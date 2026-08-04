@@ -1,3 +1,4 @@
 /target
 /.ratatoskr
 ratatoskr.toml
+.env
