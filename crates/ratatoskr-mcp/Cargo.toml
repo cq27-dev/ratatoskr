@@ -8,11 +8,11 @@ rust-version.workspace = true
 [dependencies]
 ratatoskr-core.workspace = true
 thiserror.workspace = true
-# Pinned now to prove the dependency tree resolves; the real client lands in Phase 1.
+tracing.workspace = true
+# rmcp carries client + transport-child-process features (see workspace Cargo.toml); the version
+# is pinned to 2.x to match rig-agent, so the ServerSink handed to `.rmcp_tools()` type-checks.
 rmcp.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
 
 [lints]
 workspace = true

@@ -13,15 +13,21 @@ path = ".ratatoskr/state.sqlite3"
 # Root for per-run git worktrees (unused until Phase 3).
 root = ".ratatoskr/worktrees"
 
-# Per-node model routing (illustrative — real choices are a Phase 2/3 decision).
+# Per-node model routing. `ask` is the only route used in Phase 1; provider is one of
+# "anthropic" or "moonshot", read from ANTHROPIC_API_KEY / MOONSHOT_API_KEY. The rest are
+# illustrative, forward-looking node routes (Phase 2+).
+[models.ask]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+
 [models.scout]
-provider = "kimi"
-model = "k2"
+provider = "moonshot"
+model = "kimi-k2.5"
 
 [models.analyst]
 provider = "anthropic"
-model = "claude-sonnet"
+model = "claude-sonnet-4-6"
 
 [models.implementer]
 provider = "anthropic"
-model = "claude-opus"
+model = "claude-opus-4-8"

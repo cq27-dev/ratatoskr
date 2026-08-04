@@ -15,6 +15,7 @@ warnings = "deny"
 [workspace.dependencies]
 # Internal crates
 ratatoskr-core = { path = "crates/ratatoskr-core" }
+ratatoskr-agent = { path = "crates/ratatoskr-agent" }
 ratatoskr-graph = { path = "crates/ratatoskr-graph" }
 ratatoskr-mcp = { path = "crates/ratatoskr-mcp" }
 ratatoskr-store = { path = "crates/ratatoskr-store" }
@@ -23,7 +24,10 @@ ratatoskr-store = { path = "crates/ratatoskr-store" }
 # before any logic depends on it (rmcp/gix/rig-core are wired but unused until later phases).
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync"] }
 rig-core = "0.41"
-rmcp = "3.1"
+# rig-agent carries the Agent runtime + the rmcp tool bridge (split out of rig-core in 0.41).
+# It pins rmcp 2.x, so rmcp here must match — a 3.x Peer wouldn't type-check against `.rmcp_tools()`.
+rig-agent = { version = "0.41", features = ["rmcp"] }
+rmcp = { version = "2.2", features = ["client", "transport-child-process"] }
 gix = "0.86"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

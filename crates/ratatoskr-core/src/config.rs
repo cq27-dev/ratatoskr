@@ -89,9 +89,18 @@ impl Default for RatatoskrConfig {
                 root: PathBuf::from(".ratatoskr/worktrees"),
             },
             models: HashMap::from([
-                ("scout".to_string(), route("kimi", "k2")),
-                ("analyst".to_string(), route("anthropic", "claude-sonnet")),
-                ("implementer".to_string(), route("anthropic", "claude-opus")),
+                // `ask` is the only route consumed in Phase 1; the rest are illustrative,
+                // forward-looking node routes (Phase 2+).
+                ("ask".to_string(), route("anthropic", "claude-sonnet-4-6")),
+                ("scout".to_string(), route("moonshot", "kimi-k2.5")),
+                (
+                    "analyst".to_string(),
+                    route("anthropic", "claude-sonnet-4-6"),
+                ),
+                (
+                    "implementer".to_string(),
+                    route("anthropic", "claude-opus-4-8"),
+                ),
             ]),
         }
     }
@@ -131,6 +140,7 @@ mod tests {
         let toml_str = toml::to_string(&RatatoskrConfig::default()).unwrap();
         let reparsed = RatatoskrConfig::from_toml_str(&toml_str).unwrap();
         assert_eq!(reparsed.rag_rat.command.len(), 4);
-        assert_eq!(reparsed.models.len(), 3);
+        assert_eq!(reparsed.models.len(), 4);
+        assert_eq!(reparsed.models["ask"].provider, "anthropic");
     }
 }
