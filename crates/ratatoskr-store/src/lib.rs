@@ -22,6 +22,14 @@ pub enum StoreError {
     Join(#[from] tokio::task::JoinError),
 }
 
+/// A per-node checkpoint snapshot read back from the `checkpoints` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub node_name: String,
+    pub output_json: String,
+    pub created_at: String,
+}
+
 /// A handle to the checkpoint database. Cheap to clone (shares the guarded connection).
 #[derive(Clone)]
 pub struct Store {
@@ -101,6 +109,56 @@ impl Store {
         })
         .await?
     }
+
+    /// Append a node's output snapshot for a run. Called after each node in the plan flow.
+    pub async fn insert_checkpoint(
+        &self,
+        run_id: &str,
+        node_name: &str,
+        output_json: &str,
+    ) -> Result<(), StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let (run_id, node_name, output_json) = (
+            run_id.to_string(),
+            node_name.to_string(),
+            output_json.to_string(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            conn.execute(
+                "INSERT INTO checkpoints (run_id, node_name, output_json)
+                 VALUES (?1, ?2, ?3)",
+                params![run_id, node_name, output_json],
+            )?;
+            Ok::<_, StoreError>(())
+        })
+        .await?
+    }
+
+    /// All checkpoints for a run, oldest first. Not needed by `plan` itself; it's what Phase 5's
+    /// `ratatoskr status` command will read.
+    pub async fn checkpoints_for_run(&self, run_id: &str) -> Result<Vec<Checkpoint>, StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT node_name, output_json, created_at
+                 FROM checkpoints WHERE run_id = ?1 ORDER BY id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![run_id], |row| {
+                    Ok(Checkpoint {
+                        node_name: row.get(0)?,
+                        output_json: row.get(1)?,
+                        created_at: row.get(2)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, StoreError>(rows)
+        })
+        .await?
+    }
 }
 
 #[cfg(test)]
@@ -131,5 +189,27 @@ mod tests {
             store.run_status("run-1").await.unwrap().as_deref(),
             Some("running")
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoints_persist_in_order() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("run-1", None, "running").await.unwrap();
+
+        store
+            .insert_checkpoint("run-1", "scout", r#"{"a":1}"#)
+            .await
+            .unwrap();
+        store
+            .insert_checkpoint("run-1", "analyst", r#"{"b":2}"#)
+            .await
+            .unwrap();
+
+        let checkpoints = store.checkpoints_for_run("run-1").await.unwrap();
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(checkpoints[0].node_name, "scout");
+        assert_eq!(checkpoints[1].node_name, "analyst");
+        assert_eq!(checkpoints[1].output_json, r#"{"b":2}"#);
+        assert!(store.checkpoints_for_run("other").await.unwrap().is_empty());
     }
 }

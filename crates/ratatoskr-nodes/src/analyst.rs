@@ -1,0 +1,158 @@
+//! Analyst: given the issue, scout's findings, and repo memories, assess impact and risk.
+
+use std::fmt::Write as _;
+
+use ratatoskr_core::{ModelRoute, RunState};
+use ratatoskr_graph::{Node, NodeError, parse_validated};
+use rmcp::model::Tool;
+use rmcp::service::ServerSink;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::memory::MemoryOutput;
+use crate::scout::ScoutOutput;
+
+/// rag-rat tools the analyst may use to resolve what the change actually touches.
+pub const ANALYST_TOOLS: &[&str] = &["impact_surface", "symbol_lookup", "semantic_search"];
+
+const PREAMBLE: &str = "You are the analyst in a code-planning pipeline. You are given an issue, \
+    the scout's findings, and relevant repo memories. Use `impact_surface` and `symbol_lookup` to \
+    determine what this change actually touches and its blast radius — call the tools, don't guess. \
+    Produce: an impact summary, the specific symbols/paths touched, a list of risks (each with a \
+    severity), a list of concrete requirements the implementation must satisfy, and a residual-risk \
+    note capturing what remains uncertain or unknown after your analysis.";
+
+/// Input to the analyst: the issue plus the two upstream node outputs.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AnalystInput {
+    pub issue: String,
+    pub scout: ScoutOutput,
+    pub memory: MemoryOutput,
+}
+
+/// A risk the analyst identified. Fields optional (best-effort agent output); the gate still
+/// enforces that each risk is an object of strings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct Risk {
+    pub description: String,
+    /// Free-text severity (e.g. "low"/"medium"/"high").
+    pub severity: String,
+}
+
+/// Analyst's structured output — the plan's substance.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AnalystOutput {
+    pub impact_summary: String,
+    /// Specific symbols/paths the change touches.
+    #[serde(default)]
+    pub touched: Vec<String>,
+    #[serde(default)]
+    pub risks: Vec<Risk>,
+    #[serde(default)]
+    pub requirements: Vec<String>,
+    /// What remains uncertain after analysis — drives Phase 5's clarification edge later.
+    #[serde(default)]
+    pub residual_risk: String,
+}
+
+/// The analyst node: a stronger agent restricted to impact/lookup tools.
+pub struct AnalystNode {
+    pub route: ModelRoute,
+    pub tools: Vec<Tool>,
+    pub sink: ServerSink,
+}
+
+impl Node for AnalystNode {
+    type Input = AnalystInput;
+    type Output = AnalystOutput;
+
+    fn name(&self) -> &'static str {
+        "analyst"
+    }
+
+    async fn run(
+        &self,
+        input: AnalystInput,
+        _run_state: &RunState,
+    ) -> Result<AnalystOutput, NodeError> {
+        let prompt = render_prompt(&input);
+        let raw = ratatoskr_agent::run_structured(
+            &self.route,
+            PREAMBLE,
+            &prompt,
+            self.tools.clone(),
+            self.sink.clone(),
+            schemars::schema_for!(AnalystOutput),
+        )
+        .await
+        .map_err(|e| NodeError::Failed(format!("analyst agent failed: {e}")))?;
+
+        parse_validated::<AnalystOutput>(&raw)
+    }
+}
+
+/// Fold the issue + upstream outputs into the analyst's prompt.
+fn render_prompt(input: &AnalystInput) -> String {
+    let mut s = String::new();
+    let _ = write!(s, "ISSUE:\n{}\n\n", input.issue);
+    let _ = write!(s, "SCOUT SUMMARY:\n{}\n\n", input.scout.papertrail_summary);
+
+    if !input.scout.related_items.is_empty() {
+        s.push_str("RELATED ITEMS:\n");
+        for item in &input.scout.related_items {
+            let _ = writeln!(
+                s,
+                "- [{}] {} — {}",
+                item.item_key, item.title, item.relation
+            );
+        }
+        s.push('\n');
+    }
+
+    if !input.memory.memories.is_empty() {
+        s.push_str("REPO MEMORIES:\n");
+        for m in &input.memory.memories {
+            let detail = m.summary.as_deref().unwrap_or(&m.body);
+            let _ = writeln!(s, "- ({}) {}: {}", m.kind, m.title, detail);
+        }
+        s.push('\n');
+    }
+
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_canned_analyst_response() {
+        let raw = r#"{
+            "impact_summary": "touches the store",
+            "touched": ["ratatoskr-store::Store"],
+            "risks": [{"description": "lock contention", "severity": "medium"}],
+            "requirements": ["keep single-writer"],
+            "residual_risk": "throughput under load unknown"
+        }"#;
+        let out = parse_validated::<AnalystOutput>(raw).unwrap();
+        assert_eq!(out.touched, ["ratatoskr-store::Store"]);
+        assert_eq!(out.risks[0].severity, "medium");
+    }
+
+    #[test]
+    fn rejects_a_malformed_analyst_response() {
+        // Missing the essential `impact_summary` → rejected.
+        let raw = r#"{"touched":[],"risks":[],"requirements":[],"residual_risk":"none"}"#;
+        assert!(matches!(
+            parse_validated::<AnalystOutput>(raw),
+            Err(NodeError::InvalidOutput(_))
+        ));
+        // Wrong type for risks (object, not array) → also rejected.
+        let raw = r#"{"impact_summary":"x","risks":{"description":"d"}}"#;
+        assert!(matches!(
+            parse_validated::<AnalystOutput>(raw),
+            Err(NodeError::InvalidOutput(_))
+        ));
+    }
+}

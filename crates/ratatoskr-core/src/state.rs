@@ -18,6 +18,9 @@ pub enum RunStatus {
     Pending,
     Running,
     AwaitingClarification,
+    /// The linear scout → memory → analyst planning flow finished successfully (Phase 2).
+    /// Distinct from `Converged`, which is reserved for Phase 4's real done-criteria.
+    Planned,
     Converged,
     Failed,
     Abandoned,
@@ -30,6 +33,7 @@ impl RunStatus {
             RunStatus::Pending => "pending",
             RunStatus::Running => "running",
             RunStatus::AwaitingClarification => "awaiting_clarification",
+            RunStatus::Planned => "planned",
             RunStatus::Converged => "converged",
             RunStatus::Failed => "failed",
             RunStatus::Abandoned => "abandoned",
@@ -50,6 +54,7 @@ impl FromStr for RunStatus {
             "pending" => RunStatus::Pending,
             "running" => RunStatus::Running,
             "awaiting_clarification" => RunStatus::AwaitingClarification,
+            "planned" => RunStatus::Planned,
             "converged" => RunStatus::Converged,
             "failed" => RunStatus::Failed,
             "abandoned" => RunStatus::Abandoned,
@@ -126,6 +131,7 @@ mod tests {
             RunStatus::Pending,
             RunStatus::Running,
             RunStatus::AwaitingClarification,
+            RunStatus::Planned,
             RunStatus::Converged,
             RunStatus::Failed,
             RunStatus::Abandoned,

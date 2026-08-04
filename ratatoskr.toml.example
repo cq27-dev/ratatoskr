@@ -1,8 +1,9 @@
 # Example Ratatoskr configuration. Copy to `ratatoskr.toml` (or run `ratatoskr init`).
 
 [rag_rat]
-# How to launch rag-rat's MCP server over stdio.
-command = ["npx", "-y", "@rag-rat/bin", "mcp"]
+# How to launch rag-rat's MCP server over stdio. `--json` selects JSON output (not the default
+# TOON) so nodes that parse tool results directly get a stable shape.
+command = ["npx", "-y", "@rag-rat/bin", "mcp", "--json"]
 # working_dir = "/path/to/target/repo"
 
 [store]

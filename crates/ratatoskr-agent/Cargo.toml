@@ -10,6 +10,7 @@ ratatoskr-core.workspace = true
 rig-core.workspace = true
 rig-agent.workspace = true
 rmcp.workspace = true
+schemars.workspace = true
 thiserror.workspace = true
 
 [lints]

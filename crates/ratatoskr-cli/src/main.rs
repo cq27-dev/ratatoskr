@@ -1,5 +1,5 @@
-//! The `ratatoskr` binary. Phase 1 exposes `--version`, `init`, and `ask`.
-//! The `plan` / `run` / `status` commands belong to later phases and are deliberately absent —
+//! The `ratatoskr` binary. Phase 2 exposes `--version`, `init`, `ask`, and `plan`.
+//! The `run` / `status` commands belong to later phases and are deliberately absent —
 //! an empty stub command looks implemented when it isn't.
 
 use std::path::{Path, PathBuf};
@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ratatoskr_core::RatatoskrConfig;
+use ratatoskr_nodes::PlanOutcome;
 use tracing_subscriber::EnvFilter;
 
 /// System prompt for `ask`: ground answers in rag-rat's tools, don't guess.
@@ -38,6 +39,20 @@ enum Command {
         #[arg(long, default_value = "ratatoskr.toml")]
         config: PathBuf,
     },
+    /// Plan work for an issue: scout → memory → analyst, printing a grounded summary.
+    Plan {
+        /// The issue description (omit and use --file for long text).
+        description: Option<String>,
+        /// Read the issue description from a file instead of the argument.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Path to the config file.
+        #[arg(long, default_value = "ratatoskr.toml")]
+        config: PathBuf,
+        /// Print the raw structured RunState as JSON instead of a formatted summary.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -55,6 +70,12 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Some(Command::Init) => init(),
         Some(Command::Ask { question, config }) => ask(&question, &config).await,
+        Some(Command::Plan {
+            description,
+            file,
+            config,
+            json,
+        }) => plan(description, file, &config, json).await,
         None => {
             Cli::command().print_help()?;
             println!();
@@ -108,6 +129,82 @@ async fn ask(question: &str, config_path: &Path) -> anyhow::Result<()> {
 
     println!("{}", answer.context("agent failed to answer")?);
     Ok(())
+}
+
+/// Run the scout → memory → analyst plan flow for an issue and print the result.
+async fn plan(
+    description: Option<String>,
+    file: Option<PathBuf>,
+    config_path: &Path,
+    json: bool,
+) -> anyhow::Result<()> {
+    let issue = match (description, file) {
+        (Some(d), None) => d,
+        (None, Some(f)) => {
+            std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?
+        }
+        (Some(_), Some(_)) => bail!("pass either a description or --file, not both"),
+        (None, None) => bail!("provide an issue description or --file"),
+    };
+
+    let config = load_config(config_path)?;
+    let store = ratatoskr_store::Store::open(&config.store.path)
+        .with_context(|| format!("opening store at {}", config.store.path.display()))?;
+    let client = ratatoskr_mcp::RagRatClient::connect(config.rag_rat.clone())
+        .await
+        .context("connecting to rag-rat")?;
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let result = ratatoskr_nodes::run_plan(&client, &config, &store, &run_id, &issue).await;
+
+    // Tear down rag-rat regardless of outcome.
+    if let Err(e) = client.shutdown().await {
+        tracing::warn!("failed to shut down rag-rat cleanly: {e}");
+    }
+
+    let outcome = result.context("plan run failed")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&outcome.state)?);
+    } else {
+        print_summary(&run_id, &outcome);
+    }
+    Ok(())
+}
+
+/// Render a plan outcome as a short, readable report — this is what makes `plan` useful to run.
+fn print_summary(run_id: &str, outcome: &PlanOutcome) {
+    println!("── plan {run_id} ──\n");
+
+    println!("RELATED ITEMS ({}):", outcome.scout.related_items.len());
+    for item in &outcome.scout.related_items {
+        println!("  • [{}] {} — {}", item.item_key, item.title, item.relation);
+    }
+    if !outcome.scout.papertrail_summary.is_empty() {
+        println!("  {}", outcome.scout.papertrail_summary);
+    }
+
+    println!("\nREPO MEMORIES ({}):", outcome.memory.memories.len());
+    for m in &outcome.memory.memories {
+        println!("  • ({}) {}", m.kind, m.title);
+    }
+
+    let a = &outcome.analyst;
+    println!("\nIMPACT:\n  {}", a.impact_summary);
+    if !a.touched.is_empty() {
+        println!("  touches: {}", a.touched.join(", "));
+    }
+
+    println!("\nRISKS ({}):", a.risks.len());
+    for r in &a.risks {
+        println!("  • [{}] {}", r.severity, r.description);
+    }
+
+    println!("\nREQUIREMENTS ({}):", a.requirements.len());
+    for req in &a.requirements {
+        println!("  • {req}");
+    }
+
+    println!("\nRESIDUAL RISK:\n  {}", a.residual_risk);
 }
 
 fn load_config(path: &Path) -> anyhow::Result<RatatoskrConfig> {

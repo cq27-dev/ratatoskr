@@ -17,6 +17,7 @@ warnings = "deny"
 ratatoskr-core = { path = "crates/ratatoskr-core" }
 ratatoskr-agent = { path = "crates/ratatoskr-agent" }
 ratatoskr-graph = { path = "crates/ratatoskr-graph" }
+ratatoskr-nodes = { path = "crates/ratatoskr-nodes" }
 ratatoskr-mcp = { path = "crates/ratatoskr-mcp" }
 ratatoskr-store = { path = "crates/ratatoskr-store" }
 
@@ -40,3 +41,7 @@ thiserror = "2"
 anyhow = "1"
 toml = "1"
 dotenvy = "0.15"
+# jsonschema validates node output values against their schemars-generated schema. default-features
+# off drops the reqwest-based remote-$ref resolver we don't need (schemas are local & self-contained).
+jsonschema = { version = "0.49", default-features = false }
+uuid = { version = "1", features = ["v4"] }

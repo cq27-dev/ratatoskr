@@ -10,10 +10,66 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-/// Error produced by a node. Kept minimal in Phase 0; nodes refine it as they're built.
+/// Error produced by a node.
 #[derive(Debug, thiserror::Error)]
-#[error("node error: {0}")]
-pub struct NodeError(pub String);
+pub enum NodeError {
+    /// The node's own work failed (a tool call, an agent turn, a client error).
+    #[error("{0}")]
+    Failed(String),
+    /// The node produced output that didn't parse or didn't match its schema — the
+    /// [`parse_validated`] gate rejected it, so the run must stop rather than accept it.
+    #[error("output failed schema validation: {0}")]
+    InvalidOutput(String),
+}
+
+/// The schema-validation gate: parse best-effort model/tool output into a typed `T`, rejecting
+/// anything that doesn't match `T`'s JSON Schema. This is the enforcement behind "structured JSON
+/// handoffs, not chat transcripts" — call it on every node's raw output before accepting it into
+/// `RunState`.
+///
+/// `raw` may be wrapped in prose or ```json fences (agents in `OutputMode::Tool` are *instructed*
+/// but not *forced* to emit clean JSON), so the object between the outermost braces is extracted
+/// first.
+pub fn parse_validated<T>(raw: &str) -> Result<T, NodeError>
+where
+    T: DeserializeOwned + JsonSchema,
+{
+    let json = extract_json_object(raw).ok_or_else(|| {
+        NodeError::InvalidOutput(format!("no JSON object found in output: {}", elide(raw)))
+    })?;
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| NodeError::InvalidOutput(format!("output is not valid JSON: {e}")))?;
+
+    let schema = serde_json::to_value(schemars::schema_for!(T))
+        .map_err(|e| NodeError::InvalidOutput(format!("could not build schema: {e}")))?;
+    let validator = jsonschema::validator_for(&schema)
+        .map_err(|e| NodeError::InvalidOutput(format!("could not compile schema: {e}")))?;
+    if let Err(err) = validator.validate(&value) {
+        return Err(NodeError::InvalidOutput(format!(
+            "{} does not match its schema: {err}",
+            std::any::type_name::<T>()
+        )));
+    }
+
+    serde_json::from_value(value)
+        .map_err(|e| NodeError::InvalidOutput(format!("could not deserialize: {e}")))
+}
+
+/// Return the substring from the first `{` to the last `}`, or `None` if there isn't a brace pair.
+fn extract_json_object(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    (end > start).then(|| &raw[start..=end])
+}
+
+fn elide(s: &str) -> String {
+    let s = s.trim();
+    if s.chars().count() <= 200 {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(200).collect::<String>())
+    }
+}
 
 /// A unit of work in the graph. Its `Input`/`Output` are schema-bearing so the executor can, in
 /// Phase 2, check that one node's output lines up with the next node's input before wiring them.
@@ -105,5 +161,27 @@ mod tests {
         };
         assert_eq!(e.from, "scout");
         assert_eq!(e.to, "analyst");
+    }
+
+    #[test]
+    fn parse_validated_accepts_good_output_even_wrapped_in_prose() {
+        let ok: Message = parse_validated(r#"{"text":"hi"}"#).unwrap();
+        assert_eq!(ok.text, "hi");
+
+        // OutputMode::Tool is best-effort; tolerate fences/prose around the object.
+        let wrapped: Message =
+            parse_validated("Here you go:\n```json\n{\"text\":\"hi\"}\n```").unwrap();
+        assert_eq!(wrapped.text, "hi");
+    }
+
+    #[test]
+    fn parse_validated_rejects_schema_violations() {
+        // Missing the required `text` field → InvalidOutput, not a silent default.
+        let err = parse_validated::<Message>(r#"{"nope":1}"#).unwrap_err();
+        assert!(matches!(err, NodeError::InvalidOutput(_)));
+
+        // Not JSON at all.
+        let err = parse_validated::<Message>("total garbage").unwrap_err();
+        assert!(matches!(err, NodeError::InvalidOutput(_)));
     }
 }

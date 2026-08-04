@@ -13,12 +13,16 @@ path = "src/main.rs"
 ratatoskr-core.workspace = true
 ratatoskr-mcp.workspace = true
 ratatoskr-agent.workspace = true
+ratatoskr-nodes.workspace = true
+ratatoskr-store.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 dotenvy.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
 # Pinned now so the full dependency tree resolves in CI; used from Phase 3 (gix worktrees).
 gix.workspace = true
 
