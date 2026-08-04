@@ -77,7 +77,7 @@ impl Default for RatatoskrConfig {
         };
         RatatoskrConfig {
             rag_rat: RagRatConfig {
-                command: ["npx", "-y", "@rag-rat/bin", "mcp", "serve"]
+                command: ["npx", "-y", "@rag-rat/bin", "mcp"]
                     .map(str::to_string)
                     .to_vec(),
                 working_dir: None,
@@ -130,7 +130,7 @@ mod tests {
     fn default_config_serializes_and_reparses() {
         let toml_str = toml::to_string(&RatatoskrConfig::default()).unwrap();
         let reparsed = RatatoskrConfig::from_toml_str(&toml_str).unwrap();
-        assert_eq!(reparsed.rag_rat.command.len(), 5);
+        assert_eq!(reparsed.rag_rat.command.len(), 4);
         assert_eq!(reparsed.models.len(), 3);
     }
 }

@@ -2,7 +2,7 @@
 
 [rag_rat]
 # How to launch rag-rat's MCP server over stdio.
-command = ["npx", "-y", "@rag-rat/bin", "mcp", "serve"]
+command = ["npx", "-y", "@rag-rat/bin", "mcp"]
 # working_dir = "/path/to/target/repo"
 
 [store]
