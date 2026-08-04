@@ -1,0 +1,24 @@
+[package]
+name = "ratatoskr-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ratatoskr"
+path = "src/main.rs"
+
+[dependencies]
+ratatoskr-core.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+# Pinned now so the full dependency tree resolves in CI; used from Phase 1 (rig) / Phase 3 (gix).
+rig-core.workspace = true
+gix.workspace = true
+
+[lints]
+workspace = true

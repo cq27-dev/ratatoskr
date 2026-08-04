@@ -1,0 +1,15 @@
+[package]
+name = "ratatoskr-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ratatoskr-core.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

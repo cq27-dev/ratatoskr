@@ -1,0 +1,27 @@
+# Example Ratatoskr configuration. Copy to `ratatoskr.toml` (or run `ratatoskr init`).
+
+[rag_rat]
+# How to launch rag-rat's MCP server over stdio.
+command = ["rag-rat", "mcp", "serve"]
+# working_dir = "/path/to/target/repo"
+
+[store]
+# Ratatoskr's own checkpoint database — a separate file from rag-rat's index.
+path = ".ratatoskr/state.sqlite3"
+
+[worktree]
+# Root for per-run git worktrees (unused until Phase 3).
+root = ".ratatoskr/worktrees"
+
+# Per-node model routing (illustrative — real choices are a Phase 2/3 decision).
+[models.scout]
+provider = "kimi"
+model = "k2"
+
+[models.analyst]
+provider = "anthropic"
+model = "claude-sonnet"
+
+[models.implementer]
+provider = "anthropic"
+model = "claude-opus"

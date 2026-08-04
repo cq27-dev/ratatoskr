@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.97"
+repository = "https://github.com/cq27-dev/ratatoskr"
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.dependencies]
+# Internal crates
+ratatoskr-core = { path = "crates/ratatoskr-core" }
+ratatoskr-graph = { path = "crates/ratatoskr-graph" }
+ratatoskr-mcp = { path = "crates/ratatoskr-mcp" }
+ratatoskr-store = { path = "crates/ratatoskr-store" }
+
+# External — pinned in Phase 0 so the dependency tree resolves and compiles cleanly
+# before any logic depends on it (rmcp/gix/rig-core are wired but unused until later phases).
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync"] }
+rig-core = "0.41"
+rmcp = "3.1"
+gix = "0.86"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1.2"
+rusqlite = { version = "0.40", features = ["bundled"] }
+clap = { version = "4.6", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+toml = "1"
