@@ -462,8 +462,13 @@ fn load_config(path: &Path) -> anyhow::Result<RatatoskrConfig> {
     }
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    RatatoskrConfig::from_toml_str(&text)
-        .with_context(|| format!("parsing config {}", path.display()))
+    let config = RatatoskrConfig::from_toml_str(&text)
+        .with_context(|| format!("parsing config {}", path.display()))?;
+    // Reject unusable configs here, before any command touches rag-rat, a sandbox, or a model.
+    config
+        .validate()
+        .with_context(|| format!("in config {}", path.display()))?;
+    Ok(config)
 }
 
 /// The nodes a ruleset may govern — the LLM agents that go through `run_structured`. `memory` and
