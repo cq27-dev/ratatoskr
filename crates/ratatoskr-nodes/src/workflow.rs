@@ -212,6 +212,7 @@ async fn scout_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, St
         max_turns: cfg.max_turns,
         // Node-to-node clarification is built-in-flow only for now; the scripted path opts out.
         clarifier: None,
+        system_prompt: cfg.system_prompt,
     };
     let out = node
         .run(issue, &RunState::new(&ctx.run_id, None))
@@ -258,6 +259,7 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
         sink: ctx.sink.clone(),
         policy: cfg.policy,
         max_turns: cfg.max_turns,
+        system_prompt: cfg.system_prompt,
     };
     let out = node
         .run(input, &RunState::new(&ctx.run_id, None))
@@ -271,8 +273,8 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
 
 fn build_red_team(ctx: &WorkflowContext) -> Result<RedTeamNode, PlanError> {
     let short: String = ctx.run_id.chars().take(8).collect();
-    let classifier = match ctx.config.models.get("redteam") {
-        Some(_) => {
+    let classifier = match crate::classifier_enabled(&ctx.engine, &ctx.config) {
+        true => {
             let cfg = node_agent_config(
                 &ctx.engine,
                 &ctx.config,
@@ -287,9 +289,10 @@ fn build_red_team(ctx: &WorkflowContext) -> Result<RedTeamNode, PlanError> {
                 policy: cfg.policy,
                 max_turns: cfg.max_turns,
                 clarifier: None,
+                system_prompt: cfg.system_prompt,
             })
         }
-        None => None,
+        false => None,
     };
     Ok(RedTeamNode {
         repo_path: ctx.repo_path.clone(),
@@ -634,6 +637,7 @@ async fn bookkeep_scripted(
         policy: cfg.policy,
         max_turns: cfg.max_turns,
         clarifier: None,
+        system_prompt: cfg.system_prompt,
     };
     let out = node
         .run(input)

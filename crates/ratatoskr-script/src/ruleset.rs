@@ -41,6 +41,7 @@ globalThis.__staticConfig = function() {
             model: a.model || null,
             tools: a.tools || null,
             maxTurns: (typeof a.maxTurns === 'number') ? a.maxTurns : null,
+            systemPrompt: (typeof a.systemPrompt === 'string') ? a.systemPrompt : null,
             hasOnToolCall: typeof a.onToolCall === 'function'
         };
     }
@@ -73,6 +74,9 @@ pub struct AgentRuleset {
     pub tools: Option<ToolRule>,
     #[serde(default, rename = "maxTurns")]
     pub max_turns: Option<usize>,
+    /// Replaces the node's built-in preamble when set.
+    #[serde(default, rename = "systemPrompt")]
+    pub system_prompt: Option<String>,
     #[serde(default, rename = "hasOnToolCall")]
     pub has_on_tool_call: bool,
 }
@@ -248,5 +252,42 @@ mod tests {
         ));
         // A node with no ruleset gets nothing to gate.
         assert!(engine.ruleset("analyst").is_none());
+    }
+
+    #[tokio::test]
+    async fn model_and_system_prompt_deserialize() {
+        let dir = std::env::temp_dir().join("ratatoskr-script-ruleset-prompt-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.ts"),
+            r#"
+            defineAgent("analyst", {
+                model: { provider: "anthropic", model: "claude-opus-4-8" },
+                systemPrompt: "You are a terse analyst.",
+                maxTurns: 7,
+            });
+            defineAgent("scout", { model: { provider: "moonshot", model: "kimi-k2.5" } });
+            defineAgent("bookkeeper", { maxTurns: 3 });
+            "#,
+        )
+        .unwrap();
+
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+
+        let analyst = engine.ruleset("analyst").unwrap();
+        let c = analyst.config();
+        assert_eq!(c.model.as_ref().unwrap().provider, "anthropic");
+        assert_eq!(c.system_prompt.as_deref(), Some("You are a terse analyst."));
+        assert_eq!(c.max_turns, Some(7));
+
+        // model-only: everything else stays absent.
+        let scout = engine.ruleset("scout").unwrap();
+        assert_eq!(scout.config().model.as_ref().unwrap().model, "kimi-k2.5");
+        assert!(scout.config().system_prompt.is_none());
+
+        // no model, no prompt — the fallback path.
+        let bk = engine.ruleset("bookkeeper").unwrap();
+        assert!(bk.config().model.is_none());
+        assert!(bk.config().system_prompt.is_none());
     }
 }

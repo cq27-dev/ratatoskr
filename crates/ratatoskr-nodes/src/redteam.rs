@@ -2,7 +2,8 @@
 //! checkout into a sandbox, runs the repo's tests, and parses pass/fail deterministically. That
 //! deterministic characterization is what converge compares the implementer's run against.
 //!
-//! An OPTIONAL classifier (enabled only when a `[models.redteam]` route is configured) adds one LLM
+//! An OPTIONAL classifier (enabled only when redteam has a model route — from `[models.redteam]` or
+//! its ruleset) adds one LLM
 //! pass labeling each baseline failure flaky vs real — a separate, additive field. The strict
 //! pass/fail is never touched by it.
 
@@ -45,7 +46,8 @@ struct Classification {
 }
 
 /// Deterministic baseline characterization (strict schema — built from a real test run, not an LLM).
-/// `classifications` is optional/additive: empty unless a `[models.redteam]` classifier ran.
+/// `classifications` is optional/additive: empty unless a redteam classifier ran (it runs when
+/// redteam has a route from `[models.redteam]` or its ruleset).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RedTeamOutput {
     pub failing_tests: Vec<String>,
@@ -63,6 +65,8 @@ pub struct RedTeamClassifier {
     pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
     pub max_turns: Option<usize>,
     pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
+    /// Ruleset `systemPrompt`; replaces [`CLASSIFY_PREAMBLE`] when set.
+    pub system_prompt: Option<String>,
 }
 
 impl RedTeamClassifier {
@@ -80,7 +84,7 @@ impl RedTeamClassifier {
         let raw = ratatoskr_agent::run_structured(
             "redteam",
             &self.route,
-            CLASSIFY_PREAMBLE,
+            self.system_prompt.as_deref().unwrap_or(CLASSIFY_PREAMBLE),
             &prompt,
             self.tools.clone(),
             self.sink.clone(),
@@ -101,7 +105,7 @@ pub struct RedTeamNode {
     pub sandbox: ratatoskr_core::SandboxConfig,
     /// Unique sandbox name for this run.
     pub name: String,
-    /// Enabled only when `[models.redteam]` is configured.
+    /// Enabled only when redteam has a route — from `[models.redteam]` or its ruleset.
     pub classifier: Option<RedTeamClassifier>,
 }
 

@@ -151,8 +151,14 @@ impl NodeClarifier {
 
         // Only the route matters here; answer mode runs with no tools. Label with the RESOLVED
         // answerer (not the raw `to`), so a fallback to analyst isn't misattributed.
-        let route = match node_agent_config(&self.engine, &self.config, &[], answerer, &[]) {
-            Ok(cfg) => cfg.route,
+        let (route, system_prompt) = match node_agent_config(
+            &self.engine,
+            &self.config,
+            &[],
+            answerer,
+            &[],
+        ) {
+            Ok(cfg) => (cfg.route, cfg.system_prompt),
             Err(_) => {
                 return format!(
                     "Could not reach `{answerer}`: no model route is configured for it. Proceed with \
@@ -161,10 +167,15 @@ impl NodeClarifier {
             }
         };
 
+        // A ruleset `systemPrompt` replaces the node's *persona*, but the answer-mode contract is
+        // this call site's own and always applies — otherwise a scout-shaped prompt would make the
+        // answerer go scout instead of answering.
+        let persona = system_prompt
+            .unwrap_or_else(|| format!("You are the {answerer} in a code-planning pipeline."));
         let preamble = format!(
-            "You are the {answerer} in a code-planning pipeline. A peer node is asking you a question \
-             mid-run. Answer it concisely and concretely from the context you are given; if you \
-             cannot answer from what you have, say so plainly rather than guessing."
+            "{persona}\n\nA peer node is asking you a question mid-run. Answer it concisely and \
+             concretely from the context you are given; if you cannot answer from what you have, \
+             say so plainly rather than guessing."
         );
         let prompt = format!("A peer node (`{from}`) asks:\n{question}\n\nContext:\n{context}");
 
