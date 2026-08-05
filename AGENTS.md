@@ -80,6 +80,12 @@ changed and why. Durable, checkable references are encouraged: issue/PR numbers,
 names, file paths. (This is about *public* artifacts; rag-rat memories are the internal cross-agent
 layer and may record provenance freely.)
 
+The same applies to **files**: plans, design notes, and working scratch do not get committed. They
+describe the process, they go stale the moment the feature lands, and the repo then carries a
+document that contradicts the code. Put the durable part where it will be read — a comment at the
+constraint, a rag-rat memory, or the issue/PR — and let the plan itself be disposable. Documentation
+that a *user* needs (the README, a crate's README) is a different thing and belongs in the repo.
+
 Commit messages use conventional-commit form: `type(scope): summary`.
 
 ## Repo orientation
