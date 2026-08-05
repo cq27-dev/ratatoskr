@@ -452,24 +452,33 @@ async fn bookkeep(run_id: &str, config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Print the memories a bookkeeper run wrote.
+/// Print what the bookkeeper decided the repository's memory should now say.
 fn print_bookkeeper(out: &ratatoskr_nodes::BookkeeperOutput) {
-    if out.memories_written.is_empty() {
-        println!("no memories written");
+    // Recording nothing is an ordinary outcome, so say why rather than reporting a bare absence.
+    if let Some(reason) = &out.skipped {
+        println!("no memory recorded: {reason}");
         return;
     }
-    println!("wrote {} memory(ies):", out.memories_written.len());
-    for m in &out.memories_written {
-        let anchor = if m.anchor.is_empty() {
-            "<unanchored>"
-        } else {
-            &m.anchor
-        };
-        println!("  • {} [{}] @ {}", m.memory_id, m.kind, anchor);
-        if let Some(s) = &m.summary {
-            println!("    {s}");
+
+    let list = |label: &str, memories: &[ratatoskr_nodes::MemoryWritten]| {
+        if memories.is_empty() {
+            return;
         }
-    }
+        println!("{label} {} memory(ies):", memories.len());
+        for m in memories {
+            let anchor = if m.anchor.is_empty() {
+                "<unanchored>"
+            } else {
+                &m.anchor
+            };
+            println!("  • {} [{}] @ {}", m.memory_id, m.kind, anchor);
+            if let Some(s) = &m.summary {
+                println!("    {s}");
+            }
+        }
+    };
+    list("wrote", &out.memories_written);
+    list("revised", &out.memories_revised);
 }
 
 /// Show a run's status and per-node checkpoints from the store — pure read, no rag-rat or LLM.
