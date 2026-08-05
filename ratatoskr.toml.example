@@ -57,3 +57,9 @@ backend = "landlock"                        # "landlock" (bwrap+Landlock, defaul
                                             #  `--features microsandbox`)
 image = "docker.io/library/rust:1-slim"     # OCI image the sandbox boots (microsandbox only)
 test_command = ["cargo", "test"]            # the target repo's test command
+
+# Agent plugins, in the format coding CLIs already use. `.ratatoskr/plugins/` is always searched;
+# these paths add plugins installed elsewhere, and may name a plugin or a directory of them.
+# A plugin's SessionStart hook runs once per run and its output is prefixed to each node's preamble.
+[plugins]
+paths = []

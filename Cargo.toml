@@ -23,6 +23,7 @@ ratatoskr-script = { path = "crates/ratatoskr-script" }
 ratatoskr-mcp = { path = "crates/ratatoskr-mcp" }
 ratatoskr-store = { path = "crates/ratatoskr-store" }
 ratatoskr-serve = { path = "crates/ratatoskr-serve" }
+ratatoskr-plugin = { path = "crates/ratatoskr-plugin" }
 
 # External — pinned in Phase 0 so the dependency tree resolves and compiles cleanly
 # before any logic depends on it (rmcp/gix/rig-core are wired but unused until later phases).

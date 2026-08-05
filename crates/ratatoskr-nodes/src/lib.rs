@@ -84,16 +84,56 @@ pub async fn run_plan(
 ) -> Result<PlanOutcome, PlanError> {
     // A `.ratatoskr/workflow.ts` overrides the built-in scout → memory → analyst sequencing.
     if let Some(runtime) = load_workflow().await? {
-        let ctx = workflow::WorkflowContext::new(client, config, store, run_id, issue, engine)?;
+        let plugin_context =
+            PluginContext::resolve(config, &std::env::current_dir().unwrap_or_default()).await;
+        let ctx = workflow::WorkflowContext::new(
+            client,
+            config,
+            store,
+            run_id,
+            issue,
+            engine,
+            plugin_context,
+        )?;
         return workflow::run_plan_scripted(runtime, ctx).await;
     }
 
+    // Once per run: `SessionStart` describes the repository, not the node.
+    let context =
+        PluginContext::resolve(config, &std::env::current_dir().unwrap_or_default()).await;
+    plan_half(client, config, store, run_id, issue, engine, &context).await
+}
+
+/// The planning half, against an already-resolved plugin context. `run_full` resolves it once and
+/// reuses it for both halves, so a full run doesn't pay for every plugin's `SessionStart` twice.
+async fn plan_half(
+    client: &RagRatClient,
+    config: &RatatoskrConfig,
+    store: &Store,
+    run_id: &str,
+    issue: &str,
+    engine: &Arc<ScriptEngine>,
+    context: &PluginContext,
+) -> Result<PlanOutcome, PlanError> {
+    // First, and here rather than in a caller: every checkpoint references this row, and the
+    // schema enforces it. `run_full` reaches this function directly, so a caller-side write would
+    // leave that path creating checkpoints for a run that doesn't exist yet.
     store
         .upsert_run(run_id, None, RunStatus::Running.as_str())
         .await?;
 
     let clarifier = NodeClarifier::new(config, store, engine, run_id, issue, client.sink());
-    let outcome = run_nodes(client, config, store, run_id, issue, engine, &clarifier)
+    let run = Run {
+        client,
+        config,
+        store,
+        run_id,
+        issue,
+        engine,
+        clarifier: &clarifier,
+        context,
+    };
+    let outcome = run_nodes(&run)
         .await
         // Drain the plan-half clarifications into the outcome's state (the clarifier can't reach the
         // borrowed RunState during the run).
@@ -115,15 +155,18 @@ pub async fn run_plan(
     outcome
 }
 
-async fn run_nodes(
-    client: &RagRatClient,
-    config: &RatatoskrConfig,
-    store: &Store,
-    run_id: &str,
-    issue: &str,
-    engine: &Arc<ScriptEngine>,
-    clarifier: &Arc<NodeClarifier>,
-) -> Result<PlanOutcome, PlanError> {
+async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
+    // Every field is a shared reference, so this just names them locally.
+    let &Run {
+        client,
+        config,
+        store,
+        run_id,
+        issue,
+        engine,
+        clarifier,
+        context,
+    } = run;
     let sink = client.sink();
     let all_tools = client.tools();
     let mut state = RunState::new(run_id, None);
@@ -150,6 +193,7 @@ async fn run_nodes(
         max_turns: scout_cfg.max_turns,
         clarifier: Some(clarifier.as_dyn()),
         system_prompt: scout_cfg.system_prompt,
+        context: context.0.clone(),
     };
     let scout_out = scout
         .run(issue.to_string(), &state)
@@ -192,6 +236,7 @@ async fn run_nodes(
         policy: analyst_cfg.policy,
         max_turns: analyst_cfg.max_turns,
         system_prompt: analyst_cfg.system_prompt,
+        context: context.0.clone(),
     };
     let analyst_out = analyst
         .run(
@@ -263,6 +308,68 @@ struct NodeAgentConfig {
     max_turns: Option<usize>,
     /// Replaces the node's built-in preamble when the ruleset declares one.
     system_prompt: Option<String>,
+}
+
+/// Everything a run's helpers need in common: the rag-rat connection, the run's identity and
+/// configuration, and the two things resolved once per run — the clarifier and the plugin context.
+///
+/// A parameter struct because these travel together through every stage; passing them
+/// individually made each helper's signature grow with the run rather than with its job.
+struct Run<'a> {
+    client: &'a RagRatClient,
+    config: &'a RatatoskrConfig,
+    store: &'a Store,
+    run_id: &'a str,
+    issue: &'a str,
+    engine: &'a Arc<ScriptEngine>,
+    clarifier: &'a Arc<NodeClarifier>,
+    context: &'a PluginContext,
+}
+
+/// What plugins contributed for this run, prefixed to every node's preamble.
+///
+/// Resolved once because `SessionStart` describes the repository, not the node. Once plugins are
+/// bound per node this becomes per node too.
+#[derive(Clone, Default)]
+pub struct PluginContext(pub Option<String>);
+
+impl PluginContext {
+    /// Run every discovered plugin's `SessionStart` hook. Never fails: a plugin that is missing,
+    /// broken, or slow simply contributes nothing.
+    pub async fn resolve(config: &RatatoskrConfig, cwd: &std::path::Path) -> Self {
+        let plugins = ratatoskr_plugin::discover(&config.plugins.search_paths(cwd));
+        if plugins.is_empty() {
+            return PluginContext(None);
+        }
+        for plugin in &plugins {
+            tracing::info!(plugin = plugin.name, "loaded plugin");
+        }
+        let context = ratatoskr_plugin::session_start_context(&plugins, cwd).await;
+        match &context {
+            // Worth a line: this text is prefixed to every prompt these nodes make.
+            Some(text) => tracing::info!(chars = text.len(), "plugin session context"),
+            None => tracing::debug!("plugins contributed no session context"),
+        }
+        PluginContext(context)
+    }
+
+    pub fn as_deref(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+/// The preamble a node actually runs with: its built-in text, or a ruleset's replacement for it,
+/// prefixed by whatever context plugins contributed for this run.
+pub(crate) fn effective_preamble(
+    built_in: &str,
+    system_prompt: Option<&str>,
+    context: Option<&str>,
+) -> String {
+    let base = system_prompt.unwrap_or(built_in);
+    match context {
+        Some(context) => format!("{context}\n\n{base}"),
+        None => base.to_string(),
+    }
 }
 
 /// Resolve a node's agent settings. The ruleset is authoritative where it speaks: its `model` is
@@ -367,11 +474,24 @@ pub async fn run_full(
 ) -> Result<RunOutcome, PlanError> {
     // A `.ratatoskr/workflow.ts` overrides the whole run flow (plan + fork + converge).
     if let Some(runtime) = load_workflow().await? {
-        let ctx = workflow::WorkflowContext::new(client, config, store, run_id, issue, engine)?;
+        let plugin_context =
+            PluginContext::resolve(config, &std::env::current_dir().unwrap_or_default()).await;
+        let ctx = workflow::WorkflowContext::new(
+            client,
+            config,
+            store,
+            run_id,
+            issue,
+            engine,
+            plugin_context,
+        )?;
         return workflow::run_full_scripted(runtime, ctx).await;
     }
 
-    let plan = run_plan(client, config, store, run_id, issue, engine).await?;
+    // Resolved here and shared with both halves.
+    let plan_context =
+        PluginContext::resolve(config, &std::env::current_dir().unwrap_or_default()).await;
+    let plan = plan_half(client, config, store, run_id, issue, engine, &plan_context).await?;
     // `plan.state.clarifications` already holds the plan-half asks; the fork/bookkeep half gets its
     // own clarifier, drained and appended at the end.
     let mut state = plan.state.clone();
@@ -391,10 +511,18 @@ pub async fn run_full(
         tracing::warn!("failed to record run status before the fork: {e}");
     }
 
-    let result = fork_and_converge(
-        client, config, store, run_id, issue, &plan, engine, &clarifier,
-    )
-    .await;
+    let run = Run {
+        client,
+        config,
+        store,
+        run_id,
+        issue,
+        engine,
+        clarifier: &clarifier,
+        // The plan half's context, reused: `SessionStart` runs once per run, not once per stage.
+        context: &plan_context,
+    };
+    let result = fork_and_converge(&run, &plan).await;
 
     let status = match &result {
         Ok((_, _, _, status, _)) => *status,
@@ -423,9 +551,7 @@ pub async fn run_full(
             iterations,
             converged: status == RunStatus::Converged,
         };
-        match bookkeep_and_checkpoint(client, config, store, run_id, input, engine, &clarifier)
-            .await
-        {
+        match bookkeep_and_checkpoint(&run, input).await {
             Ok(bk) => {
                 state.artifacts = vec![serde_json::to_value(&bk)?];
                 Some(bk)
@@ -457,14 +583,21 @@ pub async fn run_full(
 /// Build the bookkeeper node, run it, and checkpoint its output. Shared by `run_full` (auto path)
 /// and `run_bookkeeper` (replay).
 async fn bookkeep_and_checkpoint(
-    client: &RagRatClient,
-    config: &RatatoskrConfig,
-    store: &Store,
-    run_id: &str,
+    run: &Run<'_>,
     input: BookkeeperInput,
-    engine: &Arc<ScriptEngine>,
-    clarifier: &Arc<NodeClarifier>,
 ) -> Result<BookkeeperOutput, PlanError> {
+    // Every field is a shared reference, so this just names them locally. The issue comes from
+    // `input` here, which on a replay is reconstructed from the store rather than passed in.
+    let &Run {
+        client,
+        config,
+        store,
+        run_id,
+        engine,
+        clarifier,
+        context,
+        ..
+    } = run;
     let cfg = node_agent_config(
         engine,
         config,
@@ -482,6 +615,7 @@ async fn bookkeep_and_checkpoint(
         max_turns: cfg.max_turns,
         clarifier: Some(clarifier.as_dyn()),
         system_prompt: cfg.system_prompt,
+        context: context.0.clone(),
     };
     let out = node
         .run(input)
@@ -536,21 +670,26 @@ pub async fn run_bookkeeper(
         iterations,
         converged,
     };
-    bookkeep_and_checkpoint(client, config, store, run_id, input, engine, &clarifier).await
+    let context =
+        PluginContext::resolve(config, &std::env::current_dir().unwrap_or_default()).await;
+    let run = Run {
+        client,
+        config,
+        store,
+        run_id,
+        issue: &input.issue.clone(),
+        engine,
+        clarifier: &clarifier,
+        context: &context,
+    };
+    bookkeep_and_checkpoint(&run, input).await
 }
 
 /// The fork + converge half. Returns the terminal status; leaves the worktree in place on a
 /// terminal outcome and removes it on a hard error.
-#[allow(clippy::too_many_arguments)] // run context (client/config/store/run_id/issue/plan/engine) + the clarifier
 async fn fork_and_converge(
-    client: &RagRatClient,
-    config: &RatatoskrConfig,
-    store: &Store,
-    run_id: &str,
-    issue: &str,
+    run: &Run<'_>,
     plan: &PlanOutcome,
-    engine: &Arc<ScriptEngine>,
-    clarifier: &Arc<NodeClarifier>,
 ) -> Result<
     (
         RedTeamOutput,
@@ -561,6 +700,16 @@ async fn fork_and_converge(
     ),
     PlanError,
 > {
+    let &Run {
+        client,
+        config,
+        store,
+        run_id,
+        issue,
+        engine,
+        clarifier,
+        context,
+    } = run;
     let repo_path: PathBuf = std::env::current_dir()
         .map_err(|e| PlanError::node("fork", NodeError::Failed(format!("cwd: {e}"))))?;
     let short: String = run_id.chars().take(8).collect();
@@ -590,6 +739,7 @@ async fn fork_and_converge(
                     max_turns: cfg.max_turns,
                     clarifier: Some(clarifier.as_dyn()),
                     system_prompt: cfg.system_prompt,
+                    context: context.0.clone(),
                 })
             }
             false => None,
@@ -712,6 +862,25 @@ mod agent_config_tests {
         )
         .unwrap();
         ScriptEngine::load(&dir).await.unwrap()
+    }
+
+    #[test]
+    fn plugin_context_prefixes_whichever_preamble_applies() {
+        // A ruleset replaces the node's own text; plugin context is prepended to whatever wins,
+        // so a repository digest never costs a node its instructions.
+        assert_eq!(effective_preamble("built-in", None, None), "built-in");
+        assert_eq!(
+            effective_preamble("built-in", Some("override"), None),
+            "override"
+        );
+        assert_eq!(
+            effective_preamble("built-in", None, Some("digest")),
+            "digest\n\nbuilt-in"
+        );
+        assert_eq!(
+            effective_preamble("built-in", Some("override"), Some("digest")),
+            "digest\n\noverride"
+        );
     }
 
     #[tokio::test]

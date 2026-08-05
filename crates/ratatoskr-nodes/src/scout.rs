@@ -60,6 +60,8 @@ pub struct ScoutNode {
     pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
     /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
     pub system_prompt: Option<String>,
+    /// Session context contributed by plugins, prefixed to whichever preamble applies.
+    pub context: Option<String>,
 }
 
 impl Node for ScoutNode {
@@ -74,7 +76,11 @@ impl Node for ScoutNode {
         let raw = ratatoskr_agent::run_structured(
             "scout",
             &self.route,
-            self.system_prompt.as_deref().unwrap_or(PREAMBLE),
+            &crate::effective_preamble(
+                PREAMBLE,
+                self.system_prompt.as_deref(),
+                self.context.as_deref(),
+            ),
             &issue,
             self.tools.clone(),
             self.sink.clone(),

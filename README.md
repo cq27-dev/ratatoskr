@@ -135,6 +135,16 @@ Rulesets apply to `scout`, `analyst`, `bookkeeper`, and `redteam` — the nodes 
 TypeScript is transpiled and evaluated in-process; the types are for editor ergonomics and are
 stripped at load.
 
+### Agent plugins
+
+`.ratatoskr/plugins/` (and any path in `[plugins] paths`) holds plugins in the format coding CLIs
+already use — a `.claude-plugin/plugin.json` manifest and an optional `hooks/hooks.json`. A
+plugin's `SessionStart` hook runs once per run and its output is prefixed to each node's preamble,
+so a node can open with the repository's shape instead of discovering it one tool call at a time.
+
+Nothing a plugin does can fail a run: one that is missing, malformed, slow, or broken is logged and
+skipped, and the node simply gets less context.
+
 ### Scripted orchestration
 
 `.ratatoskr/workflow.ts` replaces the built-in run flow outright when present, letting a repo
