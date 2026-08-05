@@ -4,3 +4,5 @@
 !/.ratatoskr/rules/
 ratatoskr.toml
 .env
+# Agent-local settings; the shared skills/rules under .claude/ and .agents/ ARE tracked.
+.claude/settings.local.json
