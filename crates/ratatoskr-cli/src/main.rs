@@ -407,6 +407,14 @@ fn print_run_summary(run_id: &str, outcome: &ratatoskr_nodes::RunOutcome) {
         rt.failing_tests.len(),
         rt.passing_tests.len()
     );
+    for c in &rt.classifications {
+        let reason = if c.reason.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", c.reason)
+        };
+        println!("  [{}] {}{}", c.category, c.test, reason);
+    }
 
     let im = &outcome.implementer;
     println!(

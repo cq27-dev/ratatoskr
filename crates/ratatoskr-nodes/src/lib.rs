@@ -240,7 +240,7 @@ pub async fn run_full(
     let plan = run_plan(client, config, store, run_id, issue).await?;
     let mut state = plan.state.clone();
 
-    let result = fork_and_converge(config, store, run_id, issue, &plan).await;
+    let result = fork_and_converge(client, config, store, run_id, issue, &plan).await;
 
     let status = match &result {
         Ok((_, _, _, status, _)) => *status,
@@ -365,6 +365,7 @@ pub async fn run_bookkeeper(
 /// The fork + converge half. Returns the terminal status; leaves the worktree in place on a
 /// terminal outcome and removes it on a hard error.
 async fn fork_and_converge(
+    client: &RagRatClient,
     config: &RatatoskrConfig,
     store: &Store,
     run_id: &str,
@@ -388,6 +389,15 @@ async fn fork_and_converge(
         repo_path: repo_path.clone(),
         sandbox: config.sandbox.clone(),
         name: format!("ratatoskr-redteam-{short}"),
+        // Opt-in: classify baseline failures only when a [models.redteam] route is configured.
+        classifier: config
+            .models
+            .get("redteam")
+            .map(|route| redteam::RedTeamClassifier {
+                route: route.clone(),
+                tools: filter_tools(&client.tools(), redteam::CLASSIFIER_TOOLS),
+                sink: client.sink(),
+            }),
     };
     let implementer = ImplementerNode {
         repo_path: repo_path.clone(),

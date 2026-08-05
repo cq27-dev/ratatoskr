@@ -18,6 +18,8 @@ pub struct TestResults {
     pub failing: Vec<String>,
     pub passing: Vec<String>,
     pub exit_code: i32,
+    /// Combined stdout+stderr — context for the optional failure classifier.
+    pub raw_output: String,
 }
 
 /// Run `cfg.test_command` against `host_path` mounted into a sandbox named `name`.
@@ -48,6 +50,7 @@ pub async fn run_tests(
         failing,
         passing,
         exit_code: out.exit_code,
+        raw_output: format!("{}\n{}", out.stdout, out.stderr),
     })
 }
 

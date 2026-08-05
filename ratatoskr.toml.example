@@ -37,6 +37,13 @@ model = "claude-opus-4-8"
 provider = "moonshot"
 model = "kimi-k2.5"
 
+# Optional: with a [models.redteam] route set, red-team adds one LLM pass classifying each baseline
+# failure as flaky vs real (an additive field; the deterministic pass/fail is untouched). Omit to
+# skip classification entirely.
+# [models.redteam]
+# provider = "moonshot"
+# model = "kimi-k2.5"
+
 # Phase 3: the implementer drives a coding CLI via ACP in an isolated worktree.
 [implementer]
 cli = "claude"          # which coding CLI to drive (Claude Code via its ACP adapter)
