@@ -2,6 +2,7 @@
 //! The `run` / `status` commands belong to later phases and are deliberately absent —
 //! an empty stub command looks implemented when it isn't.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -83,6 +84,15 @@ enum Command {
         #[arg(long, default_value = "ratatoskr.toml")]
         config: PathBuf,
     },
+    /// Serve the observability dashboard's read-only API over the checkpoint store.
+    Serve {
+        /// Address to bind. Defaults to loopback — this reads a local store and has no auth.
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        addr: SocketAddr,
+        /// Path to the config file.
+        #[arg(long, default_value = "ratatoskr.toml")]
+        config: PathBuf,
+    },
     /// Reclaim ratatoskr's per-run worktrees and their `ratatoskr/*` branches.
     ///
     /// Without `--force` it only lists what would be removed. Removal is destructive: it discards
@@ -120,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
         }) => run_cmd(description, file, &config, json).await,
         Some(Command::Bookkeep { run_id, config }) => bookkeep(&run_id, &config).await,
         Some(Command::Status { run_id, config }) => status(&run_id, &config).await,
+        Some(Command::Serve { addr, config }) => serve(addr, &config).await,
         Some(Command::Clean { force }) => clean(force).await,
         None => {
             Cli::command().print_help()?;
@@ -401,6 +412,13 @@ async fn status(run_id: &str, config_path: &Path) -> anyhow::Result<()> {
             Err(_) => println!("{}", c.output_json),
         }
     }
+    Ok(())
+}
+
+/// Serve the dashboard API over the configured store — pure read, no rag-rat or LLM.
+async fn serve(addr: SocketAddr, config_path: &Path) -> anyhow::Result<()> {
+    let config = load_config(config_path)?;
+    ratatoskr_serve::serve(&config.store.path, addr).await?;
     Ok(())
 }
 

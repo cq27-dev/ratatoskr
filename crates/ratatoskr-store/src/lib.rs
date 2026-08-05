@@ -30,6 +30,16 @@ pub struct Checkpoint {
     pub created_at: String,
 }
 
+/// A row of the `runs` table. `updated_at` moves only on a status transition — it is not a
+/// heartbeat, so it can't be used alone to tell a live run from one that died mid-flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Run {
+    pub run_id: String,
+    pub issue_id: Option<String>,
+    pub status: String,
+    pub updated_at: String,
+}
+
 /// A handle to the checkpoint database. Cheap to clone (shares the guarded connection).
 #[derive(Clone)]
 pub struct Store {
@@ -47,7 +57,10 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        // WAL so readers (`status`, `serve`) never block on the writer. `busy_timeout` covers the
+        // brief moments a WAL checkpoint does take the write lock — without it a concurrent reader
+        // gets a sporadic `SQLITE_BUSY` instead of waiting.
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")?;
         Self::from_connection(conn)
     }
 
@@ -79,10 +92,13 @@ impl Store {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().expect("store mutex poisoned");
             conn.execute(
+                // COALESCE, not assignment: status transitions pass `issue_id = None`, so a plain
+                // `issue_id = excluded.issue_id` would null out an issue set at submission on the
+                // very next status write. A later write can set it; none can erase it.
                 "INSERT INTO runs (run_id, issue_id, status, updated_at)
                  VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                  ON CONFLICT(run_id) DO UPDATE SET
-                     issue_id = excluded.issue_id,
+                     issue_id = COALESCE(excluded.issue_id, runs.issue_id),
                      status = excluded.status,
                      updated_at = excluded.updated_at",
                 params![run_id, issue_id, status],
@@ -94,18 +110,43 @@ impl Store {
 
     /// The current status string for a run, or `None` if there's no such run.
     pub async fn run_status(&self, run_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self.run(run_id).await?.map(|r| r.status))
+    }
+
+    /// One run row, or `None` if there's no such run. A run can have checkpoints but no row: the
+    /// scripted path writes its `issue` checkpoint before the row exists, and the schema's foreign
+    /// key is decorative (`PRAGMA foreign_keys` is never enabled). Callers must tolerate `None`
+    /// without concluding the run doesn't exist.
+    pub async fn run(&self, run_id: &str) -> Result<Option<Run>, StoreError> {
         let conn = Arc::clone(&self.conn);
         let run_id = run_id.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().expect("store mutex poisoned");
-            let status = conn
+            let run = conn
                 .query_row(
-                    "SELECT status FROM runs WHERE run_id = ?1",
+                    "SELECT run_id, issue_id, status, updated_at FROM runs WHERE run_id = ?1",
                     params![run_id],
-                    |row| row.get::<_, String>(0),
+                    row_to_run,
                 )
                 .optional()?;
-            Ok::<_, StoreError>(status)
+            Ok::<_, StoreError>(run)
+        })
+        .await?
+    }
+
+    /// Every run, most recently updated first — what the dashboard's run list reads.
+    pub async fn list_runs(&self) -> Result<Vec<Run>, StoreError> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT run_id, issue_id, status, updated_at FROM runs
+                 ORDER BY updated_at DESC, run_id DESC",
+            )?;
+            let rows = stmt
+                .query_map([], row_to_run)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, StoreError>(rows)
         })
         .await?
     }
@@ -161,6 +202,16 @@ impl Store {
     }
 }
 
+/// Shared row mapper for the `runs` columns, in the order both queries select them.
+fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
+    Ok(Run {
+        run_id: row.get(0)?,
+        issue_id: row.get(1)?,
+        status: row.get(2)?,
+        updated_at: row.get(3)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +240,40 @@ mod tests {
             store.run_status("run-1").await.unwrap().as_deref(),
             Some("running")
         );
+    }
+
+    #[tokio::test]
+    async fn a_status_write_does_not_erase_the_issue_id() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-1", Some("issue-42"), "running")
+            .await
+            .unwrap();
+
+        // Every status transition in the pipeline passes `issue_id = None`; it must not clobber.
+        store.upsert_run("run-1", None, "converged").await.unwrap();
+
+        let run = store.run("run-1").await.unwrap().unwrap();
+        assert_eq!(run.issue_id.as_deref(), Some("issue-42"));
+        assert_eq!(run.status, "converged");
+    }
+
+    #[tokio::test]
+    async fn list_runs_is_newest_first() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.list_runs().await.unwrap().is_empty());
+        assert!(store.run("nope").await.unwrap().is_none());
+
+        for id in ["a", "b", "c"] {
+            store.upsert_run(id, None, "running").await.unwrap();
+        }
+        // `updated_at` has millisecond resolution and these writes can share a millisecond, so
+        // assert on set membership plus the tiebreak, not on a specific interleaving.
+        let runs = store.list_runs().await.unwrap();
+        assert_eq!(runs.len(), 3);
+        let mut ids: Vec<_> = runs.iter().map(|r| r.run_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["a", "b", "c"]);
     }
 
     #[tokio::test]
