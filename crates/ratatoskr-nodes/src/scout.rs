@@ -33,6 +33,14 @@ pub struct RelatedItem {
     pub summary: String,
 }
 
+impl RelatedItem {
+    /// Whether this item carries any identity — the model sometimes pads `related_items` with empty
+    /// placeholders, which should be dropped before they reach the analyst or the CLI summary.
+    pub fn is_meaningful(&self) -> bool {
+        !(self.item_key.trim().is_empty() && self.title.trim().is_empty())
+    }
+}
+
 /// Scout's structured output.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ScoutOutput {
@@ -73,7 +81,11 @@ impl Node for ScoutNode {
         .await
         .map_err(|e| NodeError::Failed(format!("scout agent failed: {e}")))?;
 
-        parse_validated::<ScoutOutput>(&raw)
+        let mut out = parse_validated::<ScoutOutput>(&raw)?;
+        // Drop empty placeholder items so the checkpoint, the analyst's input, and the CLI summary
+        // stay clean.
+        out.related_items.retain(RelatedItem::is_meaningful);
+        Ok(out)
     }
 }
 
@@ -93,6 +105,27 @@ mod tests {
         let out = parse_validated::<ScoutOutput>(raw).unwrap();
         assert_eq!(out.related_items.len(), 1);
         assert_eq!(out.related_items[0].item_key, "42");
+    }
+
+    #[test]
+    fn empty_related_items_are_dropped() {
+        let item = |k: &str, t: &str| RelatedItem {
+            item_key: k.to_string(),
+            title: t.to_string(),
+            url: String::new(),
+            relation: String::new(),
+            summary: String::new(),
+        };
+        // Empty and whitespace-only placeholders are not meaningful; anything with a key or title is.
+        assert!(!item("", "").is_meaningful());
+        assert!(!item("  ", "\t").is_meaningful());
+        assert!(item("42", "").is_meaningful());
+        assert!(item("", "Fix the lock").is_meaningful());
+
+        let mut items = vec![item("", ""), item("42", "Fix"), item("  ", "")];
+        items.retain(RelatedItem::is_meaningful);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_key, "42");
     }
 
     #[test]
