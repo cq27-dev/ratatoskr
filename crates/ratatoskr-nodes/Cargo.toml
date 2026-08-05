@@ -9,6 +9,7 @@ rust-version.workspace = true
 ratatoskr-core.workspace = true
 ratatoskr-graph.workspace = true
 ratatoskr-agent.workspace = true
+ratatoskr-script.workspace = true
 ratatoskr-mcp.workspace = true
 ratatoskr-store.workspace = true
 ratatoskr-exec.workspace = true

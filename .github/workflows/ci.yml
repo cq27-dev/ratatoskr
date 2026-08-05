@@ -6,12 +6,21 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # swc_core + microsandbox + the crypto stack make debug artifacts huge; symbols aren't needed to
+  # run tests, and dropping them keeps target/ under the runner's disk (a full disk shows up as a
+  # linker SIGBUS or "No space left on device").
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # Reclaim ~25GB of preinstalled toolchains we don't use; the swc/microsandbox build tree is
+      # large enough that the default free space isn't enough.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
 
       # microsandbox pulls the `capng` crate, which links the system libcap-ng.
       - name: Install system libraries

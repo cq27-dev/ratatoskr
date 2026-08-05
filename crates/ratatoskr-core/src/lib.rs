@@ -4,10 +4,12 @@
 //! runtime dependency — if a type here ever needs `tokio`, it belongs in a different crate.
 
 pub mod config;
+pub mod policy;
 pub mod state;
 
 pub use config::{
     ConfigError, ImplementerConfig, ModelRoute, RagRatConfig, RatatoskrConfig, SandboxConfig,
     StoreConfig, WorktreeConfig,
 };
+pub use policy::{ToolDecision, ToolPolicy};
 pub use state::{RunState, RunStatus};

@@ -223,8 +223,10 @@ async fn plan(
         .await
         .context("connecting to rag-rat")?;
 
+    let engine = load_rules().await?;
     let run_id = uuid::Uuid::new_v4().to_string();
-    let result = ratatoskr_nodes::run_plan(&client, &config, &store, &run_id, &issue).await;
+    let result =
+        ratatoskr_nodes::run_plan(&client, &config, &store, &run_id, &issue, &engine).await;
 
     // Tear down rag-rat regardless of outcome.
     if let Err(e) = client.shutdown().await {
@@ -292,8 +294,10 @@ async fn run_cmd(
         .await
         .context("connecting to rag-rat")?;
 
+    let engine = load_rules().await?;
     let run_id = uuid::Uuid::new_v4().to_string();
-    let result = ratatoskr_nodes::run_full(&client, &config, &store, &run_id, &issue).await;
+    let result =
+        ratatoskr_nodes::run_full(&client, &config, &store, &run_id, &issue, &engine).await;
 
     if let Err(e) = client.shutdown().await {
         tracing::warn!("failed to shut down rag-rat cleanly: {e}");
@@ -317,7 +321,8 @@ async fn bookkeep(run_id: &str, config_path: &Path) -> anyhow::Result<()> {
         .await
         .context("connecting to rag-rat")?;
 
-    let result = ratatoskr_nodes::run_bookkeeper(&client, &config, &store, run_id).await;
+    let engine = load_rules().await?;
+    let result = ratatoskr_nodes::run_bookkeeper(&client, &config, &store, run_id, &engine).await;
 
     if let Err(e) = client.shutdown().await {
         tracing::warn!("failed to shut down rag-rat cleanly: {e}");
@@ -459,4 +464,25 @@ fn load_config(path: &Path) -> anyhow::Result<RatatoskrConfig> {
         .with_context(|| format!("reading config {}", path.display()))?;
     RatatoskrConfig::from_toml_str(&text)
         .with_context(|| format!("parsing config {}", path.display()))
+}
+
+/// The nodes a ruleset may govern — the LLM agents that go through `run_structured`. `memory` and
+/// `implementer` don't (no model/tool set to override), so targeting them is a config error.
+const RULESET_NODES: &[&str] = &["scout", "analyst", "bookkeeper", "redteam"];
+
+/// Load the `.ratatoskr/rules/*.ts` agent rulesets (empty engine if the dir is absent), rejecting
+/// any `defineAgent(name)` that isn't a governable node.
+async fn load_rules() -> anyhow::Result<std::sync::Arc<ratatoskr_script::ScriptEngine>> {
+    let engine = ratatoskr_script::ScriptEngine::load(Path::new(".ratatoskr/rules"))
+        .await
+        .context("loading .ratatoskr/rules")?;
+    for name in engine.declared_agents() {
+        if !RULESET_NODES.contains(&name) {
+            bail!(
+                "defineAgent(\"{name}\") targets an unknown node; rulesets apply to: {}",
+                RULESET_NODES.join(", ")
+            );
+        }
+    }
+    Ok(engine)
 }
