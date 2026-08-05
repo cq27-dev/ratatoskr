@@ -167,7 +167,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn composes_bindings_and_forks_concurrently() {
-        let dir = std::env::temp_dir().join("ratatoskr-workflow-test-ok");
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-workflow-test-ok-{}", std::process::id()));
         let rt = load(
             &dir,
             r#"
@@ -226,7 +227,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn host_error_propagates_as_script_error() {
-        let dir = std::env::temp_dir().join("ratatoskr-workflow-test-err");
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-workflow-test-err-{}",
+            std::process::id()
+        ));
         let rt = load(
             &dir,
             "async function run(input) { return await boom(input); }",

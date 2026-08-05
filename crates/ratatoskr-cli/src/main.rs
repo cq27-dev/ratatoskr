@@ -67,6 +67,10 @@ enum Command {
         /// Print the raw structured RunState as JSON instead of a formatted summary.
         #[arg(long)]
         json: bool,
+        /// Use this run id instead of generating one. Lets a caller that spawns this command
+        /// (the dashboard) record and follow the run without waiting for it to finish.
+        #[arg(long)]
+        run_id: Option<String>,
     },
     /// Replay the bookkeeper against a stored run's checkpoints — write memories, no re-run.
     Bookkeep {
@@ -84,14 +88,21 @@ enum Command {
         #[arg(long, default_value = "ratatoskr.toml")]
         config: PathBuf,
     },
-    /// Serve the observability dashboard's read-only API over the checkpoint store.
+    /// Serve the observability dashboard over the checkpoint store.
     Serve {
-        /// Address to bind. Defaults to loopback — this reads a local store and has no auth.
+        /// Address to bind. Defaults to loopback, and should stay there: the dashboard can
+        /// START RUNS, and there is no auth — anyone who can reach this port can drive a coding
+        /// CLI against the repo and spend API credits.
         #[arg(long, default_value = "127.0.0.1:7878")]
         addr: SocketAddr,
         /// Path to the config file.
         #[arg(long, default_value = "ratatoskr.toml")]
         config: PathBuf,
+        /// How many dashboard-started runs may be in flight at once. The default is 1 because
+        /// red-team characterises the baseline against the main checkout, so concurrent runs
+        /// contend on one build directory and serialise there regardless.
+        #[arg(long, default_value_t = 1)]
+        max_runs: usize,
     },
     /// Reclaim ratatoskr's per-run worktrees and their `ratatoskr/*` branches.
     ///
@@ -127,10 +138,15 @@ async fn main() -> anyhow::Result<()> {
             file,
             config,
             json,
-        }) => run_cmd(description, file, &config, json).await,
+            run_id,
+        }) => run_cmd(description, file, &config, json, run_id).await,
         Some(Command::Bookkeep { run_id, config }) => bookkeep(&run_id, &config).await,
         Some(Command::Status { run_id, config }) => status(&run_id, &config).await,
-        Some(Command::Serve { addr, config }) => serve(addr, &config).await,
+        Some(Command::Serve {
+            addr,
+            config,
+            max_runs,
+        }) => serve(addr, &config, max_runs).await,
         Some(Command::Clean { force }) => clean(force).await,
         None => {
             Cli::command().print_help()?;
@@ -313,6 +329,7 @@ async fn run_cmd(
     file: Option<PathBuf>,
     config_path: &Path,
     json: bool,
+    run_id: Option<String>,
 ) -> anyhow::Result<()> {
     let issue = read_issue(description, file)?;
 
@@ -324,7 +341,15 @@ async fn run_cmd(
         .context("connecting to rag-rat")?;
 
     let engine = load_rules().await?;
-    let run_id = uuid::Uuid::new_v4().to_string();
+    let run_id = match run_id {
+        // Reusing an id would interleave this run's checkpoints with the existing run's, since
+        // the run row is an upsert and checkpoints are an unconstrained append.
+        Some(id) if store.run_status(&id).await?.is_some() => {
+            bail!("run {id} already exists; omit --run-id to start a new run")
+        }
+        Some(id) => id,
+        None => uuid::Uuid::new_v4().to_string(),
+    };
     let result =
         ratatoskr_nodes::run_full(&client, &config, &store, &run_id, &issue, &engine).await;
 
@@ -415,10 +440,19 @@ async fn status(run_id: &str, config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Serve the dashboard API over the configured store — pure read, no rag-rat or LLM.
-async fn serve(addr: SocketAddr, config_path: &Path) -> anyhow::Result<()> {
+/// Serve the dashboard over the configured store. Reads the store directly; runs started from
+/// the dashboard are spawned as child processes, so this one never writes to it.
+async fn serve(addr: SocketAddr, config_path: &Path, max_runs: usize) -> anyhow::Result<()> {
     let config = load_config(config_path)?;
-    ratatoskr_serve::serve(&config.store.path, addr).await?;
+    let project = std::env::current_dir().context("resolving the project directory")?;
+    ratatoskr_serve::serve(ratatoskr_serve::ServeOptions {
+        store_path: &config.store.path,
+        addr,
+        project: &project,
+        config_path,
+        max_runs,
+    })
+    .await?;
     Ok(())
 }
 
