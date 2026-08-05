@@ -285,7 +285,7 @@ fn print_summary(run_id: &str, outcome: &PlanOutcome) {
 
     println!("\nRISKS ({}):", a.risks.len());
     for r in &a.risks {
-        println!("  • [{}] {}", r.severity, r.description);
+        println!("  • {r}");
     }
 
     println!("\nREQUIREMENTS ({}):", a.requirements.len());
