@@ -217,7 +217,7 @@ async fn scout_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, St
         // Node-to-node clarification is built-in-flow only for now; the scripted path opts out.
         clarifier: None,
         system_prompt: cfg.system_prompt,
-        context: ctx.plugin_context.0.clone(),
+        context: ctx.plugin_context.for_node("scout"),
     };
     let out = node
         .run(issue, &RunState::new(&ctx.run_id, None))
@@ -265,7 +265,7 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
         policy: cfg.policy,
         max_turns: cfg.max_turns,
         system_prompt: cfg.system_prompt,
-        context: ctx.plugin_context.0.clone(),
+        context: ctx.plugin_context.for_node("analyst"),
     };
     let out = node
         .run(input, &RunState::new(&ctx.run_id, None))
@@ -296,7 +296,7 @@ fn build_red_team(ctx: &WorkflowContext) -> Result<RedTeamNode, PlanError> {
                 max_turns: cfg.max_turns,
                 clarifier: None,
                 system_prompt: cfg.system_prompt,
-                context: ctx.plugin_context.0.clone(),
+                context: ctx.plugin_context.for_node("redteam"),
             })
         }
         false => None,
@@ -647,7 +647,7 @@ async fn bookkeep_scripted(
         max_turns: cfg.max_turns,
         clarifier: None,
         system_prompt: cfg.system_prompt,
-        context: ctx.plugin_context.0.clone(),
+        context: ctx.plugin_context.for_node("bookkeeper"),
     };
     let out = node
         .run(input)

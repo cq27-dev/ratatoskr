@@ -142,8 +142,31 @@ already use — a `.claude-plugin/plugin.json` manifest and an optional `hooks/h
 plugin's `SessionStart` hook runs once per run and its output is prefixed to each node's preamble,
 so a node can open with the repository's shape instead of discovering it one tool call at a time.
 
-Nothing a plugin does can fail a run: one that is missing, malformed, slow, or broken is logged and
-skipped, and the node simply gets less context.
+Nothing a plugin *does* can fail a run: one that is missing, malformed, slow, or broken is logged
+and skipped, and the node simply gets less context. Naming a plugin that isn't installed is
+different — that is a typo, and it fails the run rather than silently binding less than you asked
+for.
+
+Installing a plugin is enough to use it: with no declaration anywhere, every discovered plugin
+applies to every node. Rulesets *narrow* that, in the same place they govern a node's model and
+tools:
+
+```ts
+// .ratatoskr/rules/_defaults.ts — every node inherits this
+defineDefaults({ plugins: ["rag-rat"] });
+
+// .ratatoskr/rules/analyst.ts — adjust what this one inherits
+defineAgent("analyst", { plugins: { add: ["impact-lens"], remove: ["noisy"] } });
+
+// or start from nothing, said out loud
+defineAgent("scout", { plugins: { inherit: false, add: ["scout-only"] } });
+
+// or name the set exactly
+defineAgent("bookkeeper", { plugins: ["rag-rat"] });
+```
+
+Hooks still run once per run whichever way you bind them — each node composes its context from the
+plugins it holds, so per-node binding costs nothing extra.
 
 ### Scripted orchestration
 

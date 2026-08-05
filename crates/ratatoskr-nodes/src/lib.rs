@@ -85,7 +85,8 @@ pub async fn run_plan(
     // A `.ratatoskr/workflow.ts` overrides the built-in scout → memory → analyst sequencing.
     if let Some(runtime) = load_workflow().await? {
         let plugin_context =
-            PluginContext::resolve(config, &std::env::current_dir().unwrap_or_default()).await;
+            PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
+                .await?;
         let ctx = workflow::WorkflowContext::new(
             client,
             config,
@@ -100,7 +101,8 @@ pub async fn run_plan(
 
     // Once per run: `SessionStart` describes the repository, not the node.
     let context =
-        PluginContext::resolve(config, &std::env::current_dir().unwrap_or_default()).await;
+        PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
+            .await?;
     plan_half(client, config, store, run_id, issue, engine, &context).await
 }
 
@@ -193,7 +195,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         max_turns: scout_cfg.max_turns,
         clarifier: Some(clarifier.as_dyn()),
         system_prompt: scout_cfg.system_prompt,
-        context: context.0.clone(),
+        context: context.for_node("scout"),
     };
     let scout_out = scout
         .run(issue.to_string(), &state)
@@ -236,7 +238,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         policy: analyst_cfg.policy,
         max_turns: analyst_cfg.max_turns,
         system_prompt: analyst_cfg.system_prompt,
-        context: context.0.clone(),
+        context: context.for_node("analyst"),
     };
     let analyst_out = analyst
         .run(
@@ -326,35 +328,73 @@ struct Run<'a> {
     context: &'a PluginContext,
 }
 
-/// What plugins contributed for this run, prefixed to every node's preamble.
+/// What each plugin contributed for this run.
 ///
-/// Resolved once because `SessionStart` describes the repository, not the node. Once plugins are
-/// bound per node this becomes per node too.
+/// Hooks run once per run — `SessionStart` describes the repository, not the node — and each node
+/// then composes its own context from the plugins its ruleset binds. Per-node binding therefore
+/// costs nothing extra in hook executions.
 #[derive(Clone, Default)]
-pub struct PluginContext(pub Option<String>);
+pub struct PluginContext {
+    contexts: std::collections::BTreeMap<String, String>,
+    /// Every plugin found, which is what a node inherits when no ruleset narrows it.
+    discovered: Vec<String>,
+    engine: Option<Arc<ScriptEngine>>,
+}
 
 impl PluginContext {
-    /// Run every discovered plugin's `SessionStart` hook. Never fails: a plugin that is missing,
-    /// broken, or slow simply contributes nothing.
-    pub async fn resolve(config: &RatatoskrConfig, cwd: &std::path::Path) -> Self {
+    /// Discover plugins, run their `SessionStart` hooks, and check that every plugin a ruleset
+    /// names actually exists.
+    ///
+    /// A plugin that is missing, broken, or slow contributes nothing and is logged. A ruleset that
+    /// *names* a plugin nobody installed is a different thing — a typo in configuration — and
+    /// fails the run rather than silently binding less than its author asked for.
+    pub async fn resolve(
+        config: &RatatoskrConfig,
+        engine: &Arc<ScriptEngine>,
+        cwd: &std::path::Path,
+    ) -> Result<Self, PlanError> {
         let plugins = ratatoskr_plugin::discover(&config.plugins.search_paths(cwd));
-        if plugins.is_empty() {
-            return PluginContext(None);
-        }
         for plugin in &plugins {
             tracing::info!(plugin = plugin.name, "loaded plugin");
         }
-        let context = ratatoskr_plugin::session_start_context(&plugins, cwd).await;
-        match &context {
-            // Worth a line: this text is prefixed to every prompt these nodes make.
-            Some(text) => tracing::info!(chars = text.len(), "plugin session context"),
-            None => tracing::debug!("plugins contributed no session context"),
+
+        let missing: Vec<String> = engine
+            .declared_plugins()
+            .into_iter()
+            .filter(|name| !plugins.iter().any(|p| &p.name == name))
+            .collect();
+        if !missing.is_empty() {
+            let known: Vec<&str> = plugins.iter().map(|p| p.name.as_str()).collect();
+            return Err(PlanError::node(
+                "plugins",
+                NodeError::Failed(format!(
+                    "ruleset names plugin(s) that were not found: {}; discovered: {}",
+                    missing.join(", "),
+                    if known.is_empty() {
+                        "none".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                )),
+            ));
         }
-        PluginContext(context)
+
+        let discovered: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
+        let contexts = ratatoskr_plugin::session_start(&plugins, cwd).await;
+        for (name, text) in &contexts {
+            tracing::info!(plugin = name, chars = text.len(), "plugin session context");
+        }
+        Ok(PluginContext {
+            contexts,
+            discovered,
+            engine: Some(Arc::clone(engine)),
+        })
     }
 
-    pub fn as_deref(&self) -> Option<&str> {
-        self.0.as_deref()
+    /// The context `node` carries, composed from the plugins its ruleset binds.
+    pub fn for_node(&self, node: &str) -> Option<String> {
+        let engine = self.engine.as_ref()?;
+        ratatoskr_plugin::compose(&self.contexts, &engine.plugins_for(node, &self.discovered))
     }
 }
 
@@ -475,7 +515,8 @@ pub async fn run_full(
     // A `.ratatoskr/workflow.ts` overrides the whole run flow (plan + fork + converge).
     if let Some(runtime) = load_workflow().await? {
         let plugin_context =
-            PluginContext::resolve(config, &std::env::current_dir().unwrap_or_default()).await;
+            PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
+                .await?;
         let ctx = workflow::WorkflowContext::new(
             client,
             config,
@@ -490,7 +531,8 @@ pub async fn run_full(
 
     // Resolved here and shared with both halves.
     let plan_context =
-        PluginContext::resolve(config, &std::env::current_dir().unwrap_or_default()).await;
+        PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
+            .await?;
     let plan = plan_half(client, config, store, run_id, issue, engine, &plan_context).await?;
     // `plan.state.clarifications` already holds the plan-half asks; the fork/bookkeep half gets its
     // own clarifier, drained and appended at the end.
@@ -615,7 +657,7 @@ async fn bookkeep_and_checkpoint(
         max_turns: cfg.max_turns,
         clarifier: Some(clarifier.as_dyn()),
         system_prompt: cfg.system_prompt,
-        context: context.0.clone(),
+        context: context.for_node("bookkeeper"),
     };
     let out = node
         .run(input)
@@ -671,7 +713,8 @@ pub async fn run_bookkeeper(
         converged,
     };
     let context =
-        PluginContext::resolve(config, &std::env::current_dir().unwrap_or_default()).await;
+        PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
+            .await?;
     let run = Run {
         client,
         config,
@@ -739,7 +782,7 @@ async fn fork_and_converge(
                     max_turns: cfg.max_turns,
                     clarifier: Some(clarifier.as_dyn()),
                     system_prompt: cfg.system_prompt,
-                    context: context.0.clone(),
+                    context: context.for_node("redteam"),
                 })
             }
             false => None,
@@ -862,6 +905,59 @@ mod agent_config_tests {
         )
         .unwrap();
         ScriptEngine::load(&dir).await.unwrap()
+    }
+
+    /// A ruleset directory built for one test.
+    async fn binding_engine(case: &str, source: &str) -> Arc<ScriptEngine> {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-nodes-binding-{}-{case}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agents.ts"), source).unwrap();
+        ScriptEngine::load(&dir).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_node_only_carries_the_context_of_the_plugins_it_binds() {
+        // The hooks run once per run; what differs per node is which of their outputs it carries.
+        let engine = binding_engine(
+            "per-node",
+            r#"
+            defineDefaults({ plugins: ["everywhere"] });
+            defineAgent("analyst", { plugins: { add: ["analyst-only"] } });
+            defineAgent("scout", { plugins: { inherit: false } });
+            "#,
+        )
+        .await;
+
+        let context = PluginContext {
+            contexts: [
+                ("everywhere".to_string(), "SHARED".to_string()),
+                ("analyst-only".to_string(), "DEEP".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            discovered: vec!["everywhere".to_string(), "analyst-only".to_string()],
+            engine: Some(engine),
+        };
+
+        // Defaults first, then what the node added.
+        assert_eq!(
+            context.for_node("analyst").as_deref(),
+            Some("SHARED\n\nDEEP")
+        );
+        // A node that inherits nothing and adds nothing carries nothing.
+        assert_eq!(context.for_node("scout"), None);
+        // A node with no ruleset still gets the defaults.
+        assert_eq!(context.for_node("bookkeeper").as_deref(), Some("SHARED"));
+    }
+
+    #[tokio::test]
+    async fn a_context_with_no_engine_composes_nothing() {
+        // The default value is what a run gets before plugins are resolved; it must not panic.
+        assert_eq!(PluginContext::default().for_node("scout"), None);
     }
 
     #[test]
