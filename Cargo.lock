@@ -5295,6 +5295,7 @@ dependencies = [
  "gix",
  "ratatoskr-agent",
  "ratatoskr-core",
+ "ratatoskr-exec",
  "ratatoskr-mcp",
  "ratatoskr-nodes",
  "ratatoskr-script",

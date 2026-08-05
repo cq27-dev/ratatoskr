@@ -83,6 +83,15 @@ enum Command {
         #[arg(long, default_value = "ratatoskr.toml")]
         config: PathBuf,
     },
+    /// Reclaim ratatoskr's per-run worktrees and their `ratatoskr/*` branches.
+    ///
+    /// Without `--force` it only lists what would be removed. Removal is destructive: it discards
+    /// each worktree's uncommitted changes and force-deletes its branch.
+    Clean {
+        /// Actually remove the worktrees and branches (default is a listing only).
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -111,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
         }) => run_cmd(description, file, &config, json).await,
         Some(Command::Bookkeep { run_id, config }) => bookkeep(&run_id, &config).await,
         Some(Command::Status { run_id, config }) => status(&run_id, &config).await,
+        Some(Command::Clean { force }) => clean(force).await,
         None => {
             Cli::command().print_help()?;
             println!();
@@ -451,6 +461,77 @@ fn print_run_summary(run_id: &str, outcome: &ratatoskr_nodes::RunOutcome) {
         println!("\nBOOKKEEPER:");
         print_bookkeeper(bk);
     }
+}
+
+/// Reclaim ratatoskr's per-run worktrees and their `ratatoskr/*` branches. Only worktrees on a
+/// `ratatoskr/*` branch are touched — never the user's own or a foreign worktree. Needs no config;
+/// it works off the current repo's git worktree registry.
+async fn clean(force: bool) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir().context("resolving the current directory")?;
+    // `main_root` is the stable anchor for every git call: it's never a removal target, so cleanup
+    // still works when invoked from inside a worktree it's about to delete.
+    let survey = ratatoskr_exec::survey_worktrees(&cwd)
+        .await
+        .context("listing ratatoskr worktrees")?;
+    let main_root = &survey.main_root;
+    let branches = ratatoskr_exec::managed_worktree_branches(main_root)
+        .await
+        .context("listing ratatoskr branches")?;
+
+    if survey.managed.is_empty() && branches.is_empty() {
+        println!("No ratatoskr worktrees or branches to clean.");
+        return Ok(());
+    }
+
+    if !force {
+        println!(
+            "Would remove {} worktree(s) and {} branch(es):",
+            survey.managed.len(),
+            branches.len()
+        );
+        let attached: std::collections::HashSet<&str> =
+            survey.managed.iter().map(|w| w.branch.as_str()).collect();
+        for w in &survey.managed {
+            println!(
+                "  worktree {} (branch {})",
+                w.path.as_path().display(),
+                w.branch
+            );
+        }
+        for b in &branches {
+            if !attached.contains(b.as_str()) {
+                println!("  branch {b} (orphaned — no worktree)");
+            }
+        }
+        println!(
+            "\nRemoval discards each worktree's uncommitted changes. \
+             Re-run `ratatoskr clean --force` to proceed."
+        );
+        return Ok(());
+    }
+
+    for w in &survey.managed {
+        match ratatoskr_exec::remove_worktree(main_root, &w.path).await {
+            Ok(()) => println!("removed worktree {}", w.path.as_path().display()),
+            Err(e) => eprintln!(
+                "warning: could not remove worktree {}: {e}",
+                w.path.as_path().display()
+            ),
+        }
+    }
+    // Clear registrations left by dirs removed above (or deleted out-of-band).
+    if let Err(e) = ratatoskr_exec::prune_worktrees(main_root).await {
+        eprintln!("warning: `git worktree prune` failed: {e}");
+    }
+    // Sweep branches independently — catches orphans whose worktree was already gone.
+    for b in &branches {
+        match ratatoskr_exec::delete_worktree_branch(main_root, b).await {
+            Ok(()) => println!("deleted branch {b}"),
+            Err(e) => eprintln!("warning: could not delete branch {b}: {e}"),
+        }
+    }
+    println!("Done.");
+    Ok(())
 }
 
 fn load_config(path: &Path) -> anyhow::Result<RatatoskrConfig> {
