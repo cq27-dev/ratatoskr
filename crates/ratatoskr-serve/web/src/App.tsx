@@ -4,6 +4,7 @@ import {
   LIVE,
   getNodeCheckpoints,
   getRun,
+  answerQuestion,
   followRun,
   listRuns,
   startRun,
@@ -162,6 +163,70 @@ function RunMeta({ detail }: { detail: RunDetail }) {
 }
 
 /**
+ * A run is blocked waiting for an answer. This has to be unmissable: until it is answered or
+ * times out, a node is doing nothing, and the only thing that unblocks it is a person reading it.
+ */
+function Question({
+  question,
+  onAnswered,
+}: {
+  question: LiveEvent;
+  onAnswered: (questionId: string) => void;
+}) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const box = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    box.current?.focus();
+  }, [question.question_id]);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!text.trim() || busy || !question.question_id) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await answerQuestion(question.question_id, text);
+      setText("");
+      onAnswered(question.question_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form className="ask" onSubmit={(e) => void submit(e)}>
+      <div className="sec ask-head">
+        <span>
+          /// {question.node ?? "a node"} is waiting on you
+        </span>
+        <span>{clock(question.at)}</span>
+      </div>
+      <p className="ask-q">{question.detail}</p>
+      <textarea
+        ref={box}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="your answer…"
+        rows={2}
+        spellCheck={false}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey) void submit(e);
+        }}
+      />
+      <button type="submit" disabled={busy || !text.trim()}>
+        {busy ? "SENDING…" : ">>> ANSWER"}
+      </button>
+      {error && <p className="ask-error hazard">{error}</p>}
+    </form>
+  );
+}
+
+/**
  * What the run is doing right now. Scoped to the selected node when there is one, because during
  * the fork two nodes are genuinely concurrent and an interleaved feed is the hardest possible read.
  */
@@ -242,6 +307,7 @@ export default function App() {
   const [node, setNode] = useState<string | null>(null);
   const [checkpoints, setCheckpoints] = useState<CheckpointView[] | null>(null);
   const [events, setEvents] = useState<LiveEvent[]>([]);
+  const [answered, setAnswered] = useState<ReadonlySet<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -298,6 +364,7 @@ export default function App() {
   useEffect(() => {
     if (!runId) return;
     setEvents([]);
+    setAnswered(new Set());
     const stop = followRun(runId, {
       onReset: () => setEvents([]),
       onEvent: (event) => {
@@ -331,6 +398,24 @@ export default function App() {
       cancelled = true;
     };
   }, [runId, node]);
+
+  // Every question stands until its *own* resolution arrives — during the fork two nodes run
+  // concurrently and can both be waiting, and resolving one must not hide the other. A viewer who
+  // attaches mid-wait still sees them, because the stream replays history on connect.
+  const open = new Map<string, LiveEvent>();
+  for (const event of events) {
+    if (!event.question_id) {
+      // A run ending resolves anything still outstanding.
+      if (event.kind.startsWith("run_")) open.clear();
+      continue;
+    }
+    if (event.kind === "question") open.set(event.question_id, event);
+    if (event.kind === "question_answered") open.delete(event.question_id);
+  }
+  // Answered in this tab: clear immediately rather than waiting for the run's event to come back
+  // round through the log.
+  for (const id of answered) open.delete(id);
+  const pending = [...open.values()];
 
   return (
     <div className="shell">
@@ -366,7 +451,18 @@ export default function App() {
               />
             </div>
             <div className="lower">
-              <Feed events={events} node={node} />
+              <div className="activity">
+                {pending.map((question) => (
+                  <Question
+                    key={question.question_id}
+                    question={question}
+                    onAnswered={(id) =>
+                      setAnswered((prev) => new Set(prev).add(id))
+                    }
+                  />
+                ))}
+                <Feed events={events} node={node} />
+              </div>
               {node && (
                 <div className="detail">
                   <Detail runId={runId} node={node} checkpoints={checkpoints} />

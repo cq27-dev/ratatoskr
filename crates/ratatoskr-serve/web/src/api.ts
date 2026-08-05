@@ -105,10 +105,38 @@ export const getRun = (runId: string) =>
 /** One thing a run did, from `GET /api/runs/{id}/events`. Mirrors `events::LiveEvent`. */
 export interface LiveEvent {
   at: string;
-  /** `tool_call`, `model_text`, `checkpoint`, `run_started`, `run_finished`, `run_failed`, … */
+  /** `tool_call`, `model_text`, `checkpoint`, `question`, `question_answered`, `run_*`, … */
   kind: string;
   node: string | null;
   detail: string;
+  /** Present on a `question` event: what an answer is posted against. */
+  question_id?: string;
+}
+
+/**
+ * Answer a question a run is waiting on. Rejects if it is no longer pending — already answered,
+ * timed out, or replayed from history — which the caller should show rather than retry.
+ */
+export async function answerQuestion(
+  questionId: string,
+  answer: string,
+): Promise<void> {
+  const res = await fetch(
+    `/api/clarifications/${encodeURIComponent(questionId)}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ answer }),
+    },
+  );
+  if (!res.ok) {
+    const body: unknown = await res.json().catch(() => null);
+    throw new Error(
+      body && typeof body === "object" && "error" in body
+        ? String((body as { error: unknown }).error)
+        : `${res.status}`,
+    );
+  }
 }
 
 /**
