@@ -75,6 +75,14 @@ enum Command {
         #[arg(long, default_value = "ratatoskr.toml")]
         config: PathBuf,
     },
+    /// Show a run's status and its per-node checkpoints from the store (no rag-rat, no LLM).
+    Status {
+        /// The run id to inspect.
+        run_id: String,
+        /// Path to the config file.
+        #[arg(long, default_value = "ratatoskr.toml")]
+        config: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -102,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
             json,
         }) => run_cmd(description, file, &config, json).await,
         Some(Command::Bookkeep { run_id, config }) => bookkeep(&run_id, &config).await,
+        Some(Command::Status { run_id, config }) => status(&run_id, &config).await,
         None => {
             Cli::command().print_help()?;
             println!();
@@ -337,6 +346,39 @@ fn print_bookkeeper(out: &ratatoskr_nodes::BookkeeperOutput) {
             println!("    {s}");
         }
     }
+}
+
+/// Show a run's status and per-node checkpoints from the store — pure read, no rag-rat or LLM.
+async fn status(run_id: &str, config_path: &Path) -> anyhow::Result<()> {
+    let config = load_config(config_path)?;
+    let store = ratatoskr_store::Store::open(&config.store.path)
+        .with_context(|| format!("opening store at {}", config.store.path.display()))?;
+
+    let run_status = store.run_status(run_id).await?;
+    let checkpoints = store.checkpoints_for_run(run_id).await?;
+
+    match run_status {
+        Some(s) => println!("run {run_id}: {s}"),
+        None if checkpoints.is_empty() => bail!("no run {run_id} in the store"),
+        None => println!("run {run_id}: (no status row)"),
+    }
+
+    if checkpoints.is_empty() {
+        println!("(no checkpoints)");
+        return Ok(());
+    }
+    for c in &checkpoints {
+        println!("\n── {} @ {} ──", c.node_name, c.created_at);
+        // Pretty-print the stored JSON; fall back to the raw text if it doesn't parse.
+        match serde_json::from_str::<serde_json::Value>(&c.output_json) {
+            Ok(v) => println!(
+                "{}",
+                serde_json::to_string_pretty(&v).unwrap_or_else(|_| c.output_json.clone())
+            ),
+            Err(_) => println!("{}", c.output_json),
+        }
+    }
+    Ok(())
 }
 
 /// Read the issue text from a positional argument or `--file` (exactly one).

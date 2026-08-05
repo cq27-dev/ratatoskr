@@ -399,25 +399,58 @@ async fn fork_and_converge(
     checkpoint(store, run_id, "red_team", &red_team_out).await?;
     checkpoint(store, run_id, "implementer", &impl_out).await?;
 
+    // Hard guard: red-team must have actually characterized the baseline. If the test command
+    // produced no tests, converge would compare against empty data and falsely "converge".
+    if !converge::test_command_ran(
+        &red_team_out.failing_tests,
+        &red_team_out.passing_tests,
+        red_team_out.exit_code,
+    ) {
+        return Err(PlanError::node(
+            "red_team",
+            NodeError::Failed(format!(
+                "baseline test command produced no tests (exit {}); \
+                 check [sandbox] test_command and backend",
+                red_team_out.exit_code
+            )),
+        ));
+    }
+
     // Converge: iterate the implementer (not red-team — the baseline doesn't change) until it
     // introduces no new failures, or the budget runs out.
     let mut iterations = 1u32;
     let status = loop {
-        if converge::is_converged(&red_team_out.failing_tests, &impl_out.failing_tests) {
+        let post_ran = converge::test_command_ran(
+            &impl_out.failing_tests,
+            &impl_out.passing_tests,
+            impl_out.exit_code,
+        );
+        if post_ran && converge::is_converged(&red_team_out.failing_tests, &impl_out.failing_tests)
+        {
             break RunStatus::Converged;
         }
         if iterations >= config.implementer.max_iterations {
             break RunStatus::MaxIterationsReached;
         }
-        let new_failures = converge::newly_introduced_failures(
-            &red_team_out.failing_tests,
-            &impl_out.failing_tests,
-        );
-        let diagnostic = format!(
-            "Your change introduced NEW failing tests not present in the baseline: {}. \
-             Fix them without breaking other tests.",
-            new_failures.join(", ")
-        );
+        // A post-change run that didn't complete usually means the edit broke the build — say that
+        // specifically instead of reporting "no new failures".
+        let diagnostic = if !post_ran {
+            format!(
+                "The test command did not run to completion (exit {}) — your change likely does \
+                 not compile. Fix it so the tests run and pass.",
+                impl_out.exit_code
+            )
+        } else {
+            let new_failures = converge::newly_introduced_failures(
+                &red_team_out.failing_tests,
+                &impl_out.failing_tests,
+            );
+            format!(
+                "Your change introduced NEW failing tests not present in the baseline: {}. \
+                 Fix them without breaking other tests.",
+                new_failures.join(", ")
+            )
+        };
         impl_out = match implementer.iterate(&worktree, &diagnostic).await {
             Ok(out) => out,
             Err(e) => {

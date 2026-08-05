@@ -20,7 +20,7 @@ red-team, and implement against a repository, checkpointing state as it goes.
 | `ratatoskr-nodes` | scout/memory/analyst + red-team/implementer/bookkeeper nodes; `run_plan`/`run_full` executors. |
 | `ratatoskr-exec` | Worktrees (git), sandboxed execution (microsandbox / bwrap), and the ACP client. |
 | `ratatoskr-store` | SQLite checkpoint store (single-writer): runs + per-node checkpoints. |
-| `ratatoskr-cli` | The `ratatoskr` binary — `--version`, `init`, `ask`, `plan`, `run`, `bookkeep`. |
+| `ratatoskr-cli` | The `ratatoskr` binary — `--version`, `init`, `ask`, `plan`, `run`, `bookkeep`, `status`. |
 
 ## Build
 
