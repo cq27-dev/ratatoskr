@@ -80,6 +80,7 @@ impl Node for AnalystNode {
     ) -> Result<AnalystOutput, NodeError> {
         let prompt = render_prompt(&input);
         let raw = ratatoskr_agent::run_structured(
+            "analyst",
             &self.route,
             PREAMBLE,
             &prompt,

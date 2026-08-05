@@ -20,6 +20,7 @@ use rig_core::message::AssistantContent;
 use rig_core::providers::{anthropic, moonshot};
 use rmcp::model::Tool;
 use rmcp::service::ServerSink;
+use tracing::Instrument;
 
 /// How many tool-calling turns the agent may take before it must produce a final answer. A node
 /// that does real work (the analyst's impact analysis walks callers/callees/tests across the graph)
@@ -196,6 +197,7 @@ impl AgentHook for RulesetHook {
 
 #[allow(clippy::too_many_arguments)] // route + preamble + question + tools + sink + schema + policy + max_turns are all inherent
 pub async fn run_structured(
+    node: &str,
     route: &ModelRoute,
     preamble: &str,
     question: &str,
@@ -212,6 +214,7 @@ pub async fn run_structured(
                 source,
             })?;
             run_typed(
+                node,
                 client.completion_model(&route.model),
                 preamble,
                 question,
@@ -229,6 +232,7 @@ pub async fn run_structured(
                 source,
             })?;
             run_typed(
+                node,
                 client.completion_model(&route.model),
                 preamble,
                 question,
@@ -246,6 +250,7 @@ pub async fn run_structured(
 /// Structured variant of [`run`]: sets an output schema so the final answer is structured JSON.
 #[allow(clippy::too_many_arguments)] // mirrors run_structured's inherent parameter list
 async fn run_typed<M>(
+    node: &str,
     model: M,
     preamble: &str,
     question: &str,
@@ -275,8 +280,11 @@ where
     }
     let agent = builder.build();
 
-    agent
-        .prompt(question)
+    // Tag every log line for this run — the hook's tool-call/text lines and rig-agent's own turn
+    // logs — with the node name, so a run's agents are distinguishable in the logs. `prompt()` is
+    // IntoFuture (not Future), so instrument the awaiting block rather than the request.
+    async move { agent.prompt(question).await }
+        .instrument(tracing::info_span!("agent", node))
         .await
         .map_err(|e| AgentError::Prompt(e.to_string()))
 }

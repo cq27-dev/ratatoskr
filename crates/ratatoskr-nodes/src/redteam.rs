@@ -77,6 +77,7 @@ impl RedTeamClassifier {
             truncate(raw_output, 6000)
         );
         let raw = ratatoskr_agent::run_structured(
+            "redteam",
             &self.route,
             CLASSIFY_PREAMBLE,
             &prompt,
