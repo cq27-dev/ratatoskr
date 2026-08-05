@@ -224,6 +224,9 @@ async fn checkpoint<T: Serialize>(
 ) -> Result<(), PlanError> {
     let json = serde_json::to_string(output)?;
     store.insert_checkpoint(run_id, node, &json).await?;
+    // The third structured event: a node produced output. Tool calls and model text come from
+    // the agent's observability hook; this is what says a node actually finished.
+    tracing::info!(kind = "checkpoint", node, bytes = json.len(), "checkpoint");
     Ok(())
 }
 

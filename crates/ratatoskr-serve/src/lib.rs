@@ -294,7 +294,7 @@ async fn start_run(
     Json(body): Json<StartRun>,
 ) -> Result<(StatusCode, Json<StartedRun>), ApiError> {
     let run_id = state.launcher.spawn(&body.issue)?;
-    tracing::info!("started run {run_id} from the dashboard");
+    tracing::info!(kind = "run_started", run_id = %run_id, "started run from the dashboard");
     Ok((StatusCode::ACCEPTED, Json(StartedRun { run_id })))
 }
 
