@@ -4,62 +4,48 @@
 //! produce them don't exist yet, so each node crate will define its own `JsonSchema`-deriving
 //! struct and validate at the handoff boundary once it's actually built (Phase 2 onward).
 
-use std::str::FromStr;
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Lifecycle status of a run. Serializes as a lowercase string (e.g. `"awaiting_clarification"`),
-/// which is also the form persisted in the checkpoint store's `status` column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Lifecycle status of a run. Serializes (serde) and persists (strum, in the store's `status`
+/// column) as the same snake_case string — `strum::AsRefStr`/`EnumString` give the string ⇄ enum
+/// mapping, kept in one place with the variants.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    strum::IntoStaticStr,
+    strum::Display,
+    strum::EnumString,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum RunStatus {
     Pending,
     Running,
     AwaitingClarification,
     /// The linear scout → memory → analyst planning flow finished successfully (Phase 2).
-    /// Distinct from `Converged`, which is reserved for Phase 4's real done-criteria.
+    /// Distinct from `Converged`, which is reserved for real done-criteria.
     Planned,
+    /// The fork+converge loop reached real success: no newly-introduced test failures (Phase 3).
     Converged,
+    /// Converge ran out of its `max_iterations` budget with a legible residual failure set —
+    /// distinct from `Failed` (an error): the loop worked, it just didn't finish in budget.
+    MaxIterationsReached,
     Failed,
     Abandoned,
 }
 
 impl RunStatus {
-    /// The persisted string form. Kept in sync with the `#[serde(rename_all)]` above.
+    /// The persisted string form (delegates to `strum::IntoStaticStr`).
     pub fn as_str(&self) -> &'static str {
-        match self {
-            RunStatus::Pending => "pending",
-            RunStatus::Running => "running",
-            RunStatus::AwaitingClarification => "awaiting_clarification",
-            RunStatus::Planned => "planned",
-            RunStatus::Converged => "converged",
-            RunStatus::Failed => "failed",
-            RunStatus::Abandoned => "abandoned",
-        }
-    }
-}
-
-/// Error returned when a status string from the store (or config) doesn't name a known variant.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("unknown run status: {0:?}")]
-pub struct ParseRunStatusError(pub String);
-
-impl FromStr for RunStatus {
-    type Err = ParseRunStatusError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "pending" => RunStatus::Pending,
-            "running" => RunStatus::Running,
-            "awaiting_clarification" => RunStatus::AwaitingClarification,
-            "planned" => RunStatus::Planned,
-            "converged" => RunStatus::Converged,
-            "failed" => RunStatus::Failed,
-            "abandoned" => RunStatus::Abandoned,
-            other => return Err(ParseRunStatusError(other.to_string())),
-        })
+        (*self).into()
     }
 }
 
@@ -106,6 +92,8 @@ impl RunState {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
 
     #[test]
@@ -133,10 +121,11 @@ mod tests {
             RunStatus::AwaitingClarification,
             RunStatus::Planned,
             RunStatus::Converged,
+            RunStatus::MaxIterationsReached,
             RunStatus::Failed,
             RunStatus::Abandoned,
         ] {
-            assert_eq!(RunStatus::from_str(status.as_str()), Ok(status));
+            assert_eq!(RunStatus::from_str(status.as_str()).unwrap(), status);
         }
         assert!(RunStatus::from_str("nonsense").is_err());
     }

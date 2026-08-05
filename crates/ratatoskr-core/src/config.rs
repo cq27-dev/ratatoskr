@@ -19,6 +19,49 @@ pub struct RatatoskrConfig {
     /// Phase 2 wires nodes; present now so nodes route against an existing table.
     #[serde(default)]
     pub models: HashMap<String, ModelRoute>,
+    #[serde(default)]
+    pub implementer: ImplementerConfig,
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
+}
+
+/// Phase 3 implementer settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImplementerConfig {
+    /// Which coding CLI to drive via ACP (`"claude"`). One target per the Phase 3 non-goals.
+    pub cli: String,
+    /// How many times converge may re-run the implementer before giving up.
+    pub max_iterations: u32,
+}
+
+impl Default for ImplementerConfig {
+    fn default() -> Self {
+        ImplementerConfig {
+            cli: "claude".to_string(),
+            max_iterations: 3,
+        }
+    }
+}
+
+/// Phase 3 sandbox settings — where red-team and implementer run the repo's test command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    /// `"microsandbox"` (MicroVM, needs KVM) or `"landlock"` (bwrap+Landlock fallback).
+    pub backend: String,
+    /// OCI image the sandbox boots (microsandbox backend).
+    pub image: String,
+    /// The target repo's test command, run inside the sandbox to characterize pass/fail.
+    pub test_command: Vec<String>,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        SandboxConfig {
+            backend: "microsandbox".to_string(),
+            image: "docker.io/library/rust:1-slim".to_string(),
+            test_command: vec!["cargo".to_string(), "test".to_string()],
+        }
+    }
 }
 
 /// How to launch rag-rat's MCP server over stdio.
@@ -104,6 +147,8 @@ impl Default for RatatoskrConfig {
                     route("anthropic", "claude-opus-4-8"),
                 ),
             ]),
+            implementer: ImplementerConfig::default(),
+            sandbox: SandboxConfig::default(),
         }
     }
 }

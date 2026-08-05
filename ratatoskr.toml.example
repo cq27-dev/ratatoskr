@@ -32,3 +32,14 @@ model = "claude-sonnet-4-6"
 [models.implementer]
 provider = "anthropic"
 model = "claude-opus-4-8"
+
+# Phase 3: the implementer drives a coding CLI via ACP in an isolated worktree.
+[implementer]
+cli = "claude"          # which coding CLI to drive (Claude Code via its ACP adapter)
+max_iterations = 3      # converge re-runs the implementer at most this many times
+
+# Phase 3: red-team and implementer run the repo's tests in a sandbox.
+[sandbox]
+backend = "microsandbox"                    # "microsandbox" (MicroVM, needs KVM) or "landlock"
+image = "docker.io/library/rust:1-slim"     # OCI image the sandbox boots
+test_command = ["cargo", "test"]            # the target repo's test command

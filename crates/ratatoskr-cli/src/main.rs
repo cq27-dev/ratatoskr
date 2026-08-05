@@ -53,6 +53,20 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Full run: plan, then fork red-team ∥ implementer in a worktree, then converge.
+    Run {
+        /// The issue description (omit and use --file for long text).
+        description: Option<String>,
+        /// Read the issue description from a file instead of the argument.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Path to the config file.
+        #[arg(long, default_value = "ratatoskr.toml")]
+        config: PathBuf,
+        /// Print the raw structured RunState as JSON instead of a formatted summary.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -76,6 +90,12 @@ async fn main() -> anyhow::Result<()> {
             config,
             json,
         }) => plan(description, file, &config, json).await,
+        Some(Command::Run {
+            description,
+            file,
+            config,
+            json,
+        }) => run_cmd(description, file, &config, json).await,
         None => {
             Cli::command().print_help()?;
             println!();
@@ -138,14 +158,7 @@ async fn plan(
     config_path: &Path,
     json: bool,
 ) -> anyhow::Result<()> {
-    let issue = match (description, file) {
-        (Some(d), None) => d,
-        (None, Some(f)) => {
-            std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?
-        }
-        (Some(_), Some(_)) => bail!("pass either a description or --file, not both"),
-        (None, None) => bail!("provide an issue description or --file"),
-    };
+    let issue = read_issue(description, file)?;
 
     let config = load_config(config_path)?;
     let store = ratatoskr_store::Store::open(&config.store.path)
@@ -205,6 +218,92 @@ fn print_summary(run_id: &str, outcome: &PlanOutcome) {
     }
 
     println!("\nRESIDUAL RISK:\n  {}", a.residual_risk);
+}
+
+/// Full fork+converge run for an issue.
+async fn run_cmd(
+    description: Option<String>,
+    file: Option<PathBuf>,
+    config_path: &Path,
+    json: bool,
+) -> anyhow::Result<()> {
+    let issue = read_issue(description, file)?;
+
+    let config = load_config(config_path)?;
+    let store = ratatoskr_store::Store::open(&config.store.path)
+        .with_context(|| format!("opening store at {}", config.store.path.display()))?;
+    let client = ratatoskr_mcp::RagRatClient::connect(config.rag_rat.clone())
+        .await
+        .context("connecting to rag-rat")?;
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let result = ratatoskr_nodes::run_full(&client, &config, &store, &run_id, &issue).await;
+
+    if let Err(e) = client.shutdown().await {
+        tracing::warn!("failed to shut down rag-rat cleanly: {e}");
+    }
+
+    let outcome = result.context("run failed")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&outcome.state)?);
+    } else {
+        print_run_summary(&run_id, &outcome);
+    }
+    Ok(())
+}
+
+/// Read the issue text from a positional argument or `--file` (exactly one).
+fn read_issue(description: Option<String>, file: Option<PathBuf>) -> anyhow::Result<String> {
+    match (description, file) {
+        (Some(d), None) => Ok(d),
+        (None, Some(f)) => {
+            std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))
+        }
+        (Some(_), Some(_)) => bail!("pass either a description or --file, not both"),
+        (None, None) => bail!("provide an issue description or --file"),
+    }
+}
+
+/// Render a full-run outcome: the plan summary plus the fork+converge result.
+fn print_run_summary(run_id: &str, outcome: &ratatoskr_nodes::RunOutcome) {
+    println!("── run {run_id} ──\n");
+    println!(
+        "STATUS: {}  (implementer iterations: {})",
+        outcome.status, outcome.iterations
+    );
+
+    let rt = &outcome.red_team;
+    println!(
+        "\nBASELINE (red-team): {} failing, {} passing",
+        rt.failing_tests.len(),
+        rt.passing_tests.len()
+    );
+
+    let im = &outcome.implementer;
+    println!(
+        "AFTER CHANGE: {} failing, {} passing",
+        im.failing_tests.len(),
+        im.passing_tests.len()
+    );
+
+    let new_failures =
+        ratatoskr_nodes::converge::newly_introduced_failures(&rt.failing_tests, &im.failing_tests);
+    if new_failures.is_empty() {
+        println!("NEW FAILURES: none");
+    } else {
+        println!("NEW FAILURES ({}):", new_failures.len());
+        for f in &new_failures {
+            println!("  • {f}");
+        }
+    }
+
+    println!("\nWORKTREE: {}", im.worktree_path);
+    if !im.touched_files.is_empty() {
+        println!("TOUCHED: {}", im.touched_files.join(", "));
+    }
+    if !im.diff_summary.is_empty() {
+        println!("\nDIFF:\n{}", im.diff_summary);
+    }
 }
 
 fn load_config(path: &Path) -> anyhow::Result<RatatoskrConfig> {
