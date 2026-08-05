@@ -83,11 +83,8 @@ async fn main() -> anyhow::Result<()> {
     // the environment. Real env vars already set take precedence over the file.
     dotenvy::dotenv().ok();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // Keep the file-logger guard alive for the whole process, else buffered logs are dropped.
+    let _log_guard = init_logging();
 
     match Cli::parse().command {
         Some(Command::Init) => init(),
@@ -111,6 +108,47 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Set up logging: the console at `info` (or `RUST_LOG`), plus a verbose, daily-rotating file
+/// under `.ratatoskr/logs/` capturing everything at `debug` (or `RATATOSKR_LOG`) for later
+/// analysis. Returns the file-writer guard, which must be held for the process's lifetime.
+fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let console_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let console = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(console_filter);
+
+    // Best-effort file layer; if the log dir can't be created, fall back to console-only.
+    let (file_layer, guard) = match std::fs::create_dir_all(".ratatoskr/logs") {
+        Ok(()) => {
+            let file_filter = EnvFilter::new(
+                std::env::var("RATATOSKR_LOG").unwrap_or_else(|_| "debug".to_string()),
+            );
+            let appender = tracing_appender::rolling::daily(".ratatoskr/logs", "ratatoskr.log");
+            let (writer, guard) = tracing_appender::non_blocking(appender);
+            let layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(writer)
+                .with_filter(file_filter);
+            (Some(layer), Some(guard))
+        }
+        Err(e) => {
+            eprintln!("warning: could not create .ratatoskr/logs ({e}); logging to console only");
+            (None, None)
+        }
+    };
+
+    tracing_subscriber::registry()
+        .with(console)
+        .with(file_layer)
+        .init();
+    guard
 }
 
 /// Write a default config, leaving any existing `ratatoskr.toml` untouched.
