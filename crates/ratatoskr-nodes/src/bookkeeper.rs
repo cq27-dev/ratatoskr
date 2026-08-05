@@ -38,13 +38,14 @@ const VALID_KINDS: &[&str] = &[
     "Concept",
 ];
 
-const PREAMBLE: &str = "You are the bookkeeper. A coding run just finished successfully. Distill \
-    ONE durable, non-obvious learning a FUTURE run on a related change would want — an invariant, a \
-    decision + its rationale, a gotcha, a risk. Write it in the present tense: what is true now and \
-    how to apply it, NOT a changelog of what this run did. Be specific and grounded; a vague or \
-    obvious memory is worse than none. Choose a `kind` from rag-rat's taxonomy: Invariant, \
-    Decision, RejectedAlternative, Risk, BugPattern, TestExpectation, PerformanceNote, \
-    SecurityNote, FFIBoundary, PlatformQuirk, FollowUp, OpenQuestion, Concept.";
+const PREAMBLE: &str = "You are the bookkeeper. A coding run just finished (the prompt says whether \
+    it succeeded or hit a wall). Distill ONE durable, non-obvious learning a FUTURE run on a \
+    related change would want — an invariant, a decision + its rationale, a gotcha, a risk, or (if \
+    the run hit a wall) what that wall was and what to watch for. Write it in the present tense: \
+    what is true now and how to apply it, NOT a changelog of what this run did. Be specific and \
+    grounded; a vague or obvious memory is worse than none. Choose a `kind` from rag-rat's \
+    taxonomy: Invariant, Decision, RejectedAlternative, Risk, BugPattern, TestExpectation, \
+    PerformanceNote, SecurityNote, FFIBoundary, PlatformQuirk, FollowUp, OpenQuestion, Concept.";
 
 /// What the compose model produces.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -81,6 +82,9 @@ pub struct BookkeeperInput {
     pub analyst: AnalystOutput,
     pub implementer: ImplementerOutput,
     pub iterations: u32,
+    /// Whether the run converged. `false` means it exhausted its iteration budget with unresolved
+    /// failures — the memory is framed as a wall hit and tagged `unresolved`.
+    pub converged: bool,
 }
 
 /// The bookkeeper node. Holds a cheap model route, a small tool subset (for the compose agent), and
@@ -109,8 +113,15 @@ impl BookkeeperNode {
         let kind = normalize_kind(&draft.kind);
         let anchor = input.implementer.touched_files.first().cloned();
 
+        // Tag unresolved (max-iterations) runs so they're distinguishable from success write-backs.
+        let tags: &[&str] = if input.converged {
+            &["ratatoskr", "bookkeeper"]
+        } else {
+            &["ratatoskr", "bookkeeper", "unresolved"]
+        };
+
         let memory_id = self
-            .create_memory(&kind, &draft.title, &draft.body, anchor.as_deref())
+            .create_memory(&kind, &draft.title, &draft.body, anchor.as_deref(), tags)
             .await?;
 
         Ok(BookkeeperOutput {
@@ -132,6 +143,7 @@ impl BookkeeperNode {
         title: &str,
         body: &str,
         anchor: Option<&str>,
+        tags: &[&str],
     ) -> Result<String, NodeError> {
         let mut args = serde_json::json!({
             "kind": kind,
@@ -139,7 +151,7 @@ impl BookkeeperNode {
             "body": body,
             "confidence": "medium",
             "source": "agent",
-            "tags": ["ratatoskr", "bookkeeper"],
+            "tags": tags,
         });
         // Always anchor: rag-rat rejects an unanchored memory unless it's a Task/Concept. Use the
         // touched file if we have one, else bind to the repo root directory.
@@ -200,6 +212,18 @@ fn normalize_kind(kind: &str) -> String {
 
 fn render_prompt(input: &BookkeeperInput) -> String {
     let mut s = String::new();
+    if input.converged {
+        s.push_str("OUTCOME: the run CONVERGED — the change landed and the tests pass.\n\n");
+    } else {
+        let _ = write!(
+            s,
+            "OUTCOME: the run HIT A WALL — after {} implementer iterations it could not resolve \
+             these failing tests: {}. Record what a future run should know about this wall / this \
+             class of change.\n\n",
+            input.iterations,
+            input.implementer.failing_tests.join(", ")
+        );
+    }
     let _ = write!(s, "TASK:\n{}\n\n", input.issue);
     let a = &input.analyst;
     if !a.impact_summary.is_empty() {

@@ -223,7 +223,8 @@ pub struct RunOutcome {
     pub worktree: WorktreePath,
     pub iterations: u32,
     pub status: RunStatus,
-    /// Bookkeeper result — `Some` only on a converged run (bookkeeping is skipped otherwise).
+    /// Bookkeeper result — `Some` on a terminal fork outcome (converged, or max-iterations with an
+    /// `unresolved`-tagged memory); `None` otherwise.
     pub bookkeeper: Option<BookkeeperOutput>,
 }
 
@@ -254,14 +255,19 @@ pub async fn run_full(
     state.implementer = Some(serde_json::to_value(&implementer)?);
     state.status = status;
 
-    // Bookkeeping is mandatory on success and skipped otherwise. A bookkeeping failure is logged
-    // but doesn't discard the converged work.
-    let bookkeeper = if status == RunStatus::Converged {
+    // Bookkeeping fires on a terminal fork outcome: `Converged` (record the learning) or
+    // `MaxIterationsReached` (record the wall, tagged `unresolved`). A bookkeeping failure is
+    // logged but doesn't discard the run's work.
+    let bookkeeper = if matches!(
+        status,
+        RunStatus::Converged | RunStatus::MaxIterationsReached
+    ) {
         let input = BookkeeperInput {
             issue: issue.to_string(),
             analyst: plan.analyst.clone(),
             implementer: implementer.clone(),
             iterations,
+            converged: status == RunStatus::Converged,
         };
         match bookkeep_and_checkpoint(client, config, store, run_id, input).await {
             Ok(bk) => {
@@ -269,7 +275,7 @@ pub async fn run_full(
                 Some(bk)
             }
             Err(e) => {
-                tracing::warn!("bookkeeping failed on a converged run: {e}");
+                tracing::warn!("bookkeeping failed: {e}");
                 None
             }
         }
@@ -342,12 +348,16 @@ pub async fn run_bookkeeper(
         .iter()
         .filter(|c| c.node_name == "implementer")
         .count() as u32;
+    // A replay treats anything not recorded as `converged` as a wall hit.
+    let converged =
+        store.run_status(run_id).await?.as_deref() == Some(RunStatus::Converged.as_str());
 
     let input = BookkeeperInput {
         issue,
         analyst,
         implementer,
         iterations,
+        converged,
     };
     bookkeep_and_checkpoint(client, config, store, run_id, input).await
 }
