@@ -256,8 +256,15 @@ async fn plan(
 fn print_summary(run_id: &str, outcome: &PlanOutcome) {
     println!("── plan {run_id} ──\n");
 
-    println!("RELATED ITEMS ({}):", outcome.scout.related_items.len());
-    for item in &outcome.scout.related_items {
+    // Skip empty placeholder items (e.g. from an older checkpoint) so the count and lines are clean.
+    let items: Vec<_> = outcome
+        .scout
+        .related_items
+        .iter()
+        .filter(|i| i.is_meaningful())
+        .collect();
+    println!("RELATED ITEMS ({}):", items.len());
+    for item in items {
         println!("  • [{}] {} — {}", item.item_key, item.title, item.relation);
     }
     if !outcome.scout.papertrail_summary.is_empty() {
