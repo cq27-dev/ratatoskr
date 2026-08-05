@@ -80,6 +80,17 @@ It reads the same SQLite file a run writes to and never writes to it, so it is s
 against a live run. Runs started from the dashboard are spawned as child processes with an explicit
 working directory, and are capped at one at a time by default (`--max-runs`).
 
+A node that gets stuck can ask *you*: when you are watching a run, a question addressed to the user
+appears in the dashboard and your answer goes back as that tool's result. Nobody watching, or nobody
+answering in time, and the analyst answers instead — exactly as an unattended run behaves.
+
+One dashboard can watch several projects. Each keeps its own store, worktrees, and logs; nothing is
+merged, and a project switcher appears once there is more than one:
+
+```sh
+cargo run -p ratatoskr-cli -- serve --project ~/src/one --project ~/src/two
+```
+
 Bind it to loopback — the default — and keep it there. There is no auth, and it can start runs.
 
 The UI is a separate build artifact and is optional: without it you still get the JSON API

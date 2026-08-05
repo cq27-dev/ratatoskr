@@ -6,10 +6,12 @@ import {
   getRun,
   answerQuestion,
   followRun,
+  listProjects,
   listRuns,
   startRun,
   type CheckpointView,
   type LiveEvent,
+  type ProjectView,
   type RunDetail,
   type RunSummary,
 } from "./api";
@@ -22,7 +24,45 @@ const FEED_LIMIT = 250;
 const short = (id: string | null) => (id ? id.slice(0, 8) : "—");
 const clock = (ts: string | null) => (ts ? ts.slice(11, 19) : "—");
 
-function NewRun({ onStarted }: { onStarted: (runId: string) => void }) {
+function Projects({
+  projects,
+  selected,
+  onSelect,
+}: {
+  projects: ProjectView[];
+  selected: string | null;
+  onSelect: (slug: string) => void;
+}) {
+  // With one project there is nothing to choose, so the switcher stays out of the way.
+  if (projects.length < 2) return null;
+  return (
+    <div className="projects">
+      <div className="sec">
+        <span>[ PROJECTS ]</span>
+        <output>{projects.length}</output>
+      </div>
+      {projects.map((p) => (
+        <button
+          key={p.slug}
+          className="proj"
+          aria-current={p.slug === selected}
+          onClick={() => onSelect(p.slug)}
+          title={p.dir}
+        >
+          {p.slug}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function NewRun({
+  project,
+  onStarted,
+}: {
+  project: string;
+  onStarted: (runId: string) => void;
+}) {
   const [issue, setIssue] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -34,7 +74,7 @@ function NewRun({ onStarted }: { onStarted: (runId: string) => void }) {
     setBusy(true);
     setError(null);
     try {
-      const runId = await startRun(issue);
+      const runId = await startRun(project, issue);
       setIssue("");
       onStarted(runId);
     } catch (err) {
@@ -71,11 +111,17 @@ function NewRun({ onStarted }: { onStarted: (runId: string) => void }) {
 }
 
 function Rail({
+  projects,
+  project,
+  onProject,
   runs,
   selected,
   onSelect,
   onStarted,
 }: {
+  projects: ProjectView[];
+  project: string;
+  onProject: (slug: string) => void;
   runs: RunSummary[];
   selected: string | null;
   onSelect: (id: string) => void;
@@ -83,7 +129,8 @@ function Rail({
 }) {
   return (
     <nav className="rail">
-      <NewRun onStarted={onStarted} />
+      <Projects projects={projects} selected={project} onSelect={onProject} />
+      <NewRun project={project} onStarted={onStarted} />
       <div className="sec">
         <span>[ RUNS ]</span>
         <output>{runs.length}</output>
@@ -301,6 +348,8 @@ function Detail({
 }
 
 export default function App() {
+  const [projects, setProjects] = useState<ProjectView[]>([]);
+  const [project, setProject] = useState<string | null>(null);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [runId, setRunId] = useState<string | null>(null);
   const [detail, setDetail] = useState<RunDetail | null>(null);
@@ -310,20 +359,46 @@ export default function App() {
   const [answered, setAnswered] = useState<ReadonlySet<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
 
+  // Which projects this dashboard watches. Fixed at startup, so fetched once.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const found = await listProjects();
+        setProjects(found);
+        setProject((cur) => cur ?? found[0]?.slug ?? null);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    })();
+  }, []);
+
   const refresh = useCallback(async () => {
+    if (!project) return;
     try {
-      const list = await listRuns();
+      const list = await listRuns(project);
       setRuns(list);
       setError(null);
       setRunId((cur) => cur ?? list[0]?.run_id ?? null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, []);
+  }, [project]);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // Switching project means a different store entirely, so nothing selected carries over. This
+  // has to happen in the same update as the project change: as a reactive effect it would run
+  // *after* the fetch effects had already re-run, asking the new project for the old run's id.
+  const onProject = useCallback((slug: string) => {
+    setProject(slug);
+    setRunId(null);
+    setRuns([]);
+    setDetail(null);
+    setEvents([]);
+    setError(null);
+  }, []);
 
   // Follow a freshly started run immediately; its rows land in the store moments later.
   const onStarted = useCallback(
@@ -335,24 +410,26 @@ export default function App() {
     [refresh],
   );
 
-  // Which run the view is actually on, so a slow response for a run we've since left can be
-  // dropped instead of overwriting the current one.
+  // What the view is actually on, so a slow response for something we've since left can be
+  // dropped instead of overwriting the current one. Keyed by project as well as run: switching
+  // project can leave a request for the same-named run in flight.
   const shown = useRef<string | null>(null);
+  const showing = project && runId ? `${project}/${runId}` : null;
   useEffect(() => {
-    shown.current = runId;
-  }, [runId]);
+    shown.current = showing;
+  }, [showing]);
 
   const load = useCallback(async () => {
-    if (!runId) return;
+    if (!runId || !project) return;
     try {
-      const d = await getRun(runId);
-      if (shown.current === runId) setDetail(d);
+      const d = await getRun(project, runId);
+      if (shown.current === `${project}/${runId}`) setDetail(d);
     } catch (e) {
-      if (shown.current === runId) {
+      if (shown.current === `${project}/${runId}`) {
         setError(e instanceof Error ? e.message : String(e));
       }
     }
-  }, [runId]);
+  }, [runId, project]);
 
   useEffect(() => {
     void load();
@@ -362,10 +439,10 @@ export default function App() {
   // the stream is what shows a node working through a long turn. Node state still comes from the
   // store, so a checkpoint event is the cue to re-read it.
   useEffect(() => {
-    if (!runId) return;
+    if (!runId || !project) return;
     setEvents([]);
     setAnswered(new Set());
-    const stop = followRun(runId, {
+    const stop = followRun(project, runId, {
       onReset: () => setEvents([]),
       onEvent: (event) => {
         setEvents((prev) => [...prev.slice(-(FEED_LIMIT - 1)), event]);
@@ -376,7 +453,7 @@ export default function App() {
       },
     });
     return stop;
-  }, [runId, load, refresh]);
+  }, [runId, project, load, refresh]);
 
   useEffect(() => {
     setNode(null);
@@ -384,10 +461,10 @@ export default function App() {
   }, [runId]);
 
   useEffect(() => {
-    if (!runId || !node) return;
+    if (!runId || !node || !project) return;
     let cancelled = false;
     setCheckpoints(null);
-    getNodeCheckpoints(runId, node)
+    getNodeCheckpoints(project, runId, node)
       .then((cps) => {
         if (!cancelled) setCheckpoints(cps);
       })
@@ -397,7 +474,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [runId, node]);
+  }, [runId, node, project]);
 
   // Every question stands until its *own* resolution arrives — during the fork two nodes run
   // concurrently and can both be waiting, and resolving one must not hide the other. A viewer who
@@ -433,6 +510,9 @@ export default function App() {
       </div>
 
       <Rail
+        projects={projects}
+        project={project ?? ""}
+        onProject={onProject}
         runs={runs}
         selected={runId}
         onSelect={setRunId}

@@ -9,7 +9,9 @@ pub mod clarify;
 pub mod events;
 pub mod launch;
 pub mod pipeline;
+pub mod project;
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,23 +22,22 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use ratatoskr_store::{Checkpoint, Store};
+use ratatoskr_store::Checkpoint;
 use serde::Serialize;
 use tokio_stream::StreamExt as _;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::clarify::{AnswerError, AskReply, AskRequest, Desk};
-use crate::launch::{LaunchError, Launcher};
+use crate::launch::LaunchError;
 use crate::pipeline::{ISSUE_NODE, NodeView};
+pub use crate::project::ProjectSpec;
+use crate::project::{Project, ProjectError, ProjectView};
 
 /// Errors starting the server.
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
-    #[error(
-        "no checkpoint store at {0} — run `ratatoskr plan` or `ratatoskr run` first, or point \
-         --config at the right ratatoskr.toml"
-    )]
-    NoStore(PathBuf),
+    #[error(transparent)]
+    Project(#[from] ProjectError),
     #[error("store error: {0}")]
     Store(#[from] ratatoskr_store::StoreError),
     #[error("io error: {0}")]
@@ -45,61 +46,59 @@ pub enum ServeError {
 
 #[derive(Clone)]
 struct AppState {
-    store: Store,
-    launcher: Arc<Launcher>,
-    /// Where the structured log lives, for the live event stream.
-    log_dir: PathBuf,
-    /// Questions from runs waiting on a human, and who is watching.
+    projects: Arc<BTreeMap<String, Project>>,
+    /// Questions from runs waiting on a human, and who is watching. Shared across projects: run
+    /// ids are unique, so a question needs no further scoping.
     desk: Arc<Desk>,
 }
 
-/// What `serve` needs: where to read, where to listen, and what to launch runs against.
-pub struct ServeOptions<'a> {
-    pub store_path: &'a Path,
+impl AppState {
+    /// The project a request names, or a 404 that says which one was asked for.
+    fn project(&self, slug: &str) -> Result<&Project, ApiError> {
+        self.projects
+            .get(slug)
+            .ok_or_else(|| ApiError::NotFound(format!("no project `{slug}`")))
+    }
+}
+
+/// What `serve` needs: where to listen, and which projects to watch.
+pub struct ServeOptions {
     pub addr: SocketAddr,
-    /// Working directory for runs started from the dashboard — the project's repo root.
-    pub project: &'a Path,
-    /// Config path handed to those runs, so they resolve the same settings this server did.
-    pub config_path: &'a Path,
-    /// How many runs may be in flight at once.
+    /// One or more projects. Each keeps its own store, worktrees, and logs — nothing is merged.
+    pub projects: Vec<ProjectSpec>,
+    /// How many runs may be in flight at once, per project.
     pub max_runs: usize,
 }
 
-/// Serve the dashboard API on `addr`, reading the store at `store_path`.
-///
-/// Fails if the store file is absent rather than creating an empty one: `Store::open` would
-/// happily produce a fresh database, and a typo'd path would then show an empty dashboard that
-/// looks like "no runs yet" instead of a mistake.
-pub async fn serve(opts: ServeOptions<'_>) -> Result<(), ServeError> {
+/// Serve the dashboard for one or more projects.
+pub async fn serve(opts: ServeOptions) -> Result<(), ServeError> {
     let ServeOptions {
-        store_path,
         addr,
-        project,
-        config_path,
+        projects,
         max_runs,
     } = opts;
-    if !store_path.exists() {
-        return Err(ServeError::NoStore(store_path.to_path_buf()));
-    }
-    let store = Store::open(store_path)?;
-    let log_dir = project.join(".ratatoskr/logs");
-    let desk = Arc::new(Desk::default());
-    // Bind before building the launcher: a spawned run is told where to reach this server, and
-    // with port 0 the real port isn't known until the listener exists.
+    // Bind before opening the projects: a spawned run is told where to reach this server, and with
+    // port 0 the real port isn't known until the listener exists.
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
-    let launcher = Arc::new(Launcher::new(
-        project,
-        config_path,
+    let projects = Arc::new(project::open_all(
+        projects,
         max_runs,
         &dashboard_url(bound),
-    ));
+    )?);
+    let desk = Arc::new(Desk::default());
     let web = web_dir();
 
+    for slug in projects.keys() {
+        tracing::info!("watching project {slug}");
+    }
     match &web {
         Some(dir) => {
             tracing::info!("serving dashboard from {}", dir.display());
-            println!("dashboard on http://{bound}");
+            println!(
+                "dashboard on http://{bound} ({} project(s))",
+                projects.len()
+            );
         }
         None => {
             // The UI is a separate build artifact, so a Rust-only checkout still gets a working
@@ -108,7 +107,7 @@ pub async fn serve(opts: ServeOptions<'_>) -> Result<(), ServeError> {
         }
     }
 
-    axum::serve(listener, router(store, launcher, log_dir, desk, web)).await?;
+    axum::serve(listener, router(projects, desk, web)).await?;
     Ok(())
 }
 
@@ -139,17 +138,26 @@ fn web_dir() -> Option<PathBuf> {
 }
 
 fn router(
-    store: Store,
-    launcher: Arc<Launcher>,
-    log_dir: PathBuf,
+    projects: Arc<BTreeMap<String, Project>>,
     desk: Arc<Desk>,
     web: Option<PathBuf>,
 ) -> Router {
     let api = Router::new()
-        .route("/api/runs", get(list_runs).post(start_run))
-        .route("/api/runs/{run_id}", get(run_detail))
-        .route("/api/runs/{run_id}/nodes/{node}", get(node_checkpoints))
-        .route("/api/runs/{run_id}/events", get(run_events))
+        .route("/api/projects", get(list_projects))
+        .route(
+            "/api/projects/{project}/runs",
+            get(list_runs).post(start_run),
+        )
+        .route("/api/projects/{project}/runs/{run_id}", get(run_detail))
+        .route(
+            "/api/projects/{project}/runs/{run_id}/nodes/{node}",
+            get(node_checkpoints),
+        )
+        .route(
+            "/api/projects/{project}/runs/{run_id}/events",
+            get(run_events),
+        )
+        // Answering is keyed by question id alone — unique across every project.
         .route(
             "/api/clarifications/{question_id}",
             axum::routing::post(answer_question),
@@ -159,12 +167,7 @@ fn router(
             "/internal/clarifications",
             axum::routing::post(await_answer),
         )
-        .with_state(AppState {
-            store,
-            launcher,
-            log_dir,
-            desk,
-        });
+        .with_state(AppState { projects, desk });
 
     match web {
         // Unmatched paths fall back to index.html so the client owns its own routing.
@@ -174,6 +177,19 @@ fn router(
         }
         None => api,
     }
+}
+
+async fn list_projects(State(state): State<AppState>) -> Json<Vec<ProjectView>> {
+    Json(
+        state
+            .projects
+            .values()
+            .map(|p| ProjectView {
+                slug: p.slug.clone(),
+                dir: p.dir.display().to_string(),
+            })
+            .collect(),
+    )
 }
 
 /// A run as the list view shows it.
@@ -222,8 +238,11 @@ struct CheckpointView {
     output: serde_json::Value,
 }
 
-async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<RunSummary>>, ApiError> {
-    let runs = state.store.list_runs().await?;
+async fn list_runs(
+    State(state): State<AppState>,
+    AxumPath(project): AxumPath<String>,
+) -> Result<Json<Vec<RunSummary>>, ApiError> {
+    let runs = state.project(&project)?.store.list_runs().await?;
     Ok(Json(
         runs.into_iter()
             .map(|r| RunSummary {
@@ -238,10 +257,11 @@ async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<RunSummary>
 
 async fn run_detail(
     State(state): State<AppState>,
-    AxumPath(run_id): AxumPath<String>,
+    AxumPath((project, run_id)): AxumPath<(String, String)>,
 ) -> Result<Json<RunDetail>, ApiError> {
-    let run = state.store.run(&run_id).await?;
-    let checkpoints = state.store.checkpoints_for_run(&run_id).await?;
+    let store = &state.project(&project)?.store;
+    let run = store.run(&run_id).await?;
+    let checkpoints = store.checkpoints_for_run(&run_id).await?;
     if run.is_none() && checkpoints.is_empty() {
         return Err(ApiError::NotFound(format!("no run {run_id}")));
     }
@@ -269,9 +289,13 @@ async fn run_detail(
 
 async fn node_checkpoints(
     State(state): State<AppState>,
-    AxumPath((run_id, node)): AxumPath<(String, String)>,
+    AxumPath((project, run_id, node)): AxumPath<(String, String, String)>,
 ) -> Result<Json<Vec<CheckpointView>>, ApiError> {
-    let all = state.store.checkpoints_for_run(&run_id).await?;
+    let all = state
+        .project(&project)?
+        .store
+        .checkpoints_for_run(&run_id)
+        .await?;
     // Every checkpoint, not just the latest: the implementer writes one per converge iteration and
     // the diagnostic progression between them is the interesting part.
     let views: Vec<CheckpointView> = all
@@ -342,9 +366,10 @@ struct StartedRun {
 
 async fn start_run(
     State(state): State<AppState>,
+    AxumPath(project): AxumPath<String>,
     Json(body): Json<StartRun>,
 ) -> Result<(StatusCode, Json<StartedRun>), ApiError> {
-    let run_id = state.launcher.spawn(&body.issue)?;
+    let run_id = state.project(&project)?.launcher.spawn(&body.issue)?;
     tracing::info!(kind = "run_started", run_id = %run_id, "started run from the dashboard");
     Ok((StatusCode::ACCEPTED, Json(StartedRun { run_id })))
 }
@@ -356,13 +381,14 @@ async fn start_run(
 /// disconnects — the tailing task is owned by the channel and dies with it.
 async fn run_events(
     State(state): State<AppState>,
-    AxumPath(run_id): AxumPath<String>,
-) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    AxumPath((project, run_id)): AxumPath<(String, String)>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError>
+{
+    let dir = state.project(&project)?.log_dir.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     // Watching this run *is* holding an event stream open, so attendance is exactly this task's
     // lifetime — no disconnect handling to get wrong.
-    let attending = state.desk.attend(&run_id);
-    let dir = state.log_dir.clone();
+    let attending = state.desk.attend(&project, &run_id);
     tokio::spawn(async move {
         events::follow(dir, run_id, tx).await;
         drop(attending);
@@ -375,7 +401,7 @@ async fn run_events(
     });
     // A keep-alive comment holds the connection open through the quiet stretch while a node waits
     // on a model, which can outlast an idle-timeout proxy.
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 /// A run asking whether a human will answer. Blocks until one does, or until it's clear none
@@ -386,7 +412,7 @@ async fn await_answer(
 ) -> Json<AskReply> {
     let answer = state
         .desk
-        .wait_for_answer(&req.run_id, &req.question_id)
+        .wait_for_answer(&req.project, &req.run_id, &req.question_id)
         .await;
     Json(AskReply { answer })
 }

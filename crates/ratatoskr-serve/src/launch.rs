@@ -34,21 +34,25 @@ pub enum LaunchError {
 /// Spawns runs, bounded by a fixed number of concurrent children.
 pub struct Launcher {
     /// Working directory for spawned runs — the project's repo root.
-    project: PathBuf,
+    dir: PathBuf,
     config: PathBuf,
     /// Where a run should reach this server to ask a human a question.
     dashboard: String,
+    /// Which project the run belongs to. A run id is only unique *within* a project — an
+    /// operator-chosen `--run-id` can repeat across them — so questions are scoped by both.
+    project: String,
     permits: Arc<Semaphore>,
     max: usize,
 }
 
 impl Launcher {
-    pub fn new(project: &Path, config: &Path, max: usize, dashboard: &str) -> Self {
+    pub fn new(dir: &Path, config: &Path, max: usize, dashboard: &str, project: &str) -> Self {
         let max = max.max(1);
         Launcher {
-            project: project.to_path_buf(),
+            dir: dir.to_path_buf(),
             config: config.to_path_buf(),
             dashboard: dashboard.to_string(),
+            project: project.to_string(),
             permits: Arc::new(Semaphore::new(max)),
             max,
         }
@@ -83,6 +87,7 @@ impl Launcher {
         // How the run reaches back to ask a human. A run started any other way doesn't get this,
         // and answers its own questions exactly as it does today.
         cmd.env("RATATOSKR_DASHBOARD", &self.dashboard);
+        cmd.env("RATATOSKR_PROJECT", &self.project);
         let mut child = cmd
             .arg("run")
             .arg("--run-id")
@@ -93,7 +98,7 @@ impl Launcher {
             // with a dash; without this it would be parsed as a flag.
             .arg("--")
             .arg(issue)
-            .current_dir(&self.project)
+            .current_dir(&self.dir)
             .kill_on_drop(false)
             .spawn()
             .map_err(LaunchError::Spawn)?;
@@ -132,6 +137,7 @@ mod tests {
             Path::new("ratatoskr.toml"),
             max,
             "http://127.0.0.1:7878",
+            "test",
         )
     }
 

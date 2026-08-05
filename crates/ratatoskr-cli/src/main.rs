@@ -96,12 +96,17 @@ enum Command {
         /// CLI against the repo and spend API credits.
         #[arg(long, default_value = "127.0.0.1:7878")]
         addr: SocketAddr,
-        /// Path to the config file.
+        /// Path to the config file, for the current directory. Ignored when `--project` is used:
+        /// each of those reads its own `ratatoskr.toml`.
         #[arg(long, default_value = "ratatoskr.toml")]
         config: PathBuf,
-        /// How many dashboard-started runs may be in flight at once. The default is 1 because
-        /// red-team characterises the baseline against the main checkout, so concurrent runs
-        /// contend on one build directory and serialise there regardless.
+        /// Watch another project's repository root. Repeatable. Each keeps its own store,
+        /// worktrees, and logs; nothing is merged. Defaults to the current directory.
+        #[arg(long = "project")]
+        projects: Vec<PathBuf>,
+        /// How many dashboard-started runs may be in flight at once, per project. The default is
+        /// 1 because red-team characterises the baseline against the main checkout, so concurrent
+        /// runs contend on one build directory and serialise there regardless.
         #[arg(long, default_value_t = 1)]
         max_runs: usize,
     },
@@ -146,8 +151,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Serve {
             addr,
             config,
+            projects,
             max_runs,
-        }) => serve(addr, &config, max_runs).await,
+        }) => serve(addr, &config, projects, max_runs).await,
         Some(Command::Clean { force }) => clean(force).await,
         None => {
             Cli::command().print_help()?;
@@ -499,20 +505,53 @@ async fn status(run_id: &str, config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Serve the dashboard over the configured store. Reads the store directly; runs started from
-/// the dashboard are spawned as child processes, so this one never writes to it.
-async fn serve(addr: SocketAddr, config_path: &Path, max_runs: usize) -> anyhow::Result<()> {
-    let config = load_config(config_path)?;
-    let project = std::env::current_dir().context("resolving the project directory")?;
+/// Serve the dashboard over one or more projects' stores. Reads them directly; runs started from
+/// the dashboard are spawned as child processes, so this one never writes to them.
+async fn serve(
+    addr: SocketAddr,
+    config_path: &Path,
+    projects: Vec<PathBuf>,
+    max_runs: usize,
+) -> anyhow::Result<()> {
+    let specs = if projects.is_empty() {
+        // No `--project`: watch the current directory, exactly as before.
+        let dir = std::env::current_dir().context("resolving the project directory")?;
+        vec![project_spec(&dir, config_path)?]
+    } else {
+        projects
+            .iter()
+            .map(|dir| project_spec(dir, &dir.join("ratatoskr.toml")))
+            .collect::<anyhow::Result<Vec<_>>>()?
+    };
+
     ratatoskr_serve::serve(ratatoskr_serve::ServeOptions {
-        store_path: &config.store.path,
         addr,
-        project: &project,
-        config_path,
+        projects: specs,
         max_runs,
     })
     .await?;
     Ok(())
+}
+
+/// Resolve one project for `serve`: its config, and where that config's store actually is.
+///
+/// `store.path` is relative to the project it belongs to, but this process has a single working
+/// directory, so it has to be joined here rather than left for the server to guess.
+fn project_spec(dir: &Path, config_path: &Path) -> anyhow::Result<ratatoskr_serve::ProjectSpec> {
+    let config = load_config(config_path)?;
+    let dir = dir
+        .canonicalize()
+        .with_context(|| format!("resolving project directory {}", dir.display()))?;
+    let store_path = if config.store.path.is_absolute() {
+        config.store.path.clone()
+    } else {
+        dir.join(&config.store.path)
+    };
+    Ok(ratatoskr_serve::ProjectSpec {
+        dir,
+        config_path: config_path.to_path_buf(),
+        store_path,
+    })
 }
 
 /// Read the issue text from a positional argument or `--file` (exactly one).
