@@ -239,7 +239,7 @@ fn render_prompt(input: &BookkeeperInput) -> String {
     if !a.risks.is_empty() {
         s.push_str("RISKS FLAGGED:\n");
         for r in &a.risks {
-            let _ = writeln!(s, "- [{}] {}", r.severity, r.description);
+            let _ = writeln!(s, "- {r}");
         }
         s.push('\n');
     }

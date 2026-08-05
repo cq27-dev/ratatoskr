@@ -18,12 +18,12 @@ pub const ANALYST_TOOLS: &[&str] = &["impact_surface", "symbol_lookup", "semanti
 const PREAMBLE: &str = "You are the analyst in a code-planning pipeline. You are given an issue, \
     the scout's findings, and relevant repo memories. Use `impact_surface` and `symbol_lookup` to \
     determine what this change actually touches and its blast radius — call the tools, don't guess. \
-    Produce: an impact summary, the specific symbols/paths touched, a list of risks (each with a \
-    severity), a list of concrete requirements the implementation must satisfy, and a residual-risk \
-    note capturing what remains uncertain or unknown after your analysis. You are also the \
-    pipeline's fallback answerer: when another node cannot resolve something on its own, its \
-    question routes to you, so hold clear, present-tense judgments about the change that you can \
-    share when asked.";
+    Produce: an impact summary, the specific symbols/paths touched, a list of risks (each a short \
+    line — lead with the severity if it's clear-cut), a list of concrete requirements the \
+    implementation must satisfy, and a residual-risk note capturing what remains uncertain or \
+    unknown after your analysis. You are also the pipeline's fallback answerer: when another node \
+    cannot resolve something on its own, its question routes to you, so hold clear, present-tense \
+    judgments about the change that you can share when asked.";
 
 /// Input to the analyst: the issue plus the two upstream node outputs.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -33,16 +33,6 @@ pub struct AnalystInput {
     pub memory: MemoryOutput,
 }
 
-/// A risk the analyst identified. Fields optional (best-effort agent output); the gate still
-/// enforces that each risk is an object of strings.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
-pub struct Risk {
-    pub description: String,
-    /// Free-text severity (e.g. "low"/"medium"/"high").
-    pub severity: String,
-}
-
 /// Analyst's structured output — the plan's substance.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AnalystOutput {
@@ -50,8 +40,11 @@ pub struct AnalystOutput {
     /// Specific symbols/paths the change touches.
     #[serde(default)]
     pub touched: Vec<String>,
+    /// Risks, one short line each (severity is just part of the text). Free text on purpose: no
+    /// consumer branches on a structured severity, and a plain list can't fail schema validation the
+    /// way a `{description, severity}` object did when the model wrote a stringy risk.
     #[serde(default)]
-    pub risks: Vec<Risk>,
+    pub risks: Vec<String>,
     #[serde(default)]
     pub requirements: Vec<String>,
     /// What remains uncertain after analysis — drives Phase 5's clarification edge later.
@@ -141,13 +134,13 @@ mod tests {
         let raw = r#"{
             "impact_summary": "touches the store",
             "touched": ["ratatoskr-store::Store"],
-            "risks": [{"description": "lock contention", "severity": "medium"}],
+            "risks": ["medium: lock contention"],
             "requirements": ["keep single-writer"],
             "residual_risk": "throughput under load unknown"
         }"#;
         let out = parse_validated::<AnalystOutput>(raw).unwrap();
         assert_eq!(out.touched, ["ratatoskr-store::Store"]);
-        assert_eq!(out.risks[0].severity, "medium");
+        assert_eq!(out.risks[0], "medium: lock contention");
     }
 
     #[test]

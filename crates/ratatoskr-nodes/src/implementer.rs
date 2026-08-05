@@ -132,7 +132,7 @@ impl ImplementerNode {
         if !a.risks.is_empty() {
             s.push_str("Known risks to avoid:\n");
             for risk in &a.risks {
-                let _ = writeln!(s, "- [{}] {}", risk.severity, risk.description);
+                let _ = writeln!(s, "- {risk}");
             }
             s.push('\n');
         }

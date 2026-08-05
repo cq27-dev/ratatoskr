@@ -16,7 +16,7 @@ pub mod scout;
 pub mod testrun;
 pub mod workflow;
 
-pub use analyst::{AnalystNode, AnalystOutput, Risk};
+pub use analyst::{AnalystNode, AnalystOutput};
 pub use bookkeeper::{BookkeeperInput, BookkeeperNode, BookkeeperOutput, MemoryWritten};
 pub use implementer::{ImplementerNode, ImplementerOutput};
 pub use memory::{MemoryNode, MemoryOutput, MemoryRecord};
