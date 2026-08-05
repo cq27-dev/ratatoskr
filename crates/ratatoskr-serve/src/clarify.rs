@@ -35,6 +35,10 @@ const TICK: Duration = Duration::from_millis(500);
 pub struct AskRequest {
     pub run_id: String,
     pub question_id: String,
+    /// Which project the asking run belongs to. A run id is unique within a project but an
+    /// operator can reuse one across projects, so attendance is keyed by both.
+    #[serde(default)]
+    pub project: String,
 }
 
 /// What it gets back. `answer: None` means "nobody answered — use your own fallback"; the run
@@ -53,12 +57,21 @@ pub enum AnswerError {
 
 #[derive(Default)]
 struct State {
-    /// Event-stream subscribers per run — the only signal that a human is present.
-    watchers: HashMap<String, usize>,
+    /// Event-stream subscribers per watched run — the only signal that a human is present.
+    watchers: HashMap<Watched, usize>,
     /// When a run's watcher count last hit zero, for the grace period.
-    lonely_since: HashMap<String, Instant>,
+    lonely_since: HashMap<Watched, Instant>,
     /// Questions waiting on a human, by question id.
     parked: HashMap<String, oneshot::Sender<String>>,
+}
+
+/// Identifies a run being watched. Scoped by project because a run id is only unique within one:
+/// `ratatoskr run --run-id` lets an operator pick the same id in two projects, and a viewer of one
+/// must not make the other's run look attended.
+type Watched = (String, String);
+
+fn watched(project: &str, run_id: &str) -> Watched {
+    (project.to_string(), run_id.to_string())
 }
 
 /// Tracks who is watching and what is waiting to be answered.
@@ -71,56 +84,55 @@ pub struct Desk {
 /// attendance follows the event stream's lifetime without any explicit disconnect handling.
 pub struct Attending {
     desk: Arc<Desk>,
-    run_id: String,
+    key: Watched,
 }
 
 impl Drop for Attending {
     fn drop(&mut self) {
         let mut state = self.desk.state.lock().expect("desk mutex");
-        let count = state.watchers.entry(self.run_id.clone()).or_insert(1);
+        let count = state.watchers.entry(self.key.clone()).or_insert(1);
         *count = count.saturating_sub(1);
         if *count == 0 {
-            state.watchers.remove(&self.run_id);
-            state
-                .lonely_since
-                .insert(self.run_id.clone(), Instant::now());
+            state.watchers.remove(&self.key);
+            state.lonely_since.insert(self.key.clone(), Instant::now());
         }
     }
 }
 
 impl Desk {
     /// Register a viewer for `run_id`.
-    pub fn attend(self: &Arc<Self>, run_id: &str) -> Attending {
+    pub fn attend(self: &Arc<Self>, project: &str, run_id: &str) -> Attending {
+        let key = watched(project, run_id);
         {
             let mut state = self.state.lock().expect("desk mutex");
-            *state.watchers.entry(run_id.to_string()).or_insert(0) += 1;
-            state.lonely_since.remove(run_id);
+            *state.watchers.entry(key.clone()).or_insert(0) += 1;
+            state.lonely_since.remove(&key);
         }
         Attending {
             desk: Arc::clone(self),
-            run_id: run_id.to_string(),
+            key,
         }
     }
 
-    fn watching(&self, run_id: &str) -> bool {
+    fn watching(&self, key: &Watched) -> bool {
         self.state
             .lock()
             .expect("desk mutex")
             .watchers
-            .get(run_id)
+            .get(key)
             .is_some_and(|n| *n > 0)
     }
 
     /// How long this run has had no viewer, or `None` if one is watching.
-    fn lonely_for(&self, run_id: &str) -> Option<Duration> {
+    fn lonely_for(&self, key: &Watched) -> Option<Duration> {
         let state = self.state.lock().expect("desk mutex");
-        if state.watchers.get(run_id).is_some_and(|n| *n > 0) {
+        if state.watchers.get(key).is_some_and(|n| *n > 0) {
             return None;
         }
         Some(
             state
                 .lonely_since
-                .get(run_id)
+                .get(key)
                 .map_or(Duration::MAX, |since| since.elapsed()),
         )
     }
@@ -166,8 +178,14 @@ impl Desk {
     ///
     /// Returns `None` the moment it is clear no answer is coming, so an unattended run never
     /// waits at all.
-    pub async fn wait_for_answer(&self, run_id: &str, question_id: &str) -> Option<String> {
-        if !self.watching(run_id) {
+    pub async fn wait_for_answer(
+        &self,
+        project: &str,
+        run_id: &str,
+        question_id: &str,
+    ) -> Option<String> {
+        let key = watched(project, run_id);
+        if !self.watching(&key) {
             return None;
         }
         // The guard unparks on every exit, including the one this function can't see: the whole
@@ -180,7 +198,7 @@ impl Desk {
                 answered = &mut rx => return answered.ok(),
                 _ = tokio::time::sleep(TICK) => {
                     let gave_up = Instant::now() >= deadline
-                        || self.lonely_for(run_id).is_some_and(|d| d > ATTENDANCE_GRACE);
+                        || self.lonely_for(&key).is_some_and(|d| d > ATTENDANCE_GRACE);
                     if gave_up {
                         // An answer may have landed while we were deciding to give up. It has
                         // already been reported delivered, so take it rather than discard it.
@@ -217,18 +235,18 @@ mod tests {
         // The guarantee that keeps `ratatoskr run` behaving exactly as it does today.
         let desk = desk();
         let started = Instant::now();
-        assert!(desk.wait_for_answer("r1", "q1").await.is_none());
+        assert!(desk.wait_for_answer("p", "r1", "q1").await.is_none());
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[tokio::test]
     async fn a_watched_run_receives_the_answer() {
         let desk = desk();
-        let _viewer = desk.attend("r1");
+        let _viewer = desk.attend("p", "r1");
 
         let waiting = tokio::spawn({
             let desk = Arc::clone(&desk);
-            async move { desk.wait_for_answer("r1", "q1").await }
+            async move { desk.wait_for_answer("p", "r1", "q1").await }
         });
 
         // Let the question park before answering it.
@@ -242,12 +260,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watching_one_project_does_not_attend_another_projects_run() {
+        // `ratatoskr run --run-id` lets an operator pick the same id in two projects. A viewer of
+        // one must not make the other's run wait for an answer nobody is going to give.
+        let desk = desk();
+        let _viewer = desk.attend("alpha", "same-id");
+
+        let started = Instant::now();
+        assert!(
+            desk.wait_for_answer("beta", "same-id", "q1")
+                .await
+                .is_none(),
+            "the other project's run is unattended"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "and is not delayed by the grace period or the timeout"
+        );
+    }
+
+    #[tokio::test]
     async fn only_the_first_answer_is_accepted() {
         let desk = desk();
-        let _viewer = desk.attend("r1");
+        let _viewer = desk.attend("p", "r1");
         let waiting = tokio::spawn({
             let desk = Arc::clone(&desk);
-            async move { desk.wait_for_answer("r1", "q1").await }
+            async move { desk.wait_for_answer("p", "r1", "q1").await }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -264,9 +302,9 @@ mod tests {
     async fn a_dropped_wait_leaves_nothing_parked() {
         // The run's connection can vanish mid-wait; the entry must not outlive the future.
         let desk = desk();
-        let _viewer = desk.attend("r1");
+        let _viewer = desk.attend("p", "r1");
         {
-            let waiting = desk.wait_for_answer("r1", "q1");
+            let waiting = desk.wait_for_answer("p", "r1", "q1");
             tokio::pin!(waiting);
             // Poll once so the question is actually parked, then drop the future.
             let _ = tokio::time::timeout(Duration::from_millis(50), &mut waiting).await;
@@ -289,36 +327,36 @@ mod tests {
     #[tokio::test]
     async fn attendance_follows_the_viewer_guard() {
         let desk = desk();
-        assert!(!desk.watching("r1"));
+        assert!(!desk.watching(&watched("p", "r1")));
 
-        let first = desk.attend("r1");
-        let second = desk.attend("r1");
-        assert!(desk.watching("r1"));
+        let first = desk.attend("p", "r1");
+        let second = desk.attend("p", "r1");
+        assert!(desk.watching(&watched("p", "r1")));
 
         // Two tabs on the same run: one closing doesn't end attendance.
         drop(first);
-        assert!(desk.watching("r1"));
-        assert!(desk.lonely_for("r1").is_none());
+        assert!(desk.watching(&watched("p", "r1")));
+        assert!(desk.lonely_for(&watched("p", "r1")).is_none());
 
         drop(second);
-        assert!(!desk.watching("r1"));
-        assert!(desk.lonely_for("r1").is_some());
+        assert!(!desk.watching(&watched("p", "r1")));
+        assert!(desk.lonely_for(&watched("p", "r1")).is_some());
     }
 
     #[tokio::test]
     async fn losing_the_viewer_gives_up_after_the_grace_period() {
         let desk = desk();
-        let viewer = desk.attend("r1");
+        let viewer = desk.attend("p", "r1");
         let waiting = tokio::spawn({
             let desk = Arc::clone(&desk);
-            async move { desk.wait_for_answer("r1", "q1").await }
+            async move { desk.wait_for_answer("p", "r1", "q1").await }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Closing the tab shouldn't strand the node for the full timeout...
         drop(viewer);
         // ...but a refresh reconnects within the grace, so re-attending keeps it parked.
-        let _reopened = desk.attend("r1");
+        let _reopened = desk.attend("p", "r1");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!waiting.is_finished(), "still parked while someone watches");
 

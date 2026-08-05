@@ -28,6 +28,12 @@ export interface NodeView {
   last_at: string | null;
 }
 
+/** A watched project. Each has its own store, worktrees and logs; nothing is shared. */
+export interface ProjectView {
+  slug: string;
+  dir: string;
+}
+
 export interface RunSummary {
   run_id: string;
   issue_id: string | null;
@@ -71,15 +77,24 @@ async function getJSON<T>(url: string): Promise<T> {
   return (await res.json()) as T;
 }
 
-export const listRuns = () => getJSON<RunSummary[]>("/api/runs");
+const scope = (project: string) =>
+  `/api/projects/${encodeURIComponent(project)}`;
+
+export const listProjects = () => getJSON<ProjectView[]>("/api/projects");
+
+export const listRuns = (project: string) =>
+  getJSON<RunSummary[]>(`${scope(project)}/runs`);
 
 /**
  * Start a run. Resolves as soon as the run has been spawned — a run takes minutes, so the id
  * comes back immediately and the run is followed through the normal endpoints. A 409 means the
  * server is already at its concurrent-run cap.
  */
-export async function startRun(issue: string): Promise<string> {
-  const res = await fetch("/api/runs", {
+export async function startRun(
+  project: string,
+  issue: string,
+): Promise<string> {
+  const res = await fetch(`${scope(project)}/runs`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ issue }),
@@ -99,10 +114,10 @@ interface StartedRun {
   run_id: string;
 }
 
-export const getRun = (runId: string) =>
-  getJSON<RunDetail>(`/api/runs/${encodeURIComponent(runId)}`);
+export const getRun = (project: string, runId: string) =>
+  getJSON<RunDetail>(`${scope(project)}/runs/${encodeURIComponent(runId)}`);
 
-/** One thing a run did, from `GET /api/runs/{id}/events`. Mirrors `events::LiveEvent`. */
+/** One thing a run did, from a run's event stream. Mirrors `events::LiveEvent`. */
 export interface LiveEvent {
   at: string;
   /** `tool_call`, `model_text`, `checkpoint`, `question`, `question_answered`, `run_*`, … */
@@ -146,11 +161,12 @@ export async function answerQuestion(
  * shows what already happened instead of an empty pane.
  */
 export function followRun(
+  project: string,
   runId: string,
   handlers: { onEvent: (event: LiveEvent) => void; onReset: () => void },
 ): () => void {
   const source = new EventSource(
-    `/api/runs/${encodeURIComponent(runId)}/events`,
+    `${scope(project)}/runs/${encodeURIComponent(runId)}/events`,
   );
   // EventSource reconnects on its own after a drop, and the server replays history to every new
   // connection — so without clearing here, one blip duplicates the whole feed.
@@ -165,7 +181,11 @@ export function followRun(
   return () => source.close();
 }
 
-export const getNodeCheckpoints = (runId: string, node: string) =>
+export const getNodeCheckpoints = (
+  project: string,
+  runId: string,
+  node: string,
+) =>
   getJSON<CheckpointView[]>(
-    `/api/runs/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(node)}`,
+    `${scope(project)}/runs/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(node)}`,
   );

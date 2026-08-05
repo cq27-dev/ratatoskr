@@ -182,7 +182,13 @@ impl NodeClarifier {
     async fn await_user_answer(&self, dashboard: &str, question_id: &str) -> Option<String> {
         let reply = reqwest::Client::new()
             .post(format!("{dashboard}/internal/clarifications"))
-            .json(&serde_json::json!({ "run_id": self.run_id, "question_id": question_id }))
+            .json(&serde_json::json!({
+                "run_id": self.run_id,
+                "question_id": question_id,
+                // Empty unless the dashboard spawned this run, which is also the only case in
+                // which it can be answered.
+                "project": std::env::var("RATATOSKR_PROJECT").unwrap_or_default(),
+            }))
             .timeout(USER_ANSWER_CEILING)
             .send()
             .await
