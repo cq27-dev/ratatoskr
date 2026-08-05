@@ -58,6 +58,8 @@ pub struct ScoutNode {
     pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
     pub max_turns: Option<usize>,
     pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
+    /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
+    pub system_prompt: Option<String>,
 }
 
 impl Node for ScoutNode {
@@ -72,7 +74,7 @@ impl Node for ScoutNode {
         let raw = ratatoskr_agent::run_structured(
             "scout",
             &self.route,
-            PREAMBLE,
+            self.system_prompt.as_deref().unwrap_or(PREAMBLE),
             &issue,
             self.tools.clone(),
             self.sink.clone(),

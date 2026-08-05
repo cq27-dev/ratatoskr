@@ -149,6 +149,7 @@ async fn run_nodes(
         policy: scout_cfg.policy,
         max_turns: scout_cfg.max_turns,
         clarifier: Some(clarifier.as_dyn()),
+        system_prompt: scout_cfg.system_prompt,
     };
     let scout_out = scout
         .run(issue.to_string(), &state)
@@ -190,6 +191,7 @@ async fn run_nodes(
         sink: sink.clone(),
         policy: analyst_cfg.policy,
         max_turns: analyst_cfg.max_turns,
+        system_prompt: analyst_cfg.system_prompt,
     };
     let analyst_out = analyst
         .run(
@@ -240,6 +242,15 @@ fn route(config: &RatatoskrConfig, name: &str) -> Result<ratatoskr_core::ModelRo
         .ok_or_else(|| PlanError::MissingRoute(name.to_string()))
 }
 
+/// The red-team classifier is opt-in: it runs only when redteam has a model route to run on,
+/// whether that comes from `[models.redteam]` or from its ruleset.
+fn classifier_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> bool {
+    config.models.contains_key("redteam")
+        || engine
+            .ruleset("redteam")
+            .is_some_and(|r| r.config().model.is_some())
+}
+
 /// The resolved agent settings for one node: base config plus any `.ratatoskr/rules/<node>.ts`
 /// overrides (model, tool set, per-call policy, max turns).
 struct NodeAgentConfig {
@@ -247,11 +258,15 @@ struct NodeAgentConfig {
     tools: Vec<Tool>,
     policy: Option<Arc<dyn ToolPolicy>>,
     max_turns: Option<usize>,
+    /// Replaces the node's built-in preamble when the ruleset declares one.
+    system_prompt: Option<String>,
 }
 
-/// Resolve a node's agent settings from `[models.<node>]` + `default_tools`, then layer the ruleset:
-/// `allow` (if given) REPLACES the default tool set, `deny` is always removed, a `model` rule
-/// overrides provider/model, and `onToolCall` (if defined) becomes the per-call [`ToolPolicy`].
+/// Resolve a node's agent settings. The ruleset is authoritative where it speaks: its `model` is
+/// the route (so a fully-declared node needs no `[models.<node>]` entry — that's only the
+/// fallback), `allow` (if given) REPLACES `default_tools`, `deny` is always removed,
+/// `systemPrompt` replaces the node's built-in preamble, and `onToolCall` (if defined) becomes the
+/// per-call [`ToolPolicy`].
 fn node_agent_config(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
@@ -259,16 +274,18 @@ fn node_agent_config(
     node: &str,
     default_tools: &[&str],
 ) -> Result<NodeAgentConfig, PlanError> {
-    let mut route = route(config, node)?;
     let ruleset = engine.ruleset(node);
     let rc = ruleset.as_ref().map(|r| r.config());
 
-    if let Some(m) = rc.and_then(|c| c.model.as_ref()) {
-        route = ratatoskr_core::ModelRoute {
+    // Ruleset model FIRST: a node whose ruleset declares one needs no `[models.<node>]` entry.
+    // `route()` — and its "add a [models.<node>]" error — is only the fallback.
+    let route = match rc.and_then(|c| c.model.as_ref()) {
+        Some(m) => ratatoskr_core::ModelRoute {
             provider: m.provider.clone(),
             model: m.model.clone(),
-        };
-    }
+        },
+        None => route(config, node)?,
+    };
 
     let allow: Vec<&str> = match rc
         .and_then(|c| c.tools.as_ref())
@@ -287,6 +304,7 @@ fn node_agent_config(
         .collect();
 
     let max_turns = rc.and_then(|c| c.max_turns);
+    let system_prompt = rc.and_then(|c| c.system_prompt.clone());
     let policy: Option<Arc<dyn ToolPolicy>> = match ruleset {
         Some(r) if r.config().has_on_tool_call => Some(Arc::new(r) as Arc<dyn ToolPolicy>),
         _ => None,
@@ -297,6 +315,7 @@ fn node_agent_config(
         tools,
         policy,
         max_turns,
+        system_prompt,
     })
 }
 
@@ -445,6 +464,7 @@ async fn bookkeep_and_checkpoint(
         policy: cfg.policy,
         max_turns: cfg.max_turns,
         clarifier: Some(clarifier.as_dyn()),
+        system_prompt: cfg.system_prompt,
     };
     let out = node
         .run(input)
@@ -532,10 +552,10 @@ async fn fork_and_converge(
         repo_path: repo_path.clone(),
         sandbox: config.sandbox.clone(),
         name: format!("ratatoskr-redteam-{short}"),
-        // Opt-in: classify baseline failures only when a [models.redteam] route is configured.
-        // When it is, its `.ratatoskr/rules/redteam.ts` ruleset (if any) applies on top.
-        classifier: match config.models.get("redteam") {
-            Some(_) => {
+        // Opt-in: classify baseline failures only when redteam has a route — from
+        // `[models.redteam]` or from its `.ratatoskr/rules/redteam.ts` ruleset.
+        classifier: match classifier_enabled(engine, config) {
+            true => {
                 let cfg = node_agent_config(
                     engine,
                     config,
@@ -552,9 +572,10 @@ async fn fork_and_converge(
                     policy: cfg.policy,
                     max_turns: cfg.max_turns,
                     clarifier: Some(clarifier.as_dyn()),
+                    system_prompt: cfg.system_prompt,
                 })
             }
-            None => None,
+            false => None,
         },
     };
     let implementer = ImplementerNode {
@@ -644,4 +665,80 @@ async fn fork_and_converge(
     };
 
     Ok((red_team_out, impl_out, worktree, status, iterations))
+}
+
+#[cfg(test)]
+mod agent_config_tests {
+    use super::*;
+
+    /// scout: full ruleset (model + prompt), no `[models.scout]`. bookkeeper: partial ruleset
+    /// (no model) → TOML route + built-in preamble. memory: no ruleset at all.
+    async fn engine() -> Arc<ScriptEngine> {
+        let dir = std::env::temp_dir().join("ratatoskr-nodes-agent-config-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.ts"),
+            r#"
+            defineAgent("scout", {
+                model: { provider: "openai", model: "gpt-5" },
+                systemPrompt: "Be brief.",
+            });
+            defineAgent("bookkeeper", { maxTurns: 3 });
+            "#,
+        )
+        .unwrap();
+        ScriptEngine::load(&dir).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn ruleset_model_replaces_the_toml_route() {
+        let engine = engine().await;
+        let mut config = RatatoskrConfig::default();
+        // The whole point: no `[models.scout]` entry at all.
+        config.models.remove("scout");
+
+        let cfg = node_agent_config(&engine, &config, &[], "scout", &[]).unwrap();
+        assert_eq!(cfg.route.provider, "openai");
+        assert_eq!(cfg.route.model, "gpt-5");
+        assert_eq!(cfg.system_prompt.as_deref(), Some("Be brief."));
+    }
+
+    #[tokio::test]
+    async fn a_ruleset_without_a_model_still_falls_back_to_toml() {
+        let engine = engine().await;
+        let config = RatatoskrConfig::default();
+
+        let cfg = node_agent_config(&engine, &config, &[], "bookkeeper", &[]).unwrap();
+        assert_eq!(cfg.route.provider, config.models["bookkeeper"].provider);
+        assert_eq!(cfg.route.model, config.models["bookkeeper"].model);
+        assert!(cfg.system_prompt.is_none());
+        assert_eq!(cfg.max_turns, Some(3));
+    }
+
+    #[tokio::test]
+    async fn no_ruleset_and_no_toml_route_is_still_an_error() {
+        let engine = engine().await;
+        let mut config = RatatoskrConfig::default();
+        config.models.remove("analyst");
+
+        assert!(matches!(
+            node_agent_config(&engine, &config, &[], "analyst", &[]),
+            Err(PlanError::MissingRoute(n)) if n == "analyst"
+        ));
+    }
+
+    #[tokio::test]
+    async fn redteam_classifier_opts_in_on_either_route_source() {
+        let engine = engine().await;
+        let mut config = RatatoskrConfig::default();
+        assert!(!classifier_enabled(&engine, &config));
+        config.models.insert(
+            "redteam".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+            },
+        );
+        assert!(classifier_enabled(&engine, &config));
+    }
 }

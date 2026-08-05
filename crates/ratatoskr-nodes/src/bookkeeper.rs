@@ -96,6 +96,8 @@ pub struct BookkeeperNode {
     pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
     pub max_turns: Option<usize>,
     pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
+    /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
+    pub system_prompt: Option<String>,
 }
 
 impl BookkeeperNode {
@@ -104,7 +106,7 @@ impl BookkeeperNode {
         let raw = ratatoskr_agent::run_structured(
             "bookkeeper",
             &self.route,
-            PREAMBLE,
+            self.system_prompt.as_deref().unwrap_or(PREAMBLE),
             &prompt,
             self.tools.clone(),
             self.sink.clone(),

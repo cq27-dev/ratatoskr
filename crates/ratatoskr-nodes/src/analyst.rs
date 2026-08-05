@@ -59,6 +59,8 @@ pub struct AnalystNode {
     pub sink: ServerSink,
     pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
     pub max_turns: Option<usize>,
+    /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
+    pub system_prompt: Option<String>,
 }
 
 impl Node for AnalystNode {
@@ -78,7 +80,7 @@ impl Node for AnalystNode {
         let raw = ratatoskr_agent::run_structured(
             "analyst",
             &self.route,
-            PREAMBLE,
+            self.system_prompt.as_deref().unwrap_or(PREAMBLE),
             &prompt,
             self.tools.clone(),
             self.sink.clone(),

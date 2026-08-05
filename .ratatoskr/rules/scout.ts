@@ -6,6 +6,11 @@ type ToolCall = { tool: string; args: Record<string, unknown> };
 type Decision = "allow" | "deny";
 
 defineAgent("scout", {
+  // A ruleset can also fully declare a node's route and persona — uncomment to override:
+  //   model: { provider: "moonshot", model: "kimi-k2.5" },  // sufficient on its own; no [models.scout] needed
+  //   systemPrompt: "You are the scout...",                 // replaces the node's built-in preamble
+  //   tools: { allow: ["semantic_search"] },                // REPLACES default_tools; `deny` also supported
+  //   maxTurns: 40,
   onToolCall({ tool }: ToolCall): Decision {
     // Block the tracker search; the scout should lean on semantic_search for this repo. The agent
     // receives the denial as tool feedback and continues with its remaining tools.
