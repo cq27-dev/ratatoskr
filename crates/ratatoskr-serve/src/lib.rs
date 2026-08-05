@@ -17,6 +17,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use ratatoskr_store::{Checkpoint, Store};
 use serde::Serialize;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::pipeline::{ISSUE_NODE, NodeView};
 
@@ -51,19 +52,53 @@ pub async fn serve(store_path: &Path, addr: SocketAddr) -> Result<(), ServeError
     let store = Store::open(store_path)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
-    tracing::info!("dashboard API listening on http://{bound}");
-    println!("dashboard API on http://{bound}");
+    let web = web_dir();
 
-    axum::serve(listener, router(store)).await?;
+    match &web {
+        Some(dir) => {
+            tracing::info!("serving dashboard from {}", dir.display());
+            println!("dashboard on http://{bound}");
+        }
+        None => {
+            // The UI is a separate build artifact, so a Rust-only checkout still gets a working
+            // API instead of a hard failure.
+            println!("dashboard API on http://{bound} (no UI build found — see {WEB_HINT})");
+        }
+    }
+
+    axum::serve(listener, router(store, web)).await?;
     Ok(())
 }
 
-fn router(store: Store) -> Router {
-    Router::new()
+const WEB_HINT: &str = "crates/ratatoskr-serve/web: `bun install && bun run build`";
+
+/// Where the built dashboard assets live, if they've been built.
+///
+/// `RATATOSKR_WEB_DIR` wins so a packaged build can point elsewhere; otherwise this is the
+/// in-repo build output. Returning `None` is normal, not an error — the API stands alone.
+fn web_dir() -> Option<PathBuf> {
+    let candidate = match std::env::var_os("RATATOSKR_WEB_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/web/dist")),
+    };
+    candidate.join("index.html").is_file().then_some(candidate)
+}
+
+fn router(store: Store, web: Option<PathBuf>) -> Router {
+    let api = Router::new()
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{run_id}", get(run_detail))
         .route("/api/runs/{run_id}/nodes/{node}", get(node_checkpoints))
-        .with_state(AppState { store })
+        .with_state(AppState { store });
+
+    match web {
+        // Unmatched paths fall back to index.html so the client owns its own routing.
+        Some(dir) => {
+            let index = dir.join("index.html");
+            api.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)))
+        }
+        None => api,
+    }
 }
 
 /// A run as the list view shows it.
