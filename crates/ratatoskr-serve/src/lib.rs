@@ -1,0 +1,280 @@
+//! The observability dashboard's HTTP layer: a small, read-only local server over the checkpoint
+//! store.
+//!
+//! It opens the same SQLite file the run writes to and only ever calls read methods — the store's
+//! single-writer discipline is preserved because this process never writes. WAL means these reads
+//! don't block a run in progress.
+
+pub mod pipeline;
+
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
+use axum::extract::{Path as AxumPath, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
+use ratatoskr_store::{Checkpoint, Store};
+use serde::Serialize;
+
+use crate::pipeline::{ISSUE_NODE, NodeView};
+
+/// Errors starting the server.
+#[derive(Debug, thiserror::Error)]
+pub enum ServeError {
+    #[error(
+        "no checkpoint store at {0} — run `ratatoskr plan` or `ratatoskr run` first, or point \
+         --config at the right ratatoskr.toml"
+    )]
+    NoStore(PathBuf),
+    #[error("store error: {0}")]
+    Store(#[from] ratatoskr_store::StoreError),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+#[derive(Clone)]
+struct AppState {
+    store: Store,
+}
+
+/// Serve the dashboard API on `addr`, reading the store at `store_path`.
+///
+/// Fails if the store file is absent rather than creating an empty one: `Store::open` would
+/// happily produce a fresh database, and a typo'd path would then show an empty dashboard that
+/// looks like "no runs yet" instead of a mistake.
+pub async fn serve(store_path: &Path, addr: SocketAddr) -> Result<(), ServeError> {
+    if !store_path.exists() {
+        return Err(ServeError::NoStore(store_path.to_path_buf()));
+    }
+    let store = Store::open(store_path)?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+    tracing::info!("dashboard API listening on http://{bound}");
+    println!("dashboard API on http://{bound}");
+
+    axum::serve(listener, router(store)).await?;
+    Ok(())
+}
+
+fn router(store: Store) -> Router {
+    Router::new()
+        .route("/api/runs", get(list_runs))
+        .route("/api/runs/{run_id}", get(run_detail))
+        .route("/api/runs/{run_id}/nodes/{node}", get(node_checkpoints))
+        .with_state(AppState { store })
+}
+
+/// A run as the list view shows it.
+#[derive(Debug, Serialize)]
+struct RunSummary {
+    run_id: String,
+    issue_id: Option<String>,
+    status: String,
+    updated_at: String,
+}
+
+/// A run's full pipeline view.
+#[derive(Debug, Serialize)]
+struct RunDetail {
+    run_id: String,
+    /// `None` for a run with checkpoints but no `runs` row — possible because the schema's
+    /// foreign key isn't enforced and the scripted path checkpoints the issue first.
+    status: Option<String>,
+    issue_id: Option<String>,
+    updated_at: Option<String>,
+    /// The run's subject, from the `issue` pseudo-checkpoint. `runs.issue_id` is unset by the
+    /// built-in flows, so this is normally the only record of what a run is about.
+    issue: Option<String>,
+    /// The most recent thing that happened, checkpoint or status change. `updated_at` alone moves
+    /// only on status transitions, so it can't distinguish a live run from one killed mid-flight;
+    /// this can, by how stale it is.
+    last_activity: Option<String>,
+    nodes: Vec<NodeView>,
+    worktree: Option<WorktreeView>,
+}
+
+/// The implementer's worktree — the reviewable deliverable, kept on `converged` and
+/// `max_iterations_reached` and removed by a hard error or `ratatoskr clean`. Reported separately
+/// from node state on purpose: a converged run's worktree is usually still on disk.
+#[derive(Debug, Serialize)]
+struct WorktreeView {
+    path: String,
+    exists: bool,
+}
+
+/// One stored checkpoint, with its JSON parsed so the client gets structure rather than a string.
+#[derive(Debug, Serialize)]
+struct CheckpointView {
+    node_name: String,
+    created_at: String,
+    output: serde_json::Value,
+}
+
+async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<RunSummary>>, ApiError> {
+    let runs = state.store.list_runs().await?;
+    Ok(Json(
+        runs.into_iter()
+            .map(|r| RunSummary {
+                run_id: r.run_id,
+                issue_id: r.issue_id,
+                status: r.status,
+                updated_at: r.updated_at,
+            })
+            .collect(),
+    ))
+}
+
+async fn run_detail(
+    State(state): State<AppState>,
+    AxumPath(run_id): AxumPath<String>,
+) -> Result<Json<RunDetail>, ApiError> {
+    let run = state.store.run(&run_id).await?;
+    let checkpoints = state.store.checkpoints_for_run(&run_id).await?;
+    if run.is_none() && checkpoints.is_empty() {
+        return Err(ApiError::NotFound(format!("no run {run_id}")));
+    }
+
+    let status = run.as_ref().map(|r| r.status.clone());
+    let nodes = pipeline::derive(status.as_deref(), &checkpoints);
+    let last_activity = checkpoints
+        .iter()
+        .map(|c| c.created_at.as_str())
+        .chain(run.as_ref().map(|r| r.updated_at.as_str()))
+        .max()
+        .map(str::to_string);
+
+    Ok(Json(RunDetail {
+        run_id,
+        status,
+        issue_id: run.as_ref().and_then(|r| r.issue_id.clone()),
+        updated_at: run.as_ref().map(|r| r.updated_at.clone()),
+        issue: issue_text(&checkpoints),
+        last_activity,
+        nodes,
+        worktree: worktree_view(&checkpoints),
+    }))
+}
+
+async fn node_checkpoints(
+    State(state): State<AppState>,
+    AxumPath((run_id, node)): AxumPath<(String, String)>,
+) -> Result<Json<Vec<CheckpointView>>, ApiError> {
+    let all = state.store.checkpoints_for_run(&run_id).await?;
+    // Every checkpoint, not just the latest: the implementer writes one per converge iteration and
+    // the diagnostic progression between them is the interesting part.
+    let views: Vec<CheckpointView> = all
+        .into_iter()
+        .filter(|c| c.node_name == node)
+        .map(|c| CheckpointView {
+            created_at: c.created_at,
+            output: parse_or_raw(&c.output_json),
+            node_name: c.node_name,
+        })
+        .collect();
+    if views.is_empty() {
+        return Err(ApiError::NotFound(format!(
+            "no checkpoints for node {node} in run {run_id}"
+        )));
+    }
+    Ok(Json(views))
+}
+
+/// Pull the run's issue text out of the `issue` pseudo-checkpoint.
+fn issue_text(checkpoints: &[Checkpoint]) -> Option<String> {
+    let raw = checkpoints
+        .iter()
+        .find(|c| c.node_name == ISSUE_NODE)?
+        .output_json
+        .as_str();
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    value
+        .get("issue")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// The implementer records an absolute `worktree_path`; iterations reuse it, so the latest
+/// checkpoint is authoritative. Whether it's still on disk is a filesystem question, not a
+/// store one — `ratatoskr clean` removes worktrees without touching checkpoints.
+fn worktree_view(checkpoints: &[Checkpoint]) -> Option<WorktreeView> {
+    let raw = checkpoints
+        .iter()
+        .rev()
+        .find(|c| c.node_name == "implementer")?
+        .output_json
+        .as_str();
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let path = value.get("worktree_path")?.as_str()?.to_string();
+    let exists = Path::new(&path).exists();
+    Some(WorktreeView { path, exists })
+}
+
+/// Parse stored JSON, falling back to the raw text so a malformed checkpoint is still visible
+/// rather than swallowing the whole response.
+fn parse_or_raw(raw: &str) -> serde_json::Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+}
+
+/// API error responses.
+#[derive(Debug, thiserror::Error)]
+enum ApiError {
+    #[error("{0}")]
+    NotFound(String),
+    #[error("store error: {0}")]
+    Store(#[from] ratatoskr_store::StoreError),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let code = match self {
+            ApiError::NotFound(_) => StatusCode::NOT_FOUND,
+            ApiError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (code, Json(serde_json::json!({ "error": self.to_string() }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cp(node: &str, json: &str) -> Checkpoint {
+        Checkpoint {
+            node_name: node.to_string(),
+            output_json: json.to_string(),
+            created_at: "t".to_string(),
+        }
+    }
+
+    #[test]
+    fn reads_the_issue_text_out_of_the_pseudo_node() {
+        let cps = vec![cp(ISSUE_NODE, r#"{"issue":"fix the flaky retry"}"#)];
+        assert_eq!(issue_text(&cps).as_deref(), Some("fix the flaky retry"));
+        assert!(issue_text(&[]).is_none());
+        // A malformed record is absent, not a panic.
+        assert!(issue_text(&[cp(ISSUE_NODE, "not json")]).is_none());
+    }
+
+    #[test]
+    fn takes_the_worktree_from_the_latest_implementer_checkpoint() {
+        let cps = vec![
+            cp("implementer", r#"{"worktree_path":"/tmp/old"}"#),
+            cp(
+                "implementer",
+                r#"{"worktree_path":"/tmp/ratatoskr-definitely-absent"}"#,
+            ),
+        ];
+        let wt = worktree_view(&cps).unwrap();
+        assert_eq!(wt.path, "/tmp/ratatoskr-definitely-absent");
+        assert!(!wt.exists);
+        assert!(worktree_view(&[]).is_none());
+    }
+
+    #[test]
+    fn a_malformed_checkpoint_still_renders() {
+        assert_eq!(parse_or_raw(r#"{"a":1}"#), serde_json::json!({"a": 1}));
+        assert_eq!(parse_or_raw("garbage"), serde_json::json!("garbage"));
+    }
+}

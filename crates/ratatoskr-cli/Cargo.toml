@@ -17,6 +17,7 @@ ratatoskr-nodes.workspace = true
 ratatoskr-exec.workspace = true
 ratatoskr-script.workspace = true
 ratatoskr-store.workspace = true
+ratatoskr-serve.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true

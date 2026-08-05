@@ -374,6 +374,20 @@ pub async fn run_full(
     let mut state = plan.state.clone();
     let clarifier = NodeClarifier::new(config, store, engine, run_id, issue, client.sink());
 
+    // `run_plan` signs off with `Planned`, but a full run is only half done — the fork+converge
+    // phase that follows is the longest one. Without this write the store would report `Planned`
+    // for its entire duration, making an in-flight full run indistinguishable from a finished
+    // `plan` (and a run that died mid-fork look like it planned successfully).
+    //
+    // Best-effort like the other mid-run status writes: this is observability bookkeeping, and
+    // failing the run over it would discard completed planning work for a cosmetic reason.
+    if let Err(e) = store
+        .upsert_run(run_id, None, RunStatus::Running.as_str())
+        .await
+    {
+        tracing::warn!("failed to record run status before the fork: {e}");
+    }
+
     let result = fork_and_converge(
         client, config, store, run_id, issue, &plan, engine, &clarifier,
     )
