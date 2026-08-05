@@ -69,13 +69,21 @@ pub async fn run(spec: SandboxSpec) -> Result<ExecOutput, SandboxError> {
         return Err(SandboxError::EmptyCommand);
     }
     match spec.backend.as_str() {
+        #[cfg(feature = "microsandbox")]
         "microsandbox" => run_microsandbox(spec).await,
+        #[cfg(not(feature = "microsandbox"))]
+        "microsandbox" => Err(SandboxError::Microsandbox(
+            "microsandbox backend not compiled in; rebuild ratatoskr-exec with \
+             --features microsandbox"
+                .to_string(),
+        )),
         "landlock" | "bwrap" => run_bwrap(spec).await,
         other => Err(SandboxError::UnknownBackend(other.to_string())),
     }
 }
 
 /// microsandbox (MicroVM) backend: boot the image with the mounts, run, tear down.
+#[cfg(feature = "microsandbox")]
 async fn run_microsandbox(spec: SandboxSpec) -> Result<ExecOutput, SandboxError> {
     use microsandbox::Sandbox;
 
@@ -201,6 +209,7 @@ mod tests {
         assert!(out.stdout.contains("sandbox-ok"));
     }
 
+    #[cfg(feature = "microsandbox")]
     #[tokio::test]
     #[ignore = "provisions the microsandbox runtime + boots a MicroVM; needs KVM + network"]
     async fn microsandbox_backend_boots_and_runs() {

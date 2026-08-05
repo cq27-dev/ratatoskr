@@ -45,3 +45,8 @@ jobs:
 
       - name: test
         run: cargo test --workspace
+
+      # The microsandbox backend is off by default (its build script needs network); keep the
+      # opt-in path compiling. Runs on CI, which has network to fetch the helper binary.
+      - name: check microsandbox feature
+        run: cargo clippy -p ratatoskr-exec --all-targets --features microsandbox -- -D warnings
