@@ -73,6 +73,32 @@ async function getJSON<T>(url: string): Promise<T> {
 
 export const listRuns = () => getJSON<RunSummary[]>("/api/runs");
 
+/**
+ * Start a run. Resolves as soon as the run has been spawned — a run takes minutes, so the id
+ * comes back immediately and the run is followed through the normal endpoints. A 409 means the
+ * server is already at its concurrent-run cap.
+ */
+export async function startRun(issue: string): Promise<string> {
+  const res = await fetch("/api/runs", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ issue }),
+  });
+  const body: unknown = await res.json().catch(() => null);
+  if (!res.ok) {
+    const msg =
+      body && typeof body === "object" && "error" in body
+        ? String((body as { error: unknown }).error)
+        : `${res.status}`;
+    throw new Error(msg);
+  }
+  return (body as StartedRun).run_id;
+}
+
+interface StartedRun {
+  run_id: string;
+}
+
 export const getRun = (runId: string) =>
   getJSON<RunDetail>(`/api/runs/${encodeURIComponent(runId)}`);
 

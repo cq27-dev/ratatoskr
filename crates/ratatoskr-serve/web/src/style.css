@@ -118,6 +118,69 @@ body::after {
   gap: 8px;
 }
 
+/* ── New run ─────────────────────────────────────────────────────────────── */
+.newrun {
+  border-bottom: 1px solid var(--rule);
+}
+
+.newrun textarea {
+  display: block;
+  width: 100%;
+  background: var(--panel);
+  color: var(--fg);
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+  padding: 9px 12px;
+  font: inherit;
+  letter-spacing: inherit;
+  resize: vertical;
+  outline-offset: -2px;
+}
+
+.newrun textarea::placeholder {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 10px;
+}
+
+.newrun textarea:focus-visible {
+  outline: 1px solid var(--fg);
+}
+
+.newrun button {
+  display: block;
+  width: 100%;
+  background: transparent;
+  color: var(--fg);
+  border: 0;
+  padding: 9px 12px;
+  font: inherit;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-size: 10px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.newrun button:hover:not(:disabled) {
+  background: var(--hazard);
+  color: var(--bg);
+}
+
+.newrun button:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.newrun-error {
+  margin: 0;
+  padding: 0 12px 9px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
 /* ── Run list ────────────────────────────────────────────────────────────── */
 .run {
   display: block;

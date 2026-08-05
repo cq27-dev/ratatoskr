@@ -5,10 +5,12 @@
 //! single-writer discipline is preserved because this process never writes. WAL means these reads
 //! don't block a run in progress.
 
+pub mod launch;
 pub mod pipeline;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
@@ -19,6 +21,7 @@ use ratatoskr_store::{Checkpoint, Store};
 use serde::Serialize;
 use tower_http::services::{ServeDir, ServeFile};
 
+use crate::launch::{LaunchError, Launcher};
 use crate::pipeline::{ISSUE_NODE, NodeView};
 
 /// Errors starting the server.
@@ -38,6 +41,19 @@ pub enum ServeError {
 #[derive(Clone)]
 struct AppState {
     store: Store,
+    launcher: Arc<Launcher>,
+}
+
+/// What `serve` needs: where to read, where to listen, and what to launch runs against.
+pub struct ServeOptions<'a> {
+    pub store_path: &'a Path,
+    pub addr: SocketAddr,
+    /// Working directory for runs started from the dashboard — the project's repo root.
+    pub project: &'a Path,
+    /// Config path handed to those runs, so they resolve the same settings this server did.
+    pub config_path: &'a Path,
+    /// How many runs may be in flight at once.
+    pub max_runs: usize,
 }
 
 /// Serve the dashboard API on `addr`, reading the store at `store_path`.
@@ -45,11 +61,19 @@ struct AppState {
 /// Fails if the store file is absent rather than creating an empty one: `Store::open` would
 /// happily produce a fresh database, and a typo'd path would then show an empty dashboard that
 /// looks like "no runs yet" instead of a mistake.
-pub async fn serve(store_path: &Path, addr: SocketAddr) -> Result<(), ServeError> {
+pub async fn serve(opts: ServeOptions<'_>) -> Result<(), ServeError> {
+    let ServeOptions {
+        store_path,
+        addr,
+        project,
+        config_path,
+        max_runs,
+    } = opts;
     if !store_path.exists() {
         return Err(ServeError::NoStore(store_path.to_path_buf()));
     }
     let store = Store::open(store_path)?;
+    let launcher = Arc::new(Launcher::new(project, config_path, max_runs));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     let web = web_dir();
@@ -66,7 +90,7 @@ pub async fn serve(store_path: &Path, addr: SocketAddr) -> Result<(), ServeError
         }
     }
 
-    axum::serve(listener, router(store, web)).await?;
+    axum::serve(listener, router(store, launcher, web)).await?;
     Ok(())
 }
 
@@ -84,12 +108,12 @@ fn web_dir() -> Option<PathBuf> {
     candidate.join("index.html").is_file().then_some(candidate)
 }
 
-fn router(store: Store, web: Option<PathBuf>) -> Router {
+fn router(store: Store, launcher: Arc<Launcher>, web: Option<PathBuf>) -> Router {
     let api = Router::new()
-        .route("/api/runs", get(list_runs))
+        .route("/api/runs", get(list_runs).post(start_run))
         .route("/api/runs/{run_id}", get(run_detail))
         .route("/api/runs/{run_id}/nodes/{node}", get(node_checkpoints))
-        .with_state(AppState { store });
+        .with_state(AppState { store, launcher });
 
     match web {
         // Unmatched paths fall back to index.html so the client owns its own routing.
@@ -252,6 +276,28 @@ fn parse_or_raw(raw: &str) -> serde_json::Value {
     serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
 }
 
+/// A request to start a run.
+#[derive(Debug, serde::Deserialize)]
+struct StartRun {
+    issue: String,
+}
+
+/// The id of a run that has been started. Returned as soon as the process is spawned — a run
+/// takes minutes, so the client follows it through the normal endpoints rather than waiting.
+#[derive(Debug, Serialize)]
+struct StartedRun {
+    run_id: String,
+}
+
+async fn start_run(
+    State(state): State<AppState>,
+    Json(body): Json<StartRun>,
+) -> Result<(StatusCode, Json<StartedRun>), ApiError> {
+    let run_id = state.launcher.spawn(&body.issue)?;
+    tracing::info!("started run {run_id} from the dashboard");
+    Ok((StatusCode::ACCEPTED, Json(StartedRun { run_id })))
+}
+
 /// API error responses.
 #[derive(Debug, thiserror::Error)]
 enum ApiError {
@@ -259,6 +305,8 @@ enum ApiError {
     NotFound(String),
     #[error("store error: {0}")]
     Store(#[from] ratatoskr_store::StoreError),
+    #[error("{0}")]
+    Launch(#[from] LaunchError),
 }
 
 impl IntoResponse for ApiError {
@@ -266,6 +314,11 @@ impl IntoResponse for ApiError {
         let code = match self {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            // Capacity is a "try again", a bad issue is the caller's fault, and a spawn failure
+            // is ours.
+            ApiError::Launch(LaunchError::AtCapacity(_)) => StatusCode::CONFLICT,
+            ApiError::Launch(LaunchError::EmptyIssue) => StatusCode::BAD_REQUEST,
+            ApiError::Launch(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (code, Json(serde_json::json!({ "error": self.to_string() }))).into_response()
     }

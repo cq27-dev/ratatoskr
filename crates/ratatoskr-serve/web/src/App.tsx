@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import PipelineGraph from "./PipelineGraph";
 import {
   LIVE,
   getNodeCheckpoints,
   getRun,
   listRuns,
+  startRun,
   type CheckpointView,
   type RunDetail,
   type RunSummary,
@@ -17,17 +18,68 @@ const POLL_MS = 3000;
 const short = (id: string | null) => (id ? id.slice(0, 8) : "—");
 const clock = (ts: string | null) => (ts ? ts.slice(11, 19) : "—");
 
+function NewRun({ onStarted }: { onStarted: (runId: string) => void }) {
+  const [issue, setIssue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const box = useRef<HTMLTextAreaElement>(null);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!issue.trim() || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const runId = await startRun(issue);
+      setIssue("");
+      onStarted(runId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+      box.current?.focus();
+    }
+  };
+
+  return (
+    <form className="newrun" onSubmit={(e) => void submit(e)}>
+      <div className="sec">
+        <span>[ NEW RUN ]</span>
+      </div>
+      <textarea
+        ref={box}
+        value={issue}
+        onChange={(e) => setIssue(e.target.value)}
+        placeholder="describe the task…"
+        rows={3}
+        spellCheck={false}
+        // Enter submits; newlines still available for multi-line issues.
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey) void submit(e);
+        }}
+      />
+      <button type="submit" disabled={busy || !issue.trim()}>
+        {busy ? "STARTING…" : ">>> START RUN"}
+      </button>
+      {error && <p className="newrun-error hazard">{error}</p>}
+    </form>
+  );
+}
+
 function Rail({
   runs,
   selected,
   onSelect,
+  onStarted,
 }: {
   runs: RunSummary[];
   selected: string | null;
   onSelect: (id: string) => void;
+  onStarted: (runId: string) => void;
 }) {
   return (
     <nav className="rail">
+      <NewRun onStarted={onStarted} />
       <div className="sec">
         <span>[ RUNS ]</span>
         <output>{runs.length}</output>
@@ -171,6 +223,16 @@ export default function App() {
     void refresh();
   }, [refresh]);
 
+  // Follow a freshly started run immediately; its rows land in the store moments later.
+  const onStarted = useCallback(
+    (newRunId: string) => {
+      setRunId(newRunId);
+      setDetail(null);
+      void refresh();
+    },
+    [refresh],
+  );
+
   // Poll while the selected run is live. #39 replaces this with a pushed log tail; until then
   // this is deliberately coarse — checkpoint arrival is the only signal the store can give.
   const live = detail?.status != null && LIVE.has(detail.status);
@@ -238,7 +300,12 @@ export default function App() {
         </span>
       </div>
 
-      <Rail runs={runs} selected={runId} onSelect={setRunId} />
+      <Rail
+        runs={runs}
+        selected={runId}
+        onSelect={setRunId}
+        onStarted={onStarted}
+      />
 
       <main className={node ? "stage stage--split" : "stage"}>
         {detail ? (
