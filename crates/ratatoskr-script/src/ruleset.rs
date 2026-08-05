@@ -223,7 +223,10 @@ mod tests {
 
     #[tokio::test]
     async fn ontoolcall_allows_and_denies_per_rule() {
-        let dir = std::env::temp_dir().join("ratatoskr-script-ruleset-test");
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-script-ruleset-test-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("scout.ts"),
@@ -256,7 +259,10 @@ mod tests {
 
     #[tokio::test]
     async fn model_and_system_prompt_deserialize() {
-        let dir = std::env::temp_dir().join("ratatoskr-script-ruleset-prompt-test");
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-script-ruleset-prompt-test-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("agents.ts"),

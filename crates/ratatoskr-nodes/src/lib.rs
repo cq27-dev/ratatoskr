@@ -687,8 +687,15 @@ mod agent_config_tests {
 
     /// scout: full ruleset (model + prompt), no `[models.scout]`. bookkeeper: partial ruleset
     /// (no model) → TOML route + built-in preamble. memory: no ruleset at all.
-    async fn engine() -> Arc<ScriptEngine> {
-        let dir = std::env::temp_dir().join("ratatoskr-nodes-agent-config-test");
+    ///
+    /// The fixture directory is unique per test *and* per process: these tests run concurrently,
+    /// and `fs::write` truncates before writing, so a shared path lets one test's engine load
+    /// another's half-written file and see a ruleset that is missing agents.
+    async fn engine(case: &str) -> Arc<ScriptEngine> {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-nodes-agent-config-{}-{case}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("agents.ts"),
@@ -706,7 +713,7 @@ mod agent_config_tests {
 
     #[tokio::test]
     async fn ruleset_model_replaces_the_toml_route() {
-        let engine = engine().await;
+        let engine = engine("model-override").await;
         let mut config = RatatoskrConfig::default();
         // The whole point: no `[models.scout]` entry at all.
         config.models.remove("scout");
@@ -719,7 +726,7 @@ mod agent_config_tests {
 
     #[tokio::test]
     async fn a_ruleset_without_a_model_still_falls_back_to_toml() {
-        let engine = engine().await;
+        let engine = engine("toml-fallback").await;
         let config = RatatoskrConfig::default();
 
         let cfg = node_agent_config(&engine, &config, &[], "bookkeeper", &[]).unwrap();
@@ -731,7 +738,7 @@ mod agent_config_tests {
 
     #[tokio::test]
     async fn no_ruleset_and_no_toml_route_is_still_an_error() {
-        let engine = engine().await;
+        let engine = engine("no-route").await;
         let mut config = RatatoskrConfig::default();
         config.models.remove("analyst");
 
@@ -743,7 +750,7 @@ mod agent_config_tests {
 
     #[tokio::test]
     async fn redteam_classifier_opts_in_on_either_route_source() {
-        let engine = engine().await;
+        let engine = engine("redteam-optin").await;
         let mut config = RatatoskrConfig::default();
         assert!(!classifier_enabled(&engine, &config));
         config.models.insert(
