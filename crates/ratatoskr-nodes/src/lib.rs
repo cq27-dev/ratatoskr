@@ -13,6 +13,7 @@ pub mod memory;
 pub mod redteam;
 pub mod scout;
 pub mod testrun;
+pub mod workflow;
 
 pub use analyst::{AnalystNode, AnalystOutput, Risk};
 pub use bookkeeper::{BookkeeperInput, BookkeeperNode, BookkeeperOutput, MemoryWritten};
@@ -28,7 +29,7 @@ use ratatoskr_core::{RatatoskrConfig, RunState, RunStatus, ToolPolicy};
 use ratatoskr_exec::{WorktreePath, remove_worktree};
 use ratatoskr_graph::{Node, NodeError};
 use ratatoskr_mcp::RagRatClient;
-use ratatoskr_script::ScriptEngine;
+use ratatoskr_script::{ScriptEngine, WorkflowRuntime};
 use ratatoskr_store::{Store, StoreError};
 use rmcp::model::Tool;
 use serde::Serialize;
@@ -78,6 +79,12 @@ pub async fn run_plan(
     issue: &str,
     engine: &Arc<ScriptEngine>,
 ) -> Result<PlanOutcome, PlanError> {
+    // A `.ratatoskr/workflow.ts` overrides the built-in scout → memory → analyst sequencing.
+    if let Some(runtime) = load_workflow().await? {
+        let ctx = workflow::WorkflowContext::new(client, config, store, run_id, issue, engine)?;
+        return workflow::run_plan_scripted(runtime, ctx).await;
+    }
+
     store
         .upsert_run(run_id, None, RunStatus::Running.as_str())
         .await?;
@@ -203,6 +210,13 @@ async fn checkpoint<T: Serialize>(
     Ok(())
 }
 
+/// Load `.ratatoskr/workflow.ts` if present — the optional scriptable-orchestration override.
+async fn load_workflow() -> Result<Option<WorkflowRuntime>, PlanError> {
+    WorkflowRuntime::load(std::path::Path::new(".ratatoskr/workflow.ts"))
+        .await
+        .map_err(|e| PlanError::node("workflow", NodeError::Failed(e.to_string())))
+}
+
 fn route(config: &RatatoskrConfig, name: &str) -> Result<ratatoskr_core::ModelRoute, PlanError> {
     config
         .models
@@ -314,6 +328,12 @@ pub async fn run_full(
     issue: &str,
     engine: &Arc<ScriptEngine>,
 ) -> Result<RunOutcome, PlanError> {
+    // A `.ratatoskr/workflow.ts` overrides the whole run flow (plan + fork + converge).
+    if let Some(runtime) = load_workflow().await? {
+        let ctx = workflow::WorkflowContext::new(client, config, store, run_id, issue, engine)?;
+        return workflow::run_full_scripted(runtime, ctx).await;
+    }
+
     let plan = run_plan(client, config, store, run_id, issue, engine).await?;
     let mut state = plan.state.clone();
 

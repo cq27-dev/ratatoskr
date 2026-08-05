@@ -7,8 +7,10 @@
 
 pub mod ruleset;
 pub mod transpile;
+pub mod workflow;
 
 pub use ruleset::{AgentRuleset, ModelRule, NodeRuleset, ScriptEngine, ToolRule};
+pub use workflow::{HostFn, HostResult, WorkflowRuntime};
 
 /// Errors loading or evaluating ruleset scripts.
 #[derive(Debug, thiserror::Error)]
