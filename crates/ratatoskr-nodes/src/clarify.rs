@@ -15,6 +15,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ratatoskr_agent::Clarifier;
 use ratatoskr_core::RatatoskrConfig;
@@ -38,6 +39,11 @@ const ANSWER_MAX_TURNS: usize = 3;
 /// Cap on how much of a target's prior checkpoint is fed back as answer context.
 const CONTEXT_LIMIT: usize = 4000;
 
+/// Hard ceiling on the request that waits for a human. The dashboard gives up first (its own
+/// timeout is shorter); this only stops a wedged connection from blocking a node indefinitely,
+/// and stays well under the prompt-cache TTL that the block-the-node design depends on.
+const USER_ANSWER_CEILING: Duration = Duration::from_secs(150);
+
 /// The synthetic `ask` tool declaration, injected into an asker node's tool list. Like the
 /// structured-output tool, it's a system capability — not a rag-rat tool subject to a ruleset's
 /// allow/deny (the clarification hook handles it before the ruleset hook sees it). A per-node opt-out
@@ -48,8 +54,10 @@ pub(crate) fn ask_tool() -> Tool {
         "properties": {
             "to": {
                 "type": "string",
-                "enum": ["scout", "analyst", "bookkeeper", "redteam"],
-                "description": "Which node to ask; `analyst` is the general fallback answerer."
+                "enum": ["scout", "analyst", "bookkeeper", "redteam", "user"],
+                "description": "Which node to ask. `user` reaches the human operator when one is \
+                    watching the dashboard, and is answered by the `analyst` when nobody is — so \
+                    prefer a peer node when one actually holds the answer."
             },
             "question": { "type": "string", "description": "A self-contained question." }
         },
@@ -137,7 +145,63 @@ impl NodeClarifier {
         }
     }
 
+    /// Offer the question to a human, if this run was started by a dashboard and somebody is
+    /// watching it. `None` means nobody answered — for any reason — and the caller falls through
+    /// to the node path, which is exactly what an unattended run does today.
+    async fn ask_the_user(&self, from: &str, question: &str) -> Option<String> {
+        let dashboard = std::env::var("RATATOSKR_DASHBOARD").ok()?;
+        let question_id = uuid::Uuid::new_v4().to_string();
+
+        // Emit before waiting: the dashboard learns about the question by tailing this, so it has
+        // to be on disk before the request that blocks on an answer.
+        tracing::info!(
+            kind = "question",
+            question_id,
+            from,
+            question,
+            "waiting on the user"
+        );
+
+        let answer = self.await_user_answer(&dashboard, &question_id).await;
+
+        // Always announce the outcome, including the ordinary one where nobody answered. The
+        // dashboard clears its prompt on this event, so without it a viewer is left staring at a
+        // question the run has long since moved past.
+        tracing::info!(
+            kind = "question_answered",
+            question_id,
+            answered = answer.is_some(),
+            "question resolved"
+        );
+        answer
+    }
+
+    /// The blocking half. Any failure — unreachable dashboard, malformed reply, nobody watching,
+    /// nobody typing — is the same `None`, because the caller's response to all of them is the
+    /// same: fall through to the node path.
+    async fn await_user_answer(&self, dashboard: &str, question_id: &str) -> Option<String> {
+        let reply = reqwest::Client::new()
+            .post(format!("{dashboard}/internal/clarifications"))
+            .json(&serde_json::json!({ "run_id": self.run_id, "question_id": question_id }))
+            .timeout(USER_ANSWER_CEILING)
+            .send()
+            .await
+            .ok()?
+            .json::<serde_json::Value>()
+            .await
+            .ok()?;
+        reply.get("answer")?.as_str().map(str::to_string)
+    }
+
     async fn answer_inner(&self, from: &str, to: &str, question: &str) -> String {
+        // A question addressed to the user goes to a human first; everything else keeps its
+        // existing routing, because a peer node holds answers a person doesn't.
+        if to.trim() == "user"
+            && let Some(answer) = self.ask_the_user(from, question).await
+        {
+            return format!("Answer from the user:\n{answer}");
+        }
+
         let (answerer, checkpoint_name) = resolve_target(to);
 
         let mut context = format!("ISSUE:\n{}\n", self.issue);

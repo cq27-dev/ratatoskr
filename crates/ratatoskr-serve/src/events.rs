@@ -40,6 +40,9 @@ pub struct LiveEvent {
     pub node: Option<String>,
     /// The useful part: the tool name, the model's text, or the message.
     pub detail: String,
+    /// Set on a `question` event: what a viewer's answer has to be posted against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_id: Option<String>,
 }
 
 /// The newest daily log file, if any. `tracing-appender` suffixes the date (`ratatoskr.jsonl.
@@ -97,6 +100,8 @@ fn to_event(record: &Value) -> LiveEvent {
     let detail = match kind.as_str() {
         "tool_call" => str_field("tool").unwrap_or("tool"),
         "model_text" => str_field("text").unwrap_or_default(),
+        // The question itself is the point of a question event, not its log message.
+        "question" => str_field("question").unwrap_or_default(),
         _ => str_field("message").unwrap_or(&kind),
     };
     let detail = match detail.char_indices().nth(DETAIL_LIMIT) {
@@ -106,6 +111,7 @@ fn to_event(record: &Value) -> LiveEvent {
 
     LiveEvent {
         at: str_field("timestamp").unwrap_or_default().to_string(),
+        question_id: str_field("question_id").map(str::to_string),
         kind,
         node: node_of(record).map(str::to_string),
         detail,
@@ -121,6 +127,23 @@ fn events_for(run_id: &str, lines: &[&str]) -> Vec<LiveEvent> {
         .filter(|record| run_id_of(record) == Some(run_id))
         .map(|record| to_event(&record))
         .collect()
+}
+
+/// Cap what a newly attached viewer is replayed.
+///
+/// The tail, not the whole history — but never at the cost of a question. A run blocked on a
+/// human is the one thing a viewer must see, and on a busy run its event is easily older than the
+/// last few hundred lines.
+fn trim_replay(events: &mut Vec<LiveEvent>) {
+    if events.len() <= REPLAY_LIMIT {
+        return;
+    }
+    let cut = events.len() - REPLAY_LIMIT;
+    let mut seen = 0;
+    events.retain(|event| {
+        seen += 1;
+        seen > cut || event.kind.starts_with("question")
+    });
 }
 
 /// Read whatever has been appended since `pos`. Returns the new text and the new position.
@@ -172,9 +195,8 @@ impl Tail {
         let lines: Vec<&str> = complete.lines().collect();
 
         let mut events = events_for(run_id, &lines);
-        if !self.replayed && events.len() > REPLAY_LIMIT {
-            // Attaching to a long-running run replays the tail, not the whole history.
-            events.drain(..events.len() - REPLAY_LIMIT);
+        if !self.replayed {
+            trim_replay(&mut events);
         }
         // Only once a complete line has actually been seen, so a connect that races a
         // half-written line still caps the backlog that follows.
@@ -267,6 +289,60 @@ mod tests {
         assert_eq!(events[1].node.as_deref(), Some("analyst"));
         // A malformed line is skipped rather than ending the stream.
         assert_eq!(events_for("r3", &refs).len(), 0);
+    }
+
+    #[test]
+    fn replay_trimming_keeps_the_tail_and_every_question() {
+        let question = LiveEvent {
+            at: "t0".into(),
+            kind: "question".into(),
+            node: None,
+            detail: "which way?".into(),
+            question_id: Some("q-1".into()),
+        };
+        let noise = LiveEvent {
+            at: "t1".into(),
+            kind: "tool_call".into(),
+            node: Some("scout".into()),
+            detail: "semantic_search".into(),
+            question_id: None,
+        };
+
+        // The question is the oldest event, well outside the replay window.
+        let mut events = vec![question];
+        events.extend(std::iter::repeat_n(noise.clone(), REPLAY_LIMIT + 50));
+        trim_replay(&mut events);
+
+        assert_eq!(
+            events.iter().filter(|e| e.kind == "question").count(),
+            1,
+            "an open question survives the trim however old it is"
+        );
+        assert_eq!(events.len(), REPLAY_LIMIT + 1, "the rest is capped");
+
+        // Under the limit nothing is dropped.
+        let mut short = vec![noise; 3];
+        trim_replay(&mut short);
+        assert_eq!(short.len(), 3);
+    }
+
+    #[test]
+    fn a_question_carries_its_id_and_text() {
+        // Both are needed: the text to show, the id to answer against.
+        let record = serde_json::json!({
+            "kind": "question",
+            "question_id": "q-7",
+            "question": "which approach should I take?",
+            "message": "waiting on the user",
+            "spans": [{"name": "run", "run_id": "r1"}]
+        });
+        let event = to_event(&record);
+        assert_eq!(event.question_id.as_deref(), Some("q-7"));
+        assert_eq!(event.detail, "which approach should I take?");
+
+        // Everything else leaves it unset, so the UI can't offer to answer a tool call.
+        let tool: Value = serde_json::from_str(&agent_line("r1", "scout")).unwrap();
+        assert!(to_event(&tool).question_id.is_none());
     }
 
     #[test]

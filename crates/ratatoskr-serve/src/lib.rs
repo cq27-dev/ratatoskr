@@ -5,6 +5,7 @@
 //! single-writer discipline is preserved because this process never writes. WAL means these reads
 //! don't block a run in progress.
 
+pub mod clarify;
 pub mod events;
 pub mod launch;
 pub mod pipeline;
@@ -24,6 +25,7 @@ use serde::Serialize;
 use tokio_stream::StreamExt as _;
 use tower_http::services::{ServeDir, ServeFile};
 
+use crate::clarify::{AnswerError, AskReply, AskRequest, Desk};
 use crate::launch::{LaunchError, Launcher};
 use crate::pipeline::{ISSUE_NODE, NodeView};
 
@@ -47,6 +49,8 @@ struct AppState {
     launcher: Arc<Launcher>,
     /// Where the structured log lives, for the live event stream.
     log_dir: PathBuf,
+    /// Questions from runs waiting on a human, and who is watching.
+    desk: Arc<Desk>,
 }
 
 /// What `serve` needs: where to read, where to listen, and what to launch runs against.
@@ -78,10 +82,18 @@ pub async fn serve(opts: ServeOptions<'_>) -> Result<(), ServeError> {
         return Err(ServeError::NoStore(store_path.to_path_buf()));
     }
     let store = Store::open(store_path)?;
-    let launcher = Arc::new(Launcher::new(project, config_path, max_runs));
     let log_dir = project.join(".ratatoskr/logs");
+    let desk = Arc::new(Desk::default());
+    // Bind before building the launcher: a spawned run is told where to reach this server, and
+    // with port 0 the real port isn't known until the listener exists.
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
+    let launcher = Arc::new(Launcher::new(
+        project,
+        config_path,
+        max_runs,
+        &dashboard_url(bound),
+    ));
     let web = web_dir();
 
     match &web {
@@ -96,8 +108,20 @@ pub async fn serve(opts: ServeOptions<'_>) -> Result<(), ServeError> {
         }
     }
 
-    axum::serve(listener, router(store, launcher, log_dir, web)).await?;
+    axum::serve(listener, router(store, launcher, log_dir, desk, web)).await?;
     Ok(())
+}
+
+/// Where a spawned run should reach this server.
+///
+/// A wildcard bind (`0.0.0.0`) is an address to listen on, not one to connect to, so the child is
+/// pointed at loopback on the same port.
+fn dashboard_url(bound: SocketAddr) -> String {
+    if bound.ip().is_unspecified() {
+        format!("http://127.0.0.1:{}", bound.port())
+    } else {
+        format!("http://{bound}")
+    }
 }
 
 const WEB_HINT: &str = "crates/ratatoskr-serve/web: `bun install && bun run build`";
@@ -114,16 +138,32 @@ fn web_dir() -> Option<PathBuf> {
     candidate.join("index.html").is_file().then_some(candidate)
 }
 
-fn router(store: Store, launcher: Arc<Launcher>, log_dir: PathBuf, web: Option<PathBuf>) -> Router {
+fn router(
+    store: Store,
+    launcher: Arc<Launcher>,
+    log_dir: PathBuf,
+    desk: Arc<Desk>,
+    web: Option<PathBuf>,
+) -> Router {
     let api = Router::new()
         .route("/api/runs", get(list_runs).post(start_run))
         .route("/api/runs/{run_id}", get(run_detail))
         .route("/api/runs/{run_id}/nodes/{node}", get(node_checkpoints))
         .route("/api/runs/{run_id}/events", get(run_events))
+        .route(
+            "/api/clarifications/{question_id}",
+            axum::routing::post(answer_question),
+        )
+        // Not for browsers: the waiting end of the rendezvous, called by a run process.
+        .route(
+            "/internal/clarifications",
+            axum::routing::post(await_answer),
+        )
         .with_state(AppState {
             store,
             launcher,
             log_dir,
+            desk,
         });
 
     match web {
@@ -319,7 +359,14 @@ async fn run_events(
     AxumPath(run_id): AxumPath<String>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let (tx, rx) = tokio::sync::mpsc::channel(256);
-    tokio::spawn(events::follow(state.log_dir.clone(), run_id, tx));
+    // Watching this run *is* holding an event stream open, so attendance is exactly this task's
+    // lifetime — no disconnect handling to get wrong.
+    let attending = state.desk.attend(&run_id);
+    let dir = state.log_dir.clone();
+    tokio::spawn(async move {
+        events::follow(dir, run_id, tx).await;
+        drop(attending);
+    });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|event| {
         Ok(Event::default()
@@ -331,6 +378,40 @@ async fn run_events(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+/// A run asking whether a human will answer. Blocks until one does, or until it's clear none
+/// will — which is immediately when nobody is watching, so an unattended run is never delayed.
+async fn await_answer(
+    State(state): State<AppState>,
+    Json(req): Json<AskRequest>,
+) -> Json<AskReply> {
+    let answer = state
+        .desk
+        .wait_for_answer(&req.run_id, &req.question_id)
+        .await;
+    Json(AskReply { answer })
+}
+
+/// A human answering a parked question.
+#[derive(Debug, serde::Deserialize)]
+struct Answer {
+    answer: String,
+}
+
+async fn answer_question(
+    State(state): State<AppState>,
+    AxumPath(question_id): AxumPath<String>,
+    Json(body): Json<Answer>,
+) -> Result<StatusCode, ApiError> {
+    match state.desk.answer(&question_id, body.answer) {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        // Already answered, timed out, or the run moved on — all the same to a viewer, and all
+        // reachable by clicking twice or answering a question replayed from history.
+        Err(AnswerError::NotPending) => Err(ApiError::Gone(
+            "that question is no longer waiting for an answer".to_string(),
+        )),
+    }
+}
+
 /// API error responses.
 #[derive(Debug, thiserror::Error)]
 enum ApiError {
@@ -340,6 +421,8 @@ enum ApiError {
     Store(#[from] ratatoskr_store::StoreError),
     #[error("{0}")]
     Launch(#[from] LaunchError),
+    #[error("{0}")]
+    Gone(String),
 }
 
 impl IntoResponse for ApiError {
@@ -352,6 +435,7 @@ impl IntoResponse for ApiError {
             ApiError::Launch(LaunchError::AtCapacity(_)) => StatusCode::CONFLICT,
             ApiError::Launch(LaunchError::EmptyIssue) => StatusCode::BAD_REQUEST,
             ApiError::Launch(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::Gone(_) => StatusCode::GONE,
         };
         (code, Json(serde_json::json!({ "error": self.to_string() }))).into_response()
     }

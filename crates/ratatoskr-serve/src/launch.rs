@@ -36,16 +36,19 @@ pub struct Launcher {
     /// Working directory for spawned runs — the project's repo root.
     project: PathBuf,
     config: PathBuf,
+    /// Where a run should reach this server to ask a human a question.
+    dashboard: String,
     permits: Arc<Semaphore>,
     max: usize,
 }
 
 impl Launcher {
-    pub fn new(project: &Path, config: &Path, max: usize) -> Self {
+    pub fn new(project: &Path, config: &Path, max: usize, dashboard: &str) -> Self {
         let max = max.max(1);
         Launcher {
             project: project.to_path_buf(),
             config: config.to_path_buf(),
+            dashboard: dashboard.to_string(),
             permits: Arc::new(Semaphore::new(max)),
             max,
         }
@@ -77,6 +80,9 @@ impl Launcher {
         // group and take running work down with it.
         #[cfg(unix)]
         cmd.process_group(0);
+        // How the run reaches back to ask a human. A run started any other way doesn't get this,
+        // and answers its own questions exactly as it does today.
+        cmd.env("RATATOSKR_DASHBOARD", &self.dashboard);
         let mut child = cmd
             .arg("run")
             .arg("--run-id")
@@ -121,7 +127,12 @@ mod tests {
     use super::*;
 
     fn launcher(max: usize) -> Launcher {
-        Launcher::new(Path::new("."), Path::new("ratatoskr.toml"), max)
+        Launcher::new(
+            Path::new("."),
+            Path::new("ratatoskr.toml"),
+            max,
+            "http://127.0.0.1:7878",
+        )
     }
 
     #[tokio::test]
