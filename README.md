@@ -76,8 +76,11 @@ cargo run -p ratatoskr-cli -- run "Fix the flaky retry in the store"
 cargo run -p ratatoskr-cli -- bookkeep <run-id>   # replay just the bookkeeper on a stored run
 ```
 
-The sandbox backend (`[sandbox] backend`) is `microsandbox` (a MicroVM, needs KVM) or `landlock`
-(bubblewrap, no image). Both are verified working.
+The sandbox backend (`[sandbox] backend`) is `landlock` (bubblewrap + Landlock, the default — no
+image, builds offline) or `microsandbox` (a MicroVM, needs KVM). The microsandbox backend is behind
+a Cargo feature because its build script downloads a helper binary; build with
+`cargo build --features ratatoskr-exec/microsandbox` to enable it, otherwise selecting it at runtime
+errors.
 
 ## License
 

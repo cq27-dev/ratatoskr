@@ -52,7 +52,9 @@ pub struct SandboxConfig {
 impl Default for SandboxConfig {
     fn default() -> Self {
         SandboxConfig {
-            backend: "microsandbox".to_string(),
+            // landlock builds with no network build script; microsandbox is opt-in behind
+            // ratatoskr-exec's `microsandbox` feature (see its Cargo.toml).
+            backend: "landlock".to_string(),
             image: "docker.io/library/rust:1-slim".to_string(),
             test_command: vec!["cargo".to_string(), "test".to_string()],
         }
