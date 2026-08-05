@@ -5281,6 +5281,8 @@ dependencies = [
  "rig-core",
  "rmcp",
  "schemars 1.2.2",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tracing",
 ]

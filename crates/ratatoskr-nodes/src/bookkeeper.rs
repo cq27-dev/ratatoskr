@@ -95,6 +95,7 @@ pub struct BookkeeperNode {
     pub sink: ServerSink,
     pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
     pub max_turns: Option<usize>,
+    pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
 }
 
 impl BookkeeperNode {
@@ -110,6 +111,7 @@ impl BookkeeperNode {
             schemars::schema_for!(MemoryDraft),
             self.policy.clone(),
             self.max_turns,
+            self.clarifier.clone(),
         )
         .await
         .map_err(|e| NodeError::Failed(format!("bookkeeper compose failed: {e}")))?;

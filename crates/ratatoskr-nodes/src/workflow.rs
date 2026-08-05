@@ -210,6 +210,8 @@ async fn scout_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, St
         sink: ctx.sink.clone(),
         policy: cfg.policy,
         max_turns: cfg.max_turns,
+        // Node-to-node clarification is built-in-flow only for now; the scripted path opts out.
+        clarifier: None,
     };
     let out = node
         .run(issue, &RunState::new(&ctx.run_id, None))
@@ -284,6 +286,7 @@ fn build_red_team(ctx: &WorkflowContext) -> Result<RedTeamNode, PlanError> {
                 sink: ctx.sink.clone(),
                 policy: cfg.policy,
                 max_turns: cfg.max_turns,
+                clarifier: None,
             })
         }
         None => None,
@@ -630,6 +633,7 @@ async fn bookkeep_scripted(
         sink: ctx.sink.clone(),
         policy: cfg.policy,
         max_turns: cfg.max_turns,
+        clarifier: None,
     };
     let out = node
         .run(input)

@@ -20,7 +20,10 @@ const PREAMBLE: &str = "You are the analyst in a code-planning pipeline. You are
     determine what this change actually touches and its blast radius — call the tools, don't guess. \
     Produce: an impact summary, the specific symbols/paths touched, a list of risks (each with a \
     severity), a list of concrete requirements the implementation must satisfy, and a residual-risk \
-    note capturing what remains uncertain or unknown after your analysis.";
+    note capturing what remains uncertain or unknown after your analysis. You are also the \
+    pipeline's fallback answerer: when another node cannot resolve something on its own, its \
+    question routes to you, so hold clear, present-tense judgments about the change that you can \
+    share when asked.";
 
 /// Input to the analyst: the issue plus the two upstream node outputs.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -89,6 +92,8 @@ impl Node for AnalystNode {
             schemars::schema_for!(AnalystOutput),
             self.policy.clone(),
             self.max_turns,
+            // Analyst is the clarification terminus — it answers other nodes but never asks.
+            None,
         )
         .await
         .map_err(|e| NodeError::Failed(format!("analyst agent failed: {e}")))?;

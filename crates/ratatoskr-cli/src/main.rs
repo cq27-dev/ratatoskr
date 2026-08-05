@@ -205,6 +205,7 @@ async fn ask(question: &str, config_path: &Path) -> anyhow::Result<()> {
         question,
         client.tools(),
         client.sink(),
+        None,
     )
     .await;
 
