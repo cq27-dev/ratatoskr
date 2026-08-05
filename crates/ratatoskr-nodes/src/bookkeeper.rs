@@ -18,7 +18,7 @@ use crate::implementer::ImplementerOutput;
 
 /// rag-rat tools the compose agent may use to ground the memory (and to engage the tool-composing
 /// output mode — see the OutputMode note in ratatoskr-agent).
-pub const BOOKKEEPER_TOOLS: &[&str] = &["semantic_search", "symbol_lookup"];
+pub const BOOKKEEPER_TOOLS: &[&str] = &["semantic_search", "symbol_lookup", "memory_search"];
 
 /// rag-rat's memory taxonomy (`McpMemoryKind`). The compose model must pick one of these; anything
 /// else is normalized to `Decision`.
@@ -38,22 +38,48 @@ const VALID_KINDS: &[&str] = &[
     "Concept",
 ];
 
-const PREAMBLE: &str = "You are the bookkeeper. A coding run just finished (the prompt says whether \
-    it succeeded or hit a wall). Distill ONE durable, non-obvious learning a FUTURE run on a \
-    related change would want — an invariant, a decision + its rationale, a gotcha, a risk, or (if \
-    the run hit a wall) what that wall was and what to watch for. Write it in the present tense: \
-    what is true now and how to apply it, NOT a changelog of what this run did. Be specific and \
-    grounded; a vague or obvious memory is worse than none. Choose a `kind` from rag-rat's \
-    taxonomy: Invariant, Decision, RejectedAlternative, Risk, BugPattern, TestExpectation, \
-    PerformanceNote, SecurityNote, FFIBoundary, PlatformQuirk, FollowUp, OpenQuestion, Concept.";
+const PREAMBLE: &str = "You are the bookkeeper. A coding run just finished (the prompt says \
+    whether it succeeded or hit a wall). Decide what, if anything, the repository's memory should \
+    now say — and act on the one that fits.\n\n\
+    FIRST search the existing memories with `memory_search` for whatever this change touched. What \
+    you find decides between three outcomes:\n\
+    - `revise` — this run made an existing memory WRONG or incomplete. Rewrite its body to state \
+      what is true NOW; do not append a status section or a changelog. This is the right answer \
+      more often than it looks, because a change that alters behaviour usually contradicts \
+      something already recorded.\n\
+    - `create` — there is a durable, non-obvious learning here that nothing already covers: an \
+      invariant, a decision and its rationale, a gotcha, a risk, or (if the run hit a wall) what \
+      that wall was and what to watch for.\n\
+    - `none` — nothing worth recording. This is a perfectly good and COMMON answer. A vague, \
+      obvious, or duplicate memory is worse than no memory at all, because every future run pays \
+      to read it. If the change was routine, or what you would write is already recorded, choose \
+      this and say why.\n\n\
+    Write in the present tense: what is true now and how to apply it, NOT a narrative of what this \
+    run did. Be specific and grounded. Choose a `kind` from rag-rat's taxonomy: Invariant, \
+    Decision, RejectedAlternative, Risk, BugPattern, TestExpectation, PerformanceNote, \
+    SecurityNote, FFIBoundary, PlatformQuirk, FollowUp, OpenQuestion, Concept.";
 
-/// What the compose model produces.
+/// What the bookkeeper decided the repository's memory should say.
+///
+/// Flat rather than a tagged union because models fill a flat shape far more reliably, and
+/// because the fields a decision needs overlap: Rust validates the combination.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct MemoryDraft {
+pub struct MemoryDecision {
+    /// `none`, `create`, or `revise`.
+    pub action: String,
+    /// Why this was the right call. The whole result when nothing is recorded, so it is never
+    /// optional — "nothing to record" without a reason is indistinguishable from a failure.
+    #[serde(default)]
+    pub reason: String,
+    /// Which memory to rewrite, for `revise`.
+    #[serde(default)]
+    pub memory_id: Option<String>,
     /// One of rag-rat's kinds; normalized to `Decision` if unrecognized.
     #[serde(default)]
     pub kind: String,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub body: String,
 }
 
@@ -70,7 +96,14 @@ pub struct MemoryWritten {
 /// Bookkeeper output: the memories written plus the run's artifact fields.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BookkeeperOutput {
+    /// Memories created. Empty is an ordinary outcome, not a failure.
     pub memories_written: Vec<MemoryWritten>,
+    /// Memories this run rewrote because it made them wrong.
+    #[serde(default)]
+    pub memories_revised: Vec<MemoryWritten>,
+    /// Why nothing was recorded, when nothing was. Present exactly when both lists are empty.
+    #[serde(default)]
+    pub skipped: Option<String>,
     pub iterations: u32,
     pub residual_risk_accepted: bool,
 }
@@ -85,6 +118,19 @@ pub struct BookkeeperInput {
     /// Whether the run converged. `false` means it exhausted its iteration budget with unresolved
     /// failures — the memory is framed as a wall hit and tagged `unresolved`.
     pub converged: bool,
+}
+
+impl BookkeeperInput {
+    /// A result that records nothing, and says why.
+    fn nothing_recorded(&self, reason: &str) -> BookkeeperOutput {
+        BookkeeperOutput {
+            memories_written: Vec::new(),
+            memories_revised: Vec::new(),
+            skipped: Some(reason.to_string()),
+            iterations: self.iterations,
+            residual_risk_accepted: false,
+        }
+    }
 }
 
 /// The bookkeeper node. Holds a cheap model route, a small tool subset (for the compose agent), and
@@ -104,6 +150,16 @@ pub struct BookkeeperNode {
 
 impl BookkeeperNode {
     pub async fn run(&self, input: BookkeeperInput) -> Result<BookkeeperOutput, NodeError> {
+        // A run that changed nothing has nothing to teach. Exact, and it costs no model call —
+        // this is the case that used to store a memory saying there was nothing to store.
+        if input.converged
+            && input.implementer.touched_files.is_empty()
+            && input.implementer.diff_summary.trim().is_empty()
+        {
+            tracing::info!("nothing was changed; recording no memory");
+            return Ok(input.nothing_recorded("the run changed nothing"));
+        }
+
         let prompt = render_prompt(&input);
         let raw = ratatoskr_agent::run_structured(
             "bookkeeper",
@@ -116,7 +172,7 @@ impl BookkeeperNode {
             &prompt,
             self.tools.clone(),
             self.sink.clone(),
-            schemars::schema_for!(MemoryDraft),
+            schemars::schema_for!(MemoryDecision),
             self.policy.clone(),
             self.max_turns,
             self.clarifier.clone(),
@@ -124,31 +180,135 @@ impl BookkeeperNode {
         .await
         .map_err(|e| NodeError::Failed(format!("bookkeeper compose failed: {e}")))?;
 
-        let draft = parse_validated::<MemoryDraft>(&raw)?;
-        let kind = normalize_kind(&draft.kind);
-        let anchor = input.implementer.touched_files.first().cloned();
+        let decision = parse_validated::<MemoryDecision>(&raw)?;
+        self.act_on(decision, &input).await
+    }
 
-        // Tag unresolved (max-iterations) runs so they're distinguishable from success write-backs.
-        let tags: &[&str] = if input.converged {
-            &["ratatoskr", "bookkeeper"]
-        } else {
-            &["ratatoskr", "bookkeeper", "unresolved"]
-        };
+    /// Carry out what the model decided. The model chooses; this performs the write, so the
+    /// memory layer only ever changes through a call this code made deliberately.
+    async fn act_on(
+        &self,
+        decision: MemoryDecision,
+        input: &BookkeeperInput,
+    ) -> Result<BookkeeperOutput, NodeError> {
+        match decision.action.trim().to_ascii_lowercase().as_str() {
+            "revise" => {
+                // A revision without a target is a create that lost its id; treat the ambiguity as
+                // "record nothing" rather than guessing which memory to overwrite.
+                let (Some(id), false) = (
+                    decision.memory_id.as_deref().filter(|id| !id.is_empty()),
+                    decision.body.trim().is_empty(),
+                ) else {
+                    tracing::warn!("bookkeeper asked to revise without a memory id or body");
+                    return Ok(input.nothing_recorded("the revision named no memory to rewrite"));
+                };
+                let title = (!decision.title.trim().is_empty()).then(|| decision.title.clone());
+                self.update_memory(id, title.as_deref(), &decision.body)
+                    .await?;
+                tracing::info!(memory_id = id, "revised a memory this run made wrong");
 
-        let memory_id = self
-            .create_memory(&kind, &draft.title, &draft.body, anchor.as_deref(), tags)
-            .await?;
+                Ok(BookkeeperOutput {
+                    memories_written: Vec::new(),
+                    memories_revised: vec![MemoryWritten {
+                        kind: normalize_kind(&decision.kind),
+                        anchor: String::new(),
+                        memory_id: id.to_string(),
+                        summary: title.or(Some(decision.reason)),
+                    }],
+                    skipped: None,
+                    iterations: input.iterations,
+                    residual_risk_accepted: false,
+                })
+            }
+            "create" => {
+                if decision.title.trim().is_empty() || decision.body.trim().is_empty() {
+                    tracing::warn!("bookkeeper produced an empty memory; recording nothing");
+                    return Ok(input.nothing_recorded("the composed memory was empty"));
+                }
+                let kind = normalize_kind(&decision.kind);
+                let anchor = input.implementer.touched_files.first().cloned();
+                // Tag unresolved (max-iterations) runs so they're distinguishable from success
+                // write-backs.
+                let tags: &[&str] = if input.converged {
+                    &["ratatoskr", "bookkeeper"]
+                } else {
+                    &["ratatoskr", "bookkeeper", "unresolved"]
+                };
 
-        Ok(BookkeeperOutput {
-            memories_written: vec![MemoryWritten {
-                kind,
-                anchor: anchor.unwrap_or_default(),
-                memory_id,
-                summary: Some(draft.title),
-            }],
-            iterations: input.iterations,
-            residual_risk_accepted: false,
-        })
+                let memory_id = self
+                    .create_memory(
+                        &kind,
+                        &decision.title,
+                        &decision.body,
+                        anchor.as_deref(),
+                        tags,
+                    )
+                    .await?;
+
+                Ok(BookkeeperOutput {
+                    memories_written: vec![MemoryWritten {
+                        kind,
+                        anchor: anchor.unwrap_or_default(),
+                        memory_id,
+                        summary: Some(decision.title),
+                    }],
+                    memories_revised: Vec::new(),
+                    skipped: None,
+                    iterations: input.iterations,
+                    residual_risk_accepted: false,
+                })
+            }
+            // Including anything unrecognised: the safe reading of a decision we can't parse is
+            // that nothing should be written.
+            other => {
+                let reason = if decision.reason.trim().is_empty() {
+                    format!("nothing recorded ({other})")
+                } else {
+                    decision.reason.clone()
+                };
+                tracing::info!(reason = %reason, "recording no memory");
+                Ok(input.nothing_recorded(&reason))
+            }
+        }
+    }
+
+    /// Rewrite an existing memory through rag-rat's `memory_update`.
+    ///
+    /// The body replaces the old one outright rather than being appended to: a memory that ends
+    /// in a list of what changed is one nobody finishes reading, and the point of revising is that
+    /// it states what is true now.
+    async fn update_memory(
+        &self,
+        memory_id: &str,
+        title: Option<&str>,
+        body: &str,
+    ) -> Result<(), NodeError> {
+        let mut args = serde_json::json!({ "memory_id": memory_id, "body": body });
+        if let Some(title) = title {
+            args["title"] = serde_json::json!(title);
+        }
+        let arguments = args.as_object().cloned().expect("json object literal");
+        let param = CallToolRequestParams::new("memory_update").with_arguments(arguments);
+
+        let result = self
+            .sink
+            .call_tool(param)
+            .await
+            .map_err(|e| NodeError::Failed(format!("memory_update call failed: {e}")))?;
+
+        if result.is_error.unwrap_or(false) {
+            let text = result
+                .content
+                .iter()
+                .filter_map(|c| c.as_text())
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>()
+                .join("");
+            return Err(NodeError::Failed(format!(
+                "memory_update returned an error: {text}"
+            )));
+        }
+        Ok(())
     }
 
     /// Call rag-rat's `memory_create` directly and return the new memory id.
@@ -290,10 +450,73 @@ mod tests {
     }
 
     #[test]
-    fn draft_parses_and_defaults_kind() {
-        // Missing kind → default field, later normalized.
-        let d = parse_validated::<MemoryDraft>(r#"{"title":"t","body":"b"}"#).unwrap();
-        assert_eq!(d.title, "t");
-        assert_eq!(normalize_kind(&d.kind), "Decision");
+    fn a_decision_parses_with_only_what_that_action_needs() {
+        // Declining carries a reason and nothing else.
+        let none =
+            parse_validated::<MemoryDecision>(r#"{"action":"none","reason":"already recorded"}"#)
+                .unwrap();
+        assert_eq!(none.action, "none");
+        assert!(none.title.is_empty());
+
+        // Creating without a kind still normalizes to a valid one.
+        let create =
+            parse_validated::<MemoryDecision>(r#"{"action":"create","title":"t","body":"b"}"#)
+                .unwrap();
+        assert_eq!(normalize_kind(&create.kind), "Decision");
+
+        let revise = parse_validated::<MemoryDecision>(
+            r#"{"action":"revise","memory_id":"mem_1","body":"now true"}"#,
+        )
+        .unwrap();
+        assert_eq!(revise.memory_id.as_deref(), Some("mem_1"));
+
+        // An action is the one thing a decision must state.
+        assert!(parse_validated::<MemoryDecision>(r#"{"reason":"x"}"#).is_err());
+    }
+
+    fn input(converged: bool, touched: &[&str], diff: &str) -> BookkeeperInput {
+        BookkeeperInput {
+            issue: "an issue".into(),
+            analyst: AnalystOutput {
+                impact_summary: "impact".into(),
+                touched: Vec::new(),
+                risks: Vec::new(),
+                requirements: Vec::new(),
+                residual_risk: String::new(),
+            },
+            implementer: ImplementerOutput {
+                worktree_path: "/tmp/wt".into(),
+                diff_summary: diff.into(),
+                touched_files: touched.iter().map(|s| (*s).to_string()).collect(),
+                failing_tests: Vec::new(),
+                passing_tests: Vec::new(),
+                exit_code: 0,
+                narrative: None,
+            },
+            iterations: 1,
+            converged,
+        }
+    }
+
+    #[test]
+    fn a_run_that_changed_nothing_records_nothing() {
+        // The case that used to store a memory whose content was that there was nothing to store.
+        let out = input(true, &[], "").nothing_recorded("the run changed nothing");
+        assert!(out.memories_written.is_empty());
+        assert!(out.memories_revised.is_empty());
+        assert_eq!(out.skipped.as_deref(), Some("the run changed nothing"));
+        assert_eq!(out.iterations, 1);
+    }
+
+    #[test]
+    fn a_run_that_hit_a_wall_without_touching_files_still_has_something_to_say() {
+        // Converged-and-untouched is a no-op; walled-and-untouched is a wall worth recording.
+        let walled = input(false, &[], "");
+        assert!(
+            !(walled.converged
+                && walled.implementer.touched_files.is_empty()
+                && walled.implementer.diff_summary.trim().is_empty()),
+            "the skip must not swallow a run that failed to get started"
+        );
     }
 }
