@@ -98,10 +98,6 @@ pub async fn run_plan(
         return workflow::run_plan_scripted(runtime, ctx).await;
     }
 
-    store
-        .upsert_run(run_id, None, RunStatus::Running.as_str())
-        .await?;
-
     // Once per run: `SessionStart` describes the repository, not the node.
     let context =
         PluginContext::resolve(config, &std::env::current_dir().unwrap_or_default()).await;
@@ -119,6 +115,13 @@ async fn plan_half(
     engine: &Arc<ScriptEngine>,
     context: &PluginContext,
 ) -> Result<PlanOutcome, PlanError> {
+    // First, and here rather than in a caller: every checkpoint references this row, and the
+    // schema enforces it. `run_full` reaches this function directly, so a caller-side write would
+    // leave that path creating checkpoints for a run that doesn't exist yet.
+    store
+        .upsert_run(run_id, None, RunStatus::Running.as_str())
+        .await?;
+
     let clarifier = NodeClarifier::new(config, store, engine, run_id, issue, client.sink());
     let run = Run {
         client,

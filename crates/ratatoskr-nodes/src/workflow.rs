@@ -475,6 +475,10 @@ pub async fn run_plan_scripted(
     runtime: WorkflowRuntime,
     ctx: Arc<WorkflowContext>,
 ) -> Result<PlanOutcome, PlanError> {
+    // The run row first: the issue checkpoint references it, and the schema enforces that.
+    ctx.store
+        .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
+        .await?;
     checkpoint(
         &ctx.store,
         &ctx.run_id,
@@ -482,9 +486,6 @@ pub async fn run_plan_scripted(
         &json!({ "issue": ctx.issue }),
     )
     .await?;
-    ctx.store
-        .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
-        .await?;
 
     let hosts = build_hosts(&ctx);
     let input = json!({ "issue": ctx.issue }).to_string();
@@ -518,6 +519,10 @@ pub async fn run_full_scripted(
     runtime: WorkflowRuntime,
     ctx: Arc<WorkflowContext>,
 ) -> Result<RunOutcome, PlanError> {
+    // The run row first: the issue checkpoint references it, and the schema enforces that.
+    ctx.store
+        .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
+        .await?;
     checkpoint(
         &ctx.store,
         &ctx.run_id,
@@ -525,9 +530,6 @@ pub async fn run_full_scripted(
         &json!({ "issue": ctx.issue }),
     )
     .await?;
-    ctx.store
-        .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
-        .await?;
 
     let hosts = build_hosts(&ctx);
     let input =

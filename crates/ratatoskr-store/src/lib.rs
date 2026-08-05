@@ -277,6 +277,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_checkpoint_needs_its_run_row_to_exist() {
+        // The bundled SQLite is compiled with `SQLITE_DEFAULT_FOREIGN_KEYS=1`, so this constraint
+        // is live even though the system `sqlite3` CLI (built without it) will happily insert an
+        // orphan. Anything that checkpoints must create the run row first.
+        let store = Store::open_in_memory().unwrap();
+        assert!(
+            store
+                .insert_checkpoint("never-started", "scout", "{}")
+                .await
+                .is_err(),
+            "a checkpoint for an unknown run is refused"
+        );
+
+        store.upsert_run("started", None, "running").await.unwrap();
+        assert!(
+            store
+                .insert_checkpoint("started", "scout", "{}")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn checkpoints_persist_in_order() {
         let store = Store::open_in_memory().unwrap();
         store.upsert_run("run-1", None, "running").await.unwrap();
