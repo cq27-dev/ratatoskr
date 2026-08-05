@@ -9,6 +9,7 @@ use anyhow::{Context, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ratatoskr_core::RatatoskrConfig;
 use ratatoskr_nodes::PlanOutcome;
+use tracing::Instrument as _;
 use tracing_subscriber::EnvFilter;
 
 /// System prompt for `ask`: ground answers in rag-rat's tools, don't guess.
@@ -156,10 +157,33 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Set up logging: the console at `info` (or `RUST_LOG`), plus a verbose, daily-rotating file
-/// under `.ratatoskr/logs/` capturing everything at `debug` (or `RATATOSKR_LOG`) for later
-/// analysis. Returns the file-writer guard, which must be held for the process's lifetime.
-fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+/// Set up logging. Three sinks, each for a different reader:
+///
+/// - the console at `info` (or `RUST_LOG`), for whoever is watching;
+/// - `.ratatoskr/logs/ratatoskr.log`, verbose prose at `debug` (or `RATATOSKR_LOG`), for reading
+///   after the fact;
+/// - `.ratatoskr/logs/ratatoskr.jsonl.<YYYY-MM-DD>`, one JSON object per event, for machines — the
+///   dashboard tails it to show what a node is doing between checkpoints. Both files rotate daily
+///   and the date is a *suffix*, so there is no bare `ratatoskr.jsonl`: a consumer opens the
+///   newest match and follows the rollover. Consumers depend on this shape:
+///
+///   ```json
+///   {"timestamp":"…","level":"INFO","message":"tool call","kind":"tool_call",
+///    "tool":"semantic_search","target":"ratatoskr_agent",
+///    "spans":[{"name":"run","run_id":"…"},{"name":"agent","node":"scout"}]}
+///   ```
+///
+///   `kind` is one of `tool_call`, `model_text`, or `checkpoint`. `run_id` and `node` come from
+///   the enclosing spans — the log file is per process and day, so concurrent runs interleave and
+///   `run_id` is what separates them. A `checkpoint` event carries `node` as a field directly.
+///
+///   Not every line has a `run` span: anything logged before a run starts, and `serve`'s own
+///   lines about launching and reaping children, are emitted outside one. Those carry `run_id` as
+///   a plain field where they know it, so match on the field first and fall back to the span.
+///
+/// Returns the file-writer guards, which must be held for the process's lifetime or buffered
+/// output is dropped.
+fn init_logging() -> Vec<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::Layer as _;
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
@@ -170,8 +194,13 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
         .with_writer(std::io::stderr)
         .with_filter(console_filter);
 
-    // Best-effort file layer; if the log dir can't be created, fall back to console-only.
-    let (file_layer, guard) = match std::fs::create_dir_all(".ratatoskr/logs") {
+    // Best-effort file layers; if the log dir can't be created, fall back to console-only.
+    let log_dir = std::fs::create_dir_all(".ratatoskr/logs");
+    if let Err(e) = &log_dir {
+        eprintln!("warning: could not create .ratatoskr/logs ({e}); logging to console only");
+    }
+
+    let (file_layer, guard) = match &log_dir {
         Ok(()) => {
             let file_filter = EnvFilter::new(
                 std::env::var("RATATOSKR_LOG").unwrap_or_else(|_| "debug".to_string()),
@@ -184,17 +213,43 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
                 .with_filter(file_filter);
             (Some(layer), Some(guard))
         }
-        Err(e) => {
-            eprintln!("warning: could not create .ratatoskr/logs ({e}); logging to console only");
-            (None, None)
+        Err(_) => (None, None),
+    };
+
+    // The structured sink. Deliberately narrow: only ratatoskr's own events, so the file stays a
+    // stream of run activity rather than a transcript of every dependency's chatter. `spans` is
+    // what carries `run_id` and `node`, so a consumer can attribute an event without parsing prose.
+    //
+    // `ratatoskr` prefix-matches every `ratatoskr_*` target, so this is "our crates at info" and
+    // nothing else. It also has to cover this binary itself — the `[[bin]]` is named `ratatoskr`,
+    // so that, not `ratatoskr_cli`, is main.rs's module path — because the filter gates *spans*
+    // as well as events, and the `run` span carrying `run_id` is opened here.
+    let (json_layer, json_guard) = match &log_dir {
+        Ok(()) => {
+            let filter = EnvFilter::new(
+                std::env::var("RATATOSKR_JSON_LOG")
+                    .unwrap_or_else(|_| "ratatoskr=info".to_string()),
+            );
+            let appender = tracing_appender::rolling::daily(".ratatoskr/logs", "ratatoskr.jsonl");
+            let (writer, guard) = tracing_appender::non_blocking(appender);
+            let layer = tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(true)
+                .with_writer(writer)
+                .with_filter(filter);
+            (Some(layer), Some(guard))
         }
+        Err(_) => (None, None),
     };
 
     tracing_subscriber::registry()
         .with(console)
         .with(file_layer)
+        .with(json_layer)
         .init();
-    guard
+    [guard, json_guard].into_iter().flatten().collect()
 }
 
 /// Write a default config, leaving any existing `ratatoskr.toml` untouched.
@@ -263,8 +318,9 @@ async fn plan(
 
     let engine = load_rules().await?;
     let run_id = uuid::Uuid::new_v4().to_string();
-    let result =
-        ratatoskr_nodes::run_plan(&client, &config, &store, &run_id, &issue, &engine).await;
+    let result = ratatoskr_nodes::run_plan(&client, &config, &store, &run_id, &issue, &engine)
+        .instrument(tracing::info_span!("run", run_id = %run_id))
+        .await;
 
     // Tear down rag-rat regardless of outcome.
     if let Err(e) = client.shutdown().await {
@@ -350,8 +406,9 @@ async fn run_cmd(
         Some(id) => id,
         None => uuid::Uuid::new_v4().to_string(),
     };
-    let result =
-        ratatoskr_nodes::run_full(&client, &config, &store, &run_id, &issue, &engine).await;
+    let result = ratatoskr_nodes::run_full(&client, &config, &store, &run_id, &issue, &engine)
+        .instrument(tracing::info_span!("run", run_id = %run_id))
+        .await;
 
     if let Err(e) = client.shutdown().await {
         tracing::warn!("failed to shut down rag-rat cleanly: {e}");
@@ -376,7 +433,9 @@ async fn bookkeep(run_id: &str, config_path: &Path) -> anyhow::Result<()> {
         .context("connecting to rag-rat")?;
 
     let engine = load_rules().await?;
-    let result = ratatoskr_nodes::run_bookkeeper(&client, &config, &store, run_id, &engine).await;
+    let result = ratatoskr_nodes::run_bookkeeper(&client, &config, &store, run_id, &engine)
+        .instrument(tracing::info_span!("run", run_id = %run_id))
+        .await;
 
     if let Err(e) = client.shutdown().await {
         tracing::warn!("failed to shut down rag-rat cleanly: {e}");
@@ -631,4 +690,82 @@ async fn load_rules() -> anyhow::Result<std::sync::Arc<ratatoskr_script::ScriptE
         }
     }
     Ok(engine)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    /// Captures a layer's output so the emitted JSON can be asserted on.
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("buffer mutex").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+        type Writer = Buffer;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Pins the record shape `init_logging`'s JSON sink produces, because it is a contract the
+    /// dashboard parses: `kind` and the event's own fields at the top level, and `run_id` reachable
+    /// through `spans`. The layer options here mirror `init_logging`; change them together.
+    #[test]
+    fn the_json_sink_emits_the_documented_shape() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let buf = Buffer::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(true)
+            .with_writer(buf.clone());
+
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            let span = tracing::info_span!("run", run_id = "run-abc");
+            let _entered = span.enter();
+            tracing::info!(
+                kind = "checkpoint",
+                node = "scout",
+                bytes = 12,
+                "checkpoint"
+            );
+        });
+
+        let raw = String::from_utf8(buf.0.lock().expect("buffer mutex").clone()).expect("utf-8");
+        let record: serde_json::Value =
+            serde_json::from_str(raw.trim()).expect("each line is one JSON object");
+
+        // Event fields are flattened to the top level, not nested under `fields`.
+        assert_eq!(record["kind"], "checkpoint");
+        assert_eq!(record["node"], "scout");
+        assert_eq!(record["bytes"], 12);
+
+        // `run_id` rides the enclosing span — this is what lets a consumer separate concurrent
+        // runs sharing one file.
+        let spans = record["spans"].as_array().expect("a span list");
+        assert!(
+            spans.iter().any(|s| s["run_id"] == "run-abc"),
+            "run_id must be reachable through spans, got {spans:?}"
+        );
+    }
+
+    #[test]
+    fn the_buffer_writer_captures_what_is_written() {
+        let mut buf = Buffer::default();
+        buf.write_all(b"x").unwrap();
+        assert_eq!(buf.0.lock().unwrap().as_slice(), b"x");
+    }
 }

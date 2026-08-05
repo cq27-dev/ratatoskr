@@ -95,10 +95,19 @@ impl Launcher {
         // Hold the permit until the child exits, and reap it so it doesn't linger as a zombie.
         let id = run_id.clone();
         tokio::spawn(async move {
+            // `run_id` as a field, not just in the message: these are emitted in the server
+            // process, outside the child's `run` span, so the field is all a consumer has to
+            // attribute them by.
             match child.wait().await {
-                Ok(status) if status.success() => tracing::info!("run {id} finished"),
-                Ok(status) => tracing::warn!("run {id} exited with {status}"),
-                Err(e) => tracing::warn!("run {id} could not be waited on: {e}"),
+                Ok(status) if status.success() => {
+                    tracing::info!(kind = "run_finished", run_id = %id, "run finished")
+                }
+                Ok(status) => {
+                    tracing::warn!(kind = "run_failed", run_id = %id, %status, "run exited")
+                }
+                Err(e) => {
+                    tracing::warn!(kind = "run_failed", run_id = %id, error = %e, "run not reaped")
+                }
             }
             drop(permit);
         });

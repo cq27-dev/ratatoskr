@@ -171,7 +171,12 @@ struct ObservabilityHook;
 
 impl AgentHook for ObservabilityHook {
     async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
-        tracing::info!(tool = event.tool_name, args = %truncate(event.args, 200), "tool call");
+        tracing::info!(
+            kind = "tool_call",
+            tool = event.tool_name,
+            args = %truncate(event.args, 200),
+            "tool call"
+        );
         ToolCallAction::Run
     }
 
@@ -184,7 +189,12 @@ impl AgentHook for ObservabilityHook {
             if let AssistantContent::Text(text) = content {
                 let text = text.text.trim();
                 if !text.is_empty() {
-                    tracing::info!(turn = event.turn, "model text: {}", truncate(text, 400));
+                    tracing::info!(
+                        kind = "model_text",
+                        turn = event.turn,
+                        text = %truncate(text, 400),
+                        "model text"
+                    );
                 }
             }
         }
