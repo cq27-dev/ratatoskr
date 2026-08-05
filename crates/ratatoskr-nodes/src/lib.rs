@@ -7,6 +7,7 @@
 
 pub mod analyst;
 pub mod bookkeeper;
+pub mod clarify;
 pub mod converge;
 pub mod implementer;
 pub mod memory;
@@ -31,6 +32,8 @@ use ratatoskr_graph::{Node, NodeError};
 use ratatoskr_mcp::RagRatClient;
 use ratatoskr_script::{ScriptEngine, WorkflowRuntime};
 use ratatoskr_store::{Store, StoreError};
+
+use crate::clarify::NodeClarifier;
 use rmcp::model::Tool;
 use serde::Serialize;
 
@@ -89,7 +92,15 @@ pub async fn run_plan(
         .upsert_run(run_id, None, RunStatus::Running.as_str())
         .await?;
 
-    let outcome = run_nodes(client, config, store, run_id, issue, engine).await;
+    let clarifier = NodeClarifier::new(config, store, engine, run_id, issue, client.sink());
+    let outcome = run_nodes(client, config, store, run_id, issue, engine, &clarifier)
+        .await
+        // Drain the plan-half clarifications into the outcome's state (the clarifier can't reach the
+        // borrowed RunState during the run).
+        .map(|mut o| {
+            o.state.clarifications = clarifier.drain();
+            o
+        });
 
     let final_status = if outcome.is_ok() {
         RunStatus::Planned
@@ -111,6 +122,7 @@ async fn run_nodes(
     run_id: &str,
     issue: &str,
     engine: &Arc<ScriptEngine>,
+    clarifier: &Arc<NodeClarifier>,
 ) -> Result<PlanOutcome, PlanError> {
     let sink = client.sink();
     let all_tools = client.tools();
@@ -128,12 +140,15 @@ async fn run_nodes(
 
     // --- scout ---
     let scout_cfg = node_agent_config(engine, config, &all_tools, "scout", scout::SCOUT_TOOLS)?;
+    let mut scout_tools = scout_cfg.tools;
+    scout_tools.push(clarify::ask_tool());
     let scout = ScoutNode {
         route: scout_cfg.route,
-        tools: scout_cfg.tools,
+        tools: scout_tools,
         sink: sink.clone(),
         policy: scout_cfg.policy,
         max_turns: scout_cfg.max_turns,
+        clarifier: Some(clarifier.as_dyn()),
     };
     let scout_out = scout
         .run(issue.to_string(), &state)
@@ -335,9 +350,15 @@ pub async fn run_full(
     }
 
     let plan = run_plan(client, config, store, run_id, issue, engine).await?;
+    // `plan.state.clarifications` already holds the plan-half asks; the fork/bookkeep half gets its
+    // own clarifier, drained and appended at the end.
     let mut state = plan.state.clone();
+    let clarifier = NodeClarifier::new(config, store, engine, run_id, issue, client.sink());
 
-    let result = fork_and_converge(client, config, store, run_id, issue, &plan, engine).await;
+    let result = fork_and_converge(
+        client, config, store, run_id, issue, &plan, engine, &clarifier,
+    )
+    .await;
 
     let status = match &result {
         Ok((_, _, _, status, _)) => *status,
@@ -366,7 +387,9 @@ pub async fn run_full(
             iterations,
             converged: status == RunStatus::Converged,
         };
-        match bookkeep_and_checkpoint(client, config, store, run_id, input, engine).await {
+        match bookkeep_and_checkpoint(client, config, store, run_id, input, engine, &clarifier)
+            .await
+        {
             Ok(bk) => {
                 state.artifacts = vec![serde_json::to_value(&bk)?];
                 Some(bk)
@@ -379,6 +402,9 @@ pub async fn run_full(
     } else {
         None
     };
+
+    // Append the fork/bookkeep-half clarifications to the plan-half ones.
+    state.clarifications.extend(clarifier.drain());
 
     Ok(RunOutcome {
         state,
@@ -401,6 +427,7 @@ async fn bookkeep_and_checkpoint(
     run_id: &str,
     input: BookkeeperInput,
     engine: &Arc<ScriptEngine>,
+    clarifier: &Arc<NodeClarifier>,
 ) -> Result<BookkeeperOutput, PlanError> {
     let cfg = node_agent_config(
         engine,
@@ -409,12 +436,15 @@ async fn bookkeep_and_checkpoint(
         "bookkeeper",
         bookkeeper::BOOKKEEPER_TOOLS,
     )?;
+    let mut tools = cfg.tools;
+    tools.push(clarify::ask_tool());
     let node = BookkeeperNode {
         route: cfg.route,
-        tools: cfg.tools,
+        tools,
         sink: client.sink(),
         policy: cfg.policy,
         max_turns: cfg.max_turns,
+        clarifier: Some(clarifier.as_dyn()),
     };
     let out = node
         .run(input)
@@ -460,6 +490,8 @@ pub async fn run_bookkeeper(
     let converged =
         store.run_status(run_id).await?.as_deref() == Some(RunStatus::Converged.as_str());
 
+    // Build the clarifier before `issue` is moved into the input (it clones the issue internally).
+    let clarifier = NodeClarifier::new(config, store, engine, run_id, &issue, client.sink());
     let input = BookkeeperInput {
         issue,
         analyst,
@@ -467,11 +499,12 @@ pub async fn run_bookkeeper(
         iterations,
         converged,
     };
-    bookkeep_and_checkpoint(client, config, store, run_id, input, engine).await
+    bookkeep_and_checkpoint(client, config, store, run_id, input, engine, &clarifier).await
 }
 
 /// The fork + converge half. Returns the terminal status; leaves the worktree in place on a
 /// terminal outcome and removes it on a hard error.
+#[allow(clippy::too_many_arguments)] // run context (client/config/store/run_id/issue/plan/engine) + the clarifier
 async fn fork_and_converge(
     client: &RagRatClient,
     config: &RatatoskrConfig,
@@ -480,6 +513,7 @@ async fn fork_and_converge(
     issue: &str,
     plan: &PlanOutcome,
     engine: &Arc<ScriptEngine>,
+    clarifier: &Arc<NodeClarifier>,
 ) -> Result<
     (
         RedTeamOutput,
@@ -509,12 +543,15 @@ async fn fork_and_converge(
                     "redteam",
                     redteam::CLASSIFIER_TOOLS,
                 )?;
+                let mut tools = cfg.tools;
+                tools.push(clarify::ask_tool());
                 Some(redteam::RedTeamClassifier {
                     route: cfg.route,
-                    tools: cfg.tools,
+                    tools,
                     sink: client.sink(),
                     policy: cfg.policy,
                     max_turns: cfg.max_turns,
+                    clarifier: Some(clarifier.as_dyn()),
                 })
             }
             None => None,

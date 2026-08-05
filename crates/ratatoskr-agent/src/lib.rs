@@ -4,6 +4,8 @@
 //! rather than a registry. The agent's own multi-turn loop (from `rig-agent`) does the tool
 //! calling — we hand it the tools and a client handle via `.rmcp_tools()`.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use ratatoskr_core::{ModelRoute, ToolDecision, ToolPolicy};
@@ -31,6 +33,23 @@ const DEFAULT_MAX_TURNS: usize = 100;
 /// rig-agent's default name for the synthetic structured-output tool (`OutputMode::Tool`). Kept in
 /// sync with `rig_agent`'s `DEFAULT_OUTPUT_TOOL_NAME`; a ruleset must not be able to deny it.
 const OUTPUT_TOOL_NAME: &str = "final_result";
+
+/// The synthetic tool a node calls to ask another node a question. Intercepted by
+/// [`ClarificationHook`] and answered in-conversation; it is never dispatched to the rag-rat sink.
+pub const ASK_TOOL_NAME: &str = "ask";
+
+/// Answers a node's `ask` call by running the target node against its stored context (implemented in
+/// `ratatoskr-nodes`). Lives here so [`ClarificationHook`] can hold it without a dependency cycle.
+/// Always yields text — a failure to answer becomes best-effort guidance, never an error that breaks
+/// the asking node's turn loop.
+pub trait Clarifier: Send + Sync {
+    fn answer<'a>(
+        &'a self,
+        from: &'a str,
+        to: &'a str,
+        question: &'a str,
+    ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>;
+}
 
 /// Errors running an agent turn.
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +90,7 @@ pub async fn ask(
     question: &str,
     tools: Vec<Tool>,
     sink: ServerSink,
+    max_turns: Option<usize>,
 ) -> Result<String, AgentError> {
     match parse_provider(&route.provider)? {
         Provider::Anthropic => {
@@ -84,6 +104,7 @@ pub async fn ask(
                 question,
                 tools,
                 sink,
+                max_turns,
             )
             .await
         }
@@ -98,6 +119,7 @@ pub async fn ask(
                 question,
                 tools,
                 sink,
+                max_turns,
             )
             .await
         }
@@ -111,14 +133,16 @@ async fn run<M>(
     question: &str,
     tools: Vec<Tool>,
     sink: ServerSink,
+    max_turns: Option<usize>,
 ) -> Result<String, AgentError>
 where
     M: CompletionModel + 'static,
 {
     let agent = AgentBuilder::new(model)
         .preamble(preamble)
-        .default_max_turns(DEFAULT_MAX_TURNS)
+        .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
         .rmcp_tools(tools, sink)
+        .add_hook(ObservabilityHook)
         .build();
 
     agent
@@ -168,6 +192,43 @@ impl AgentHook for ObservabilityHook {
     }
 }
 
+/// The `ask` tool's arguments: which node to ask, and the question.
+#[derive(serde::Deserialize)]
+struct AskArgs {
+    #[serde(default)]
+    to: String,
+    question: String,
+}
+
+/// Intercepts the synthetic `ask` tool: instead of dispatching, it runs the target node against its
+/// checkpointed context and returns the answer as the tool result (via `Skip`), so the asking node's
+/// conversation — and its prompt cache — continue uninterrupted.
+struct ClarificationHook {
+    /// The asking node, for provenance in the answer + logs.
+    node: String,
+    clarifier: Arc<dyn Clarifier>,
+}
+
+impl AgentHook for ClarificationHook {
+    async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
+        if event.tool_name != ASK_TOOL_NAME {
+            return ToolCallAction::Run;
+        }
+        let (to, question) = match serde_json::from_str::<AskArgs>(event.args) {
+            Ok(a) => (a.to, a.question),
+            Err(e) => {
+                return ToolCallAction::Skip(format!(
+                    "ask: invalid arguments ({e}); call it as \
+                     {{\"to\": \"scout|analyst|bookkeeper|redteam\", \"question\": \"...\"}}"
+                ));
+            }
+        };
+        // The clarifier labels the answer with the resolved answerer (which may differ from `to`).
+        let answer = self.clarifier.answer(&self.node, &to, &question).await;
+        ToolCallAction::Skip(answer)
+    }
+}
+
 /// A per-tool-call gate: a ruleset's `onToolCall` decides Run / Skip / Rewrite for each call.
 struct RulesetHook {
     policy: Arc<dyn ToolPolicy>,
@@ -206,6 +267,7 @@ pub async fn run_structured(
     output_schema: schemars::Schema,
     policy: Option<Arc<dyn ToolPolicy>>,
     max_turns: Option<usize>,
+    clarifier: Option<Arc<dyn Clarifier>>,
 ) -> Result<String, AgentError> {
     match parse_provider(&route.provider)? {
         Provider::Anthropic => {
@@ -223,6 +285,7 @@ pub async fn run_structured(
                 output_schema,
                 policy,
                 max_turns,
+                clarifier,
             )
             .await
         }
@@ -241,6 +304,7 @@ pub async fn run_structured(
                 output_schema,
                 policy,
                 max_turns,
+                clarifier,
             )
             .await
         }
@@ -259,6 +323,7 @@ async fn run_typed<M>(
     output_schema: schemars::Schema,
     policy: Option<Arc<dyn ToolPolicy>>,
     max_turns: Option<usize>,
+    clarifier: Option<Arc<dyn Clarifier>>,
 ) -> Result<String, AgentError>
 where
     M: CompletionModel + 'static,
@@ -273,8 +338,16 @@ where
         .output_mode(OutputMode::Tool)
         .rmcp_tools(tools, sink)
         // Log tool calls + model text for every node run; added first so it observes calls before
-        // the ruleset gate can skip them.
+        // the clarification/ruleset hooks can skip them.
         .add_hook(ObservabilityHook);
+    // Answer `ask` calls in-conversation. Added before the ruleset hook so an `ask` is handled here
+    // (and short-circuits) rather than reaching the ruleset gate.
+    if let Some(clarifier) = clarifier {
+        builder = builder.add_hook(ClarificationHook {
+            node: node.to_string(),
+            clarifier,
+        });
+    }
     if let Some(policy) = policy {
         builder = builder.add_hook(RulesetHook { policy });
     }

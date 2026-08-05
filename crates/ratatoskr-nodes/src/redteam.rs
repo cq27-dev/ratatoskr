@@ -62,6 +62,7 @@ pub struct RedTeamClassifier {
     pub sink: ServerSink,
     pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
     pub max_turns: Option<usize>,
+    pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
 }
 
 impl RedTeamClassifier {
@@ -86,6 +87,7 @@ impl RedTeamClassifier {
             schemars::schema_for!(Classification),
             self.policy.clone(),
             self.max_turns,
+            self.clarifier.clone(),
         )
         .await
         .map_err(|e| NodeError::Failed(format!("red-team classifier failed: {e}")))?;
