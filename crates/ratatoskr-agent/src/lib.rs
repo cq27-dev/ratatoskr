@@ -8,17 +8,24 @@ use std::sync::Arc;
 
 use ratatoskr_core::{ModelRoute, ToolDecision, ToolPolicy};
 use rig_agent::AgentBuilder;
-use rig_agent::agent::{AgentHook, HookContext, OutputMode, ToolCall, ToolCallAction};
+use rig_agent::agent::{
+    AgentHook, HookContext, ModelTurnAction, ModelTurnFinished, OutputMode, ToolCall,
+    ToolCallAction,
+};
 use rig_agent::completion::Prompt;
 use rig_core::client::completion::CompletionClient;
 use rig_core::client::{ProviderClient, ProviderClientError};
 use rig_core::completion::CompletionModel;
+use rig_core::message::AssistantContent;
 use rig_core::providers::{anthropic, moonshot};
 use rmcp::model::Tool;
 use rmcp::service::ServerSink;
 
-/// How many tool-calling turns the agent may take before it must produce a final answer.
-const DEFAULT_MAX_TURNS: usize = 10;
+/// How many tool-calling turns the agent may take before it must produce a final answer. A node
+/// that does real work (the analyst's impact analysis walks callers/callees/tests across the graph)
+/// needs a generous budget; 10 was a toy limit that tripped `MaxTurns` mid-analysis. Overridable
+/// per node via a ruleset's `maxTurns`.
+const DEFAULT_MAX_TURNS: usize = 100;
 
 /// rig-agent's default name for the synthetic structured-output tool (`OutputMode::Tool`). Kept in
 /// sync with `rig_agent`'s `DEFAULT_OUTPUT_TOOL_NAME`; a ruleset must not be able to deny it.
@@ -123,6 +130,43 @@ where
 /// JSON matching that schema (rig's `OutputMode::Auto` resolves to a synthetic output tool that
 /// composes with the rag-rat tools). Returns the raw output string — best-effort, so the caller
 /// must still validate it (see `ratatoskr_graph::parse_validated`).
+/// Trim `s` to `max` chars for a log line, with an ellipsis when cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+/// Always-on hook that makes a run legible in the logs: every tool call (name + args) and the
+/// model's text at the end of each turn. Successful tool calls aren't otherwise surfaced, so without
+/// this a stuck node (e.g. an analyst churning through turns) looks like silence.
+struct ObservabilityHook;
+
+impl AgentHook for ObservabilityHook {
+    async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
+        tracing::info!(tool = event.tool_name, args = %truncate(event.args, 200), "tool call");
+        ToolCallAction::Run
+    }
+
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &HookContext,
+        event: ModelTurnFinished<'_>,
+    ) -> ModelTurnAction {
+        for content in event.content.iter() {
+            if let AssistantContent::Text(text) = content {
+                let text = text.text.trim();
+                if !text.is_empty() {
+                    tracing::info!(turn = event.turn, "model text: {}", truncate(text, 400));
+                }
+            }
+        }
+        ModelTurnAction::Continue
+    }
+}
+
 /// A per-tool-call gate: a ruleset's `onToolCall` decides Run / Skip / Rewrite for each call.
 struct RulesetHook {
     policy: Arc<dyn ToolPolicy>,
@@ -222,7 +266,10 @@ where
         // Anthropic rejects when combined with tools ("output_config.format: Cannot be combined
         // with tools"). Tool mode sends no native format and composes with the rag-rat tools.
         .output_mode(OutputMode::Tool)
-        .rmcp_tools(tools, sink);
+        .rmcp_tools(tools, sink)
+        // Log tool calls + model text for every node run; added first so it observes calls before
+        // the ruleset gate can skip them.
+        .add_hook(ObservabilityHook);
     if let Some(policy) = policy {
         builder = builder.add_hook(RulesetHook { policy });
     }
