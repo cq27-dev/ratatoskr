@@ -56,6 +56,8 @@ strum = { version = "0.28", features = ["derive"] }
 # The observability dashboard's HTTP layer. axum (Tower) rather than an actor framework: the rest
 # of the workspace is plain async/await Tokio, and this composes with it directly.
 axum = "0.8"
+# `fs` only: ServeDir/ServeFile for the built dashboard assets.
+tower-http = { version = "0.7", features = ["fs"] }
 # Phase 3 execution: MicroVM sandbox + ACP client for driving a coding CLI.
 microsandbox = "0.6.8"
 agent-client-protocol = "2.0.0"

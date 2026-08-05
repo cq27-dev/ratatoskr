@@ -1,0 +1,383 @@
+/*
+ * RATATOSKR RUN TELEMETRY — tactical-telemetry substrate.
+ *
+ * Dark CRT substrate, monospace dominance, hairline compartmentalisation. No radii anywhere: every
+ * corner is 90 degrees. Terminal green is reserved for exactly one thing — the WORKING state — so
+ * a live run is the only thing on screen that glows.
+ */
+
+:root {
+  --bg: #0a0a0a;
+  --panel: #121212;
+  --rule: #2a2a2a;
+  --fg: #eaeaea;
+  --muted: #6e6e6e;
+  --hazard: #e61919;
+  --live: #4af626;
+
+  --mono: ui-monospace, "JetBrains Mono", "IBM Plex Mono", "SF Mono", Menlo, Consolas, monospace;
+  --sans: Inter, "Helvetica Neue", Helvetica, Arial, sans-serif;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  border-radius: 0 !important;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Electron-beam sweep. Fixed and inert so it never intercepts a click. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.22) 2px,
+    rgba(0, 0, 0, 0.22) 4px
+  );
+}
+
+/* ── Shell ───────────────────────────────────────────────────────────────── */
+/* gap:1px over a --rule backdrop draws the dividing lines: no border bookkeeping. */
+.shell {
+  display: grid;
+  grid-template-columns: 300px 1fr;
+  grid-template-rows: auto 1fr;
+  height: 100%;
+  gap: 1px;
+  background: var(--rule);
+}
+
+.masthead {
+  grid-column: 1 / -1;
+  background: var(--bg);
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 14px 18px;
+}
+
+.masthead h1 {
+  margin: 0;
+  font-family: var(--sans);
+  font-weight: 900;
+  font-size: clamp(1.1rem, 2.4vw, 2rem);
+  letter-spacing: -0.04em;
+  line-height: 0.9;
+  text-transform: uppercase;
+}
+
+.masthead .rev {
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.rail,
+.stage {
+  background: var(--bg);
+  overflow: auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* ── Section headers ─────────────────────────────────────────────────────── */
+.sec {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--bg);
+  border-bottom: 1px solid var(--rule);
+  padding: 9px 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 10px;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+/* ── Run list ────────────────────────────────────────────────────────────── */
+.run {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+  border-left: 2px solid transparent;
+  padding: 9px 12px;
+  cursor: pointer;
+}
+
+.run:hover {
+  background: var(--panel);
+}
+
+.run[aria-current="true"] {
+  background: var(--panel);
+  border-left-color: var(--hazard);
+}
+
+.run-id {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.run-id samp {
+  font-family: var(--mono);
+}
+
+.run-sub {
+  color: var(--muted);
+  font-size: 10px;
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-transform: uppercase;
+}
+
+/* ── Status tokens ───────────────────────────────────────────────────────── */
+.st {
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  white-space: nowrap;
+}
+.st--running,
+.st--awaiting_clarification,
+.st--working {
+  color: var(--live);
+}
+.st--failed {
+  color: var(--hazard);
+}
+.st--converged,
+.st--done,
+.st--planned {
+  color: var(--fg);
+}
+.st--idle,
+.st--max_iterations_reached,
+.st--abandoned,
+.st--pending {
+  color: var(--muted);
+}
+
+/* ── Stage: graph, plus a detail pane only once a node is selected ───────── */
+.stage {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  gap: 1px;
+  background: var(--rule);
+  overflow: hidden;
+}
+
+/* The detail row exists only when there's something in it — an empty pane would otherwise
+   reserve half the stage to say nothing, and a child max-height can't cap an `auto` track. */
+.stage--split {
+  grid-template-rows: auto minmax(220px, 1fr) minmax(0, 45%);
+}
+
+.runmeta {
+  background: var(--bg);
+  padding: 12px 16px;
+}
+
+.runmeta h2 {
+  margin: 0 0 8px;
+  font-family: var(--sans);
+  font-weight: 900;
+  font-size: clamp(0.95rem, 1.8vw, 1.4rem);
+  letter-spacing: -0.03em;
+  line-height: 0.95;
+  text-transform: uppercase;
+}
+
+.runmeta dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 2px 18px;
+  margin: 0;
+  font-size: 10px;
+}
+
+.runmeta dt {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.runmeta dd {
+  margin: 0 0 4px;
+}
+
+.graph {
+  background: var(--bg);
+  position: relative;
+  min-height: 0;
+}
+
+.detail {
+  background: var(--bg);
+  overflow: auto;
+  min-height: 0;
+}
+
+.detail pre {
+  margin: 0;
+  padding: 12px 16px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.iter {
+  border-bottom: 1px solid var(--rule);
+}
+
+.iter > .sec {
+  position: static;
+  border-bottom: 1px dashed var(--rule);
+}
+
+.empty {
+  padding: 16px;
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+
+.hazard {
+  color: var(--hazard);
+}
+.muted {
+  color: var(--muted);
+}
+
+/* ── Pipeline nodes ──────────────────────────────────────────────────────── */
+.node {
+  width: 150px;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  padding: 7px 9px;
+  cursor: pointer;
+}
+
+.node--selected {
+  border-color: var(--fg);
+}
+.node--working {
+  border-color: var(--live);
+}
+.node--failed {
+  border-color: var(--hazard);
+}
+
+.node-name {
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  align-items: baseline;
+}
+
+/* The one sanctioned use of terminal green: a live node, and nothing else. */
+.node-name .dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  background: var(--muted);
+  align-self: center;
+}
+.node--working .dot {
+  background: var(--live);
+  animation: pulse 1.1s steps(2, end) infinite;
+}
+.node--failed .dot {
+  background: var(--hazard);
+}
+.node--done .dot {
+  background: var(--fg);
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.15;
+  }
+}
+
+.node-meta {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+/* ── React Flow overrides: strip the consumer-UI defaults ────────────────── */
+.react-flow__node {
+  font-family: var(--mono);
+}
+.react-flow__handle {
+  opacity: 0;
+  pointer-events: none;
+}
+.react-flow__edge-path {
+  stroke: var(--rule);
+  stroke-width: 1;
+}
+.react-flow__edge.is-live .react-flow__edge-path {
+  stroke: var(--live);
+}
+.react-flow__edge-text {
+  fill: var(--muted);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+}
+.react-flow__edge-textbg {
+  fill: var(--bg);
+}
+.react-flow__attribution {
+  display: none;
+}
+.react-flow__panel {
+  margin: 8px;
+}

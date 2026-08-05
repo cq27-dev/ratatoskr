@@ -20,7 +20,8 @@ red-team, and implement against a repository, checkpointing state as it goes.
 | `ratatoskr-nodes` | scout/memory/analyst + red-team/implementer/bookkeeper nodes; `run_plan`/`run_full` executors. |
 | `ratatoskr-exec` | Worktrees (git), sandboxed execution (microsandbox / bwrap), and the ACP client. |
 | `ratatoskr-store` | SQLite checkpoint store (single-writer): runs + per-node checkpoints. |
-| `ratatoskr-cli` | The `ratatoskr` binary — `--version`, `init`, `ask`, `plan`, `run`, `bookkeep`, `status`. |
+| `ratatoskr-serve` | Read-only HTTP API over the store, plus the dashboard UI it serves. |
+| `ratatoskr-cli` | The `ratatoskr` binary — `--version`, `init`, `ask`, `plan`, `run`, `bookkeep`, `status`, `serve`. |
 
 ## Build
 
@@ -81,6 +82,25 @@ image, builds offline) or `microsandbox` (a MicroVM, needs KVM). The microsandbo
 a Cargo feature because its build script downloads a helper binary; build with
 `cargo build --features ratatoskr-exec/microsandbox` to enable it, otherwise selecting it at runtime
 errors.
+
+## `ratatoskr serve`
+
+A local dashboard for watching runs — the pipeline graph, each node's state, and its checkpointed
+output. It reads the same SQLite store a run writes to and never writes, so it is safe to leave
+running against a live run.
+
+```sh
+cargo run -p ratatoskr-cli -- serve            # http://127.0.0.1:7878
+```
+
+The UI is a separate build artifact and is not required: without it you get the JSON API
+(`/api/runs`, `/api/runs/{id}`, `/api/runs/{id}/nodes/{node}`) and a hint on stdout. To build it:
+
+```sh
+cd crates/ratatoskr-serve/web && bun install && bun run build
+```
+
+See [that crate's web README](crates/ratatoskr-serve/web/README.md) for the dev-server workflow.
 
 ## License
 
