@@ -5,6 +5,7 @@
 //! single-writer discipline is preserved because this process never writes. WAL means these reads
 //! don't block a run in progress.
 
+pub mod events;
 pub mod launch;
 pub mod pipeline;
 
@@ -14,11 +15,13 @@ use std::sync::Arc;
 
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use ratatoskr_store::{Checkpoint, Store};
 use serde::Serialize;
+use tokio_stream::StreamExt as _;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::launch::{LaunchError, Launcher};
@@ -42,6 +45,8 @@ pub enum ServeError {
 struct AppState {
     store: Store,
     launcher: Arc<Launcher>,
+    /// Where the structured log lives, for the live event stream.
+    log_dir: PathBuf,
 }
 
 /// What `serve` needs: where to read, where to listen, and what to launch runs against.
@@ -74,6 +79,7 @@ pub async fn serve(opts: ServeOptions<'_>) -> Result<(), ServeError> {
     }
     let store = Store::open(store_path)?;
     let launcher = Arc::new(Launcher::new(project, config_path, max_runs));
+    let log_dir = project.join(".ratatoskr/logs");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     let web = web_dir();
@@ -90,7 +96,7 @@ pub async fn serve(opts: ServeOptions<'_>) -> Result<(), ServeError> {
         }
     }
 
-    axum::serve(listener, router(store, launcher, web)).await?;
+    axum::serve(listener, router(store, launcher, log_dir, web)).await?;
     Ok(())
 }
 
@@ -108,12 +114,17 @@ fn web_dir() -> Option<PathBuf> {
     candidate.join("index.html").is_file().then_some(candidate)
 }
 
-fn router(store: Store, launcher: Arc<Launcher>, web: Option<PathBuf>) -> Router {
+fn router(store: Store, launcher: Arc<Launcher>, log_dir: PathBuf, web: Option<PathBuf>) -> Router {
     let api = Router::new()
         .route("/api/runs", get(list_runs).post(start_run))
         .route("/api/runs/{run_id}", get(run_detail))
         .route("/api/runs/{run_id}/nodes/{node}", get(node_checkpoints))
-        .with_state(AppState { store, launcher });
+        .route("/api/runs/{run_id}/events", get(run_events))
+        .with_state(AppState {
+            store,
+            launcher,
+            log_dir,
+        });
 
     match web {
         // Unmatched paths fall back to index.html so the client owns its own routing.
@@ -296,6 +307,28 @@ async fn start_run(
     let run_id = state.launcher.spawn(&body.issue)?;
     tracing::info!(kind = "run_started", run_id = %run_id, "started run from the dashboard");
     Ok((StatusCode::ACCEPTED, Json(StartedRun { run_id })))
+}
+
+/// Stream a run's activity as it happens.
+///
+/// Checkpoints only tell you a node *finished*; this is what it is doing in between. The stream
+/// replays the run's recent history on connect, then follows the log, and ends when the client
+/// disconnects — the tailing task is owned by the channel and dies with it.
+async fn run_events(
+    State(state): State<AppState>,
+    AxumPath(run_id): AxumPath<String>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    tokio::spawn(events::follow(state.log_dir.clone(), run_id, tx));
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|event| {
+        Ok(Event::default()
+            .json_data(event)
+            .unwrap_or_else(|_| Event::default().data("{}")))
+    });
+    // A keep-alive comment holds the connection open through the quiet stretch while a node waits
+    // on a model, which can outlast an idle-timeout proxy.
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// API error responses.

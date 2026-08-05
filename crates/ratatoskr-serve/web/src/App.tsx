@@ -4,16 +4,19 @@ import {
   LIVE,
   getNodeCheckpoints,
   getRun,
+  followRun,
   listRuns,
   startRun,
   type CheckpointView,
+  type LiveEvent,
   type RunDetail,
   type RunSummary,
 } from "./api";
 
 /** A live run with nothing recorded for this long is almost certainly dead, not busy. */
 const STALE_MS = 120_000;
-const POLL_MS = 3000;
+/** How many live events to keep on screen. Old ones scroll away; the log file keeps everything. */
+const FEED_LIMIT = 250;
 
 const short = (id: string | null) => (id ? id.slice(0, 8) : "—");
 const clock = (ts: string | null) => (ts ? ts.slice(11, 19) : "—");
@@ -158,6 +161,38 @@ function RunMeta({ detail }: { detail: RunDetail }) {
   );
 }
 
+/**
+ * What the run is doing right now. Scoped to the selected node when there is one, because during
+ * the fork two nodes are genuinely concurrent and an interleaved feed is the hardest possible read.
+ */
+function Feed({ events, node }: { events: LiveEvent[]; node: string | null }) {
+  const shown = node ? events.filter((e) => e.node === node) : events;
+  const tail = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    tail.current?.scrollIntoView({ block: "end" });
+  }, [shown.length]);
+
+  return (
+    <div className="feed">
+      <div className="sec">
+        <span>[ ACTIVITY {node ? `/ ${node.replace("_", " ")}` : ""} ]</span>
+        <output>{shown.length}</output>
+      </div>
+      {shown.length === 0 && <p className="empty">no activity recorded yet</p>}
+      {shown.map((e, i) => (
+        <div className="ev" key={`${e.at}-${i}`}>
+          <span className="ev-t">{clock(e.at)}</span>
+          <span className={`ev-k ev-k--${e.kind}`}>{e.kind.replace("_", " ")}</span>
+          {!node && <span className="ev-n">{e.node ?? "—"}</span>}
+          <span className="ev-d">{e.detail}</span>
+        </div>
+      ))}
+      <div ref={tail} />
+    </div>
+  );
+}
+
 function Detail({
   runId,
   node,
@@ -206,6 +241,7 @@ export default function App() {
   const [detail, setDetail] = useState<RunDetail | null>(null);
   const [node, setNode] = useState<string | null>(null);
   const [checkpoints, setCheckpoints] = useState<CheckpointView[] | null>(null);
+  const [events, setEvents] = useState<LiveEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -233,36 +269,47 @@ export default function App() {
     [refresh],
   );
 
-  // Poll while the selected run is live. #39 replaces this with a pushed log tail; until then
-  // this is deliberately coarse — checkpoint arrival is the only signal the store can give.
-  const live = detail?.status != null && LIVE.has(detail.status);
+  // Which run the view is actually on, so a slow response for a run we've since left can be
+  // dropped instead of overwriting the current one.
+  const shown = useRef<string | null>(null);
+  useEffect(() => {
+    shown.current = runId;
+  }, [runId]);
+
+  const load = useCallback(async () => {
+    if (!runId) return;
+    try {
+      const d = await getRun(runId);
+      if (shown.current === runId) setDetail(d);
+    } catch (e) {
+      if (shown.current === runId) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    }
+  }, [runId]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // Follow the run's activity rather than polling for it. Checkpoints only say a node *finished*;
+  // the stream is what shows a node working through a long turn. Node state still comes from the
+  // store, so a checkpoint event is the cue to re-read it.
   useEffect(() => {
     if (!runId) return;
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const d = await getRun(runId);
-        if (!cancelled) setDetail(d);
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
-      }
-    };
-    void load();
-    // The cleanup must be registered on every path, including the non-polling one: without it
-    // `cancelled` never flips, and a slow response for the previously selected run lands after
-    // you've already switched, overwriting the newer one.
-    let timer: ReturnType<typeof setInterval> | undefined;
-    if (live) {
-      timer = setInterval(() => {
-        void load();
-        void refresh();
-      }, POLL_MS);
-    }
-    return () => {
-      cancelled = true;
-      if (timer !== undefined) clearInterval(timer);
-    };
-  }, [runId, live, refresh]);
+    setEvents([]);
+    const stop = followRun(runId, {
+      onReset: () => setEvents([]),
+      onEvent: (event) => {
+        setEvents((prev) => [...prev.slice(-(FEED_LIMIT - 1)), event]);
+        if (event.kind === "checkpoint" || event.kind.startsWith("run_")) {
+          void load();
+          void refresh();
+        }
+      },
+    });
+    return stop;
+  }, [runId, load, refresh]);
 
   useEffect(() => {
     setNode(null);
@@ -307,7 +354,7 @@ export default function App() {
         onStarted={onStarted}
       />
 
-      <main className={node ? "stage stage--split" : "stage"}>
+      <main className="stage stage--split">
         {detail ? (
           <>
             <RunMeta detail={detail} />
@@ -318,11 +365,14 @@ export default function App() {
                 onSelect={setNode}
               />
             </div>
-            {node && (
-              <div className="detail">
-                <Detail runId={runId} node={node} checkpoints={checkpoints} />
-              </div>
-            )}
+            <div className="lower">
+              <Feed events={events} node={node} />
+              {node && (
+                <div className="detail">
+                  <Detail runId={runId} node={node} checkpoints={checkpoints} />
+                </div>
+              )}
+            </div>
           </>
         ) : (
           <p className="empty">no run selected</p>
