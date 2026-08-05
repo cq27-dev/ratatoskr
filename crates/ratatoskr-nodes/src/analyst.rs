@@ -61,6 +61,8 @@ pub struct AnalystNode {
     pub max_turns: Option<usize>,
     /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
     pub system_prompt: Option<String>,
+    /// Session context contributed by plugins, prefixed to whichever preamble applies.
+    pub context: Option<String>,
 }
 
 impl Node for AnalystNode {
@@ -80,7 +82,11 @@ impl Node for AnalystNode {
         let raw = ratatoskr_agent::run_structured(
             "analyst",
             &self.route,
-            self.system_prompt.as_deref().unwrap_or(PREAMBLE),
+            &crate::effective_preamble(
+                PREAMBLE,
+                self.system_prompt.as_deref(),
+                self.context.as_deref(),
+            ),
             &prompt,
             self.tools.clone(),
             self.sink.clone(),

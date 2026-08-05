@@ -55,6 +55,8 @@ pub struct WorkflowContext {
     iterate_lock: tokio::sync::Mutex<()>,
     invocations: AtomicUsize,
     iterations: AtomicU32,
+    /// What plugins contributed for this run, prefixed to each node's preamble.
+    plugin_context: crate::PluginContext,
 }
 
 impl WorkflowContext {
@@ -65,10 +67,12 @@ impl WorkflowContext {
         run_id: &str,
         issue: &str,
         engine: &Arc<ScriptEngine>,
+        plugin_context: crate::PluginContext,
     ) -> Result<Arc<Self>, PlanError> {
         let repo_path = std::env::current_dir()
             .map_err(|e| PlanError::node("workflow", NodeError::Failed(format!("cwd: {e}"))))?;
         Ok(Arc::new(Self {
+            plugin_context,
             config: config.clone(),
             store: store.clone(),
             engine: Arc::clone(engine),
@@ -213,6 +217,7 @@ async fn scout_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, St
         // Node-to-node clarification is built-in-flow only for now; the scripted path opts out.
         clarifier: None,
         system_prompt: cfg.system_prompt,
+        context: ctx.plugin_context.0.clone(),
     };
     let out = node
         .run(issue, &RunState::new(&ctx.run_id, None))
@@ -260,6 +265,7 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
         policy: cfg.policy,
         max_turns: cfg.max_turns,
         system_prompt: cfg.system_prompt,
+        context: ctx.plugin_context.0.clone(),
     };
     let out = node
         .run(input, &RunState::new(&ctx.run_id, None))
@@ -290,6 +296,7 @@ fn build_red_team(ctx: &WorkflowContext) -> Result<RedTeamNode, PlanError> {
                 max_turns: cfg.max_turns,
                 clarifier: None,
                 system_prompt: cfg.system_prompt,
+                context: ctx.plugin_context.0.clone(),
             })
         }
         false => None,
@@ -638,6 +645,7 @@ async fn bookkeep_scripted(
         max_turns: cfg.max_turns,
         clarifier: None,
         system_prompt: cfg.system_prompt,
+        context: ctx.plugin_context.0.clone(),
     };
     let out = node
         .run(input)

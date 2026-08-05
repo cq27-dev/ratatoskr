@@ -1,7 +1,7 @@
 //! `ratatoskr.toml` configuration.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +18,34 @@ pub struct RatatoskrConfig {
     pub implementer: ImplementerConfig,
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    #[serde(default)]
+    pub plugins: PluginConfig,
+}
+
+/// Where to look for agent plugins. `.ratatoskr/plugins/` is always searched; `paths` adds
+/// plugins installed elsewhere, and may name either a plugin or a directory of them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginConfig {
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+}
+
+impl PluginConfig {
+    /// Every directory to search, convention first, resolved against the project root.
+    ///
+    /// Relative paths are joined to `root` rather than left to the process's working directory:
+    /// a config's paths belong to the project it configures, and one process can serve several.
+    pub fn search_paths(&self, root: &Path) -> Vec<PathBuf> {
+        let mut dirs = vec![root.join(".ratatoskr/plugins")];
+        dirs.extend(self.paths.iter().map(|p| {
+            if p.is_absolute() {
+                p.clone()
+            } else {
+                root.join(p)
+            }
+        }));
+        dirs
+    }
 }
 
 /// Phase 3 implementer settings.
@@ -188,6 +216,7 @@ impl Default for RatatoskrConfig {
             ]),
             implementer: ImplementerConfig::default(),
             sandbox: SandboxConfig::default(),
+            plugins: PluginConfig::default(),
         }
     }
 }

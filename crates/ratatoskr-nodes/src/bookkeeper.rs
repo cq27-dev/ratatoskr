@@ -98,6 +98,8 @@ pub struct BookkeeperNode {
     pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
     /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
     pub system_prompt: Option<String>,
+    /// Session context contributed by plugins, prefixed to whichever preamble applies.
+    pub context: Option<String>,
 }
 
 impl BookkeeperNode {
@@ -106,7 +108,11 @@ impl BookkeeperNode {
         let raw = ratatoskr_agent::run_structured(
             "bookkeeper",
             &self.route,
-            self.system_prompt.as_deref().unwrap_or(PREAMBLE),
+            &crate::effective_preamble(
+                PREAMBLE,
+                self.system_prompt.as_deref(),
+                self.context.as_deref(),
+            ),
             &prompt,
             self.tools.clone(),
             self.sink.clone(),

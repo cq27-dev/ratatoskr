@@ -67,6 +67,8 @@ pub struct RedTeamClassifier {
     pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
     /// Ruleset `systemPrompt`; replaces [`CLASSIFY_PREAMBLE`] when set.
     pub system_prompt: Option<String>,
+    /// Session context contributed by plugins, prefixed to whichever preamble applies.
+    pub context: Option<String>,
 }
 
 impl RedTeamClassifier {
@@ -84,7 +86,11 @@ impl RedTeamClassifier {
         let raw = ratatoskr_agent::run_structured(
             "redteam",
             &self.route,
-            self.system_prompt.as_deref().unwrap_or(CLASSIFY_PREAMBLE),
+            &crate::effective_preamble(
+                CLASSIFY_PREAMBLE,
+                self.system_prompt.as_deref(),
+                self.context.as_deref(),
+            ),
             &prompt,
             self.tools.clone(),
             self.sink.clone(),
