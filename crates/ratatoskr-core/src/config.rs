@@ -91,11 +91,13 @@ pub struct ModelRoute {
     pub model: String,
 }
 
-/// Error parsing `ratatoskr.toml`.
+/// Error parsing or validating `ratatoskr.toml`.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to parse ratatoskr.toml: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("invalid config: {0}")]
+    Invalid(String),
 }
 
 impl RatatoskrConfig {
@@ -107,6 +109,44 @@ impl RatatoskrConfig {
     /// Render this config as TOML — what `ratatoskr init` writes.
     pub fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
+    }
+
+    /// Reject configs that would otherwise fail deep in a run with a cryptic error. Structural
+    /// checks only — this does not probe the environment (whether the sandbox backend's kernel
+    /// features are present, whether the CLI is installed); those surface at run time.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        const BACKENDS: [&str; 2] = ["microsandbox", "landlock"];
+        const CLIS: [&str; 1] = ["claude"];
+
+        if self.rag_rat.command.is_empty() {
+            return Err(ConfigError::Invalid(
+                "rag_rat.command is empty — set the command that launches rag-rat's MCP server"
+                    .to_string(),
+            ));
+        }
+        if self.sandbox.test_command.is_empty() {
+            return Err(ConfigError::Invalid(
+                "sandbox.test_command is empty — set the repo's test command".to_string(),
+            ));
+        }
+        if !BACKENDS.contains(&self.sandbox.backend.as_str()) {
+            return Err(ConfigError::Invalid(format!(
+                "sandbox.backend `{}` is not one of {BACKENDS:?}",
+                self.sandbox.backend
+            )));
+        }
+        if !CLIS.contains(&self.implementer.cli.as_str()) {
+            return Err(ConfigError::Invalid(format!(
+                "implementer.cli `{}` is not one of {CLIS:?}",
+                self.implementer.cli
+            )));
+        }
+        if self.implementer.max_iterations == 0 {
+            return Err(ConfigError::Invalid(
+                "implementer.max_iterations must be >= 1".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -182,6 +222,36 @@ mod tests {
         assert_eq!(cfg.rag_rat.command, ["rag-rat", "mcp", "serve"]);
         assert_eq!(cfg.store.path, PathBuf::from(".ratatoskr/state.sqlite3"));
         assert_eq!(cfg.models["scout"].provider, "kimi");
+    }
+
+    #[test]
+    fn default_config_is_valid() {
+        RatatoskrConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_unusable_configs() {
+        let invalid = |mutate: fn(&mut RatatoskrConfig)| {
+            let mut cfg = RatatoskrConfig::default();
+            mutate(&mut cfg);
+            match cfg.validate() {
+                Err(ConfigError::Invalid(_)) => {}
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+        };
+
+        invalid(|c| c.rag_rat.command.clear());
+        invalid(|c| c.sandbox.test_command.clear());
+        invalid(|c| c.sandbox.backend = "docker".to_string());
+        invalid(|c| c.implementer.cli = "aider".to_string());
+        invalid(|c| c.implementer.max_iterations = 0);
+    }
+
+    #[test]
+    fn landlock_backend_is_valid() {
+        let mut cfg = RatatoskrConfig::default();
+        cfg.sandbox.backend = "landlock".to_string();
+        cfg.validate().unwrap();
     }
 
     #[test]
