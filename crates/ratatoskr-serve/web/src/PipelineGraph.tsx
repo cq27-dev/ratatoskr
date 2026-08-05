@@ -27,6 +27,14 @@ const LAYOUT: Record<string, { x: number; y: number }> = {
   bookkeeper: { x: 800, y: 70 },
 };
 
+/**
+ * Declared up front rather than measured. React Flow keeps a node `visibility: hidden` until a
+ * ResizeObserver reports its size, and these are a fixed-size box anyway — giving the dimensions
+ * removes the dependency on that callback ever firing, which is what decides whether the graph
+ * appears at all. Keep in step with `.node` in style.css.
+ */
+const NODE_SIZE = { width: 150, height: 52 };
+
 const EDGES: ReadonlyArray<readonly [string, string]> = [
   ["scout", "memory"],
   ["memory", "analyst"],
@@ -126,6 +134,7 @@ export default function PipelineGraph({ nodes, selected, onSelect }: Props) {
             position,
             data: { node: n, isSelected: selected === n.name },
             draggable: false,
+            ...NODE_SIZE,
           },
         ];
       }),

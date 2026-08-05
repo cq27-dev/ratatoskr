@@ -263,10 +263,81 @@ body::after {
   overflow: hidden;
 }
 
-/* The detail row exists only when there's something in it — an empty pane would otherwise
-   reserve half the stage to say nothing, and a child max-height can't cap an `auto` track. */
+/* The lower half is always present now: even with no node selected there is a live feed to show. */
 .stage--split {
-  grid-template-rows: auto minmax(220px, 1fr) minmax(0, 45%);
+  grid-template-rows: auto minmax(200px, 1fr) minmax(0, 46%);
+}
+
+/* Activity beside output: the feed says what is happening, the pane what was produced. */
+.lower {
+  display: grid;
+  grid-template-columns: minmax(280px, 2fr) 3fr;
+  gap: 1px;
+  background: var(--rule);
+  overflow: hidden;
+  min-height: 0;
+}
+
+.lower:has(> .feed:only-child) {
+  grid-template-columns: 1fr;
+}
+
+.feed {
+  background: var(--bg);
+  overflow: auto;
+  min-height: 0;
+}
+
+/* Flex, not grid: the node column is only rendered when no node is selected, so the column count
+   varies and a fixed track list would wrap the detail onto its own row. */
+.ev {
+  display: flex;
+  gap: 8px;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--rule);
+  align-items: baseline;
+  font-size: 10px;
+}
+
+.ev-t,
+.ev-k,
+.ev-n {
+  flex: none;
+}
+
+.ev-d {
+  flex: 1;
+  min-width: 0;
+}
+
+.ev-t {
+  color: var(--muted);
+}
+
+.ev-k {
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* Only the two that mean forward progress get emphasis; the rest stay quiet. */
+.ev-k--checkpoint {
+  color: var(--fg);
+}
+.ev-k--run_failed {
+  color: var(--hazard);
+}
+
+.ev-n {
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.ev-d {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .runmeta {
@@ -351,7 +422,9 @@ body::after {
 
 /* ── Pipeline nodes ──────────────────────────────────────────────────────── */
 .node {
-  width: 150px;
+  /* The wrapper is sized by NODE_SIZE in PipelineGraph.tsx; fill it rather than restating it. */
+  width: 100%;
+  height: 100%;
   background: var(--panel);
   border: 1px solid var(--rule);
   padding: 7px 9px;

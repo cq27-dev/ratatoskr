@@ -1,0 +1,455 @@
+//! Following a run's activity between checkpoints.
+//!
+//! Checkpoint arrival is a coarse signal — a node can work for minutes without producing one. The
+//! structured log records every tool call and every piece of model text as it happens, so the
+//! dashboard tails that instead of waiting.
+//!
+//! The log file is per process and per day, and concurrent runs interleave in it, so attribution
+//! has to happen here: each record carries its `run_id` either as a field or through the enclosing
+//! spans, and only records belonging to the requested run are forwarded.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::Serialize;
+use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::mpsc;
+
+/// How often the log is checked for new lines. Fast enough to feel live, slow enough that an idle
+/// dashboard costs nothing measurable.
+const POLL: Duration = Duration::from_millis(300);
+
+/// The most recent events replayed when a client attaches, so opening the dashboard mid-run shows
+/// what has happened rather than an empty pane until the next event.
+const REPLAY_LIMIT: usize = 200;
+
+/// Longest `detail` forwarded. Model text is already truncated at the logging site; this is a
+/// backstop so one enormous record can't stall a stream.
+const DETAIL_LIMIT: usize = 2000;
+
+/// One thing a run did, normalised for display.
+///
+/// The messy part — that `run_id` and `node` live in different places depending on which crate
+/// logged the record — is resolved here rather than in the client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LiveEvent {
+    pub at: String,
+    /// `tool_call`, `model_text`, `checkpoint`, or whatever else the log carried.
+    pub kind: String,
+    pub node: Option<String>,
+    /// The useful part: the tool name, the model's text, or the message.
+    pub detail: String,
+}
+
+/// The newest daily log file, if any. `tracing-appender` suffixes the date (`ratatoskr.jsonl.
+/// 2026-08-05`), so there is never a bare `ratatoskr.jsonl`, and the dates sort lexicographically.
+pub async fn newest_log(dir: &Path) -> Option<PathBuf> {
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    let mut newest: Option<PathBuf> = None;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let is_jsonl = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("ratatoskr.jsonl."));
+        if is_jsonl && newest.as_ref().is_none_or(|cur| path > *cur) {
+            newest = Some(path);
+        }
+    }
+    newest
+}
+
+/// Pull `run_id` out of a record: a plain field first (how the dashboard's own launch and reap
+/// lines carry it, since they are emitted outside any run), then the enclosing spans.
+fn run_id_of(record: &Value) -> Option<&str> {
+    if let Some(id) = record.get("run_id").and_then(Value::as_str) {
+        return Some(id);
+    }
+    record
+        .get("spans")?
+        .as_array()?
+        .iter()
+        .find_map(|span| span.get("run_id").and_then(Value::as_str))
+}
+
+/// Same idea for the node: a field on checkpoint records, the `agent` span for everything an
+/// agent emits.
+fn node_of(record: &Value) -> Option<&str> {
+    if let Some(node) = record.get("node").and_then(Value::as_str) {
+        return Some(node);
+    }
+    record
+        .get("spans")?
+        .as_array()?
+        .iter()
+        .find_map(|span| span.get("node").and_then(Value::as_str))
+}
+
+/// Normalise one log record, keeping only what a viewer can act on.
+fn to_event(record: &Value) -> LiveEvent {
+    let kind = record
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("event")
+        .to_string();
+    let str_field = |key: &str| record.get(key).and_then(Value::as_str);
+    let detail = match kind.as_str() {
+        "tool_call" => str_field("tool").unwrap_or("tool"),
+        "model_text" => str_field("text").unwrap_or_default(),
+        _ => str_field("message").unwrap_or(&kind),
+    };
+    let detail = match detail.char_indices().nth(DETAIL_LIMIT) {
+        Some((cut, _)) => format!("{}…", &detail[..cut]),
+        None => detail.to_string(),
+    };
+
+    LiveEvent {
+        at: str_field("timestamp").unwrap_or_default().to_string(),
+        kind,
+        node: node_of(record).map(str::to_string),
+        detail,
+    }
+}
+
+/// Parse a batch of lines into this run's events, dropping anything unparseable or belonging to
+/// another run.
+fn events_for(run_id: &str, lines: &[&str]) -> Vec<LiveEvent> {
+    lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| run_id_of(record) == Some(run_id))
+        .map(|record| to_event(&record))
+        .collect()
+}
+
+/// Read whatever has been appended since `pos`. Returns the new text and the new position.
+async fn read_since(path: &Path, pos: u64) -> std::io::Result<(String, u64)> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let len = file.metadata().await?.len();
+    // A shorter file than last time means it was replaced under us; start over rather than
+    // seeking past the end and reading garbage.
+    let pos = if len < pos { 0 } else { pos };
+    if len == pos {
+        return Ok((String::new(), pos));
+    }
+    file.seek(std::io::SeekFrom::Start(pos)).await?;
+    let mut buf = Vec::with_capacity((len - pos) as usize);
+    file.take(len - pos).read_to_end(&mut buf).await?;
+    Ok((String::from_utf8_lossy(&buf).into_owned(), len))
+}
+
+/// Where a tail has got to in the log.
+#[derive(Default)]
+struct Tail {
+    current: Option<PathBuf>,
+    pos: u64,
+    /// A trailing fragment with no newline yet — the writer is mid-line.
+    partial: String,
+    replayed: bool,
+}
+
+impl Tail {
+    /// Read and forward whatever is new. `Err(())` means the client is gone.
+    async fn drain(&mut self, run_id: &str, tx: &mpsc::Sender<LiveEvent>) -> Result<(), ()> {
+        let Some(path) = self.current.clone() else {
+            return Ok(());
+        };
+        let Ok((chunk, next)) = read_since(&path, self.pos).await else {
+            return Ok(());
+        };
+        self.pos = next;
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        self.partial.push_str(&chunk);
+        // Keep the unterminated tail: forwarding half a line would drop the event.
+        let Some(end) = self.partial.rfind('\n') else {
+            return Ok(());
+        };
+        let complete: String = self.partial.drain(..end + 1).collect();
+        let lines: Vec<&str> = complete.lines().collect();
+
+        let mut events = events_for(run_id, &lines);
+        if !self.replayed && events.len() > REPLAY_LIMIT {
+            // Attaching to a long-running run replays the tail, not the whole history.
+            events.drain(..events.len() - REPLAY_LIMIT);
+        }
+        // Only once a complete line has actually been seen, so a connect that races a
+        // half-written line still caps the backlog that follows.
+        self.replayed = true;
+
+        for event in events {
+            tx.send(event).await.map_err(|_| ())?;
+        }
+        Ok(())
+    }
+}
+
+/// Follow the log for one run until the receiver goes away.
+///
+/// One task per connected client. That is more polling than a single shared tailer broadcasting to
+/// everyone, but the task dies with its channel — no shared state to own, and no lifecycle to get
+/// wrong — and this is a local dashboard with a handful of viewers at most.
+pub async fn follow(dir: PathBuf, run_id: String, tx: mpsc::Sender<LiveEvent>) {
+    let mut tail = Tail::default();
+
+    loop {
+        if tx.is_closed() {
+            return;
+        }
+
+        // Follow the rollover: at midnight the run keeps writing, just to a new file.
+        let newest = newest_log(&dir).await;
+        if newest != tail.current {
+            // Drain what we are leaving first. The rollover is noticed up to one poll after it
+            // happens, so the old file's last lines would otherwise never be read.
+            if tail.current.is_some() && tail.drain(&run_id, &tx).await.is_err() {
+                return;
+            }
+            tail.current = newest;
+            tail.pos = 0;
+            tail.partial.clear();
+        }
+
+        if tail.drain(&run_id, &tx).await.is_err() {
+            return;
+        }
+
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A record shaped exactly like the agent's, where attribution lives in the span list.
+    fn agent_line(run: &str, node: &str) -> String {
+        serde_json::json!({
+            "timestamp": "2026-08-05T19:02:08Z",
+            "kind": "tool_call",
+            "tool": "semantic_search",
+            "spans": [{"name": "run", "run_id": run}, {"name": "agent", "node": node}]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn attribution_comes_from_a_field_or_the_span_list() {
+        let from_span: Value = serde_json::from_str(&agent_line("r1", "scout")).unwrap();
+        assert_eq!(run_id_of(&from_span), Some("r1"));
+        assert_eq!(node_of(&from_span), Some("scout"));
+
+        // The dashboard's own launch/reap lines are emitted outside any run span.
+        let from_field = serde_json::json!({"kind": "run_started", "run_id": "r2"});
+        assert_eq!(run_id_of(&from_field), Some("r2"));
+        assert_eq!(node_of(&from_field), None);
+
+        assert_eq!(run_id_of(&serde_json::json!({"kind": "x"})), None);
+    }
+
+    #[test]
+    fn only_the_requested_runs_lines_are_forwarded() {
+        // Concurrent runs share one file, so this filter is what keeps streams separate.
+        let lines = [
+            agent_line("r1", "scout"),
+            agent_line("r2", "analyst"),
+            agent_line("r1", "analyst"),
+            "not json at all".to_string(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+
+        let events = events_for("r1", &refs);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].node.as_deref(), Some("scout"));
+        assert_eq!(events[1].node.as_deref(), Some("analyst"));
+        // A malformed line is skipped rather than ending the stream.
+        assert_eq!(events_for("r3", &refs).len(), 0);
+    }
+
+    #[test]
+    fn each_kind_surfaces_its_useful_part() {
+        let tool: Value = serde_json::from_str(&agent_line("r", "scout")).unwrap();
+        assert_eq!(to_event(&tool).detail, "semantic_search");
+
+        let text = serde_json::json!({"kind": "model_text", "text": "thinking about it"});
+        assert_eq!(to_event(&text).detail, "thinking about it");
+
+        let checkpoint = serde_json::json!({"kind": "checkpoint", "message": "checkpoint"});
+        let event = to_event(&checkpoint);
+        assert_eq!(event.kind, "checkpoint");
+        assert_eq!(event.detail, "checkpoint");
+    }
+
+    #[test]
+    fn an_enormous_record_is_truncated_not_forwarded_whole() {
+        let huge = serde_json::json!({"kind": "model_text", "text": "x".repeat(9000)});
+        let event = to_event(&huge);
+        assert!(event.detail.ends_with('…'));
+        assert_eq!(event.detail.chars().count(), DETAIL_LIMIT + 1);
+    }
+
+    #[tokio::test]
+    async fn the_newest_daily_file_wins_and_a_missing_dir_is_not_an_error() {
+        let dir = std::env::temp_dir().join(format!("ratatoskr-events-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        assert!(newest_log(&dir).await.is_none(), "no directory yet");
+
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        assert!(newest_log(&dir).await.is_none(), "no logs yet");
+
+        for day in ["2026-08-04", "2026-08-05"] {
+            tokio::fs::write(dir.join(format!("ratatoskr.jsonl.{day}")), "")
+                .await
+                .unwrap();
+        }
+        // The prose log sits in the same directory and must not be picked up.
+        tokio::fs::write(dir.join("ratatoskr.log.2026-08-06"), "")
+            .await
+            .unwrap();
+
+        let newest = newest_log(&dir).await.expect("a log file");
+        assert!(
+            newest
+                .to_string_lossy()
+                .ends_with("ratatoskr.jsonl.2026-08-05")
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn reading_resumes_from_the_last_position() {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-events-read-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("ratatoskr.jsonl.2026-08-05");
+
+        tokio::fs::write(&path, "one\n").await.unwrap();
+        let (chunk, pos) = read_since(&path, 0).await.unwrap();
+        assert_eq!(chunk, "one\n");
+
+        // Nothing new: same position, no repeated content.
+        let (chunk, pos) = read_since(&path, pos).await.unwrap();
+        assert!(chunk.is_empty());
+
+        tokio::fs::write(&path, "one\ntwo\n").await.unwrap();
+        let (chunk, _) = read_since(&path, pos).await.unwrap();
+        assert_eq!(chunk, "two\n", "only the appended part is re-read");
+
+        // A replaced, shorter file restarts rather than seeking past its end.
+        tokio::fs::write(&path, "x\n").await.unwrap();
+        let (chunk, _) = read_since(&path, 999).await.unwrap();
+        assert_eq!(chunk, "x\n");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A scratch log directory unique to this test and process — `follow` polls a real directory,
+    /// and a shared path would let concurrent tests read each other's lines.
+    fn scratch(case: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-follow-{}-{case}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn next_event(rx: &mut mpsc::Receiver<LiveEvent>) -> LiveEvent {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an event within five seconds")
+            .expect("the stream is still open")
+    }
+
+    #[tokio::test]
+    async fn follow_picks_up_appends_and_never_splits_a_line() {
+        let dir = scratch("append");
+        let path = dir.join("ratatoskr.jsonl.2026-08-05");
+        std::fs::write(&path, format!("{}\n", agent_line("r1", "scout"))).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let task = tokio::spawn(follow(dir.clone(), "r1".to_string(), tx));
+
+        assert_eq!(next_event(&mut rx).await.node.as_deref(), Some("scout"));
+
+        // Append a line in two writes, cut mid-JSON: the half-line must not be forwarded as an
+        // event, and must not be lost once the writer finishes it.
+        let second = format!("{}\n", agent_line("r1", "analyst"));
+        let (head, tail) = second.split_at(second.len() / 2);
+        std::fs::write(&path, format!("{}\n{head}", agent_line("r1", "scout"))).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        std::fs::write(
+            &path,
+            format!("{}\n{head}{tail}", agent_line("r1", "scout")),
+        )
+        .unwrap();
+
+        assert_eq!(next_event(&mut rx).await.node.as_deref(), Some("analyst"));
+
+        task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn follow_drains_the_old_file_before_moving_to_the_next_day() {
+        let dir = scratch("rollover");
+        let today = dir.join("ratatoskr.jsonl.2026-08-05");
+        std::fs::write(&today, format!("{}\n", agent_line("r1", "scout"))).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let task = tokio::spawn(follow(dir.clone(), "r1".to_string(), tx));
+        assert_eq!(next_event(&mut rx).await.node.as_deref(), Some("scout"));
+
+        // A line lands in the old file and the new day's file appears in the same window. The
+        // straggler must still be delivered, not skipped past by the rotation.
+        std::fs::write(
+            &today,
+            format!(
+                "{}\n{}\n",
+                agent_line("r1", "scout"),
+                agent_line("r1", "memory")
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ratatoskr.jsonl.2026-08-06"),
+            format!("{}\n", agent_line("r1", "analyst")),
+        )
+        .unwrap();
+
+        let seen = [
+            next_event(&mut rx).await.node,
+            next_event(&mut rx).await.node,
+        ];
+        assert!(
+            seen.iter().any(|n| n.as_deref() == Some("memory")),
+            "the old file's last line survives the rollover, got {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|n| n.as_deref() == Some("analyst")),
+            "and the new file is picked up, got {seen:?}"
+        );
+
+        task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn follow_stops_when_the_client_goes_away() {
+        let dir = scratch("hangup");
+        std::fs::write(
+            dir.join("ratatoskr.jsonl.2026-08-05"),
+            format!("{}\n", agent_line("r1", "scout")),
+        )
+        .unwrap();
+
+        let (tx, rx) = mpsc::channel(16);
+        let task = tokio::spawn(follow(dir.clone(), "r1".to_string(), tx));
+        drop(rx); // the SSE response was dropped: the tail must not outlive it
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert!(ended.is_ok(), "the tailing task must end with its receiver");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

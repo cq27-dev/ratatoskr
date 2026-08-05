@@ -102,6 +102,41 @@ interface StartedRun {
 export const getRun = (runId: string) =>
   getJSON<RunDetail>(`/api/runs/${encodeURIComponent(runId)}`);
 
+/** One thing a run did, from `GET /api/runs/{id}/events`. Mirrors `events::LiveEvent`. */
+export interface LiveEvent {
+  at: string;
+  /** `tool_call`, `model_text`, `checkpoint`, `run_started`, `run_finished`, `run_failed`, … */
+  kind: string;
+  node: string | null;
+  detail: string;
+}
+
+/**
+ * Follow a run's activity. Returns a teardown function.
+ *
+ * The server replays recent history on connect and then streams, so a dashboard opened mid-run
+ * shows what already happened instead of an empty pane.
+ */
+export function followRun(
+  runId: string,
+  handlers: { onEvent: (event: LiveEvent) => void; onReset: () => void },
+): () => void {
+  const source = new EventSource(
+    `/api/runs/${encodeURIComponent(runId)}/events`,
+  );
+  // EventSource reconnects on its own after a drop, and the server replays history to every new
+  // connection — so without clearing here, one blip duplicates the whole feed.
+  source.onopen = () => handlers.onReset();
+  source.onmessage = (message) => {
+    try {
+      handlers.onEvent(JSON.parse(message.data) as LiveEvent);
+    } catch {
+      // A malformed frame shouldn't tear down the stream.
+    }
+  };
+  return () => source.close();
+}
+
 export const getNodeCheckpoints = (runId: string, node: string) =>
   getJSON<CheckpointView[]>(
     `/api/runs/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(node)}`,
