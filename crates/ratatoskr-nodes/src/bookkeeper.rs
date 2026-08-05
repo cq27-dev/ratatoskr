@@ -101,6 +101,7 @@ impl BookkeeperNode {
     pub async fn run(&self, input: BookkeeperInput) -> Result<BookkeeperOutput, NodeError> {
         let prompt = render_prompt(&input);
         let raw = ratatoskr_agent::run_structured(
+            "bookkeeper",
             &self.route,
             PREAMBLE,
             &prompt,

@@ -69,6 +69,7 @@ impl Node for ScoutNode {
 
     async fn run(&self, issue: String, _run_state: &RunState) -> Result<ScoutOutput, NodeError> {
         let raw = ratatoskr_agent::run_structured(
+            "scout",
             &self.route,
             PREAMBLE,
             &issue,
