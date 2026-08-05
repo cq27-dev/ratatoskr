@@ -1,4 +1,6 @@
 /target
-/.ratatoskr
+# Runtime state (logs, store, worktrees) is ignored; version-controlled agent rulesets are not.
+/.ratatoskr/*
+!/.ratatoskr/rules/
 ratatoskr.toml
 .env

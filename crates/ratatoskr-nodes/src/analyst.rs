@@ -61,6 +61,8 @@ pub struct AnalystNode {
     pub route: ModelRoute,
     pub tools: Vec<Tool>,
     pub sink: ServerSink,
+    pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
+    pub max_turns: Option<usize>,
 }
 
 impl Node for AnalystNode {
@@ -84,6 +86,8 @@ impl Node for AnalystNode {
             self.tools.clone(),
             self.sink.clone(),
             schemars::schema_for!(AnalystOutput),
+            self.policy.clone(),
+            self.max_turns,
         )
         .await
         .map_err(|e| NodeError::Failed(format!("analyst agent failed: {e}")))?;

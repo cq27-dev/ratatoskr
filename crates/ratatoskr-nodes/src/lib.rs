@@ -22,11 +22,13 @@ pub use redteam::{RedTeamNode, RedTeamOutput};
 pub use scout::{RelatedItem, ScoutNode, ScoutOutput};
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use ratatoskr_core::{RatatoskrConfig, RunState, RunStatus};
+use ratatoskr_core::{RatatoskrConfig, RunState, RunStatus, ToolPolicy};
 use ratatoskr_exec::{WorktreePath, remove_worktree};
 use ratatoskr_graph::{Node, NodeError};
 use ratatoskr_mcp::RagRatClient;
+use ratatoskr_script::ScriptEngine;
 use ratatoskr_store::{Store, StoreError};
 use rmcp::model::Tool;
 use serde::Serialize;
@@ -74,12 +76,13 @@ pub async fn run_plan(
     store: &Store,
     run_id: &str,
     issue: &str,
+    engine: &Arc<ScriptEngine>,
 ) -> Result<PlanOutcome, PlanError> {
     store
         .upsert_run(run_id, None, RunStatus::Running.as_str())
         .await?;
 
-    let outcome = run_nodes(client, config, store, run_id, issue).await;
+    let outcome = run_nodes(client, config, store, run_id, issue, engine).await;
 
     let final_status = if outcome.is_ok() {
         RunStatus::Planned
@@ -100,6 +103,7 @@ async fn run_nodes(
     store: &Store,
     run_id: &str,
     issue: &str,
+    engine: &Arc<ScriptEngine>,
 ) -> Result<PlanOutcome, PlanError> {
     let sink = client.sink();
     let all_tools = client.tools();
@@ -116,10 +120,13 @@ async fn run_nodes(
     .await?;
 
     // --- scout ---
+    let scout_cfg = node_agent_config(engine, config, &all_tools, "scout", scout::SCOUT_TOOLS)?;
     let scout = ScoutNode {
-        route: route(config, "scout")?,
-        tools: filter_tools(&all_tools, scout::SCOUT_TOOLS),
+        route: scout_cfg.route,
+        tools: scout_cfg.tools,
         sink: sink.clone(),
+        policy: scout_cfg.policy,
+        max_turns: scout_cfg.max_turns,
     };
     let scout_out = scout
         .run(issue.to_string(), &state)
@@ -148,10 +155,19 @@ async fn run_nodes(
         .collect::<Result<_, _>>()?;
 
     // --- analyst ---
+    let analyst_cfg = node_agent_config(
+        engine,
+        config,
+        &all_tools,
+        "analyst",
+        analyst::ANALYST_TOOLS,
+    )?;
     let analyst = AnalystNode {
-        route: route(config, "analyst")?,
-        tools: filter_tools(&all_tools, analyst::ANALYST_TOOLS),
+        route: analyst_cfg.route,
+        tools: analyst_cfg.tools,
         sink: sink.clone(),
+        policy: analyst_cfg.policy,
+        max_turns: analyst_cfg.max_turns,
     };
     let analyst_out = analyst
         .run(
@@ -195,6 +211,66 @@ fn route(config: &RatatoskrConfig, name: &str) -> Result<ratatoskr_core::ModelRo
         .ok_or_else(|| PlanError::MissingRoute(name.to_string()))
 }
 
+/// The resolved agent settings for one node: base config plus any `.ratatoskr/rules/<node>.ts`
+/// overrides (model, tool set, per-call policy, max turns).
+struct NodeAgentConfig {
+    route: ratatoskr_core::ModelRoute,
+    tools: Vec<Tool>,
+    policy: Option<Arc<dyn ToolPolicy>>,
+    max_turns: Option<usize>,
+}
+
+/// Resolve a node's agent settings from `[models.<node>]` + `default_tools`, then layer the ruleset:
+/// `allow` (if given) REPLACES the default tool set, `deny` is always removed, a `model` rule
+/// overrides provider/model, and `onToolCall` (if defined) becomes the per-call [`ToolPolicy`].
+fn node_agent_config(
+    engine: &Arc<ScriptEngine>,
+    config: &RatatoskrConfig,
+    all_tools: &[Tool],
+    node: &str,
+    default_tools: &[&str],
+) -> Result<NodeAgentConfig, PlanError> {
+    let mut route = route(config, node)?;
+    let ruleset = engine.ruleset(node);
+    let rc = ruleset.as_ref().map(|r| r.config());
+
+    if let Some(m) = rc.and_then(|c| c.model.as_ref()) {
+        route = ratatoskr_core::ModelRoute {
+            provider: m.provider.clone(),
+            model: m.model.clone(),
+        };
+    }
+
+    let allow: Vec<&str> = match rc
+        .and_then(|c| c.tools.as_ref())
+        .and_then(|t| t.allow.as_deref())
+    {
+        Some(a) => a.iter().map(String::as_str).collect(),
+        None => default_tools.to_vec(),
+    };
+    let deny: Vec<&str> = rc
+        .and_then(|c| c.tools.as_ref())
+        .map(|t| t.deny.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let tools: Vec<Tool> = filter_tools(all_tools, &allow)
+        .into_iter()
+        .filter(|t| !deny.contains(&t.name.as_ref()))
+        .collect();
+
+    let max_turns = rc.and_then(|c| c.max_turns);
+    let policy: Option<Arc<dyn ToolPolicy>> = match ruleset {
+        Some(r) if r.config().has_on_tool_call => Some(Arc::new(r) as Arc<dyn ToolPolicy>),
+        _ => None,
+    };
+
+    Ok(NodeAgentConfig {
+        route,
+        tools,
+        policy,
+        max_turns,
+    })
+}
+
 /// Keep only the tools named in `names` — a focused subset per node. Names not present in the
 /// server's tool list are silently absent (logged); the node runs with whatever it got.
 pub fn filter_tools(all: &[Tool], names: &[&str]) -> Vec<Tool> {
@@ -236,11 +312,12 @@ pub async fn run_full(
     store: &Store,
     run_id: &str,
     issue: &str,
+    engine: &Arc<ScriptEngine>,
 ) -> Result<RunOutcome, PlanError> {
-    let plan = run_plan(client, config, store, run_id, issue).await?;
+    let plan = run_plan(client, config, store, run_id, issue, engine).await?;
     let mut state = plan.state.clone();
 
-    let result = fork_and_converge(client, config, store, run_id, issue, &plan).await;
+    let result = fork_and_converge(client, config, store, run_id, issue, &plan, engine).await;
 
     let status = match &result {
         Ok((_, _, _, status, _)) => *status,
@@ -269,7 +346,7 @@ pub async fn run_full(
             iterations,
             converged: status == RunStatus::Converged,
         };
-        match bookkeep_and_checkpoint(client, config, store, run_id, input).await {
+        match bookkeep_and_checkpoint(client, config, store, run_id, input, engine).await {
             Ok(bk) => {
                 state.artifacts = vec![serde_json::to_value(&bk)?];
                 Some(bk)
@@ -303,11 +380,21 @@ async fn bookkeep_and_checkpoint(
     store: &Store,
     run_id: &str,
     input: BookkeeperInput,
+    engine: &Arc<ScriptEngine>,
 ) -> Result<BookkeeperOutput, PlanError> {
+    let cfg = node_agent_config(
+        engine,
+        config,
+        &client.tools(),
+        "bookkeeper",
+        bookkeeper::BOOKKEEPER_TOOLS,
+    )?;
     let node = BookkeeperNode {
-        route: route(config, "bookkeeper")?,
-        tools: filter_tools(&client.tools(), bookkeeper::BOOKKEEPER_TOOLS),
+        route: cfg.route,
+        tools: cfg.tools,
         sink: client.sink(),
+        policy: cfg.policy,
+        max_turns: cfg.max_turns,
     };
     let out = node
         .run(input)
@@ -324,6 +411,7 @@ pub async fn run_bookkeeper(
     config: &RatatoskrConfig,
     store: &Store,
     run_id: &str,
+    engine: &Arc<ScriptEngine>,
 ) -> Result<BookkeeperOutput, PlanError> {
     let checkpoints = store.checkpoints_for_run(run_id).await?;
     let latest = |name: &'static str| {
@@ -359,7 +447,7 @@ pub async fn run_bookkeeper(
         iterations,
         converged,
     };
-    bookkeep_and_checkpoint(client, config, store, run_id, input).await
+    bookkeep_and_checkpoint(client, config, store, run_id, input, engine).await
 }
 
 /// The fork + converge half. Returns the terminal status; leaves the worktree in place on a
@@ -371,6 +459,7 @@ async fn fork_and_converge(
     run_id: &str,
     issue: &str,
     plan: &PlanOutcome,
+    engine: &Arc<ScriptEngine>,
 ) -> Result<
     (
         RedTeamOutput,
@@ -390,14 +479,26 @@ async fn fork_and_converge(
         sandbox: config.sandbox.clone(),
         name: format!("ratatoskr-redteam-{short}"),
         // Opt-in: classify baseline failures only when a [models.redteam] route is configured.
-        classifier: config
-            .models
-            .get("redteam")
-            .map(|route| redteam::RedTeamClassifier {
-                route: route.clone(),
-                tools: filter_tools(&client.tools(), redteam::CLASSIFIER_TOOLS),
-                sink: client.sink(),
-            }),
+        // When it is, its `.ratatoskr/rules/redteam.ts` ruleset (if any) applies on top.
+        classifier: match config.models.get("redteam") {
+            Some(_) => {
+                let cfg = node_agent_config(
+                    engine,
+                    config,
+                    &client.tools(),
+                    "redteam",
+                    redteam::CLASSIFIER_TOOLS,
+                )?;
+                Some(redteam::RedTeamClassifier {
+                    route: cfg.route,
+                    tools: cfg.tools,
+                    sink: client.sink(),
+                    policy: cfg.policy,
+                    max_turns: cfg.max_turns,
+                })
+            }
+            None => None,
+        },
     };
     let implementer = ImplementerNode {
         repo_path: repo_path.clone(),

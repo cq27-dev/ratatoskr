@@ -19,6 +19,7 @@ ratatoskr-agent = { path = "crates/ratatoskr-agent" }
 ratatoskr-graph = { path = "crates/ratatoskr-graph" }
 ratatoskr-nodes = { path = "crates/ratatoskr-nodes" }
 ratatoskr-exec = { path = "crates/ratatoskr-exec" }
+ratatoskr-script = { path = "crates/ratatoskr-script" }
 ratatoskr-mcp = { path = "crates/ratatoskr-mcp" }
 ratatoskr-store = { path = "crates/ratatoskr-store" }
 

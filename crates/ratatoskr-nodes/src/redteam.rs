@@ -60,6 +60,8 @@ pub struct RedTeamClassifier {
     pub route: ModelRoute,
     pub tools: Vec<Tool>,
     pub sink: ServerSink,
+    pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
+    pub max_turns: Option<usize>,
 }
 
 impl RedTeamClassifier {
@@ -81,6 +83,8 @@ impl RedTeamClassifier {
             self.tools.clone(),
             self.sink.clone(),
             schemars::schema_for!(Classification),
+            self.policy.clone(),
+            self.max_turns,
         )
         .await
         .map_err(|e| NodeError::Failed(format!("red-team classifier failed: {e}")))?;
