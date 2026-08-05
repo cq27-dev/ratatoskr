@@ -33,6 +33,10 @@ model = "claude-sonnet-4-6"
 provider = "anthropic"
 model = "claude-opus-4-8"
 
+[models.bookkeeper]
+provider = "moonshot"
+model = "kimi-k2.5"
+
 # Phase 3: the implementer drives a coding CLI via ACP in an isolated worktree.
 [implementer]
 cli = "claude"          # which coding CLI to drive (Claude Code via its ACP adapter)

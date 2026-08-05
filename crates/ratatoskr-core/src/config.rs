@@ -146,6 +146,8 @@ impl Default for RatatoskrConfig {
                     "implementer".to_string(),
                     route("anthropic", "claude-opus-4-8"),
                 ),
+                // Bookkeeper composes memory prose — a cheap/fast tier is fine.
+                ("bookkeeper".to_string(), route("moonshot", "kimi-k2.5")),
             ]),
             implementer: ImplementerConfig::default(),
             sandbox: SandboxConfig::default(),
@@ -187,7 +189,7 @@ mod tests {
         let toml_str = toml::to_string(&RatatoskrConfig::default()).unwrap();
         let reparsed = RatatoskrConfig::from_toml_str(&toml_str).unwrap();
         assert_eq!(reparsed.rag_rat.command.len(), 5);
-        assert_eq!(reparsed.models.len(), 4);
+        assert_eq!(reparsed.models.len(), 5);
         assert_eq!(reparsed.models["ask"].provider, "anthropic");
     }
 }

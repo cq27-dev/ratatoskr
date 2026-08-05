@@ -67,6 +67,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Replay the bookkeeper against a stored run's checkpoints — write memories, no re-run.
+    Bookkeep {
+        /// The run id to bookkeep.
+        run_id: String,
+        /// Path to the config file.
+        #[arg(long, default_value = "ratatoskr.toml")]
+        config: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -96,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
             config,
             json,
         }) => run_cmd(description, file, &config, json).await,
+        Some(Command::Bookkeep { run_id, config }) => bookkeep(&run_id, &config).await,
         None => {
             Cli::command().print_help()?;
             println!();
@@ -252,6 +261,46 @@ async fn run_cmd(
     Ok(())
 }
 
+/// Replay the bookkeeper against a stored run's checkpoints.
+async fn bookkeep(run_id: &str, config_path: &Path) -> anyhow::Result<()> {
+    let config = load_config(config_path)?;
+    let store = ratatoskr_store::Store::open(&config.store.path)
+        .with_context(|| format!("opening store at {}", config.store.path.display()))?;
+    let client = ratatoskr_mcp::RagRatClient::connect(config.rag_rat.clone())
+        .await
+        .context("connecting to rag-rat")?;
+
+    let result = ratatoskr_nodes::run_bookkeeper(&client, &config, &store, run_id).await;
+
+    if let Err(e) = client.shutdown().await {
+        tracing::warn!("failed to shut down rag-rat cleanly: {e}");
+    }
+
+    let out = result.context("bookkeeper failed")?;
+    print_bookkeeper(&out);
+    Ok(())
+}
+
+/// Print the memories a bookkeeper run wrote.
+fn print_bookkeeper(out: &ratatoskr_nodes::BookkeeperOutput) {
+    if out.memories_written.is_empty() {
+        println!("no memories written");
+        return;
+    }
+    println!("wrote {} memory(ies):", out.memories_written.len());
+    for m in &out.memories_written {
+        let anchor = if m.anchor.is_empty() {
+            "<unanchored>"
+        } else {
+            &m.anchor
+        };
+        println!("  • {} [{}] @ {}", m.memory_id, m.kind, anchor);
+        if let Some(s) = &m.summary {
+            println!("    {s}");
+        }
+    }
+}
+
 /// Read the issue text from a positional argument or `--file` (exactly one).
 fn read_issue(description: Option<String>, file: Option<PathBuf>) -> anyhow::Result<String> {
     match (description, file) {
@@ -303,6 +352,11 @@ fn print_run_summary(run_id: &str, outcome: &ratatoskr_nodes::RunOutcome) {
     }
     if !im.diff_summary.is_empty() {
         println!("\nDIFF:\n{}", im.diff_summary);
+    }
+
+    if let Some(bk) = &outcome.bookkeeper {
+        println!("\nBOOKKEEPER:");
+        print_bookkeeper(bk);
     }
 }
 

@@ -6,6 +6,7 @@
 //! with nothing to get wrong. The real executor arrives in Phase 3 when fork/join needs one.
 
 pub mod analyst;
+pub mod bookkeeper;
 pub mod converge;
 pub mod implementer;
 pub mod memory;
@@ -14,6 +15,7 @@ pub mod scout;
 pub mod testrun;
 
 pub use analyst::{AnalystNode, AnalystOutput, Risk};
+pub use bookkeeper::{BookkeeperInput, BookkeeperNode, BookkeeperOutput, MemoryWritten};
 pub use implementer::{ImplementerNode, ImplementerOutput};
 pub use memory::{MemoryNode, MemoryOutput, MemoryRecord};
 pub use redteam::{RedTeamNode, RedTeamOutput};
@@ -54,6 +56,8 @@ pub enum PlanError {
     Serialize(#[from] serde_json::Error),
     #[error("no model route `{0}` in config — add a [models.{0}] entry")]
     MissingRoute(String),
+    #[error("run {0} has no `{1}` checkpoint — not a converged run?")]
+    MissingCheckpoint(String, &'static str),
 }
 
 impl PlanError {
@@ -101,6 +105,15 @@ async fn run_nodes(
     let all_tools = client.tools();
     let mut state = RunState::new(run_id, None);
     state.status = RunStatus::Running;
+
+    // Persist the issue so `ratatoskr bookkeep <run-id>` can replay against stored checkpoints.
+    checkpoint(
+        store,
+        run_id,
+        "issue",
+        &serde_json::json!({ "issue": issue }),
+    )
+    .await?;
 
     // --- scout ---
     let scout = ScoutNode {
@@ -210,6 +223,8 @@ pub struct RunOutcome {
     pub worktree: WorktreePath,
     pub iterations: u32,
     pub status: RunStatus,
+    /// Bookkeeper result — `Some` only on a converged run (bookkeeping is skipped otherwise).
+    pub bookkeeper: Option<BookkeeperOutput>,
 }
 
 /// The full Phase 3 run: plan (scout → memory → analyst), then fork red-team ∥ implementer, then
@@ -239,6 +254,29 @@ pub async fn run_full(
     state.implementer = Some(serde_json::to_value(&implementer)?);
     state.status = status;
 
+    // Bookkeeping is mandatory on success and skipped otherwise. A bookkeeping failure is logged
+    // but doesn't discard the converged work.
+    let bookkeeper = if status == RunStatus::Converged {
+        let input = BookkeeperInput {
+            issue: issue.to_string(),
+            analyst: plan.analyst.clone(),
+            implementer: implementer.clone(),
+            iterations,
+        };
+        match bookkeep_and_checkpoint(client, config, store, run_id, input).await {
+            Ok(bk) => {
+                state.artifacts = vec![serde_json::to_value(&bk)?];
+                Some(bk)
+            }
+            Err(e) => {
+                tracing::warn!("bookkeeping failed on a converged run: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(RunOutcome {
         state,
         plan,
@@ -247,7 +285,71 @@ pub async fn run_full(
         worktree,
         iterations,
         status,
+        bookkeeper,
     })
+}
+
+/// Build the bookkeeper node, run it, and checkpoint its output. Shared by `run_full` (auto path)
+/// and `run_bookkeeper` (replay).
+async fn bookkeep_and_checkpoint(
+    client: &RagRatClient,
+    config: &RatatoskrConfig,
+    store: &Store,
+    run_id: &str,
+    input: BookkeeperInput,
+) -> Result<BookkeeperOutput, PlanError> {
+    let node = BookkeeperNode {
+        route: route(config, "bookkeeper")?,
+        tools: filter_tools(&client.tools(), bookkeeper::BOOKKEEPER_TOOLS),
+        sink: client.sink(),
+    };
+    let out = node
+        .run(input)
+        .await
+        .map_err(|e| PlanError::node("bookkeeper", e))?;
+    checkpoint(store, run_id, "bookkeeper", &out).await?;
+    Ok(out)
+}
+
+/// Replay the bookkeeper alone against a previously-run run's stored checkpoints — no Phase 3
+/// re-run. Reads the issue/analyst/implementer checkpoints and composes a fresh memory.
+pub async fn run_bookkeeper(
+    client: &RagRatClient,
+    config: &RatatoskrConfig,
+    store: &Store,
+    run_id: &str,
+) -> Result<BookkeeperOutput, PlanError> {
+    let checkpoints = store.checkpoints_for_run(run_id).await?;
+    let latest = |name: &'static str| {
+        checkpoints
+            .iter()
+            .rev()
+            .find(|c| c.node_name == name)
+            .ok_or(PlanError::MissingCheckpoint(run_id.to_string(), name))
+    };
+
+    let issue = checkpoints
+        .iter()
+        .rev()
+        .find(|c| c.node_name == "issue")
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c.output_json).ok())
+        .and_then(|v| v.get("issue").and_then(|i| i.as_str()).map(str::to_string))
+        .unwrap_or_default();
+
+    let analyst: AnalystOutput = serde_json::from_str(&latest("analyst")?.output_json)?;
+    let implementer: ImplementerOutput = serde_json::from_str(&latest("implementer")?.output_json)?;
+    let iterations = checkpoints
+        .iter()
+        .filter(|c| c.node_name == "implementer")
+        .count() as u32;
+
+    let input = BookkeeperInput {
+        issue,
+        analyst,
+        implementer,
+        iterations,
+    };
+    bookkeep_and_checkpoint(client, config, store, run_id, input).await
 }
 
 /// The fork + converge half. Returns the terminal status; leaves the worktree in place on a
