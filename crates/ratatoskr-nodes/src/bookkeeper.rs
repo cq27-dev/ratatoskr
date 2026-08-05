@@ -141,9 +141,12 @@ impl BookkeeperNode {
             "source": "agent",
             "tags": ["ratatoskr", "bookkeeper"],
         });
-        if let Some(path) = anchor {
-            args["bind"] = serde_json::json!({ "path": path });
-        }
+        // Always anchor: rag-rat rejects an unanchored memory unless it's a Task/Concept. Use the
+        // touched file if we have one, else bind to the repo root directory.
+        args["bind"] = match anchor {
+            Some(path) => serde_json::json!({ "path": path }),
+            None => serde_json::json!({ "dir": "" }),
+        };
         let arguments = args.as_object().cloned().expect("json object literal");
         let param = CallToolRequestParams::new("memory_create").with_arguments(arguments);
 

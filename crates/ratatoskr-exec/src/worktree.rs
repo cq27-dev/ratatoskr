@@ -51,8 +51,15 @@ pub async fn create(
     worktree_root: &Path,
     branch: &str,
 ) -> Result<WorktreePath, ExecError> {
-    std::fs::create_dir_all(worktree_root)?;
-    let path = worktree_root.join(branch);
+    // The path must be absolute: git resolves a relative worktree path against `repo_root`, but
+    // downstream consumers (the ACP session's `cwd`) require an absolute path.
+    let abs_root = if worktree_root.is_absolute() {
+        worktree_root.to_path_buf()
+    } else {
+        repo_root.join(worktree_root)
+    };
+    std::fs::create_dir_all(&abs_root)?;
+    let path = abs_root.join(branch);
     let path_s = path_str(&path)?;
     git(
         repo_root,

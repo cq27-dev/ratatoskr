@@ -131,16 +131,24 @@ async fn run_bwrap(spec: SandboxSpec) -> Result<ExecOutput, SandboxError> {
     .map(String::from)
     .collect();
 
+    // Mount each bind in place (guest path = host path): the host root is ro-bound, so bwrap
+    // can't create fresh mount points like /workspace under it. Translate a guest workdir that
+    // matches a mount to the corresponding host path.
+    let mut chdir = spec.workdir.clone();
     for m in &spec.mounts {
+        let host = m.host.to_string_lossy().into_owned();
+        if spec.workdir == m.guest {
+            chdir = host.clone();
+        }
         args.push("--bind".into());
-        args.push(m.host.to_string_lossy().into_owned());
-        args.push(m.guest.clone());
+        args.push(host.clone());
+        args.push(host);
     }
     if !spec.network {
         args.push("--unshare-net".into());
     }
     args.push("--chdir".into());
-    args.push(spec.workdir.clone());
+    args.push(chdir);
     args.push("--".into());
     args.extend(spec.command.iter().cloned());
 

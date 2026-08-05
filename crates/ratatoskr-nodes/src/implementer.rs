@@ -136,7 +136,11 @@ impl ImplementerNode {
             }
             s.push('\n');
         }
-        s.push_str("Make the change and ensure the repo's tests pass.");
+        s.push_str(
+            "Apply the change directly with your editing tools — do NOT ask for confirmation or \
+             present options to choose between; just make the fix. Then run the repo's tests and \
+             ensure they pass.",
+        );
         s
     }
 }

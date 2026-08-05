@@ -60,8 +60,26 @@ pub async fn drive(command: &str, cwd: &Path, prompt: &str) -> Result<AcpTurnRes
         )
         .on_receive_request(
             async move |request: RequestPermissionRequest, responder, _connection| {
-                // The run is already sandboxed, so auto-approve (select the first option).
-                match request.options.first().map(|opt| opt.option_id.clone()) {
+                // The run is already sandboxed, so auto-APPROVE. Options come as
+                // [reject, allow, allow_always]; picking the first would DENY, so prefer an
+                // option whose `kind` starts with "allow" (fall back to the last, usually the
+                // most permissive). Match on the serialized `kind` to stay independent of the
+                // schema's exact enum type.
+                let allow = request
+                    .options
+                    .iter()
+                    .find(|opt| {
+                        serde_json::to_value(opt)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("kind")
+                                    .and_then(|k| k.as_str())
+                                    .map(|s| s.starts_with("allow"))
+                            })
+                            .unwrap_or(false)
+                    })
+                    .or_else(|| request.options.last());
+                match allow.map(|opt| opt.option_id.clone()) {
                     Some(id) => responder.respond(RequestPermissionResponse::new(
                         RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),
                     )),
