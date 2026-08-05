@@ -1,7 +1,8 @@
 /target
-# Runtime state (logs, store, worktrees) is ignored; version-controlled agent rulesets are not.
+# Runtime state (logs, store, worktrees) is ignored; version-controlled agent scripts are not.
 /.ratatoskr/*
 !/.ratatoskr/rules/
+!/.ratatoskr/workflow.ts
 ratatoskr.toml
 .env
 # Agent-local settings; the shared skills/rules under .claude/ and .agents/ ARE tracked.
