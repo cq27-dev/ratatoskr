@@ -1,8 +1,4 @@
 //! `ratatoskr.toml` configuration.
-//!
-//! Several fields exist in Phase 0 as *shape* only — nothing reads them yet — so later phases
-//! are written against a config that already has a slot for them rather than retrofitting one:
-//! [`WorktreeConfig`] (Phase 3) and [`RatatoskrConfig::models`] (Phase 2 node routing).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,8 +11,7 @@ pub struct RatatoskrConfig {
     pub rag_rat: RagRatConfig,
     pub store: StoreConfig,
     pub worktree: WorktreeConfig,
-    /// Per-node model routing, keyed by node name (`"scout"`, `"analyst"`, ...). Unused until
-    /// Phase 2 wires nodes; present now so nodes route against an existing table.
+    /// Per-node model routing, keyed by node name (`"scout"`, `"analyst"`, ...).
     #[serde(default)]
     pub models: HashMap<String, ModelRoute>,
     #[serde(default)]
@@ -78,7 +73,7 @@ pub struct StoreConfig {
     pub path: PathBuf,
 }
 
-/// Root for Phase 3's per-run git worktrees. Field exists now, unused until Phase 3.
+/// Root for the per-run git worktrees `run`'s implementer fork creates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeConfig {
     pub root: PathBuf,

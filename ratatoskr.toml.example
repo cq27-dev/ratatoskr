@@ -11,7 +11,8 @@ command = ["npx", "-y", "@rag-rat/bin", "mcp", "--json"]
 path = ".ratatoskr/state.sqlite3"
 
 [worktree]
-# Root for per-run git worktrees (unused until Phase 3).
+# Root for per-run git worktrees. `run` leaves a converged run's worktree here for review;
+# `ratatoskr clean` reclaims them (and their `ratatoskr/*` branches) when you're done.
 root = ".ratatoskr/worktrees"
 
 # Per-node model routing. `ask` is the only route used in Phase 1; provider is one of

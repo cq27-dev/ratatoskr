@@ -12,7 +12,7 @@ use tokio::process::Command;
 use crate::ExecError;
 
 /// The path to a created worktree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreePath(pub PathBuf);
 
 impl WorktreePath {
@@ -82,6 +82,121 @@ pub async fn remove(repo_root: &Path, worktree: &WorktreePath) -> Result<(), Exe
     Ok(())
 }
 
+/// Ratatoskr's run branches (and their worktrees) live under this prefix — these are ours to
+/// reclaim; anything else is the user's own or a foreign worktree and is never touched.
+const MANAGED_BRANCH_PREFIX: &str = "ratatoskr/";
+
+/// A ratatoskr-created worktree and the branch it's on (short name, e.g. `ratatoskr/abc12345`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedWorktree {
+    pub path: WorktreePath,
+    pub branch: String,
+}
+
+/// What `clean` operates on: the main worktree root (a stable git anchor — it's never a target, so
+/// operations still work when invoked from inside a worktree being removed) plus the managed set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeSurvey {
+    pub main_root: PathBuf,
+    pub managed: Vec<ManagedWorktree>,
+}
+
+/// One `git worktree list --porcelain` entry: path and short branch name (`None` if detached/bare).
+struct Entry {
+    path: PathBuf,
+    branch: Option<String>,
+}
+
+fn parse_worktrees(porcelain: &str) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    let mut branch: Option<String> = None;
+    for line in porcelain.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            if let Some(prev) = path.take() {
+                entries.push(Entry {
+                    path: prev,
+                    branch: branch.take(),
+                });
+            }
+            path = Some(PathBuf::from(p));
+        } else if let Some(b) = line
+            .strip_prefix("branch ")
+            .and_then(|r| r.strip_prefix("refs/heads/"))
+        {
+            branch = Some(b.to_string());
+        }
+    }
+    if let Some(p) = path.take() {
+        entries.push(Entry { path: p, branch });
+    }
+    entries
+}
+
+/// Survey `repo_root`'s worktrees: the main root (always the first entry git lists) and every
+/// worktree on a `ratatoskr/*` branch. Foreign and user worktrees are excluded by the branch prefix;
+/// an empty/failed listing yields no managed entries — never a wildcard removal.
+pub async fn survey(repo_root: &Path) -> Result<WorktreeSurvey, ExecError> {
+    let out = git(
+        repo_root,
+        "worktree list",
+        &["worktree", "list", "--porcelain"],
+    )
+    .await?;
+    let entries = parse_worktrees(&out);
+    let main_root = entries
+        .first()
+        .map(|e| e.path.clone())
+        .unwrap_or_else(|| repo_root.to_path_buf());
+    let managed = entries
+        .into_iter()
+        .filter_map(|e| {
+            let branch = e.branch?;
+            branch
+                .starts_with(MANAGED_BRANCH_PREFIX)
+                .then_some(ManagedWorktree {
+                    path: WorktreePath(e.path),
+                    branch,
+                })
+        })
+        .collect();
+    Ok(WorktreeSurvey { main_root, managed })
+}
+
+/// Every local `ratatoskr/*` branch — including orphans whose worktree was already removed (the old
+/// hard-error path, or a partial `clean`), which the worktree listing alone can't surface.
+pub async fn managed_branches(repo_root: &Path) -> Result<Vec<String>, ExecError> {
+    let out = git(
+        repo_root,
+        "branch list",
+        &[
+            "branch",
+            "--list",
+            "ratatoskr/*",
+            "--format=%(refname:short)",
+        ],
+    )
+    .await?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Force-delete a local branch. Refuses (errors) if the branch is still checked out in a worktree.
+pub async fn delete_branch(repo_root: &Path, branch: &str) -> Result<(), ExecError> {
+    git(repo_root, "branch -D", &["branch", "-D", branch]).await?;
+    Ok(())
+}
+
+/// Prune stale worktree registrations (dirs deleted out-of-band).
+pub async fn prune(repo_root: &Path) -> Result<(), ExecError> {
+    git(repo_root, "worktree prune", &["worktree", "prune"]).await?;
+    Ok(())
+}
+
 /// A `git diff --stat` summary of the worktree's changes (tracked + newly-added, via intent-to-add).
 pub async fn diff_stat(worktree: &WorktreePath) -> Result<String, ExecError> {
     let cwd = worktree.as_path();
@@ -134,6 +249,47 @@ mod tests {
                 .success();
             assert!(ok, "git {args:?} failed");
         }
+    }
+
+    #[test]
+    fn parse_worktrees_pairs_paths_and_isolates_ratatoskr_branches() {
+        let porcelain = "\
+worktree /repo
+HEAD aaaa
+branch refs/heads/main
+
+worktree /repo/.ratatoskr/worktrees/ratatoskr/abc12345
+HEAD bbbb
+branch refs/heads/ratatoskr/abc12345
+
+worktree /repo/detached
+HEAD cccc
+detached
+
+worktree /elsewhere/feature
+HEAD dddd
+branch refs/heads/feature/x
+";
+        let entries = parse_worktrees(porcelain);
+        assert_eq!(entries.len(), 4);
+        // The main worktree is the first entry — the stable anchor for git operations.
+        assert_eq!(entries[0].path, PathBuf::from("/repo"));
+        assert_eq!(entries[0].branch.as_deref(), Some("main"));
+        assert_eq!(entries[2].branch, None, "detached entry has no branch");
+
+        let managed: Vec<(PathBuf, String)> = entries
+            .into_iter()
+            .filter_map(|e| {
+                let b = e.branch?;
+                b.starts_with(MANAGED_BRANCH_PREFIX).then_some((e.path, b))
+            })
+            .collect();
+        assert_eq!(managed.len(), 1, "only the ratatoskr/* worktree is managed");
+        assert_eq!(managed[0].1, "ratatoskr/abc12345");
+        assert_eq!(
+            managed[0].0,
+            PathBuf::from("/repo/.ratatoskr/worktrees/ratatoskr/abc12345")
+        );
     }
 
     #[tokio::test]
