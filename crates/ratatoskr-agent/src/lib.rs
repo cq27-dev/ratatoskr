@@ -165,6 +165,7 @@ pub async fn ask(
                 question,
                 tools,
                 max_turns,
+                route.max_tokens(),
             )
             .await
         }
@@ -179,6 +180,7 @@ pub async fn ask(
                 question,
                 tools,
                 max_turns,
+                route.max_tokens(),
             )
             .await
         }
@@ -192,6 +194,7 @@ async fn run<M>(
     question: &str,
     tools: ToolSet,
     max_turns: Option<usize>,
+    max_tokens: u64,
 ) -> Result<String, AgentError>
 where
     M: CompletionModel + 'static,
@@ -200,6 +203,7 @@ where
         AgentBuilder::new(model)
             .preamble(preamble)
             .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
+            .max_tokens(max_tokens)
             .add_hook(ObservabilityHook),
         &tools,
         None,
@@ -815,6 +819,7 @@ async fn run_typed<M>(model: M, run: NodeRun<'_>) -> Result<String, AgentError>
 where
     M: CompletionModel + 'static,
 {
+    let max_tokens = run.route.max_tokens();
     let NodeRun {
         node,
         route,
@@ -841,9 +846,14 @@ where
         None => (preamble.to_string(), question.to_string()),
     };
 
+    // Always set, never left to the provider client to infer from the model name: its table of
+    // known prefixes does not include models released after it was compiled, and a model that falls
+    // through it goes out with no cap at all — which Anthropic rejects outright, losing the run at
+    // the node's first call.
     let mut builder = AgentBuilder::new(model)
         .preamble(&preamble)
         .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
+        .max_tokens(max_tokens)
         .output_schema_raw(output_schema)
         // Force the synthetic output-tool: Auto can resolve to native structured output, which
         // Anthropic rejects when combined with tools ("output_config.format: Cannot be combined

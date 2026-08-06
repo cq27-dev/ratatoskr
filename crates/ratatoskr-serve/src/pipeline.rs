@@ -65,6 +65,7 @@ fn is_terminal(status: Option<&str>) -> bool {
                 | "converged"
                 | "max_iterations_reached"
                 | "no_code_change"
+                | "unreviewed"
                 | "failed"
                 | "abandoned"
         )
@@ -335,5 +336,22 @@ mod tests {
         let views = derive(Some("no_code_change"), &[cp("analyst", "t")]);
         assert_ne!(state_of(&views, "analyst"), NodeState::Working);
         assert_ne!(state_of(&views, "implementer"), NodeState::Working);
+    }
+
+    #[test]
+    fn a_run_nobody_could_review_is_finished_not_failed() {
+        // The change was made and passed its tests; only the reviewer was unavailable. Reporting
+        // that as still-executing would leave it spinning in the dashboard forever.
+        assert!(is_terminal(Some("unreviewed")));
+        let views = derive(
+            Some("unreviewed"),
+            &[
+                cp("red_team", "t"),
+                cp("implementer", "t"),
+                cp("verifier", "t"),
+            ],
+        );
+        assert_eq!(state_of(&views, "implementer"), NodeState::Done);
+        assert_ne!(state_of(&views, "verifier"), NodeState::Working);
     }
 }

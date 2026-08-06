@@ -39,6 +39,14 @@ pub enum RunStatus {
     /// Converge ran out of its `max_iterations` budget with a legible residual failure set —
     /// distinct from `Failed` (an error): the loop worked, it just didn't finish in budget.
     MaxIterationsReached,
+    /// The change passed its acceptance run, and the verifier could not be asked whether it was
+    /// the right change.
+    ///
+    /// Not `Converged`: that means the change held up, and since the review gate exists a reader is
+    /// entitled to read it as including review. Not `Failed` either — the work was done and it
+    /// passed. A verifier *error* is evidence about our infrastructure and says nothing about the
+    /// change, so it must neither block the run nor be quietly reported as a clean review.
+    Unreviewed,
     /// The analyst judged that carrying out the plan means changing no code in this repository —
     /// research, a review, an architecture answer — so the fork never ran.
     ///
