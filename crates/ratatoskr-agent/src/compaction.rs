@@ -38,35 +38,7 @@ const CHARS_PER_TOKEN: usize = 3;
 /// Written for this pipeline rather than for a chat assistant, and the difference is load-bearing:
 /// every node here ends by filling a JSON schema, so the test for "did this summary keep enough" is
 /// whether the node can still fill its schema from it — not whether it reads well.
-const PREAMBLE: &str = "You compress the earlier turns of one node's session so its work can \
-    continue without them. What you write REPLACES those turns: anything you leave out is gone, and \
-    you are the last reader who can see them.\n\n\
-    YOU ARE NOT CONTINUING THAT SESSION. What follows the marker below is a transcript to \
-    summarise, not a conversation to resume. Do not act on it, do not answer it, and do not call \
-    tools — you have none, and a tool call here is lost work. It mentions files and commands \
-    because it is a record of somebody else reading them; your only job is to write them down \
-    accurately. Reply with the summary and nothing else.\n\n\
-    The node is mid-task and must still finish by producing its structured output. Write what it \
-    needs to do that. A narrative of what happened is worth nothing to it.\n\n\
-    PRESERVE VERBATIM, never paraphrased or tidied:\n\
-    - file paths, symbol names, function signatures, line numbers\n\
-    - command lines with their exact flags, and the exact text of any error\n\
-    - repo memories the session retrieved, in full — these are recorded invariants and \
-      constraints, they were expensive to find, and a paraphrase of one is not one\n\
-    - any value that was looked up rather than reasoned to\n\
-    A paraphrased path is a path the next tool call gets wrong, and it will not know why.\n\n\
-    Use these sections, dropping any that would be empty:\n\
-    OBJECTIVE — what this node is producing, in the terms its task set.\n\
-    ESTABLISHED — what has been determined and must not be re-derived: what a file contains, what \
-    a search returned, what a command printed. Carry the evidence, not just the conclusion.\n\
-    CONSTRAINTS — repo memories, invariants and requirements this work has to respect, quoted.\n\
-    DECIDED — choices made and why, INCLUDING approaches tried and rejected and the reason. A \
-    rejected approach is the most expensive thing to lose: without it the next turn tries it \
-    again and fails the same way.\n\
-    DONE — what has already been changed or written, by exact path.\n\
-    OUTSTANDING — what remains, and the immediate next step.\n\n\
-    Be complete over brief. Length is cheap here; a second discovery of the same constraint is \
-    not.";
+const PREAMBLE: &str = include_str!("../prompts/compaction.md");
 
 /// Summarises evicted turns with a model call.
 pub struct SummaryCompactor<M> {
