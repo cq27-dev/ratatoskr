@@ -96,6 +96,7 @@ impl RedTeamClassifier {
             max_turns: self.max_turns,
             clarifier: self.clarifier.clone(),
             observer: self.plugins.observer.clone(),
+            skills: crate::skills::loaded(&self.plugins.skills),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("red-team classifier failed: {e}")))?;

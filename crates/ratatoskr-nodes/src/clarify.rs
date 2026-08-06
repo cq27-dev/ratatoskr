@@ -224,6 +224,8 @@ impl NodeClarifier {
             ToolSet::default(),
             answerer,
             &[],
+            // Answer mode runs with no tools at all, so no skills either.
+            &crate::NodePlugins::default(),
         ) {
             Ok(cfg) => (cfg.route, cfg.system_prompt),
             Err(_) => {

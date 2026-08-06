@@ -86,6 +86,7 @@ impl Node for ScoutNode {
             max_turns: self.max_turns,
             clarifier: self.clarifier.clone(),
             observer: self.plugins.observer.clone(),
+            skills: crate::skills::loaded(&self.plugins.skills),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("scout agent failed: {e}")))?;

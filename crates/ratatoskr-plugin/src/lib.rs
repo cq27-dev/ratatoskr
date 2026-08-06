@@ -8,14 +8,18 @@
 //! Nothing here may fail a run. A plugin that is missing, malformed, slow, or broken is logged and
 //! skipped — a node that would have got some extra context simply doesn't.
 
+pub mod skill;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ratatoskr_core::HookLimits;
+
 use regex::Regex;
 use serde::Deserialize;
+pub use skill::Skill;
 
 /// Most output read from a single hook before it is cut off and the process killed.
 ///
@@ -33,6 +37,8 @@ pub struct Plugin {
     pub hooks: Vec<Hook>,
     /// MCP servers this plugin brings, in manifest order.
     pub mcp_servers: Vec<McpServerSpec>,
+    /// Skills this plugin ships, in name order.
+    pub skills: Vec<Skill>,
 }
 
 /// One MCP server a plugin declares: how to launch it, over stdio.
@@ -177,6 +183,7 @@ fn load(root: &Path) -> Option<Plugin> {
         name,
         hooks: read_hooks(root),
         mcp_servers: read_mcp_servers(root, manifest.mcp_servers),
+        skills: skill::read_skills(root),
         root: root.to_path_buf(),
     })
 }

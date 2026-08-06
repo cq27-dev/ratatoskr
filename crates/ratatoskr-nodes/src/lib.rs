@@ -13,6 +13,7 @@ pub mod implementer;
 pub mod memory;
 pub mod redteam;
 pub mod scout;
+pub mod skills;
 pub mod testrun;
 pub mod workflow;
 
@@ -182,12 +183,14 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
     .await?;
 
     // --- scout ---
+    let plugins_scout = context.for_node("scout");
     let scout_cfg = node_agent_config(
         engine,
         config,
         context.pool_for("scout", client.offer()),
         "scout",
         scout::SCOUT_TOOLS,
+        &plugins_scout,
     )?;
     let mut scout_tools = scout_cfg.tools;
     scout_tools.add_local(clarify::ask_tool(), sink.clone());
@@ -198,7 +201,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         max_turns: scout_cfg.max_turns,
         clarifier: Some(clarifier.as_dyn()),
         system_prompt: scout_cfg.system_prompt,
-        plugins: context.for_node("scout"),
+        plugins: plugins_scout,
     };
     let scout_out = scout
         .run(issue.to_string(), &state)
@@ -227,12 +230,14 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         .collect::<Result<_, _>>()?;
 
     // --- analyst ---
+    let plugins_analyst = context.for_node("analyst");
     let analyst_cfg = node_agent_config(
         engine,
         config,
         context.pool_for("analyst", client.offer()),
         "analyst",
         analyst::ANALYST_TOOLS,
+        &plugins_analyst,
     )?;
     let analyst = AnalystNode {
         route: analyst_cfg.route,
@@ -240,7 +245,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         policy: analyst_cfg.policy,
         max_turns: analyst_cfg.max_turns,
         system_prompt: analyst_cfg.system_prompt,
-        plugins: context.for_node("analyst"),
+        plugins: plugins_analyst,
     };
     let analyst_out = analyst
         .run(
@@ -365,6 +370,8 @@ pub struct NodePlugins {
     /// Runs the node's tool calls past its plugins' `PreToolUse`/`PostToolUse` hooks. `None` when
     /// nothing it binds registers one, so a node that gains nothing pays nothing.
     pub observer: Option<Arc<dyn ratatoskr_agent::ToolObserver>>,
+    /// Skills the plugins it binds ship, in binding order.
+    pub skills: Vec<ratatoskr_plugin::Skill>,
 }
 
 /// Runs one node's bound plugins around each of its tool calls.
@@ -504,6 +511,12 @@ impl PluginContext {
             .cloned()
             .collect();
         NodePlugins {
+            skills: self
+                .plugins
+                .iter()
+                .filter(|p| bound.contains(&p.name))
+                .flat_map(|p| p.skills.iter().cloned())
+                .collect(),
             context: ratatoskr_plugin::compose(&self.contexts, &bound, &self.limits),
             // `None` rather than an empty runner: it is what keeps the hook off the agent
             // entirely for a node whose plugins have nothing to say about its tool calls.
@@ -619,7 +632,11 @@ fn node_agent_config(
     mut tools: ToolSet,
     node: &str,
     default_tools: &[&str],
+    plugins: &NodePlugins,
 ) -> Result<NodeAgentConfig, PlanError> {
+    // Taken before narrowing: the synthetic tools below need a sink to nominally belong to, and
+    // a node whose ruleset denied everything would otherwise have no group left to take one from.
+    let sink = tools.groups().first().map(|g| g.sink.clone());
     let ruleset = engine.ruleset(node);
     let rc = ruleset.as_ref().map(|r| r.config());
 
@@ -680,6 +697,13 @@ fn node_agent_config(
         Some(r) if r.config().has_on_tool_call => Some(Arc::new(r) as Arc<dyn ToolPolicy>),
         _ => None,
     };
+
+    // Every node reaches this function, which is why the skill tool is added here rather than at
+    // each construction site: a node that binds a skill and is never offered it is the failure
+    // this seam exists to prevent.
+    if let (Some(tool), Some(sink)) = (skills::skill_tool(&plugins.skills), sink) {
+        tools.add_local(tool, sink);
+    }
 
     Ok(NodeAgentConfig {
         route,
@@ -857,12 +881,14 @@ async fn bookkeep_and_checkpoint(
         context,
         ..
     } = run;
+    let plugins_bookkeeper = context.for_node("bookkeeper");
     let cfg = node_agent_config(
         engine,
         config,
         context.pool_for("bookkeeper", client.offer()),
         "bookkeeper",
         bookkeeper::BOOKKEEPER_TOOLS,
+        &plugins_bookkeeper,
     )?;
     let mut tools = cfg.tools;
     tools.add_local(clarify::ask_tool(), client.sink());
@@ -874,7 +900,7 @@ async fn bookkeep_and_checkpoint(
         max_turns: cfg.max_turns,
         clarifier: Some(clarifier.as_dyn()),
         system_prompt: cfg.system_prompt,
-        plugins: context.for_node("bookkeeper"),
+        plugins: plugins_bookkeeper,
     };
     let out = node
         .run(input)
@@ -982,12 +1008,14 @@ async fn fork_and_converge(
         // `[models.redteam]` or from its `.ratatoskr/rules/redteam.ts` ruleset.
         classifier: match classifier_enabled(engine, config) {
             true => {
+                let plugins_redteam = context.for_node("redteam");
                 let cfg = node_agent_config(
                     engine,
                     config,
                     context.pool_for("redteam", client.offer()),
                     "redteam",
                     redteam::CLASSIFIER_TOOLS,
+                    &plugins_redteam,
                 )?;
                 let mut tools = cfg.tools;
                 tools.add_local(clarify::ask_tool(), client.sink());
@@ -998,7 +1026,7 @@ async fn fork_and_converge(
                     max_turns: cfg.max_turns,
                     clarifier: Some(clarifier.as_dyn()),
                     system_prompt: cfg.system_prompt,
-                    plugins: context.for_node("redteam"),
+                    plugins: plugins_redteam,
                 })
             }
             false => None,
@@ -1247,6 +1275,7 @@ mod agent_config_tests {
             name: name.to_string(),
             root: PathBuf::from("/nonexistent"),
             hooks: Vec::new(),
+            skills: Vec::new(),
             mcp_servers: vec![ratatoskr_plugin::McpServerSpec {
                 name: server.to_string(),
                 command: vec!["true".to_string()],
@@ -1322,7 +1351,15 @@ mod agent_config_tests {
         // The whole point: no `[models.scout]` entry at all.
         config.models.remove("scout");
 
-        let cfg = node_agent_config(&engine, &config, ToolSet::default(), "scout", &[]).unwrap();
+        let cfg = node_agent_config(
+            &engine,
+            &config,
+            ToolSet::default(),
+            "scout",
+            &[],
+            &NodePlugins::default(),
+        )
+        .unwrap();
         assert_eq!(cfg.route.provider, "openai");
         assert_eq!(cfg.route.model, "gpt-5");
         assert_eq!(cfg.system_prompt.as_deref(), Some("Be brief."));
@@ -1333,8 +1370,15 @@ mod agent_config_tests {
         let engine = engine("toml-fallback").await;
         let config = RatatoskrConfig::default();
 
-        let cfg =
-            node_agent_config(&engine, &config, ToolSet::default(), "bookkeeper", &[]).unwrap();
+        let cfg = node_agent_config(
+            &engine,
+            &config,
+            ToolSet::default(),
+            "bookkeeper",
+            &[],
+            &NodePlugins::default(),
+        )
+        .unwrap();
         assert_eq!(cfg.route.provider, config.models["bookkeeper"].provider);
         assert_eq!(cfg.route.model, config.models["bookkeeper"].model);
         assert!(cfg.system_prompt.is_none());
@@ -1348,7 +1392,14 @@ mod agent_config_tests {
         config.models.remove("analyst");
 
         assert!(matches!(
-            node_agent_config(&engine, &config, ToolSet::default(), "analyst", &[]),
+            node_agent_config(
+                &engine,
+                &config,
+                ToolSet::default(),
+                "analyst",
+                &[],
+                &NodePlugins::default(),
+            ),
             Err(PlanError::MissingRoute(n)) if n == "analyst"
         ));
     }

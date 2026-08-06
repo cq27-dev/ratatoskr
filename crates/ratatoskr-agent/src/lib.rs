@@ -38,6 +38,21 @@ const OUTPUT_TOOL_NAME: &str = "final_result";
 /// [`ClarificationHook`] and answered in-conversation; it is never dispatched to the rag-rat sink.
 pub const ASK_TOOL_NAME: &str = "ask";
 
+/// The synthetic tool a node calls to load a skill's instructions. Named as the plugin format
+/// names it, so a skill written for that host is invoked here the same way.
+pub const SKILL_TOOL_NAME: &str = "Skill";
+
+/// A skill a node may load, as the agent needs it: the name it is asked for by, and the
+/// instructions handed back.
+///
+/// The *description* is deliberately not here. It belongs to the tool's schema, because it is what
+/// the model reads to choose; this is what it reads once it has chosen.
+#[derive(Debug, Clone)]
+pub struct Skill {
+    pub name: String,
+    pub body: String,
+}
+
 /// Answers a node's `ask` call by running the target node against its stored context (implemented in
 /// `ratatoskr-nodes`). Lives here so [`ClarificationHook`] can hold it without a dependency cycle.
 /// Always yields text — a failure to answer becomes best-effort guidance, never an error that breaks
@@ -278,6 +293,56 @@ impl AgentHook for ClarificationHook {
     }
 }
 
+/// The `Skill` tool's arguments: which skill to load.
+#[derive(serde::Deserialize)]
+struct SkillArgs {
+    skill: String,
+}
+
+/// Answers the synthetic `Skill` tool with the chosen skill's instructions.
+///
+/// The body is delivered as the tool's result rather than prepended to the preamble, which is the
+/// whole point of a skill over a longer system prompt: a node carries every bound skill's
+/// description, and pays for the instructions of the one it actually picks.
+struct SkillHook {
+    skills: Vec<Skill>,
+}
+
+impl AgentHook for SkillHook {
+    async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
+        if event.tool_name != SKILL_TOOL_NAME {
+            return ToolCallAction::Run;
+        }
+        let known = || {
+            self.skills
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let wanted = match serde_json::from_str::<SkillArgs>(event.args) {
+            Ok(a) => a.skill,
+            Err(e) => {
+                return ToolCallAction::Skip(format!(
+                    "Skill: invalid arguments ({e}); call it as {{\"skill\": \"<name>\"}}. \
+                     Available: {}",
+                    known()
+                ));
+            }
+        };
+        match self.skills.iter().find(|s| s.name == wanted) {
+            Some(skill) => {
+                tracing::info!(kind = "skill", skill = skill.name, "loaded skill");
+                ToolCallAction::Skip(skill.body.clone())
+            }
+            // Not an error the node should stop on: name the ones it does have and let it choose.
+            None => {
+                ToolCallAction::Skip(format!("No skill named `{wanted}`. Available: {}", known()))
+            }
+        }
+    }
+}
+
 /// A per-tool-call gate: a ruleset's `onToolCall` decides Run / Skip / Rewrite for each call.
 struct RulesetHook {
     policy: Arc<dyn ToolPolicy>,
@@ -398,6 +463,8 @@ pub struct NodeRun<'a> {
     pub clarifier: Option<Arc<dyn Clarifier>>,
     /// The node's plugins, run around each tool call; `None` when it binds none that hook one.
     pub observer: Option<Arc<dyn ToolObserver>>,
+    /// Skills the node may load, answered in-conversation by the synthetic `Skill` tool.
+    pub skills: Vec<Skill>,
 }
 
 /// Run one node's turn with an output schema, so its final answer is structured JSON.
@@ -437,6 +504,7 @@ where
         max_turns,
         clarifier,
         observer,
+        skills,
         ..
     } = run;
     let mut builder = AgentBuilder::new(model)
@@ -457,6 +525,11 @@ where
             node: node.to_string(),
             clarifier,
         });
+    }
+    // Before the ruleset gate, like `ask`: loading a skill a node was given is not a tool call to
+    // adjudicate, and a repo that does not want one simply does not bind the plugin.
+    if !skills.is_empty() {
+        builder = builder.add_hook(SkillHook { skills });
     }
     if let Some(policy) = policy {
         builder = builder.add_hook(RulesetHook { policy });
