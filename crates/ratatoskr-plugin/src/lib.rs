@@ -10,8 +10,10 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use regex::Regex;
 use serde::Deserialize;
 
 /// Longest a single hook may take before it is abandoned. Plugins declare their own timeout; this
@@ -34,8 +36,28 @@ const MAX_HOOK_OUTPUT: u64 = 256 * 1024;
 /// node makes — the budget is what keeps an orientation digest from becoming a tax.
 pub const CONTEXT_BUDGET: usize = 4000;
 
+/// Longest a hook that runs around a *tool call* may take.
+///
+/// Tighter than [`MAX_TIMEOUT`] because this one is on the model's critical path: the node is
+/// waiting mid-turn, not waiting to start.
+const MAX_TOOL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How much one event's hooks may contribute to a tool call, across all of them.
+///
+/// Per event, so a call that has both a `PreToolUse` and a `PostToolUse` hook can carry twice this
+/// on its result — they answer different questions and each gets its own allowance. Smaller than
+/// [`CONTEXT_BUDGET`] either way: this rides on a tool result, and there is one per tool call
+/// rather than one per run.
+pub const TOOL_CONTEXT_BUDGET: usize = 2000;
+
+/// Total wall-clock a run will spend inside tool hooks before it stops running them.
+///
+/// A per-hook timeout bounds one call; nothing bounds a hundred of them. This is the ceiling on
+/// what plugins may cost a node in latency, after which they are silent for the rest of the run.
+pub const TOOL_HOOK_BUDGET: Duration = Duration::from_secs(60);
+
 /// A loaded plugin.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Plugin {
     pub name: String,
     /// The plugin's directory, substituted for `${CLAUDE_PLUGIN_ROOT}` in its commands.
@@ -58,13 +80,27 @@ pub struct McpServerSpec {
 }
 
 /// One hook a plugin registers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Hook {
     pub event: String,
     /// Regex over the tool name, as written. Unused for `SessionStart`.
     pub matcher: Option<String>,
+    /// The compiled `matcher`, or `None` when there is none — or when it would not compile, which
+    /// is treated as "matches nothing" so a broken pattern costs its own hook and no other.
+    pattern: Option<Regex>,
     pub command: String,
     pub timeout: Duration,
+}
+
+impl Hook {
+    /// Whether this hook fires for `tool`. A hook with no matcher fires for every tool.
+    pub fn matches(&self, tool: &str) -> bool {
+        match (&self.matcher, &self.pattern) {
+            (None, _) => true,
+            (Some(_), Some(re)) => re.is_match(tool),
+            (Some(_), None) => false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -241,6 +277,12 @@ fn read_hooks(root: &Path) -> Vec<Hook> {
                     }
                     Some(Hook {
                         event: event.clone(),
+                        // Compiled once at load: these are matched on every tool call.
+                        pattern: matcher.as_deref().and_then(|m| {
+                            Regex::new(m)
+                                .inspect_err(|e| tracing::warn!("ignoring hook matcher `{m}`: {e}"))
+                                .ok()
+                        }),
                         matcher: matcher.clone(),
                         command: entry.command,
                         timeout: entry
@@ -271,7 +313,7 @@ pub async fn session_start(plugins: &[Plugin], cwd: &Path) -> BTreeMap<String, S
                 // Plugins commonly gate on this; a run beginning is a startup.
                 "source": "startup",
             });
-            let Some(text) = run_hook(plugin, hook, &payload, cwd).await else {
+            let Some(text) = run_hook(plugin, hook, hook.timeout, &payload, cwd).await else {
                 continue;
             };
             let text = text.trim();
@@ -297,6 +339,126 @@ pub async fn session_start(plugins: &[Plugin], cwd: &Path) -> BTreeMap<String, S
         contexts.insert(plugin.name.clone(), text);
     }
     contexts
+}
+
+/// One tool call, as the plugins around it see it.
+pub struct ToolEvent<'a> {
+    /// `PreToolUse` before the call, `PostToolUse` after it.
+    pub event: &'a str,
+    pub tool: &'a str,
+    /// The call's JSON arguments.
+    pub input: &'a str,
+    /// What the tool answered — `PostToolUse` only.
+    pub response: Option<&'a str>,
+}
+
+/// A tool hook's answer. Only `additionalContext` is read.
+///
+/// The other fields of this envelope decide whether a call proceeds, and that is not a plugin's
+/// call to make here: gating already has an owner in a ruleset's `onToolCall`, which is the
+/// repository's decision about its own agents rather than a third party's about them.
+#[derive(Debug, Deserialize)]
+struct HookEnvelope {
+    #[serde(rename = "hookSpecificOutput")]
+    hook_specific_output: Option<SpecificOutput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpecificOutput {
+    #[serde(rename = "additionalContext")]
+    additional_context: Option<String>,
+}
+
+/// Run the hooks `plugins` register for one tool call, and return what they want the model to see.
+///
+/// Every matching hook runs; their answers are joined in plugin order and capped at
+/// [`TOOL_CONTEXT_BUDGET`], whole hooks in or out. A hook that fails, times out, or answers with
+/// something that isn't the envelope contributes nothing — this text is an aside on a tool result,
+/// and nothing about it may disturb the call it rode in on.
+///
+/// `spent` accumulates the wall-clock these hooks cost; once it passes [`TOOL_HOOK_BUDGET`] this
+/// returns immediately without running anything, for the rest of the run.
+pub async fn tool_hooks(
+    plugins: &[Plugin],
+    event: ToolEvent<'_>,
+    cwd: &Path,
+    spent: &AtomicU64,
+) -> Option<String> {
+    if Duration::from_millis(spent.load(Ordering::Relaxed)) >= TOOL_HOOK_BUDGET {
+        return None;
+    }
+    let started = std::time::Instant::now();
+    let mut parts: Vec<String> = Vec::new();
+    let mut used = 0usize;
+
+    for plugin in plugins {
+        for hook in plugin
+            .hooks
+            .iter()
+            .filter(|h| h.event == event.event && h.matches(event.tool))
+        {
+            let mut payload = serde_json::json!({
+                "session_id": "",
+                "cwd": cwd.display().to_string(),
+                "hook_event_name": event.event,
+                "tool_name": event.tool,
+                "tool_input": serde_json::from_str::<serde_json::Value>(event.input)
+                    .unwrap_or(serde_json::Value::Null),
+            });
+            if let Some(response) = event.response {
+                payload["tool_response"] = serde_json::json!(response);
+            }
+
+            // The tighter cap: a node is mid-turn waiting on this.
+            let timeout = hook.timeout.min(MAX_TOOL_TIMEOUT);
+            let Some(raw) = run_hook(plugin, hook, timeout, &payload, cwd).await else {
+                continue;
+            };
+            let Some(text) = additional_context(&raw, &plugin.name) else {
+                continue;
+            };
+            // Whole hooks in or out: half an aside is worse than none of one.
+            if used + text.len() > TOOL_CONTEXT_BUDGET {
+                tracing::debug!(
+                    plugin = plugin.name,
+                    tool = event.tool,
+                    "dropping a tool hook's context: over budget"
+                );
+                continue;
+            }
+            used += text.len();
+            parts.push(text);
+        }
+    }
+
+    // Warn exactly on the call that exhausts it, so a run says once that its plugins went quiet.
+    let cost = started.elapsed();
+    let before = Duration::from_millis(spent.fetch_add(cost.as_millis() as u64, Ordering::Relaxed));
+    if before < TOOL_HOOK_BUDGET && before + cost >= TOOL_HOOK_BUDGET {
+        tracing::warn!(
+            "plugins have spent their {TOOL_HOOK_BUDGET:?} of tool-hook time; \
+             no more tool hooks will run this run"
+        );
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// Read `additionalContext` out of a hook's envelope, or nothing.
+///
+/// Silence and an empty envelope are both ordinary — "nothing to say" is the common answer. Output
+/// that is not the envelope at all is a plugin written against a different contract, and is logged
+/// once rather than pasted into the model's context as-is.
+fn additional_context(raw: &str, plugin: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let envelope: HookEnvelope = serde_json::from_str(raw)
+        .inspect_err(|e| tracing::warn!(plugin, "ignoring a tool hook's output: {e}"))
+        .ok()?;
+    let text = envelope.hook_specific_output?.additional_context?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// Compose one node's session context from the plugins it is bound to, in binding order.
@@ -327,6 +489,7 @@ pub fn compose(contexts: &BTreeMap<String, String>, names: &[String]) -> Option<
 async fn run_hook(
     plugin: &Plugin,
     hook: &Hook,
+    timeout: Duration,
     payload: &serde_json::Value,
     cwd: &Path,
 ) -> Option<String> {
@@ -353,32 +516,36 @@ async fn run_hook(
     let mut stdout = child.stdout.take();
     let payload = payload.to_string();
 
+    // Write and read concurrently. A `PostToolUse` payload carries what the tool answered and can
+    // exceed the pipe buffer, so a hook that does not read its stdin leaves the write parked until
+    // the hook exits and the pipe breaks. Nothing hangs either way — the timeout covers both — but
+    // reading alongside means a hook's answer is collected as it arrives rather than after a write
+    // nobody was listening to. Dropping `stdin` at the end of the write is what lets a hook that
+    // reads to EOF proceed.
     let collect = async {
-        if let Some(mut stdin) = stdin.take() {
-            // A hook that never reads stdin would block this write; it is inside the timeout, and
-            // the close is what lets a hook that reads to EOF proceed.
-            let _ = stdin.write_all(payload.as_bytes()).await;
-            drop(stdin);
-        }
-        let mut buf = Vec::new();
-        if let Some(stdout) = stdout.as_mut() {
-            let _ = stdout.take(MAX_HOOK_OUTPUT).read_to_end(&mut buf).await;
-        }
-        buf
+        let write = async {
+            if let Some(mut stdin) = stdin.take() {
+                let _ = stdin.write_all(payload.as_bytes()).await;
+            }
+        };
+        let read = async {
+            let mut buf = Vec::new();
+            if let Some(stdout) = stdout.as_mut() {
+                let _ = stdout.take(MAX_HOOK_OUTPUT).read_to_end(&mut buf).await;
+            }
+            buf
+        };
+        tokio::join!(write, read).1
     };
 
-    match tokio::time::timeout(hook.timeout, collect).await {
+    match tokio::time::timeout(timeout, collect).await {
         Ok(buf) => {
             // Reap it, but never wait on it: the output is already in hand.
             let _ = child.start_kill();
             Some(String::from_utf8_lossy(&buf).into_owned())
         }
         Err(_) => {
-            tracing::warn!(
-                "plugin {} hook timed out after {:?}",
-                plugin.name,
-                hook.timeout
-            );
+            tracing::warn!("plugin {} hook timed out after {timeout:?}", plugin.name);
             None
         }
     }
@@ -446,6 +613,185 @@ mod tests {
             Some(&format!("{here}/data"))
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A plugin whose PreToolUse hook echoes an envelope, matching `matcher`.
+    fn tool_plugin(case: &str, matcher: &str, event: &str, answer: &str) -> PathBuf {
+        let root = plugin_dir(
+            case,
+            &format!(r#"{{"name": "{case}"}}"#),
+            Some(&format!(
+                r#"{{"hooks": {{"{event}": [{{"matcher": "{matcher}", "hooks": [
+                    {{"type": "command", "command": "cat ${{CLAUDE_PLUGIN_ROOT}}/answer"}}
+                ]}}]}}}}"#
+            )),
+        );
+        std::fs::write(root.join("answer"), answer).unwrap();
+        root
+    }
+
+    const ENVELOPE: &str = r#"{"hookSpecificOutput":
+        {"hookEventName": "PreToolUse", "additionalContext": "  mind the clones  "}}"#;
+
+    #[test]
+    fn a_matcher_selects_tools_and_a_broken_one_selects_none() {
+        let root = tool_plugin("matching", "^(Grep|Read)$", "PreToolUse", "");
+        let hook = &discover(std::slice::from_ref(&root))[0].hooks[0];
+        assert!(hook.matches("Grep") && hook.matches("Read"));
+        assert!(!hook.matches("semantic_search"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // A pattern that will not compile costs its own hook and no other.
+        let broken = tool_plugin("bad-matcher", "^(unclosed", "PreToolUse", "");
+        let hook = &discover(std::slice::from_ref(&broken))[0].hooks[0];
+        assert!(!hook.matches("unclosed"));
+        let _ = std::fs::remove_dir_all(&broken);
+
+        // A group with no matcher fires for every tool.
+        let all = plugin_dir(
+            "no-matcher",
+            r#"{"name": "no-matcher"}"#,
+            Some(
+                r#"{"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "true"}]}]}}"#,
+            ),
+        );
+        assert!(discover(std::slice::from_ref(&all))[0].hooks[0].matches("anything"));
+        let _ = std::fs::remove_dir_all(&all);
+    }
+
+    #[tokio::test]
+    async fn a_tool_hook_contributes_only_its_envelope_s_additional_context() {
+        let root = tool_plugin("envelope", "^semantic_search$", "PreToolUse", ENVELOPE);
+        let plugins = discover(std::slice::from_ref(&root));
+        let spent = AtomicU64::new(0);
+        let event = |tool| ToolEvent {
+            event: "PreToolUse",
+            tool,
+            input: r#"{"query":"x"}"#,
+            response: None,
+        };
+
+        assert_eq!(
+            tool_hooks(&plugins, event("semantic_search"), Path::new("."), &spent).await,
+            Some("mind the clones".to_string())
+        );
+        // The matcher decides; an unmatched tool runs nothing at all.
+        assert_eq!(
+            tool_hooks(&plugins, event("impact_surface"), Path::new("."), &spent).await,
+            None
+        );
+        // So does the event: a PreToolUse hook has nothing to say after the call.
+        assert_eq!(
+            tool_hooks(
+                &plugins,
+                ToolEvent {
+                    event: "PostToolUse",
+                    ..event("semantic_search")
+                },
+                Path::new("."),
+                &spent
+            )
+            .await,
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn output_that_is_not_the_envelope_reaches_the_model_as_nothing() {
+        // A hook written against a host that reads bare stdout, and one that gates rather than
+        // informs: neither is this contract, and neither may paste itself into the model's context.
+        let plain = tool_plugin("plain", ".*", "PreToolUse", "just some text");
+        let deny = tool_plugin(
+            "deny",
+            ".*",
+            "PreToolUse",
+            r#"{"permissionDecision": "deny"}"#,
+        );
+        let quiet = tool_plugin("quiet", ".*", "PreToolUse", "");
+
+        let spent = AtomicU64::new(0);
+        for root in [&plain, &deny, &quiet] {
+            let plugins = discover(std::slice::from_ref(root));
+            let got = tool_hooks(
+                &plugins,
+                ToolEvent {
+                    event: "PreToolUse",
+                    tool: "Read",
+                    input: "{}",
+                    response: None,
+                },
+                Path::new("."),
+                &spent,
+            )
+            .await;
+            assert_eq!(got, None, "{} contributed something", root.display());
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hook_that_never_reads_its_stdin_still_answers_a_large_payload() {
+        // A `PostToolUse` payload carries what the tool answered, which can dwarf the pipe buffer.
+        // The fixture's `cat <file>` never reads stdin, so this pins the case where the hook
+        // answers and exits with most of its input still unsent.
+        let root = tool_plugin("big-payload", ".*", "PostToolUse", ENVELOPE);
+        let plugins = discover(std::slice::from_ref(&root));
+        let huge = "x".repeat(4 * 1024 * 1024);
+        let spent = AtomicU64::new(0);
+
+        let started = std::time::Instant::now();
+        let got = tool_hooks(
+            &plugins,
+            ToolEvent {
+                event: "PostToolUse",
+                tool: "Read",
+                input: "{}",
+                response: Some(&huge),
+            },
+            Path::new("."),
+            &spent,
+        )
+        .await;
+
+        assert_eq!(got.as_deref(), Some("mind the clones"));
+        assert!(
+            started.elapsed() < MAX_TOOL_TIMEOUT,
+            "the hook answered rather than waiting out its timeout on a blocked write"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_spent_run_stops_running_tool_hooks() {
+        // A per-hook timeout bounds one call; this is what bounds a hundred of them.
+        let root = tool_plugin("budget", ".*", "PreToolUse", ENVELOPE);
+        let plugins = discover(std::slice::from_ref(&root));
+        let event = || ToolEvent {
+            event: "PreToolUse",
+            tool: "Read",
+            input: "{}",
+            response: None,
+        };
+
+        let spent = AtomicU64::new(0);
+        assert!(
+            tool_hooks(&plugins, event(), Path::new("."), &spent)
+                .await
+                .is_some()
+        );
+        assert!(
+            spent.load(Ordering::Relaxed) > 0,
+            "a hook that ran is charged for the time it took"
+        );
+
+        let exhausted = AtomicU64::new(TOOL_HOOK_BUDGET.as_millis() as u64);
+        assert_eq!(
+            tool_hooks(&plugins, event(), Path::new("."), &exhausted).await,
+            None,
+            "past its budget a run runs no more tool hooks"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

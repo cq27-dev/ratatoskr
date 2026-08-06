@@ -180,6 +180,27 @@ Where two servers offer one name, the first one connected keeps it, so a plugin 
 rag-rat tool a node's prompt was written against; the collision is logged with both server names. A
 server that will not start costs its plugin's tools and nothing else.
 
+A plugin's `PreToolUse` and `PostToolUse` hooks run around a node's tool calls, matched on the tool
+name by the group's `matcher` regex. Each answers with the usual envelope, and only
+`additionalContext` is read:
+
+```json
+{"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "…"}}
+```
+
+That text is appended to the tool result as a labelled note, which is the only place it can reach
+the model. **Write facts, not instructions.** A node treats imperative text arriving through a tool
+result as untrusted — correctly, since that is where prompt injection would come from — so a hook
+that says "always do X" is likely to be quoted and refused, while one that says what is true about
+the repository gets used. Whether a call proceeds at all is not a plugin's decision: gating belongs
+to a ruleset's `onToolCall`, which is the repository speaking about its own agents.
+
+These fire on *every* matching call, so they are budgeted: 5s per hook, 2000 characters per call,
+and 60s of total hook time per run, after which the run stops calling them and says so. Note that
+existing plugins match a coding CLI's tool vocabulary (`^(Grep|Read|Bash|Write|Edit)$`) and a
+planning node calls none of those — this is for hooks written against the tools nodes actually
+call, like `semantic_search` and `impact_surface`.
+
 ### Scripted orchestration
 
 `.ratatoskr/workflow.ts` replaces the built-in run flow outright when present, letting a repo

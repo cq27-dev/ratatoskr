@@ -59,8 +59,8 @@ pub struct AnalystNode {
     pub max_turns: Option<usize>,
     /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
     pub system_prompt: Option<String>,
-    /// Session context contributed by plugins, prefixed to whichever preamble applies.
-    pub context: Option<String>,
+    /// What the plugins this node binds contribute to it.
+    pub plugins: crate::NodePlugins,
 }
 
 impl Node for AnalystNode {
@@ -83,7 +83,7 @@ impl Node for AnalystNode {
             preamble: &crate::effective_preamble(
                 PREAMBLE,
                 self.system_prompt.as_deref(),
-                self.context.as_deref(),
+                self.plugins.context.as_deref(),
             ),
             question: &prompt,
             tools: self.tools.clone(),
@@ -92,6 +92,7 @@ impl Node for AnalystNode {
             max_turns: self.max_turns,
             // Analyst is the clarification terminus — it answers other nodes but never asks.
             clarifier: None,
+            observer: self.plugins.observer.clone(),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("analyst agent failed: {e}")))?;

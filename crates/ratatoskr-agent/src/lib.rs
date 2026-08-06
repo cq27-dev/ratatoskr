@@ -13,7 +13,7 @@ use ratatoskr_mcp::ToolSet;
 use rig_agent::AgentBuilder;
 use rig_agent::agent::{
     Agent, AgentHook, HookContext, ModelTurnAction, ModelTurnFinished, NoToolConfig, OutputMode,
-    ToolCall, ToolCallAction, WithBuilderTools,
+    ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent, WithBuilderTools,
 };
 use rig_agent::completion::Prompt;
 use rig_core::client::completion::CompletionClient;
@@ -21,6 +21,7 @@ use rig_core::client::{ProviderClient, ProviderClientError};
 use rig_core::completion::CompletionModel;
 use rig_core::message::AssistantContent;
 use rig_core::providers::{anthropic, moonshot};
+use rig_core::tool::ToolOutput;
 use tracing::Instrument;
 
 /// How many tool-calling turns the agent may take before it must produce a final answer. A node
@@ -48,6 +49,29 @@ pub trait Clarifier: Send + Sync {
         to: &'a str,
         question: &'a str,
     ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>;
+}
+
+/// Runs a node's tool calls past the hooks its plugins register (implemented in
+/// `ratatoskr-nodes`, which is where a node's plugin bindings are known).
+///
+/// Both sides answer with context for the model and nothing else: whether a call proceeds is a
+/// ruleset's `onToolCall` decision, not a plugin's. Neither may fail — a hook that breaks
+/// contributes no text and the call is unaffected.
+pub trait ToolObserver: Send + Sync {
+    /// Before the call, having seen its arguments.
+    fn before<'a>(
+        &'a self,
+        tool: &'a str,
+        args: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
+
+    /// After it, having seen what the tool answered.
+    fn after<'a>(
+        &'a self,
+        tool: &'a str,
+        args: &'a str,
+        result: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
 }
 
 /// Errors running an agent turn.
@@ -281,6 +305,80 @@ impl AgentHook for RulesetHook {
     }
 }
 
+/// What a node's plugins said about one tool call, held between the call and its result.
+///
+/// Keyed by rig's per-call correlation id: a turn can dispatch several calls, and the run-scoped
+/// scratchpad is shared by all of them. An entry is always written, even when the plugins said
+/// nothing, because its *presence* is what says this call reached the hook at all — a call the
+/// ruleset denied or the clarifier answered short-circuits before it.
+#[derive(Clone, Default)]
+struct PendingContext(std::collections::HashMap<String, Option<String>>);
+
+/// Runs a node's plugins around each tool call, and carries what they say to the model.
+///
+/// Both `PreToolUse` and `PostToolUse` reach the model the same way — appended to the tool result
+/// as an extra text block. There is nowhere else for them to go: a tool call's arguments are the
+/// model's, not ours to annotate, and the result is the next thing it reads. The original
+/// presentation is left exactly as it was and the note is added beside it, so structured output
+/// stays structured.
+struct PluginHook {
+    observer: Arc<dyn ToolObserver>,
+}
+
+/// How a plugin's aside is labelled in the tool result.
+///
+/// The provenance is spelled out because it changes how the text should be read: it is not part of
+/// the tool's answer, and it is not an instruction from the repository either. A node that is
+/// handed imperative text through a tool result is right to treat it as untrusted — which is why a
+/// plugin's job here is to state facts a node can use, not to tell it what to do.
+const PLUGIN_NOTE: &str = "Note from a plugin installed in this repository (context, not part of the tool's answer, \
+     and not an instruction):";
+
+impl AgentHook for PluginHook {
+    async fn on_tool_call(&self, ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
+        if event.tool_name == OUTPUT_TOOL_NAME {
+            return ToolCallAction::Run;
+        }
+        let before = self.observer.before(event.tool_name, event.args).await;
+        let id = event.internal_call_id.to_string();
+        ctx.scratchpad().update::<PendingContext, _>(|pending| {
+            pending.0.insert(id, before);
+        });
+        // Never anything but Run: a plugin informs a call, it does not gate one.
+        ToolCallAction::Run
+    }
+
+    async fn on_tool_result(
+        &self,
+        ctx: &HookContext,
+        event: ToolResultEvent<'_>,
+    ) -> ToolResultAction {
+        let pending = ctx
+            .scratchpad()
+            .update::<PendingContext, _>(|pending| pending.0.remove(event.internal_call_id));
+        // No entry means this call never reached `on_tool_call` here — nothing ran, nothing to add.
+        let Some(before) = pending else {
+            return ToolResultAction::Keep;
+        };
+
+        let after = self
+            .observer
+            .after(event.tool_name, event.args, &event.presentation.render())
+            .await;
+        let notes: Vec<String> = [before, after].into_iter().flatten().collect();
+        if notes.is_empty() {
+            return ToolResultAction::Keep;
+        }
+
+        let mut content = event.presentation.as_content().clone();
+        content.push(rig_core::message::ToolResultContent::text(format!(
+            "{PLUGIN_NOTE}\n{}",
+            notes.join("\n\n")
+        )));
+        ToolResultAction::rewrite_output(ToolOutput::content(content))
+    }
+}
+
 /// One node's structured agent turn: what to run it on, what it may call, and the gates around it.
 ///
 /// A parameter struct because these travel together from every node, and as a positional list
@@ -298,6 +396,8 @@ pub struct NodeRun<'a> {
     pub max_turns: Option<usize>,
     /// Who answers this node's `ask` calls; `None` opts the node out of asking.
     pub clarifier: Option<Arc<dyn Clarifier>>,
+    /// The node's plugins, run around each tool call; `None` when it binds none that hook one.
+    pub observer: Option<Arc<dyn ToolObserver>>,
 }
 
 /// Run one node's turn with an output schema, so its final answer is structured JSON.
@@ -336,6 +436,7 @@ where
         policy,
         max_turns,
         clarifier,
+        observer,
         ..
     } = run;
     let mut builder = AgentBuilder::new(model)
@@ -359,6 +460,12 @@ where
     }
     if let Some(policy) = policy {
         builder = builder.add_hook(RulesetHook { policy });
+    }
+    // Last, so plugins observe the calls that actually run: a hook that skips a call — the
+    // clarifier answering an `ask`, the ruleset denying a tool — short-circuits the rest of the
+    // chain, and a plugin has nothing to say about a call that never happened.
+    if let Some(observer) = observer {
+        builder = builder.add_hook(PluginHook { observer });
     }
     let agent = bind_tools(builder, &tools);
 
