@@ -11,6 +11,7 @@ pub mod clarify;
 pub mod converge;
 pub mod implementer;
 pub mod memory;
+pub mod overseer;
 pub mod redteam;
 pub mod scout;
 pub mod skills;
@@ -22,6 +23,7 @@ pub use analyst::{AnalystNode, AnalystOutput};
 pub use bookkeeper::{BookkeeperInput, BookkeeperNode, BookkeeperOutput, MemoryWritten};
 pub use implementer::{ImplementerNode, ImplementerOutput};
 pub use memory::{MemoryNode, MemoryOutput, MemoryRecord};
+pub use overseer::{OverseerNode, OverseerOutput};
 pub use redteam::{RedTeamNode, RedTeamOutput};
 pub use scout::{RelatedItem, ScoutNode, ScoutOutput};
 pub use verifier::{Finding, FindingKind, Severity, VerifierNode, VerifierOutput};
@@ -79,6 +81,8 @@ impl PlanError {
 /// Run scout → memory → analyst in sequence, checkpointing after each, and record the run's final
 /// status. On any node failure the run is marked `Failed` and the error names the node.
 pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError> {
+    // Decided before the request is taken apart: choosing needs the whole of it.
+    let chosen = choose(&request).await?;
     let RunRequest {
         client,
         config,
@@ -86,10 +90,10 @@ pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError>
         run_id,
         issue,
         engine,
-        workflow,
+        ..
     } = request;
     // A workflow, when this repo defines one, overrides the built-in sequencing.
-    if let Workflow::Scripted(runtime) = select(registry().await?, workflow)? {
+    if let Workflow::Scripted(runtime) = chosen {
         let plugin_context =
             PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
                 .await?;
@@ -469,6 +473,7 @@ pub const BUILT_IN: &str = "built-in";
 /// Lives here rather than in the CLI because this crate is what decides which nodes exist. A
 /// workflow may add to this set; see [`Workflow::nodes`].
 pub const BUILT_IN_NODES: &[&str] = &[
+    "overseer",
     "scout",
     "analyst",
     "bookkeeper",
@@ -508,6 +513,15 @@ impl Workflow {
         match self {
             Workflow::BuiltIn => &[],
             Workflow::Scripted(w) => &w.meta().nodes,
+        }
+    }
+
+    /// The cases in which this workflow is the right one. Empty for the built-in: it is the
+    /// fallback, so it is chosen by nothing else matching rather than by matching.
+    pub fn when_to_use(&self) -> &[String] {
+        match self {
+            Workflow::BuiltIn => &[],
+            Workflow::Scripted(w) => &w.meta().when_to_use,
         }
     }
 
@@ -611,6 +625,80 @@ pub fn select(found: Vec<Workflow>, wanted: Option<&str>) -> Result<Workflow, Pl
             )),
         )),
     }
+}
+
+/// The overseer is opt-in on having somewhere to run, like the verifier and the characterizer.
+fn overseer_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> bool {
+    config.models.contains_key("overseer")
+        || engine
+            .ruleset("overseer")
+            .is_some_and(|r| r.config().model.is_some())
+}
+
+/// Pick the workflow for this run, asking the overseer when there is a real choice to make.
+///
+/// The order is deliberate. A named workflow wins outright — a caller that said which shape it
+/// wanted is not asking to be second-guessed. Nothing to choose between resolves without a model
+/// call, because paying for a decision with one answer is waste. Only a genuine choice reaches the
+/// overseer, and without one configured the run still refuses to guess rather than picking.
+pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
+    let found = registry().await?;
+    let real_choice = request.workflow.is_none()
+        && found
+            .iter()
+            .filter(|w| !matches!(w, Workflow::BuiltIn))
+            .count()
+            > 1;
+    if !real_choice || !overseer_enabled(request.engine, request.config) {
+        return select(found, request.workflow);
+    }
+
+    let choices: Vec<overseer::Choice> = found
+        .iter()
+        .map(|w| overseer::Choice {
+            name: w.name().to_string(),
+            purpose: w.purpose().to_string(),
+            when_to_use: w.when_to_use().to_vec(),
+        })
+        .collect();
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let context = PluginContext::resolve(request.config, request.engine, &cwd).await?;
+    let plugins = context.for_node("overseer");
+    let cfg = node_agent_config(
+        request.engine,
+        request.config,
+        context.pool_for("overseer", request.client.offer()),
+        "overseer",
+        overseer::OVERSEER_TOOLS,
+        &plugins,
+    )?;
+    let decided = OverseerNode {
+        route: cfg.route,
+        tools: cfg.tools,
+        policy: cfg.policy,
+        max_turns: cfg.max_turns,
+        system_prompt: cfg.system_prompt,
+        plugins,
+        ledger: None,
+        files: cfg.files,
+    }
+    .run(request.issue, &choices)
+    .await
+    .map_err(|e| PlanError::node("overseer", e))?;
+
+    // Recorded before it is acted on, and recorded even when the name turns out to be wrong: the
+    // reasoning is what a reader needs when a run went somewhere unexpected, and a rejected choice
+    // is exactly such a case.
+    request
+        .store
+        .upsert_run(request.run_id, None, RunStatus::Running.as_str())
+        .await?;
+    checkpoint(request.store, request.run_id, "overseer", &decided).await?;
+
+    // A model naming something that is not there does not get to select it. Falling through to the
+    // named lookup gives the error that lists what was available.
+    select(found, Some(&decided.workflow))
 }
 
 /// What one run needs to start.
@@ -1227,6 +1315,8 @@ async fn no_code_change(
 /// The full Phase 3 run: plan (scout → memory → analyst), then fork red-team ∥ implementer, then
 /// converge. Reuses [`run_plan`] for the planning half.
 pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> {
+    // Decided before the request is taken apart: choosing needs the whole of it.
+    let chosen = choose(&request).await?;
     let RunRequest {
         client,
         config,
@@ -1234,10 +1324,10 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
         run_id,
         issue,
         engine,
-        workflow,
+        ..
     } = request;
     // A workflow, when this repo defines one, overrides the whole run flow.
-    if let Workflow::Scripted(runtime) = select(registry().await?, workflow)? {
+    if let Workflow::Scripted(runtime) = chosen {
         // Said out loud because it is a gate the run will not have. The scripted path checkpoints,
         // validates and enforces the referee and iteration limits, but it has no verifier binding
         // — so a change that passes its tests is accepted without anything reading the diff.
@@ -2552,5 +2642,54 @@ mod agent_config_tests {
         assert!(BUILT_IN_NODES.contains(&"verifier"));
         assert!(!BUILT_IN_NODES.contains(&"memory"));
         assert!(!BUILT_IN_NODES.contains(&"implementer"));
+    }
+
+    /// Whether `choose` would spend a model call, given what the repo defines and what was asked.
+    fn would_consult(defined: usize, named: bool, configured: bool) -> bool {
+        !named && defined > 1 && configured
+    }
+
+    #[test]
+    fn the_overseer_is_consulted_only_when_there_is_a_real_choice() {
+        // A caller that named a workflow said which shape it wanted and is not asking to be
+        // second-guessed.
+        assert!(!would_consult(3, true, true));
+        // One or none resolves without a model call: paying for a decision with one answer is
+        // waste, and the built-in is what a repo defining nothing gets.
+        assert!(!would_consult(1, false, true));
+        assert!(!would_consult(0, false, true));
+        // Unconfigured, the run refuses to guess rather than picking for itself.
+        assert!(!would_consult(3, false, false));
+        // The only case worth a call.
+        assert!(would_consult(2, false, true));
+    }
+
+    #[tokio::test]
+    async fn a_choice_naming_something_absent_is_refused_rather_than_run() {
+        // The overseer returns a name; it does not get to select one that is not there. Routing on
+        // an invented name would run a shape nobody defined.
+        let dir = std::env::temp_dir().join(format!("ratatoskr-ovr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ts"), r#"defineWorkflow({ name: "research" });"#).unwrap();
+        let found = WorkflowRuntime::discover(&dir).await.unwrap();
+        let mut registry = vec![Workflow::BuiltIn];
+        registry.extend(found.into_iter().map(Workflow::Scripted));
+
+        let err = match select(registry, Some("invented")) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a name that is not in the registry must not select anything"),
+        };
+        assert!(err.contains("no workflow named `invented`"), "{err}");
+        assert!(err.contains("research"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_built_in_is_chosen_by_nothing_else_matching() {
+        // It declares no cases on purpose — it is the fallback, so a model matching cases will
+        // never match it, and the prompt says to land there when nothing else fits.
+        assert!(Workflow::BuiltIn.when_to_use().is_empty());
+        assert!(!Workflow::BuiltIn.purpose().is_empty());
     }
 }

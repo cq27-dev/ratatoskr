@@ -62,9 +62,11 @@ a file beside the ruleset when it is long enough that a TS string literal stops 
 defineAgent("analyst", { systemPromptFile: "research-analyst.md" });
 ```
 
-With one defined it is used; with several, name one with `--workflow <name>` — picking for you is
-the overseer's job, and choosing the alphabetically-first would look like a decision while being an
-accident. With none, the built-in flow above runs. A single `.ratatoskr/workflow.ts` still works and
+With one defined it is used; with several, name one with `--workflow <name>` — or set a
+`[models.overseer]` route and one is chosen per task from the declared purposes and cases, with the
+choice and its reasoning checkpointed. Without either, a repo with several workflows is asked to
+name one rather than guessed at: choosing the alphabetically-first would look like a decision while
+being an accident. With none, the built-in flow above runs. A single `.ratatoskr/workflow.ts` still works and
 is registered under its filename.
 
 Every node's output is validated against its JSON Schema and checkpointed before the next node

@@ -54,6 +54,15 @@ model = "kimi-k2.5"
 # provider = "anthropic"
 # model = "claude-sonnet-5"
 
+# Optional: with a [models.overseer] route set, a repo that defines several workflows has one
+# chosen for it per task, from each workflow's declared purpose and `whenToUse` cases. The choice
+# and its reasoning land on a checkpoint. Consulted only when there is a real choice — never when
+# `--workflow` named one, and never when the repo defines fewer than two. Omit and a repo with
+# several workflows is asked to name one rather than guessed at.
+# [models.overseer]
+# provider = "anthropic"
+# model = "claude-sonnet-5"
+
 # Optional: with a [models.characterizer] route set, a cheap model reads each acceptance step's
 # raw output and names the individual checks that passed and failed — so converge compares at test
 # granularity for any toolchain, with no parser to teach. Omit and a run still converges, comparing
