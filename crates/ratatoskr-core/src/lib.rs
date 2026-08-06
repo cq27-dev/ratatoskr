@@ -8,8 +8,8 @@ pub mod policy;
 pub mod state;
 
 pub use config::{
-    ConfigError, ImplementerConfig, ModelRoute, RagRatConfig, RatatoskrConfig, SandboxConfig,
-    StoreConfig, WorktreeConfig,
+    ConfigError, HookLimits, ImplementerConfig, ModelRoute, PluginConfig, RagRatConfig,
+    RatatoskrConfig, SandboxConfig, StoreConfig, WorktreeConfig,
 };
 pub use policy::{ToolDecision, ToolPolicy};
 pub use state::{RunState, RunStatus};

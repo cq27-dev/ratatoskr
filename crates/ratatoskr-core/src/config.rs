@@ -28,6 +28,64 @@ pub struct RatatoskrConfig {
 pub struct PluginConfig {
     #[serde(default)]
     pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub hooks: HookLimits,
+}
+
+/// What a plugin's hooks may spend of a run.
+///
+/// The defaults are the Claude Code plugin format's own, so a plugin written against that host
+/// behaves here the way its author tested it. They are generous — a hook may take ten minutes and
+/// answer with ten thousand characters — because that host has a person watching it. Ratatoskr
+/// runs unattended, so every one of them is overridable in `ratatoskr.toml`, and a repo that
+/// treats plugins as a latency budget rather than a convenience should lower them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookLimits {
+    /// Seconds a hook gets when it declares no `timeout` of its own.
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_secs: u64,
+    /// Ceiling on a hook-declared `timeout`. The format sets none; this defaults to the same value
+    /// as `timeout_secs`, so a hook asking for less gets less and one asking for more is capped.
+    #[serde(default = "default_hook_timeout")]
+    pub max_timeout_secs: u64,
+    /// Characters one event's hooks may contribute, across all of them.
+    #[serde(default = "default_output_budget")]
+    pub output_budget: usize,
+    /// Characters of plugin context a node will carry into its preamble, across every plugin it
+    /// binds. Paid on every model call that node makes, which is why it has its own limit.
+    #[serde(default = "default_output_budget")]
+    pub context_budget: usize,
+    /// Total seconds a run will spend in hooks that run around tool calls, after which it stops
+    /// running them. `0` means no limit.
+    ///
+    /// Not part of the plugin format — it has no equivalent because a person can interrupt an
+    /// interactive session. A hook on a tool call fires on every one a node makes, so this is the
+    /// only bound on what plugins cost a run as a whole.
+    #[serde(default)]
+    pub tool_time_budget_secs: u64,
+}
+
+/// The plugin format's default hook timeout.
+fn default_hook_timeout() -> u64 {
+    600
+}
+
+/// The plugin format's cap on a hook's output.
+fn default_output_budget() -> usize {
+    10_000
+}
+
+impl Default for HookLimits {
+    fn default() -> Self {
+        HookLimits {
+            timeout_secs: default_hook_timeout(),
+            max_timeout_secs: default_hook_timeout(),
+            output_budget: default_output_budget(),
+            context_budget: default_output_budget(),
+            tool_time_budget_secs: 0,
+        }
+    }
 }
 
 impl PluginConfig {
@@ -224,6 +282,68 @@ impl Default for RatatoskrConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_limits_default_to_the_plugin_formats_own_and_are_overridable() {
+        // A config that says nothing about plugins gets the format's defaults, so a plugin
+        // behaves here the way its author tested it.
+        let bare = RatatoskrConfig::from_toml_str(
+            r#"
+            [rag_rat]
+            command = ["rag-rat", "mcp"]
+            [store]
+            path = ".ratatoskr/state.sqlite3"
+            [worktree]
+            root = ".ratatoskr/worktrees"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(bare.plugins.hooks.timeout_secs, 600);
+        assert_eq!(bare.plugins.hooks.max_timeout_secs, 600);
+        assert_eq!(bare.plugins.hooks.output_budget, 10_000);
+        assert_eq!(bare.plugins.hooks.context_budget, 10_000);
+        // Not the format's: a run is unattended, so this one is opt-in.
+        assert_eq!(bare.plugins.hooks.tool_time_budget_secs, 0);
+
+        // Each is overridable on its own; the rest stay at their defaults.
+        let tight = RatatoskrConfig::from_toml_str(
+            r#"
+            [rag_rat]
+            command = ["rag-rat", "mcp"]
+            [store]
+            path = ".ratatoskr/state.sqlite3"
+            [worktree]
+            root = ".ratatoskr/worktrees"
+            [plugins.hooks]
+            max_timeout_secs = 10
+            tool_time_budget_secs = 60
+            "#,
+        )
+        .unwrap();
+        assert_eq!(tight.plugins.hooks.max_timeout_secs, 10);
+        assert_eq!(tight.plugins.hooks.tool_time_budget_secs, 60);
+        assert_eq!(tight.plugins.hooks.timeout_secs, 600);
+        assert_eq!(tight.plugins.hooks.output_budget, 10_000);
+    }
+
+    #[test]
+    fn a_misspelled_hook_limit_is_refused_rather_than_ignored() {
+        // A limit that silently stayed at its default would be the worst kind of typo: the run
+        // looks configured and isn't.
+        let err = RatatoskrConfig::from_toml_str(
+            r#"
+            [rag_rat]
+            command = ["rag-rat", "mcp"]
+            [store]
+            path = ".ratatoskr/state.sqlite3"
+            [worktree]
+            root = ".ratatoskr/worktrees"
+            [plugins.hooks]
+            timeout_seconds = 30
+            "#,
+        );
+        assert!(err.is_err(), "an unknown key is a typo, not a preference");
+    }
 
     #[test]
     fn parses_a_minimal_config() {

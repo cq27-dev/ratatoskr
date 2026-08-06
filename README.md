@@ -195,11 +195,26 @@ that says "always do X" is likely to be quoted and refused, while one that says 
 the repository gets used. Whether a call proceeds at all is not a plugin's decision: gating belongs
 to a ruleset's `onToolCall`, which is the repository speaking about its own agents.
 
-These fire on *every* matching call, so they are budgeted: 5s per hook, 2000 characters per call,
-and 60s of total hook time per run, after which the run stops calling them and says so. Note that
-existing plugins match a coding CLI's tool vocabulary (`^(Grep|Read|Bash|Write|Edit)$`) and a
-planning node calls none of those — this is for hooks written against the tools nodes actually
-call, like `semantic_search` and `impact_surface`.
+What a plugin's hooks may spend is the format's own defaults — 600s per hook, 10,000 characters of
+output — so a plugin behaves here the way its author tested it. Those are generous because that
+host has a person watching a spinner; a run here is unattended, and every limit is overridable:
+
+```toml
+[plugins.hooks]
+timeout_secs = 600         # a hook that declares no `timeout` of its own
+max_timeout_secs = 600     # ceiling on one that does
+output_budget = 10000      # characters one event's hooks may contribute
+context_budget = 10000     # characters of plugin context a node carries into its preamble
+tool_time_budget_secs = 0  # total seconds per run in tool-call hooks; 0 means no limit
+```
+
+`tool_time_budget_secs` has no equivalent in the format, because there a person can interrupt.
+Hooks around tool calls fire on *every* call a node makes, so it is the only bound on what plugins
+cost a run as a whole — set it if you want one.
+
+Note that existing plugins match a coding CLI's tool vocabulary (`^(Grep|Read|Bash|Write|Edit)$`)
+and a planning node calls none of those — this is for hooks written against the tools nodes
+actually call, like `semantic_search` and `impact_surface`.
 
 ### Scripted orchestration
 

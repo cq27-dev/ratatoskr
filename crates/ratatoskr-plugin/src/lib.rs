@@ -13,48 +13,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use ratatoskr_core::HookLimits;
 use regex::Regex;
 use serde::Deserialize;
 
-/// Longest a single hook may take before it is abandoned. Plugins declare their own timeout; this
-/// caps it, because the caller is a node waiting to start.
-const MAX_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Timeout for a hook that declares none.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Most output read from a single hook before it is cut off and the process killed.
 ///
-/// The read itself has to be bounded, not just the text kept: a hook that writes without end
-/// would otherwise be buffered in full before anything got a chance to reject it, and a plugin
-/// must not be able to exhaust the run's memory.
-const MAX_HOOK_OUTPUT: u64 = 256 * 1024;
-
-/// How much hook output a node will carry.
-///
-/// This text is prepended to the node's preamble, so it is paid for on *every* model call that
-/// node makes — the budget is what keeps an orientation digest from becoming a tax.
-pub const CONTEXT_BUDGET: usize = 4000;
-
-/// Longest a hook that runs around a *tool call* may take.
-///
-/// Tighter than [`MAX_TIMEOUT`] because this one is on the model's critical path: the node is
-/// waiting mid-turn, not waiting to start.
-const MAX_TOOL_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How much one event's hooks may contribute to a tool call, across all of them.
-///
-/// Per event, so a call that has both a `PreToolUse` and a `PostToolUse` hook can carry twice this
-/// on its result — they answer different questions and each gets its own allowance. Smaller than
-/// [`CONTEXT_BUDGET`] either way: this rides on a tool result, and there is one per tool call
-/// rather than one per run.
-pub const TOOL_CONTEXT_BUDGET: usize = 2000;
-
-/// Total wall-clock a run will spend inside tool hooks before it stops running them.
-///
-/// A per-hook timeout bounds one call; nothing bounds a hundred of them. This is the ceiling on
-/// what plugins may cost a node in latency, after which they are silent for the rest of the run.
-pub const TOOL_HOOK_BUDGET: Duration = Duration::from_secs(60);
+/// A hard limit rather than a budget: the *read* has to be bounded, not just the text kept, or a
+/// hook that writes without end would be buffered in full before anything could reject it. Set
+/// well above any configured [`HookLimits::output_budget`], so it only ever catches a runaway.
+const MAX_HOOK_OUTPUT: u64 = 1024 * 1024;
 
 /// A loaded plugin.
 #[derive(Debug, Clone)]
@@ -89,10 +57,18 @@ pub struct Hook {
     /// is treated as "matches nothing" so a broken pattern costs its own hook and no other.
     pattern: Option<Regex>,
     pub command: String,
-    pub timeout: Duration,
+    /// The hook's own `timeout`, in seconds, when it declares one. Resolved against
+    /// [`HookLimits`] at run time rather than at load, so a config change needs no reload.
+    pub timeout: Option<u64>,
 }
 
 impl Hook {
+    /// How long this hook may run: what it asked for, defaulted and capped by `limits`.
+    pub fn timeout(&self, limits: &HookLimits) -> Duration {
+        let asked = self.timeout.unwrap_or(limits.timeout_secs);
+        Duration::from_secs(asked.min(limits.max_timeout_secs))
+    }
+
     /// Whether this hook fires for `tool`. A hook with no matcher fires for every tool.
     pub fn matches(&self, tool: &str) -> bool {
         match (&self.matcher, &self.pattern) {
@@ -285,9 +261,7 @@ fn read_hooks(root: &Path) -> Vec<Hook> {
                         }),
                         matcher: matcher.clone(),
                         command: entry.command,
-                        timeout: entry
-                            .timeout
-                            .map_or(DEFAULT_TIMEOUT, |s| Duration::from_secs(s).min(MAX_TIMEOUT)),
+                        timeout: entry.timeout,
                     })
                 })
             })
@@ -300,7 +274,11 @@ fn read_hooks(root: &Path) -> Vec<Hook> {
 /// Per plugin rather than one joined string because nodes bind different sets: the hooks run once
 /// per run, and each node composes from this map. `SessionStart` answers with plain text on stdout
 /// — no envelope — and silence is the normal "nothing to say".
-pub async fn session_start(plugins: &[Plugin], cwd: &Path) -> BTreeMap<String, String> {
+pub async fn session_start(
+    plugins: &[Plugin],
+    cwd: &Path,
+    limits: &HookLimits,
+) -> BTreeMap<String, String> {
     let mut contexts = BTreeMap::new();
 
     for plugin in plugins {
@@ -313,7 +291,8 @@ pub async fn session_start(plugins: &[Plugin], cwd: &Path) -> BTreeMap<String, S
                 // Plugins commonly gate on this; a run beginning is a startup.
                 "source": "startup",
             });
-            let Some(text) = run_hook(plugin, hook, hook.timeout, &payload, cwd).await else {
+            let Some(text) = run_hook(plugin, hook, hook.timeout(limits), &payload, cwd).await
+            else {
                 continue;
             };
             let text = text.trim();
@@ -328,7 +307,7 @@ pub async fn session_start(plugins: &[Plugin], cwd: &Path) -> BTreeMap<String, S
         // worse than none of one, and refusing it now means nothing over the budget is held
         // resident for the run.
         let text = parts.join("\n\n");
-        if text.len() > CONTEXT_BUDGET {
+        if text.len() > limits.output_budget {
             tracing::warn!(
                 plugin = plugin.name,
                 chars = text.len(),
@@ -382,9 +361,11 @@ pub async fn tool_hooks(
     plugins: &[Plugin],
     event: ToolEvent<'_>,
     cwd: &Path,
+    limits: &HookLimits,
     spent: &AtomicU64,
 ) -> Option<String> {
-    if Duration::from_millis(spent.load(Ordering::Relaxed)) >= TOOL_HOOK_BUDGET {
+    let budget = tool_time_budget(limits);
+    if budget.is_some_and(|b| Duration::from_millis(spent.load(Ordering::Relaxed)) >= b) {
         return None;
     }
     let started = std::time::Instant::now();
@@ -409,16 +390,15 @@ pub async fn tool_hooks(
                 payload["tool_response"] = serde_json::json!(response);
             }
 
-            // The tighter cap: a node is mid-turn waiting on this.
-            let timeout = hook.timeout.min(MAX_TOOL_TIMEOUT);
-            let Some(raw) = run_hook(plugin, hook, timeout, &payload, cwd).await else {
+            let Some(raw) = run_hook(plugin, hook, hook.timeout(limits), &payload, cwd).await
+            else {
                 continue;
             };
             let Some(text) = additional_context(&raw, &plugin.name) else {
                 continue;
             };
             // Whole hooks in or out: half an aside is worse than none of one.
-            if used + text.len() > TOOL_CONTEXT_BUDGET {
+            if used + text.len() > limits.output_budget {
                 tracing::debug!(
                     plugin = plugin.name,
                     tool = event.tool,
@@ -434,13 +414,21 @@ pub async fn tool_hooks(
     // Warn exactly on the call that exhausts it, so a run says once that its plugins went quiet.
     let cost = started.elapsed();
     let before = Duration::from_millis(spent.fetch_add(cost.as_millis() as u64, Ordering::Relaxed));
-    if before < TOOL_HOOK_BUDGET && before + cost >= TOOL_HOOK_BUDGET {
+    if let Some(budget) = budget
+        && before < budget
+        && before + cost >= budget
+    {
         tracing::warn!(
-            "plugins have spent their {TOOL_HOOK_BUDGET:?} of tool-hook time; \
+            "plugins have spent their {budget:?} of tool-hook time; \
              no more tool hooks will run this run"
         );
     }
     (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// The run's tool-hook time budget, or `None` when it is unlimited.
+fn tool_time_budget(limits: &HookLimits) -> Option<Duration> {
+    (limits.tool_time_budget_secs > 0).then(|| Duration::from_secs(limits.tool_time_budget_secs))
 }
 
 /// Read `additionalContext` out of a hook's envelope, or nothing.
@@ -465,7 +453,11 @@ fn additional_context(raw: &str, plugin: &str) -> Option<String> {
 ///
 /// Capped at [`CONTEXT_BUDGET`] and truncated between plugins rather than mid-sentence: this text
 /// is prepended to the node's preamble, so it is paid for on every model call that node makes.
-pub fn compose(contexts: &BTreeMap<String, String>, names: &[String]) -> Option<String> {
+pub fn compose(
+    contexts: &BTreeMap<String, String>,
+    names: &[String],
+    limits: &HookLimits,
+) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
     let mut used = 0usize;
 
@@ -474,7 +466,7 @@ pub fn compose(contexts: &BTreeMap<String, String>, names: &[String]) -> Option<
             continue;
         };
         // Whole plugins in or out: half a digest is worse than none of one.
-        if used + text.len() > CONTEXT_BUDGET {
+        if used + text.len() > limits.context_budget {
             tracing::debug!("dropping {name}'s session context: over budget");
             continue;
         }
@@ -554,6 +546,11 @@ async fn run_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The format's own defaults, which is what a repo gets unless `ratatoskr.toml` says otherwise.
+    fn limits() -> HookLimits {
+        HookLimits::default()
+    }
 
     #[test]
     fn mcp_servers_are_read_from_either_spelling_and_rooted() {
@@ -639,6 +636,11 @@ mod tests {
         let root = tool_plugin("matching", "^(Grep|Read)$", "PreToolUse", "");
         let hook = &discover(std::slice::from_ref(&root))[0].hooks[0];
         assert!(hook.matches("Grep") && hook.matches("Read"));
+        // Declaring no timeout of its own, it takes the configured default.
+        assert_eq!(
+            hook.timeout(&limits()),
+            Duration::from_secs(limits().timeout_secs)
+        );
         assert!(!hook.matches("semantic_search"));
         let _ = std::fs::remove_dir_all(&root);
 
@@ -673,12 +675,26 @@ mod tests {
         };
 
         assert_eq!(
-            tool_hooks(&plugins, event("semantic_search"), Path::new("."), &spent).await,
+            tool_hooks(
+                &plugins,
+                event("semantic_search"),
+                Path::new("."),
+                &limits(),
+                &spent
+            )
+            .await,
             Some("mind the clones".to_string())
         );
         // The matcher decides; an unmatched tool runs nothing at all.
         assert_eq!(
-            tool_hooks(&plugins, event("impact_surface"), Path::new("."), &spent).await,
+            tool_hooks(
+                &plugins,
+                event("impact_surface"),
+                Path::new("."),
+                &limits(),
+                &spent
+            )
+            .await,
             None
         );
         // So does the event: a PreToolUse hook has nothing to say after the call.
@@ -690,6 +706,7 @@ mod tests {
                     ..event("semantic_search")
                 },
                 Path::new("."),
+                &limits(),
                 &spent
             )
             .await,
@@ -723,6 +740,7 @@ mod tests {
                     response: None,
                 },
                 Path::new("."),
+                &limits(),
                 &spent,
             )
             .await;
@@ -751,13 +769,14 @@ mod tests {
                 response: Some(&huge),
             },
             Path::new("."),
+            &limits(),
             &spent,
         )
         .await;
 
         assert_eq!(got.as_deref(), Some("mind the clones"));
         assert!(
-            started.elapsed() < MAX_TOOL_TIMEOUT,
+            started.elapsed() < Duration::from_secs(limits().timeout_secs),
             "the hook answered rather than waiting out its timeout on a blocked write"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -777,7 +796,7 @@ mod tests {
 
         let spent = AtomicU64::new(0);
         assert!(
-            tool_hooks(&plugins, event(), Path::new("."), &spent)
+            tool_hooks(&plugins, event(), Path::new("."), &limits(), &spent)
                 .await
                 .is_some()
         );
@@ -786,9 +805,14 @@ mod tests {
             "a hook that ran is charged for the time it took"
         );
 
-        let exhausted = AtomicU64::new(TOOL_HOOK_BUDGET.as_millis() as u64);
+        let budgeted = HookLimits {
+            tool_time_budget_secs: 60,
+            ..limits()
+        };
+        let exhausted =
+            AtomicU64::new(Duration::from_secs(budgeted.tool_time_budget_secs).as_millis() as u64);
         assert_eq!(
-            tool_hooks(&plugins, event(), Path::new("."), &exhausted).await,
+            tool_hooks(&plugins, event(), Path::new("."), &budgeted, &exhausted).await,
             None,
             "past its budget a run runs no more tool hooks"
         );
@@ -845,7 +869,15 @@ mod tests {
             .collect();
         assert_eq!(pre[0].matcher.as_deref(), Some("^(Grep|Read)$"));
         // A plugin cannot hold a node for as long as it likes.
-        assert_eq!(pre[0].timeout, MAX_TIMEOUT);
+        // A hook gets what it asked for, up to the configured ceiling.
+        assert_eq!(pre[0].timeout, Some(99));
+        assert_eq!(pre[0].timeout(&limits()), Duration::from_secs(99));
+        let strict = HookLimits {
+            max_timeout_secs: 10,
+            ..limits()
+        };
+        assert_eq!(pre[0].timeout(&strict), Duration::from_secs(10));
+        assert_eq!(session[0].timeout(&limits()), Duration::from_secs(5));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -918,8 +950,9 @@ mod tests {
 
         let plugins = discover(&[talkative.clone(), quiet.clone()]);
         let context = compose(
-            &session_start(&plugins, Path::new(".")).await,
+            &session_start(&plugins, Path::new("."), &limits()).await,
             &plugins.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+            &limits(),
         );
         assert_eq!(context.as_deref(), Some("repo digest"));
 
@@ -944,8 +977,9 @@ mod tests {
         let plugins = discover(std::slice::from_ref(&broken));
         let started = std::time::Instant::now();
         let context = compose(
-            &session_start(&plugins, Path::new(".")).await,
+            &session_start(&plugins, Path::new("."), &limits()).await,
             &plugins.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+            &limits(),
         );
 
         assert_eq!(context.as_deref(), Some("survived"));
@@ -972,8 +1006,9 @@ mod tests {
         let plugins = discover(std::slice::from_ref(&flood));
         let started = std::time::Instant::now();
         let context = compose(
-            &session_start(&plugins, Path::new(".")).await,
+            &session_start(&plugins, Path::new("."), &limits()).await,
             &plugins.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+            &limits(),
         );
 
         assert!(
@@ -999,8 +1034,12 @@ mod tests {
         );
         let plugins = discover(std::slice::from_ref(&root));
         let names: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
-        let context = compose(&session_start(&plugins, Path::new(".")).await, &names)
-            .expect("the hook echoed its root");
+        let context = compose(
+            &session_start(&plugins, Path::new("."), &limits()).await,
+            &names,
+            &limits(),
+        )
+        .expect("the hook echoed its root");
         assert_eq!(context, root.display().to_string());
         let _ = std::fs::remove_dir_all(&root);
     }

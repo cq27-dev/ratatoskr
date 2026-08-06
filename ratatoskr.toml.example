@@ -63,3 +63,16 @@ test_command = ["cargo", "test"]            # the target repo's test command
 # A plugin's SessionStart hook runs once per run and its output is prefixed to each node's preamble.
 [plugins]
 paths = []
+
+# What a plugin's hooks may spend. The defaults are the plugin format's own, so a plugin behaves
+# here the way its author tested it in a coding CLI. They are generous because that host has a
+# person watching; a run here is unattended, so lower them if plugins are a latency budget.
+[plugins.hooks]
+timeout_secs = 600        # a hook that declares no `timeout` of its own
+max_timeout_secs = 600    # ceiling on one that does
+output_budget = 10000     # characters one event's hooks may contribute
+context_budget = 10000    # characters of plugin context a node carries into its preamble
+# Total seconds a run will spend in hooks that run around tool calls; 0 means no limit. Not part
+# of the format — it has no equivalent, because a person can interrupt an interactive session.
+# These hooks fire on every tool call a node makes, so this is the only bound on the whole run.
+tool_time_budget_secs = 0

@@ -349,6 +349,8 @@ pub struct PluginContext {
     /// Wall-clock the run has spent inside tool hooks, shared by every node so the budget is the
     /// run's rather than each node's.
     hook_time: Arc<std::sync::atomic::AtomicU64>,
+    /// What this repo lets its plugins' hooks spend.
+    limits: ratatoskr_core::HookLimits,
 }
 
 /// What the plugins a node binds contribute to that node.
@@ -373,6 +375,7 @@ struct NodeObserver {
     plugins: Vec<ratatoskr_plugin::Plugin>,
     cwd: PathBuf,
     hook_time: Arc<std::sync::atomic::AtomicU64>,
+    limits: ratatoskr_core::HookLimits,
 }
 
 impl NodeObserver {
@@ -393,6 +396,7 @@ impl NodeObserver {
                     response,
                 },
                 &self.cwd,
+                &self.limits,
                 &self.hook_time,
             )
             .await
@@ -469,7 +473,7 @@ impl PluginContext {
         }
 
         let discovered: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
-        let contexts = ratatoskr_plugin::session_start(&plugins, cwd).await;
+        let contexts = ratatoskr_plugin::session_start(&plugins, cwd, &config.plugins.hooks).await;
         for (name, text) in &contexts {
             tracing::info!(plugin = name, chars = text.len(), "plugin session context");
         }
@@ -480,6 +484,7 @@ impl PluginContext {
             servers: Arc::new(connect_plugin_servers(&plugins, cwd).await),
             plugins: Arc::new(plugins),
             hook_time: Arc::default(),
+            limits: config.plugins.hooks.clone(),
         })
     }
 
@@ -499,7 +504,7 @@ impl PluginContext {
             .cloned()
             .collect();
         NodePlugins {
-            context: ratatoskr_plugin::compose(&self.contexts, &bound),
+            context: ratatoskr_plugin::compose(&self.contexts, &bound, &self.limits),
             // `None` rather than an empty runner: it is what keeps the hook off the agent
             // entirely for a node whose plugins have nothing to say about its tool calls.
             observer: (!hooked.is_empty()).then(|| {
@@ -507,6 +512,7 @@ impl PluginContext {
                     plugins: hooked,
                     cwd: std::env::current_dir().unwrap_or_default(),
                     hook_time: Arc::clone(&self.hook_time),
+                    limits: self.limits.clone(),
                 }) as Arc<dyn ratatoskr_agent::ToolObserver>
             }),
         }
@@ -1218,9 +1224,7 @@ mod agent_config_tests {
             .collect(),
             discovered: vec!["everywhere".to_string(), "analyst-only".to_string()],
             engine: Some(engine),
-            servers: Arc::new(Vec::new()),
-            plugins: Arc::new(Vec::new()),
-            hook_time: Arc::default(),
+            ..Default::default()
         };
 
         // Defaults first, then what the node added.
