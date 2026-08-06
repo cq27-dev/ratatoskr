@@ -261,7 +261,7 @@ fn metered<M: CompletionModel + 'static>(
         .max_tokens(max_tokens)
         // Log tool calls + model text; added before the gates so it observes calls the
         // clarification and ruleset hooks may skip.
-        .add_hook(ObservabilityHook)
+        .add_hook(ObservabilityHook::default())
         .add_hook(usage);
     (builder, meter)
 }
@@ -338,13 +338,29 @@ impl AgentHook for UsageHook {
     }
 }
 
-/// Always-on hook that makes a run legible in the logs: every tool call (name + args) and the
-/// model's text at the end of each turn. Successful tool calls aren't otherwise surfaced, so without
-/// this a stuck node (e.g. an analyst churning through turns) looks like silence.
-struct ObservabilityHook;
+/// Always-on hook that makes a run legible in the logs: every tool call (name + args), how long it
+/// took, and the model's text at the end of each turn. Successful tool calls aren't otherwise
+/// surfaced, so without this a stuck node (e.g. an analyst churning through turns) looks like
+/// silence.
+///
+/// The duration is what makes a slow node diagnosable. Without it the only measurable interval is
+/// call-to-next-call, which is a tool's own time and the model's next response added together —
+/// and the two have completely different fixes.
+#[derive(Default)]
+struct ObservabilityHook {
+    /// Start times by rig's correlation id. Entries are removed when the result arrives; a tool
+    /// whose result never comes leaves one behind, which is bounded by the turn ceiling.
+    started: Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
 
 impl AgentHook for ObservabilityHook {
     async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
+        if let Ok(mut started) = self.started.lock() {
+            started.insert(
+                event.internal_call_id.to_string(),
+                std::time::Instant::now(),
+            );
+        }
         tracing::info!(
             kind = "tool_call",
             tool = event.tool_name,
@@ -352,6 +368,26 @@ impl AgentHook for ObservabilityHook {
             "tool call"
         );
         ToolCallAction::Run
+    }
+
+    async fn on_tool_result(
+        &self,
+        _ctx: &HookContext,
+        event: rig_agent::agent::ToolResultEvent<'_>,
+    ) -> ToolResultAction {
+        let elapsed = self
+            .started
+            .lock()
+            .ok()
+            .and_then(|mut started| started.remove(event.internal_call_id))
+            .map(|at| at.elapsed().as_millis() as u64);
+        tracing::info!(
+            kind = "tool_result",
+            tool = event.tool_name,
+            duration_ms = elapsed,
+            "tool result"
+        );
+        ToolResultAction::Keep
     }
 
     async fn on_model_turn_finished(
@@ -939,6 +975,9 @@ where
     };
 
     let (builder, meter) = metered(model, &preamble, max_turns, max_tokens);
+    // Kept for the validation below: the builder consumes the schema, and a node's answer has to
+    // be checked against it here, where the agent that wrote it can still be asked to fix it.
+    let schema_value = serde_json::to_value(&output_schema).unwrap_or(serde_json::Value::Null);
     let mut builder = builder
         .output_schema_raw(output_schema)
         // Force the synthetic output-tool: Auto can resolve to native structured output, which
@@ -987,17 +1026,44 @@ where
     // Field names follow the OpenTelemetry GenAI semantic conventions. Those are still unstable and
     // not worth an SDK dependency yet, but naming to match now makes adopting one a layer swap
     // rather than a rename of every field a dashboard reads.
+    let span = tracing::info_span!(
+        "agent",
+        node,
+        "gen_ai.operation.name" = "invoke_agent",
+        "gen_ai.agent.name" = node,
+        "gen_ai.request.model" = %model_name,
+    );
     let started = std::time::Instant::now();
-    let answer = async move { agent.prompt(&question).await }
-        .instrument(tracing::info_span!(
-            "agent",
-            node,
-            "gen_ai.operation.name" = "invoke_agent",
-            "gen_ai.agent.name" = node,
-            "gen_ai.request.model" = %model_name,
-        ))
+    let answer = async { agent.prompt(&question).await }
+        .instrument(span.clone())
         .await
         .map_err(|e| AgentError::Prompt(e.to_string()));
+
+    // Give a malformed answer back to the agent that wrote it, once. The alternative is what a
+    // schema failure used to cost: the node's whole run discarded — every tool call, every file
+    // read, minutes of it — over a key in the wrong shape, which is the one kind of mistake a
+    // model corrects immediately when told. The correction is a fresh short prompt rather than a
+    // continuation, so the preamble and tools stay cached and the transcript does not grow.
+    let answer = match &answer {
+        Ok(raw) => match ratatoskr_graph::validate_raw(raw, &schema_value) {
+            Ok(_) => answer,
+            Err(invalid) => {
+                tracing::warn!(node, %invalid, "output failed its schema; asking for a correction");
+                let correction = format!(
+                    "Your answer did not match the schema you were given: {invalid}\n\n\
+                     Here is what you returned:\n{raw}\n\n\
+                     Return the same content corrected to match the schema. Change only what the \
+                     error names — keep every finding, do not shorten anything, and do not go and \
+                     look anything up again. Answer by calling the output tool.",
+                );
+                async { agent.prompt(&correction).await }
+                    .instrument(span)
+                    .await
+                    .map_err(|e| AgentError::Prompt(e.to_string()))
+            }
+        },
+        Err(_) => answer,
+    };
 
     let (usage, calls) = meter.read();
     if let Some(ledger) = &ledger {

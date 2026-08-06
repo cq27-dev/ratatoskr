@@ -34,25 +34,54 @@ pub fn parse_validated<T>(raw: &str) -> Result<T, NodeError>
 where
     T: DeserializeOwned + JsonSchema,
 {
+    let schema = serde_json::to_value(schemars::schema_for!(T))
+        .map_err(|e| NodeError::InvalidOutput(format!("could not build schema: {e}")))?;
+    let value = validate_raw(raw, &schema).map_err(|e| match e {
+        // The type name is the useful half of the message for a reader, and only this half of the
+        // call knows it.
+        NodeError::InvalidOutput(msg) if msg.starts_with("does not match") => {
+            NodeError::InvalidOutput(format!("{} {msg}", std::any::type_name::<T>()))
+        }
+        other => other,
+    })?;
+
+    serde_json::from_value(value)
+        .map_err(|e| NodeError::InvalidOutput(format!("could not deserialize: {e}")))
+}
+
+/// The same extraction and schema check [`parse_validated`] performs, against a schema given as a
+/// value rather than a type.
+///
+/// Exposed for the agent loop, which holds a node's schema but not its type and has something
+/// `parse_validated` does not: the agent that produced the output, still able to correct it. A
+/// caller that has the type should use [`parse_validated`].
+pub fn validate_raw(raw: &str, schema: &serde_json::Value) -> Result<serde_json::Value, NodeError> {
     let json = extract_json_object(raw).ok_or_else(|| {
         NodeError::InvalidOutput(format!("no JSON object found in output: {}", elide(raw)))
     })?;
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| NodeError::InvalidOutput(format!("output is not valid JSON: {e}")))?;
 
-    let schema = serde_json::to_value(schemars::schema_for!(T))
-        .map_err(|e| NodeError::InvalidOutput(format!("could not build schema: {e}")))?;
-    let validator = jsonschema::validator_for(&schema)
+    let validator = jsonschema::validator_for(schema)
         .map_err(|e| NodeError::InvalidOutput(format!("could not compile schema: {e}")))?;
-    if let Err(err) = validator.validate(&value) {
+    // Every error, each with the field it is about. The validator's own message says only what was
+    // wrong ("is not of type \"array\""), never where — which is unactionable both for the reader
+    // of a failed run and for the model being asked to correct it. Reporting all of them means a
+    // correction fixes the answer rather than the first of several faults in it.
+    let problems: Vec<String> = validator
+        .iter_errors(&value)
+        .map(|err| match err.instance_path().to_string() {
+            path if path.is_empty() => err.to_string(),
+            path => format!("at `{path}`: {err}"),
+        })
+        .collect();
+    if !problems.is_empty() {
         return Err(NodeError::InvalidOutput(format!(
-            "{} does not match its schema: {err}",
-            std::any::type_name::<T>()
+            "does not match its schema: {}",
+            problems.join("; ")
         )));
     }
-
-    serde_json::from_value(value)
-        .map_err(|e| NodeError::InvalidOutput(format!("could not deserialize: {e}")))
+    Ok(value)
 }
 
 /// Return the substring from the first `{` to the last `}`, or `None` if there isn't a brace pair.
@@ -172,6 +201,28 @@ mod tests {
         let wrapped: Message =
             parse_validated("Here you go:\n```json\n{\"text\":\"hi\"}\n```").unwrap();
         assert_eq!(wrapped.text, "hi");
+    }
+
+    #[test]
+    fn validate_raw_names_the_field_and_the_shape_it_wanted() {
+        // What the agent loop hands back to the model to correct. It has to say which field and
+        // what was wrong with it, or the retry is a guess — this is the exact shape that cost a
+        // live run: an array field answered with the single string that belonged inside it.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct Plan {
+            acceptance: Vec<String>,
+        }
+
+        let schema = serde_json::to_value(schemars::schema_for!(Plan)).unwrap();
+        let err = validate_raw(r#"{"acceptance":"cargo test"}"#, &schema)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("acceptance"), "{err}");
+        assert!(err.contains("array"), "{err}");
+
+        // And the corrected shape both validates and deserializes into the field it belongs to.
+        let fixed: Plan = parse_validated(r#"{"acceptance":["cargo test"]}"#).unwrap();
+        assert_eq!(fixed.acceptance, ["cargo test"]);
     }
 
     #[test]
