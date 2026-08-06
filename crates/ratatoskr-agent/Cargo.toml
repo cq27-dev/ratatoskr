@@ -11,7 +11,7 @@ ratatoskr-mcp.workspace = true
 glob.workspace = true
 regex.workspace = true
 walkdir.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "process", "io-util"] }
 rig-core.workspace = true
 rig-agent.workspace = true
 rig-memory.workspace = true

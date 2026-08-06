@@ -23,10 +23,12 @@ flowchart LR
     verifier -->|execution findings| impl
     verifier -->|plan findings| analyst
     verifier -->|nothing blocking| bookkeeper[bookkeeper]
+    verifier -->|nothing blocking| publisher[publisher]
     bookkeeper -.->|informs the next run| context
+    publisher -.->|pull request or comment| tracker([tracker])
 
     classDef optional stroke-dasharray: 4 3
-    class overseer,verifier optional
+    class overseer,verifier,publisher optional
 ```
 
 Dashed nodes are opt-in: each runs only when it has a model route. Without them a run goes straight
@@ -52,7 +54,9 @@ to the built-in workflow and converges on its test result alone.
    the tests cannot. Findings that fault the *plan* go back to the analyst; the rest go back to the
    implementer.
 7. **bookkeeper** distils what the run learned — weighted toward what it *struggled* with — and
-   writes it to rag-rat via `memory_create`.
+   writes it to rag-rat via `memory_create`. Alongside it, **publisher** delivers what the run
+   *made*: a pull request, a comment on the issue it was given, both, or neither. One writes to the
+   memory graph and the other to the tracker, so they run concurrently.
 
 Converge only believes a test run the change did not referee. An iteration that touches the tests,
 their runner config (`conftest.py`, `pytest.ini`, `jest.config.*`, `Cargo.toml`, `package.json`, …)

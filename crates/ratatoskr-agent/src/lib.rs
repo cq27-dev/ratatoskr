@@ -6,6 +6,7 @@
 
 pub mod compaction;
 pub mod files;
+pub mod publish;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -427,10 +428,13 @@ fn prefixed(text: &str, context: Option<String>) -> String {
 /// Bind a tool this host answers itself: a built-in file tool, or — for the synthetic ones a hook
 /// answers in-conversation — a stand-in that says so if it is ever actually dispatched.
 fn local_tool(tool: &Tool, files: Option<&std::path::Path>) -> DynamicTool {
-    if let Some(root) = files
-        && let Some(implemented) = files::implementation(&tool.name, root)
-    {
-        return implemented;
+    if let Some(root) = files {
+        if let Some(implemented) = files::implementation(&tool.name, root) {
+            return implemented;
+        }
+        if let Some(implemented) = publish::implementation(&tool.name, root) {
+            return implemented;
+        }
     }
     let name = tool.name.to_string();
     let schema = serde_json::Value::Object((*tool.input_schema).clone());

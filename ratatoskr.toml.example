@@ -100,6 +100,21 @@ test_command = ["cargo", "test"]
 # a model deciding what proves its code works.
 pin_acceptance = false
 
+# Where a run's output goes when it finishes. Off by default, and deliberately a switch rather than
+# something inferred from having a [models.publisher] route: the publisher is the only node that
+# acts outside this machine, and a run that opens a pull request nobody expected is worse than one
+# that publishes nothing. With it on, the publisher decides for itself whether the run produced a
+# pull request, a comment on the issue it was given, both, or neither — and writes through `gh`,
+# which must be installed and authenticated.
+[publish]
+enabled = false
+
+# Optional: with a [models.publisher] route set and [publish] enabled, a finished run delivers what
+# it made to the tracker, in parallel with the bookkeeper recording what it learned.
+# [models.publisher]
+# provider = "anthropic"
+# model = "claude-sonnet-5"
+
 # Agent plugins, in the format coding CLIs already use. `.ratatoskr/plugins/` is always searched;
 # these paths add plugins installed elsewhere, and may name a plugin or a directory of them.
 # A plugin's SessionStart hook runs once per run and its output is prefixed to each node's preamble.

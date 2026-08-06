@@ -20,6 +20,8 @@ pub struct RatatoskrConfig {
     pub sandbox: SandboxConfig,
     #[serde(default)]
     pub plugins: PluginConfig,
+    #[serde(default)]
+    pub publish: PublishConfig,
 }
 
 /// Where to look for agent plugins. `.ratatoskr/plugins/` is always searched; `paths` adds
@@ -153,6 +155,20 @@ impl Default for ImplementerConfig {
 
 fn default_verify_threshold() -> String {
     "P2".to_string()
+}
+
+/// Where a run's output goes when it is finished.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishConfig {
+    /// Whether the publisher may write to the tracker.
+    ///
+    /// Off by default, and deliberately a switch rather than an inference from having a route. This
+    /// is the only node that acts outside this machine: a run that opens a pull request nobody
+    /// expected is worse than one that publishes nothing, so turning it on should be a thing
+    /// somebody did.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Phase 3 sandbox settings — where red-team and implementer run the acceptance check.
@@ -344,6 +360,7 @@ impl Default for RatatoskrConfig {
             model: model.to_string(),
         };
         RatatoskrConfig {
+            publish: PublishConfig::default(),
             rag_rat: RagRatConfig {
                 // `--json` makes rag-rat emit JSON (not its default TOON), so nodes that parse
                 // tool results directly (MemoryNode) get a stable shape.
@@ -648,6 +665,57 @@ mod tests {
                 provider = "anthropic"
                 model = "m"
                 max_token = 64000
+                "#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn publishing_is_off_until_somebody_turns_it_on() {
+        let bare = RatatoskrConfig::from_toml_str(
+            r#"
+            [rag_rat]
+            command = ["rag-rat", "mcp"]
+            [store]
+            path = "s"
+            [worktree]
+            root = "w"
+            "#,
+        )
+        .unwrap();
+        // The only node that acts outside this machine. A run that opens a pull request nobody
+        // expected is worse than one that publishes nothing, so this is a switch somebody throws
+        // rather than something inferred from having configured a model.
+        assert!(!bare.publish.enabled);
+
+        let on = RatatoskrConfig::from_toml_str(
+            r#"
+            [rag_rat]
+            command = ["rag-rat", "mcp"]
+            [store]
+            path = "s"
+            [worktree]
+            root = "w"
+            [publish]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+        assert!(on.publish.enabled);
+
+        // And a misspelling does not read as "left off" — it fails, like every other gate key.
+        assert!(
+            RatatoskrConfig::from_toml_str(
+                r#"
+                [rag_rat]
+                command = ["rag-rat", "mcp"]
+                [store]
+                path = "s"
+                [worktree]
+                root = "w"
+                [publish]
+                enable = true
                 "#,
             )
             .is_err()
