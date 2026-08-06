@@ -48,14 +48,15 @@ globalThis.defineWorkflow = function (meta) {
         throw new Error("defineWorkflow: `name` is required");
     }
     for (var k in meta) {
-        if (k !== "name" && k !== "purpose" && k !== "whenToUse") {
+        if (k !== "name" && k !== "purpose" && k !== "whenToUse" && k !== "nodes") {
             throw new Error("defineWorkflow: unknown key '" + k + "'");
         }
     }
     globalThis.__workflow = {
         name: meta.name,
         purpose: meta.purpose || "",
-        whenToUse: meta.whenToUse || []
+        whenToUse: meta.whenToUse || [],
+        nodes: meta.nodes || []
     };
 };
 globalThis.__workflowMeta = function () {
@@ -84,6 +85,10 @@ pub struct WorkflowMeta {
     /// concrete cases beat an abstract description, because selection is a matching problem.
     #[serde(default, rename = "whenToUse")]
     pub when_to_use: Vec<String>,
+    /// Nodes this workflow governs beyond the built-in set, so a ruleset targeting one is accepted
+    /// rather than read as a typo.
+    #[serde(default)]
+    pub nodes: Vec<String>,
 }
 
 /// A loaded workflow script: the resident JS context plus the transpiled source.
@@ -124,6 +129,7 @@ impl WorkflowRuntime {
                 .unwrap_or_else(|| "workflow".to_string()),
             purpose: String::new(),
             when_to_use: Vec::new(),
+            nodes: Vec::new(),
         });
 
         Ok(Some(WorkflowRuntime {

@@ -24,6 +24,11 @@
 //
 // A run that calls verify() and returns with blocking findings standing does NOT converge: the
 // terminal status is inferred from the verifier checkpoint, not from what the script returns.
+//
+// A workflow that introduces a node of its own declares it, so its `.ratatoskr/rules/<node>.ts` is
+// accepted rather than read as a typo:
+//
+//   defineWorkflow({ name: "deep", nodes: ["reviewer2"] });
 //   isConverged({baseline, post}) -> boolean
 //   testCommandRan(output) -> boolean
 //   newlyIntroducedFailures({baseline, post}) -> string[]

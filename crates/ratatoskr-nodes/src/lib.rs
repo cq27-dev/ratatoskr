@@ -462,6 +462,21 @@ pub const WORKFLOW_DIR: &str = ".ratatoskr/workflows";
 /// The name of the flow this binary implements in Rust.
 pub const BUILT_IN: &str = "built-in";
 
+/// The nodes a ruleset may govern out of the box — the LLM agents that go through
+/// `run_structured`. `memory` and `implementer` are absent because they have no model or tool set
+/// to override, so targeting one is a config error rather than a no-op.
+///
+/// Lives here rather than in the CLI because this crate is what decides which nodes exist. A
+/// workflow may add to this set; see [`Workflow::nodes`].
+pub const BUILT_IN_NODES: &[&str] = &[
+    "scout",
+    "analyst",
+    "bookkeeper",
+    "redteam",
+    "verifier",
+    "characterizer",
+];
+
 /// One workflow a run can use.
 ///
 /// The built-in is not a script and deliberately is not going to become one. Its gates — the
@@ -483,6 +498,19 @@ impl Workflow {
         }
     }
 
+    /// Node names this workflow governs beyond [`BUILT_IN_NODES`].
+    ///
+    /// A workflow that only re-sequences the existing nodes declares none. One that introduces a
+    /// node has to say so, or its `.ratatoskr/rules/<node>.ts` is rejected at load as targeting
+    /// something that does not exist — which is the right error for a typo and the wrong one for a
+    /// node the workflow genuinely has.
+    pub fn nodes(&self) -> &[String] {
+        match self {
+            Workflow::BuiltIn => &[],
+            Workflow::Scripted(w) => &w.meta().nodes,
+        }
+    }
+
     /// What it is for, for whatever is choosing.
     pub fn purpose(&self) -> &str {
         match self {
@@ -497,6 +525,21 @@ impl Workflow {
 
 /// The single-script path, still honoured so a repo that has one keeps working untouched.
 const LEGACY_WORKFLOW: &str = ".ratatoskr/workflow.ts";
+
+/// Every node any workflow in this repo may govern: the built-in set plus what each declares.
+///
+/// The union across all of them, not just the one a run selects, because rulesets are loaded
+/// before a workflow is chosen — and a ruleset targeting a node that some workflow declares is
+/// legitimate whether or not this particular run uses that workflow.
+pub async fn governable_nodes() -> Result<Vec<String>, PlanError> {
+    let mut names: Vec<String> = BUILT_IN_NODES.iter().map(|s| s.to_string()).collect();
+    for workflow in defined().await? {
+        names.extend(workflow.meta().nodes.iter().cloned());
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
 
 /// Every workflow a run could use: the built-in, then whatever this repo defines.
 pub async fn registry() -> Result<Vec<Workflow>, PlanError> {
@@ -2482,5 +2525,32 @@ mod agent_config_tests {
         // Rust flow's gates without deleting a file.
         let picked = select(registry_of("override", &["only"]).await, Some(BUILT_IN)).unwrap();
         assert!(matches!(picked, Workflow::BuiltIn));
+    }
+
+    #[tokio::test]
+    async fn a_workflow_can_add_to_the_nodes_a_ruleset_may_govern() {
+        let built_in = Workflow::BuiltIn;
+        // The built-in adds none: it governs exactly the standard set.
+        assert!(built_in.nodes().is_empty());
+
+        let dir = std::env::temp_dir().join(format!("ratatoskr-nodes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("deep.ts"),
+            r#"defineWorkflow({ name: "deep", nodes: ["reviewer2", "triager"] });"#,
+        )
+        .unwrap();
+        let found = WorkflowRuntime::discover(&dir).await.unwrap();
+        let declared = Workflow::Scripted(found.into_iter().next().unwrap());
+        assert_eq!(declared.nodes(), ["reviewer2", "triager"]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The standard set is what a repo defining nothing may govern, and `memory`/`implementer`
+        // are deliberately absent — neither has a model or tool set to override, so targeting one
+        // is a config error rather than a no-op.
+        assert!(BUILT_IN_NODES.contains(&"verifier"));
+        assert!(!BUILT_IN_NODES.contains(&"memory"));
+        assert!(!BUILT_IN_NODES.contains(&"implementer"));
     }
 }
