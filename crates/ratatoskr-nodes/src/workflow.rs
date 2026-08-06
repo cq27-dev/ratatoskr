@@ -636,6 +636,7 @@ async fn finish_full(ctx: &Arc<WorkflowContext>) -> Result<RunOutcome, PlanError
             implementer: implementer.clone(),
             iterations,
             converged: status == RunStatus::Converged,
+            friction: crate::friction_of(&ctx.store, &ctx.run_id).await,
         };
         match bookkeep_scripted(ctx, input).await {
             Ok(bk) => Some(bk),

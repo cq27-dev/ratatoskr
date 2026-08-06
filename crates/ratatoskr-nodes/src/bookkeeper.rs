@@ -17,6 +17,97 @@ use serde::{Deserialize, Serialize};
 use crate::analyst::AnalystOutput;
 use crate::implementer::ImplementerOutput;
 
+/// What a run struggled with — the part of a run that its diff does not show.
+///
+/// The diff says what the change was. This says what nobody knew when it started: the constraint
+/// that only surfaced when a test broke, the assumption in the plan that turned out wrong, the
+/// node that spent forty turns finding something. That is what a future run would pay to be told,
+/// and without it every run ends by discarding its most expensive lesson.
+///
+/// Derived entirely from checkpoints so the live path and `ratatoskr bookkeep`'s replay compose
+/// from the same source and reach the same memories.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RunFriction {
+    /// The converge diagnostic each implementer iteration past the first was given — literally
+    /// "your change broke these, fix them". Each one cost a full ACP session.
+    pub diagnostics: Vec<String>,
+    /// Nodes that failed, and why. A node that had to be retried hit something.
+    pub errors: Vec<NodeFailure>,
+    /// How much work each node's turn took. No threshold is applied: what counts as an unusual
+    /// number of turns is a judgement about this repo, so the numbers are handed over as they are.
+    pub effort: Vec<NodeEffort>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeFailure {
+    pub node: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeEffort {
+    pub node: String,
+    pub turns: u64,
+    pub seconds: u64,
+}
+
+impl RunFriction {
+    /// Read a run's path out of its checkpoints.
+    pub fn from_checkpoints(checkpoints: &[ratatoskr_store::Checkpoint]) -> Self {
+        let mut friction = RunFriction::default();
+        for cp in checkpoints {
+            // Iteration 1 was given the plan; everything after it was given a diagnostic saying
+            // what the previous attempt broke. Only the latter is friction.
+            if cp.node_name == "implementer"
+                && cp.iteration.is_some_and(|i| i > 1)
+                && let Some(input) = &cp.input_json
+            {
+                friction.diagnostics.push(unquote(input));
+            }
+            if let Some(error) = &cp.telemetry.error {
+                friction.errors.push(NodeFailure {
+                    node: cp.node_name.clone(),
+                    error: error.clone(),
+                });
+            }
+            if let (Some(turns), Some(ms)) = (cp.telemetry.turns, cp.telemetry.duration_ms) {
+                friction.effort.push(NodeEffort {
+                    node: cp.node_name.clone(),
+                    turns,
+                    seconds: ms / 1000,
+                });
+            }
+        }
+        friction
+    }
+
+    /// Whether the run's path holds anything at all. A run that changed nothing AND hit nothing
+    /// has genuinely nothing to teach; one that changed nothing after a struggle does.
+    pub fn is_empty(&self) -> bool {
+        self.diagnostics.is_empty() && self.errors.is_empty()
+    }
+}
+
+/// Why nothing was recorded, when nothing was.
+///
+/// `None` as soon as anything was written: a run that recorded one memory and declined another
+/// recorded something, and a skip reason reported alongside it reads as a failure it was not.
+fn skip_reason(recorded: usize, declined: &[String]) -> Option<String> {
+    if recorded > 0 {
+        return None;
+    }
+    Some(match declined.is_empty() {
+        true => "the bookkeeper decided nothing".to_string(),
+        false => declined.join("; "),
+    })
+}
+
+/// A checkpoint's `input_json` is serialized, so a plain string input arrives JSON-quoted. Show the
+/// model the diagnostic it was given, not a quoted rendering of it.
+fn unquote(raw: &str) -> String {
+    serde_json::from_str::<String>(raw).unwrap_or_else(|_| raw.to_string())
+}
+
 /// rag-rat tools the compose agent may use to ground the memory (and to engage the tool-composing
 /// output mode — see the OutputMode note in ratatoskr-agent).
 pub const BOOKKEEPER_TOOLS: &[&str] = &["semantic_search", "symbol_lookup", "memory_search"];
@@ -39,26 +130,90 @@ const VALID_KINDS: &[&str] = &[
     "Concept",
 ];
 
-const PREAMBLE: &str = "You are the bookkeeper. A coding run just finished (the prompt says \
-    whether it succeeded or hit a wall). Decide what, if anything, the repository's memory should \
-    now say — and act on the one that fits.\n\n\
-    FIRST search the existing memories with `memory_search` for whatever this change touched. What \
-    you find decides between three outcomes:\n\
-    - `revise` — this run made an existing memory WRONG or incomplete. Rewrite its body to state \
-      what is true NOW; do not append a status section or a changelog. This is the right answer \
-      more often than it looks, because a change that alters behaviour usually contradicts \
-      something already recorded.\n\
-    - `create` — there is a durable, non-obvious learning here that nothing already covers: an \
-      invariant, a decision and its rationale, a gotcha, a risk, or (if the run hit a wall) what \
-      that wall was and what to watch for.\n\
-    - `none` — nothing worth recording. This is a perfectly good and COMMON answer. A vague, \
-      obvious, or duplicate memory is worse than no memory at all, because every future run pays \
-      to read it. If the change was routine, or what you would write is already recorded, choose \
-      this and say why.\n\n\
-    Write in the present tense: what is true now and how to apply it, NOT a narrative of what this \
-    run did. Be specific and grounded. Choose a `kind` from rag-rat's taxonomy: Invariant, \
-    Decision, RejectedAlternative, Risk, BugPattern, TestExpectation, PerformanceNote, \
-    SecurityNote, FFIBoundary, PlatformQuirk, FollowUp, OpenQuestion, Concept.";
+/// What the bookkeeper is told to look for, and in what order.
+///
+/// The ordering is not arbitrary and should not be shortened without a reason as good as the ones
+/// that put each line here:
+///
+/// - **Rejected alternatives lead** because they are simultaneously the most-asked question about
+///   unfamiliar code and the least-supplied answer. The alternative not taken leaves no artifact
+///   anywhere — not in the diff, not in the types, not in the history. This repo had thirty-odd
+///   memories and none of that kind, while its commit messages argue about little else.
+/// - **"Could this be recovered by reading the repo?" is the gate**, stated first, because a
+///   generated record that restates the repo measurably makes agents *worse* rather than merely
+///   failing to help: it costs attention and returns nothing. Recording nothing is the correct
+///   answer for most runs, which is why `none` is described as common rather than as a fallback.
+/// - **Translate, never store the trajectory.** Retrieved raw traces score worse than having no
+///   memory at all; distilled situation-and-action rules are what carries the benefit.
+/// - **Trigger-and-action shape, with the evidence quoted.** Situated questions are not answered
+///   by general advice, and quoting what the rule was generalised from is what stops the next
+///   reader having to trust a summary of a summary.
+/// - **`revise` is preferred to `create`** because a memory that has drifted actively misleads
+///   while a missing one merely fails to help — removing wrong records is the single
+///   best-evidenced improvement to a knowledge base.
+/// - **Terseness is a staleness strategy, not a style preference**: every extra detail is another
+///   thing a later change can falsify, and inconsistent records carry a measurably higher chance
+///   of a bug in the code that trusts them.
+const PREAMBLE: &str = "You are the bookkeeper. A coding run just finished. Decide what, if \
+    anything, the repository's memory should now say, and act on it.\n\n\
+    THE TEST FOR EVERYTHING BELOW: could a competent agent recover this by reading the repo or \
+    running its tools? If yes, DO NOT RECORD IT. A memory that restates the repo is not neutral, \
+    it is a debit — it costs every future run attention and returns nothing. Records that merely \
+    summarise code measurably make agents worse; the ones that help are the ones stating what is \
+    NOT in the repo.\n\n\
+    WHAT IS WORTH RECORDING, IN ORDER:\n\
+    1. WHY THIS AND NOT THE OBVIOUS ALTERNATIVE. The single most-asked question about unfamiliar \
+       code, and the one thing that leaves no trace anywhere: the alternative not taken has no \
+       artifact. If this run rejected an approach — or discovered that the obvious approach does \
+       not work — record that as a RejectedAlternative, with the reason it fails. This is the \
+       most valuable and most consistently missing entry in any repository.\n\
+    2. AN INVARIANT THE CODE SILENTLY ASSUMES. Something that must stay true, that no type or \
+       assertion expresses, and that a plausible edit would break.\n\
+    3. WHAT BREAKS IF YOU CHANGE THIS. Blast radius the tools do not show: coupling across crates, \
+       two places that must change together with nothing connecting them, an ordering requirement.\n\
+    4. AN ENVIRONMENT, BUILD OR TOOLING FACT. The exact invocation that works, a dependency's \
+       real behaviour where it differs from its documentation, a platform quirk. Not knowing how \
+       to run something is the largest single category of agent failure — a precise command is \
+       worth more than a paragraph of advice.\n\
+    5. A FOOTGUN WITH ITS SYMPTOM. A trap, described so the reader recognises it BEFORE they know \
+       the cause: what it looks like when you hit it, and the wrong diagnosis to rule out.\n\n\
+    WHERE TO FIND IT: the FRICTION section is the best evidence you have. It is what the run \
+    actually collided with, and a collision is a fact — where 'the run succeeded' is a weaker \
+    claim than it appears, since a change can pass a test suite that never checked the thing that \
+    matters. But do not mine friction alone: what the run got RIGHT on purpose is where the \
+    rationale in (1) lives.\n\n\
+    TRANSLATE FRICTION INTO A RULE ABOUT THE CODE. Never record the trajectory itself — a stored \
+    narrative of what a run did is worse than storing nothing. 'The implementer needed three \
+    iterations' is unactionable and stale on arrival. The durable fact is underneath it: a \
+    diagnostic that kept naming a migration test becomes 'adding a column needs an entry in both \
+    schema.sql and ADDED_COLUMNS; neither alone migrates an existing store'. If you cannot make \
+    that translation for a piece of friction, record nothing for it.\n\n\
+    SHAPE OF A GOOD ENTRY:\n\
+    - A trigger and an action: 'When <situation>, do <specific thing>' — not 'be careful with X'. \
+      General advice answers no question anyone asked.\n\
+    - Quote the concrete evidence you are generalising from (the diagnostic, the error text), so \
+      the next reader can judge it rather than trust you. Do not embellish what you were given.\n\
+    - Name the check that would catch a violation, if there is one — a test, a lint, a grep.\n\
+    - As short as it can be and stay true. Every extra detail is another thing that goes stale, \
+      and a memory that has gone stale is worse than one that never existed.\n\n\
+    FIRST search existing memories with `memory_search` for whatever this run touched, then use \
+    `symbol_lookup` / `semantic_search` to check what you are about to write against current \
+    code. What you find decides each entry's action:\n\
+    - `revise` — this run made an existing memory WRONG or incomplete. Rewrite the body to state \
+      what is true NOW; never append a status section or a changelog. Prefer this to `create`: \
+      correcting a memory that has drifted is worth more than adding a new one beside it, because \
+      a wrong memory actively misleads while a missing one merely fails to help.\n\
+    - `create` — a durable learning nothing already covers, matching one of the five above.\n\
+    - `none` — nothing worth recording. This is a good and COMMON answer, and the right one for \
+      most routine runs. A vague, obvious, or duplicate entry is worse than none.\n\n\
+    Return one entry per distinct thing learned — a run that hit three separate footguns should \
+    produce three, a routine run a single `none`. Blurring two lessons into one makes both \
+    unfindable. Set `anchor` to the file the lesson is ABOUT: where a record is stored decides \
+    whether it is ever read, and the constraint that bit is frequently in code the diff left \
+    alone. Write in the present tense — what is true now and what to do about it. Choose a `kind` \
+    from rag-rat's taxonomy: Invariant, Decision, RejectedAlternative, Risk, BugPattern, \
+    TestExpectation, PerformanceNote, SecurityNote, FFIBoundary, PlatformQuirk, FollowUp, \
+    OpenQuestion, Concept.";
 
 /// What the bookkeeper decided the repository's memory should say.
 ///
@@ -82,6 +237,22 @@ pub struct MemoryDecision {
     pub title: String,
     #[serde(default)]
     pub body: String,
+    /// The file this lesson is about. Often not a file the diff touched: the constraint that bit
+    /// is frequently in the code that was left alone. Falls back to the first touched file.
+    #[serde(default)]
+    pub anchor: Option<String>,
+}
+
+/// What the bookkeeper decided, in full.
+///
+/// A list because one run can teach more than one thing, and a single-decision shape forces it to
+/// pick — which is how a run that hit three separate footguns records one of them. Wrapped in a
+/// struct rather than returned as a bare array: the schema gate and the output tool both take an
+/// object, and a named field is what the model fills most reliably.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryDecisions {
+    #[serde(default)]
+    pub decisions: Vec<MemoryDecision>,
 }
 
 /// One memory rag-rat wrote back (id/anchor/kind strict — they're rag-rat's response).
@@ -119,6 +290,10 @@ pub struct BookkeeperInput {
     /// Whether the run converged. `false` means it exhausted its iteration budget with unresolved
     /// failures — the memory is framed as a wall hit and tagged `unresolved`.
     pub converged: bool,
+    /// What the run struggled with. The diff says what changed; this says what nobody knew, and
+    /// it is usually where the memory worth writing comes from.
+    #[serde(default)]
+    pub friction: RunFriction,
 }
 
 impl BookkeeperInput {
@@ -155,14 +330,16 @@ pub struct BookkeeperNode {
 
 impl BookkeeperNode {
     pub async fn run(&self, input: BookkeeperInput) -> Result<BookkeeperOutput, NodeError> {
-        // A run that changed nothing has nothing to teach. Exact, and it costs no model call —
-        // this is the case that used to store a memory saying there was nothing to store.
+        // A run that changed nothing AND hit nothing has nothing to teach. The friction check is
+        // what keeps this from throwing away the interesting case: a run that fought its way to an
+        // empty diff learned something expensive about why the change was not needed.
         if input.converged
             && input.implementer.touched_files.is_empty()
             && input.implementer.diff_summary.trim().is_empty()
+            && input.friction.is_empty()
         {
-            tracing::info!("nothing was changed; recording no memory");
-            return Ok(input.nothing_recorded("the run changed nothing"));
+            tracing::info!("nothing was changed and nothing went wrong; recording no memory");
+            return Ok(input.nothing_recorded("the run changed nothing and hit nothing"));
         }
 
         let prompt = render_prompt(&input);
@@ -176,7 +353,7 @@ impl BookkeeperNode {
             ),
             question: &prompt,
             tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(MemoryDecision),
+            output_schema: schemars::schema_for!(MemoryDecisions),
             policy: self.policy.clone(),
             max_turns: self.max_turns,
             clarifier: self.clarifier.clone(),
@@ -188,96 +365,122 @@ impl BookkeeperNode {
         .await
         .map_err(|e| NodeError::Failed(format!("bookkeeper compose failed: {e}")))?;
 
-        let decision = parse_validated::<MemoryDecision>(&raw)?;
-        self.act_on(decision, &input).await
+        let decided = parse_validated::<MemoryDecisions>(&raw)?;
+        self.act_on(decided.decisions, &input).await
     }
 
-    /// Carry out what the model decided. The model chooses; this performs the write, so the
+    /// Carry out what the model decided. The model chooses; this performs the writes, so the
     /// memory layer only ever changes through a call this code made deliberately.
+    ///
+    /// Each entry is independent: one that names no memory to revise, or composes an empty body,
+    /// is dropped without taking the others with it. A run that learned three things and botched
+    /// the wording of one should still record the other two.
     async fn act_on(
         &self,
-        decision: MemoryDecision,
+        decisions: Vec<MemoryDecision>,
         input: &BookkeeperInput,
     ) -> Result<BookkeeperOutput, NodeError> {
-        match decision.action.trim().to_ascii_lowercase().as_str() {
-            "revise" => {
-                // A revision without a target is a create that lost its id; treat the ambiguity as
-                // "record nothing" rather than guessing which memory to overwrite.
-                let (Some(id), false) = (
-                    decision.memory_id.as_deref().filter(|id| !id.is_empty()),
-                    decision.body.trim().is_empty(),
-                ) else {
-                    tracing::warn!("bookkeeper asked to revise without a memory id or body");
-                    return Ok(input.nothing_recorded("the revision named no memory to rewrite"));
-                };
-                let title = (!decision.title.trim().is_empty()).then(|| decision.title.clone());
-                self.update_memory(id, title.as_deref(), &decision.body)
-                    .await?;
-                tracing::info!(memory_id = id, "revised a memory this run made wrong");
+        let mut written = Vec::new();
+        let mut revised = Vec::new();
+        let mut declined = Vec::new();
 
-                Ok(BookkeeperOutput {
-                    memories_written: Vec::new(),
-                    memories_revised: vec![MemoryWritten {
-                        kind: normalize_kind(&decision.kind),
-                        anchor: String::new(),
-                        memory_id: id.to_string(),
-                        summary: title.or(Some(decision.reason)),
-                    }],
-                    skipped: None,
-                    iterations: input.iterations,
-                    residual_risk_accepted: false,
-                })
-            }
-            "create" => {
-                if decision.title.trim().is_empty() || decision.body.trim().is_empty() {
-                    tracing::warn!("bookkeeper produced an empty memory; recording nothing");
-                    return Ok(input.nothing_recorded("the composed memory was empty"));
-                }
-                let kind = normalize_kind(&decision.kind);
-                let anchor = input.implementer.touched_files.first().cloned();
-                // Tag unresolved (max-iterations) runs so they're distinguishable from success
-                // write-backs.
-                let tags: &[&str] = if input.converged {
-                    &["ratatoskr", "bookkeeper"]
-                } else {
-                    &["ratatoskr", "bookkeeper", "unresolved"]
-                };
-
-                let memory_id = self
-                    .create_memory(
-                        &kind,
-                        &decision.title,
-                        &decision.body,
-                        anchor.as_deref(),
-                        tags,
-                    )
-                    .await?;
-
-                Ok(BookkeeperOutput {
-                    memories_written: vec![MemoryWritten {
-                        kind,
-                        anchor: anchor.unwrap_or_default(),
-                        memory_id,
-                        summary: Some(decision.title),
-                    }],
-                    memories_revised: Vec::new(),
-                    skipped: None,
-                    iterations: input.iterations,
-                    residual_risk_accepted: false,
-                })
-            }
-            // Including anything unrecognised: the safe reading of a decision we can't parse is
-            // that nothing should be written.
-            other => {
-                let reason = if decision.reason.trim().is_empty() {
-                    format!("nothing recorded ({other})")
-                } else {
-                    decision.reason.clone()
-                };
-                tracing::info!(reason = %reason, "recording no memory");
-                Ok(input.nothing_recorded(&reason))
+        for decision in decisions {
+            match decision.action.trim().to_ascii_lowercase().as_str() {
+                "revise" => match self.revise(&decision).await? {
+                    Some(entry) => revised.push(entry),
+                    None => declined.push("a revision named no memory to rewrite".to_string()),
+                },
+                "create" => match self.create(&decision, input).await? {
+                    Some(entry) => written.push(entry),
+                    None => declined.push("a composed memory was empty".to_string()),
+                },
+                // Including anything unrecognised: the safe reading of a decision we can't parse
+                // is that nothing should be written.
+                other => declined.push(match decision.reason.trim() {
+                    "" => format!("nothing recorded ({other})"),
+                    reason => reason.to_string(),
+                }),
             }
         }
+
+        let skipped = skip_reason(written.len() + revised.len(), &declined);
+        if let Some(reason) = &skipped {
+            tracing::info!(reason = %reason, "recording no memory");
+        }
+        Ok(BookkeeperOutput {
+            memories_written: written,
+            memories_revised: revised,
+            skipped,
+            iterations: input.iterations,
+            residual_risk_accepted: false,
+        })
+    }
+
+    /// Rewrite a memory this run made wrong. `None` when the decision named no target or no body:
+    /// a revision without an id is a create that lost its id, and guessing which memory to
+    /// overwrite is worse than recording nothing.
+    async fn revise(&self, decision: &MemoryDecision) -> Result<Option<MemoryWritten>, NodeError> {
+        let (Some(id), false) = (
+            decision.memory_id.as_deref().filter(|id| !id.is_empty()),
+            decision.body.trim().is_empty(),
+        ) else {
+            tracing::warn!("bookkeeper asked to revise without a memory id or body");
+            return Ok(None);
+        };
+        let title = (!decision.title.trim().is_empty()).then(|| decision.title.clone());
+        self.update_memory(id, title.as_deref(), &decision.body)
+            .await?;
+        tracing::info!(memory_id = id, "revised a memory this run made wrong");
+        Ok(Some(MemoryWritten {
+            kind: normalize_kind(&decision.kind),
+            anchor: String::new(),
+            memory_id: id.to_string(),
+            summary: title.or_else(|| Some(decision.reason.clone())),
+        }))
+    }
+
+    /// Write a new memory. `None` when the model composed an empty one.
+    async fn create(
+        &self,
+        decision: &MemoryDecision,
+        input: &BookkeeperInput,
+    ) -> Result<Option<MemoryWritten>, NodeError> {
+        if decision.title.trim().is_empty() || decision.body.trim().is_empty() {
+            tracing::warn!("bookkeeper produced an empty memory; recording nothing");
+            return Ok(None);
+        }
+        let kind = normalize_kind(&decision.kind);
+        // The lesson's own file first: what a run learned is often about code it did not change,
+        // and anchoring that to the diff would file it where nobody looking for it would look.
+        let anchor = decision
+            .anchor
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string)
+            .or_else(|| input.implementer.touched_files.first().cloned());
+        // Tag unresolved (max-iterations) runs so they're distinguishable from success write-backs.
+        let tags: &[&str] = if input.converged {
+            &["ratatoskr", "bookkeeper"]
+        } else {
+            &["ratatoskr", "bookkeeper", "unresolved"]
+        };
+
+        let memory_id = self
+            .create_memory(
+                &kind,
+                &decision.title,
+                &decision.body,
+                anchor.as_deref(),
+                tags,
+            )
+            .await?;
+        Ok(Some(MemoryWritten {
+            kind,
+            anchor: anchor.unwrap_or_default(),
+            memory_id,
+            summary: Some(decision.title.clone()),
+        }))
     }
 
     /// Rewrite an existing memory through rag-rat's `memory_update`.
@@ -431,6 +634,40 @@ fn render_prompt(input: &BookkeeperInput) -> String {
     if !im.touched_files.is_empty() {
         let _ = writeln!(s, "TOUCHED FILES: {}", im.touched_files.join(", "));
     }
+
+    // Last, and deliberately: it is the section the preamble tells the model to reason from, and
+    // what a model reads last is what it reasons from first.
+    let f = &input.friction;
+    if !f.diagnostics.is_empty() || !f.errors.is_empty() || !f.effort.is_empty() {
+        s.push_str("\nFRICTION — what this run struggled with:\n");
+    }
+    if !f.diagnostics.is_empty() {
+        let _ = writeln!(
+            s,
+            "\nEach of these was handed to a fresh implementer session after the previous attempt \
+             broke something. Whatever a diagnostic keeps pointing at is a constraint nobody had \
+             written down:"
+        );
+        for (i, d) in f.diagnostics.iter().enumerate() {
+            let _ = writeln!(s, "- attempt {}: {}", i + 2, d);
+        }
+    }
+    if !f.errors.is_empty() {
+        s.push_str("\nNodes that failed:\n");
+        for e in &f.errors {
+            let _ = writeln!(s, "- {}: {}", e.node, e.error);
+        }
+    }
+    if !f.effort.is_empty() {
+        s.push_str(
+            "\nWhat each node's turn took. A node that spent many turns was hunting for \
+                    something — that is a fact about how hard this repo is to navigate, not about \
+                    the node:\n",
+        );
+        for e in &f.effort {
+            let _ = writeln!(s, "- {}: {} turns, {}s", e.node, e.turns, e.seconds);
+        }
+    }
     s
 }
 
@@ -504,6 +741,7 @@ mod tests {
             },
             iterations: 1,
             converged,
+            friction: RunFriction::default(),
         }
     }
 
@@ -527,5 +765,104 @@ mod tests {
                 && walled.implementer.diff_summary.trim().is_empty()),
             "the skip must not swallow a run that failed to get started"
         );
+    }
+
+    fn checkpoint(
+        node: &str,
+        iteration: Option<u32>,
+        input: Option<&str>,
+    ) -> ratatoskr_store::Checkpoint {
+        ratatoskr_store::Checkpoint {
+            node_name: node.into(),
+            iteration,
+            input_json: input.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn friction_is_the_diagnostics_a_rerun_was_given_not_the_original_plan() {
+        let cps = [
+            checkpoint(
+                "implementer",
+                Some(1),
+                Some(r#"{"requirements":["do the thing"]}"#),
+            ),
+            checkpoint(
+                "implementer",
+                Some(2),
+                Some(r#""You broke store::migrate. Fix it.""#),
+            ),
+            checkpoint(
+                "implementer",
+                Some(3),
+                Some(r#""You broke store::migrate again.""#),
+            ),
+        ];
+        let f = RunFriction::from_checkpoints(&cps);
+
+        // Iteration 1 was handed the plan; only what came after it is friction.
+        assert_eq!(f.diagnostics.len(), 2);
+        // Unquoted, so the model reads the diagnostic rather than a JSON rendering of it.
+        assert_eq!(f.diagnostics[0], "You broke store::migrate. Fix it.");
+        assert!(!f.is_empty());
+    }
+
+    #[test]
+    fn a_clean_run_has_no_friction_but_a_failed_node_does() {
+        let clean = [checkpoint("implementer", Some(1), Some(r#"{"plan":1}"#))];
+        assert!(RunFriction::from_checkpoints(&clean).is_empty());
+
+        let mut failed = checkpoint("analyst", None, None);
+        failed.telemetry.error = Some("output failed schema validation".into());
+        failed.telemetry.turns = Some(41);
+        failed.telemetry.duration_ms = Some(90_000);
+        let f = RunFriction::from_checkpoints(&[failed]);
+
+        assert!(!f.is_empty(), "a node that failed is something the run hit");
+        assert_eq!(f.errors[0].node, "analyst");
+        assert_eq!(f.effort[0].turns, 41);
+        assert_eq!(f.effort[0].seconds, 90);
+    }
+
+    #[test]
+    fn effort_alone_is_not_friction() {
+        // Every node reports turns and duration. If those counted, no run would ever be quiet and
+        // the "nothing happened" short-circuit would never fire.
+        let mut cp = checkpoint("scout", None, None);
+        cp.telemetry.turns = Some(4);
+        cp.telemetry.duration_ms = Some(1_000);
+        let f = RunFriction::from_checkpoints(&[cp]);
+        assert!(!f.effort.is_empty());
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn a_skip_reason_is_only_reported_when_nothing_was_recorded() {
+        let declined = vec!["a composed memory was empty".to_string()];
+        assert_eq!(
+            skip_reason(0, &declined).as_deref(),
+            Some("a composed memory was empty")
+        );
+        assert_eq!(
+            skip_reason(1, &declined),
+            None,
+            "one memory written and one declined is a run that recorded something"
+        );
+        // Nothing decided at all still owes an explanation: an empty result with no reason is
+        // indistinguishable from a failure.
+        assert!(skip_reason(0, &[]).is_some());
+    }
+
+    #[test]
+    fn the_prompt_shows_the_model_what_the_run_struggled_with() {
+        let mut input = input(true, &["a.rs"], "diff");
+        input.friction.diagnostics = vec!["You broke store::migrate.".into()];
+        let prompt = render_prompt(&input);
+        assert!(prompt.contains("FRICTION"));
+        assert!(prompt.contains("You broke store::migrate."));
+        // Numbered from 2: the first attempt was given the plan, so the first diagnostic belongs
+        // to the second attempt.
+        assert!(prompt.contains("attempt 2"));
     }
 }
