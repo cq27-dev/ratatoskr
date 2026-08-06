@@ -42,6 +42,25 @@ globalThis.__wrap = function (name) {
         return r.value;
     };
 };
+globalThis.__workflow = null;
+globalThis.defineWorkflow = function (meta) {
+    if (!meta || typeof meta.name !== "string" || meta.name === "") {
+        throw new Error("defineWorkflow: `name` is required");
+    }
+    for (var k in meta) {
+        if (k !== "name" && k !== "purpose" && k !== "whenToUse") {
+            throw new Error("defineWorkflow: unknown key '" + k + "'");
+        }
+    }
+    globalThis.__workflow = {
+        name: meta.name,
+        purpose: meta.purpose || "",
+        whenToUse: meta.whenToUse || []
+    };
+};
+globalThis.__workflowMeta = function () {
+    return JSON.stringify(globalThis.__workflow);
+};
 globalThis.__runEntry = async function (entry, inputJson) {
     var fn = globalThis[entry];
     if (typeof fn !== "function") {
@@ -52,11 +71,27 @@ globalThis.__runEntry = async function (entry, inputJson) {
 };
 "#;
 
+/// What a workflow says about itself, so something can choose between workflows without running
+/// one to find out whether it fits.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowMeta {
+    /// How it is named on the command line and in a checkpoint.
+    pub name: String,
+    /// What it does, in a sentence.
+    #[serde(default)]
+    pub purpose: String,
+    /// What a task looks like when this is the right workflow for it. Read by whatever selects;
+    /// concrete cases beat an abstract description, because selection is a matching problem.
+    #[serde(default, rename = "whenToUse")]
+    pub when_to_use: Vec<String>,
+}
+
 /// A loaded workflow script: the resident JS context plus the transpiled source.
 pub struct WorkflowRuntime {
     _runtime: AsyncRuntime,
     context: AsyncContext,
     source: String,
+    meta: WorkflowMeta,
 }
 
 impl WorkflowRuntime {
@@ -76,11 +111,94 @@ impl WorkflowRuntime {
             .await
             .map_err(|e| ScriptError::Eval(e.to_string()))?;
 
+        // Evaluated once here to read what the script declares about itself. `run` evaluates it
+        // again in the same context, which re-runs `defineWorkflow` — an idempotent assignment, and
+        // the price of keeping the two paths independent.
+        let declared = Self::declared(&context, &source).await?;
+        let meta = declared.unwrap_or_else(|| WorkflowMeta {
+            // A script that declares nothing is still usable and is named after its file. This is
+            // what keeps a repo's existing `workflow.ts` working with no edit.
+            name: path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "workflow".to_string()),
+            purpose: String::new(),
+            when_to_use: Vec::new(),
+        });
+
         Ok(Some(WorkflowRuntime {
             _runtime: runtime,
             context,
             source,
+            meta,
         }))
+    }
+
+    /// What this workflow says about itself.
+    pub fn meta(&self) -> &WorkflowMeta {
+        &self.meta
+    }
+
+    /// Read the script's `defineWorkflow` call, if it makes one.
+    async fn declared(
+        context: &AsyncContext,
+        source: &str,
+    ) -> Result<Option<WorkflowMeta>, ScriptError> {
+        let program = format!("{BOOTSTRAP}\n{source}");
+        context
+            .async_with(async move |ctx| {
+                ctx.eval::<(), _>(program)
+                    .catch(&ctx)
+                    .map_err(|e| ScriptError::Eval(format!("{e}")))?;
+                let get: Function = ctx
+                    .globals()
+                    .get("__workflowMeta")
+                    .catch(&ctx)
+                    .map_err(|e| ScriptError::Eval(format!("{e}")))?;
+                let raw: String = get
+                    .call(())
+                    .catch(&ctx)
+                    .map_err(|e| ScriptError::Eval(format!("{e}")))?;
+                serde_json::from_str(&raw).map_err(|e| ScriptError::Eval(e.to_string()))
+            })
+            .await
+    }
+
+    /// Every workflow in `dir`, by name.
+    ///
+    /// A directory rather than one file because a task is not one shape: research, a review, a
+    /// mechanical migration and a bug fix are different jobs, and bending each into a single graph
+    /// is what produced the flag that skips half of it.
+    ///
+    /// Sorted by name, and a duplicate name is refused rather than resolved — two workflows
+    /// answering to one name means whichever the filesystem listed first wins, silently.
+    pub async fn discover(dir: &Path) -> Result<Vec<Self>, ScriptError> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Ok(Vec::new());
+        };
+        let mut paths: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "ts"))
+            .collect();
+        paths.sort();
+
+        let mut found: Vec<Self> = Vec::new();
+        for path in paths {
+            let Some(workflow) = Self::load(&path).await? else {
+                continue;
+            };
+            if let Some(clash) = found.iter().find(|w| w.meta.name == workflow.meta.name) {
+                return Err(ScriptError::Eval(format!(
+                    "two workflows are both named `{}`: {} and {}",
+                    workflow.meta.name,
+                    clash.meta.name,
+                    path.display()
+                )));
+            }
+            found.push(workflow);
+        }
+        Ok(found)
     }
 
     /// Register `hosts` and invoke the script's `entry` function with `input_json` (a JSON string),
@@ -254,5 +372,114 @@ mod tests {
     async fn missing_file_is_none() {
         let path = std::env::temp_dir().join("ratatoskr-workflow-absent/workflow.ts");
         assert!(WorkflowRuntime::load(&path).await.unwrap().is_none());
+    }
+
+    fn scratch(case: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ratatoskr-wf-{}-{case}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_workflow_declares_what_it_is_for() {
+        let dir = scratch("declared");
+        std::fs::write(
+            dir.join("research.ts"),
+            r#"defineWorkflow({
+                 name: "research",
+                 purpose: "Answer a question about the repository without changing it.",
+                 whenToUse: ["the task asks what or why", "no code change is expected"],
+               });
+               async function plan(issue) { return issue; }"#,
+        )
+        .unwrap();
+
+        let found = WorkflowRuntime::discover(&dir).await.unwrap();
+        assert_eq!(found.len(), 1);
+        let meta = found[0].meta();
+        assert_eq!(meta.name, "research");
+        assert!(meta.purpose.starts_with("Answer a question"));
+        // Selection is a matching problem, so the concrete cases are the part that carries.
+        assert_eq!(meta.when_to_use.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_script_that_declares_nothing_is_named_after_its_file() {
+        // What keeps a repo's existing `workflow.ts` working with no edit.
+        let dir = scratch("undeclared");
+        std::fs::write(
+            dir.join("legacy.ts"),
+            "async function plan(i) { return i; }",
+        )
+        .unwrap();
+        let found = WorkflowRuntime::discover(&dir).await.unwrap();
+        assert_eq!(found[0].meta().name, "legacy");
+        assert!(found[0].meta().purpose.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn two_workflows_with_one_name_is_refused() {
+        // Otherwise whichever the filesystem listed first wins, silently, and `--workflow` picks a
+        // shape nobody chose.
+        let dir = scratch("clash");
+        for file in ["a.ts", "b.ts"] {
+            std::fs::write(
+                dir.join(file),
+                r#"defineWorkflow({ name: "same" }); async function plan(i) { return i; }"#,
+            )
+            .unwrap();
+        }
+        let err = match WorkflowRuntime::discover(&dir).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("this must be refused"),
+        };
+        assert!(err.contains("both named `same`"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_misspelled_declaration_key_is_refused() {
+        // Same reason the config structs refuse unknown fields: a typo that silently declared
+        // nothing would leave the workflow unselectable with no indication why.
+        let dir = scratch("typo");
+        std::fs::write(
+            dir.join("w.ts"),
+            r#"defineWorkflow({ name: "w", whenToUser: ["x"] });"#,
+        )
+        .unwrap();
+        let err = match WorkflowRuntime::discover(&dir).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("this must be refused"),
+        };
+        assert!(err.contains("whenToUser"), "{err}");
+
+        // And a declaration with no name at all.
+        std::fs::write(dir.join("w.ts"), r#"defineWorkflow({ purpose: "x" });"#).unwrap();
+        assert!(WorkflowRuntime::discover(&dir).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn discovery_is_ordered_and_an_absent_directory_is_ordinary() {
+        let dir = scratch("order");
+        for (file, name) in [("z.ts", "zeta"), ("a.ts", "alpha")] {
+            std::fs::write(
+                dir.join(file),
+                format!(r#"defineWorkflow({{ name: "{name}" }});"#),
+            )
+            .unwrap();
+        }
+        let found = WorkflowRuntime::discover(&dir).await.unwrap();
+        // By path, so two checkouts of the same files agree regardless of `read_dir` order.
+        assert_eq!(found[0].meta().name, "alpha");
+        assert_eq!(found[1].meta().name, "zeta");
+
+        // A repo that defines no workflows is the common case, not an error.
+        let missing = WorkflowRuntime::discover(&dir.join("nope")).await.unwrap();
+        assert!(missing.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

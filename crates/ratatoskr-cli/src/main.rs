@@ -42,6 +42,9 @@ enum Command {
     Plan {
         /// The issue description (omit and use --file for long text).
         description: Option<String>,
+        /// Which workflow to run, when this repo defines more than one.
+        #[arg(long)]
+        workflow: Option<String>,
         /// Read the issue description from a file instead of the argument.
         #[arg(long)]
         file: Option<PathBuf>,
@@ -54,6 +57,10 @@ enum Command {
     },
     /// Full run: plan, then fork red-team ∥ implementer in a worktree, then converge.
     Run {
+        /// Which workflow to run, when this repo defines more than one. Omitted, a repo with one
+        /// workflow uses it and a repo with several is asked to name one rather than guessed at.
+        #[arg(long)]
+        workflow: Option<String>,
         /// The issue description (omit and use --file for long text).
         description: Option<String>,
         /// Read the issue description from a file instead of the argument.
@@ -132,17 +139,19 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Ask { question, config }) => ask(&question, &config).await,
         Some(Command::Plan {
             description,
+            workflow,
             file,
             config,
             json,
-        }) => plan(description, file, &config, json).await,
+        }) => plan(description, file, &config, json, workflow).await,
         Some(Command::Run {
+            workflow,
             description,
             file,
             config,
             json,
             run_id,
-        }) => run_cmd(description, file, &config, json, run_id).await,
+        }) => run_cmd(description, file, &config, json, run_id, workflow).await,
         Some(Command::Bookkeep { run_id, config }) => bookkeep(&run_id, &config).await,
         Some(Command::Status { run_id, config }) => status(&run_id, &config).await,
         Some(Command::Serve {
@@ -308,6 +317,7 @@ async fn plan(
     file: Option<PathBuf>,
     config_path: &Path,
     json: bool,
+    workflow: Option<String>,
 ) -> anyhow::Result<()> {
     let issue = read_issue(description, file)?;
 
@@ -320,9 +330,17 @@ async fn plan(
 
     let engine = load_rules().await?;
     let run_id = uuid::Uuid::new_v4().to_string();
-    let result = ratatoskr_nodes::run_plan(&client, &config, &store, &run_id, &issue, &engine)
-        .instrument(tracing::info_span!("run", run_id = %run_id))
-        .await;
+    let result = ratatoskr_nodes::run_plan(ratatoskr_nodes::RunRequest {
+        client: &client,
+        config: &config,
+        store: &store,
+        run_id: &run_id,
+        issue: &issue,
+        engine: &engine,
+        workflow: workflow.as_deref(),
+    })
+    .instrument(tracing::info_span!("run", run_id = %run_id))
+    .await;
 
     // Tear down rag-rat regardless of outcome.
     if let Err(e) = client.shutdown().await {
@@ -388,6 +406,7 @@ async fn run_cmd(
     config_path: &Path,
     json: bool,
     run_id: Option<String>,
+    workflow: Option<String>,
 ) -> anyhow::Result<()> {
     let issue = read_issue(description, file)?;
 
@@ -408,9 +427,17 @@ async fn run_cmd(
         Some(id) => id,
         None => uuid::Uuid::new_v4().to_string(),
     };
-    let result = ratatoskr_nodes::run_full(&client, &config, &store, &run_id, &issue, &engine)
-        .instrument(tracing::info_span!("run", run_id = %run_id))
-        .await;
+    let result = ratatoskr_nodes::run_full(ratatoskr_nodes::RunRequest {
+        client: &client,
+        config: &config,
+        store: &store,
+        run_id: &run_id,
+        issue: &issue,
+        engine: &engine,
+        workflow: workflow.as_deref(),
+    })
+    .instrument(tracing::info_span!("run", run_id = %run_id))
+    .await;
 
     if let Err(e) = client.shutdown().await {
         tracing::warn!("failed to shut down rag-rat cleanly: {e}");

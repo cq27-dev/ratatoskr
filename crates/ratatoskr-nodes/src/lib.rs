@@ -78,16 +78,18 @@ impl PlanError {
 
 /// Run scout → memory → analyst in sequence, checkpointing after each, and record the run's final
 /// status. On any node failure the run is marked `Failed` and the error names the node.
-pub async fn run_plan(
-    client: &RagRatClient,
-    config: &RatatoskrConfig,
-    store: &Store,
-    run_id: &str,
-    issue: &str,
-    engine: &Arc<ScriptEngine>,
-) -> Result<PlanOutcome, PlanError> {
-    // A `.ratatoskr/workflow.ts` overrides the built-in scout → memory → analyst sequencing.
-    if let Some(runtime) = load_workflow().await? {
+pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError> {
+    let RunRequest {
+        client,
+        config,
+        store,
+        run_id,
+        issue,
+        engine,
+        workflow,
+    } = request;
+    // A workflow, when this repo defines one, overrides the built-in sequencing.
+    if let Some(runtime) = select(workflows().await?, workflow)? {
         let plugin_context =
             PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
                 .await?;
@@ -389,8 +391,7 @@ async fn record_provenance(store: &Store, run_id: &str, config: &RatatoskrConfig
     }
 }
 
-/// A fingerprint of the orchestration that ran: `.ratatoskr/workflow.ts` plus every ruleset, in a
-/// fixed order.
+/// A fingerprint of the orchestration that ran: every workflow and every ruleset, in a fixed order.
 ///
 /// Deliberately not a cryptographic digest and deliberately not `DefaultHasher`. Nothing here
 /// defends against a forged match — it answers "did the graph change between these two runs", and
@@ -398,19 +399,25 @@ async fn record_provenance(store: &Store, run_id: &str, config: &RatatoskrConfig
 /// neither, so a stored value would silently stop matching on a toolchain bump; FNV-1a is fixed
 /// because it is written here.
 fn graph_fingerprint(repo: &std::path::Path) -> String {
-    let mut sources: Vec<PathBuf> = std::fs::read_dir(repo.join(".ratatoskr/rules"))
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "ts"))
-                .collect()
-        })
-        .unwrap_or_default();
+    let scripts_in = |dir: PathBuf| -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "ts"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut sources = scripts_in(repo.join(".ratatoskr/rules"));
+    // Every workflow, not just the one this run used: which workflows exist is part of what the
+    // graph *is* now, and two runs cannot be compared across a registry that changed under them.
+    sources.extend(scripts_in(repo.join(WORKFLOW_DIR)));
     // Sorted, because `read_dir` order is the filesystem's business and a fingerprint that depends
     // on it would differ between two checkouts of identical files.
     sources.sort();
-    sources.insert(0, repo.join(".ratatoskr/workflow.ts"));
+    sources.insert(0, repo.join(LEGACY_WORKFLOW));
 
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for path in sources {
@@ -449,11 +456,97 @@ async fn checkpoint<T: Serialize>(
     .await
 }
 
-/// Load `.ratatoskr/workflow.ts` if present — the optional scriptable-orchestration override.
-async fn load_workflow() -> Result<Option<WorkflowRuntime>, PlanError> {
-    WorkflowRuntime::load(std::path::Path::new(".ratatoskr/workflow.ts"))
+/// Where a repo keeps the workflows it defines.
+pub const WORKFLOW_DIR: &str = ".ratatoskr/workflows";
+
+/// The single-script path, still honoured so a repo that has one keeps working untouched.
+const LEGACY_WORKFLOW: &str = ".ratatoskr/workflow.ts";
+
+/// Every workflow this repo defines, in name order.
+///
+/// `.ratatoskr/workflows/*.ts` first, then a bare `.ratatoskr/workflow.ts` if one is there. Both,
+/// rather than one superseding the other: a repo that has the old file gets it as an ordinary
+/// entry in the registry rather than a migration to perform before anything runs.
+pub async fn workflows() -> Result<Vec<WorkflowRuntime>, PlanError> {
+    let fail = |e: ratatoskr_script::ScriptError| {
+        PlanError::node("workflow", NodeError::Failed(e.to_string()))
+    };
+    let mut found = WorkflowRuntime::discover(std::path::Path::new(WORKFLOW_DIR))
         .await
-        .map_err(|e| PlanError::node("workflow", NodeError::Failed(e.to_string())))
+        .map_err(fail)?;
+    if let Some(legacy) = WorkflowRuntime::load(std::path::Path::new(LEGACY_WORKFLOW))
+        .await
+        .map_err(fail)?
+    {
+        // Only when the directory has not already claimed that name, so a repo mid-move does not
+        // get a duplicate-name error for a file it has already copied across.
+        if !found.iter().any(|w| w.meta().name == legacy.meta().name) {
+            found.push(legacy);
+        }
+    }
+    Ok(found)
+}
+
+/// Pick the workflow a run should use.
+///
+/// `wanted` names one explicitly and fails if it is not there — a run asked for a specific shape
+/// must not quietly get a different one. With nothing named, a lone workflow is used and anything
+/// else declines to guess: choosing between several is the overseer's job, and picking the
+/// alphabetically-first one would look like a decision while being an accident.
+pub fn select(
+    found: Vec<WorkflowRuntime>,
+    wanted: Option<&str>,
+) -> Result<Option<WorkflowRuntime>, PlanError> {
+    let names = || {
+        found
+            .iter()
+            .map(|w| w.meta().name.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match wanted {
+        Some(name) => {
+            let listed = names();
+            found
+                .into_iter()
+                .find(|w| w.meta().name == name)
+                .map(Some)
+                .ok_or_else(|| {
+                    PlanError::node(
+                        "workflow",
+                        NodeError::Failed(match listed.is_empty() {
+                            true => format!("no workflow named `{name}`; this repo defines none"),
+                            false => format!("no workflow named `{name}`; available: {listed}"),
+                        }),
+                    )
+                })
+        }
+        None if found.len() > 1 => Err(PlanError::node(
+            "workflow",
+            NodeError::Failed(format!(
+                "this repo defines several workflows ({}); name one with --workflow",
+                names()
+            )),
+        )),
+        None => Ok(found.into_iter().next()),
+    }
+}
+
+/// What one run needs to start.
+///
+/// A struct rather than a seventh positional argument: these travel together through both entry
+/// points, and every one of them is a borrow of something the caller already holds, so a positional
+/// list grows with the run rather than with the job.
+pub struct RunRequest<'a> {
+    pub client: &'a RagRatClient,
+    pub config: &'a RatatoskrConfig,
+    pub store: &'a Store,
+    pub run_id: &'a str,
+    pub issue: &'a str,
+    pub engine: &'a Arc<ScriptEngine>,
+    /// Which workflow to run, when the caller knows. `None` uses the repo's only one, or the
+    /// built-in flow when it defines none — and refuses to guess when it defines several.
+    pub workflow: Option<&'a str>,
 }
 
 fn route(config: &RatatoskrConfig, name: &str) -> Result<ratatoskr_core::ModelRoute, PlanError> {
@@ -1052,16 +1145,18 @@ async fn no_code_change(
 
 /// The full Phase 3 run: plan (scout → memory → analyst), then fork red-team ∥ implementer, then
 /// converge. Reuses [`run_plan`] for the planning half.
-pub async fn run_full(
-    client: &RagRatClient,
-    config: &RatatoskrConfig,
-    store: &Store,
-    run_id: &str,
-    issue: &str,
-    engine: &Arc<ScriptEngine>,
-) -> Result<RunOutcome, PlanError> {
-    // A `.ratatoskr/workflow.ts` overrides the whole run flow (plan + fork + converge).
-    if let Some(runtime) = load_workflow().await? {
+pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> {
+    let RunRequest {
+        client,
+        config,
+        store,
+        run_id,
+        issue,
+        engine,
+        workflow,
+    } = request;
+    // A workflow, when this repo defines one, overrides the whole run flow.
+    if let Some(runtime) = select(workflows().await?, workflow)? {
         let plugin_context =
             PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
                 .await?;
@@ -2270,5 +2365,59 @@ mod agent_config_tests {
             .unwrap();
         assert!(req < why, "requirements lead, findings follow:\n{prompt}");
         assert!(prompt.contains("any non-utf-8 path"));
+    }
+
+    async fn workflows_in(case: &str, named: &[&str]) -> Vec<WorkflowRuntime> {
+        let dir = std::env::temp_dir().join(format!("ratatoskr-sel-{}-{case}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in named {
+            std::fs::write(
+                dir.join(format!("{name}.ts")),
+                format!(r#"defineWorkflow({{ name: "{name}" }});"#),
+            )
+            .unwrap();
+        }
+        let found = WorkflowRuntime::discover(&dir).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        found
+    }
+
+    #[tokio::test]
+    async fn naming_a_workflow_that_is_not_there_fails_and_says_what_is() {
+        // A run asked for a specific shape must not quietly get a different one.
+        let found = workflows_in("missing", &["research", "fix"]).await;
+        let err = match select(found, Some("migrate")) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an unknown workflow name must fail"),
+        };
+        assert!(err.contains("no workflow named `migrate`"), "{err}");
+        assert!(err.contains("fix") && err.contains("research"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn choosing_between_several_is_not_done_by_accident() {
+        // Picking the alphabetically-first would look like a decision while being one nobody made.
+        // Until something can choose deliberately, several workflows means the caller must say.
+        let found = workflows_in("several", &["research", "fix"]).await;
+        let err = match select(found, None) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("several workflows with no name must not silently pick one"),
+        };
+        assert!(err.contains("--workflow"), "{err}");
+
+        // Named explicitly, it is used.
+        let found = workflows_in("several-named", &["research", "fix"]).await;
+        let picked = select(found, Some("fix")).unwrap().unwrap();
+        assert_eq!(picked.meta().name, "fix");
+    }
+
+    #[tokio::test]
+    async fn one_workflow_needs_no_naming_and_none_means_the_built_in_flow() {
+        let found = workflows_in("one", &["only"]).await;
+        assert_eq!(select(found, None).unwrap().unwrap().meta().name, "only");
+
+        // No workflows at all is the ordinary case: the built-in Rust flow runs.
+        assert!(select(Vec::new(), None).unwrap().is_none());
     }
 }
