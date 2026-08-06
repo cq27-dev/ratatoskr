@@ -198,7 +198,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         max_turns: scout_cfg.max_turns,
         clarifier: Some(clarifier.as_dyn()),
         system_prompt: scout_cfg.system_prompt,
-        context: context.for_node("scout"),
+        plugins: context.for_node("scout"),
     };
     let scout_out = scout
         .run(issue.to_string(), &state)
@@ -240,7 +240,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         policy: analyst_cfg.policy,
         max_turns: analyst_cfg.max_turns,
         system_prompt: analyst_cfg.system_prompt,
-        context: context.for_node("analyst"),
+        plugins: context.for_node("analyst"),
     };
     let analyst_out = analyst
         .run(
@@ -344,7 +344,88 @@ pub struct PluginContext {
     /// The MCP servers the discovered plugins declare, connected once and shared by every node
     /// that binds the plugin. Held for the run: dropping a connection kills its subprocess.
     servers: Arc<Vec<PluginServer>>,
+    /// The loaded plugins themselves, for the hooks that run around a node's tool calls.
+    plugins: Arc<Vec<ratatoskr_plugin::Plugin>>,
+    /// Wall-clock the run has spent inside tool hooks, shared by every node so the budget is the
+    /// run's rather than each node's.
+    hook_time: Arc<std::sync::atomic::AtomicU64>,
+    /// What this repo lets its plugins' hooks spend.
+    limits: ratatoskr_core::HookLimits,
 }
+
+/// What the plugins a node binds contribute to that node.
+///
+/// One value rather than a field per contribution: a node's plugins are resolved in one place and
+/// travel together, and every new thing plugins can give a node would otherwise mean another
+/// parameter threaded through every node struct and every construction site.
+#[derive(Clone, Default)]
+pub struct NodePlugins {
+    /// Session context, prefixed to whichever preamble the node runs with.
+    pub context: Option<String>,
+    /// Runs the node's tool calls past its plugins' `PreToolUse`/`PostToolUse` hooks. `None` when
+    /// nothing it binds registers one, so a node that gains nothing pays nothing.
+    pub observer: Option<Arc<dyn ratatoskr_agent::ToolObserver>>,
+}
+
+/// Runs one node's bound plugins around each of its tool calls.
+///
+/// Holds only the plugins that node binds, so the per-node binding that decides its context and
+/// its tools decides its hooks too.
+struct NodeObserver {
+    plugins: Vec<ratatoskr_plugin::Plugin>,
+    cwd: PathBuf,
+    hook_time: Arc<std::sync::atomic::AtomicU64>,
+    limits: ratatoskr_core::HookLimits,
+}
+
+impl NodeObserver {
+    fn run<'a>(
+        &'a self,
+        event: &'a str,
+        tool: &'a str,
+        args: &'a str,
+        response: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(async move {
+            ratatoskr_plugin::tool_hooks(
+                &self.plugins,
+                ratatoskr_plugin::ToolEvent {
+                    event,
+                    tool,
+                    input: args,
+                    response,
+                },
+                &self.cwd,
+                &self.limits,
+                &self.hook_time,
+            )
+            .await
+        })
+    }
+}
+
+impl ratatoskr_agent::ToolObserver for NodeObserver {
+    fn before<'a>(
+        &'a self,
+        tool: &'a str,
+        args: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        self.run("PreToolUse", tool, args, None)
+    }
+
+    fn after<'a>(
+        &'a self,
+        tool: &'a str,
+        args: &'a str,
+        result: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        self.run("PostToolUse", tool, args, Some(result))
+    }
+}
+
+/// The hook events that fire around a node's tool calls. Every other event a plugin registers is
+/// for a host with a different lifecycle and is not ours to run.
+const TOOL_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUse"];
 
 /// One connected server, and the plugin that declared it — which is what a node binds, not the
 /// server's own name.
@@ -392,7 +473,7 @@ impl PluginContext {
         }
 
         let discovered: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
-        let contexts = ratatoskr_plugin::session_start(&plugins, cwd).await;
+        let contexts = ratatoskr_plugin::session_start(&plugins, cwd, &config.plugins.hooks).await;
         for (name, text) in &contexts {
             tracing::info!(plugin = name, chars = text.len(), "plugin session context");
         }
@@ -401,13 +482,40 @@ impl PluginContext {
             discovered,
             engine: Some(Arc::clone(engine)),
             servers: Arc::new(connect_plugin_servers(&plugins, cwd).await),
+            plugins: Arc::new(plugins),
+            hook_time: Arc::default(),
+            limits: config.plugins.hooks.clone(),
         })
     }
 
-    /// The context `node` carries, composed from the plugins its ruleset binds.
-    pub fn for_node(&self, node: &str) -> Option<String> {
-        let engine = self.engine.as_ref()?;
-        ratatoskr_plugin::compose(&self.contexts, &engine.plugins_for(node, &self.discovered))
+    /// What the plugins `node` binds give it: their session context, and a hook runner when any of
+    /// them registers one for a tool call.
+    pub fn for_node(&self, node: &str) -> NodePlugins {
+        let bound = self.bound(node);
+        let hooked: Vec<ratatoskr_plugin::Plugin> = self
+            .plugins
+            .iter()
+            .filter(|p| bound.contains(&p.name))
+            .filter(|p| {
+                p.hooks
+                    .iter()
+                    .any(|h| TOOL_EVENTS.contains(&h.event.as_str()))
+            })
+            .cloned()
+            .collect();
+        NodePlugins {
+            context: ratatoskr_plugin::compose(&self.contexts, &bound, &self.limits),
+            // `None` rather than an empty runner: it is what keeps the hook off the agent
+            // entirely for a node whose plugins have nothing to say about its tool calls.
+            observer: (!hooked.is_empty()).then(|| {
+                Arc::new(NodeObserver {
+                    plugins: hooked,
+                    cwd: std::env::current_dir().unwrap_or_default(),
+                    hook_time: Arc::clone(&self.hook_time),
+                    limits: self.limits.clone(),
+                }) as Arc<dyn ratatoskr_agent::ToolObserver>
+            }),
+        }
     }
 
     /// Which plugins `node` binds — its ruleset's declaration, or every plugin found.
@@ -766,7 +874,7 @@ async fn bookkeep_and_checkpoint(
         max_turns: cfg.max_turns,
         clarifier: Some(clarifier.as_dyn()),
         system_prompt: cfg.system_prompt,
-        context: context.for_node("bookkeeper"),
+        plugins: context.for_node("bookkeeper"),
     };
     let out = node
         .run(input)
@@ -890,7 +998,7 @@ async fn fork_and_converge(
                     max_turns: cfg.max_turns,
                     clarifier: Some(clarifier.as_dyn()),
                     system_prompt: cfg.system_prompt,
-                    context: context.for_node("redteam"),
+                    plugins: context.for_node("redteam"),
                 })
             }
             false => None,
@@ -1027,6 +1135,73 @@ mod agent_config_tests {
         ScriptEngine::load(&dir).await.unwrap()
     }
 
+    /// A plugin directory whose `PreToolUse` hook answers with an envelope for `matcher`.
+    fn hooking_plugin(name: &str, matcher: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("ratatoskr-node-hook-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".claude-plugin")).unwrap();
+        std::fs::create_dir_all(root.join("hooks")).unwrap();
+        std::fs::write(
+            root.join(".claude-plugin/plugin.json"),
+            format!(r#"{{"name": "{name}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("hooks/hooks.json"),
+            format!(
+                r#"{{"hooks": {{"PreToolUse": [{{"matcher": "{matcher}", "hooks": [
+                    {{"type": "command", "command": "cat ${{CLAUDE_PLUGIN_ROOT}}/answer"}}
+                ]}}]}}}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("answer"),
+            format!(r#"{{"hookSpecificOutput": {{"additionalContext": "from {name}"}}}}"#),
+        )
+        .unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn a_node_runs_the_tool_hooks_of_the_plugins_it_binds_and_no_others() {
+        // The same binding that decides a node's context and its tools decides its hooks.
+        let engine = binding_engine(
+            "node-hooks",
+            r#"
+            defineDefaults({ plugins: ["hookful"] });
+            defineAgent("analyst", { plugins: { inherit: false } });
+            "#,
+        )
+        .await;
+        let hookful = hooking_plugin("hookful", "^semantic_search$");
+        let quiet = hooking_plugin("quiet", "^nothing_calls_this$");
+        let plugins = ratatoskr_plugin::discover(&[hookful.clone(), quiet.clone()]);
+
+        let context = PluginContext {
+            discovered: plugins.iter().map(|p| p.name.clone()).collect(),
+            plugins: Arc::new(plugins),
+            engine: Some(engine),
+            ..Default::default()
+        };
+
+        let scout = context.for_node("scout").observer.expect("scout binds it");
+        assert_eq!(
+            scout.before("semantic_search", "{}").await.as_deref(),
+            Some("from hookful")
+        );
+        // The matcher still decides which calls it sees, and a PreToolUse hook says nothing after.
+        assert_eq!(scout.before("impact_surface", "{}").await, None);
+        assert_eq!(scout.after("semantic_search", "{}", "result").await, None);
+
+        // A node that binds nothing carries no runner at all, so the hook never reaches its agent.
+        assert!(context.for_node("analyst").observer.is_none());
+
+        let _ = std::fs::remove_dir_all(&hookful);
+        let _ = std::fs::remove_dir_all(&quiet);
+    }
+
     #[tokio::test]
     async fn a_node_only_carries_the_context_of_the_plugins_it_binds() {
         // The hooks run once per run; what differs per node is which of their outputs it carries.
@@ -1049,18 +1224,21 @@ mod agent_config_tests {
             .collect(),
             discovered: vec!["everywhere".to_string(), "analyst-only".to_string()],
             engine: Some(engine),
-            servers: Arc::new(Vec::new()),
+            ..Default::default()
         };
 
         // Defaults first, then what the node added.
         assert_eq!(
-            context.for_node("analyst").as_deref(),
+            context.for_node("analyst").context.as_deref(),
             Some("SHARED\n\nDEEP")
         );
         // A node that inherits nothing and adds nothing carries nothing.
-        assert_eq!(context.for_node("scout"), None);
+        assert_eq!(context.for_node("scout").context, None);
         // A node with no ruleset still gets the defaults.
-        assert_eq!(context.for_node("bookkeeper").as_deref(), Some("SHARED"));
+        assert_eq!(
+            context.for_node("bookkeeper").context.as_deref(),
+            Some("SHARED")
+        );
     }
 
     /// A plugin declaring one MCP server, for the start-decision tests.
@@ -1115,7 +1293,7 @@ mod agent_config_tests {
     #[tokio::test]
     async fn a_context_with_no_engine_composes_nothing() {
         // The default value is what a run gets before plugins are resolved; it must not panic.
-        assert_eq!(PluginContext::default().for_node("scout"), None);
+        assert_eq!(PluginContext::default().for_node("scout").context, None);
     }
 
     #[test]

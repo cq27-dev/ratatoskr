@@ -145,8 +145,8 @@ pub struct BookkeeperNode {
     pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
     /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
     pub system_prompt: Option<String>,
-    /// Session context contributed by plugins, prefixed to whichever preamble applies.
-    pub context: Option<String>,
+    /// What the plugins this node binds contribute to it.
+    pub plugins: crate::NodePlugins,
 }
 
 impl BookkeeperNode {
@@ -168,7 +168,7 @@ impl BookkeeperNode {
             preamble: &crate::effective_preamble(
                 PREAMBLE,
                 self.system_prompt.as_deref(),
-                self.context.as_deref(),
+                self.plugins.context.as_deref(),
             ),
             question: &prompt,
             tools: self.tools.clone(),
@@ -176,6 +176,7 @@ impl BookkeeperNode {
             policy: self.policy.clone(),
             max_turns: self.max_turns,
             clarifier: self.clarifier.clone(),
+            observer: self.plugins.observer.clone(),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("bookkeeper compose failed: {e}")))?;

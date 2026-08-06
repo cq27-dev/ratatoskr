@@ -65,8 +65,8 @@ pub struct RedTeamClassifier {
     pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
     /// Ruleset `systemPrompt`; replaces [`CLASSIFY_PREAMBLE`] when set.
     pub system_prompt: Option<String>,
-    /// Session context contributed by plugins, prefixed to whichever preamble applies.
-    pub context: Option<String>,
+    /// What the plugins this node binds contribute to it.
+    pub plugins: crate::NodePlugins,
 }
 
 impl RedTeamClassifier {
@@ -87,7 +87,7 @@ impl RedTeamClassifier {
             preamble: &crate::effective_preamble(
                 CLASSIFY_PREAMBLE,
                 self.system_prompt.as_deref(),
-                self.context.as_deref(),
+                self.plugins.context.as_deref(),
             ),
             question: &prompt,
             tools: self.tools.clone(),
@@ -95,6 +95,7 @@ impl RedTeamClassifier {
             policy: self.policy.clone(),
             max_turns: self.max_turns,
             clarifier: self.clarifier.clone(),
+            observer: self.plugins.observer.clone(),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("red-team classifier failed: {e}")))?;

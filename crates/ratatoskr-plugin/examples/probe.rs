@@ -22,9 +22,10 @@ async fn main() {
         }
     }
     let cwd = std::env::current_dir().unwrap();
-    let contexts = ratatoskr_plugin::session_start(&plugins, &cwd).await;
+    let limits = ratatoskr_core::HookLimits::default();
+    let contexts = ratatoskr_plugin::session_start(&plugins, &cwd, &limits).await;
     let names: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
-    match ratatoskr_plugin::compose(&contexts, &names) {
+    match ratatoskr_plugin::compose(&contexts, &names, &limits) {
         Some(c) => println!("\n--- SessionStart context ({} chars) ---\n{c}", c.len()),
         None => println!("\n(no session context)"),
     }
