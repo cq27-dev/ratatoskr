@@ -4,10 +4,13 @@
 //! what a plugin matches on and inspects: a `PreToolUse` hook keyed to `^(Read|Grep)$` reading
 //! `tool_input.file_path` fires here exactly as it does in the host the plugin was written for.
 //!
-//! Read-only, deliberately. `Write`, `Edit` and `Bash` belong to the implementer, which delegates
-//! them to a coding CLI inside a sandboxed worktree; a planning node that could edit the checkout
-//! it is reasoning about would undo that separation for nothing. A node that wants a change
-//! proposes one.
+//! [`declarations`] is read-only, deliberately: a planning node that could edit the checkout it is
+//! reasoning about would undo that separation for nothing. A node that wants a change proposes one.
+//!
+//! [`edit_declarations`] is the write-capable set — `Write` and `Edit`, under the names and argument
+//! shapes a plugin matches on — and is offered only to the implementer. The two are separate
+//! functions rather than a flag because the read-only guarantee should be visible at the call site
+//! that grants it, not buried in a boolean.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +37,12 @@ const SKIP: [&str; 5] = [".git", "target", "node_modules", ".venv", "dist"];
 pub const READ: &str = "Read";
 pub const GREP: &str = "Grep";
 pub const GLOB: &str = "Glob";
+pub const WRITE: &str = "Write";
+pub const EDIT: &str = "Edit";
+
+/// Most one `Write` may put on disk. A model that means to write more than this has lost the plot,
+/// and the worktree is on the host's filesystem.
+const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Declarations for a node's tool set, so `allow`/`deny` and the collision rule see them like any
 /// other tool.
@@ -41,7 +50,10 @@ pub fn declarations() -> Vec<Tool> {
     vec![
         declare(
             READ,
-            "Read a file from the repository. Returns its lines, numbered.",
+            "Return a file's contents with 1-based line numbers. offset selects the first line to return, \
+            limit caps the line count — use them for large files, since output is capped at 256 KB. Read \
+            before any Edit so old_string can be copied exactly (strip the line-number prefix). To \
+            locate which files mention something, use Grep instead of reading files one by one.",
             json!({
                 "type": "object",
                 "properties": {
@@ -58,7 +70,13 @@ pub fn declarations() -> Vec<Tool> {
         ),
         declare(
             GREP,
-            "Search the repository's files for a regular expression.",
+            "Search file contents across the repository with a regex. Prefer this over Reading many files \
+            when hunting for a symbol, string, or pattern. path narrows to a file or directory, glob \
+            filters filenames, -i makes it case-insensitive. output_mode: files_with_matches lists \
+            matching files (best first pass), content shows matching lines, count gives per-file totals; \
+            head_limit truncates output. Skips .git, target, node_modules, .venv, dist; results cap at \
+            200 — if you hit the cap, narrow the pattern or path. Zero matches often means the pattern \
+            is too strict: loosen it or drop anchors before concluding the code is absent.",
             json!({
                 "type": "object",
                 "properties": {
@@ -78,7 +96,9 @@ pub fn declarations() -> Vec<Tool> {
         ),
         declare(
             GLOB,
-            "Find files in the repository by glob pattern.",
+            "Find files by name pattern, e.g. src/**/*.rs, with optional path to scope the search. Use \
+            this to discover file layout or locate a file whose name you partly know; use Grep when you \
+            are matching file contents rather than names.",
             json!({
                 "type": "object",
                 "properties": {
@@ -86,6 +106,66 @@ pub fn declarations() -> Vec<Tool> {
                     "path": { "type": "string", "description": "Directory to search within." }
                 },
                 "required": ["pattern"]
+            }),
+        ),
+    ]
+}
+
+/// The write-capable tools. Offered to the implementer and to nothing else — see the module docs.
+///
+/// Names and argument shapes follow the coding CLIs a plugin is written against, so a `PreToolUse`
+/// hook keyed to `^(Write|Edit)$` inspecting `tool_input.file_path` fires here as it does there.
+pub fn edit_declarations() -> Vec<Tool> {
+    vec![
+        declare(
+            WRITE,
+            "Write content to file_path, creating parent directories as needed. If the file exists it is \
+            replaced entirely, so any lines you do not restate are lost — prefer Edit for modifying an \
+            existing file and reserve Write for new files or intentional full rewrites. Paths outside \
+            the repository are refused. Content over 4 MB is refused. To overwrite safely, Read the file \
+            first so you know what you are discarding.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute path to the file. A path relative to the \
+                            repository root is also accepted. Parent directories are created."
+                    },
+                    "content": { "type": "string", "description": "The file's complete contents." }
+                },
+                "required": ["file_path", "content"]
+            }),
+        ),
+        declare(
+            EDIT,
+            "Replace one exact string in a file. old_string must match the file byte-for-byte, including \
+            every space, tab, and newline of indentation — copy it from Read output (dropping the \
+            line-number prefix), never retype it from memory. If old_string occurs more than once, the \
+            call fails and nothing is written; fix by extending old_string with surrounding lines until \
+            it is unique, or pass replace_all: true to change every occurrence. If old_string occurs \
+            zero times, the tool retries with whitespace-normalized matching (lines trimmed, blank lines \
+            ignored): exactly one region matching that way is edited and the result says so; several \
+            such regions still fail, and the error quotes the nearest file lines with numbers — copy \
+            your next old_string directly from that quote or re-Read the region. old_string identical to \
+            new_string fails. Non-UTF-8 files are refused. Existing LF/CRLF line endings are preserved. \
+            Prefer this over Write for any change to an existing file: it touches only the lines you \
+            name.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "The file to edit." },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Text to replace, matched exactly including indentation."
+                    },
+                    "new_string": { "type": "string", "description": "What to replace it with." },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every occurrence instead of requiring exactly one."
+                    }
+                },
+                "required": ["file_path", "old_string", "new_string"]
             }),
         ),
     ]
@@ -100,8 +180,14 @@ fn declare(name: &'static str, description: &str, schema: serde_json::Value) -> 
 }
 
 /// The implementation of `name`, rooted at `root`, or `None` if it is not one of these.
+///
+/// Covers both sets. Which tools a node may actually call is decided by what was declared for it —
+/// this only says how each one behaves once called.
 pub fn implementation(name: &str, root: &Path) -> Option<DynamicTool> {
-    let declaration = declarations().into_iter().find(|t| t.name == name)?;
+    let declaration = declarations()
+        .into_iter()
+        .chain(edit_declarations())
+        .find(|t| t.name == name)?;
     let root = root.to_path_buf();
     let schema = serde_json::Value::Object((*declaration.input_schema).clone());
     let description = declaration
@@ -121,6 +207,8 @@ pub fn implementation(name: &str, root: &Path) -> Option<DynamicTool> {
                 let answer = match name.as_str() {
                     READ => read(&root, &args),
                     GREP => grep(&root, &args),
+                    WRITE => write(&root, &args),
+                    EDIT => edit(&root, &args),
                     _ => glob_files(&root, &args),
                 };
                 answer.map(ToolOutput::text)
@@ -180,6 +268,303 @@ fn lexical(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// `Write`: put `content` at `file_path`, creating parents.
+fn write(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionError> {
+    let path = within(root, Some(arg(args, "file_path")?))?;
+    let content = arg(args, "content")?;
+    if content.len() > MAX_WRITE_BYTES {
+        return Err(ToolExecutionError::invalid_args(format!(
+            "refusing to write {} bytes to {}; the cap is {MAX_WRITE_BYTES}",
+            content.len(),
+            path.display()
+        )));
+    }
+    if path.is_dir() {
+        return Err(ToolExecutionError::invalid_args(format!(
+            "{} is a directory",
+            path.display()
+        )));
+    }
+    // Created here rather than failing: a change that adds a module adds its directory too, and
+    // making the model call a separate tool for that is a turn spent on nothing.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ToolExecutionError::other(format!("could not create {}: {e}", parent.display()))
+        })?;
+    }
+    let existed = path.exists();
+    std::fs::write(&path, content).map_err(|e| {
+        ToolExecutionError::other(format!("could not write {}: {e}", path.display()))
+    })?;
+    let what = if existed { "Replaced" } else { "Created" };
+    Ok(format!(
+        "{what} {} ({} bytes, {} lines).",
+        display(root, &path),
+        content.len(),
+        content.lines().count()
+    ))
+}
+
+/// `Edit`: replace an exact string.
+///
+/// Exactness is the contract, and the failures are deliberately loud. A `no match` that silently
+/// did nothing, or an ambiguous match that changed the first occurrence, both look like a
+/// successful edit to the model — which then builds its next step on a change that never happened.
+fn edit(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionError> {
+    let path = within(root, Some(arg(args, "file_path")?))?;
+    let old = arg(args, "old_string")?;
+    let new = args
+        .get("new_string")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolExecutionError::invalid_args("`new_string` is required"))?;
+    let all = args
+        .get("replace_all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if old == new {
+        return Err(ToolExecutionError::invalid_args(
+            "`old_string` and `new_string` are identical; this edit would change nothing",
+        ));
+    }
+    if old.is_empty() {
+        return Err(ToolExecutionError::invalid_args(
+            "`old_string` is empty; use Write to create a file",
+        ));
+    }
+
+    let before = std::fs::read_to_string(&path).map_err(|e| {
+        ToolExecutionError::other(format!("could not read {}: {e}", path.display()))
+    })?;
+
+    let count = before.matches(old).count();
+    if count == 0 {
+        // Exact matching failed. Before giving up, look for the region whose *normalized* form
+        // matches — same tokens, different indentation or blank lines. That is the difference a
+        // model gets wrong most often and the one that matters least, and requiring the match to be
+        // unique keeps this from editing an arbitrary candidate.
+        if let Some(at) = locate(&before, old) {
+            let lines: Vec<&str> = before.lines().collect();
+            let needle_indent = old
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| &l[..l.len() - l.trim_start().len()])
+                .unwrap_or("");
+            let replacement = reindent(new, needle_indent, &at.indent);
+            let mut out: Vec<String> = lines[..at.start].iter().map(|l| l.to_string()).collect();
+            out.extend(replacement.lines().map(str::to_string));
+            out.extend(lines[at.end..].iter().map(|l| l.to_string()));
+            // `str::lines` strips a trailing `\r`, so rejoining with `\n` would quietly convert a
+            // CRLF file to mixed endings — a whole-file diff dressed up as a one-line edit.
+            let eol = if before.contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let mut after = out.join(eol);
+            if before.ends_with('\n') {
+                after.push_str(eol);
+            }
+            std::fs::write(&path, &after).map_err(|e| {
+                ToolExecutionError::other(format!("could not write {}: {e}", path.display()))
+            })?;
+            // Said plainly: the edit landed somewhere the arguments did not name exactly, and the
+            // caller should know that rather than assume a literal match.
+            return Ok(format!(
+                "Edited {} at lines {}-{}, matched ignoring indentation and blank lines.",
+                display(root, &path),
+                at.start + 1,
+                at.end
+            ));
+        }
+        return Err(ToolExecutionError::invalid_args(format!(
+            "`old_string` does not appear in {}{}",
+            display(root, &path),
+            not_found_help(&before, old)
+        )));
+    }
+    if count > 1 && !all {
+        return Err(ToolExecutionError::invalid_args(format!(
+            "`old_string` appears {count} times in {}; include enough surrounding lines to make it \
+             unique, or set `replace_all`",
+            display(root, &path)
+        )));
+    }
+
+    let after = if all {
+        before.replace(old, new)
+    } else {
+        before.replacen(old, new, 1)
+    };
+    std::fs::write(&path, &after).map_err(|e| {
+        ToolExecutionError::other(format!("could not write {}: {e}", path.display()))
+    })?;
+    Ok(format!(
+        "Edited {} ({} replacement{}).",
+        display(root, &path),
+        if all { count } else { 1 },
+        if all && count != 1 { "s" } else { "" }
+    ))
+}
+
+/// A region of the file whose normalized form matches what the edit was aiming at.
+struct Located {
+    start: usize,
+    end: usize,
+    /// Leading whitespace the file uses on the first matched line, for re-indenting the
+    /// replacement.
+    indent: String,
+}
+
+/// Normalize as rag-rat anchors chunks: trim each line, drop the blank ones.
+///
+/// Indentation and blank lines are the two things a model reproduces least reliably and that matter
+/// least to identity. Everything else — every token, in order — still has to match exactly.
+fn normalized(text: &str) -> Vec<&str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// The single line range whose normalized form equals the needle's, or `None` when there is none or
+/// more than one.
+///
+/// The uniqueness requirement is the whole safety argument: relocating to *a* match when several
+/// exist would edit an arbitrary one, which is the failure the exact-match rule exists to prevent.
+fn locate(haystack: &str, needle: &str) -> Option<Located> {
+    let wanted = normalized(needle);
+    if wanted.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = haystack.lines().collect();
+    let mut found: Option<Located> = None;
+    for start in 0..lines.len() {
+        // Walk forward until as many non-blank lines as the needle has are covered.
+        let mut seen = 0usize;
+        let mut end = start;
+        while end < lines.len() && seen < wanted.len() {
+            if !lines[end].trim().is_empty() {
+                seen += 1;
+            }
+            end += 1;
+        }
+        if seen != wanted.len() {
+            break;
+        }
+        if normalized(&lines[start..end].join("\n")) != wanted {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        let first = lines[start..end]
+            .iter()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or(&"");
+        found = Some(Located {
+            start,
+            end,
+            indent: first[..first.len() - first.trim_start().len()].to_string(),
+        });
+    }
+    found
+}
+
+/// Re-indent `text` by the difference between the file's indentation and the needle's.
+///
+/// Without this, relocating an edit whose `old_string` was under-indented would write the
+/// replacement back at the model's indentation and silently reformat the block.
+fn reindent(text: &str, from: &str, to: &str) -> String {
+    if from == to {
+        return text.to_string();
+    }
+    text.lines()
+        .map(|l| match l.strip_prefix(from) {
+            Some(rest) if !l.trim().is_empty() => format!("{to}{rest}"),
+            _ if l.trim().is_empty() => l.to_string(),
+            _ => format!("{to}{}", l.trim_start()),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Why an exact match failed, and — when nothing more specific applies — what the file actually
+/// says where the edit was aimed.
+///
+/// The content matters more than the diagnosis. A bare "could not find old_string" is a message a
+/// model will answer by sending the same hallucinated string again, and again: opencode has this
+/// filed as an infinite loop, ten-plus identical calls after the same error. Putting the real lines
+/// in the error gives the next attempt the text to copy, instead of telling it to go and look.
+fn not_found_help(haystack: &str, needle: &str) -> String {
+    // Specific causes first: these say exactly what to change, which beats showing content.
+    if haystack.contains('\r') && haystack.replace("\r\n", "\n").contains(needle) {
+        return ". The file has CRLF line endings and `old_string` has LF — match the file's."
+            .to_string();
+    }
+    let flattened = squash(needle);
+    if !flattened.is_empty() && squash(haystack).contains(&flattened) {
+        return ". The text is present but its whitespace differs — copy the indentation exactly."
+            .to_string();
+    }
+    match nearest(haystack, needle) {
+        Some(window) => format!(
+            ". The closest the file comes is:\n{window}\nCopy from there verbatim; do not retype \
+             `old_string` from memory."
+        ),
+        None => String::new(),
+    }
+}
+
+/// Collapse runs of whitespace so two texts can be compared ignoring indentation.
+fn squash(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The lines around the file's best match for the needle's first line, numbered.
+///
+/// Scored by shared tokens rather than edit distance: the failure this serves is a model that got
+/// the identifiers right and the punctuation or spacing wrong, and token overlap finds that.
+fn nearest(haystack: &str, needle: &str) -> Option<String> {
+    let target = needle.lines().find(|l| !l.trim().is_empty())?;
+    let wanted: Vec<&str> = target.split_whitespace().collect();
+    if wanted.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = haystack.lines().collect();
+    let (best, score) = lines
+        .iter()
+        .enumerate()
+        .fold((0usize, 0usize), |acc, (i, l)| {
+            let hits = wanted.iter().filter(|w| l.contains(**w)).count();
+            if hits > acc.1 { (i, hits) } else { acc }
+        });
+    // No token in common means the guess is unrelated to this file; quoting an arbitrary window
+    // would be inventing a suggestion rather than making one.
+    if score == 0 {
+        return None;
+    }
+    let from = best.saturating_sub(2);
+    let to = (best + 3).min(lines.len());
+    Some(
+        lines[from..to]
+            .iter()
+            .enumerate()
+            .map(|(n, l)| format!("{:>6}\t{l}", from + n + 1))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// A path as the caller is likely to recognise it: relative to the repository when it is inside.
+fn display(root: &Path, path: &Path) -> String {
+    let base = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    path.strip_prefix(&base)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 /// `Read`: one file's lines, numbered, from `offset` for `limit` lines.
@@ -461,5 +846,232 @@ mod tests {
         let err = grep(&root, &json!({})).expect_err("refused");
         assert!(err.to_string().contains("`pattern` is required"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn scratch(case: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-edit-{}-{case}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn write_creates_parents_and_edit_replaces_exactly_once() {
+        let root = scratch("basic");
+        let created = write(
+            &root,
+            &json!({ "file_path": "src/deep/new.rs", "content": "fn a() {}\nfn b() {}\n" }),
+        )
+        .unwrap();
+        assert!(created.starts_with("Created"), "{created}");
+        assert!(root.join("src/deep/new.rs").is_file());
+
+        let edited = edit(
+            &root,
+            &json!({ "file_path": "src/deep/new.rs", "old_string": "fn a() {}",
+                     "new_string": "fn a() -> u8 { 1 }" }),
+        )
+        .unwrap();
+        assert!(edited.starts_with("Edited"), "{edited}");
+        let now = std::fs::read_to_string(root.join("src/deep/new.rs")).unwrap();
+        assert_eq!(now, "fn a() -> u8 { 1 }\nfn b() {}\n");
+
+        // Writing an existing file says so, rather than reporting a create.
+        let again = write(
+            &root,
+            &json!({ "file_path": "src/deep/new.rs", "content": "x" }),
+        )
+        .unwrap();
+        assert!(again.starts_with("Replaced"), "{again}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_ambiguous_edit_fails_instead_of_changing_the_first_match() {
+        let root = scratch("ambiguous");
+        std::fs::write(root.join("f.rs"), "let x = 1;\nlet x = 1;\n").unwrap();
+
+        let err = edit(
+            &root,
+            &json!({ "file_path": "f.rs", "old_string": "let x = 1;", "new_string": "let x = 2;" }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("appears 2 times"), "{err}");
+        // Nothing was written: an ambiguous edit that silently took the first match would look
+        // identical to a successful one from the model's side.
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.rs")).unwrap(),
+            "let x = 1;\nlet x = 1;\n"
+        );
+
+        let ok = edit(
+            &root,
+            &json!({ "file_path": "f.rs", "old_string": "let x = 1;", "new_string": "let x = 2;",
+                     "replace_all": true }),
+        )
+        .unwrap();
+        assert!(ok.contains("2 replacements"), "{ok}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_match_hands_back_the_text_to_copy() {
+        // The loop this prevents is documented upstream: told only "could not find old_string", a
+        // model re-sends the same hallucinated string ten times over. The error carries the real
+        // lines so the next attempt has something to copy.
+        let root = scratch("nearest");
+        std::fs::write(
+            root.join("f.rs"),
+            "fn main() {\n    if guess < secret_number {\n        println!(\"low\");\n    }\n}\n",
+        )
+        .unwrap();
+
+        let err = edit(
+            &root,
+            &json!({ "file_path": "f.rs", "old_string": "if guess <<< secret secret_number {",
+                     "new_string": "if guess > secret_number {" }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("closest the file comes"), "{err}");
+        assert!(err.contains("if guess < secret_number {"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_specific_causes_are_named_before_content_is_quoted() {
+        let root = scratch("causes");
+        // A CRLF file against an LF needle relocates rather than failing — and keeps its endings.
+        // Rejoining with `\n` would turn a one-line edit into a whole-file diff.
+        std::fs::write(root.join("crlf.rs"), "fn a() {}\r\nfn b() {}\r\n").unwrap();
+        let ok = edit(
+            &root,
+            &json!({ "file_path": "crlf.rs", "old_string": "fn a() {}\nfn b() {}",
+                     "new_string": "fn c() {}" }),
+        )
+        .unwrap();
+        assert!(ok.contains("matched ignoring"), "{ok}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("crlf.rs")).unwrap(),
+            "fn c() {}\r\n"
+        );
+
+        // Tabs in the file against spaces in the needle: no substring match, and no unique
+        // normalized region either, because both lines normalize the same.
+        std::fs::write(root.join("ws.rs"), "\tdeep();\n\tdeep();\n").unwrap();
+        let err = edit(
+            &root,
+            &json!({ "file_path": "ws.rs", "old_string": "    deep();", "new_string": "x();" }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("whitespace differs"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_non_utf8_file_is_refused_rather_than_mangled() {
+        // opencode carries this as a corruption bug: read-as-UTF-8, write-as-UTF-8 destroys a
+        // Windows-1252 file's accented bytes. Rust's `read_to_string` refuses instead, which is the
+        // behaviour to keep — never "fix" this with `from_utf8_lossy`, which would corrupt exactly
+        // as reported there.
+        let root = scratch("latin1");
+        std::fs::write(root.join("l.txt"), [0x66, 0x6f, 0x6f, 0xE7, 0x0a]).unwrap();
+        let err = edit(
+            &root,
+            &json!({ "file_path": "l.txt", "old_string": "foo", "new_string": "bar" }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("could not read"), "{err}");
+        // The bytes are untouched.
+        assert_eq!(
+            std::fs::read(root.join("l.txt")).unwrap(),
+            [0x66, 0x6f, 0x6f, 0xE7, 0x0a]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_no_op_edit_and_an_escape_from_the_repository_are_both_refused() {
+        let root = scratch("guards");
+        std::fs::write(root.join("f.rs"), "x").unwrap();
+        // Identical strings waste a turn and read as success.
+        assert!(
+            edit(
+                &root,
+                &json!({ "file_path": "f.rs", "old_string": "x", "new_string": "x" })
+            )
+            .is_err()
+        );
+        // Containment holds for writes to paths that do not exist yet, which is where
+        // `canonicalize` alone fails.
+        assert!(
+            write(
+                &root,
+                &json!({ "file_path": "../escaped.rs", "content": "no" })
+            )
+            .is_err()
+        );
+        assert!(!root.parent().unwrap().join("escaped.rs").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_under_indented_edit_relocates_and_keeps_the_files_indentation() {
+        // The common real failure: the model retypes the body without its surrounding indentation.
+        // Exact matching fails; the normalized region is unique, so the edit lands — and the
+        // replacement is written at the file's indentation, not the model's.
+        let root = scratch("reindent");
+        std::fs::write(
+            root.join("f.rs"),
+            "impl T {\n    fn go(&self) {\n        do_it();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let ok = edit(
+            &root,
+            &json!({ "file_path": "f.rs", "old_string": "fn go(&self) {\n    do_it();\n}",
+                     "new_string": "fn go(&self) {\n    do_it_twice();\n}" }),
+        )
+        .unwrap();
+        assert!(ok.contains("matched ignoring indentation"), "{ok}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.rs")).unwrap(),
+            "impl T {\n    fn go(&self) {\n        do_it_twice();\n    }\n}\n",
+            "the block keeps the file's indentation, not the argument's"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn relocation_refuses_an_ambiguous_region() {
+        // Two blocks that normalize identically. Relocating to one of them would edit an arbitrary
+        // choice, which is exactly what the exact-match rule exists to prevent.
+        let root = scratch("ambiguous-relocate");
+        std::fs::write(root.join("f.rs"), "  a();\n  b();\n\n\ta();\n\tb();\n").unwrap();
+        let err = edit(
+            &root,
+            &json!({ "file_path": "f.rs", "old_string": "a();\nb();", "new_string": "c();" }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not appear"), "{err}");
+        // Untouched.
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.rs")).unwrap(),
+            "  a();\n  b();\n\n\ta();\n\tb();\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn normalization_ignores_indentation_and_blanks_but_nothing_else() {
+        assert_eq!(normalized("  a\n\n\tb  \n"), ["a", "b"]);
+        // Token order and content still have to match exactly — this is not fuzzy matching.
+        assert_ne!(normalized("a b"), normalized("b a"));
+        assert_ne!(normalized("a();"), normalized("a ();"));
     }
 }

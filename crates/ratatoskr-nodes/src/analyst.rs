@@ -14,23 +14,7 @@ use crate::scout::ScoutOutput;
 /// rag-rat tools the analyst may use to resolve what the change actually touches.
 pub const ANALYST_TOOLS: &[&str] = &["impact_surface", "symbol_lookup", "semantic_search"];
 
-const PREAMBLE: &str = "You are the analyst in a code-planning pipeline. You are given an issue, \
-    the scout's findings, and relevant repo memories. Use `impact_surface` and `symbol_lookup` to \
-    determine what this change actually touches and its blast radius — call the tools, don't guess. \
-    Produce: an impact summary, the specific symbols/paths touched, a list of risks (each a short \
-    line — lead with the severity if it's clear-cut), a list of concrete requirements the \
-    implementation must satisfy, and a residual-risk note capturing what remains uncertain or \
-    unknown after your analysis. Also set `changes_code`: true when carrying out this plan means \
-    editing code in this repository, false when it does not — research, a review, an architecture \
-    answer, or expanding an issue's description all produce no code change. Judge the task you \
-    were given, not the breadth of what it touches: a question about eight files is still a \
-    question. When it does change code, also set `acceptance`: the ordered commands that must run \
-    and pass for this change to be believed done, each with a short name. Use the repo's own \
-    tooling, and include every step the check needs — building an artifact before testing it is \
-    two steps, not one. Leave it empty to accept the repository's configured test command, which \
-    is the right answer whenever the existing suite already covers the change. You are also the pipeline's fallback answerer: when another node \
-    cannot resolve something on its own, its question routes to you, so hold clear, present-tense \
-    judgments about the change that you can share when asked.";
+const PREAMBLE: &str = include_str!("../prompts/analyst.md");
 
 /// Input to the analyst: the issue plus the two upstream node outputs.
 ///
@@ -166,6 +150,9 @@ impl Node for AnalystNode {
             skills: crate::skills::loaded(&self.plugins.skills),
             files: self.files.clone(),
             ledger: self.ledger.clone(),
+            produces: Some(
+                "an impact summary, the symbols and paths touched, risks, the concrete requirements the implementation must satisfy, and the acceptance steps that prove it done",
+            ),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("analyst agent failed: {e}")))?;

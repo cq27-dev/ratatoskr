@@ -20,11 +20,7 @@ use crate::testrun::{Characterizer, by_exit_code, run_acceptance};
 /// rag-rat tools the classifier may use to inspect the failing tests' code.
 pub const CLASSIFIER_TOOLS: &[&str] = &["symbol_lookup", "semantic_search"];
 
-const CLASSIFY_PREAMBLE: &str = "You classify failing tests. For each test, decide whether it is \
-    \"flaky\" (fails non-deterministically — timing, ordering, environment, network — and would \
-    likely pass on a retry) or \"real\" (a genuine, reproducible failure in the code under test). \
-    Base the call on the test output and, if useful, the test's code. Be conservative: only call \
-    something flaky when the evidence points to non-determinism.";
+const CLASSIFY_PREAMBLE: &str = include_str!("../prompts/redteam-classifier.md");
 
 /// One baseline failure's classification. Additive context, not part of the strict pass/fail.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -103,6 +99,9 @@ impl RedTeamClassifier {
             skills: crate::skills::loaded(&self.plugins.skills),
             files: self.files.clone(),
             ledger: self.ledger.clone(),
+            produces: Some(
+                "a classification of each baseline test failure as flaky or real, with the reason",
+            ),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("red-team classifier failed: {e}")))?;
