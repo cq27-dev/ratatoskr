@@ -113,6 +113,14 @@ pub struct ImplementerConfig {
     pub cli: String,
     /// How many times converge may re-run the implementer before giving up.
     pub max_iterations: u32,
+    /// Run the fork even when the analyst says the task calls for no code change.
+    ///
+    /// The override for disagreeing with that judgement. It is a config key rather than a silent
+    /// heuristic because the analyst's call is recorded in its checkpoint and named by the run's
+    /// status: a human who thinks it got the task wrong should be able to say so, and have that be
+    /// as visible as the decision it overrules.
+    #[serde(default)]
+    pub always_fork: bool,
 }
 
 impl Default for ImplementerConfig {
@@ -120,6 +128,7 @@ impl Default for ImplementerConfig {
         ImplementerConfig {
             cli: "claude".to_string(),
             max_iterations: 3,
+            always_fork: false,
         }
     }
 }

@@ -659,9 +659,9 @@ async fn finish_full(ctx: &Arc<WorkflowContext>) -> Result<RunOutcome, PlanError
     Ok(RunOutcome {
         state,
         plan,
-        red_team,
-        implementer,
-        worktree,
+        red_team: Some(red_team),
+        implementer: Some(implementer),
+        worktree: Some(worktree),
         iterations,
         status,
         bookkeeper,

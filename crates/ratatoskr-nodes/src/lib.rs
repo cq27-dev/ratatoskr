@@ -975,14 +975,63 @@ fn default_allow(built_in: &[&str], from_plugins: Vec<String>) -> Vec<String> {
 pub struct RunOutcome {
     pub state: RunState,
     pub plan: PlanOutcome,
-    pub red_team: RedTeamOutput,
-    pub implementer: ImplementerOutput,
-    pub worktree: WorktreePath,
+    /// The fork's three products, `None` when the fork never ran because the analyst judged the
+    /// task to call for no code change (`RunStatus::NoCodeChange`).
+    pub red_team: Option<RedTeamOutput>,
+    pub implementer: Option<ImplementerOutput>,
+    pub worktree: Option<WorktreePath>,
     pub iterations: u32,
     pub status: RunStatus,
     /// Bookkeeper result — `Some` on a terminal fork outcome (converged, or max-iterations with an
     /// `unresolved`-tagged memory); `None` otherwise.
     pub bookkeeper: Option<BookkeeperOutput>,
+}
+
+/// Whether to run the fork at all.
+///
+/// The analyst owns this call — it is the node that turns a task into a plan, so it is the one that
+/// knows whether carrying the plan out means editing code. `always_fork` is the override for a
+/// human who disagrees, and it only ever adds work: nothing can configure the fork *away* when the
+/// analyst says a change is needed.
+fn fork_is_needed(analyst: &AnalystOutput, config: &RatatoskrConfig) -> bool {
+    analyst.changes_code || config.implementer.always_fork
+}
+
+/// Finish a run whose analyst judged that carrying out the plan changes no code.
+///
+/// The plan itself is the artifact, and it is already checkpointed. The bookkeeper is not run:
+/// it composes memories from the implementer's diff, and there is none — a research run's learning
+/// is worth recording, but doing it means teaching that node to compose from the analyst alone,
+/// which is a change to what it produces rather than to when it fires.
+async fn no_code_change(
+    store: &Store,
+    run_id: &str,
+    context: &PluginContext,
+    plan: PlanOutcome,
+) -> Result<RunOutcome, PlanError> {
+    tracing::info!(
+        kind = "fork_skipped",
+        impact = %plan.analyst.impact_summary,
+        "the analyst judged this task to need no code change; skipping the fork"
+    );
+    let status = RunStatus::NoCodeChange;
+    if let Err(e) = store.upsert_run(run_id, None, status.as_str()).await {
+        tracing::warn!("failed to record the run's final status: {e}");
+    }
+    context.session_end(status.as_str()).await;
+
+    let mut state = plan.state.clone();
+    state.status = status;
+    Ok(RunOutcome {
+        state,
+        plan,
+        red_team: None,
+        implementer: None,
+        worktree: None,
+        iterations: 0,
+        status,
+        bookkeeper: None,
+    })
 }
 
 /// The full Phase 3 run: plan (scout → memory → analyst), then fork red-team ∥ implementer, then
@@ -1023,6 +1072,13 @@ pub async fn run_full(
             return Err(e);
         }
     };
+
+    // Some tasks call for no code change: research, a review, an architecture answer. Running the
+    // fork for one costs a sandboxed baseline test run and an ACP session to produce an empty diff,
+    // and then reports `Converged` — a success claim about a change that was never made.
+    if !fork_is_needed(&plan.analyst, config) {
+        return no_code_change(store, run_id, &plan_context, plan).await;
+    }
     // `plan.state.clarifications` already holds the plan-half asks; the fork/bookkeep half gets its
     // own clarifier, drained and appended at the end.
     let mut state = plan.state.clone();
@@ -1105,9 +1161,9 @@ pub async fn run_full(
     Ok(RunOutcome {
         state,
         plan,
-        red_team,
-        implementer,
-        worktree,
+        red_team: Some(red_team),
+        implementer: Some(implementer),
+        worktree: Some(worktree),
         iterations,
         status,
         bookkeeper,
@@ -1756,5 +1812,32 @@ mod agent_config_tests {
         assert_ne!(with_rules, graph_fingerprint(&root));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn analyst_saying(changes_code: bool) -> AnalystOutput {
+        AnalystOutput {
+            impact_summary: "impact".into(),
+            touched: vec!["a.rs".into()],
+            risks: Vec::new(),
+            requirements: Vec::new(),
+            residual_risk: String::new(),
+            changes_code,
+        }
+    }
+
+    #[test]
+    fn the_fork_runs_when_the_plan_changes_code_and_when_a_human_insists() {
+        let mut config = RatatoskrConfig::default();
+        assert!(fork_is_needed(&analyst_saying(true), &config));
+        assert!(
+            !fork_is_needed(&analyst_saying(false), &config),
+            "a task that changes no code does not pay for a baseline test run and an ACP session"
+        );
+
+        // The override only ever adds work. There is no configuration that skips the fork when the
+        // analyst says a change is needed — that would drop the work silently.
+        config.implementer.always_fork = true;
+        assert!(fork_is_needed(&analyst_saying(false), &config));
+        assert!(fork_is_needed(&analyst_saying(true), &config));
     }
 }
