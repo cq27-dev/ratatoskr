@@ -2,8 +2,7 @@
 
 use ratatoskr_core::{ModelRoute, RunState};
 use ratatoskr_graph::{Node, NodeError, parse_validated};
-use rmcp::model::Tool;
-use rmcp::service::ServerSink;
+use ratatoskr_mcp::ToolSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -53,8 +52,7 @@ pub struct ScoutOutput {
 /// The scout node: a fast agent restricted to search tools.
 pub struct ScoutNode {
     pub route: ModelRoute,
-    pub tools: Vec<Tool>,
-    pub sink: ServerSink,
+    pub tools: ToolSet,
     pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
     pub max_turns: Option<usize>,
     pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
@@ -73,22 +71,21 @@ impl Node for ScoutNode {
     }
 
     async fn run(&self, issue: String, _run_state: &RunState) -> Result<ScoutOutput, NodeError> {
-        let raw = ratatoskr_agent::run_structured(
-            "scout",
-            &self.route,
-            &crate::effective_preamble(
+        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
+            node: "scout",
+            route: &self.route,
+            preamble: &crate::effective_preamble(
                 PREAMBLE,
                 self.system_prompt.as_deref(),
                 self.context.as_deref(),
             ),
-            &issue,
-            self.tools.clone(),
-            self.sink.clone(),
-            schemars::schema_for!(ScoutOutput),
-            self.policy.clone(),
-            self.max_turns,
-            self.clarifier.clone(),
-        )
+            question: &issue,
+            tools: self.tools.clone(),
+            output_schema: schemars::schema_for!(ScoutOutput),
+            policy: self.policy.clone(),
+            max_turns: self.max_turns,
+            clarifier: self.clarifier.clone(),
+        })
         .await
         .map_err(|e| NodeError::Failed(format!("scout agent failed: {e}")))?;
 

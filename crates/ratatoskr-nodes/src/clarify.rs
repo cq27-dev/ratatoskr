@@ -19,10 +19,10 @@ use std::time::Duration;
 
 use ratatoskr_agent::Clarifier;
 use ratatoskr_core::RatatoskrConfig;
+use ratatoskr_mcp::ToolSet;
 use ratatoskr_script::ScriptEngine;
 use ratatoskr_store::Store;
 use rmcp::model::Tool;
-use rmcp::service::ServerSink;
 use serde_json::{Value, json};
 use tracing::Instrument;
 
@@ -88,7 +88,6 @@ pub struct NodeClarifier {
     engine: Arc<ScriptEngine>,
     run_id: String,
     issue: String,
-    sink: ServerSink,
     budget: AtomicUsize,
     recorded: Mutex<Vec<Value>>,
 }
@@ -100,7 +99,6 @@ impl NodeClarifier {
         engine: &Arc<ScriptEngine>,
         run_id: &str,
         issue: &str,
-        sink: ServerSink,
     ) -> Arc<Self> {
         Arc::new(Self {
             config: config.clone(),
@@ -108,7 +106,6 @@ impl NodeClarifier {
             engine: Arc::clone(engine),
             run_id: run_id.to_string(),
             issue: issue.to_string(),
-            sink,
             budget: AtomicUsize::new(0),
             recorded: Mutex::new(Vec::new()),
         })
@@ -224,7 +221,7 @@ impl NodeClarifier {
         let (route, system_prompt) = match node_agent_config(
             &self.engine,
             &self.config,
-            &[],
+            ToolSet::default(),
             answerer,
             &[],
         ) {
@@ -254,8 +251,7 @@ impl NodeClarifier {
             &route,
             &preamble,
             &prompt,
-            Vec::new(),
-            self.sink.clone(),
+            ToolSet::default(),
             Some(ANSWER_MAX_TURNS),
         )
         .instrument(span)

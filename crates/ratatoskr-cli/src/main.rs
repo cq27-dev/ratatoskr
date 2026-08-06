@@ -291,8 +291,7 @@ async fn ask(question: &str, config_path: &Path) -> anyhow::Result<()> {
         &route,
         ASK_PREAMBLE,
         question,
-        client.tools(),
-        client.sink(),
+        ratatoskr_mcp::ToolSet::from_servers(vec![client.offer()]),
         None,
     )
     .await;

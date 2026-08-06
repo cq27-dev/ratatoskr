@@ -9,10 +9,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use ratatoskr_core::{ModelRoute, ToolDecision, ToolPolicy};
+use ratatoskr_mcp::ToolSet;
 use rig_agent::AgentBuilder;
 use rig_agent::agent::{
-    AgentHook, HookContext, ModelTurnAction, ModelTurnFinished, OutputMode, ToolCall,
-    ToolCallAction,
+    Agent, AgentHook, HookContext, ModelTurnAction, ModelTurnFinished, NoToolConfig, OutputMode,
+    ToolCall, ToolCallAction, WithBuilderTools,
 };
 use rig_agent::completion::Prompt;
 use rig_core::client::completion::CompletionClient;
@@ -20,8 +21,6 @@ use rig_core::client::{ProviderClient, ProviderClientError};
 use rig_core::completion::CompletionModel;
 use rig_core::message::AssistantContent;
 use rig_core::providers::{anthropic, moonshot};
-use rmcp::model::Tool;
-use rmcp::service::ServerSink;
 use tracing::Instrument;
 
 /// How many tool-calling turns the agent may take before it must produce a final answer. A node
@@ -80,7 +79,7 @@ fn parse_provider(name: &str) -> Result<Provider, AgentError> {
     }
 }
 
-/// Ask one question, letting the agent call rag-rat's `tools` (via `sink`) to answer.
+/// Ask one question, letting the agent call `tools` to answer.
 ///
 /// `preamble` is the system prompt; `route` picks the provider/model. Returns the agent's final
 /// text after its tool-calling loop settles.
@@ -88,8 +87,7 @@ pub async fn ask(
     route: &ModelRoute,
     preamble: &str,
     question: &str,
-    tools: Vec<Tool>,
-    sink: ServerSink,
+    tools: ToolSet,
     max_turns: Option<usize>,
 ) -> Result<String, AgentError> {
     match parse_provider(&route.provider)? {
@@ -103,7 +101,6 @@ pub async fn ask(
                 preamble,
                 question,
                 tools,
-                sink,
                 max_turns,
             )
             .await
@@ -118,7 +115,6 @@ pub async fn ask(
                 preamble,
                 question,
                 tools,
-                sink,
                 max_turns,
             )
             .await
@@ -131,19 +127,19 @@ async fn run<M>(
     model: M,
     preamble: &str,
     question: &str,
-    tools: Vec<Tool>,
-    sink: ServerSink,
+    tools: ToolSet,
     max_turns: Option<usize>,
 ) -> Result<String, AgentError>
 where
     M: CompletionModel + 'static,
 {
-    let agent = AgentBuilder::new(model)
-        .preamble(preamble)
-        .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
-        .rmcp_tools(tools, sink)
-        .add_hook(ObservabilityHook)
-        .build();
+    let agent = bind_tools(
+        AgentBuilder::new(model)
+            .preamble(preamble)
+            .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
+            .add_hook(ObservabilityHook),
+        &tools,
+    );
 
     agent
         .prompt(question)
@@ -200,6 +196,25 @@ impl AgentHook for ObservabilityHook {
         }
         ModelTurnAction::Continue
     }
+}
+
+/// Bind each server's tools to the sink they are dispatched on, then build.
+///
+/// A loop won't do it: the first binding moves the builder into a different typestate, so the
+/// first group is bound separately and the rest fold onto the result. A node with no tools at all
+/// (every one denied) builds an agent that can only answer.
+fn bind_tools<M: CompletionModel + 'static>(
+    builder: AgentBuilder<M, NoToolConfig>,
+    tools: &ToolSet,
+) -> Agent<M> {
+    let Some((first, rest)) = tools.groups().split_first() else {
+        return builder.build();
+    };
+    let bound: AgentBuilder<M, WithBuilderTools> = rest.iter().fold(
+        builder.rmcp_tools(first.tools.clone(), first.sink.clone()),
+        |builder, group| builder.rmcp_tools(group.tools.clone(), group.sink.clone()),
+    );
+    bound.build()
 }
 
 /// The `ask` tool's arguments: which node to ask, and the question.
@@ -266,78 +281,63 @@ impl AgentHook for RulesetHook {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // route + preamble + question + tools + sink + schema + policy + max_turns are all inherent
-pub async fn run_structured(
-    node: &str,
-    route: &ModelRoute,
-    preamble: &str,
-    question: &str,
-    tools: Vec<Tool>,
-    sink: ServerSink,
-    output_schema: schemars::Schema,
-    policy: Option<Arc<dyn ToolPolicy>>,
-    max_turns: Option<usize>,
-    clarifier: Option<Arc<dyn Clarifier>>,
-) -> Result<String, AgentError> {
-    match parse_provider(&route.provider)? {
+/// One node's structured agent turn: what to run it on, what it may call, and the gates around it.
+///
+/// A parameter struct because these travel together from every node, and as a positional list
+/// they were a long train of same-typed strings that a caller could silently transpose.
+pub struct NodeRun<'a> {
+    /// The node's name, for the log span and for labelling its `ask` calls.
+    pub node: &'a str,
+    pub route: &'a ModelRoute,
+    pub preamble: &'a str,
+    pub question: &'a str,
+    pub tools: ToolSet,
+    pub output_schema: schemars::Schema,
+    /// A ruleset's `onToolCall` gate, when it defines one.
+    pub policy: Option<Arc<dyn ToolPolicy>>,
+    pub max_turns: Option<usize>,
+    /// Who answers this node's `ask` calls; `None` opts the node out of asking.
+    pub clarifier: Option<Arc<dyn Clarifier>>,
+}
+
+/// Run one node's turn with an output schema, so its final answer is structured JSON.
+pub async fn run_structured(run: NodeRun<'_>) -> Result<String, AgentError> {
+    match parse_provider(&run.route.provider)? {
         Provider::Anthropic => {
             let client = anthropic::Client::from_env().map_err(|source| AgentError::Provider {
                 provider: "anthropic".to_string(),
                 source,
             })?;
-            run_typed(
-                node,
-                client.completion_model(&route.model),
-                preamble,
-                question,
-                tools,
-                sink,
-                output_schema,
-                policy,
-                max_turns,
-                clarifier,
-            )
-            .await
+            let model = client.completion_model(&run.route.model);
+            run_typed(model, run).await
         }
         Provider::Moonshot => {
             let client = moonshot::Client::from_env().map_err(|source| AgentError::Provider {
                 provider: "moonshot".to_string(),
                 source,
             })?;
-            run_typed(
-                node,
-                client.completion_model(&route.model),
-                preamble,
-                question,
-                tools,
-                sink,
-                output_schema,
-                policy,
-                max_turns,
-                clarifier,
-            )
-            .await
+            let model = client.completion_model(&run.route.model);
+            run_typed(model, run).await
         }
     }
 }
 
-/// Structured variant of [`run`]: sets an output schema so the final answer is structured JSON.
-#[allow(clippy::too_many_arguments)] // mirrors run_structured's inherent parameter list
-async fn run_typed<M>(
-    node: &str,
-    model: M,
-    preamble: &str,
-    question: &str,
-    tools: Vec<Tool>,
-    sink: ServerSink,
-    output_schema: schemars::Schema,
-    policy: Option<Arc<dyn ToolPolicy>>,
-    max_turns: Option<usize>,
-    clarifier: Option<Arc<dyn Clarifier>>,
-) -> Result<String, AgentError>
+/// Provider-resolved half of [`run_structured`].
+async fn run_typed<M>(model: M, run: NodeRun<'_>) -> Result<String, AgentError>
 where
     M: CompletionModel + 'static,
 {
+    let NodeRun {
+        node,
+        preamble,
+        question,
+        tools,
+        output_schema,
+        policy,
+        max_turns,
+        clarifier,
+        ..
+    } = run;
     let mut builder = AgentBuilder::new(model)
         .preamble(preamble)
         .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
@@ -346,7 +346,6 @@ where
         // Anthropic rejects when combined with tools ("output_config.format: Cannot be combined
         // with tools"). Tool mode sends no native format and composes with the rag-rat tools.
         .output_mode(OutputMode::Tool)
-        .rmcp_tools(tools, sink)
         // Log tool calls + model text for every node run; added first so it observes calls before
         // the clarification/ruleset hooks can skip them.
         .add_hook(ObservabilityHook);
@@ -361,7 +360,7 @@ where
     if let Some(policy) = policy {
         builder = builder.add_hook(RulesetHook { policy });
     }
-    let agent = builder.build();
+    let agent = bind_tools(builder, &tools);
 
     // Tag every log line for this run — the hook's tool-call/text lines and rig-agent's own turn
     // logs — with the node name, so a run's agents are distinguishable in the logs. `prompt()` is

@@ -5348,6 +5348,7 @@ name = "ratatoskr-agent"
 version = "0.1.0"
 dependencies = [
  "ratatoskr-core",
+ "ratatoskr-mcp",
  "rig-agent",
  "rig-core",
  "rmcp",

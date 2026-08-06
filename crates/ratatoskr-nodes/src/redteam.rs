@@ -11,8 +11,7 @@ use std::path::PathBuf;
 
 use ratatoskr_core::ModelRoute;
 use ratatoskr_graph::{NodeError, parse_validated};
-use rmcp::model::Tool;
-use rmcp::service::ServerSink;
+use ratatoskr_mcp::ToolSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -60,8 +59,7 @@ pub struct RedTeamOutput {
 /// Optional LLM classifier for baseline failures.
 pub struct RedTeamClassifier {
     pub route: ModelRoute,
-    pub tools: Vec<Tool>,
-    pub sink: ServerSink,
+    pub tools: ToolSet,
     pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
     pub max_turns: Option<usize>,
     pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
@@ -83,22 +81,21 @@ impl RedTeamClassifier {
             failing.join("\n"),
             truncate(raw_output, 6000)
         );
-        let raw = ratatoskr_agent::run_structured(
-            "redteam",
-            &self.route,
-            &crate::effective_preamble(
+        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
+            node: "redteam",
+            route: &self.route,
+            preamble: &crate::effective_preamble(
                 CLASSIFY_PREAMBLE,
                 self.system_prompt.as_deref(),
                 self.context.as_deref(),
             ),
-            &prompt,
-            self.tools.clone(),
-            self.sink.clone(),
-            schemars::schema_for!(Classification),
-            self.policy.clone(),
-            self.max_turns,
-            self.clarifier.clone(),
-        )
+            question: &prompt,
+            tools: self.tools.clone(),
+            output_schema: schemars::schema_for!(Classification),
+            policy: self.policy.clone(),
+            max_turns: self.max_turns,
+            clarifier: self.clarifier.clone(),
+        })
         .await
         .map_err(|e| NodeError::Failed(format!("red-team classifier failed: {e}")))?;
         Ok(parse_validated::<Classification>(&raw)?.classifications)

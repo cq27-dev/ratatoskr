@@ -16,10 +16,9 @@ use std::sync::{Arc, Mutex};
 use ratatoskr_core::{RatatoskrConfig, RunState, RunStatus};
 use ratatoskr_exec::{WorktreePath, remove_worktree};
 use ratatoskr_graph::{Node, NodeError};
-use ratatoskr_mcp::RagRatClient;
+use ratatoskr_mcp::{RagRatClient, ServerTools};
 use ratatoskr_script::{HostFn, ScriptEngine, WorkflowRuntime};
 use ratatoskr_store::Store;
-use rmcp::model::Tool;
 use rmcp::service::ServerSink;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -46,7 +45,8 @@ pub struct WorkflowContext {
     run_id: String,
     issue: String,
     sink: ServerSink,
-    tools: Vec<Tool>,
+    /// rag-rat's whole offer, the base of every node's tool pool.
+    rag_rat: ServerTools,
     repo_path: PathBuf,
     /// Set by `implement`, read by `iterate` and cleanup. The script never sees a raw path.
     worktree: Mutex<Option<WorktreePath>>,
@@ -79,7 +79,7 @@ impl WorkflowContext {
             run_id: run_id.to_string(),
             issue: issue.to_string(),
             sink: client.sink(),
-            tools: client.tools(),
+            rag_rat: client.offer(),
             repo_path,
             worktree: Mutex::new(None),
             implement_started: AtomicBool::new(false),
@@ -203,7 +203,7 @@ async fn scout_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, St
     let cfg = node_agent_config(
         &ctx.engine,
         &ctx.config,
-        &ctx.tools,
+        ctx.plugin_context.pool_for("scout", ctx.rag_rat.clone()),
         "scout",
         scout::SCOUT_TOOLS,
     )
@@ -211,7 +211,6 @@ async fn scout_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, St
     let node = ScoutNode {
         route: cfg.route,
         tools: cfg.tools,
-        sink: ctx.sink.clone(),
         policy: cfg.policy,
         max_turns: cfg.max_turns,
         // Node-to-node clarification is built-in-flow only for now; the scripted path opts out.
@@ -253,7 +252,7 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
     let cfg = node_agent_config(
         &ctx.engine,
         &ctx.config,
-        &ctx.tools,
+        ctx.plugin_context.pool_for("analyst", ctx.rag_rat.clone()),
         "analyst",
         analyst::ANALYST_TOOLS,
     )
@@ -261,7 +260,6 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
     let node = AnalystNode {
         route: cfg.route,
         tools: cfg.tools,
-        sink: ctx.sink.clone(),
         policy: cfg.policy,
         max_turns: cfg.max_turns,
         system_prompt: cfg.system_prompt,
@@ -284,14 +282,13 @@ fn build_red_team(ctx: &WorkflowContext) -> Result<RedTeamNode, PlanError> {
             let cfg = node_agent_config(
                 &ctx.engine,
                 &ctx.config,
-                &ctx.tools,
+                ctx.plugin_context.pool_for("redteam", ctx.rag_rat.clone()),
                 "redteam",
                 redteam::CLASSIFIER_TOOLS,
             )?;
             Some(redteam::RedTeamClassifier {
                 route: cfg.route,
                 tools: cfg.tools,
-                sink: ctx.sink.clone(),
                 policy: cfg.policy,
                 max_turns: cfg.max_turns,
                 clarifier: None,
@@ -635,7 +632,8 @@ async fn bookkeep_scripted(
     let cfg = node_agent_config(
         &ctx.engine,
         &ctx.config,
-        &ctx.tools,
+        ctx.plugin_context
+            .pool_for("bookkeeper", ctx.rag_rat.clone()),
         "bookkeeper",
         bookkeeper::BOOKKEEPER_TOOLS,
     )?;
