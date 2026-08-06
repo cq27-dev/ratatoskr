@@ -87,13 +87,17 @@ impl Matcher {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' ' | ',' | '|'))
         {
-            return Matcher::Exactly(
-                raw.split(['|', ','])
-                    .map(str::trim)
-                    .filter(|n| !n.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-            );
+            let names: Vec<String> = raw
+                .split(['|', ','])
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .collect();
+            if names.is_empty() {
+                tracing::warn!("ignoring hook matcher `{raw}`: it names nothing");
+                return Matcher::Nothing;
+            }
+            return Matcher::Exactly(names);
         }
         match Regex::new(raw) {
             Ok(re) => Matcher::Pattern(re),
@@ -184,7 +188,18 @@ impl<T: for<'de> Deserialize<'de>> Source<T> {
                     tracing::warn!("ignoring {what} bundle `{path}`: bundles are not supported");
                     return Vec::new();
                 }
-                let full = root.join(path.trim_start_matches("./"));
+                // The format requires a `./` path relative to the plugin root. Absolute paths
+                // discard the root entirely when joined, and `..` walks out of it; neither is a
+                // component of *this* plugin, which is all this key can name.
+                let relative = path.trim_start_matches("./");
+                if Path::new(relative)
+                    .components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                {
+                    tracing::warn!("ignoring {what} path `{path}`: it leaves the plugin directory");
+                    return Vec::new();
+                }
+                let full = root.join(relative);
                 let Ok(raw) = std::fs::read_to_string(&full) else {
                     tracing::warn!("ignoring {what} path `{}`: cannot read it", full.display());
                     return Vec::new();
@@ -676,10 +691,8 @@ async fn run_hook(
     // A hook inherits this process's environment, which in a run started from a coding CLI already
     // holds that host's `CLAUDE_*` values — a plugin would then read another host's data directory
     // as its own. Clear them all and set the three this host actually defines.
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("CLAUDE_") {
-            command.env_remove(&key);
-        }
+    for key in inherited_host_vars(std::env::vars_os().map(|(k, _)| k)) {
+        command.env_remove(&key);
     }
     let mut child = command
         // Plugins address their own files through these; the shell expands them from the
@@ -721,16 +734,24 @@ async fn run_hook(
             let capped = buf.len() as u64 >= MAX_HOOK_OUTPUT;
             (buf, capped)
         };
-        tokio::join!(write, read).1
+        let (_, (buf, capped)) = tokio::join!(write, read);
+        if capped {
+            // Its output is already past any budget it could have fit, and a hook that writes
+            // without end will not exit — waiting on it would spend the whole timeout to reach a
+            // result certain to be dropped.
+            return (buf, capped, None);
+        }
+        // Inside the timeout, not after it. Reaching EOF on stdout does not mean the hook has
+        // finished: one that closes or redirects its own output and keeps working would otherwise
+        // be awaited here with no bound at all, and its declared timeout would mean nothing.
+        (buf, capped, child.wait().await.ok())
     };
 
-    let Ok((buf, capped)) = tokio::time::timeout(timeout, collect).await else {
+    let Ok((buf, capped, status)) = tokio::time::timeout(timeout, collect).await else {
         tracing::warn!("plugin {} hook timed out after {timeout:?}", plugin.name);
         return None;
     };
     if capped {
-        // Already past any budget its output could have fit, and waiting for a hook that writes
-        // without end to exit would cost the whole timeout for something certain to be dropped.
         let _ = child.start_kill();
         tracing::warn!("plugin {} hook wrote without stopping", plugin.name);
         return None;
@@ -739,17 +760,26 @@ async fn run_hook(
     // Only exit 0 means the output is an answer. The format is explicit that stdout is read only
     // on success; a hook that failed is telling us so on stderr, and treating what it managed to
     // print as context is how a broken hook quietly steers a node.
-    match child.wait().await {
-        Ok(status) if status.success() => Some(String::from_utf8_lossy(&buf).into_owned()),
-        Ok(status) => {
+    match status {
+        Some(status) if status.success() => Some(String::from_utf8_lossy(&buf).into_owned()),
+        Some(status) => {
             tracing::warn!("plugin {} hook exited with {status}", plugin.name);
             None
         }
-        Err(e) => {
-            tracing::warn!("plugin {} hook could not be waited on: {e}", plugin.name);
+        None => {
+            tracing::warn!("plugin {} hook could not be waited on", plugin.name);
             None
         }
     }
+}
+
+/// The variables of *another* host that a hook must not inherit from this process.
+///
+/// Separate from the spawn so the rule is testable without mutating the process environment, which
+/// is global to every test running beside it.
+fn inherited_host_vars(keys: impl Iterator<Item = std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    keys.filter(|k| k.to_string_lossy().starts_with("CLAUDE_"))
+        .collect()
 }
 
 /// Where a plugin keeps state that outlives one run.
@@ -757,16 +787,18 @@ async fn run_hook(
 /// Deliberately under the project rather than in the coding CLI's own plugin directory: this is a
 /// different host, and a plugin's data here is not that host's to read or ours to overwrite.
 fn plugin_data_dir(plugin: &str, cwd: &Path) -> PathBuf {
-    let safe: String = plugin
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
+    // Escaped rather than replaced: mapping every unsafe character to one `-` would give
+    // `acme.tools` and `acme-tools` the same directory, and each would then read and overwrite the
+    // other's state. `_` escapes itself, which is what keeps the encoding reversible — and so
+    // collision-free — while leaving an ordinary kebab-case name unchanged.
+    let mut safe = String::with_capacity(plugin.len());
+    for c in plugin.chars() {
+        match c {
+            '_' => safe.push_str("_5f"),
+            c if c.is_ascii_alphanumeric() || c == '-' => safe.push(c),
+            c => safe.push_str(&format!("_{:x}", c as u32)),
+        }
+    }
     let dir = cwd.join(".ratatoskr/plugin-data").join(safe);
     // The format's own host creates it on first reference; a hook that appends to a file in it
     // should not have to make the directory first.
@@ -931,13 +963,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hook_gets_this_hosts_variables_and_not_the_surrounding_ones() {
-        // A run started from a coding CLI inherits that host's `CLAUDE_*` values. A plugin reading
-        // them would take another host's data directory for its own.
-        unsafe {
-            std::env::set_var("CLAUDE_PLUGIN_DATA", "/somewhere/else/entirely");
-            std::env::set_var("CLAUDE_PROJECT_DIR", "/not/this/project");
-        }
+    async fn a_hook_gets_this_hosts_variables() {
+        // Which are set, and point where this host says. That the *other* host's are cleared is
+        // `another_hosts_variables_are_the_ones_cleared`.
         // Reported through the exec form, so no shell quoting stands between us and the values.
         let root = tool_plugin("environment", ".*", "SessionStart", "");
         std::fs::write(
@@ -964,12 +992,82 @@ mod tests {
             seen.contains(".ratatoskr/plugin-data/environment"),
             "the data directory belongs to this host and this plugin: {seen}"
         );
-        unsafe {
-            std::env::remove_var("CLAUDE_PLUGIN_DATA");
-            std::env::remove_var("CLAUDE_PROJECT_DIR");
-        }
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(".ratatoskr/plugin-data/environment");
+    }
+
+    #[tokio::test]
+    async fn a_hook_that_closes_its_output_and_keeps_going_is_still_bounded() {
+        // Reaching EOF on stdout does not mean the hook has finished. Waiting for it to exit
+        // after that, outside the timeout, is how a one-second hook takes as long as it likes.
+        let root = tool_plugin("lingering", ".*", "SessionStart", "");
+        std::fs::write(
+            root.join("hooks/hooks.json"),
+            r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command",
+                "command": "sh", "args": ["-c", "echo done; exec 1>&-; sleep 30"],
+                "timeout": 1}]}]}}"#,
+        )
+        .unwrap();
+
+        let plugins = discover(std::slice::from_ref(&root));
+        let started = std::time::Instant::now();
+        let _ = session_start(&plugins, Path::new("."), &limits()).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the hook's own timeout still bounds it: took {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_plugin_names_never_share_a_data_directory() {
+        // Replacing every unsafe character with one `-` gave these the same directory, and each
+        // would then read and overwrite the other's state.
+        let cwd = Path::new(".");
+        let distinct: Vec<PathBuf> = ["acme.tools", "acme-tools", "acme/tools", "acme_tools"]
+            .iter()
+            .map(|n| plugin_data_dir(n, cwd))
+            .collect();
+        let mut unique = distinct.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), distinct.len(), "{distinct:?}");
+        // And none of them escapes the directory they belong in.
+        for dir in &distinct {
+            assert!(dir.starts_with("./.ratatoskr/plugin-data"), "{dir:?}");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_component_path_cannot_leave_the_plugin() {
+        // `..` walks out of the plugin root, and an absolute path discards it entirely.
+        let root = plugin_dir(
+            "escapee",
+            r#"{"name": "escapee", "mcpServers": ["../../../etc/passwd", "/etc/shadow"]}"#,
+            None,
+        );
+        let found = discover(std::slice::from_ref(&root));
+        assert_eq!(found.len(), 1, "the plugin still loads");
+        assert!(found[0].mcp_servers.is_empty(), "and reads neither path");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn another_hosts_variables_are_the_ones_cleared() {
+        // A pure decision, so it needs no process-wide environment mutation to test — that is
+        // global to every test running beside it.
+        let seen = |names: [&str; 4]| {
+            inherited_host_vars(names.iter().map(std::ffi::OsString::from))
+                .iter()
+                .map(|k| k.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            seen(["CLAUDE_PLUGIN_DATA", "PATH", "CLAUDE_PROJECT_DIR", "HOME"]),
+            ["CLAUDE_PLUGIN_DATA", "CLAUDE_PROJECT_DIR"]
+        );
     }
 
     #[tokio::test]
