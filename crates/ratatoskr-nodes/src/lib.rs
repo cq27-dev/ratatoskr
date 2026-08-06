@@ -886,6 +886,9 @@ fn node_agent_config(
         Some(m) => ratatoskr_core::ModelRoute {
             provider: m.provider.clone(),
             model: m.model.clone(),
+            // A ruleset declares which model, not how much of it. The cap comes from the default,
+            // which is always sent — so a ruleset naming a brand-new model still works.
+            max_tokens: None,
         },
         None => route(config, node)?,
     };
@@ -1140,12 +1143,13 @@ pub async fn run_full(
     state.implementer = Some(serde_json::to_value(&implementer)?);
     state.status = status;
 
-    // Bookkeeping fires on a terminal fork outcome: `Converged` (record the learning) or
-    // `MaxIterationsReached` (record the wall, tagged `unresolved`). A bookkeeping failure is
-    // logged but doesn't discard the run's work.
+    // Bookkeeping fires on a terminal fork outcome: `Converged` (record the learning),
+    // `MaxIterationsReached` (record the wall, tagged `unresolved`), or `Unreviewed` — a change was
+    // still made and its friction is still worth recording, whether or not anyone reviewed it. A
+    // bookkeeping failure is logged but doesn't discard the run's work.
     let bookkeeper = if matches!(
         status,
-        RunStatus::Converged | RunStatus::MaxIterationsReached
+        RunStatus::Converged | RunStatus::MaxIterationsReached | RunStatus::Unreviewed
     ) {
         // Read back what the run's own checkpoints recorded about its path. The same source the
         // `bookkeep` replay reads, so a replay composes from exactly what the live run did.
@@ -1328,6 +1332,21 @@ struct Review {
 }
 
 /// What a review concluded the run should do next.
+///
+/// `Unavailable` is the case that is easy to get wrong: a verifier that could not run has not
+/// approved anything, but it has not found anything either. Its error is evidence about our
+/// infrastructure, not about the change, so it must neither block the run nor pass as a clean
+/// review.
+enum Reviewed {
+    /// Nothing above the threshold. The change is accepted.
+    Clean,
+    /// Send this back.
+    Fix(Correction),
+    /// The verifier could not be asked. The reason is on its checkpoint.
+    Unavailable,
+}
+
+/// What a review concluded the run should do next.
 struct Correction {
     /// What to hand the implementer.
     prompt: String,
@@ -1455,15 +1474,15 @@ impl Review {
         }))
     }
 
-    /// Review the change. `None` means it is accepted.
-    async fn next_correction(
+    /// Review the change.
+    async fn review(
         &self,
         run: &Run<'_>,
         plan: &AnalystOutput,
         impl_out: &ImplementerOutput,
         worktree: &WorktreePath,
         iteration: u32,
-    ) -> Result<Option<Correction>, PlanError> {
+    ) -> Result<Reviewed, PlanError> {
         let &Run {
             store,
             run_id,
@@ -1488,11 +1507,26 @@ impl Review {
             "touched_files": input.touched_files,
             "diff_bytes": input.diff.len(),
         }))?;
-        let out = self
-            .verifier
-            .run(input)
-            .await
-            .map_err(|e| PlanError::node("verifier", e))?;
+        // A verifier that cannot run must not discard a change that was made and passed. Every
+        // other fallible node here is best-effort for the same reason; this one propagating its
+        // error was an oversight, and the run it cost had already implemented the task correctly.
+        let out = match self.verifier.run(input).await {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::warn!("the verifier could not review this change: {e}");
+                record(Record {
+                    store,
+                    run_id,
+                    node: "verifier",
+                    output: &serde_json::json!({ "error": e.to_string() }),
+                    input: Some(input_json),
+                    iteration: Some(iteration),
+                    ledger: Some(ledger),
+                })
+                .await?;
+                return Ok(Reviewed::Unavailable);
+            }
+        };
         record(Record {
             store,
             run_id,
@@ -1508,7 +1542,7 @@ impl Review {
 
         let blocking = out.blocking(self.threshold);
         if blocking.is_empty() {
-            return Ok(None);
+            return Ok(Reviewed::Clean);
         }
         // Findings below the threshold were still recorded above; say what was set aside so a
         // reader of the logs does not read "2 findings" as "2 problems being fixed".
@@ -1527,7 +1561,7 @@ impl Review {
             .map(|f| (*f).clone())
             .collect();
         if plan_faults.is_empty() {
-            return Ok(Some(Correction {
+            return Ok(Reviewed::Fix(Correction {
                 prompt: verifier::correction(&blocking),
                 revised: None,
             }));
@@ -1557,7 +1591,7 @@ impl Review {
         })
         .await?;
 
-        Ok(Some(Correction {
+        Ok(Reviewed::Fix(Correction {
             prompt: replan(&revised, &blocking),
             revised: Some(revised),
         }))
@@ -1747,12 +1781,12 @@ async fn fork_and_converge(
         // bar the change wrote for itself.
         let referee = converge::referee_touches(&impl_out.touched_files, engine.may_modify_tests());
 
-        // What to send back, or `None` to accept the change. The test gate goes first and the
-        // review second, deliberately: a test result is stronger evidence than a model's
-        // judgement, and reviewing a change that does not build wastes the call on noise.
-        let correction: Option<Correction> = if !referee.is_empty() {
+        // What to do next. The referee check comes first, then the test gate, then the review: a
+        // moved referee makes the test result meaningless, and a test result is stronger evidence
+        // than a model's judgement, so reviewing a change that does not build wastes the call.
+        let correction: Reviewed = if !referee.is_empty() {
             tracing::warn!(files = ?referee, "iteration touched the referee; not accepting it");
-            Some(Correction {
+            Reviewed::Fix(Correction {
                 prompt: converge::referee_correction(&referee),
                 revised: None,
             })
@@ -1776,20 +1810,24 @@ async fn fork_and_converge(
                     new_failures.join(", ")
                 )
             };
-            Some(Correction {
+            Reviewed::Fix(Correction {
                 prompt,
                 revised: None,
             })
         } else if let Some(review) = &review {
             review
-                .next_correction(run, &in_force, &impl_out, &worktree, iterations)
+                .review(run, &in_force, &impl_out, &worktree, iterations)
                 .await?
         } else {
-            None
+            Reviewed::Clean
         };
 
-        let Some(correction) = correction else {
-            break RunStatus::Converged;
+        let correction = match correction {
+            Reviewed::Clean => break RunStatus::Converged,
+            // The change passed its tests and nobody was able to review it. Saying `Converged`
+            // would claim a review that did not happen; failing would discard work that did.
+            Reviewed::Unavailable => break RunStatus::Unreviewed,
+            Reviewed::Fix(correction) => correction,
         };
         if let Some(revised) = correction.revised {
             in_force = revised;
@@ -2118,6 +2156,7 @@ mod agent_config_tests {
             ratatoskr_core::ModelRoute {
                 provider: "openai".to_string(),
                 model: "gpt-5".to_string(),
+                max_tokens: None,
             },
         );
         assert!(classifier_enabled(&engine, &config));

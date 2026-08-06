@@ -287,6 +287,7 @@ body::after {
 .st--idle,
 .st--max_iterations_reached,
 .st--no_code_change,
+.st--unreviewed,
 .st--abandoned,
 .st--pending {
   color: var(--muted);

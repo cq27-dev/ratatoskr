@@ -9,8 +9,8 @@ pub mod state;
 pub mod telemetry;
 
 pub use config::{
-    AcceptanceStep, ConfigError, HookLimits, ImplementerConfig, ModelRoute, PluginConfig,
-    RagRatConfig, RatatoskrConfig, SandboxConfig, StoreConfig, WorktreeConfig,
+    AcceptanceStep, ConfigError, DEFAULT_MAX_TOKENS, HookLimits, ImplementerConfig, ModelRoute,
+    PluginConfig, RagRatConfig, RatatoskrConfig, SandboxConfig, StoreConfig, WorktreeConfig,
 };
 pub use policy::{ToolDecision, ToolPolicy};
 pub use state::{RunState, RunStatus};

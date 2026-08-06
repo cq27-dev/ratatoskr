@@ -244,9 +244,35 @@ pub struct WorktreeConfig {
 
 /// A `provider`/`model` pair for one node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelRoute {
     pub provider: String,
     pub model: String,
+    /// Cap on the tokens one model call may produce. `None` uses [`DEFAULT_MAX_TOKENS`].
+    ///
+    /// Set explicitly rather than left to the provider client, which fills it from a table of
+    /// model-name prefixes it was compiled with. Any model released after that table falls through
+    /// it, the field goes unset, and the request is rejected — a whole run lost at the first call
+    /// of whichever node happened to be routed to the new model.
+    ///
+    /// Raise it for a route that reasons at length: on Anthropic, thinking tokens count against
+    /// this. Lower it for a model whose own ceiling is below the default.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+}
+
+/// The per-call output cap when a route does not set one.
+///
+/// Chosen to clear every node's real output — the largest structured plan this repo has produced is
+/// about 1,700 tokens — while staying at or under the ceiling of every Claude model from 3.5
+/// onwards, so the default never turns into the very error it exists to prevent.
+pub const DEFAULT_MAX_TOKENS: u64 = 8_192;
+
+impl ModelRoute {
+    /// The cap to send with each call.
+    pub fn max_tokens(&self) -> u64 {
+        self.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)
+    }
 }
 
 /// Error parsing or validating `ratatoskr.toml`.
@@ -313,6 +339,7 @@ impl Default for RatatoskrConfig {
     /// provider/model choices are a Phase 2/3 decision once there are nodes to route.
     fn default() -> Self {
         let route = |provider: &str, model: &str| ModelRoute {
+            max_tokens: None,
             provider: provider.to_string(),
             model: model.to_string(),
         };
@@ -576,5 +603,54 @@ mod tests {
         let pinned = sandbox.acceptance(&planned);
         assert_eq!(pinned.len(), 1);
         assert_eq!(pinned[0].command, ["cargo", "test"]);
+    }
+
+    #[test]
+    fn every_route_sends_a_cap_whether_or_not_it_names_one() {
+        let config = RatatoskrConfig::from_toml_str(
+            r#"
+            [rag_rat]
+            command = ["rag-rat", "mcp"]
+            [store]
+            path = "s"
+            [worktree]
+            root = "w"
+            [models.scout]
+            provider = "anthropic"
+            model = "claude-brand-new-9"
+            [models.analyst]
+            provider = "anthropic"
+            model = "claude-opus-4-8"
+            max_tokens = 64000
+            "#,
+        )
+        .unwrap();
+
+        // The case that lost a whole run: a model the provider client's table has never heard of
+        // still goes out with a cap, because we set it rather than letting the client infer it.
+        assert_eq!(config.models["scout"].max_tokens, None);
+        assert_eq!(config.models["scout"].max_tokens(), DEFAULT_MAX_TOKENS);
+        // And a route that needs more room says so.
+        assert_eq!(config.models["analyst"].max_tokens(), 64_000);
+
+        // A misspelling must not read as "left at the default" — this key decides whether a long
+        // answer is truncated.
+        assert!(
+            RatatoskrConfig::from_toml_str(
+                r#"
+                [rag_rat]
+                command = ["rag-rat", "mcp"]
+                [store]
+                path = "s"
+                [worktree]
+                root = "w"
+                [models.scout]
+                provider = "anthropic"
+                model = "m"
+                max_token = 64000
+                "#,
+            )
+            .is_err()
+        );
     }
 }
