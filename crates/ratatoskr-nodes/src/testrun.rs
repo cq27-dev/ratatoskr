@@ -257,6 +257,15 @@ fn render_prompt(outcomes: &[StepOutcome]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_characterizer_is_told_there_is_nobody_to_ask() {
+        // On a live run it answered a failed acceptance step with "What would you like me to help
+        // with?" and a list of options, having invented a diagnosis of the sandbox. Its turn
+        // produced nothing, and the diagnosis was wrong and was believed.
+        assert!(PREAMBLE.contains("no human"), "the fact it lacked");
+        assert!(PREAMBLE.contains("exit code"), "why a guess is worse");
+    }
+
     fn outcome(name: &str, exit_code: i32, output: &str) -> StepOutcome {
         StepOutcome {
             name: name.to_string(),

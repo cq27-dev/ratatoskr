@@ -1160,7 +1160,11 @@ fn node_agent_config(
     // and reading a file it found is the ordinary case rather than the dangerous one. These are
     // also the names a plugin's hooks are written against — `Read`, `Grep`, `Glob` — which is what
     // makes an unmodified plugin's `PreToolUse` fire for a planning node at all.
-    let files = std::env::current_dir().ok();
+    // An empty `default_tools` means the node declares no reach, and that has to include the file
+    // tools — otherwise "no tools" quietly means "Read, Grep and Glob", which is how a node meant
+    // to transcribe output it was handed came to be reading directories on the host instead.
+    let declares_reach = !default_tools.is_empty();
+    let files = std::env::current_dir().ok().filter(|_| declares_reach);
     if files.is_some() {
         tools
             .local()
@@ -2609,6 +2613,49 @@ mod agent_config_tests {
         assert_eq!(cfg.route.provider, "openai");
         assert_eq!(cfg.route.model, "gpt-5");
         assert_eq!(cfg.system_prompt.as_deref(), Some("Be brief."));
+    }
+
+    #[tokio::test]
+    async fn a_node_that_declares_no_tools_is_not_handed_the_file_tools() {
+        // "No tools" has to mean none. The characterizer transcribes output it was handed, and
+        // when this leaked it spent its turn reading directories on the host and inventing a
+        // diagnosis of the run instead of naming the checks.
+        let engine = engine("no-tools").await;
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "characterizer".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".into(),
+                model: "claude-haiku-4-5-20251001".into(),
+                max_tokens: None,
+            },
+        );
+
+        let none = node_agent_config(
+            &engine,
+            &config,
+            ToolSet::default(),
+            "characterizer",
+            &[],
+            &NodePlugins::default(),
+        )
+        .unwrap();
+        assert!(none.tools.names().is_empty(), "{:?}", none.tools.names());
+        assert!(none.files.is_none(), "and nothing to root them at");
+
+        // A node that does declare reach still gets them — this is the reading half of the
+        // pipeline, not an exception for one node.
+        let some = node_agent_config(
+            &engine,
+            &config,
+            ToolSet::default(),
+            "analyst",
+            analyst::ANALYST_TOOLS,
+            &NodePlugins::default(),
+        )
+        .unwrap();
+        assert!(some.files.is_some());
+        assert!(some.tools.names().iter().any(|n| n == "Read"));
     }
 
     #[tokio::test]
