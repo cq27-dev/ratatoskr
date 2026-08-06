@@ -29,12 +29,11 @@ use std::sync::Arc;
 use ratatoskr_core::{RatatoskrConfig, RunState, RunStatus, ToolPolicy};
 use ratatoskr_exec::{WorktreePath, remove_worktree};
 use ratatoskr_graph::{Node, NodeError};
-use ratatoskr_mcp::RagRatClient;
+use ratatoskr_mcp::{Connection, RagRatClient, ServerTools, ToolSet};
 use ratatoskr_script::{ScriptEngine, WorkflowRuntime};
 use ratatoskr_store::{Store, StoreError};
 
 use crate::clarify::NodeClarifier;
-use rmcp::model::Tool;
 use serde::Serialize;
 
 /// Everything a completed plan run produced. `state` carries the run's status and the node slots;
@@ -124,7 +123,7 @@ async fn plan_half(
         .upsert_run(run_id, None, RunStatus::Running.as_str())
         .await?;
 
-    let clarifier = NodeClarifier::new(config, store, engine, run_id, issue, client.sink());
+    let clarifier = NodeClarifier::new(config, store, engine, run_id, issue);
     let run = Run {
         client,
         config,
@@ -170,7 +169,6 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         context,
     } = run;
     let sink = client.sink();
-    let all_tools = client.tools();
     let mut state = RunState::new(run_id, None);
     state.status = RunStatus::Running;
 
@@ -184,13 +182,18 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
     .await?;
 
     // --- scout ---
-    let scout_cfg = node_agent_config(engine, config, &all_tools, "scout", scout::SCOUT_TOOLS)?;
+    let scout_cfg = node_agent_config(
+        engine,
+        config,
+        context.pool_for("scout", client.offer()),
+        "scout",
+        scout::SCOUT_TOOLS,
+    )?;
     let mut scout_tools = scout_cfg.tools;
-    scout_tools.push(clarify::ask_tool());
+    scout_tools.add_local(clarify::ask_tool(), sink.clone());
     let scout = ScoutNode {
         route: scout_cfg.route,
         tools: scout_tools,
-        sink: sink.clone(),
         policy: scout_cfg.policy,
         max_turns: scout_cfg.max_turns,
         clarifier: Some(clarifier.as_dyn()),
@@ -227,14 +230,13 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
     let analyst_cfg = node_agent_config(
         engine,
         config,
-        &all_tools,
+        context.pool_for("analyst", client.offer()),
         "analyst",
         analyst::ANALYST_TOOLS,
     )?;
     let analyst = AnalystNode {
         route: analyst_cfg.route,
         tools: analyst_cfg.tools,
-        sink: sink.clone(),
         policy: analyst_cfg.policy,
         max_turns: analyst_cfg.max_turns,
         system_prompt: analyst_cfg.system_prompt,
@@ -305,7 +307,7 @@ fn classifier_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> b
 /// overrides (model, tool set, per-call policy, max turns).
 struct NodeAgentConfig {
     route: ratatoskr_core::ModelRoute,
-    tools: Vec<Tool>,
+    tools: ToolSet,
     policy: Option<Arc<dyn ToolPolicy>>,
     max_turns: Option<usize>,
     /// Replaces the node's built-in preamble when the ruleset declares one.
@@ -339,6 +341,16 @@ pub struct PluginContext {
     /// Every plugin found, which is what a node inherits when no ruleset narrows it.
     discovered: Vec<String>,
     engine: Option<Arc<ScriptEngine>>,
+    /// The MCP servers the discovered plugins declare, connected once and shared by every node
+    /// that binds the plugin. Held for the run: dropping a connection kills its subprocess.
+    servers: Arc<Vec<PluginServer>>,
+}
+
+/// One connected server, and the plugin that declared it — which is what a node binds, not the
+/// server's own name.
+struct PluginServer {
+    plugin: String,
+    connection: Connection,
 }
 
 impl PluginContext {
@@ -388,6 +400,7 @@ impl PluginContext {
             contexts,
             discovered,
             engine: Some(Arc::clone(engine)),
+            servers: Arc::new(connect_plugin_servers(&plugins, cwd).await),
         })
     }
 
@@ -396,6 +409,81 @@ impl PluginContext {
         let engine = self.engine.as_ref()?;
         ratatoskr_plugin::compose(&self.contexts, &engine.plugins_for(node, &self.discovered))
     }
+
+    /// Which plugins `node` binds — its ruleset's declaration, or every plugin found.
+    fn bound(&self, node: &str) -> Vec<String> {
+        match &self.engine {
+            Some(engine) => engine.plugins_for(node, &self.discovered),
+            None => Vec::new(),
+        }
+    }
+
+    /// Every tool `node` may call: rag-rat's catalogue, then the servers its plugins declare.
+    ///
+    /// rag-rat comes first so it wins any name collision — see [`ToolSet::from_servers`].
+    fn pool_for(&self, node: &str, rag_rat: ServerTools) -> ToolSet {
+        let bound = self.bound(node);
+        let mut servers = vec![rag_rat];
+        servers.extend(
+            self.servers
+                .iter()
+                .filter(|s| bound.contains(&s.plugin))
+                .map(|s| s.connection.offer()),
+        );
+        ToolSet::from_servers(servers)
+    }
+}
+
+/// Connect the MCP servers the discovered plugins declare, once per run.
+///
+/// A server that will not start costs its plugin's tools and nothing else: a broken plugin must
+/// not fail a run.
+async fn connect_plugin_servers(
+    plugins: &[ratatoskr_plugin::Plugin],
+    cwd: &std::path::Path,
+) -> Vec<PluginServer> {
+    let mut connected = Vec::new();
+    for (plugin, spec) in servers_to_start(plugins) {
+        match Connection::spawn(&spec.name, &spec.command, &spec.env, Some(cwd)).await {
+            Ok(connection) => connected.push(PluginServer {
+                plugin: plugin.to_string(),
+                connection,
+            }),
+            Err(e) => tracing::warn!(
+                plugin,
+                server = spec.name,
+                "plugin MCP server unavailable, its tools are not offered: {e}"
+            ),
+        }
+    }
+    connected
+}
+
+/// Which declared servers actually get started, paired with the plugin that declared each.
+///
+/// One per server name, and rag-rat's name counts as already taken: the rag-rat plugin declares
+/// the very server ratatoskr launched from `[rag_rat]`, and a second copy would pay for another
+/// index load to offer the identical tools.
+fn servers_to_start(
+    plugins: &[ratatoskr_plugin::Plugin],
+) -> Vec<(&str, &ratatoskr_plugin::McpServerSpec)> {
+    let mut claimed: Vec<&str> = vec![ratatoskr_mcp::RAG_RAT];
+    let mut start = Vec::new();
+    for plugin in plugins {
+        for spec in &plugin.mcp_servers {
+            if claimed.contains(&spec.name.as_str()) {
+                tracing::info!(
+                    plugin = plugin.name,
+                    server = spec.name,
+                    "MCP server already connected; not starting a second copy"
+                );
+                continue;
+            }
+            claimed.push(&spec.name);
+            start.push((plugin.name.as_str(), spec));
+        }
+    }
+    start
 }
 
 /// The preamble a node actually runs with: its built-in text, or a ruleset's replacement for it,
@@ -420,7 +508,7 @@ pub(crate) fn effective_preamble(
 fn node_agent_config(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
-    all_tools: &[Tool],
+    mut tools: ToolSet,
     node: &str,
     default_tools: &[&str],
 ) -> Result<NodeAgentConfig, PlanError> {
@@ -437,21 +525,46 @@ fn node_agent_config(
         None => route(config, node)?,
     };
 
-    let allow: Vec<&str> = match rc
+    // A ruleset's `allow` is exhaustive. The default is not just the node's built-in list: those
+    // name rag-rat tools, written before any plugin was in the picture, so a plugin the node binds
+    // would otherwise contribute a server whose every tool is filtered straight back out.
+    let from_plugins = tools.names_beyond(ratatoskr_mcp::RAG_RAT);
+    let spelled_out = rc
         .and_then(|c| c.tools.as_ref())
-        .and_then(|t| t.allow.as_deref())
-    {
-        Some(a) => a.iter().map(String::as_str).collect(),
-        None => default_tools.to_vec(),
+        .and_then(|t| t.allow.as_deref());
+    let allow: Vec<String> = match spelled_out {
+        Some(a) => a.to_vec(),
+        None => default_allow(default_tools, from_plugins.clone()),
     };
-    let deny: Vec<&str> = rc
+    let deny: Vec<String> = rc
         .and_then(|c| c.tools.as_ref())
-        .map(|t| t.deny.iter().map(String::as_str).collect())
+        .map(|t| t.deny.clone())
         .unwrap_or_default();
-    let tools: Vec<Tool> = filter_tools(all_tools, &allow)
-        .into_iter()
-        .filter(|t| !deny.contains(&t.name.as_ref()))
+
+    // Named but nowhere on offer: a typo, or a tool the server stopped exposing. Reported by name
+    // — a count can't be acted on, and a `deny` elsewhere in the ruleset must not explain it away.
+    let offered = tools.names();
+    let missing: Vec<&String> = allow
+        .iter()
+        .filter(|n| !offered.contains(&n.as_str()) && !deny.contains(n))
         .collect();
+    if !missing.is_empty() {
+        tracing::warn!(node, ?missing, "no connected MCP server offers these tools");
+    }
+    // An `allow` written before the plugin was bound is exhaustive too, so it silently excludes
+    // every tool the plugin brought — the node gets that plugin's context and none of its reach.
+    if spelled_out.is_some() && !from_plugins.is_empty() {
+        let excluded: Vec<&String> = from_plugins.iter().filter(|n| !allow.contains(n)).collect();
+        if !excluded.is_empty() {
+            tracing::warn!(
+                node,
+                ?excluded,
+                "this node's plugins offer tools its ruleset's `allow` does not name; add them, \
+                 or unbind the plugin"
+            );
+        }
+    }
+    tools.narrow(&allow, &deny);
 
     let max_turns = rc.and_then(|c| c.max_turns);
     let system_prompt = rc.and_then(|c| c.system_prompt.clone());
@@ -469,22 +582,18 @@ fn node_agent_config(
     })
 }
 
-/// Keep only the tools named in `names` — a focused subset per node. Names not present in the
-/// server's tool list are silently absent (logged); the node runs with whatever it got.
-pub fn filter_tools(all: &[Tool], names: &[&str]) -> Vec<Tool> {
-    let kept: Vec<Tool> = all
+/// What a node may call when its ruleset names no tools: its built-in list, plus everything the
+/// plugins it binds offer.
+///
+/// The built-in lists name rag-rat tools and were written before any plugin was in the picture, so
+/// on their own they would filter a bound plugin's every tool straight back out — binding a plugin
+/// would deliver its session context and none of its capability.
+fn default_allow(built_in: &[&str], from_plugins: Vec<String>) -> Vec<String> {
+    built_in
         .iter()
-        .filter(|t| names.contains(&t.name.as_ref()))
-        .cloned()
-        .collect();
-    if kept.len() < names.len() {
-        tracing::warn!(
-            requested = ?names,
-            found = kept.len(),
-            "some requested rag-rat tools were not offered by the server"
-        );
-    }
-    kept
+        .map(|t| t.to_string())
+        .chain(from_plugins)
+        .collect()
 }
 
 /// Everything a full fork+converge run produced. The worktree is the reviewable deliverable and is
@@ -537,7 +646,7 @@ pub async fn run_full(
     // `plan.state.clarifications` already holds the plan-half asks; the fork/bookkeep half gets its
     // own clarifier, drained and appended at the end.
     let mut state = plan.state.clone();
-    let clarifier = NodeClarifier::new(config, store, engine, run_id, issue, client.sink());
+    let clarifier = NodeClarifier::new(config, store, engine, run_id, issue);
 
     // `run_plan` signs off with `Planned`, but a full run is only half done — the fork+converge
     // phase that follows is the longest one. Without this write the store would report `Planned`
@@ -643,12 +752,12 @@ async fn bookkeep_and_checkpoint(
     let cfg = node_agent_config(
         engine,
         config,
-        &client.tools(),
+        context.pool_for("bookkeeper", client.offer()),
         "bookkeeper",
         bookkeeper::BOOKKEEPER_TOOLS,
     )?;
     let mut tools = cfg.tools;
-    tools.push(clarify::ask_tool());
+    tools.add_local(clarify::ask_tool(), client.sink());
     let node = BookkeeperNode {
         route: cfg.route,
         tools,
@@ -704,7 +813,7 @@ pub async fn run_bookkeeper(
         store.run_status(run_id).await?.as_deref() == Some(RunStatus::Converged.as_str());
 
     // Build the clarifier before `issue` is moved into the input (it clones the issue internally).
-    let clarifier = NodeClarifier::new(config, store, engine, run_id, &issue, client.sink());
+    let clarifier = NodeClarifier::new(config, store, engine, run_id, &issue);
     let input = BookkeeperInput {
         issue,
         analyst,
@@ -768,16 +877,15 @@ async fn fork_and_converge(
                 let cfg = node_agent_config(
                     engine,
                     config,
-                    &client.tools(),
+                    context.pool_for("redteam", client.offer()),
                     "redteam",
                     redteam::CLASSIFIER_TOOLS,
                 )?;
                 let mut tools = cfg.tools;
-                tools.push(clarify::ask_tool());
+                tools.add_local(clarify::ask_tool(), client.sink());
                 Some(redteam::RedTeamClassifier {
                     route: cfg.route,
                     tools,
-                    sink: client.sink(),
                     policy: cfg.policy,
                     max_turns: cfg.max_turns,
                     clarifier: Some(clarifier.as_dyn()),
@@ -941,6 +1049,7 @@ mod agent_config_tests {
             .collect(),
             discovered: vec!["everywhere".to_string(), "analyst-only".to_string()],
             engine: Some(engine),
+            servers: Arc::new(Vec::new()),
         };
 
         // Defaults first, then what the node added.
@@ -952,6 +1061,55 @@ mod agent_config_tests {
         assert_eq!(context.for_node("scout"), None);
         // A node with no ruleset still gets the defaults.
         assert_eq!(context.for_node("bookkeeper").as_deref(), Some("SHARED"));
+    }
+
+    /// A plugin declaring one MCP server, for the start-decision tests.
+    fn plugin_with_server(name: &str, server: &str) -> ratatoskr_plugin::Plugin {
+        ratatoskr_plugin::Plugin {
+            name: name.to_string(),
+            root: PathBuf::from("/nonexistent"),
+            hooks: Vec::new(),
+            mcp_servers: vec![ratatoskr_plugin::McpServerSpec {
+                name: server.to_string(),
+                command: vec!["true".to_string()],
+                env: Default::default(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_server_is_started_once_and_never_a_second_rag_rat() {
+        // The rag-rat plugin declares the very server `[rag_rat]` already launched. Two plugins
+        // naming one server is the same situation a level out: connect it once.
+        let plugins = [
+            plugin_with_server("rag-rat", "rag-rat"),
+            plugin_with_server("linty", "lint"),
+            plugin_with_server("also-linty", "lint"),
+            plugin_with_server("fresh", "fresh"),
+        ];
+
+        assert_eq!(
+            servers_to_start(&plugins)
+                .into_iter()
+                .map(|(plugin, spec)| (plugin, spec.name.as_str()))
+                .collect::<Vec<_>>(),
+            [("linty", "lint"), ("fresh", "fresh")]
+        );
+    }
+
+    #[test]
+    fn a_bound_plugins_tools_are_offered_without_being_named() {
+        // The built-in lists name rag-rat tools; a plugin's are only known once its server has
+        // answered, so they join the default rather than having to be listed.
+        assert_eq!(
+            default_allow(&["semantic_search"], vec!["lint".to_string()]),
+            ["semantic_search", "lint"]
+        );
+        // Nothing bound, nothing added.
+        assert_eq!(
+            default_allow(&["semantic_search"], vec![]),
+            ["semantic_search"]
+        );
     }
 
     #[tokio::test]
@@ -986,7 +1144,7 @@ mod agent_config_tests {
         // The whole point: no `[models.scout]` entry at all.
         config.models.remove("scout");
 
-        let cfg = node_agent_config(&engine, &config, &[], "scout", &[]).unwrap();
+        let cfg = node_agent_config(&engine, &config, ToolSet::default(), "scout", &[]).unwrap();
         assert_eq!(cfg.route.provider, "openai");
         assert_eq!(cfg.route.model, "gpt-5");
         assert_eq!(cfg.system_prompt.as_deref(), Some("Be brief."));
@@ -997,7 +1155,8 @@ mod agent_config_tests {
         let engine = engine("toml-fallback").await;
         let config = RatatoskrConfig::default();
 
-        let cfg = node_agent_config(&engine, &config, &[], "bookkeeper", &[]).unwrap();
+        let cfg =
+            node_agent_config(&engine, &config, ToolSet::default(), "bookkeeper", &[]).unwrap();
         assert_eq!(cfg.route.provider, config.models["bookkeeper"].provider);
         assert_eq!(cfg.route.model, config.models["bookkeeper"].model);
         assert!(cfg.system_prompt.is_none());
@@ -1011,7 +1170,7 @@ mod agent_config_tests {
         config.models.remove("analyst");
 
         assert!(matches!(
-            node_agent_config(&engine, &config, &[], "analyst", &[]),
+            node_agent_config(&engine, &config, ToolSet::default(), "analyst", &[]),
             Err(PlanError::MissingRoute(n)) if n == "analyst"
         ));
     }

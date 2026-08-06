@@ -8,6 +8,7 @@
 use std::fmt::Write as _;
 
 use ratatoskr_graph::{NodeError, parse_validated};
+use ratatoskr_mcp::ToolSet;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::ServerSink;
 use schemars::JsonSchema;
@@ -134,10 +135,10 @@ impl BookkeeperInput {
 }
 
 /// The bookkeeper node. Holds a cheap model route, a small tool subset (for the compose agent), and
-/// the sink (to call `memory_create`).
+/// rag-rat's sink (to call `memory_create` itself, outside the agent).
 pub struct BookkeeperNode {
     pub route: ratatoskr_core::ModelRoute,
-    pub tools: Vec<rmcp::model::Tool>,
+    pub tools: ToolSet,
     pub sink: ServerSink,
     pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
     pub max_turns: Option<usize>,
@@ -161,22 +162,21 @@ impl BookkeeperNode {
         }
 
         let prompt = render_prompt(&input);
-        let raw = ratatoskr_agent::run_structured(
-            "bookkeeper",
-            &self.route,
-            &crate::effective_preamble(
+        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
+            node: "bookkeeper",
+            route: &self.route,
+            preamble: &crate::effective_preamble(
                 PREAMBLE,
                 self.system_prompt.as_deref(),
                 self.context.as_deref(),
             ),
-            &prompt,
-            self.tools.clone(),
-            self.sink.clone(),
-            schemars::schema_for!(MemoryDecision),
-            self.policy.clone(),
-            self.max_turns,
-            self.clarifier.clone(),
-        )
+            question: &prompt,
+            tools: self.tools.clone(),
+            output_schema: schemars::schema_for!(MemoryDecision),
+            policy: self.policy.clone(),
+            max_turns: self.max_turns,
+            clarifier: self.clarifier.clone(),
+        })
         .await
         .map_err(|e| NodeError::Failed(format!("bookkeeper compose failed: {e}")))?;
 

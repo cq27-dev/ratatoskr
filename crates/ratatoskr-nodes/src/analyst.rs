@@ -4,8 +4,7 @@ use std::fmt::Write as _;
 
 use ratatoskr_core::{ModelRoute, RunState};
 use ratatoskr_graph::{Node, NodeError, parse_validated};
-use rmcp::model::Tool;
-use rmcp::service::ServerSink;
+use ratatoskr_mcp::ToolSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -55,8 +54,7 @@ pub struct AnalystOutput {
 /// The analyst node: a stronger agent restricted to impact/lookup tools.
 pub struct AnalystNode {
     pub route: ModelRoute,
-    pub tools: Vec<Tool>,
-    pub sink: ServerSink,
+    pub tools: ToolSet,
     pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
     pub max_turns: Option<usize>,
     /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
@@ -79,23 +77,22 @@ impl Node for AnalystNode {
         _run_state: &RunState,
     ) -> Result<AnalystOutput, NodeError> {
         let prompt = render_prompt(&input);
-        let raw = ratatoskr_agent::run_structured(
-            "analyst",
-            &self.route,
-            &crate::effective_preamble(
+        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
+            node: "analyst",
+            route: &self.route,
+            preamble: &crate::effective_preamble(
                 PREAMBLE,
                 self.system_prompt.as_deref(),
                 self.context.as_deref(),
             ),
-            &prompt,
-            self.tools.clone(),
-            self.sink.clone(),
-            schemars::schema_for!(AnalystOutput),
-            self.policy.clone(),
-            self.max_turns,
+            question: &prompt,
+            tools: self.tools.clone(),
+            output_schema: schemars::schema_for!(AnalystOutput),
+            policy: self.policy.clone(),
+            max_turns: self.max_turns,
             // Analyst is the clarification terminus — it answers other nodes but never asks.
-            None,
-        )
+            clarifier: None,
+        })
         .await
         .map_err(|e| NodeError::Failed(format!("analyst agent failed: {e}")))?;
 

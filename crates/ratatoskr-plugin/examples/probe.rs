@@ -17,6 +17,9 @@ async fn main() {
                 h.event, h.matcher, h.timeout
             );
         }
+        for s in &p.mcp_servers {
+            println!("  mcpServer {} -> {:?} env={:?}", s.name, s.command, s.env);
+        }
     }
     let cwd = std::env::current_dir().unwrap();
     let contexts = ratatoskr_plugin::session_start(&plugins, &cwd).await;

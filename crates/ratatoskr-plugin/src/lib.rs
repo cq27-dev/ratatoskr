@@ -41,6 +41,20 @@ pub struct Plugin {
     /// The plugin's directory, substituted for `${CLAUDE_PLUGIN_ROOT}` in its commands.
     pub root: PathBuf,
     pub hooks: Vec<Hook>,
+    /// MCP servers this plugin brings, in manifest order.
+    pub mcp_servers: Vec<McpServerSpec>,
+}
+
+/// One MCP server a plugin declares: how to launch it, over stdio.
+///
+/// `name` is the key it was declared under, which is the identity two plugins can collide on —
+/// the caller decides what to do about that, since only it knows what is already connected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerSpec {
+    pub name: String,
+    /// Program plus arguments, with `${CLAUDE_PLUGIN_ROOT}` already resolved.
+    pub command: Vec<String>,
+    pub env: BTreeMap<String, String>,
 }
 
 /// One hook a plugin registers.
@@ -56,6 +70,26 @@ pub struct Hook {
 #[derive(Debug, Deserialize)]
 struct Manifest {
     name: Option<String>,
+    #[serde(default, rename = "mcpServers")]
+    mcp_servers: BTreeMap<String, ServerEntry>,
+}
+
+/// The `.mcp.json` a plugin may carry instead of (or as well as) a manifest `mcpServers` block.
+#[derive(Debug, Deserialize)]
+struct McpFile {
+    #[serde(default, rename = "mcpServers")]
+    mcp_servers: BTreeMap<String, ServerEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerEntry {
+    /// Absent for the transports we don't speak (`http`, `sse`); such an entry is skipped.
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,8 +164,55 @@ fn load(root: &Path) -> Option<Plugin> {
     Some(Plugin {
         name,
         hooks: read_hooks(root),
+        mcp_servers: read_mcp_servers(root, manifest.mcp_servers),
         root: root.to_path_buf(),
     })
+}
+
+/// The MCP servers a plugin declares, from its manifest and from a sibling `.mcp.json`.
+///
+/// Both spellings are in use, and a plugin commonly carries the same block twice so it works in
+/// hosts that read one or the other. The manifest wins on a shared name so the file cannot
+/// silently redirect a server the manifest already described.
+fn read_mcp_servers(root: &Path, manifest: BTreeMap<String, ServerEntry>) -> Vec<McpServerSpec> {
+    let mut declared = manifest;
+    if let Ok(raw) = std::fs::read_to_string(root.join(".mcp.json")) {
+        match serde_json::from_str::<McpFile>(&raw) {
+            Ok(file) => {
+                for (name, entry) in file.mcp_servers {
+                    declared.entry(name).or_insert(entry);
+                }
+            }
+            Err(e) => tracing::warn!("ignoring .mcp.json for plugin at {}: {e}", root.display()),
+        }
+    }
+
+    declared
+        .into_iter()
+        .filter_map(|(name, entry)| {
+            // A remote-transport entry names no command. Nothing here can launch it, and pretending
+            // otherwise would spawn the wrong thing.
+            let program = entry.command?;
+            let command = std::iter::once(program)
+                .chain(entry.args)
+                .map(|s| substitute_root(&s, root))
+                .collect();
+            let env = entry
+                .env
+                .into_iter()
+                .map(|(k, v)| (k, substitute_root(&v, root)))
+                .collect();
+            Some(McpServerSpec { name, command, env })
+        })
+        .collect()
+}
+
+/// Resolve `${CLAUDE_PLUGIN_ROOT}` — how a plugin addresses its own files.
+///
+/// Hooks get this through the environment (a shell expands it), but a server is launched directly,
+/// with no shell to do the expansion.
+fn substitute_root(text: &str, root: &Path) -> String {
+    text.replace("${CLAUDE_PLUGIN_ROOT}", &root.display().to_string())
 }
 
 /// Hooks are conventional, not declared in the manifest, and a plugin without them is normal.
@@ -306,6 +387,67 @@ async fn run_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_servers_are_read_from_either_spelling_and_rooted() {
+        // Plugins commonly carry the same block twice so it works in hosts that read one or the
+        // other; `${CLAUDE_PLUGIN_ROOT}` is how a plugin addresses its own files, and a server is
+        // launched with no shell to expand it.
+        let root = plugin_dir(
+            "servers",
+            r#"{
+                "name": "served",
+                "mcpServers": {
+                    "local": {
+                        "command": "${CLAUDE_PLUGIN_ROOT}/bin/serve",
+                        "args": ["--root", "${CLAUDE_PLUGIN_ROOT}"],
+                        "env": { "DATA": "${CLAUDE_PLUGIN_ROOT}/data" }
+                    },
+                    "remote": { "type": "http", "url": "https://example.invalid/mcp" }
+                }
+            }"#,
+            None,
+        );
+        std::fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers": {
+                "local": {"command": "should-not-win"},
+                "extra": {"command": "npx", "args": ["-y", "extra"]}
+            }}"#,
+        )
+        .unwrap();
+
+        let found = discover(std::slice::from_ref(&root));
+        let here = root.display().to_string();
+        assert_eq!(
+            found[0]
+                .mcp_servers
+                .iter()
+                .map(|s| (s.name.as_str(), s.command.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "extra",
+                    vec!["npx".to_string(), "-y".to_string(), "extra".to_string()]
+                ),
+                (
+                    "local",
+                    vec![
+                        format!("{here}/bin/serve"),
+                        "--root".to_string(),
+                        here.clone()
+                    ]
+                ),
+            ],
+            "the manifest wins on a shared name, and a transport we can't launch is skipped"
+        );
+        assert_eq!(
+            found[0].mcp_servers[1].env.get("DATA"),
+            Some(&format!("{here}/data"))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A plugin directory, built for one test.
     fn plugin_dir(case: &str, manifest: &str, hooks: Option<&str>) -> PathBuf {
