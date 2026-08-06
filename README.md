@@ -216,6 +216,29 @@ Note that existing plugins match a coding CLI's tool vocabulary (`^(Grep|Read|Ba
 and a planning node calls none of those — this is for hooks written against the tools nodes
 actually call, like `semantic_search` and `impact_surface`.
 
+A plugin's **skills** are offered to the nodes that bind it. Each is a `skills/<name>/SKILL.md` (or
+a bare `SKILL.md` for a plugin that is one skill) whose frontmatter says when it applies:
+
+```markdown
+---
+name: dream-review
+description: Use when asked to triage the memory-maintenance worklist.
+---
+
+# dream-review
+
+Instructions the node follows once it has chosen this skill.
+```
+
+A node carries every bound skill's *description* in the schema of a synthetic `Skill` tool, and
+loads the *body* of the one it picks as that tool's result — so the instructions cost nothing until
+they are wanted, which is the point of a skill over a longer `systemPrompt`. The tool is named as
+the format names it, and a node that binds no skills is offered no tool.
+
+Only `name` and `description` are read. The rest of the frontmatter (`allowed-tools`, `model`,
+`hooks`, `shell`) describes capabilities of a coding CLI that a node cannot honour, and is ignored
+rather than half-applied. `${CLAUDE_SKILL_DIR}` in a body resolves to the skill's own directory.
+
 ### Scripted orchestration
 
 `.ratatoskr/workflow.ts` replaces the built-in run flow outright when present, letting a repo

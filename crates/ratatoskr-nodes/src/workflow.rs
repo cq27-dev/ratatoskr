@@ -200,12 +200,14 @@ where
 async fn scout_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
     ctx.guard()?;
     let issue: String = serde_json::from_str(&arg).map_err(|e| format!("scout arg: {e}"))?;
+    let plugins = ctx.plugin_context.for_node("scout");
     let cfg = node_agent_config(
         &ctx.engine,
         &ctx.config,
         ctx.plugin_context.pool_for("scout", ctx.rag_rat.clone()),
         "scout",
         scout::SCOUT_TOOLS,
+        &plugins,
     )
     .map_err(|e| e.to_string())?;
     let node = ScoutNode {
@@ -216,7 +218,7 @@ async fn scout_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, St
         // Node-to-node clarification is built-in-flow only for now; the scripted path opts out.
         clarifier: None,
         system_prompt: cfg.system_prompt,
-        plugins: ctx.plugin_context.for_node("scout"),
+        plugins,
     };
     let out = node
         .run(issue, &RunState::new(&ctx.run_id, None))
@@ -249,12 +251,14 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
     ctx.guard()?;
     let input: analyst::AnalystInput =
         serde_json::from_str(&arg).map_err(|e| format!("analyze arg: {e}"))?;
+    let plugins = ctx.plugin_context.for_node("analyst");
     let cfg = node_agent_config(
         &ctx.engine,
         &ctx.config,
         ctx.plugin_context.pool_for("analyst", ctx.rag_rat.clone()),
         "analyst",
         analyst::ANALYST_TOOLS,
+        &plugins,
     )
     .map_err(|e| e.to_string())?;
     let node = AnalystNode {
@@ -263,7 +267,7 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
         policy: cfg.policy,
         max_turns: cfg.max_turns,
         system_prompt: cfg.system_prompt,
-        plugins: ctx.plugin_context.for_node("analyst"),
+        plugins,
     };
     let out = node
         .run(input, &RunState::new(&ctx.run_id, None))
@@ -279,12 +283,14 @@ fn build_red_team(ctx: &WorkflowContext) -> Result<RedTeamNode, PlanError> {
     let short: String = ctx.run_id.chars().take(8).collect();
     let classifier = match crate::classifier_enabled(&ctx.engine, &ctx.config) {
         true => {
+            let plugins = ctx.plugin_context.for_node("redteam");
             let cfg = node_agent_config(
                 &ctx.engine,
                 &ctx.config,
                 ctx.plugin_context.pool_for("redteam", ctx.rag_rat.clone()),
                 "redteam",
                 redteam::CLASSIFIER_TOOLS,
+                &plugins,
             )?;
             Some(redteam::RedTeamClassifier {
                 route: cfg.route,
@@ -293,7 +299,7 @@ fn build_red_team(ctx: &WorkflowContext) -> Result<RedTeamNode, PlanError> {
                 max_turns: cfg.max_turns,
                 clarifier: None,
                 system_prompt: cfg.system_prompt,
-                plugins: ctx.plugin_context.for_node("redteam"),
+                plugins,
             })
         }
         false => None,
@@ -629,6 +635,7 @@ async fn bookkeep_scripted(
     ctx: &WorkflowContext,
     input: BookkeeperInput,
 ) -> Result<BookkeeperOutput, PlanError> {
+    let plugins = ctx.plugin_context.for_node("bookkeeper");
     let cfg = node_agent_config(
         &ctx.engine,
         &ctx.config,
@@ -636,6 +643,7 @@ async fn bookkeep_scripted(
             .pool_for("bookkeeper", ctx.rag_rat.clone()),
         "bookkeeper",
         bookkeeper::BOOKKEEPER_TOOLS,
+        &plugins,
     )?;
     let node = BookkeeperNode {
         route: cfg.route,
@@ -645,7 +653,7 @@ async fn bookkeep_scripted(
         max_turns: cfg.max_turns,
         clarifier: None,
         system_prompt: cfg.system_prompt,
-        plugins: ctx.plugin_context.for_node("bookkeeper"),
+        plugins,
     };
     let out = node
         .run(input)
