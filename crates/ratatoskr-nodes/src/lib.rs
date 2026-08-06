@@ -13,6 +13,7 @@ pub mod converge;
 pub mod implementer;
 pub mod memory;
 pub mod overseer;
+pub mod publisher;
 pub mod redteam;
 pub mod scout;
 pub mod skills;
@@ -26,6 +27,7 @@ pub use context::{Constraint, ContextNode, ContextOutput};
 pub use implementer::{ImplementerNode, ImplementerOutput};
 pub use memory::{MemoryNode, MemoryOutput, MemoryRecord};
 pub use overseer::{OverseerNode, OverseerOutput};
+pub use publisher::{PublisherNode, PublisherOutput};
 pub use redteam::{RedTeamNode, RedTeamOutput};
 pub use scout::{RelatedItem, ScoutNode, ScoutOutput};
 pub use verifier::{Finding, FindingKind, Severity, VerifierNode, VerifierOutput};
@@ -482,6 +484,7 @@ pub const BUILT_IN: &str = "built-in";
 /// workflow may add to this set; see [`Workflow::nodes`].
 pub const BUILT_IN_NODES: &[&str] = &[
     "overseer",
+    "publisher",
     "context",
     "scout",
     "analyst",
@@ -1304,6 +1307,7 @@ fn fork_is_needed(analyst: &AnalystOutput, config: &RatatoskrConfig) -> bool {
 /// is worth recording, but doing it means teaching that node to compose from the analyst alone,
 /// which is a change to what it produces rather than to when it fires.
 async fn no_code_change(
+    run: &Run<'_>,
     store: &Store,
     run_id: &str,
     context: &PluginContext,
@@ -1318,10 +1322,28 @@ async fn no_code_change(
     if let Err(e) = store.upsert_run(run_id, None, status.as_str()).await {
         tracing::warn!("failed to record the run's final status: {e}");
     }
+    // This is the run the publisher exists for. Its deliverable is the plan, and before there was
+    // anywhere to send it the whole thing finished as a checkpoint in SQLite that somebody had to
+    // go and find.
+    let published = publish_if_enabled(
+        run,
+        publisher::PublisherInput {
+            issue: run.issue.to_string(),
+            analyst: plan.analyst.clone(),
+            implementer: None,
+            status: status.as_str().to_string(),
+            iterations: 0,
+        },
+        true,
+    )
+    .await;
     context.session_end(status.as_str()).await;
 
     let mut state = plan.state.clone();
     state.status = status;
+    if let Some(p) = &published {
+        state.artifacts.push(serde_json::to_value(p)?);
+    }
     Ok(RunOutcome {
         state,
         plan,
@@ -1385,16 +1407,32 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
         }
     };
 
+    // Built before the fork decision, because the no-code-change path publishes too and a
+    // publisher needs the same run handle every other node gets.
+    let clarifier = NodeClarifier::new(config, store, engine, run_id, issue);
+    let ledger = Arc::new(RunLedger::default());
+    let run = Run {
+        client,
+        config,
+        store,
+        run_id,
+        issue,
+        engine,
+        clarifier: &clarifier,
+        ledger: &ledger,
+        // The plan half's context, reused: `SessionStart` runs once per run, not once per stage.
+        context: &plan_context,
+    };
+
     // Some tasks call for no code change: research, a review, an architecture answer. Running the
     // fork for one costs a sandboxed baseline test run and an ACP session to produce an empty diff,
     // and then reports `Converged` — a success claim about a change that was never made.
     if !fork_is_needed(&plan.analyst, config) {
-        return no_code_change(store, run_id, &plan_context, plan).await;
+        return no_code_change(&run, store, run_id, &plan_context, plan).await;
     }
     // `plan.state.clarifications` already holds the plan-half asks; the fork/bookkeep half gets its
     // own clarifier, drained and appended at the end.
     let mut state = plan.state.clone();
-    let clarifier = NodeClarifier::new(config, store, engine, run_id, issue);
 
     // `run_plan` signs off with `Planned`, but a full run is only half done — the fork+converge
     // phase that follows is the longest one. Without this write the store would report `Planned`
@@ -1410,19 +1448,6 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
         tracing::warn!("failed to record run status before the fork: {e}");
     }
 
-    let ledger = Arc::new(RunLedger::default());
-    let run = Run {
-        client,
-        config,
-        store,
-        run_id,
-        issue,
-        engine,
-        clarifier: &clarifier,
-        ledger: &ledger,
-        // The plan half's context, reused: `SessionStart` runs once per run, not once per stage.
-        context: &plan_context,
-    };
     let result = fork_and_converge(&run, &plan).await;
 
     let status = match &result {
@@ -1443,33 +1468,53 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
     // `MaxIterationsReached` (record the wall, tagged `unresolved`), or `Unreviewed` — a change was
     // still made and its friction is still worth recording, whether or not anyone reviewed it. A
     // bookkeeping failure is logged but doesn't discard the run's work.
-    let bookkeeper = if matches!(
+    let terminal = matches!(
         status,
         RunStatus::Converged | RunStatus::MaxIterationsReached | RunStatus::Unreviewed
-    ) {
-        // Read back what the run's own checkpoints recorded about its path. The same source the
-        // `bookkeep` replay reads, so a replay composes from exactly what the live run did.
-        let input = BookkeeperInput {
-            issue: issue.to_string(),
-            analyst: plan.analyst.clone(),
-            implementer: implementer.clone(),
-            iterations,
-            converged: status == RunStatus::Converged,
-            friction: friction_of(store, run_id).await,
-        };
-        match bookkeep_and_checkpoint(&run, input).await {
-            Ok(bk) => {
-                state.artifacts = vec![serde_json::to_value(&bk)?];
-                Some(bk)
+    );
+    // Concurrently: one writes to the memory graph, the other to the tracker, and neither needs
+    // the other's result. `join!` rather than spawn — both are I/O-bound and borrow their inputs.
+    let (bookkeeper, published) = tokio::join!(
+        async {
+            if !terminal {
+                return None;
             }
-            Err(e) => {
-                tracing::warn!("bookkeeping failed: {e}");
-                None
+            // Read back what the run's own checkpoints recorded about its path. The same source
+            // the `bookkeep` replay reads, so a replay composes from what the live run did.
+            let input = BookkeeperInput {
+                issue: issue.to_string(),
+                analyst: plan.analyst.clone(),
+                implementer: implementer.clone(),
+                iterations,
+                converged: status == RunStatus::Converged,
+                friction: friction_of(store, run_id).await,
+            };
+            match bookkeep_and_checkpoint(&run, input).await {
+                Ok(bk) => Some(bk),
+                Err(e) => {
+                    tracing::warn!("bookkeeping failed: {e}");
+                    None
+                }
             }
-        }
-    } else {
-        None
-    };
+        },
+        publish_if_enabled(
+            &run,
+            publisher::PublisherInput {
+                issue: issue.to_string(),
+                analyst: plan.analyst.clone(),
+                implementer: Some(implementer.clone()),
+                status: status.as_str().to_string(),
+                iterations,
+            },
+            terminal,
+        )
+    );
+    if let Some(bk) = &bookkeeper {
+        state.artifacts = vec![serde_json::to_value(bk)?];
+    }
+    if let Some(p) = &published {
+        state.artifacts.push(serde_json::to_value(p)?);
+    }
 
     // Append the fork/bookkeep-half clarifications to the plan-half ones.
     state.clarifications.extend(clarifier.drain());
@@ -1484,6 +1529,86 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
         status,
         bookkeeper,
     })
+}
+
+/// Run the publisher, when this repo has turned it on and there is an outcome worth delivering.
+///
+/// Best-effort, like bookkeeping: the change is made, the tests are recorded, and failing the run
+/// because a tracker was unreachable would discard completed work over a delivery problem.
+async fn publish_if_enabled(
+    run: &Run<'_>,
+    input: publisher::PublisherInput,
+    terminal: bool,
+) -> Option<PublisherOutput> {
+    if !terminal || !run.config.publish.enabled {
+        return None;
+    }
+    match publish_and_checkpoint(run, input).await {
+        Ok(out) => Some(out),
+        Err(e) => {
+            tracing::warn!("publishing failed: {e}");
+            None
+        }
+    }
+}
+
+/// Build the publisher, run it, and checkpoint what it did.
+async fn publish_and_checkpoint(
+    run: &Run<'_>,
+    input: publisher::PublisherInput,
+) -> Result<PublisherOutput, PlanError> {
+    let &Run {
+        client,
+        config,
+        store,
+        run_id,
+        engine,
+        context,
+        ledger,
+        ..
+    } = run;
+    let plugins = context.for_node("publisher");
+    let cfg = node_agent_config(
+        engine,
+        config,
+        context.pool_for("publisher", client.offer()),
+        "publisher",
+        &[],
+        &plugins,
+    )?;
+    let mut tools = cfg.tools;
+    // The one tool that writes outside this machine. Added here rather than in the default list so
+    // no other node can be handed it by widening a shared constant.
+    tools
+        .local()
+        .tools
+        .push(ratatoskr_agent::publish::declaration());
+
+    let node = PublisherNode {
+        route: cfg.route,
+        tools,
+        policy: cfg.policy,
+        max_turns: cfg.max_turns,
+        system_prompt: cfg.system_prompt,
+        plugins,
+        ledger: Some(Arc::clone(ledger)),
+        files: cfg.files,
+    };
+    let out = node
+        .run(input)
+        .await
+        .map_err(|e| PlanError::node("publisher", e))?;
+    record(Record {
+        store,
+        run_id,
+        node: "publisher",
+        output: &out,
+        input: None,
+        iteration: None,
+        ledger: Some(ledger),
+    })
+    .await?;
+    Ok(out)
 }
 
 /// Build the bookkeeper node, run it, and checkpoint its output. Shared by `run_full` (auto path)
