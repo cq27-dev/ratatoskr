@@ -5,6 +5,12 @@
 //! terminal status is inferred from checkpoints after the script returns (never trusted from the
 //! script). A missing `workflow.ts` runs the built-in Rust flow unchanged (see [`super::run_full`]).
 //!
+//! Gates the script cannot weaken: schema validation and checkpointing per binding, the
+//! false-convergence guard in `redTeam`, `max_iterations` in `iterate`, the referee check, the
+//! acceptance frozen on first use, and the review — a run that called `verify()` and left blocking
+//! findings standing is not converged, because the terminal status is read from the checkpoint
+//! rather than from what the script returned.
+//!
 //! `ratatoskr-script` can't call the nodes (it depends only on `ratatoskr-core`), so the bindings
 //! live here and plug into `WorkflowRuntime` as `HostFn`s.
 
@@ -28,7 +34,7 @@ use crate::{
     AnalystNode, AnalystOutput, BookkeeperInput, BookkeeperNode, BookkeeperOutput, ImplementerNode,
     ImplementerOutput, MemoryNode, MemoryOutput, PlanError, PlanOutcome, RedTeamNode,
     RedTeamOutput, RunOutcome, ScoutNode, ScoutOutput, analyst, bookkeeper, checkpoint, converge,
-    memory, node_agent_config, redteam, scout,
+    memory, node_agent_config, redteam, scout, verifier,
 };
 
 /// Backstop on total node-running binding calls per run — a runaway-loop guard, far above any real
@@ -60,6 +66,13 @@ pub struct WorkflowContext {
     /// Where this run's nodes report what their turns cost. A scripted run records the same
     /// telemetry as a built-in one — the script chooses the order, not what gets measured.
     ledger: Arc<ratatoskr_agent::RunLedger>,
+    /// The acceptance this run is judged by, resolved once and reused.
+    ///
+    /// The built-in flow resolves it before the fork and freezes it for the same reason it matters
+    /// more here: a script can re-analyse between iterations, and if each binding resolved its own
+    /// the plan could move the bar it is judged against mid-run. Whichever binding runs acceptance
+    /// first decides it; everything after gets that.
+    acceptance: Mutex<Option<Vec<ratatoskr_core::AcceptanceStep>>>,
 }
 
 impl WorkflowContext {
@@ -76,6 +89,7 @@ impl WorkflowContext {
             .map_err(|e| PlanError::node("workflow", NodeError::Failed(format!("cwd: {e}"))))?;
         Ok(Arc::new(Self {
             ledger: Arc::new(ratatoskr_agent::RunLedger::default()),
+            acceptance: Mutex::new(None),
             plugin_context,
             config: config.clone(),
             store: store.clone(),
@@ -91,6 +105,16 @@ impl WorkflowContext {
             invocations: AtomicUsize::new(0),
             iterations: AtomicU32::new(0),
         }))
+    }
+
+    /// The acceptance steps for this run, resolved from `proposed` the first time and frozen.
+    fn acceptance(
+        &self,
+        proposed: &[ratatoskr_core::AcceptanceStep],
+    ) -> Vec<ratatoskr_core::AcceptanceStep> {
+        let mut slot = self.acceptance.lock().expect("acceptance mutex poisoned");
+        slot.get_or_insert_with(|| self.config.sandbox.acceptance(proposed))
+            .clone()
     }
 
     /// Count one node-running binding call and refuse past the ceiling.
@@ -136,11 +160,26 @@ fn infer_status(
     red_team: &RedTeamOutput,
     implementer: &ImplementerOutput,
     may_modify_tests: &[String],
+    review: Option<&verifier::VerifierOutput>,
+    threshold: verifier::Severity,
 ) -> RunStatus {
     let referee = converge::referee_touches(&implementer.touched_files, may_modify_tests);
     if !referee.is_empty() {
         tracing::warn!(files = ?referee, "run touched the referee; not converged");
         return RunStatus::MaxIterationsReached;
+    }
+    // A script chooses when to review; it does not get to ignore what a review said. Calling
+    // `verify()`, leaving blocking findings standing and returning is not convergence — and
+    // inferring the status from the checkpoint rather than the script is what makes that true.
+    if let Some(review) = review {
+        let blocking = review.blocking(threshold);
+        if !blocking.is_empty() {
+            tracing::warn!(
+                blocking = blocking.len(),
+                "the review left blocking findings; not converged"
+            );
+            return RunStatus::MaxIterationsReached;
+        }
     }
     let post_ran = converge::test_command_ran(
         &implementer.failing_tests,
@@ -373,7 +412,7 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
         .await
         .map(|a| a.acceptance)
         .unwrap_or_default();
-    let acceptance = ctx.config.sandbox.acceptance(&planned);
+    let acceptance = ctx.acceptance(&planned);
     let node = build_red_team(&ctx, acceptance).map_err(|e| e.to_string())?;
     let out = node.run().await.map_err(|e| e.to_string())?;
     // Checkpoint before the guard so a failed baseline stays inspectable.
@@ -390,7 +429,7 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
 
 fn build_implementer(ctx: &WorkflowContext, analyst: AnalystOutput) -> ImplementerNode {
     ImplementerNode {
-        acceptance: ctx.config.sandbox.acceptance(&analyst.acceptance),
+        acceptance: ctx.acceptance(&analyst.acceptance),
         characterizer: crate::build_characterizer(
             &ctx.engine,
             &ctx.config,
@@ -518,6 +557,132 @@ async fn newly_introduced_host(_ctx: Arc<WorkflowContext>, arg: String) -> Resul
     serde_json::to_string(&v).map_err(|e| e.to_string())
 }
 
+/// What `verify()` hands the script.
+///
+/// `blocking` is the part that matters and the part the script does not get to compute: Rust reads
+/// `[implementer] verify_threshold` and decides what clears it. A workflow chooses *whether* to
+/// review and what to do about findings; it cannot decide that a P1 is not a P1.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifyResult {
+    /// False when no `[models.verifier]` route is configured — the run is unreviewed and the
+    /// script should be able to tell that apart from a clean review.
+    configured: bool,
+    /// True when the verifier could not be reached. Not a finding: it says nothing about the
+    /// change, and treating it as a clean review would claim a review nobody performed.
+    unavailable: bool,
+    /// Everything found, including what fell below the threshold — recorded, not blocking.
+    findings: Vec<verifier::Finding>,
+    /// What blocks, worst first.
+    blocking: Vec<verifier::Finding>,
+    /// Whether any blocking finding faults the PLAN rather than the code. The script's cue to
+    /// re-analyse before re-driving the implementer, instead of sending it back at a requirement
+    /// already shown to be wrong.
+    needs_replan: bool,
+}
+
+/// `verify({ analyst })` — read the worktree's diff against the plan.
+///
+/// Mirrors the built-in flow's second gate. The script decides when to call it; every judgement
+/// inside stays here.
+async fn verify_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct Arg {
+        analyst: AnalystOutput,
+    }
+    ctx.guard()?;
+    let input: Arg = serde_json::from_str(&arg).map_err(|e| format!("verify arg: {e}"))?;
+
+    let none = |configured, unavailable| {
+        serde_json::to_string(&VerifyResult {
+            configured,
+            unavailable,
+            findings: Vec::new(),
+            blocking: Vec::new(),
+            needs_replan: false,
+        })
+        .map_err(|e| e.to_string())
+    };
+    if !crate::verifier_enabled(&ctx.engine, &ctx.config) {
+        return none(false, false);
+    }
+    let worktree = ctx
+        .worktree
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| "verify() called before implement()".to_string())?;
+    let implementer: ImplementerOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "implementer")
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let plugins = ctx.plugin_context.for_node("verifier");
+    let cfg = node_agent_config(
+        &ctx.engine,
+        &ctx.config,
+        ctx.plugin_context.pool_for("verifier", ctx.rag_rat.clone()),
+        "verifier",
+        verifier::VERIFIER_TOOLS,
+        &plugins,
+    )
+    .map_err(|e| e.to_string())?;
+    let node = verifier::VerifierNode {
+        route: cfg.route,
+        tools: cfg.tools,
+        files: cfg.files,
+        ledger: Some(Arc::clone(&ctx.ledger)),
+        policy: cfg.policy,
+        max_turns: cfg.max_turns,
+        system_prompt: cfg.system_prompt,
+        plugins,
+    };
+
+    // The patch, not the `--stat` the implementer records: a summary cannot show a weakened
+    // assertion, which is one of the things this gate exists to catch.
+    let diff = ratatoskr_exec::diff_text(&worktree)
+        .await
+        .unwrap_or_default();
+    let out = match node
+        .run(verifier::VerifierInput {
+            issue: ctx.issue.clone(),
+            analyst: input.analyst,
+            diff,
+            touched_files: implementer.touched_files.clone(),
+        })
+        .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            // A verifier that cannot run must not fail a change that was made and passed. Recorded
+            // and reported as unavailable, exactly as the built-in flow treats it.
+            tracing::warn!("the verifier could not review this change: {e}");
+            note(
+                &ctx,
+                "verifier",
+                &serde_json::json!({ "error": e.to_string() }),
+                None,
+            )
+            .await?;
+            return none(true, true);
+        }
+    };
+    note(&ctx, "verifier", &out, None).await?;
+
+    let threshold = crate::parse_threshold(&ctx.config.implementer.verify_threshold);
+    let blocking: Vec<verifier::Finding> = out.blocking(threshold).into_iter().cloned().collect();
+    let needs_replan = blocking
+        .iter()
+        .any(|f| f.kind == verifier::FindingKind::Plan);
+    serde_json::to_string(&VerifyResult {
+        configured: true,
+        unavailable: false,
+        findings: out.findings,
+        blocking,
+        needs_replan,
+    })
+    .map_err(|e| e.to_string())
+}
+
 fn build_hosts(ctx: &Arc<WorkflowContext>) -> HashMap<String, HostFn> {
     let mut h = HashMap::new();
     h.insert("scout".into(), binding(Arc::clone(ctx), scout_host));
@@ -526,6 +691,7 @@ fn build_hosts(ctx: &Arc<WorkflowContext>) -> HashMap<String, HostFn> {
     h.insert("redTeam".into(), binding(Arc::clone(ctx), red_team_host));
     h.insert("implement".into(), binding(Arc::clone(ctx), implement_host));
     h.insert("iterate".into(), binding(Arc::clone(ctx), iterate_host));
+    h.insert("verify".into(), binding(Arc::clone(ctx), verify_host));
     h.insert(
         "isConverged".into(),
         binding(Arc::clone(ctx), is_converged_host),
@@ -666,7 +832,20 @@ async fn finish_full(ctx: &Arc<WorkflowContext>) -> Result<RunOutcome, PlanError
     let worktree = WorktreePath(PathBuf::from(&implementer.worktree_path));
 
     // Terminal status is Rust-inferred, never trusted from the script.
-    let status = infer_status(&red_team, &implementer, ctx.engine.may_modify_tests());
+    // The last review, if the script ran one. Absent is not the same as clean: a workflow that
+    // never verified simply has no verifier checkpoint, and the warning at run start already said
+    // the change would be accepted on its tests alone.
+    let review: Option<verifier::VerifierOutput> =
+        latest_checkpoint(&ctx.store, &ctx.run_id, "verifier")
+            .await
+            .ok();
+    let status = infer_status(
+        &red_team,
+        &implementer,
+        ctx.engine.may_modify_tests(),
+        review.as_ref(),
+        crate::parse_threshold(&ctx.config.implementer.verify_threshold),
+    );
     ctx.store
         .upsert_run(&ctx.run_id, None, status.as_str())
         .await?;
@@ -782,18 +961,36 @@ mod tests {
         let baseline = red(&["a"], &["b"], 1);
         // Post ran and introduced nothing the baseline lacked → converged.
         assert_eq!(
-            infer_status(&baseline, &imp(&["a"], &["b", "c"], 0), &[]),
+            infer_status(
+                &baseline,
+                &imp(&["a"], &["b", "c"], 0),
+                &[],
+                None,
+                verifier::Severity::P2
+            ),
             RunStatus::Converged
         );
         // Post introduced a new failure → wall, not converged.
         assert_eq!(
-            infer_status(&baseline, &imp(&["a", "c"], &["b"], 1), &[]),
+            infer_status(
+                &baseline,
+                &imp(&["a", "c"], &["b"], 1),
+                &[],
+                None,
+                verifier::Severity::P2
+            ),
             RunStatus::MaxIterationsReached
         );
         // Post didn't run to completion (no tests) → wall, even with an empty failing list — this is
         // the P1a check the hardcoded loop also applies to the implementer output.
         assert_eq!(
-            infer_status(&baseline, &imp(&[], &[], 101), &[]),
+            infer_status(
+                &baseline,
+                &imp(&[], &[], 101),
+                &[],
+                None,
+                verifier::Severity::P2
+            ),
             RunStatus::MaxIterationsReached
         );
     }
@@ -805,12 +1002,18 @@ mod tests {
         let mut cheated = imp(&[], &["a", "b"], 0);
         cheated.touched_files = vec!["conftest.py".to_string()];
         assert_eq!(
-            infer_status(&baseline, &cheated, &[]),
+            infer_status(&baseline, &cheated, &[], None, verifier::Severity::P2),
             RunStatus::MaxIterationsReached
         );
         // Unless the task declared it up front.
         assert_eq!(
-            infer_status(&baseline, &cheated, &["conftest.py".to_string()]),
+            infer_status(
+                &baseline,
+                &cheated,
+                &["conftest.py".to_string()],
+                None,
+                verifier::Severity::P2
+            ),
             RunStatus::Converged
         );
     }
@@ -890,5 +1093,87 @@ mod tests {
                 .unwrap(),
             3
         );
+    }
+
+    fn finding(severity: verifier::Severity) -> verifier::Finding {
+        verifier::Finding {
+            severity,
+            kind: verifier::FindingKind::Execution,
+            file: "a.rs".into(),
+            line: None,
+            summary: "s".into(),
+            failure_scenario: "f".into(),
+        }
+    }
+
+    #[test]
+    fn a_script_cannot_converge_over_a_review_it_ignored() {
+        // Calling verify(), leaving blocking findings standing and returning is not convergence.
+        // The status is inferred from the checkpoint, so ignoring the result is not an option the
+        // script has.
+        let baseline = red(&["a"], &["b"], 1);
+        let clean_tests = imp(&["a"], &["b", "c"], 0);
+        let blocked = verifier::VerifierOutput {
+            findings: vec![finding(verifier::Severity::P1)],
+            assessment: String::new(),
+        };
+        assert_eq!(
+            infer_status(
+                &baseline,
+                &clean_tests,
+                &[],
+                Some(&blocked),
+                verifier::Severity::P2
+            ),
+            RunStatus::MaxIterationsReached
+        );
+
+        // A review that found only what falls below the threshold does not block — recorded is not
+        // the same as blocking.
+        let nits = verifier::VerifierOutput {
+            findings: vec![finding(verifier::Severity::P3)],
+            assessment: String::new(),
+        };
+        assert_eq!(
+            infer_status(
+                &baseline,
+                &clean_tests,
+                &[],
+                Some(&nits),
+                verifier::Severity::P2
+            ),
+            RunStatus::Converged
+        );
+
+        // And a workflow that never reviewed converges on its tests, which is the behaviour the
+        // run-start warning describes rather than a silent one.
+        assert_eq!(
+            infer_status(&baseline, &clean_tests, &[], None, verifier::Severity::P2),
+            RunStatus::Converged
+        );
+    }
+
+    #[test]
+    fn acceptance_is_decided_once_and_reused() {
+        // A script can re-analyse between iterations. If each binding resolved its own acceptance,
+        // the plan could move the bar it is judged against mid-run.
+        let step = |name: &str| ratatoskr_core::AcceptanceStep {
+            name: name.to_string(),
+            command: vec![name.to_string()],
+        };
+        let config = RatatoskrConfig::default();
+        let slot: Mutex<Option<Vec<ratatoskr_core::AcceptanceStep>>> = Mutex::new(None);
+        let resolve = |proposed: &[ratatoskr_core::AcceptanceStep]| {
+            let mut guard = slot.lock().unwrap();
+            guard
+                .get_or_insert_with(|| config.sandbox.acceptance(proposed))
+                .clone()
+        };
+
+        let first = resolve(&[step("wasm")]);
+        assert_eq!(first[0].name, "wasm");
+        // A later call proposing something else gets what the run already froze.
+        let later = resolve(&[step("something-else")]);
+        assert_eq!(later[0].name, "wasm");
     }
 }
