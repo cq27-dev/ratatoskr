@@ -1,33 +1,58 @@
 # Ratatoskr
 
-An orchestrator for [rag-rat]-driven coding runs. A run is a graph of agent nodes that scout the
-repository, analyse the impact, red-team the baseline, implement the change in an isolated worktree,
-and iterate until the tests agree — checkpointing every step to a local SQLite store.
+An orchestrator for [rag-rat]-driven coding runs. A run is a graph of agent nodes that gather what
+the repository already knows, analyse the impact, red-team the baseline, implement the change in an
+isolated worktree, and iterate until the tests agree and the diff survives review — checkpointing
+every step to a local SQLite store.
 
 The point is the last node. On a finished run the **bookkeeper** writes what was learned back into
-rag-rat's memory, so the *next* run's memory node surfaces it while planning. Runs compound instead
+rag-rat's memory, so the *next* run's context node surfaces it while planning. Runs compound instead
 of starting from zero.
 
+```mermaid
+flowchart LR
+    task([task]) --> overseer{{overseer}}
+    overseer --> context[context]
+    context --> analyst[analyst]
+    analyst --> redteam[red-team]
+    analyst --> impl[implementer]
+    redteam --> tests{tests}
+    impl --> tests
+    tests -->|new failures| impl
+    tests -->|clean| verifier[verifier]
+    verifier -->|execution findings| impl
+    verifier -->|plan findings| analyst
+    verifier -->|nothing blocking| bookkeeper[bookkeeper]
+    bookkeeper -.->|informs the next run| context
+
+    classDef optional stroke-dasharray: 4 3
+    class overseer,verifier optional
 ```
-             ┌─────────── informs the next run ───────────┐
-             ▼                                            │
-context ──→ analyst ─┬─→ red-team ─────┬─→ bookkeeper
-                              └─→ implementer ──┘
-                                    ↑        │
-                                    └────────┘
-                                     converge
-```
+
+Dashed nodes are opt-in: each runs only when it has a model route. Without them a run goes straight
+to the built-in workflow and converges on its test result alone.
 
 ## How a run works
 
-1. **scout** searches the tracker papertrail and the code for what already exists.
-2. **memory** corroborates from rag-rat's own repo memories — prior invariants, decisions, footguns.
-3. **analyst** determines the blast radius and produces the requirements the change must satisfy.
-4. **red-team ∥ implementer** run concurrently: red-team characterises the *baseline* test run in a
-   sandbox, while the implementer drives a coding CLI (Claude Code over ACP) in a fresh git worktree.
-5. **converge** re-runs the implementer with a diagnostic prompt until the change introduces no new
-   failures (`converged`) or the iteration budget runs out (`max_iterations_reached`).
-6. **bookkeeper** distils one durable learning and writes it to rag-rat via `memory_create`.
+1. **overseer** picks which workflow runs the task, when the repo defines more than one, and records
+   why.
+2. **context** gathers what the repository already knows: the tracker papertrail, the code, and
+   rag-rat's own memories. It hands the analyst a distillation — what bears on this task and what
+   constrains it — alongside those memories unmodified, so the interpretation can be checked against
+   its source.
+3. **analyst** determines the blast radius, the requirements the change must satisfy, and the
+   acceptance steps that prove it done.
+4. **red-team ∥ implementer** run concurrently: red-team characterises the *baseline* acceptance run
+   in a sandbox, while the implementer drives a coding CLI (Claude Code over ACP) in a fresh git
+   worktree.
+5. **converge** re-runs the implementer until the change introduces no new failures. An iteration
+   that edited the tests or their runner is refused outright — a gate that can be satisfied by
+   editing itself is not one.
+6. **verifier** reads the diff against the requirements once the tests are clean, and answers what
+   the tests cannot. Findings that fault the *plan* go back to the analyst; the rest go back to the
+   implementer.
+7. **bookkeeper** distils what the run learned — weighted toward what it *struggled* with — and
+   writes it to rag-rat via `memory_create`.
 
 Converge only believes a test run the change did not referee. An iteration that touches the tests,
 their runner config (`conftest.py`, `pytest.ini`, `jest.config.*`, `Cargo.toml`, `package.json`, …)
@@ -66,8 +91,8 @@ With one defined it is used; with several, name one with `--workflow <name>` —
 `[models.overseer]` route and one is chosen per task from the declared purposes and cases, with the
 choice and its reasoning checkpointed. Without either, a repo with several workflows is asked to
 name one rather than guessed at: choosing the alphabetically-first would look like a decision while
-being an accident. With none, the built-in flow above runs. A single `.ratatoskr/workflow.ts` still works and
-is registered under its filename.
+being an accident. With none, the built-in flow above runs. A single `.ratatoskr/workflow.ts` still
+works and is registered under its filename.
 
 Every node's output is validated against its JSON Schema and checkpointed before the next node
 runs, so a failure stops the run with `status = failed` attributed to the node that failed, and the
@@ -96,10 +121,11 @@ cargo run -p ratatoskr-cli -- run "Fix the flaky retry in the store"
 |---|---|
 | `init` | Write a default `ratatoskr.toml`. |
 | `ask <question>` | One agent answers a question about the repo, grounded in rag-rat's tools. |
-| `plan <issue>` | scout → memory → analyst, printing a grounded plan. No code is changed. |
+| `plan <issue>` | context → analyst, printing a grounded plan. No code is changed. |
 | `run <issue>` | Everything `plan` does, then fork, converge, and bookkeep. |
 | `bookkeep <run-id>` | Replay just the bookkeeper against a stored run — no re-run. |
 | `status <run-id>` | A run's status and every per-node checkpoint. Pure read: no rag-rat, no LLM. |
+| `workflows` | List the workflows a run can be given, and what each is for. |
 | `serve` | The observability dashboard (see below). |
 | `clean` | Reclaim per-run worktrees and their `ratatoskr/*` branches. |
 
