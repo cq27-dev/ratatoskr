@@ -15,6 +15,9 @@ const PIPELINE: &[&[&str]] = &[
     &["memory"],
     &["analyst"],
     &["red_team", "implementer"],
+    // Optional, and `Idle` in a repo that has not given it a route — the same reading as any node
+    // that never runs for this kind of run.
+    &["verifier"],
     &["bookkeeper"],
 ];
 

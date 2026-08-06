@@ -15,6 +15,7 @@ pub mod redteam;
 pub mod scout;
 pub mod skills;
 pub mod testrun;
+pub mod verifier;
 pub mod workflow;
 
 pub use analyst::{AnalystNode, AnalystOutput};
@@ -23,6 +24,7 @@ pub use implementer::{ImplementerNode, ImplementerOutput};
 pub use memory::{MemoryNode, MemoryOutput, MemoryRecord};
 pub use redteam::{RedTeamNode, RedTeamOutput};
 pub use scout::{RelatedItem, ScoutNode, ScoutOutput};
+pub use verifier::{Finding, FindingKind, Severity, VerifierNode, VerifierOutput};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -286,11 +288,8 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         files: analyst_cfg.files,
         ledger: Some(Arc::clone(ledger)),
     };
-    let analyst_in = analyst::AnalystInput {
-        issue: issue.to_string(),
-        scout: scout_out.clone(),
-        memory: memory_out.clone(),
-    };
+    let analyst_in =
+        analyst::AnalystInput::fresh(issue.to_string(), scout_out.clone(), memory_out.clone());
     let analyst_input_json = serde_json::to_string(&analyst_in)?;
     let analyst_out = analyst
         .run(analyst_in, &state)
@@ -1313,6 +1312,250 @@ pub async fn run_bookkeeper(
 
 /// The fork + converge half. Returns the terminal status; leaves the worktree in place on a
 /// terminal outcome and removes it on a hard error.
+/// The review stage: the verifier, plus the analyst re-entry it routes plan-level findings to.
+///
+/// Built once per run and reused across converge iterations, so a second review costs a model call
+/// rather than a rebuild. `None` when the verifier has no route — like the red team's classifier,
+/// it is opt-in by being given a model rather than by a separate switch.
+struct Review {
+    verifier: verifier::VerifierNode,
+    threshold: verifier::Severity,
+    /// The analyst, kept alive for revisions. It is the principal: it owns the plan, so it is the
+    /// only node that can tell "the plan was wrong" from "the code did not follow the plan".
+    analyst: AnalystNode,
+    scout: ScoutOutput,
+    memory: MemoryOutput,
+}
+
+/// What a review concluded the run should do next.
+struct Correction {
+    /// What to hand the implementer.
+    prompt: String,
+    /// The amended plan, when the analyst revised one. Kept so later reviews judge the change
+    /// against what was actually asked for by the end, not against the plan that was wrong.
+    revised: Option<AnalystOutput>,
+}
+
+/// The verifier is opt-in on having somewhere to run, the same way the red-team classifier is.
+fn verifier_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> bool {
+    config.models.contains_key("verifier")
+        || engine
+            .ruleset("verifier")
+            .is_some_and(|r| r.config().model.is_some())
+}
+
+/// Read `[implementer] verify_threshold`. An unrecognised value is a typo, and a typo must not
+/// quietly relax a gate — it falls back to the default and says so.
+fn parse_threshold(raw: &str) -> verifier::Severity {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "P1" => verifier::Severity::P1,
+        "P2" => verifier::Severity::P2,
+        "P3" => verifier::Severity::P3,
+        other => {
+            tracing::warn!("unknown verify_threshold {other:?}; using P2");
+            verifier::Severity::P2
+        }
+    }
+}
+
+impl Review {
+    fn build(run: &Run<'_>, plan: &PlanOutcome) -> Result<Option<Self>, PlanError> {
+        let &Run {
+            client,
+            config,
+            engine,
+            context,
+            ledger,
+            ..
+        } = run;
+        if !verifier_enabled(engine, config) {
+            return Ok(None);
+        }
+
+        let plugins_verifier = context.for_node("verifier");
+        let cfg = node_agent_config(
+            engine,
+            config,
+            context.pool_for("verifier", client.offer()),
+            "verifier",
+            verifier::VERIFIER_TOOLS,
+            &plugins_verifier,
+        )?;
+        let verifier = verifier::VerifierNode {
+            route: cfg.route,
+            tools: cfg.tools,
+            policy: cfg.policy,
+            max_turns: cfg.max_turns,
+            system_prompt: cfg.system_prompt,
+            plugins: plugins_verifier,
+            files: cfg.files,
+            ledger: Some(Arc::clone(ledger)),
+        };
+
+        let plugins_analyst = context.for_node("analyst");
+        let acfg = node_agent_config(
+            engine,
+            config,
+            context.pool_for("analyst", client.offer()),
+            "analyst",
+            analyst::ANALYST_TOOLS,
+            &plugins_analyst,
+        )?;
+        Ok(Some(Review {
+            verifier,
+            threshold: parse_threshold(&config.implementer.verify_threshold),
+            analyst: AnalystNode {
+                route: acfg.route,
+                tools: acfg.tools,
+                policy: acfg.policy,
+                max_turns: acfg.max_turns,
+                system_prompt: acfg.system_prompt,
+                plugins: plugins_analyst,
+                files: acfg.files,
+                ledger: Some(Arc::clone(ledger)),
+            },
+            scout: plan.scout.clone(),
+            memory: plan.memory.clone(),
+        }))
+    }
+
+    /// Review the change. `None` means it is accepted.
+    async fn next_correction(
+        &self,
+        run: &Run<'_>,
+        plan: &AnalystOutput,
+        impl_out: &ImplementerOutput,
+        worktree: &WorktreePath,
+        iteration: u32,
+    ) -> Result<Option<Correction>, PlanError> {
+        let &Run {
+            store,
+            run_id,
+            issue,
+            ledger,
+            ..
+        } = run;
+
+        // The patch, not the `--stat` the implementer records: a summary cannot show a weakened
+        // assertion, and that is one of the things this stage exists to catch.
+        let diff = ratatoskr_exec::diff_text(worktree)
+            .await
+            .unwrap_or_default();
+        let input = verifier::VerifierInput {
+            issue: issue.to_string(),
+            analyst: plan.clone(),
+            diff,
+            touched_files: impl_out.touched_files.clone(),
+        };
+        let input_json = serde_json::to_string(&serde_json::json!({
+            "requirements": plan.requirements,
+            "touched_files": input.touched_files,
+            "diff_bytes": input.diff.len(),
+        }))?;
+        let out = self
+            .verifier
+            .run(input)
+            .await
+            .map_err(|e| PlanError::node("verifier", e))?;
+        record(Record {
+            store,
+            run_id,
+            node: "verifier",
+            output: &out,
+            // The diff itself is not recorded: it is reproducible from the worktree, and a copy of
+            // it in every checkpoint would dwarf everything else in the store.
+            input: Some(input_json),
+            iteration: Some(iteration),
+            ledger: Some(ledger),
+        })
+        .await?;
+
+        let blocking = out.blocking(self.threshold);
+        if blocking.is_empty() {
+            return Ok(None);
+        }
+        // Findings below the threshold were still recorded above; say what was set aside so a
+        // reader of the logs does not read "2 findings" as "2 problems being fixed".
+        tracing::info!(
+            blocking = blocking.len(),
+            total = out.findings.len(),
+            "the review found problems the tests did not catch"
+        );
+
+        // Anything the verifier judged a fault in the PLAN goes to the analyst first. Sending it
+        // to the implementer instead would re-drive it against a requirement already shown to be
+        // wrong, which is the loop this stage exists to break.
+        let plan_faults: Vec<verifier::Finding> = blocking
+            .iter()
+            .filter(|f| f.kind == verifier::FindingKind::Plan)
+            .map(|f| (*f).clone())
+            .collect();
+        if plan_faults.is_empty() {
+            return Ok(Some(Correction {
+                prompt: verifier::correction(&blocking),
+                revised: None,
+            }));
+        }
+
+        let revision = analyst::AnalystInput {
+            issue: issue.to_string(),
+            scout: self.scout.clone(),
+            memory: self.memory.clone(),
+            previous: Some(Box::new(plan.clone())),
+            findings: plan_faults,
+        };
+        let revision_json = serde_json::to_string(&revision)?;
+        let revised = self
+            .analyst
+            .run(revision, &RunState::new(run_id, None))
+            .await
+            .map_err(|e| PlanError::node("analyst", e))?;
+        record(Record {
+            store,
+            run_id,
+            node: "analyst",
+            output: &revised,
+            input: Some(revision_json),
+            iteration: Some(iteration),
+            ledger: Some(ledger),
+        })
+        .await?;
+
+        Ok(Some(Correction {
+            prompt: replan(&revised, &blocking),
+            revised: Some(revised),
+        }))
+    }
+}
+
+/// What the implementer is told after the plan itself was amended.
+///
+/// The revised requirements come first and the findings after, because the implementer's job is
+/// now to satisfy the new plan — the findings are why it changed, not a separate list of fixes.
+fn replan(revised: &AnalystOutput, findings: &[&verifier::Finding]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::from(
+        "A review of your change found that the PLAN was wrong, not just the code. The \
+         requirements have been amended. Bring your change in line with them:\n\n",
+    );
+    for r in &revised.requirements {
+        let _ = writeln!(s, "- {r}");
+    }
+    if !revised.impact_summary.is_empty() {
+        let _ = write!(
+            s,
+            "\nWhat this is meant to achieve:\n{}\n",
+            revised.impact_summary
+        );
+    }
+    let _ = write!(s, "\nWhat the review found, for context:\n");
+    for f in findings {
+        let _ = writeln!(s, "- [{:?}] {}", f.severity, f.summary);
+        let _ = writeln!(s, "  Fails when: {}", f.failure_scenario);
+    }
+    s
+}
+
 async fn fork_and_converge(
     run: &Run<'_>,
     plan: &PlanOutcome,
@@ -1385,6 +1628,10 @@ async fn fork_and_converge(
         analyst: plan.analyst.clone(),
     };
 
+    // Built before the fork so a misconfigured verifier fails the run here rather than after an
+    // ACP session and a sandboxed test run have already been spent on it.
+    let review = Review::build(run, plan)?;
+
     // Fork: both branches run concurrently off the same frozen post-analyst state. join! (not
     // spawn) because both are I/O-bound (subprocess/sandbox) and borrow their nodes.
     let (rt_res, impl_res) = tokio::join!(red_team.run(), implementer.run());
@@ -1432,8 +1679,11 @@ async fn fork_and_converge(
         ));
     }
 
-    // Converge: iterate the implementer (not red-team — the baseline doesn't change) until it
-    // introduces no new failures, or the budget runs out.
+    // Converge: iterate the implementer (not red-team — the baseline doesn't change) until the
+    // change both passes the tests and survives review, or the budget runs out.
+    // The plan in force. A revision replaces it, so a later review judges the change against what
+    // was actually asked for by the end rather than against the requirement that was wrong.
+    let mut in_force = plan.analyst.clone();
     let mut iterations = 1u32;
     let status = loop {
         let post_ran = converge::test_command_ran(
@@ -1441,33 +1691,54 @@ async fn fork_and_converge(
             &impl_out.passing_tests,
             impl_out.exit_code,
         );
-        if post_ran && converge::is_converged(&red_team_out.failing_tests, &impl_out.failing_tests)
-        {
+        let tests_clean = post_ran
+            && converge::is_converged(&red_team_out.failing_tests, &impl_out.failing_tests);
+
+        // What to send back, or `None` to accept the change. The test gate goes first and the
+        // review second, deliberately: a test result is stronger evidence than a model's
+        // judgement, and reviewing a change that does not build wastes the call on noise.
+        let correction: Option<Correction> = if !tests_clean {
+            // A post-change run that didn't complete usually means the edit broke the build — say
+            // that specifically instead of reporting "no new failures".
+            let prompt = if !post_ran {
+                format!(
+                    "The test command did not run to completion (exit {}) — your change likely \
+                     does not compile. Fix it so the tests run and pass.",
+                    impl_out.exit_code
+                )
+            } else {
+                let new_failures = converge::newly_introduced_failures(
+                    &red_team_out.failing_tests,
+                    &impl_out.failing_tests,
+                );
+                format!(
+                    "Your change introduced NEW failing tests not present in the baseline: {}. \
+                     Fix them without breaking other tests.",
+                    new_failures.join(", ")
+                )
+            };
+            Some(Correction {
+                prompt,
+                revised: None,
+            })
+        } else if let Some(review) = &review {
+            review
+                .next_correction(run, &in_force, &impl_out, &worktree, iterations)
+                .await?
+        } else {
+            None
+        };
+
+        let Some(correction) = correction else {
             break RunStatus::Converged;
+        };
+        if let Some(revised) = correction.revised {
+            in_force = revised;
         }
         if iterations >= config.implementer.max_iterations {
             break RunStatus::MaxIterationsReached;
         }
-        // A post-change run that didn't complete usually means the edit broke the build — say that
-        // specifically instead of reporting "no new failures".
-        let diagnostic = if !post_ran {
-            format!(
-                "The test command did not run to completion (exit {}) — your change likely does \
-                 not compile. Fix it so the tests run and pass.",
-                impl_out.exit_code
-            )
-        } else {
-            let new_failures = converge::newly_introduced_failures(
-                &red_team_out.failing_tests,
-                &impl_out.failing_tests,
-            );
-            format!(
-                "Your change introduced NEW failing tests not present in the baseline: {}. \
-                 Fix them without breaking other tests.",
-                new_failures.join(", ")
-            )
-        };
-        impl_out = match implementer.iterate(&worktree, &diagnostic).await {
+        impl_out = match implementer.iterate(&worktree, &correction.prompt).await {
             Ok(out) => out,
             Err(e) => {
                 // Hard error mid-converge: don't leave the worktree behind.
@@ -1482,9 +1753,9 @@ async fn fork_and_converge(
             run_id,
             node: "implementer",
             output: &impl_out,
-            // The diagnostic is what this iteration was actually given — the thing that explains
+            // The correction is what this iteration was actually given — the thing that explains
             // why it did what it did, and the one input a replay would need.
-            input: Some(serde_json::to_string(&diagnostic)?),
+            input: Some(serde_json::to_string(&correction.prompt)?),
             iteration: Some(iterations + 1),
             ledger: Some(ledger),
         })
@@ -1857,5 +2128,47 @@ mod agent_config_tests {
         config.implementer.always_fork = true;
         assert!(fork_is_needed(&analyst_saying(false), &config));
         assert!(fork_is_needed(&analyst_saying(true), &config));
+    }
+
+    #[test]
+    fn a_misspelled_threshold_does_not_quietly_relax_the_gate() {
+        use verifier::Severity;
+        assert_eq!(parse_threshold("P1"), Severity::P1);
+        assert_eq!(parse_threshold("p2"), Severity::P2);
+        assert_eq!(parse_threshold(" P3 "), Severity::P3);
+        // The dangerous direction: a typo must not read as "block on nothing". It falls back to
+        // the default, which is stricter than P1, and warns.
+        assert_eq!(parse_threshold("critical"), Severity::P2);
+        assert_eq!(parse_threshold(""), Severity::P2);
+    }
+
+    #[test]
+    fn the_replan_prompt_leads_with_the_amended_requirements() {
+        let revised = AnalystOutput {
+            impact_summary: "narrower than before".into(),
+            touched: Vec::new(),
+            risks: Vec::new(),
+            requirements: vec!["only handle the utf-8 case".into()],
+            residual_risk: String::new(),
+            changes_code: true,
+        };
+        let finding = verifier::Finding {
+            severity: verifier::Severity::P1,
+            kind: verifier::FindingKind::Plan,
+            file: "a.rs".into(),
+            line: None,
+            summary: "the requirement asked for something impossible".into(),
+            failure_scenario: "any non-utf-8 path".into(),
+        };
+        let prompt = replan(&revised, &[&finding]);
+
+        // The implementer's job is now to satisfy the new plan; the findings explain why it
+        // changed, so the requirements must come first.
+        let req = prompt.find("only handle the utf-8 case").unwrap();
+        let why = prompt
+            .find("the requirement asked for something impossible")
+            .unwrap();
+        assert!(req < why, "requirements lead, findings follow:\n{prompt}");
+        assert!(prompt.contains("any non-utf-8 path"));
     }
 }

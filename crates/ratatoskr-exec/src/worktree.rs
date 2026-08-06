@@ -219,6 +219,46 @@ pub async fn diff_stat(worktree: &WorktreePath) -> Result<String, ExecError> {
     .await
 }
 
+/// How much patch text [`diff_text`] will hand back before it starts cutting.
+///
+/// A review reads the change; it does not need every line of a vendored lockfile to do that. The
+/// cap exists because the diff goes into a model's context, where an unbounded one costs the whole
+/// budget and buries the hunks that matter — and because a truncated diff that says so is more
+/// useful than a request that fails for being too large.
+const MAX_DIFF_BYTES: usize = 200_000;
+
+/// The worktree's changes as an actual patch — what a reviewer reads.
+///
+/// Distinct from [`diff_stat`], which is filenames and line counts. A `--stat` cannot show a test
+/// weakened to pass, an error swallowed, or a condition inverted, so anything judging the *content*
+/// of a change needs this instead.
+pub async fn diff_text(worktree: &WorktreePath) -> Result<String, ExecError> {
+    let cwd = worktree.as_path();
+    // `-N` (intent-to-add) so a newly-created file's content appears without staging it. A change
+    // that only adds files would otherwise diff as empty and read as "nothing was done".
+    git(cwd, "add -N", &["add", "-N", "."]).await?;
+    let out = git(cwd, "diff", &["--no-pager", "diff", "HEAD"]).await?;
+    Ok(truncate_diff(out, MAX_DIFF_BYTES))
+}
+
+/// Cut `diff` to `max` bytes at a line boundary, saying so where it cut.
+///
+/// The marker is not decoration: a reader given a silently truncated patch concludes the change
+/// ends there, and a reviewer that thinks it has seen the whole diff will approve what it cannot
+/// see.
+fn truncate_diff(diff: String, max: usize) -> String {
+    if diff.len() <= max {
+        return diff;
+    }
+    // Back up to a line boundary so the last hunk shown is readable rather than cut mid-token.
+    let cut = diff[..max].rfind('\n').map_or(max, |i| i + 1);
+    let dropped = diff.len() - cut;
+    format!(
+        "{}\n[diff truncated: {dropped} more bytes not shown]\n",
+        &diff[..cut]
+    )
+}
+
 /// The paths the worktree touched, from `git status --porcelain`.
 pub async fn touched_files(worktree: &WorktreePath) -> Result<Vec<String>, ExecError> {
     let out = git(worktree.as_path(), "status", &["status", "--porcelain"]).await?;
@@ -323,5 +363,23 @@ branch refs/heads/feature/x
         );
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn a_truncated_diff_says_that_it_was_truncated() {
+        let diff = "line one\nline two\nline three\n".to_string();
+        assert_eq!(
+            truncate_diff(diff.clone(), 1000),
+            diff,
+            "a small diff is untouched"
+        );
+
+        let cut = truncate_diff(diff, 12);
+        // A reader given a silently truncated patch concludes the change ends there, and a
+        // reviewer that thinks it saw the whole diff will approve what it could not see.
+        assert!(cut.contains("[diff truncated"), "{cut}");
+        assert!(cut.starts_with("line one\n"));
+        // Cut at a line boundary, so the last hunk shown is readable rather than split mid-token.
+        assert!(!cut.contains("line t\n"));
     }
 }

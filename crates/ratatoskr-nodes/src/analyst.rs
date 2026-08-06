@@ -29,11 +29,40 @@ const PREAMBLE: &str = "You are the analyst in a code-planning pipeline. You are
     judgments about the change that you can share when asked.";
 
 /// Input to the analyst: the issue plus the two upstream node outputs.
+///
+/// The last two fields are what makes this node re-enterable. The analyst used to produce
+/// requirements exactly once, so a run that discovered on iteration three that the plan was wrong
+/// could only re-drive the implementer against a plan already shown to be poor.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AnalystInput {
     pub issue: String,
     pub scout: ScoutOutput,
     pub memory: MemoryOutput,
+    /// The plan being revised, when this is a revision. The analyst amends rather than re-derives:
+    /// a blank sheet would discard the reasoning that was right along with the part that was not.
+    #[serde(default)]
+    pub previous: Option<Box<AnalystOutput>>,
+    /// Why it is being revised — review findings the verifier judged to be faults in the plan
+    /// rather than in the code.
+    #[serde(default)]
+    pub findings: Vec<crate::verifier::Finding>,
+}
+
+impl AnalystInput {
+    /// A first plan, with no revision history.
+    pub fn fresh(issue: String, scout: ScoutOutput, memory: MemoryOutput) -> Self {
+        AnalystInput {
+            issue,
+            scout,
+            memory,
+            previous: None,
+            findings: Vec::new(),
+        }
+    }
+
+    fn is_revision(&self) -> bool {
+        self.previous.is_some() && !self.findings.is_empty()
+    }
 }
 
 /// Analyst's structured output — the plan's substance.
@@ -133,7 +162,42 @@ impl Node for AnalystNode {
 /// Fold the issue + upstream outputs into the analyst's prompt.
 fn render_prompt(input: &AnalystInput) -> String {
     let mut s = String::new();
+    if input.is_revision() {
+        s.push_str(
+            "THIS IS A REVISION. A change was implemented against your previous plan and reviewed. \
+             The review found faults it judged to be in the PLAN rather than in the code — the \
+             requirement was wrong, missing, or impossible as written, so re-implementing it will \
+             not help.\n\n\
+             Decide, for each finding: does the plan need to change, or was the plan right and the \
+             implementation simply did not follow it? Amend the requirements where they were \
+             wrong. Where they were right, restate them unchanged — repeating a correct \
+             requirement is how you say the fault was in the execution.\n\n\
+             Keep everything that still holds. You are amending a plan, not writing a new one.\n\n",
+        );
+    }
     let _ = write!(s, "ISSUE:\n{}\n\n", input.issue);
+    if let Some(previous) = &input.previous {
+        let _ = write!(s, "YOUR PREVIOUS PLAN:\n{}\n", previous.impact_summary);
+        if !previous.requirements.is_empty() {
+            s.push_str("Requirements you set:\n");
+            for r in &previous.requirements {
+                let _ = writeln!(s, "- {r}");
+            }
+        }
+        s.push('\n');
+    }
+    if !input.findings.is_empty() {
+        s.push_str("WHAT THE REVIEW FOUND:\n");
+        for f in &input.findings {
+            let where_ = match f.file.as_str() {
+                "" => String::new(),
+                file => format!(" ({file})"),
+            };
+            let _ = writeln!(s, "- [{:?}]{} {}", f.severity, where_, f.summary);
+            let _ = writeln!(s, "  Fails when: {}", f.failure_scenario);
+        }
+        s.push('\n');
+    }
     let _ = write!(s, "SCOUT SUMMARY:\n{}\n\n", input.scout.papertrail_summary);
 
     if !input.scout.related_items.is_empty() {

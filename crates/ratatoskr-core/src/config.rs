@@ -113,6 +113,17 @@ pub struct ImplementerConfig {
     pub cli: String,
     /// How many times converge may re-run the implementer before giving up.
     pub max_iterations: u32,
+    /// The least severe review finding that sends the change back to be fixed.
+    ///
+    /// `"P1"` blocks only on must-fix defects, `"P2"` (the default) also on should-fix ones, and
+    /// `"P3"` on nits too. The default stops short of nits deliberately: the verifier's back edge
+    /// shares `max_iterations` with the test-fixing loop, so a loop that re-drives on style can
+    /// spend the whole budget there and leave none for a real failure found on the last pass.
+    ///
+    /// Findings below the threshold are still recorded on the checkpoint — not blocking is not the
+    /// same as not worth knowing.
+    #[serde(default = "default_verify_threshold")]
+    pub verify_threshold: String,
     /// Run the fork even when the analyst says the task calls for no code change.
     ///
     /// The override for disagreeing with that judgement. It is a config key rather than a silent
@@ -128,9 +139,14 @@ impl Default for ImplementerConfig {
         ImplementerConfig {
             cli: "claude".to_string(),
             max_iterations: 3,
+            verify_threshold: default_verify_threshold(),
             always_fork: false,
         }
     }
+}
+
+fn default_verify_threshold() -> String {
+    "P2".to_string()
 }
 
 /// Phase 3 sandbox settings — where red-team and implementer run the repo's test command.
