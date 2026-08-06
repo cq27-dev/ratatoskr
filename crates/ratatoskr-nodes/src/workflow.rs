@@ -281,7 +281,13 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
-fn build_red_team(ctx: &WorkflowContext) -> Result<RedTeamNode, PlanError> {
+/// `acceptance` is passed in rather than read here because the baseline and the post-change run
+/// must execute the same steps — a red team that resolved its own would drift from the implementer
+/// the moment a plan proposed anything.
+fn build_red_team(
+    ctx: &WorkflowContext,
+    acceptance: Vec<ratatoskr_core::AcceptanceStep>,
+) -> Result<RedTeamNode, PlanError> {
     let short: String = ctx.run_id.chars().take(8).collect();
     let classifier = match crate::classifier_enabled(&ctx.engine, &ctx.config) {
         true => {
@@ -309,6 +315,13 @@ fn build_red_team(ctx: &WorkflowContext) -> Result<RedTeamNode, PlanError> {
         false => None,
     };
     Ok(RedTeamNode {
+        acceptance,
+        characterizer: crate::build_characterizer(
+            &ctx.engine,
+            &ctx.config,
+            &ctx.plugin_context,
+            ctx.rag_rat.clone(),
+        )?,
         repo_path: ctx.repo_path.clone(),
         sandbox: ctx.config.sandbox.clone(),
         name: format!("ratatoskr-redteam-{short}"),
@@ -343,14 +356,21 @@ async fn note<T: serde::Serialize>(
 
 async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String, String> {
     ctx.guard()?;
-    let node = build_red_team(&ctx).map_err(|e| e.to_string())?;
+    // A script may call `redTeam()` before or after `analyze()`. When a plan exists, its acceptance
+    // is what the baseline is measured with; otherwise the configured command stands in.
+    let planned = latest_checkpoint::<AnalystOutput>(&ctx.store, &ctx.run_id, "analyst")
+        .await
+        .map(|a| a.acceptance)
+        .unwrap_or_default();
+    let acceptance = ctx.config.sandbox.acceptance(&planned);
+    let node = build_red_team(&ctx, acceptance).map_err(|e| e.to_string())?;
     let out = node.run().await.map_err(|e| e.to_string())?;
     // Checkpoint before the guard so a failed baseline stays inspectable.
     note(&ctx, "red_team", &out, None).await?;
     // The false-convergence guard is enforced here — the script cannot skip it.
     if !converge::test_command_ran(&out.failing_tests, &out.passing_tests, out.exit_code) {
         return Err(format!(
-            "baseline test command produced no tests (exit {}); check [sandbox] test_command and backend",
+            "the baseline acceptance run produced no checks (exit {}); check the analyst's acceptance, [sandbox] test_command and the sandbox backend",
             out.exit_code
         ));
     }
@@ -359,6 +379,15 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
 
 fn build_implementer(ctx: &WorkflowContext, analyst: AnalystOutput) -> ImplementerNode {
     ImplementerNode {
+        acceptance: ctx.config.sandbox.acceptance(&analyst.acceptance),
+        characterizer: crate::build_characterizer(
+            &ctx.engine,
+            &ctx.config,
+            &ctx.plugin_context,
+            ctx.rag_rat.clone(),
+        )
+        .ok()
+        .flatten(),
         repo_path: ctx.repo_path.clone(),
         worktree_root: ctx.config.worktree.root.clone(),
         sandbox: ctx.config.sandbox.clone(),

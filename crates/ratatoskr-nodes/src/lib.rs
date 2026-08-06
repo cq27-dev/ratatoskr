@@ -1336,6 +1336,42 @@ struct Correction {
     revised: Option<AnalystOutput>,
 }
 
+/// Build the acceptance characterizer, when `[models.characterizer]` gives it somewhere to run.
+///
+/// Optional on purpose: without it a run still converges on exit codes, comparing at step
+/// granularity. Coarser than named checks, and never wrong about them — so a repo that has not
+/// configured one loses detail, not correctness.
+pub(crate) fn build_characterizer(
+    engine: &Arc<ScriptEngine>,
+    config: &RatatoskrConfig,
+    context: &PluginContext,
+    offer: ServerTools,
+) -> Result<Option<testrun::Characterizer>, PlanError> {
+    if !config.models.contains_key("characterizer")
+        && !engine
+            .ruleset("characterizer")
+            .is_some_and(|r| r.config().model.is_some())
+    {
+        return Ok(None);
+    }
+    let plugins = context.for_node("characterizer");
+    // No default tools: it transcribes output it was handed. Reading the repo would invite it to
+    // decide whether a failure matters, which is the one thing it must not do.
+    let cfg = node_agent_config(
+        engine,
+        config,
+        context.pool_for("characterizer", offer),
+        "characterizer",
+        &[],
+        &plugins,
+    )?;
+    Ok(Some(testrun::Characterizer {
+        route: cfg.route,
+        tools: cfg.tools,
+        max_turns: cfg.max_turns,
+    }))
+}
+
 /// The verifier is opt-in on having somewhere to run, the same way the red-team classifier is.
 fn verifier_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> bool {
     config.models.contains_key("verifier")
@@ -1583,6 +1619,14 @@ async fn fork_and_converge(
     let repo_path: PathBuf = std::env::current_dir()
         .map_err(|e| PlanError::node("fork", NodeError::Failed(format!("cwd: {e}"))))?;
     let short: String = run_id.chars().take(8).collect();
+    // Resolved once and shared by both branches: the baseline and the post-change run must execute
+    // the same steps, or the two sets converge compares are not comparable. Frozen here for the
+    // whole run — a later analyst revision amends requirements, never the bar.
+    let acceptance = config.sandbox.acceptance(&plan.analyst.acceptance);
+    tracing::info!(
+        steps = ?acceptance.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        "acceptance for this run"
+    );
 
     let red_team = RedTeamNode {
         repo_path: repo_path.clone(),
@@ -1590,6 +1634,8 @@ async fn fork_and_converge(
         name: format!("ratatoskr-redteam-{short}"),
         // Opt-in: classify baseline failures only when redteam has a route — from
         // `[models.redteam]` or from its `.ratatoskr/rules/redteam.ts` ruleset.
+        acceptance: acceptance.clone(),
+        characterizer: build_characterizer(engine, config, context, client.offer())?,
         classifier: match classifier_enabled(engine, config) {
             true => {
                 let plugins_redteam = context.for_node("redteam");
@@ -1626,6 +1672,8 @@ async fn fork_and_converge(
         run_id: run_id.to_string(),
         issue: issue.to_string(),
         analyst: plan.analyst.clone(),
+        acceptance,
+        characterizer: build_characterizer(engine, config, context, client.offer())?,
     };
 
     // Built before the fork so a misconfigured verifier fails the run here rather than after an
@@ -1672,8 +1720,8 @@ async fn fork_and_converge(
         return Err(PlanError::node(
             "red_team",
             NodeError::Failed(format!(
-                "baseline test command produced no tests (exit {}); \
-                 check [sandbox] test_command and backend",
+                "the baseline acceptance run produced no checks (exit {}); \
+                 check the analyst's acceptance, [sandbox] test_command and the sandbox backend",
                 red_team_out.exit_code
             )),
         ));
@@ -2111,6 +2159,7 @@ mod agent_config_tests {
             requirements: Vec::new(),
             residual_risk: String::new(),
             changes_code,
+            acceptance: Vec::new(),
         }
     }
 
@@ -2151,6 +2200,7 @@ mod agent_config_tests {
             requirements: vec!["only handle the utf-8 case".into()],
             residual_risk: String::new(),
             changes_code: true,
+            acceptance: Vec::new(),
         };
         let finding = verifier::Finding {
             severity: verifier::Severity::P1,

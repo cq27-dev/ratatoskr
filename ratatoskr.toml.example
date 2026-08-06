@@ -54,6 +54,14 @@ model = "kimi-k2.5"
 # provider = "anthropic"
 # model = "claude-sonnet-5"
 
+# Optional: with a [models.characterizer] route set, a cheap model reads each acceptance step's
+# raw output and names the individual checks that passed and failed — so converge compares at test
+# granularity for any toolchain, with no parser to teach. Omit and a run still converges, comparing
+# whole steps by exit code: coarser, never wrong. The exit code is authoritative either way.
+# [models.characterizer]
+# provider = "moonshot"
+# model = "kimi-k2.5"
+
 # Phase 3: the implementer drives a coding CLI via ACP in an isolated worktree.
 [implementer]
 cli = "claude"          # which coding CLI to drive (Claude Code via its ACP adapter)
@@ -75,7 +83,13 @@ backend = "landlock"                        # "landlock" (bwrap+Landlock, defaul
                                             # ("microsandbox" needs KVM AND a build with
                                             #  `--features microsandbox`)
 image = "docker.io/library/rust:1-slim"     # OCI image the sandbox boots (microsandbox only)
-test_command = ["cargo", "test"]            # the target repo's test command
+# The DEFAULT acceptance: one step, used when the analyst proposes none. The analyst decides what
+# "done" means per task and may replace this with an ordered pipeline — "build the wasm, then drive
+# it in a browser" is two steps, not one.
+test_command = ["cargo", "test"]
+# Ignore whatever the analyst proposes and always run test_command. For a repo that does not want
+# a model deciding what proves its code works.
+pin_acceptance = false
 
 # Agent plugins, in the format coding CLIs already use. `.ratatoskr/plugins/` is always searched;
 # these paths add plugins installed elsewhere, and may name a plugin or a directory of them.

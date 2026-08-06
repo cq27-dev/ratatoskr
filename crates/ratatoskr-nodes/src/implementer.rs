@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::analyst::AnalystOutput;
-use crate::testrun::run_tests;
+use crate::testrun::{Characterizer, by_exit_code, run_acceptance};
 
 /// Implementer output. Test fields are deterministic; `diff_summary`/`touched_files`/`narrative`
 /// are best-effort context (relaxed) for the bookkeeper in Phase 4.
@@ -41,6 +41,11 @@ pub struct ImplementerNode {
     pub run_id: String,
     pub issue: String,
     pub analyst: AnalystOutput,
+    /// What "done" means for this task. Frozen at plan time: a change must not be able to move the
+    /// bar it is judged against, so an analyst revision amends requirements and never this.
+    pub acceptance: Vec<ratatoskr_core::AcceptanceStep>,
+    /// Names the checks inside each step. `None` compares at step granularity instead.
+    pub characterizer: Option<Characterizer>,
 }
 
 impl ImplementerNode {
@@ -83,13 +88,18 @@ impl ImplementerNode {
             .await
             .map_err(|e| NodeError::Failed(format!("ACP session failed: {e}")))?;
 
-        let tests = run_tests(
+        let outcomes = run_acceptance(
             &self.sandbox,
             &format!("ratatoskr-impl-{}", self.short_id()),
             worktree.as_path(),
+            &self.acceptance,
         )
         .await
         .map_err(NodeError::Failed)?;
+        let tests = match &self.characterizer {
+            Some(c) => c.read(&outcomes).await,
+            None => by_exit_code(&outcomes),
+        };
 
         // Diff/touched reads are best-effort — don't fail the attempt if they hiccup.
         let diff_summary = worktree::diff_stat(worktree).await.unwrap_or_default();

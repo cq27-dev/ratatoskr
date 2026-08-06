@@ -728,7 +728,14 @@ fn load_config(path: &Path) -> anyhow::Result<RatatoskrConfig> {
 
 /// The nodes a ruleset may govern — the LLM agents that go through `run_structured`. `memory` and
 /// `implementer` don't (no model/tool set to override), so targeting them is a config error.
-const RULESET_NODES: &[&str] = &["scout", "analyst", "bookkeeper", "redteam", "verifier"];
+const RULESET_NODES: &[&str] = &[
+    "scout",
+    "analyst",
+    "bookkeeper",
+    "redteam",
+    "verifier",
+    "characterizer",
+];
 
 /// Load the `.ratatoskr/rules/*.ts` agent rulesets (empty engine if the dir is absent), rejecting
 /// any `defineAgent(name)` that isn't a governable node.

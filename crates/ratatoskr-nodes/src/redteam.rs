@@ -15,7 +15,7 @@ use ratatoskr_mcp::ToolSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::testrun::run_tests;
+use crate::testrun::{Characterizer, by_exit_code, run_acceptance};
 
 /// rag-rat tools the classifier may use to inspect the failing tests' code.
 pub const CLASSIFIER_TOOLS: &[&str] = &["symbol_lookup", "semantic_search"];
@@ -118,13 +118,22 @@ pub struct RedTeamNode {
     pub name: String,
     /// Enabled only when redteam has a route — from `[models.redteam]` or its ruleset.
     pub classifier: Option<RedTeamClassifier>,
+    /// What "done" means for this task, from the analyst. The baseline runs exactly what the
+    /// post-change run will, or the two sets converge compares are not comparable.
+    pub acceptance: Vec<ratatoskr_core::AcceptanceStep>,
+    /// Names the checks inside each step. `None` compares at step granularity instead.
+    pub characterizer: Option<Characterizer>,
 }
 
 impl RedTeamNode {
     pub async fn run(&self) -> Result<RedTeamOutput, NodeError> {
-        let results = run_tests(&self.sandbox, &self.name, &self.repo_path)
+        let outcomes = run_acceptance(&self.sandbox, &self.name, &self.repo_path, &self.acceptance)
             .await
             .map_err(NodeError::Failed)?;
+        let results = match &self.characterizer {
+            Some(c) => c.read(&outcomes).await,
+            None => by_exit_code(&outcomes),
+        };
 
         // Classification is best-effort: never let it fail the deterministic characterization.
         let classifications = match (&self.classifier, results.failing.is_empty()) {
