@@ -215,8 +215,27 @@ to a coding CLI inside a sandboxed worktree; a planning node that could edit the
 reasoning about would undo that separation for nothing. Paths outside the repository are refused,
 and a search skips `.git`, `target`, `node_modules`, `.venv`, `dist` and dot-directories.
 
-A plugin's `PreToolUse` and `PostToolUse` hooks run around a node's tool calls, matched on the tool
-name by the group's `matcher` regex. Each answers with the usual envelope, and only
+A plugin's hooks fire at the points a run actually has:
+
+| Event | Fires | Matcher is read against | Where its context lands |
+|---|---|---|---|
+| `SessionStart` | once, per run | the source, always `startup` | each node's preamble |
+| `SubagentStart` | a node begins | the node name | that node's preamble |
+| `UserPromptSubmit` | a node is prompted | *(the format gives it none)* | alongside the prompt |
+| `PreToolUse` / `PostToolUse` | around each tool call | the tool name | the tool's result |
+| `Stop` / `SubagentStop` | a node finishes | the node name (`SubagentStop`) | nowhere — see below |
+| `SessionEnd` | once, when the run ends | the run's final status | nowhere — see below |
+
+`Stop`, `SubagentStop` and `SessionEnd` run for what they *do* — recording, notifying, syncing.
+There is no conversation left to add to by then, and a node's answer goes straight to a schema, so
+context returned there is reported as unused rather than quietly dropped.
+
+Every other event in the format — `PreCompact`, `PermissionRequest`, `Notification`,
+`MessageDisplay`, the worktree pair and the rest — describes a session with a person in it, or a
+lifecycle this host does not have. A plugin registering only those contributes nothing here.
+
+An event's matching hooks run **together**, and their answers are joined in plugin order so the
+result does not depend on how the timings fall. Each answers with the usual envelope, and only
 `additionalContext` is read:
 
 ```json
