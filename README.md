@@ -40,6 +40,23 @@ tests says so before the work starts, in the ruleset:
 defineDefaults({ mayModifyTests: ["crates/foo/tests"] });
 ```
 
+A repo can define its own workflows in `.ratatoskr/workflows/*.ts`, each declaring what it is for:
+
+```ts
+// .ratatoskr/workflows/research.ts
+defineWorkflow({
+  name: "research",
+  purpose: "Answer a question about the repository without changing it.",
+  whenToUse: ["the task asks what or why", "no code change is expected"],
+});
+async function plan(input) { /* compose the node bindings */ }
+```
+
+With one defined it is used; with several, name one with `--workflow <name>` — picking for you is
+the overseer's job, and choosing the alphabetically-first would look like a decision while being an
+accident. With none, the built-in flow above runs. A single `.ratatoskr/workflow.ts` still works and
+is registered under its filename.
+
 Every node's output is validated against its JSON Schema and checkpointed before the next node
 runs, so a failure stops the run with `status = failed` attributed to the node that failed, and the
 work up to that point is inspectable.
