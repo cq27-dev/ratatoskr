@@ -45,10 +45,24 @@ model = "kimi-k2.5"
 # provider = "moonshot"
 # model = "kimi-k2.5"
 
+# Optional: with a [models.verifier] route set, converge reviews the diff once the tests are clean
+# and sends the change back on real findings. It answers what the tests cannot — a requirement
+# missed, a test weakened rather than satisfied, an invariant a repo memory records. Findings it
+# judges to be faults in the PLAN route to the analyst to re-plan; the rest go to the implementer.
+# Omit to skip review entirely and converge on the test result alone.
+# [models.verifier]
+# provider = "anthropic"
+# model = "claude-sonnet-5"
+
 # Phase 3: the implementer drives a coding CLI via ACP in an isolated worktree.
 [implementer]
 cli = "claude"          # which coding CLI to drive (Claude Code via its ACP adapter)
 max_iterations = 3      # converge re-runs the implementer at most this many times
+# The least severe review finding that sends a change back to be fixed: "P1" (must-fix only),
+# "P2" (the default, also should-fix), or "P3" (nits too). Findings below it are still recorded.
+# P3 is deliberately not the default: the verifier shares max_iterations with the test-fixing
+# loop, so re-driving on style can spend the budget before a real failure surfaces.
+verify_threshold = "P2"
 # The analyst decides whether carrying out its plan means changing code. When it says no —
 # research, a review, an architecture question — the fork is skipped and the run finishes
 # `no_code_change` instead of paying for a baseline test run and an ACP session to produce an
