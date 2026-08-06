@@ -149,7 +149,11 @@ fn within(root: &Path, path: Option<&str>) -> Result<PathBuf, ToolExecutionError
         Some(path) => base.join(path),
         None => base.clone(),
     };
-    let real = joined.canonicalize().unwrap_or(joined);
+    // Canonicalising resolves symlinks, which is what stops one inside the repository pointing
+    // out of it. It also *fails* for a path that does not exist — and `starts_with` compares
+    // components without resolving `..`, so falling back to the raw path would let
+    // `<root>/../../etc/anything` pass. Normalise lexically first, so the check holds either way.
+    let real = joined.canonicalize().unwrap_or_else(|_| lexical(&joined));
     if !real.starts_with(&base) {
         return Err(ToolExecutionError::invalid_args(format!(
             "{} is outside this repository",
@@ -159,12 +163,28 @@ fn within(root: &Path, path: Option<&str>) -> Result<PathBuf, ToolExecutionError
     Ok(real)
 }
 
+/// Resolve `.` and `..` without touching the filesystem.
+///
+/// For a path that exists, `canonicalize` does this and more. This is the fallback for one that
+/// does not, where the alternative is a containment check that compares `..` as if it were a
+/// directory name.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            part => out.push(part),
+        }
+    }
+    out
+}
+
 /// `Read`: one file's lines, numbered, from `offset` for `limit` lines.
 fn read(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionError> {
     let path = within(root, Some(arg(args, "file_path")?))?;
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| ToolExecutionError::other(format!("cannot read {}: {e}", path.display())))?;
-
     let offset = args
         .get("offset")
         .and_then(|v| v.as_u64())
@@ -175,8 +195,13 @@ fn read(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionEr
         .and_then(|v| v.as_u64())
         .unwrap_or(u64::MAX) as usize;
 
+    // Streamed, not read whole: `offset` and `limit` bound what is *returned*, and a file large
+    // enough to matter would otherwise be held in memory in full before either applied.
     let mut out = String::new();
-    for (number, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
+    for (number, line) in lines_of(&path)?.enumerate().skip(offset - 1).take(limit) {
+        let line = line.map_err(|e| {
+            ToolExecutionError::other(format!("cannot read {}: {e}", path.display()))
+        })?;
         // Numbered because that is how a node cites what it read, and how it asks for more.
         out.push_str(&format!("{:>6}\t{line}\n", number + 1));
         if out.len() > MAX_READ_BYTES {
@@ -185,6 +210,16 @@ fn read(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionEr
         }
     }
     Ok(out)
+}
+
+/// One file's lines, read as they are needed.
+fn lines_of(
+    path: &Path,
+) -> Result<std::io::Lines<std::io::BufReader<std::fs::File>>, ToolExecutionError> {
+    use std::io::BufRead as _;
+    let file = std::fs::File::open(path)
+        .map_err(|e| ToolExecutionError::other(format!("cannot read {}: {e}", path.display())))?;
+    Ok(std::io::BufReader::new(file).lines())
 }
 
 /// `Grep`: a regular expression over the repository's files.
@@ -220,8 +255,9 @@ fn grep(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionEr
         {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&file) else {
-            continue; // Binary, or unreadable. Not an error; just not a match.
+        // Streamed, so a file large enough to matter is never held whole in memory.
+        let Ok(reading) = lines_of(&file) else {
+            continue; // Unreadable. Not an error; just not a match.
         };
         let shown = file
             .strip_prefix(root)
@@ -229,8 +265,11 @@ fn grep(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionEr
             .display()
             .to_string();
         let mut hits = 0usize;
-        for (number, line) in text.lines().enumerate() {
-            if !re.is_match(line) {
+        for (number, line) in reading.enumerate() {
+            let Ok(line) = line else {
+                break; // Not UTF-8 past here; whatever already matched still counts.
+            };
+            if !re.is_match(&line) {
                 continue;
             }
             hits += 1;
@@ -245,7 +284,9 @@ fn grep(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionEr
                 _ => {}
             }
         }
-        if lines.len() >= head && mode != "count" {
+        // Every mode stops at the same bound. `count` walking the whole tree regardless was a
+        // long synchronous stall over a large repository, and an answer nothing had asked to cap.
+        if lines.len().max(counts.len()) >= head {
             break;
         }
     }
@@ -365,6 +406,49 @@ mod tests {
         for path in ["../../../etc/passwd", "/etc/passwd"] {
             let err = read(&root, &json!({ "file_path": path })).expect_err("refused");
             assert!(err.to_string().contains("outside this repository"), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_path_that_does_not_exist_cannot_escape_either() {
+        // `canonicalize` fails for a path that is not there, and `starts_with` compares `..` as
+        // if it were a directory name — so the fallback has to normalise before it compares.
+        let root = repo("dangling");
+        for path in [
+            "../../../etc/nonexistent-xyz",
+            "src/../../../../etc/nonexistent-xyz",
+        ] {
+            let err = read(&root, &json!({ "file_path": path })).expect_err("refused");
+            assert!(
+                err.to_string().contains("outside this repository"),
+                "{path}: {err}"
+            );
+        }
+        // And a symlink inside the repository pointing out of it is resolved, then refused.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/hosts", root.join("escape")).unwrap();
+            let err = read(&root, &json!({ "file_path": "escape" })).expect_err("refused");
+            assert!(err.to_string().contains("outside this repository"), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_grep_mode_stops_at_the_same_bound() {
+        // `count` used to walk the whole tree however large, ignoring `head_limit` entirely.
+        let root = repo("bounded");
+        for name in 0..8 {
+            std::fs::write(root.join("src").join(format!("f{name}.rs")), "fn x() {}\n").unwrap();
+        }
+        for mode in ["content", "files_with_matches", "count"] {
+            let out = grep(
+                &root,
+                &json!({ "pattern": "fn", "output_mode": mode, "head_limit": 3 }),
+            )
+            .unwrap();
+            assert!(out.lines().count() <= 3, "{mode}: {out}");
         }
         let _ = std::fs::remove_dir_all(&root);
     }
