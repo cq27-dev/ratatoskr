@@ -240,12 +240,29 @@ fn truncate(s: &str, max: usize) -> String {
 ///
 /// Returns the builder alongside the handles its usage accumulates into; the caller reads them
 /// after the prompt settles, including when it failed.
+/// Appended to every node's preamble.
+///
+/// A turn costs one round-trip to the model — measured at roughly six seconds against a large
+/// cached context, and growing with it — while the tools themselves answer in about a tenth of a
+/// second. A node that reads twelve files one per turn therefore spends over a minute waiting and
+/// barely a second working. Left unasked, that is exactly what happens: an unprompted node batches
+/// almost nothing, and the run's wall-clock is its turn count.
+///
+/// Nothing enforces this — it is the model's choice per turn — so it is worded as the default to
+/// depart from rather than a rule, since a call that genuinely depends on the previous result must
+/// still wait for it.
+const TOOL_USE_GUIDANCE: &str = "\n\n## Calling tools\n\nWhen you need several things and none of \
+    them depends on another's result, ask for them all in the same turn rather than one at a time. \
+    Reading four files is one turn with four calls, not four turns. Only wait for a result when \
+    what you do next actually depends on it.";
+
 fn metered<M: CompletionModel + 'static>(
     model: M,
     preamble: &str,
     max_turns: Option<usize>,
     max_tokens: u64,
 ) -> (AgentBuilder<M, NoToolConfig>, Meter) {
+    let preamble = &format!("{preamble}{TOOL_USE_GUIDANCE}");
     let usage = UsageHook::default();
     let meter = Meter {
         total: Arc::clone(&usage.total),
