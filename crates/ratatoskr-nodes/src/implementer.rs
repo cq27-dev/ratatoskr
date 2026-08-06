@@ -32,6 +32,19 @@ pub struct ImplementerOutput {
     pub narrative: Option<String>,
 }
 
+/// What a natively-driven implementer is told.
+///
+/// A file rather than a string constant because it is 76 lines of prose that changes for prompt
+/// reasons, not code reasons — keeping it out of the source means a wording change reads as a
+/// wording change in review, and the file can be diffed against a run's behaviour directly.
+///
+/// Written for this pipeline rather than adapted from a coding CLI's: those address an assistant
+/// with a human watching, and most of what they spend words on — tone, when to explain yourself,
+/// how to format a reply — is inapplicable here and costs attention. What replaces it is the part
+/// no interactive agent needs: what "done" means when nobody will confirm it, that the referee is
+/// off limits and why, and what to do when the session opens with a diagnostic rather than a plan.
+pub const NATIVE_PREAMBLE: &str = include_str!("../prompts/implementer.md");
+
 /// The implementer node. Holds everything needed to create the worktree and drive the CLI.
 pub struct ImplementerNode {
     pub repo_path: PathBuf,
@@ -163,5 +176,29 @@ fn acp_command(cli: &str) -> Result<String, NodeError> {
         other => Err(NodeError::Failed(format!(
             "unsupported implementer.cli {other:?}; only \"claude\" is wired in Phase 3"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_native_preamble_states_the_rules_a_run_actually_enforces() {
+        // The prompt lives in a separate file, so nothing in the type system ties it to the gates
+        // it describes. These are the four an iteration is actually rejected or re-driven on: a
+        // prompt that stopped mentioning one would leave the model to discover it by failing.
+        let p = NATIVE_PREAMBLE;
+        assert!(p.contains("REFEREE GATE"), "the hard-rejection rule");
+        assert!(
+            p.contains("conftest.py") && p.contains("Cargo.toml"),
+            "the referee files"
+        );
+        assert!(p.contains("DEFINITION OF DONE"), "when to stop");
+        assert!(p.contains("exactly once"), "Edit's uniqueness contract");
+        assert!(p.contains("DIAGNOSTIC"), "the re-driven path");
+        // It is told there is nobody to ask, which is the fact every interactive prompt assumes
+        // the opposite of.
+        assert!(p.contains("no human") || p.contains("There is no human"));
     }
 }

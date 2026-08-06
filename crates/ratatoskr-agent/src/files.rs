@@ -50,7 +50,10 @@ pub fn declarations() -> Vec<Tool> {
     vec![
         declare(
             READ,
-            "Read a file from the repository. Returns its lines, numbered.",
+            "Return a file's contents with 1-based line numbers. offset selects the first line to return, \
+            limit caps the line count — use them for large files, since output is capped at 256 KB. Read \
+            before any Edit so old_string can be copied exactly (strip the line-number prefix). To \
+            locate which files mention something, use Grep instead of reading files one by one.",
             json!({
                 "type": "object",
                 "properties": {
@@ -67,7 +70,13 @@ pub fn declarations() -> Vec<Tool> {
         ),
         declare(
             GREP,
-            "Search the repository's files for a regular expression.",
+            "Search file contents across the repository with a regex. Prefer this over Reading many files \
+            when hunting for a symbol, string, or pattern. path narrows to a file or directory, glob \
+            filters filenames, -i makes it case-insensitive. output_mode: files_with_matches lists \
+            matching files (best first pass), content shows matching lines, count gives per-file totals; \
+            head_limit truncates output. Skips .git, target, node_modules, .venv, dist; results cap at \
+            200 — if you hit the cap, narrow the pattern or path. Zero matches often means the pattern \
+            is too strict: loosen it or drop anchors before concluding the code is absent.",
             json!({
                 "type": "object",
                 "properties": {
@@ -87,7 +96,9 @@ pub fn declarations() -> Vec<Tool> {
         ),
         declare(
             GLOB,
-            "Find files in the repository by glob pattern.",
+            "Find files by name pattern, e.g. src/**/*.rs, with optional path to scope the search. Use \
+            this to discover file layout or locate a file whose name you partly know; use Grep when you \
+            are matching file contents rather than names.",
             json!({
                 "type": "object",
                 "properties": {
@@ -108,8 +119,11 @@ pub fn edit_declarations() -> Vec<Tool> {
     vec![
         declare(
             WRITE,
-            "Write a file, replacing it entirely if it exists. Prefer `Edit` for a change to an \
-             existing file: writing one whole re-states every line you did not mean to change.",
+            "Write content to file_path, creating parent directories as needed. If the file exists it is \
+            replaced entirely, so any lines you do not restate are lost — prefer Edit for modifying an \
+            existing file and reserve Write for new files or intentional full rewrites. Paths outside \
+            the repository are refused. Content over 4 MB is refused. To overwrite safely, Read the file \
+            first so you know what you are discarding.",
             json!({
                 "type": "object",
                 "properties": {
@@ -125,8 +139,18 @@ pub fn edit_declarations() -> Vec<Tool> {
         ),
         declare(
             EDIT,
-            "Replace an exact string in a file. `old_string` must appear exactly once unless \
-             `replace_all` is set, so an ambiguous edit fails instead of changing the wrong line.",
+            "Replace one exact string in a file. old_string must match the file byte-for-byte, including \
+            every space, tab, and newline of indentation — copy it from Read output (dropping the \
+            line-number prefix), never retype it from memory. If old_string occurs more than once, the \
+            call fails and nothing is written; fix by extending old_string with surrounding lines until \
+            it is unique, or pass replace_all: true to change every occurrence. If old_string occurs \
+            zero times, the tool retries with whitespace-normalized matching (lines trimmed, blank lines \
+            ignored): exactly one region matching that way is edited and the result says so; several \
+            such regions still fail, and the error quotes the nearest file lines with numbers — copy \
+            your next old_string directly from that quote or re-Read the region. old_string identical to \
+            new_string fails. Non-UTF-8 files are refused. Existing LF/CRLF line endings are preserved. \
+            Prefer this over Write for any change to an existing file: it touches only the lines you \
+            name.",
             json!({
                 "type": "object",
                 "properties": {
