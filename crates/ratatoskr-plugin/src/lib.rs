@@ -172,16 +172,16 @@ fn read_hooks(root: &Path) -> Vec<Hook> {
         .collect()
 }
 
-/// Collect the `SessionStart` context every plugin has to offer, in plugin order.
+/// Run every plugin's `SessionStart` hooks and keep each plugin's output under its own name.
 ///
-/// `SessionStart` answers with plain text on stdout — no envelope — and silence is the normal
-/// "nothing to say". The result is capped at [`CONTEXT_BUDGET`], truncated between plugins rather
-/// than mid-sentence.
-pub async fn session_start_context(plugins: &[Plugin], cwd: &Path) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    let mut used = 0usize;
+/// Per plugin rather than one joined string because nodes bind different sets: the hooks run once
+/// per run, and each node composes from this map. `SessionStart` answers with plain text on stdout
+/// — no envelope — and silence is the normal "nothing to say".
+pub async fn session_start(plugins: &[Plugin], cwd: &Path) -> BTreeMap<String, String> {
+    let mut contexts = BTreeMap::new();
 
     for plugin in plugins {
+        let mut parts: Vec<String> = Vec::new();
         for hook in plugin.hooks.iter().filter(|h| h.event == "SessionStart") {
             let payload = serde_json::json!({
                 "session_id": "",
@@ -194,17 +194,49 @@ pub async fn session_start_context(plugins: &[Plugin], cwd: &Path) -> Option<Str
                 continue;
             };
             let text = text.trim();
-            if text.is_empty() {
-                continue;
+            if !text.is_empty() {
+                parts.push(text.to_string());
             }
-            // Whole hooks in or out: half a digest is worse than none of one.
-            if used + text.len() > CONTEXT_BUDGET {
-                tracing::debug!("dropping {}'s session context: over budget", plugin.name);
-                continue;
-            }
-            used += text.len();
-            parts.push(text.to_string());
         }
+        if parts.is_empty() {
+            continue;
+        }
+        // Whole plugins in or out, decided here rather than at composition: half a digest is
+        // worse than none of one, and refusing it now means nothing over the budget is held
+        // resident for the run.
+        let text = parts.join("\n\n");
+        if text.len() > CONTEXT_BUDGET {
+            tracing::warn!(
+                plugin = plugin.name,
+                chars = text.len(),
+                "dropping session context: over budget"
+            );
+            continue;
+        }
+        contexts.insert(plugin.name.clone(), text);
+    }
+    contexts
+}
+
+/// Compose one node's session context from the plugins it is bound to, in binding order.
+///
+/// Capped at [`CONTEXT_BUDGET`] and truncated between plugins rather than mid-sentence: this text
+/// is prepended to the node's preamble, so it is paid for on every model call that node makes.
+pub fn compose(contexts: &BTreeMap<String, String>, names: &[String]) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+
+    for name in names {
+        let Some(text) = contexts.get(name) else {
+            continue;
+        };
+        // Whole plugins in or out: half a digest is worse than none of one.
+        if used + text.len() > CONTEXT_BUDGET {
+            tracing::debug!("dropping {name}'s session context: over budget");
+            continue;
+        }
+        used += text.len();
+        parts.push(text);
     }
 
     (!parts.is_empty()).then(|| parts.join("\n\n"))
@@ -397,7 +429,10 @@ mod tests {
         );
 
         let plugins = discover(&[talkative.clone(), quiet.clone()]);
-        let context = session_start_context(&plugins, Path::new(".")).await;
+        let context = compose(
+            &session_start(&plugins, Path::new(".")).await,
+            &plugins.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+        );
         assert_eq!(context.as_deref(), Some("repo digest"));
 
         let _ = std::fs::remove_dir_all(&talkative);
@@ -420,7 +455,10 @@ mod tests {
 
         let plugins = discover(std::slice::from_ref(&broken));
         let started = std::time::Instant::now();
-        let context = session_start_context(&plugins, Path::new(".")).await;
+        let context = compose(
+            &session_start(&plugins, Path::new(".")).await,
+            &plugins.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+        );
 
         assert_eq!(context.as_deref(), Some("survived"));
         assert!(
@@ -445,7 +483,10 @@ mod tests {
         );
         let plugins = discover(std::slice::from_ref(&flood));
         let started = std::time::Instant::now();
-        let context = session_start_context(&plugins, Path::new(".")).await;
+        let context = compose(
+            &session_start(&plugins, Path::new(".")).await,
+            &plugins.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+        );
 
         assert!(
             started.elapsed() < Duration::from_secs(9),
@@ -469,8 +510,8 @@ mod tests {
             ),
         );
         let plugins = discover(std::slice::from_ref(&root));
-        let context = session_start_context(&plugins, Path::new("."))
-            .await
+        let names: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
+        let context = compose(&session_start(&plugins, Path::new(".")).await, &names)
             .expect("the hook echoed its root");
         assert_eq!(context, root.display().to_string());
         let _ = std::fs::remove_dir_all(&root);

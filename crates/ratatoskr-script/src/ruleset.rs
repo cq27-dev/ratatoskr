@@ -20,10 +20,13 @@ use serde::Deserialize;
 use crate::ScriptError;
 use crate::transpile::transpile_ts;
 
-/// JS prelude: `defineAgent` registry, the tool-call dispatcher, and a static-config extractor.
+/// JS prelude: the `defineAgent` / `defineDefaults` registries, the tool-call dispatcher, and a
+/// static-config extractor.
 const BOOTSTRAP: &str = r#"
 globalThis.__agents = {};
+globalThis.__defaults = {};
 function defineAgent(name, config) { globalThis.__agents[name] = config || {}; }
+function defineDefaults(config) { globalThis.__defaults = config || {}; }
 globalThis.__onToolCall = function(name, tool, argsJson) {
     var a = globalThis.__agents[name];
     if (!a || typeof a.onToolCall !== 'function') return "allow";
@@ -34,18 +37,23 @@ globalThis.__onToolCall = function(name, tool, argsJson) {
     return "allow";
 };
 globalThis.__staticConfig = function() {
-    var out = {};
+    var agents = {};
     for (var k in globalThis.__agents) {
         var a = globalThis.__agents[k];
-        out[k] = {
+        agents[k] = {
             model: a.model || null,
             tools: a.tools || null,
             maxTurns: (typeof a.maxTurns === 'number') ? a.maxTurns : null,
             systemPrompt: (typeof a.systemPrompt === 'string') ? a.systemPrompt : null,
+            plugins: (a.plugins === undefined) ? null : a.plugins,
             hasOnToolCall: typeof a.onToolCall === 'function'
         };
     }
-    return JSON.stringify(out);
+    var d = globalThis.__defaults;
+    return JSON.stringify({
+        agents: agents,
+        defaults: { plugins: (d.plugins === undefined) ? null : d.plugins }
+    });
 };
 "#;
 
@@ -65,6 +73,47 @@ pub struct ToolRule {
     pub deny: Vec<String>,
 }
 
+/// Which plugins a node gets.
+///
+/// Two spellings, because both readings are natural: a bare list means exactly these, and an
+/// object adjusts what it inherits. Inheriting is the default in the object form because the
+/// common case is one repository-wide set, occasionally tweaked — opting out of it has to be
+/// said out loud rather than implied by an absent key.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PluginRule {
+    /// `plugins: ["a", "b"]` — exactly these, ignoring the defaults.
+    Only(Vec<String>),
+    Adjust(AdjustRule),
+}
+
+/// `plugins: { inherit?, add?, remove? }`.
+///
+/// Unknown keys are refused: a misspelled `adds` would otherwise match with every field defaulted,
+/// binding nothing and reporting nothing — the quiet failure this whole feature exists to avoid.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdjustRule {
+    /// `false` to start from nothing rather than the defaults.
+    #[serde(default = "yes")]
+    pub inherit: bool,
+    #[serde(default)]
+    pub add: Vec<String>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// What `defineDefaults` declared, inherited by every node.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Defaults {
+    #[serde(default)]
+    pub plugins: Option<Vec<String>>,
+}
+
 /// The static (non-executable) config a ruleset declares for one agent.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AgentRuleset {
@@ -77,8 +126,29 @@ pub struct AgentRuleset {
     /// Replaces the node's built-in preamble when set.
     #[serde(default, rename = "systemPrompt")]
     pub system_prompt: Option<String>,
+    /// Which plugins this node gets; `None` means "whatever the defaults say".
+    #[serde(default)]
+    pub plugins: Option<PluginRule>,
     #[serde(default, rename = "hasOnToolCall")]
     pub has_on_tool_call: bool,
+}
+
+/// The whole static config a ruleset directory declares.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct StaticConfig {
+    #[serde(default)]
+    agents: HashMap<String, AgentRuleset>,
+    #[serde(default)]
+    defaults: Defaults,
+}
+
+/// Keep first occurrences, drop repeats — a plugin named twice is bound once.
+fn dedup(names: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    names
+        .into_iter()
+        .filter(|n| seen.insert(n.clone()))
+        .collect()
 }
 
 /// A loaded ruleset engine: the resident JS context plus each agent's extracted static config.
@@ -87,6 +157,7 @@ pub struct ScriptEngine {
     _runtime: AsyncRuntime,
     context: AsyncContext,
     agents: HashMap<String, AgentRuleset>,
+    defaults: Defaults,
 }
 
 impl ScriptEngine {
@@ -131,16 +202,65 @@ impl ScriptEngine {
             })
             .await?;
 
-        let agents: HashMap<String, AgentRuleset> = serde_json::from_str(&agents_json)
+        let static_config: StaticConfig = serde_json::from_str(&agents_json)
             .map_err(|e| ScriptError::Eval(format!("static config parse: {e}")))?;
 
         Ok(Arc::new(ScriptEngine {
             _runtime: runtime,
             context,
-            agents,
+            agents: static_config.agents,
+            defaults: static_config.defaults,
         }))
         // ponytail: no JS eval budget yet (repo rules are trusted code). Add
         // AsyncRuntime::set_interrupt_handler if untrusted scripts ever run.
+    }
+
+    /// Which of the `discovered` plugins `node` gets, after inheritance.
+    ///
+    /// A node with no ruleset, or one that says nothing about plugins, gets the defaults — and the
+    /// defaults are every discovered plugin unless `defineDefaults` says otherwise, so installing
+    /// a plugin is enough to use it. Order follows the declaration: defaults first, then whatever
+    /// the node adds, because that is the order their session context is read in.
+    pub fn plugins_for(&self, node: &str, discovered: &[String]) -> Vec<String> {
+        // Installing a plugin is itself the statement that you want it: with no `defineDefaults`,
+        // every discovered plugin applies. A ruleset narrows that; it isn't a prerequisite for
+        // plugins working at all.
+        let defaults = || {
+            self.defaults
+                .plugins
+                .clone()
+                .unwrap_or_else(|| discovered.to_vec())
+        };
+        let Some(rule) = self.agents.get(node).and_then(|a| a.plugins.as_ref()) else {
+            return defaults();
+        };
+
+        match rule {
+            PluginRule::Only(only) => dedup(only.clone()),
+            PluginRule::Adjust(rule) => {
+                let mut names = if rule.inherit { defaults() } else { Vec::new() };
+                names.extend(rule.add.iter().cloned());
+                names.retain(|n| !rule.remove.contains(n));
+                dedup(names)
+            }
+        }
+    }
+
+    /// Every plugin name any ruleset mentions, for validating them against what was discovered.
+    pub fn declared_plugins(&self) -> Vec<String> {
+        let mut names = self.defaults.plugins.clone().unwrap_or_default();
+        for agent in self.agents.values() {
+            match &agent.plugins {
+                Some(PluginRule::Only(only)) => names.extend(only.iter().cloned()),
+                Some(PluginRule::Adjust(rule)) => {
+                    names.extend(rule.add.iter().cloned());
+                    // A `remove` that names nothing real is just as much a typo as an `add`.
+                    names.extend(rule.remove.iter().cloned());
+                }
+                None => {}
+            }
+        }
+        dedup(names)
     }
 
     /// The ruleset governing `node`, if one was declared.
@@ -255,6 +375,160 @@ mod tests {
         ));
         // A node with no ruleset gets nothing to gate.
         assert!(engine.ruleset("analyst").is_none());
+    }
+
+    /// Load a ruleset directory from source, for the plugin-binding tests.
+    async fn engine_with(case: &str, source: &str) -> Arc<ScriptEngine> {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-plugin-binding-{}-{case}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agents.ts"), source).unwrap();
+        ScriptEngine::load(&dir).await.unwrap()
+    }
+
+    /// Stand-in for what discovery found.
+    fn discovered() -> Vec<String> {
+        [
+            "rag-rat",
+            "noisy",
+            "impact-lens",
+            "scout-only",
+            "exactly-this",
+            "extra",
+            "a",
+            "b",
+            "c",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn with_no_declarations_every_discovered_plugin_applies() {
+        // Installing a plugin is the statement that you want it; a ruleset narrows, it is not a
+        // prerequisite. Without this, adding the binding feature would silently unbind every
+        // existing repo.
+        let engine = engine_with("implicit", r#"defineAgent("scout", { maxTurns: 2 });"#).await;
+        let discovered = vec!["rag-rat".to_string(), "other".to_string()];
+
+        assert_eq!(
+            engine.plugins_for("scout", &discovered),
+            ["rag-rat", "other"]
+        );
+        assert_eq!(
+            engine.plugins_for("analyst", &discovered),
+            ["rag-rat", "other"]
+        );
+        assert!(engine.declared_plugins().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_misspelled_key_is_refused_rather_than_defaulted() {
+        // `adds` would otherwise match with every field defaulted: nothing bound, nothing said.
+        let dir = std::env::temp_dir().join(format!("ratatoskr-typo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.ts"),
+            r#"defineAgent("analyst", { plugins: { adds: ["impact-lens"] } });"#,
+        )
+        .unwrap();
+
+        assert!(
+            ScriptEngine::load(&dir).await.is_err(),
+            "an unknown key in a plugins rule fails the load"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn defaults_reach_a_node_that_says_nothing() {
+        // Adding a plugin repository-wide must not require touching every node.
+        let engine = engine_with(
+            "inherit",
+            r#"
+            defineDefaults({ plugins: ["rag-rat"] });
+            defineAgent("analyst", { maxTurns: 3 });
+            "#,
+        )
+        .await;
+        let discovered = discovered();
+
+        assert_eq!(engine.plugins_for("analyst", &discovered), ["rag-rat"]);
+        // Including a node with no ruleset at all.
+        assert_eq!(engine.plugins_for("scout", &discovered), ["rag-rat"]);
+    }
+
+    #[tokio::test]
+    async fn a_node_adds_and_removes_against_the_defaults() {
+        let engine = engine_with(
+            "adjust",
+            r#"
+            defineDefaults({ plugins: ["rag-rat", "noisy"] });
+            defineAgent("analyst", { plugins: { add: ["impact-lens"], remove: ["noisy"] } });
+            "#,
+        )
+        .await;
+        let discovered = discovered();
+
+        // Defaults first, then what the node adds — the order their context is read in.
+        assert_eq!(
+            engine.plugins_for("analyst", &discovered),
+            ["rag-rat", "impact-lens"]
+        );
+        assert_eq!(
+            engine.plugins_for("scout", &discovered),
+            ["rag-rat", "noisy"]
+        );
+    }
+
+    #[tokio::test]
+    async fn opting_out_of_the_defaults_must_be_said_out_loud() {
+        let engine = engine_with(
+            "optout",
+            r#"
+            defineDefaults({ plugins: ["rag-rat"] });
+            defineAgent("scout", { plugins: { inherit: false, add: ["scout-only"] } });
+            defineAgent("bookkeeper", { plugins: ["exactly-this"] });
+            defineAgent("analyst", { plugins: { add: ["extra"] } });
+            "#,
+        )
+        .await;
+        let discovered = discovered();
+
+        assert_eq!(engine.plugins_for("scout", &discovered), ["scout-only"]);
+        // A bare list is "exactly these" — the other natural reading of the same key.
+        assert_eq!(
+            engine.plugins_for("bookkeeper", &discovered),
+            ["exactly-this"]
+        );
+        // Omitting `inherit` keeps the defaults, which is the common case.
+        assert_eq!(
+            engine.plugins_for("analyst", &discovered),
+            ["rag-rat", "extra"]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_mentioned_plugin_is_reported_for_validation() {
+        // A name that matches no discovered plugin is a typo, whether it was added or removed.
+        let engine = engine_with(
+            "declared",
+            r#"
+            defineDefaults({ plugins: ["rag-rat"] });
+            defineAgent("scout", { plugins: { add: ["a"], remove: ["b"] } });
+            defineAgent("analyst", { plugins: ["c", "rag-rat"] });
+            "#,
+        )
+        .await;
+
+        let mut declared = engine.declared_plugins();
+        declared.sort();
+        assert_eq!(declared, ["a", "b", "c", "rag-rat"]);
     }
 
     #[tokio::test]

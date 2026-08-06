@@ -19,7 +19,9 @@ async fn main() {
         }
     }
     let cwd = std::env::current_dir().unwrap();
-    match ratatoskr_plugin::session_start_context(&plugins, &cwd).await {
+    let contexts = ratatoskr_plugin::session_start(&plugins, &cwd).await;
+    let names: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
+    match ratatoskr_plugin::compose(&contexts, &names) {
         Some(c) => println!("\n--- SessionStart context ({} chars) ---\n{c}", c.len()),
         None => println!("\n(no session context)"),
     }
