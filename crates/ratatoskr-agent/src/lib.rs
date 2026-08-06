@@ -168,7 +168,7 @@ pub async fn ask(
                 question,
                 tools,
                 max_turns,
-                route.max_tokens(),
+                route,
             )
             .await
         }
@@ -183,7 +183,7 @@ pub async fn ask(
                 question,
                 tools,
                 max_turns,
-                route.max_tokens(),
+                route,
             )
             .await
         }
@@ -197,12 +197,12 @@ async fn run<M>(
     question: &str,
     tools: ToolSet,
     max_turns: Option<usize>,
-    max_tokens: u64,
+    route: &ModelRoute,
 ) -> Result<String, AgentError>
 where
     M: CompletionModel + 'static,
 {
-    let (builder, meter) = metered(model, preamble, max_turns, max_tokens);
+    let (builder, meter) = metered(model, preamble, max_turns, Request::of(route));
     let agent = bind_tools(builder, &tools, None, None);
 
     let answer = agent.prompt(question).await;
@@ -296,11 +296,55 @@ const TOOL_USE_GUIDANCE: &str = "\n\n## Calling tools\n\nWhen you need several t
     Reading four files is one turn with four calls, not four turns. Only wait for a result when \
     what you do next actually depends on it.";
 
+/// What one call asks of the provider, beyond the prompt and the tools.
+///
+/// A struct rather than three arguments because they arrive together from a route, and because the
+/// compactor has settings but no route — it summarises with the node's model and asks nothing
+/// extra of it.
+pub struct Request {
+    max_tokens: u64,
+    temperature: Option<f64>,
+    params: Option<serde_json::Value>,
+}
+
+impl Request {
+    /// What a route asks for.
+    pub fn of(route: &ModelRoute) -> Self {
+        Request {
+            max_tokens: route.max_tokens(),
+            temperature: route.temperature,
+            params: route.params.as_ref().and_then(|p| {
+                serde_json::to_value(p)
+                    .map_err(|e| {
+                        // Warned rather than failed: the run is otherwise fine, and a route that
+                        // cannot encode its own extras should not take the run down with it.
+                        tracing::warn!(
+                            model = %route.model,
+                            "could not encode this route's `params`, sending the call without \
+                             them: {e}"
+                        );
+                    })
+                    .ok()
+            }),
+        }
+    }
+
+    /// The defaults: a cap and nothing else. What the compactor asks for — a summary wants neither
+    /// a temperature of the node's choosing nor its extended thinking budget.
+    pub fn plain() -> Self {
+        Request {
+            max_tokens: ratatoskr_core::DEFAULT_MAX_TOKENS,
+            temperature: None,
+            params: None,
+        }
+    }
+}
+
 fn metered<M: CompletionModel + 'static>(
     model: M,
     preamble: &str,
     max_turns: Option<usize>,
-    max_tokens: u64,
+    request: Request,
 ) -> (AgentBuilder<M, NoToolConfig>, Meter) {
     let preamble = &format!("{preamble}{TOOL_USE_GUIDANCE}");
     let usage = UsageHook::default();
@@ -315,11 +359,23 @@ fn metered<M: CompletionModel + 'static>(
         // known prefixes does not include models released after it was compiled, and a model that
         // falls through it goes out with no cap at all — which Anthropic rejects outright, losing
         // the run at that node's first call.
-        .max_tokens(max_tokens)
+        .max_tokens(request.max_tokens)
         // Log tool calls + model text; added before the gates so it observes calls the
         // clarification and ruleset hooks may skip.
         .add_hook(ObservabilityHook::default())
         .add_hook(usage);
+    // Left to the provider's default when the route says nothing, rather than given a default
+    // here: "unset" is a position, and picking one for every node from one place would be picking
+    // it for nodes nobody thought about.
+    let builder = match request.temperature {
+        Some(t) => builder.temperature(t),
+        None => builder,
+    };
+    // Provider-specific fields, verbatim. Anthropic's extended thinking is the reason this exists.
+    let builder = match request.params {
+        Some(params) => builder.additional_params(params),
+        None => builder,
+    };
     (builder, meter)
 }
 
@@ -1033,7 +1089,6 @@ async fn run_typed<M>(model: M, run: NodeRun<'_>) -> Result<String, AgentError>
 where
     M: CompletionModel + 'static,
 {
-    let max_tokens = run.route.max_tokens();
     // The compactor summarises with the same model the node runs on. Cheaper would be tempting, but
     // a summary is the only record of the turns it replaces: the reader that has to reconstruct a
     // session from it is this model, and a weaker one deciding what that reader needs is a false
@@ -1067,7 +1122,7 @@ where
         None => (preamble.to_string(), question.to_string()),
     };
 
-    let (builder, meter) = metered(model, &preamble, max_turns, max_tokens);
+    let (builder, meter) = metered(model, &preamble, max_turns, Request::of(route));
     // Kept for the validation below: the builder consumes the schema, and a node's answer has to
     // be checked against it here, where the agent that wrote it can still be asked to fix it.
     let schema_value = serde_json::to_value(&output_schema).unwrap_or(serde_json::Value::Null);
@@ -1347,6 +1402,8 @@ mod tests {
             provider: "anthropic".into(),
             model: "claude-haiku-4-5-20251001".into(),
             max_tokens: None,
+            temperature: None,
+            params: None,
         };
         let answer = run_structured(NodeRun {
             node: "livetest",
@@ -1412,6 +1469,8 @@ mod tests {
             provider: "anthropic".into(),
             model: "claude-haiku-4-5-20251001".into(),
             max_tokens: None,
+            temperature: None,
+            params: None,
         };
         let answer = run_structured(NodeRun {
             node: "usagetest",

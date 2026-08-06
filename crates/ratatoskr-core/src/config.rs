@@ -272,6 +272,29 @@ pub struct ModelRoute {
     /// this. Lower it for a model whose own ceiling is below the default.
     #[serde(default)]
     pub max_tokens: Option<u64>,
+    /// Sampling temperature. `None` leaves the provider's default, which on Anthropic is 1.0.
+    ///
+    /// Worth setting to 0 for a node whose job is transcription or extraction rather than
+    /// judgement — the characterizer reads test output and names the checks in it, and a node
+    /// sampling creatively over that invents detail the output does not contain.
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Provider-specific request fields, merged into the call verbatim.
+    ///
+    /// The escape hatch for what a provider offers and this config has no word for — Anthropic's
+    /// extended thinking is the reason it exists:
+    ///
+    /// ```toml
+    /// [models.analyst.params.thinking]
+    /// type = "enabled"
+    /// budget_tokens = 4000
+    /// ```
+    ///
+    /// Passed through unvalidated, so a misspelling here is a provider error at the first call
+    /// rather than a config error at load. Thinking tokens count against `max_tokens`; raise it
+    /// alongside the budget or the call is rejected for a cap it cannot meet.
+    #[serde(default)]
+    pub params: Option<toml::Value>,
 }
 
 /// The per-call output cap when a route does not set one.
@@ -346,6 +369,8 @@ impl Default for RatatoskrConfig {
     fn default() -> Self {
         let route = |provider: &str, model: &str| ModelRoute {
             max_tokens: None,
+            temperature: None,
+            params: None,
             provider: provider.to_string(),
             model: model.to_string(),
         };

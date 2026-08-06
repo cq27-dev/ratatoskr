@@ -1183,6 +1183,8 @@ fn node_agent_config(
             // A ruleset declares which model, not how much of it. The cap comes from the default,
             // which is always sent — so a ruleset naming a brand-new model still works.
             max_tokens: None,
+            temperature: None,
+            params: None,
         },
         None => route(config, node)?,
     };
@@ -2628,6 +2630,8 @@ mod agent_config_tests {
                 provider: "anthropic".into(),
                 model: "claude-haiku-4-5-20251001".into(),
                 max_tokens: None,
+                temperature: None,
+                params: None,
             },
         );
 
@@ -2708,6 +2712,8 @@ mod agent_config_tests {
                 provider: "openai".to_string(),
                 model: "gpt-5".to_string(),
                 max_tokens: None,
+                temperature: None,
+                params: None,
             },
         );
         assert!(classifier_enabled(&engine, &config));

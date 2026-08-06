@@ -118,7 +118,7 @@ where
                     self.node, self.produces
                 ),
                 None,
-                ratatoskr_core::DEFAULT_MAX_TOKENS,
+                crate::Request::plain(),
             );
             let answer = builder.build().prompt(prompt.as_str()).await;
             // Charged whether or not the summary came back: a compaction that failed still spent
