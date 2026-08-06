@@ -170,12 +170,15 @@ plugins it holds, so per-node binding costs nothing extra.
 
 A plugin can also bring **tools**. Any stdio MCP server it declares (`mcpServers` in the manifest,
 or a `.mcp.json` beside it) is connected once per run and offered to every node that binds the
-plugin, alongside rag-rat's own catalogue. Those tools need no mention in a node's `tools.allow` —
-binding the plugin is the statement; `deny` still removes any of them, and a ruleset's
-`onToolCall` gate sees them under the same names. Where two servers offer one name, the first one
-connected keeps it, so a plugin can never shadow a rag-rat tool a node's prompt was written
-against; the collision is logged with both server names. A server that will not start costs its
-plugin's tools and nothing else.
+plugin, alongside rag-rat's own catalogue. A node that names no tools of its own gets them for
+free — binding the plugin is the statement. A node whose ruleset spells out `tools.allow` is a
+different case: that list is exhaustive, so it must name the plugin's tools too (the run warns
+when it doesn't). `deny` removes any of them, and an `onToolCall` gate sees them under the same
+names.
+
+Where two servers offer one name, the first one connected keeps it, so a plugin can never shadow a
+rag-rat tool a node's prompt was written against; the collision is logged with both server names. A
+server that will not start costs its plugin's tools and nothing else.
 
 ### Scripted orchestration
 

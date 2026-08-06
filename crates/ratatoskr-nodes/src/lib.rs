@@ -528,27 +528,43 @@ fn node_agent_config(
     // A ruleset's `allow` is exhaustive. The default is not just the node's built-in list: those
     // name rag-rat tools, written before any plugin was in the picture, so a plugin the node binds
     // would otherwise contribute a server whose every tool is filtered straight back out.
-    let allow: Vec<String> = match rc
+    let from_plugins = tools.names_beyond(ratatoskr_mcp::RAG_RAT);
+    let spelled_out = rc
         .and_then(|c| c.tools.as_ref())
-        .and_then(|t| t.allow.as_deref())
-    {
+        .and_then(|t| t.allow.as_deref());
+    let allow: Vec<String> = match spelled_out {
         Some(a) => a.to_vec(),
-        None => default_allow(default_tools, tools.names_beyond(ratatoskr_mcp::RAG_RAT)),
+        None => default_allow(default_tools, from_plugins.clone()),
     };
     let deny: Vec<String> = rc
         .and_then(|c| c.tools.as_ref())
         .map(|t| t.deny.clone())
         .unwrap_or_default();
-    let asked = allow.len();
-    tools.narrow(&allow, &deny);
-    if tools.len() + deny.len() < asked {
-        tracing::warn!(
-            node,
-            requested = ?allow,
-            found = tools.len(),
-            "some requested tools were not offered by any connected MCP server"
-        );
+
+    // Named but nowhere on offer: a typo, or a tool the server stopped exposing. Reported by name
+    // — a count can't be acted on, and a `deny` elsewhere in the ruleset must not explain it away.
+    let offered = tools.names();
+    let missing: Vec<&String> = allow
+        .iter()
+        .filter(|n| !offered.contains(&n.as_str()) && !deny.contains(n))
+        .collect();
+    if !missing.is_empty() {
+        tracing::warn!(node, ?missing, "no connected MCP server offers these tools");
     }
+    // An `allow` written before the plugin was bound is exhaustive too, so it silently excludes
+    // every tool the plugin brought — the node gets that plugin's context and none of its reach.
+    if spelled_out.is_some() && !from_plugins.is_empty() {
+        let excluded: Vec<&String> = from_plugins.iter().filter(|n| !allow.contains(n)).collect();
+        if !excluded.is_empty() {
+            tracing::warn!(
+                node,
+                ?excluded,
+                "this node's plugins offer tools its ruleset's `allow` does not name; add them, \
+                 or unbind the plugin"
+            );
+        }
+    }
+    tools.narrow(&allow, &deny);
 
     let max_turns = rc.and_then(|c| c.max_turns);
     let system_prompt = rc.and_then(|c| c.system_prompt.clone());

@@ -233,7 +233,24 @@ impl ToolSet {
     /// Add a tool that is answered locally rather than dispatched — the synthetic `ask`, which a
     /// hook intercepts. It joins the first group so it reaches the agent with everything else; the
     /// sink it nominally belongs to is never used for it.
+    ///
+    /// The name is *taken*, not merely added: the hook that answers it matches on the name alone,
+    /// so a server offering the same one would be shadowed anyway — silently, and with the wrong
+    /// argument schema shown to the model. Any such tool is dropped here instead.
     pub fn add_local(&mut self, tool: Tool, sink: ServerSink) {
+        for group in &mut self.groups {
+            group.tools.retain(|t| {
+                let clash = t.name == tool.name;
+                if clash {
+                    tracing::warn!(
+                        tool = %t.name,
+                        server = %group.origin,
+                        "dropping a server's tool: the name is answered inside the run"
+                    );
+                }
+                !clash
+            });
+        }
         match self.groups.first_mut() {
             Some(group) => group.tools.push(tool),
             None => self.groups.push(ServerTools {
@@ -242,6 +259,14 @@ impl ToolSet {
                 tools: vec![tool],
             }),
         }
+    }
+
+    /// Every tool name in the set, in precedence order.
+    pub fn names(&self) -> Vec<&str> {
+        self.groups
+            .iter()
+            .flat_map(|g| g.tools.iter().map(|t| t.name.as_ref()))
+            .collect()
     }
 
     /// Every tool name offered by a server other than `origin`, in precedence order.
