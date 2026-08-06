@@ -48,19 +48,40 @@ pub struct LiveEvent {
 /// The newest daily log file, if any. `tracing-appender` suffixes the date (`ratatoskr.jsonl.
 /// 2026-08-05`), so there is never a bare `ratatoskr.jsonl`, and the dates sort lexicographically.
 pub async fn newest_log(dir: &Path) -> Option<PathBuf> {
-    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
-    let mut newest: Option<PathBuf> = None;
+    daily_logs(dir).await.pop()
+}
+
+/// Every daily log file, oldest first.
+async fn daily_logs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
         let is_jsonl = path
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with("ratatoskr.jsonl."));
-        if is_jsonl && newest.as_ref().is_none_or(|cur| path > *cur) {
-            newest = Some(path);
+        if is_jsonl {
+            found.push(path);
         }
     }
-    newest
+    found.sort();
+    found
+}
+
+/// Where a connecting viewer starts reading: the file before the newest, when there is one.
+///
+/// A run that was live across midnight has its beginning in the previous day's file, and replaying
+/// only the newest would show a run that has been going for hours as though it had just started —
+/// the more misleading answer, because the pane looks populated and is missing the half that
+/// explains the run. One file back covers a run spanning one rollover, which is every run that is
+/// not already pathological.
+async fn replay_from(dir: &Path) -> Option<PathBuf> {
+    let mut logs = daily_logs(dir).await;
+    logs.pop();
+    logs.pop()
 }
 
 /// Pull `run_id` out of a record: a plain field first (how the dashboard's own launch and reap
@@ -215,7 +236,12 @@ impl Tail {
 /// everyone, but the task dies with its channel — no shared state to own, and no lifecycle to get
 /// wrong — and this is a local dashboard with a handful of viewers at most.
 pub async fn follow(dir: PathBuf, run_id: String, tx: mpsc::Sender<LiveEvent>) {
-    let mut tail = Tail::default();
+    // Starts one file back, so a run that began before the last rollover is replayed whole. The
+    // loop below walks forward to the newest file on its first pass.
+    let mut tail = Tail {
+        current: replay_from(&dir).await,
+        ..Default::default()
+    };
 
     loop {
         if tx.is_closed() {
@@ -385,6 +411,15 @@ mod tests {
         tokio::fs::write(dir.join("ratatoskr.log.2026-08-06"), "")
             .await
             .unwrap();
+
+        // A viewer connecting starts one file back, so a run that was live across the rollover is
+        // replayed whole rather than appearing to have just started.
+        let from = replay_from(&dir).await.expect("the previous day's log");
+        assert!(
+            from.to_string_lossy()
+                .ends_with("ratatoskr.jsonl.2026-08-04"),
+            "{from:?}"
+        );
 
         let newest = newest_log(&dir).await.expect("a log file");
         assert!(
