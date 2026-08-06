@@ -85,11 +85,24 @@ pub async fn run_acceptance(
         let out = sandbox_run(spec)
             .await
             .map_err(|e| format!("sandbox run of acceptance step `{}` failed: {e}", step.name))?;
+        // Logged here because this is the run's most consequential deterministic result and the
+        // only account of it otherwise is a model's paraphrase of it. A characterizer that
+        // misreads a read-only-filesystem error as "cargo is not installed" sends whoever reads
+        // the run after a problem that does not exist.
+        let combined = format!("{}\n{}", out.stdout, out.stderr);
+        tracing::info!(
+            kind = "acceptance_step",
+            step = %step.name,
+            command = %step.command.join(" "),
+            exit_code = out.exit_code,
+            output = %ratatoskr_agent::tail(combined.trim(), 2_000),
+            "acceptance step finished"
+        );
         outcomes.push(StepOutcome {
             name: step.name.clone(),
             command: step.command.clone(),
             exit_code: out.exit_code,
-            output: format!("{}\n{}", out.stdout, out.stderr),
+            output: combined,
         });
     }
     Ok(outcomes)
