@@ -16,12 +16,16 @@ use rig_agent::agent::{
     ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent, WithBuilderTools,
 };
 use rig_agent::completion::Prompt;
+use rig_agent::tool::{DynamicTool, ToolExecutionError};
+use rig_core::OneOrMany;
 use rig_core::client::completion::CompletionClient;
 use rig_core::client::{ProviderClient, ProviderClientError};
 use rig_core::completion::CompletionModel;
-use rig_core::message::AssistantContent;
+use rig_core::message::{AssistantContent, ImageMediaType, MimeType, ToolResultContent};
 use rig_core::providers::{anthropic, moonshot};
 use rig_core::tool::ToolOutput;
+use rmcp::model::{CallToolRequestParams, ContentBlock, Tool};
+use rmcp::service::ServerSink;
 use tracing::Instrument;
 
 /// How many tool-calling turns the agent may take before it must produce a final answer. A node
@@ -29,6 +33,10 @@ use tracing::Instrument;
 /// needs a generous budget; 10 was a toy limit that tripped `MaxTurns` mid-analysis. Overridable
 /// per node via a ruleset's `maxTurns`.
 const DEFAULT_MAX_TURNS: usize = 100;
+
+/// The bound rig's own MCP adapter applies to a call, matched here so a renamed tool is not the
+/// one that can hang forever on a response the transport lost.
+const MCP_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// rig-agent's default name for the synthetic structured-output tool (`OutputMode::Tool`). Kept in
 /// sync with `rig_agent`'s `DEFAULT_OUTPUT_TOOL_NAME`; a ruleset must not be able to deny it.
@@ -246,14 +254,95 @@ fn bind_tools<M: CompletionModel + 'static>(
     builder: AgentBuilder<M, NoToolConfig>,
     tools: &ToolSet,
 ) -> Agent<M> {
-    let Some((first, rest)) = tools.groups().split_first() else {
-        return builder.build();
-    };
-    let bound: AgentBuilder<M, WithBuilderTools> = rest.iter().fold(
-        builder.rmcp_tools(first.tools.clone(), first.sink.clone()),
-        |builder, group| builder.rmcp_tools(group.tools.clone(), group.sink.clone()),
-    );
+    // An empty dynamic set moves the builder out of `NoToolConfig` without binding anything, which
+    // is what lets the groups below be a plain loop over two different binding calls.
+    let mut bound: AgentBuilder<M, WithBuilderTools> = builder.dynamic_tools(Vec::new());
+    for group in tools.groups() {
+        bound = match &group.prefix {
+            // Named as the server names them: rig's own adapter, which sends the tool's name
+            // straight back to the server as the call's method.
+            None => bound.rmcp_tools(group.tools.clone(), group.sink.clone()),
+            // Named as the plugin format names them, which is not what the server answers to.
+            // `DynamicTool` takes a runtime name and a closure, so the two are independent.
+            Some(_) => bound.dynamic_tools(
+                group
+                    .offered()
+                    .into_iter()
+                    .map(|(tool, wire)| renamed_tool(tool, wire, group.sink.clone()))
+                    .collect(),
+            ),
+        };
+    }
     bound.build()
+}
+
+/// Bind one MCP tool under a name the server does not know it by.
+///
+/// The conversion back from an MCP result is ours to do here, where rig's adapter would have done
+/// it: every content block is carried, because dropping the ones that are not text would silently
+/// lose whatever a server answered with an image or an embedded resource.
+fn renamed_tool(tool: Tool, wire: String, sink: ServerSink) -> DynamicTool {
+    let schema = serde_json::Value::Object((*tool.input_schema).clone());
+    let description = tool.description.clone().unwrap_or_default().to_string();
+
+    DynamicTool::new(
+        tool.name.to_string(),
+        description,
+        schema,
+        move |_ctx, args| {
+            let (sink, wire) = (sink.clone(), wire.clone());
+            Box::pin(async move {
+                let mut params = CallToolRequestParams::new(wire);
+                if let serde_json::Value::Object(arguments) = args {
+                    params = params.with_arguments(arguments);
+                }
+                // The same bound rig's adapter applies, for the same reason: a response the transport
+                // silently loses would otherwise hang the agent for good.
+                let called = tokio::time::timeout(MCP_CALL_TIMEOUT, sink.call_tool(params));
+                let result = match called.await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(e)) => return Err(ToolExecutionError::from_error(Arc::new(e))),
+                    Err(elapsed) => return Err(ToolExecutionError::from_error(Arc::new(elapsed))),
+                };
+                Ok(to_output(result.content))
+            })
+        },
+    )
+}
+
+/// An MCP result's content blocks, as rig's canonical presentation.
+fn to_output(content: Vec<ContentBlock>) -> ToolOutput {
+    let blocks: Vec<ToolResultContent> = content
+        .into_iter()
+        .map(|block| match block {
+            ContentBlock::Text(text) => ToolResultContent::text(text.text),
+            ContentBlock::Image(image) => {
+                match ImageMediaType::from_mime_type(&image.mime_type) {
+                    Some(media) => ToolResultContent::image_base64(image.data, Some(media), None),
+                    // Described rather than inlined: the base64 of an image the model cannot be
+                    // shown is a great many tokens of nothing.
+                    None => ToolResultContent::text(format!(
+                        "[image the model cannot be shown: {}]",
+                        image.mime_type
+                    )),
+                }
+            }
+            // Audio and embedded resources have no canonical presentation here. Described rather
+            // than dropped — a server that answered with one said something — and described rather
+            // than inlined, because their payloads are the same problem as an image's.
+            ContentBlock::Audio(audio) => {
+                ToolResultContent::text(format!("[audio: {}]", audio.mime_type))
+            }
+            other => ToolResultContent::text(
+                serde_json::to_string(&other).unwrap_or_else(|_| "[unrenderable]".to_string()),
+            ),
+        })
+        .collect();
+    match OneOrMany::many(blocks) {
+        Ok(many) => ToolOutput::content(many),
+        // No content at all is a legitimate answer, and rig has no empty presentation.
+        Err(_) => ToolOutput::text(""),
+    }
 }
 
 /// The `ask` tool's arguments: which node to ask, and the question.

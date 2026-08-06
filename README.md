@@ -190,9 +190,16 @@ different case: that list is exhaustive, so it must name the plugin's tools too 
 when it doesn't). `deny` removes any of them, and an `onToolCall` gate sees them under the same
 names.
 
-Where two servers offer one name, the first one connected keeps it, so a plugin can never shadow a
-rag-rat tool a node's prompt was written against; the collision is logged with both server names. A
-server that will not start costs its plugin's tools and nothing else.
+A plugin server's tools are named the way the format names them —
+`mcp__plugin_<plugin>_<server>__<tool>` — so a hook matcher or permission rule written for that
+host matches here too. rag-rat is the *user-configured* case and keeps its plain names, because
+every node's built-in tool list, every ruleset and every recorded memory calls it `semantic_search`
+rather than a qualified spelling of it. That name is the same string end to end: what the model
+calls, what `tools.allow`/`deny` and an `onToolCall` gate match, and what a hook matcher sees.
+
+Where two servers still offer one name, the first one connected keeps it, and the collision is
+logged with both server names. A server that will not start costs its plugin's tools and nothing
+else.
 
 A plugin's `PreToolUse` and `PostToolUse` hooks run around a node's tool calls, matched on the tool
 name by the group's `matcher` regex. Each answers with the usual envelope, and only
