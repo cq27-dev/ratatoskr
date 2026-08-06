@@ -296,6 +296,22 @@ const TOOL_USE_GUIDANCE: &str = "\n\n## Calling tools\n\nWhen you need several t
     Reading four files is one turn with four calls, not four turns. Only wait for a result when \
     what you do next actually depends on it.";
 
+/// Whether a failure was the call not completing, rather than the model answering unfavourably.
+///
+/// Matched on the message because that is all the provider client hands back — its error type
+/// erases the distinction, and the alternative is retrying everything or nothing. Kept narrow: a
+/// pattern that catches too much turns a permanent failure into two permanent failures.
+fn is_transport_error(message: &str) -> bool {
+    const TRANSPORT: [&str; 5] = [
+        "HttpError",
+        "error sending request",
+        "connection closed",
+        "connection reset",
+        "timed out",
+    ];
+    TRANSPORT.iter().any(|m| message.contains(m))
+}
+
 /// What one call asks of the provider, beyond the prompt and the tools.
 ///
 /// A struct rather than three arguments because they arrive together from a route, and because the
@@ -1182,10 +1198,32 @@ where
         "gen_ai.request.model" = %model_name,
     );
     let started = std::time::Instant::now();
-    let answer = async { agent.prompt(&question).await }
+    let mut answer = async { agent.prompt(&question).await }
         .instrument(span.clone())
         .await
         .map_err(|e| AgentError::Prompt(e.to_string()));
+
+    // One retry when the call never reached a verdict. A dropped connection is not an answer, and
+    // it cost a live run twenty minutes of implementer work at the last node before the diff: the
+    // request went out, the proxy in front of the API closed it, and the run failed holding a
+    // worktree full of finished edits. Retrying costs another attempt; not retrying costs all of
+    // the attempt already made.
+    //
+    // Transport only. A refusal, a bad request or an exhausted turn budget will answer the same
+    // way twice, and retrying those spends a node's budget to arrive back where it started.
+    if let Err(e) = &answer
+        && is_transport_error(&e.to_string())
+    {
+        tracing::warn!(
+            node,
+            "the model call failed in transport, retrying once: {e}"
+        );
+        answer = async { agent.prompt(&question).await }
+            .instrument(span.clone())
+            .await
+            .map_err(|e| AgentError::Prompt(e.to_string()));
+    }
+    let answer = answer;
 
     // Give a malformed answer back to the agent that wrote it, once. The alternative is what a
     // schema failure used to cost: the node's whole run discarded — every tool call, every file
@@ -1514,6 +1552,25 @@ mod tests {
         // Input is reported too, and the turn count is separate from the usage.
         assert!(telemetry.usage.input_tokens > 0);
         assert!(telemetry.turns.unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn only_a_call_that_never_landed_is_worth_retrying() {
+        // The one that cost a live run: the request went out, the proxy in front of the API closed
+        // it, and the node failed holding a worktree full of finished edits.
+        assert!(is_transport_error(
+            "CompletionError: HttpError: Http client error: error sending request for url \
+             (http://127.0.0.1:3456/v1/messages)"
+        ));
+        assert!(is_transport_error("connection reset by peer"));
+
+        // And the ones that will answer the same way twice, where a retry spends a node's budget
+        // to arrive back where it started.
+        assert!(!is_transport_error("MaxTurnsError: reached 100 turns"));
+        assert!(!is_transport_error(
+            "ProviderError: invalid_request_error: max_tokens is too large"
+        ));
+        assert!(!is_transport_error("output failed schema validation"));
     }
 
     #[test]
