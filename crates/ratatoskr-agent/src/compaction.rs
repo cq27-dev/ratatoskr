@@ -43,6 +43,13 @@ const PREAMBLE: &str = include_str!("../prompts/compaction.md");
 /// Summarises evicted turns with a model call.
 pub struct SummaryCompactor<M> {
     model: Arc<M>,
+    /// Where a summarisation's cost is charged, and the node it is charged to.
+    ///
+    /// To the node that caused it, not to a line of its own: a compaction happens because *this*
+    /// node's conversation outgrew its window, so its tokens are that node's. Reported separately,
+    /// a run's per-node totals would sum to less than the invoice — and these are the calls that
+    /// fire precisely when a session got long and expensive.
+    ledger: Option<Arc<crate::RunLedger>>,
     /// The node being compacted, and what it has to end up producing.
     ///
     /// Included in the instruction because "keep what matters" is unanswerable in the abstract: what
@@ -54,9 +61,15 @@ pub struct SummaryCompactor<M> {
 }
 
 impl<M> SummaryCompactor<M> {
-    pub fn new(model: M, node: &str, produces: &str) -> Self {
+    pub fn new(
+        model: M,
+        node: &str,
+        produces: &str,
+        ledger: Option<Arc<crate::RunLedger>>,
+    ) -> Self {
         SummaryCompactor {
             model: Arc::new(model),
+            ledger,
             node: node.to_string(),
             produces: produces.to_string(),
         }
@@ -98,16 +111,31 @@ where
                 "=== END TRANSCRIPT ===\n\nWrite the summary of the transcript above now.",
             );
 
-            let agent = rig_agent::AgentBuilder::new((*self.model).clone())
-                .preamble(&format!(
+            let (builder, meter) = crate::metered(
+                (*self.model).clone(),
+                &format!(
                     "{PREAMBLE}\n\nTHIS SESSION: the `{}` node. It must finish by producing: {}",
                     self.node, self.produces
-                ))
-                .max_tokens(ratatoskr_core::DEFAULT_MAX_TOKENS)
-                .build();
-            let summary = agent
-                .prompt(prompt.as_str())
-                .await
+                ),
+                None,
+                ratatoskr_core::DEFAULT_MAX_TOKENS,
+            );
+            let answer = builder.build().prompt(prompt.as_str()).await;
+            // Charged whether or not the summary came back: a compaction that failed still spent
+            // what it spent, and dropping that would make the failure look free.
+            if let Some(ledger) = &self.ledger {
+                let (usage, calls) = meter.read();
+                ledger.record(
+                    &self.node,
+                    ratatoskr_core::NodeTelemetry {
+                        usage,
+                        turns: Some(calls),
+                        error: answer.as_ref().err().map(ToString::to_string),
+                        ..Default::default()
+                    },
+                );
+            }
+            let summary = answer
                 // `Backend` is the variant rig documents for a remote-LLM fault, and the adapter
                 // propagates it unchanged.
                 .map_err(|e| {
@@ -171,6 +199,7 @@ pub fn compacting_memory<M>(
     node: &str,
     produces: &str,
     budget: usize,
+    ledger: Option<Arc<crate::RunLedger>>,
 ) -> rig_memory::CompactingMemory<InMemoryConversationMemory, TokenWindowMemory, SummaryCompactor<M>>
 where
     M: CompletionModel + 'static,
@@ -178,7 +207,7 @@ where
     rig_memory::CompactingMemory::new(
         InMemoryConversationMemory::new(),
         TokenWindowMemory::new(budget, tokens_in),
-        SummaryCompactor::new(model, node, produces),
+        SummaryCompactor::new(model, node, produces, ledger),
     )
 }
 
@@ -236,6 +265,7 @@ mod tests {
             client.completion_model("claude-haiku-4-5-20251001"),
             "analyst",
             "the requirements an implementation must satisfy",
+            None,
         );
 
         let evicted = vec![

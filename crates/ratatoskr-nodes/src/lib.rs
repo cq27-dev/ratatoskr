@@ -326,12 +326,37 @@ struct Record<'a, T> {
     ledger: Option<&'a Arc<RunLedger>>,
 }
 
+/// Fewest output tokens that could plausibly have produced `bytes` of output.
+///
+/// Eight bytes per token is far below any real tokenizer — three to four is typical — so this
+/// cannot fire on a merely surprising number. It exists because the provider-reported count was
+/// silently near-zero for weeks and nothing noticed: a figure recorded with the same confidence as
+/// a correct one is the failure mode the whole telemetry column was added to prevent.
+fn plausible_output_tokens(bytes: usize) -> u64 {
+    (bytes / 8) as u64
+}
+
 async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
     let json = serde_json::to_string(r.output)?;
     let input_json = r.input;
     // Claimed rather than borrowed: the ledger holds one entry per model turn, and taking it here
     // is what keeps the converge loop's repeated implementer turns matched to their own rows.
     let telemetry = r.ledger.and_then(|l| l.take(r.node)).unwrap_or_default();
+    // Only for a node that actually ran a model — one with no `model` reported no usage because it
+    // had none, which is ordinary.
+    if telemetry.model.is_some() {
+        let floor = plausible_output_tokens(json.len());
+        if telemetry.usage.output_tokens < floor {
+            tracing::warn!(
+                node = r.node,
+                reported = telemetry.usage.output_tokens,
+                floor,
+                bytes = json.len(),
+                "the provider reported fewer output tokens than this node's output could contain; \
+                 the usage figures for this run are not trustworthy"
+            );
+        }
+    }
     r.store
         .insert_checkpoint(ratatoskr_store::CheckpointWrite {
             run_id: r.run_id,
@@ -657,6 +682,10 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
         overseer::OVERSEER_TOOLS,
         &plugins,
     )?;
+    // Its own ledger: the overseer runs before the run's, and its cost is still a cost. Drained
+    // straight onto the checkpoint below rather than carried, because nothing after this point
+    // would claim it.
+    let ledger = Arc::new(RunLedger::default());
     let decided = OverseerNode {
         route: cfg.route,
         tools: cfg.tools,
@@ -664,7 +693,7 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
         max_turns: cfg.max_turns,
         system_prompt: cfg.system_prompt,
         plugins,
-        ledger: None,
+        ledger: Some(Arc::clone(&ledger)),
         files: cfg.files,
     }
     .run(request.issue, &choices)
@@ -678,7 +707,16 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
         .store
         .upsert_run(request.run_id, None, RunStatus::Running.as_str())
         .await?;
-    checkpoint(request.store, request.run_id, "overseer", &decided).await?;
+    record(Record {
+        store: request.store,
+        run_id: request.run_id,
+        node: "overseer",
+        output: &decided,
+        input: Some(serde_json::to_string(request.issue)?),
+        iteration: None,
+        ledger: Some(&ledger),
+    })
+    .await?;
 
     // A model naming something that is not there does not get to select it. Falling through to the
     // named lookup gives the error that lists what was available.
@@ -1625,6 +1663,7 @@ pub(crate) fn build_characterizer(
     config: &RatatoskrConfig,
     context: &PluginContext,
     offer: ServerTools,
+    ledger: Option<Arc<RunLedger>>,
 ) -> Result<Option<testrun::Characterizer>, PlanError> {
     if !config.models.contains_key("characterizer")
         && !engine
@@ -1648,6 +1687,7 @@ pub(crate) fn build_characterizer(
         route: cfg.route,
         tools: cfg.tools,
         max_turns: cfg.max_turns,
+        ledger,
     }))
 }
 
@@ -1935,7 +1975,13 @@ async fn fork_and_converge(
         // Opt-in: classify baseline failures only when redteam has a route — from
         // `[models.redteam]` or from its `.ratatoskr/rules/redteam.ts` ruleset.
         acceptance: acceptance.clone(),
-        characterizer: build_characterizer(engine, config, context, client.offer())?,
+        characterizer: build_characterizer(
+            engine,
+            config,
+            context,
+            client.offer(),
+            Some(Arc::clone(ledger)),
+        )?,
         classifier: match classifier_enabled(engine, config) {
             true => {
                 let plugins_redteam = context.for_node("redteam");
@@ -1973,7 +2019,13 @@ async fn fork_and_converge(
         issue: issue.to_string(),
         analyst: plan.analyst.clone(),
         acceptance,
-        characterizer: build_characterizer(engine, config, context, client.offer())?,
+        characterizer: build_characterizer(
+            engine,
+            config,
+            context,
+            client.offer(),
+            Some(Arc::clone(ledger)),
+        )?,
     };
 
     // Built before the fork so a misconfigured verifier fails the run here rather than after an
@@ -2683,5 +2735,17 @@ mod agent_config_tests {
         // never match it, and the prompt says to land there when nothing else fits.
         assert!(Workflow::BuiltIn.when_to_use().is_empty());
         assert!(!Workflow::BuiltIn.purpose().is_empty());
+    }
+
+    #[test]
+    fn an_output_token_count_below_what_the_output_could_contain_is_not_believable() {
+        // The live figures that exposed this: 63 output tokens against a 5,286-byte answer.
+        assert!(63 < plausible_output_tokens(5_286));
+        // Eight bytes per token is far under any real tokenizer, so a plausible run clears it
+        // easily and the warning stays rare enough to mean something.
+        assert!(1_700 > plausible_output_tokens(5_286));
+        // A node that produced almost nothing has almost no floor to clear.
+        assert_eq!(plausible_output_tokens(0), 0);
+        assert_eq!(plausible_output_tokens(7), 0);
     }
 }

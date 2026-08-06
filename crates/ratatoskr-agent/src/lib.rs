@@ -200,20 +200,22 @@ async fn run<M>(
 where
     M: CompletionModel + 'static,
 {
-    let agent = bind_tools(
-        AgentBuilder::new(model)
-            .preamble(preamble)
-            .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
-            .max_tokens(max_tokens)
-            .add_hook(ObservabilityHook),
-        &tools,
-        None,
-    );
+    let (builder, meter) = metered(model, preamble, max_turns, max_tokens);
+    let agent = bind_tools(builder, &tools, None);
 
-    agent
-        .prompt(question)
-        .await
-        .map_err(|e| AgentError::Prompt(e.to_string()))
+    let answer = agent.prompt(question).await;
+    // No store to checkpoint to here, so it goes to the log. A one-shot question whose cost is
+    // unknowable is the same defect as an uncounted node, in a smaller place.
+    let (usage, calls) = meter.read();
+    tracing::info!(
+        kind = "usage",
+        calls,
+        "gen_ai.usage.input_tokens" = usage.input_tokens,
+        "gen_ai.usage.output_tokens" = usage.output_tokens,
+        "gen_ai.usage.cached_input_tokens" = usage.cached_input_tokens,
+        "ask usage"
+    );
+    answer.map_err(|e| AgentError::Prompt(e.to_string()))
 }
 
 /// Like [`ask`], but the agent is given an `output_schema`, so its final answer is the structured
@@ -226,6 +228,57 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+/// Start an agent, metered.
+///
+/// The only place in this crate that constructs one. Every model call therefore carries the usage
+/// hook and a token cap by construction rather than by whoever wrote the call site remembering —
+/// which is how the compactor and the `ask` path came to spend tokens nobody counted.
+///
+/// Returns the builder alongside the handles its usage accumulates into; the caller reads them
+/// after the prompt settles, including when it failed.
+fn metered<M: CompletionModel + 'static>(
+    model: M,
+    preamble: &str,
+    max_turns: Option<usize>,
+    max_tokens: u64,
+) -> (AgentBuilder<M, NoToolConfig>, Meter) {
+    let usage = UsageHook::default();
+    let meter = Meter {
+        total: Arc::clone(&usage.total),
+        calls: Arc::clone(&usage.calls),
+    };
+    let builder = AgentBuilder::new(model)
+        .preamble(preamble)
+        .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
+        // Always set, never left to the provider client to infer from the model name: its table of
+        // known prefixes does not include models released after it was compiled, and a model that
+        // falls through it goes out with no cap at all — which Anthropic rejects outright, losing
+        // the run at that node's first call.
+        .max_tokens(max_tokens)
+        // Log tool calls + model text; added before the gates so it observes calls the
+        // clarification and ruleset hooks may skip.
+        .add_hook(ObservabilityHook)
+        .add_hook(usage);
+    (builder, meter)
+}
+
+/// What one metered agent spent, readable once its prompt has settled.
+pub struct Meter {
+    total: Arc<Mutex<TokenUsage>>,
+    calls: Arc<AtomicU64>,
+}
+
+impl Meter {
+    /// The usage so far. Read after the prompt returns — including on the error path, where the
+    /// calls made before the failure cost exactly what they cost.
+    pub fn read(&self) -> (TokenUsage, u64) {
+        (
+            *self.total.lock().expect("usage mutex poisoned"),
+            self.calls.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -244,12 +297,33 @@ struct UsageHook {
 }
 
 impl AgentHook for UsageHook {
+    /// Counts model calls, including ones a later hook rejects and retries — all of them were
+    /// billed, so the call count is what says how much work a turn actually took.
     async fn on_completion_response(
         &self,
         _ctx: &HookContext,
-        event: CompletionResponseEvent<'_>,
+        _event: CompletionResponseEvent<'_>,
     ) -> ObservationAction {
         self.calls.fetch_add(1, Ordering::Relaxed);
+        ObservationAction::Continue
+    }
+
+    /// Accumulates what the turn cost.
+    ///
+    /// Not `on_completion_response`, which is where this started and where it was wrong. On the
+    /// streaming path a response is assembled from chunks and its usage is drained at the end, so
+    /// the per-response event carries the input and cache counts and almost none of the output —
+    /// live runs recorded 63 output tokens for sixteen turns that produced 5 KB of structured
+    /// answer. This event fires after the stream is drained, which is where the output count
+    /// becomes known.
+    ///
+    /// The cost is that a turn rejected and retried contributes nothing here. That is the better
+    /// error: an undercount bounded by the retry rate beats an undercount of everything.
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &HookContext,
+        event: ModelTurnFinished<'_>,
+    ) -> ModelTurnAction {
         self.total
             .lock()
             .expect("usage mutex poisoned")
@@ -259,7 +333,7 @@ impl AgentHook for UsageHook {
                 cached_input_tokens: event.usage.cached_input_tokens,
                 cache_creation_input_tokens: event.usage.cache_creation_input_tokens,
             });
-        ObservationAction::Continue
+        ModelTurnAction::Continue
     }
 }
 
@@ -860,26 +934,13 @@ where
         None => (preamble.to_string(), question.to_string()),
     };
 
-    // Always set, never left to the provider client to infer from the model name: its table of
-    // known prefixes does not include models released after it was compiled, and a model that falls
-    // through it goes out with no cap at all — which Anthropic rejects outright, losing the run at
-    // the node's first call.
-    let mut builder = AgentBuilder::new(model)
-        .preamble(&preamble)
-        .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
-        .max_tokens(max_tokens)
+    let (builder, meter) = metered(model, &preamble, max_turns, max_tokens);
+    let mut builder = builder
         .output_schema_raw(output_schema)
         // Force the synthetic output-tool: Auto can resolve to native structured output, which
         // Anthropic rejects when combined with tools ("output_config.format: Cannot be combined
         // with tools"). Tool mode sends no native format and composes with the rag-rat tools.
-        .output_mode(OutputMode::Tool)
-        // Log tool calls + model text for every node run; added first so it observes calls before
-        // the clarification/ruleset hooks can skip them.
-        .add_hook(ObservabilityHook);
-    // Count every model call, including ones a later hook rejects — all of them are billed.
-    let usage = UsageHook::default();
-    let (total, calls) = (Arc::clone(&usage.total), Arc::clone(&usage.calls));
-    builder = builder.add_hook(usage);
+        .output_mode(OutputMode::Tool);
     // Answer `ask` calls in-conversation. Added before the ruleset hook so an `ask` is handled here
     // (and short-circuits) rather than reaching the ruleset gate.
     if let Some(clarifier) = clarifier {
@@ -911,6 +972,7 @@ where
             node,
             produces,
             compaction::default_budget(),
+            ledger.clone(),
         ));
     }
     let agent = bind_tools(builder, &tools, files.as_deref());
@@ -933,12 +995,13 @@ where
         .await
         .map_err(|e| AgentError::Prompt(e.to_string()));
 
+    let (usage, calls) = meter.read();
     if let Some(ledger) = &ledger {
         let telemetry = NodeTelemetry {
             model: Some(model_name),
             duration_ms: Some(started.elapsed().as_millis() as u64),
-            usage: *total.lock().expect("usage mutex poisoned"),
-            turns: Some(calls.load(Ordering::Relaxed)),
+            usage,
+            turns: Some(calls),
             // A node that failed still spent what it spent, and why it failed is the most useful
             // thing about its row.
             error: answer.as_ref().err().map(ToString::to_string),
@@ -1163,5 +1226,91 @@ mod tests {
         .expect("the answer should match the schema");
         assert!(!done.summary.trim().is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The usage figures against the real provider.
+    ///
+    /// Ignored by default — it spends money. It exists because this is not unit-testable in any way
+    /// that would have caught the bug: a hand-made `Usage` handed to the hook passes whichever
+    /// event the hook listens on, and the whole defect was that the streaming path populates one of
+    /// them and not the other. Only a real call distinguishes them.
+    #[tokio::test]
+    #[ignore = "calls the Anthropic API; run with --ignored"]
+    async fn a_real_turn_reports_the_output_tokens_it_actually_spent() {
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct Answer {
+            /// Several sentences, so the answer is unambiguously more than a handful of tokens.
+            text: String,
+        }
+
+        let ledger = Arc::new(RunLedger::default());
+        let route = ModelRoute {
+            provider: "anthropic".into(),
+            model: "claude-haiku-4-5-20251001".into(),
+            max_tokens: None,
+        };
+        let answer = run_structured(NodeRun {
+            node: "usagetest",
+            route: &route,
+            preamble: "You answer briefly but completely.",
+            question: "In four or five full sentences, describe what a git worktree is.",
+            tools: ratatoskr_mcp::ToolSet::default(),
+            output_schema: schemars::schema_for!(Answer),
+            policy: None,
+            max_turns: Some(4),
+            clarifier: None,
+            observer: None,
+            skills: Vec::new(),
+            files: None,
+            ledger: Some(Arc::clone(&ledger)),
+            produces: None,
+        })
+        .await
+        .expect("the live run should complete");
+
+        let telemetry = ledger.take("usagetest").expect("the turn was recorded");
+        let parsed: Answer = serde_json::from_str(
+            answer
+                .find('{')
+                .zip(answer.rfind('}'))
+                .map(|(a, b)| &answer[a..=b])
+                .expect("structured output"),
+        )
+        .expect("the answer should match the schema");
+
+        // The bug this pins: output tokens read as near-zero regardless of how much was produced.
+        // The floor is bytes/8, far below any real tokenizer, so a correct count clears it easily.
+        let floor = (parsed.text.len() / 8) as u64;
+        assert!(
+            telemetry.usage.output_tokens > floor,
+            "reported {} output tokens for {} bytes of answer",
+            telemetry.usage.output_tokens,
+            parsed.text.len()
+        );
+        // Input is reported too, and the turn count is separate from the usage.
+        assert!(telemetry.usage.input_tokens > 0);
+        assert!(telemetry.turns.unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn every_model_call_in_this_crate_is_built_through_the_metered_constructor() {
+        // The defect this guards is not a wrong number, it is an absent one: the compactor and the
+        // `ask` path each spent tokens nobody counted, because attaching the hook was a per-call
+        // -site decision and forgetting it compiles. A fourth `AgentBuilder::new` would restore
+        // exactly that, so there is exactly one, inside `metered`.
+        let sources = [
+            include_str!("lib.rs"),
+            include_str!("compaction.rs"),
+            include_str!("files.rs"),
+        ];
+        let built: usize = sources
+            .iter()
+            .map(|src| src.matches("AgentBuilder::new(").count())
+            .sum();
+        // One construction, plus this test's own mention of the name.
+        assert_eq!(
+            built, 2,
+            "an agent is constructed somewhere other than `metered`, so its calls are unmetered"
+        );
     }
 }
