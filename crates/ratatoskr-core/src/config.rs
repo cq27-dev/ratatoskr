@@ -107,7 +107,13 @@ impl PluginConfig {
 }
 
 /// Phase 3 implementer settings.
+///
+/// Unknown keys are refused. Every field here changes whether the run does something or skips it —
+/// how many times it retries, what sends a change back, whether the fork runs at all — so a
+/// misspelled key that silently kept the default is the worst kind of typo: the run looks
+/// configured and is not, and nothing about the output says otherwise.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImplementerConfig {
     /// Which coding CLI to drive via ACP (`"claude"`). One target per the Phase 3 non-goals.
     pub cli: String,
@@ -432,5 +438,44 @@ mod tests {
         assert_eq!(reparsed.rag_rat.command.len(), 5);
         assert_eq!(reparsed.models.len(), 5);
         assert_eq!(reparsed.models["ask"].provider, "anthropic");
+    }
+
+    #[test]
+    fn the_implementer_reads_its_keys_and_refuses_ones_it_does_not_know() {
+        let config = RatatoskrConfig::from_toml_str(
+            r#"
+            [rag_rat]
+            command = ["rag-rat", "mcp"]
+            [store]
+            path = ".ratatoskr/state.sqlite3"
+            [worktree]
+            root = ".ratatoskr/worktrees"
+            [implementer]
+            cli = "claude"
+            max_iterations = 5
+            verify_threshold = "P1"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.implementer.max_iterations, 5);
+        assert_eq!(config.implementer.verify_threshold, "P1");
+        // Omitted keys keep their defaults rather than failing.
+        assert!(!config.implementer.always_fork);
+
+        // A misspelled key must not read as "left at the default". Every field here decides
+        // whether the run does something or skips it, so a silent default is a run that looks
+        // configured and is not.
+        let typo = r#"
+            [rag_rat]
+            command = ["rag-rat", "mcp"]
+            [implementer]
+            cli = "claude"
+            max_iterations = 3
+            verify_treshold = "P1"
+        "#;
+        let err = toml::from_str::<RatatoskrConfig>(typo)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("verify_treshold"), "{err}");
     }
 }
