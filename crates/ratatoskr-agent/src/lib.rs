@@ -244,12 +244,33 @@ struct UsageHook {
 }
 
 impl AgentHook for UsageHook {
+    /// Counts model calls, including ones a later hook rejects and retries — all of them were
+    /// billed, so the call count is what says how much work a turn actually took.
     async fn on_completion_response(
         &self,
         _ctx: &HookContext,
-        event: CompletionResponseEvent<'_>,
+        _event: CompletionResponseEvent<'_>,
     ) -> ObservationAction {
         self.calls.fetch_add(1, Ordering::Relaxed);
+        ObservationAction::Continue
+    }
+
+    /// Accumulates what the turn cost.
+    ///
+    /// Not `on_completion_response`, which is where this started and where it was wrong. On the
+    /// streaming path a response is assembled from chunks and its usage is drained at the end, so
+    /// the per-response event carries the input and cache counts and almost none of the output —
+    /// live runs recorded 63 output tokens for sixteen turns that produced 5 KB of structured
+    /// answer. This event fires after the stream is drained, which is where the output count
+    /// becomes known.
+    ///
+    /// The cost is that a turn rejected and retried contributes nothing here. That is the better
+    /// error: an undercount bounded by the retry rate beats an undercount of everything.
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &HookContext,
+        event: ModelTurnFinished<'_>,
+    ) -> ModelTurnAction {
         self.total
             .lock()
             .expect("usage mutex poisoned")
@@ -259,7 +280,7 @@ impl AgentHook for UsageHook {
                 cached_input_tokens: event.usage.cached_input_tokens,
                 cache_creation_input_tokens: event.usage.cache_creation_input_tokens,
             });
-        ObservationAction::Continue
+        ModelTurnAction::Continue
     }
 }
 
@@ -1163,5 +1184,69 @@ mod tests {
         .expect("the answer should match the schema");
         assert!(!done.summary.trim().is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The usage figures against the real provider.
+    ///
+    /// Ignored by default — it spends money. It exists because this is not unit-testable in any way
+    /// that would have caught the bug: a hand-made `Usage` handed to the hook passes whichever
+    /// event the hook listens on, and the whole defect was that the streaming path populates one of
+    /// them and not the other. Only a real call distinguishes them.
+    #[tokio::test]
+    #[ignore = "calls the Anthropic API; run with --ignored"]
+    async fn a_real_turn_reports_the_output_tokens_it_actually_spent() {
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct Answer {
+            /// Several sentences, so the answer is unambiguously more than a handful of tokens.
+            text: String,
+        }
+
+        let ledger = Arc::new(RunLedger::default());
+        let route = ModelRoute {
+            provider: "anthropic".into(),
+            model: "claude-haiku-4-5-20251001".into(),
+            max_tokens: None,
+        };
+        let answer = run_structured(NodeRun {
+            node: "usagetest",
+            route: &route,
+            preamble: "You answer briefly but completely.",
+            question: "In four or five full sentences, describe what a git worktree is.",
+            tools: ratatoskr_mcp::ToolSet::default(),
+            output_schema: schemars::schema_for!(Answer),
+            policy: None,
+            max_turns: Some(4),
+            clarifier: None,
+            observer: None,
+            skills: Vec::new(),
+            files: None,
+            ledger: Some(Arc::clone(&ledger)),
+            produces: None,
+        })
+        .await
+        .expect("the live run should complete");
+
+        let telemetry = ledger.take("usagetest").expect("the turn was recorded");
+        let parsed: Answer = serde_json::from_str(
+            answer
+                .find('{')
+                .zip(answer.rfind('}'))
+                .map(|(a, b)| &answer[a..=b])
+                .expect("structured output"),
+        )
+        .expect("the answer should match the schema");
+
+        // The bug this pins: output tokens read as near-zero regardless of how much was produced.
+        // The floor is bytes/8, far below any real tokenizer, so a correct count clears it easily.
+        let floor = (parsed.text.len() / 8) as u64;
+        assert!(
+            telemetry.usage.output_tokens > floor,
+            "reported {} output tokens for {} bytes of answer",
+            telemetry.usage.output_tokens,
+            parsed.text.len()
+        );
+        // Input is reported too, and the turn count is separate from the usage.
+        assert!(telemetry.usage.input_tokens > 0);
+        assert!(telemetry.turns.unwrap_or(0) > 0);
     }
 }
