@@ -29,6 +29,19 @@ model = "claude-sonnet-4-6"
 [models.context]
 provider = "moonshot"
 model = "kimi-k2.5"
+# A route may also set `temperature`, and `params` for anything the provider takes that this
+# config has no word for. `params` is merged into the request verbatim.
+#
+# Extended thinking is the one worth knowing about: some endpoints turn it on as soon as a
+# request carries tools, and every node here carries tools. A node that thinks before each of
+# forty file reads spends most of its wall-clock reasoning about which file to open next, so it
+# is worth turning off for the nodes that explore and leaving on for the ones that judge.
+#
+#   [models.context.params.thinking]
+#   type = "disabled"
+#
+# Thinking tokens are billed as output and count against `max_tokens`; raise it alongside any
+# budget you set.
 
 [models.analyst]
 provider = "anthropic"
