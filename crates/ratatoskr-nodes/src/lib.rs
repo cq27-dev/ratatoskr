@@ -8,6 +8,7 @@
 pub mod analyst;
 pub mod bookkeeper;
 pub mod clarify;
+pub mod context;
 pub mod converge;
 pub mod implementer;
 pub mod memory;
@@ -21,6 +22,7 @@ pub mod workflow;
 
 pub use analyst::{AnalystNode, AnalystOutput};
 pub use bookkeeper::{BookkeeperInput, BookkeeperNode, BookkeeperOutput, MemoryWritten};
+pub use context::{Constraint, ContextNode, ContextOutput};
 pub use implementer::{ImplementerNode, ImplementerOutput};
 pub use memory::{MemoryNode, MemoryOutput, MemoryRecord};
 pub use overseer::{OverseerNode, OverseerOutput};
@@ -50,6 +52,10 @@ pub struct PlanOutcome {
     pub scout: ScoutOutput,
     pub memory: MemoryOutput,
     pub analyst: AnalystOutput,
+    /// What the context node distilled. Carried so a later analyst revision keeps it: what bears
+    /// on the task did not stop being true because the plan turned out wrong.
+    pub brief: String,
+    pub constraints: Vec<Constraint>,
 }
 
 /// Errors from a plan run. A `Node` error means that node failed or produced invalid output; the
@@ -207,72 +213,47 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
     )
     .await?;
 
-    // --- scout ---
-    let plugins_scout = context.for_node("scout");
-    let scout_cfg = node_agent_config(
+    // --- context ---
+    let plugins_context = context.for_node("context");
+    let ctx_cfg = node_agent_config(
         engine,
         config,
-        context.pool_for("scout", client.offer()),
-        "scout",
-        scout::SCOUT_TOOLS,
-        &plugins_scout,
+        context.pool_for("context", client.offer()),
+        "context",
+        context::CONTEXT_TOOLS,
+        &plugins_context,
     )?;
-    let mut scout_tools = scout_cfg.tools;
-    scout_tools.add_local(clarify::ask_tool());
-    let scout = ScoutNode {
-        route: scout_cfg.route,
-        tools: scout_tools,
-        policy: scout_cfg.policy,
-        max_turns: scout_cfg.max_turns,
+    let mut ctx_tools = ctx_cfg.tools;
+    ctx_tools.add_local(clarify::ask_tool());
+    let context_node = ContextNode {
+        route: ctx_cfg.route,
+        tools: ctx_tools,
+        sink: sink.clone(),
+        policy: ctx_cfg.policy,
+        max_turns: ctx_cfg.max_turns,
         clarifier: Some(clarifier.as_dyn()),
-        system_prompt: scout_cfg.system_prompt,
-        plugins: plugins_scout,
-        files: scout_cfg.files,
+        system_prompt: ctx_cfg.system_prompt,
+        plugins: plugins_context,
+        files: ctx_cfg.files,
         ledger: Some(Arc::clone(ledger)),
     };
-    let scout_out = scout
-        .run(issue.to_string(), &state)
+    let context_out = context_node
+        .run(issue)
         .await
-        .map_err(|e| PlanError::node("scout", e))?;
+        .map_err(|e| PlanError::node("context", e))?;
     record(Record {
         store,
         run_id,
-        node: "scout",
-        output: &scout_out,
+        node: "context",
+        output: &context_out,
         input: Some(serde_json::to_string(issue)?),
         iteration: None,
         ledger: Some(ledger),
     })
     .await?;
+    let scout_out = context_out.scout.clone();
+    let memory_out = context_out.memory.clone();
     state.scout_report = Some(serde_json::to_value(&scout_out)?);
-
-    // --- memory ---
-    let memory = MemoryNode { sink: sink.clone() };
-    let memory_in = memory::MemoryInput {
-        issue: issue.to_string(),
-        context: scout_out.papertrail_summary.clone(),
-    };
-    let memory_input_json = serde_json::to_string(&memory_in)?;
-    let memory_out = memory
-        .run(memory_in, &state)
-        .await
-        .map_err(|e| PlanError::node("memory", e))?;
-    record(Record {
-        store,
-        run_id,
-        node: "memory",
-        output: &memory_out,
-        input: Some(memory_input_json),
-        iteration: None,
-        // The memory node calls rag-rat directly rather than a model, so it reports no usage.
-        ledger: Some(ledger),
-    })
-    .await?;
-    state.memories = memory_out
-        .memories
-        .iter()
-        .map(serde_json::to_value)
-        .collect::<Result<_, _>>()?;
 
     // --- analyst ---
     let plugins_analyst = context.for_node("analyst");
@@ -319,6 +300,8 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         scout: scout_out,
         memory: memory_out,
         analyst: analyst_out,
+        brief: context_out.brief,
+        constraints: context_out.constraints,
     })
 }
 
@@ -474,6 +457,7 @@ pub const BUILT_IN: &str = "built-in";
 /// workflow may add to this set; see [`Workflow::nodes`].
 pub const BUILT_IN_NODES: &[&str] = &[
     "overseer",
+    "context",
     "scout",
     "analyst",
     "bookkeeper",
@@ -1603,6 +1587,8 @@ struct Review {
     analyst: AnalystNode,
     scout: ScoutOutput,
     memory: MemoryOutput,
+    brief: String,
+    constraints: Vec<Constraint>,
 }
 
 /// What a review concluded the run should do next.
@@ -1745,6 +1731,8 @@ impl Review {
             },
             scout: plan.scout.clone(),
             memory: plan.memory.clone(),
+            brief: plan.brief.clone(),
+            constraints: plan.constraints.clone(),
         }))
     }
 
@@ -1845,6 +1833,10 @@ impl Review {
             issue: issue.to_string(),
             scout: self.scout.clone(),
             memory: self.memory.clone(),
+            // Carried unchanged into the revision: what bears on the task and what constrains it
+            // did not stop being true because the plan was wrong.
+            brief: self.brief.clone(),
+            constraints: self.constraints.clone(),
             previous: Some(Box::new(plan.clone())),
             findings: plan_faults,
         };

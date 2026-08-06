@@ -194,8 +194,20 @@ fn infer_status(
 }
 
 async fn reconstruct_plan(store: &Store, run_id: &str) -> Result<PlanOutcome, PlanError> {
-    let scout: ScoutOutput = latest_checkpoint(store, run_id, "scout").await?;
-    let memory: MemoryOutput = latest_checkpoint(store, run_id, "memory").await?;
+    // A run may have gathered context either way: one `context` checkpoint, or the separate
+    // `scout` and `memory` ones a script composing the older bindings still writes. Preferring the
+    // merged one and falling back keeps both replayable.
+    let merged: Option<crate::ContextOutput> =
+        latest_checkpoint(store, run_id, "context").await.ok();
+    let (scout, memory, brief, constraints) = match merged {
+        Some(c) => (c.scout, c.memory, c.brief, c.constraints),
+        None => (
+            latest_checkpoint::<ScoutOutput>(store, run_id, "scout").await?,
+            latest_checkpoint::<MemoryOutput>(store, run_id, "memory").await?,
+            String::new(),
+            Vec::new(),
+        ),
+    };
     let analyst: AnalystOutput = latest_checkpoint(store, run_id, "analyst").await?;
 
     let mut state = RunState::new(run_id, None);
@@ -212,6 +224,8 @@ async fn reconstruct_plan(store: &Store, run_id: &str) -> Result<PlanOutcome, Pl
         scout,
         memory,
         analyst,
+        brief,
+        constraints,
     })
 }
 
@@ -683,8 +697,43 @@ async fn verify_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, S
     .map_err(|e| e.to_string())
 }
 
+/// `context(issue)` — the merged gather step: distilled findings plus the memories unmodified.
+///
+/// `scout()` and `memory()` remain for a script that composes them itself. This is the one that
+/// guarantees the ranked memory search happened.
+async fn context_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
+    ctx.guard()?;
+    let issue: String = serde_json::from_str(&arg).map_err(|e| format!("context arg: {e}"))?;
+    let plugins = ctx.plugin_context.for_node("context");
+    let cfg = node_agent_config(
+        &ctx.engine,
+        &ctx.config,
+        ctx.plugin_context.pool_for("context", ctx.rag_rat.clone()),
+        "context",
+        crate::context::CONTEXT_TOOLS,
+        &plugins,
+    )
+    .map_err(|e| e.to_string())?;
+    let node = crate::ContextNode {
+        route: cfg.route,
+        tools: cfg.tools,
+        sink: ctx.sink.clone(),
+        files: cfg.files,
+        ledger: Some(Arc::clone(&ctx.ledger)),
+        policy: cfg.policy,
+        max_turns: cfg.max_turns,
+        clarifier: None,
+        system_prompt: cfg.system_prompt,
+        plugins,
+    };
+    let out = node.run(&issue).await.map_err(|e| e.to_string())?;
+    note(&ctx, "context", &out, Some(arg)).await?;
+    serde_json::to_string(&out).map_err(|e| e.to_string())
+}
+
 fn build_hosts(ctx: &Arc<WorkflowContext>) -> HashMap<String, HostFn> {
     let mut h = HashMap::new();
+    h.insert("context".into(), binding(Arc::clone(ctx), context_host));
     h.insert("scout".into(), binding(Arc::clone(ctx), scout_host));
     h.insert("memory".into(), binding(Arc::clone(ctx), memory_host));
     h.insert("analyze".into(), binding(Arc::clone(ctx), analyze_host));

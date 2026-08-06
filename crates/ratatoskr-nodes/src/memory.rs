@@ -61,37 +61,48 @@ impl Node for MemoryNode {
         input: MemoryInput,
         _run_state: &RunState,
     ) -> Result<MemoryOutput, NodeError> {
-        let mut query = format!("{}\n{}", input.issue, input.context);
-        query.truncate(floor_char_boundary(&query, MAX_QUERY_CHARS));
-
-        let args = serde_json::json!({ "query": query, "limit": MEMORY_LIMIT })
-            .as_object()
-            .cloned()
-            .expect("json object literal");
-        let param = CallToolRequestParams::new("memory_search").with_arguments(args);
-
-        let result = self
-            .sink
-            .call_tool(param)
-            .await
-            .map_err(|e| NodeError::Failed(format!("memory_search call failed: {e}")))?;
-
-        let text = result
-            .content
-            .iter()
-            .filter_map(|c| c.as_text())
-            .map(|t| t.text.as_str())
-            .collect::<Vec<_>>()
-            .join("");
-
-        if result.is_error.unwrap_or(false) {
-            return Err(NodeError::Failed(format!(
-                "memory_search returned an error: {text}"
-            )));
-        }
-
-        parse_memory_result(&text)
+        search(&self.sink, &input.issue, &input.context).await
     }
+}
+
+/// Run rag-rat's ranked `memory_search` for `issue` (plus any `context` narrowing it).
+///
+/// Extracted from the node so the context node runs the identical retrieval: the guarantee that
+/// matters is that the same deterministic search happens, not which node called it.
+pub async fn search(
+    sink: &ServerSink,
+    issue: &str,
+    context: &str,
+) -> Result<MemoryOutput, NodeError> {
+    let mut query = format!("{issue}\n{context}");
+    query.truncate(floor_char_boundary(&query, MAX_QUERY_CHARS));
+
+    let args = serde_json::json!({ "query": query, "limit": MEMORY_LIMIT })
+        .as_object()
+        .cloned()
+        .expect("json object literal");
+    let param = CallToolRequestParams::new("memory_search").with_arguments(args);
+
+    let result = sink
+        .call_tool(param)
+        .await
+        .map_err(|e| NodeError::Failed(format!("memory_search call failed: {e}")))?;
+
+    let text = result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text())
+        .map(|t| t.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+
+    if result.is_error.unwrap_or(false) {
+        return Err(NodeError::Failed(format!(
+            "memory_search returned an error: {text}"
+        )));
+    }
+
+    parse_memory_result(&text)
 }
 
 /// Wrap `memory_search`'s bare JSON array as `{"memories": [...]}` and run it through the schema
