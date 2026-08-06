@@ -190,9 +190,9 @@ that declares a `model` needs no `[models.<node>]` entry at all, and that TOML e
 fallback:
 
 ```ts
-defineAgent("scout", {
+defineAgent("context", {
   model: { provider: "moonshot", model: "kimi-k2.5" },
-  systemPrompt: "You are the scout...",     // replaces the node's built-in preamble
+  systemPrompt: "You gather what the repo knows...",  // replaces the node's built-in preamble
   tools: { allow: ["semantic_search"] },    // REPLACES the default tool set; `deny` also supported
   maxTurns: 40,
   onToolCall({ tool }) {                    // per-call gate, consulted for every tool call
@@ -201,7 +201,8 @@ defineAgent("scout", {
 });
 ```
 
-Rulesets apply to `scout`, `analyst`, `bookkeeper`, and `redteam` — the nodes that are LLM agents.
+Rulesets apply to every node that is an LLM agent — `context`, `analyst`, `redteam`, `implementer`,
+`verifier`, `bookkeeper`, `overseer`, `publisher`, `characterizer`.
 TypeScript is transpiled and evaluated in-process; the types are for editor ergonomics and are
 stripped at load.
 
@@ -248,7 +249,7 @@ defineDefaults({ plugins: ["rag-rat"] });
 defineAgent("analyst", { plugins: { add: ["impact-lens"], remove: ["noisy"] } });
 
 // or start from nothing, said out loud
-defineAgent("scout", { plugins: { inherit: false, add: ["scout-only"] } });
+defineAgent("context", { plugins: { inherit: false, add: ["context-only"] } });
 
 // or name the set exactly
 defineAgent("bookkeeper", { plugins: ["rag-rat"] });

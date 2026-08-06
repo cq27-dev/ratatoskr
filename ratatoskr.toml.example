@@ -22,7 +22,7 @@ root = ".ratatoskr/worktrees"
 provider = "anthropic"
 model = "claude-sonnet-4-6"
 
-[models.scout]
+[models.context]
 provider = "moonshot"
 model = "kimi-k2.5"
 
