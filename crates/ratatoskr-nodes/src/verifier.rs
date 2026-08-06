@@ -158,6 +158,8 @@ impl VerifierNode {
             observer: self.plugins.observer.clone(),
             skills: crate::skills::loaded(&self.plugins.skills),
             files: self.files.clone(),
+            // Reads the diff; runs nothing — the acceptance run already happened.
+            shell: None,
             ledger: self.ledger.clone(),
             produces: Some(
                 "findings on the diff — each with a severity, a plan/execution kind, and a concrete failure scenario — or none",

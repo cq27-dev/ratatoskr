@@ -7,6 +7,7 @@
 pub mod compaction;
 pub mod files;
 pub mod publish;
+pub mod shell;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -202,7 +203,7 @@ where
     M: CompletionModel + 'static,
 {
     let (builder, meter) = metered(model, preamble, max_turns, max_tokens);
-    let agent = bind_tools(builder, &tools, None);
+    let agent = bind_tools(builder, &tools, None, None);
 
     let answer = agent.prompt(question).await;
     // No store to checkpoint to here, so it goes to the log. A one-shot question whose cost is
@@ -219,10 +220,49 @@ where
     answer.map_err(|e| AgentError::Prompt(e.to_string()))
 }
 
-/// Like [`ask`], but the agent is given an `output_schema`, so its final answer is the structured
-/// JSON matching that schema (rig's `OutputMode::Auto` resolves to a synthetic output tool that
-/// composes with the rag-rat tools). Returns the raw output string — best-effort, so the caller
-/// must still validate it (see `ratatoskr_graph::parse_validated`).
+/// Bind a tool declaration to the closure that answers it.
+///
+/// The name, description and schema a tool is offered under are the ones in its declaration.
+/// Unpacking them again at each implementation is how the two come to disagree — a tool described
+/// one way and answering to another.
+pub(crate) fn answered_by<F>(declaration: Tool, callback: F) -> DynamicTool
+where
+    F: for<'a> Fn(
+            &'a mut rig_agent::tool::ToolContext,
+            serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<ToolOutput, ToolExecutionError>> + Send + 'a>,
+        > + Send
+        + Sync
+        + 'static,
+{
+    DynamicTool::new(
+        declaration.name.to_string(),
+        declaration
+            .description
+            .clone()
+            .unwrap_or_default()
+            .to_string(),
+        serde_json::Value::Object((*declaration.input_schema).clone()),
+        callback,
+    )
+}
+
+/// Keep the last `max` chars of `s`, saying how much was dropped.
+///
+/// The end is the half worth keeping for anything a command printed: runners put their summary
+/// last, so a head-truncated failure is the part that says a suite ran and not the part that says
+/// what failed. Stating the loss matters as much — a reader not told it was cut reads a partial
+/// suite as a whole one.
+pub fn tail(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().skip(count - max).collect();
+    format!("[{} earlier characters omitted]\n{kept}", count - max)
+}
+
 /// Trim `s` to `max` chars for a log line, with an ellipsis when cut.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -438,6 +478,7 @@ fn bind_tools<M: CompletionModel + 'static>(
     builder: AgentBuilder<M, NoToolConfig>,
     tools: &ToolSet,
     files: Option<&std::path::Path>,
+    shell: Option<&shell::ShellAccess>,
 ) -> Agent<M> {
     // An empty dynamic set moves the builder out of `NoToolConfig` without binding anything, which
     // is what lets the groups below be a plain loop over two different binding calls.
@@ -462,7 +503,7 @@ fn bind_tools<M: CompletionModel + 'static>(
                 group
                     .tools
                     .iter()
-                    .map(|tool| local_tool(tool, files))
+                    .map(|tool| local_tool(tool, files, shell))
                     .collect(),
             ),
         };
@@ -480,7 +521,14 @@ fn prefixed(text: &str, context: Option<String>) -> String {
 
 /// Bind a tool this host answers itself: a built-in file tool, or — for the synthetic ones a hook
 /// answers in-conversation — a stand-in that says so if it is ever actually dispatched.
-fn local_tool(tool: &Tool, files: Option<&std::path::Path>) -> DynamicTool {
+fn local_tool(
+    tool: &Tool,
+    files: Option<&std::path::Path>,
+    shell: Option<&shell::ShellAccess>,
+) -> DynamicTool {
+    if let Some(implemented) = shell.and_then(|s| shell::implementation(&tool.name, s)) {
+        return implemented;
+    }
     if let Some(root) = files {
         if let Some(implemented) = files::implementation(&tool.name, root) {
             return implemented;
@@ -872,9 +920,9 @@ impl RunLedger {
             .push((node.to_string(), telemetry));
     }
 
-    /// Claim the oldest unclaimed entry for `node`, if it made a model turn at all. A node that
-    /// drives a coding CLI rather than a model (the implementer) never records one, so `None` here
-    /// is ordinary and means "nothing to report", not "something went missing".
+    /// Claim the oldest unclaimed entry for `node`, if it made a model turn at all. `None` is
+    /// ordinary for a node that ran no model — it means "nothing to report", not "something went
+    /// missing", which is what [`RunLedger::unclaimed`] is for.
     pub fn take(&self, node: &str) -> Option<NodeTelemetry> {
         let mut entries = self.entries.lock().expect("ledger mutex poisoned");
         let at = entries.iter().position(|(name, _)| name == node)?;
@@ -920,6 +968,12 @@ pub struct NodeRun<'a> {
     pub skills: Vec<Skill>,
     /// The repository the node's built-in file tools read within; `None` when it has none.
     pub files: Option<std::path::PathBuf>,
+    /// The sandbox the node's `Bash` calls run in; `None` for a node that runs no commands.
+    ///
+    /// Separate from `files` because they are different powers: reading and editing a tree is not
+    /// running code in it, and only the node that has to build and test its own work is given the
+    /// second.
+    pub shell: Option<shell::ShellAccess>,
     /// Where this turn reports what it cost; `None` outside a run that records checkpoints.
     pub ledger: Option<Arc<RunLedger>>,
     /// What this node has to end up producing, in one line, for the compactor.
@@ -932,6 +986,10 @@ pub struct NodeRun<'a> {
 }
 
 /// Run one node's turn with an output schema, so its final answer is structured JSON.
+/// Like [`ask`], but the agent is given an `output_schema`, so its final answer is the structured
+/// JSON matching that schema. Returns the raw output string — best-effort, so the caller must
+/// still validate it (see `ratatoskr_graph::parse_validated`), though a first answer that misses
+/// the schema is handed back for correction before it reaches one.
 pub async fn run_structured(run: NodeRun<'_>) -> Result<String, AgentError> {
     match parse_provider(&run.route.provider)? {
         Provider::Anthropic => {
@@ -977,6 +1035,7 @@ where
         observer,
         skills,
         files,
+        shell,
         ledger,
         produces,
     } = run;
@@ -1035,7 +1094,7 @@ where
             ledger.clone(),
         ));
     }
-    let agent = bind_tools(builder, &tools, files.as_deref());
+    let agent = bind_tools(builder, &tools, files.as_deref(), shell.as_ref());
 
     // Tag every log line for this run — the hook's tool-call/text lines and rig-agent's own turn
     // logs — with the node name, so a run's agents are distinguishable in the logs. `prompt()` is
@@ -1288,6 +1347,7 @@ mod tests {
             observer: None,
             skills: Vec::new(),
             files: Some(root.clone()),
+            shell: None,
             ledger: None,
             produces: Some("a summary of the change"),
         })
@@ -1349,6 +1409,7 @@ mod tests {
             observer: None,
             skills: Vec::new(),
             files: None,
+            shell: None,
             ledger: Some(Arc::clone(&ledger)),
             produces: None,
         })

@@ -1425,7 +1425,8 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
     };
 
     // Some tasks call for no code change: research, a review, an architecture answer. Running the
-    // fork for one costs a sandboxed baseline test run and an ACP session to produce an empty diff,
+    // fork for one costs a sandboxed baseline test run and an implementer session to produce an
+    // empty diff,
     // and then reports `Converged` — a success claim about a change that was never made.
     if !fork_is_needed(&plan.analyst, config) {
         return no_code_change(&run, store, run_id, &plan_context, plan).await;
@@ -1816,6 +1817,55 @@ pub(crate) fn build_characterizer(
     }))
 }
 
+/// The implementer's agent configuration.
+///
+/// Distinct from every other node's in what it may reach: the editing tools and a shell, on top of
+/// the read tools each node gets. Built in one place because those two powers belong together and
+/// to exactly one node — a second construction site is how one of them comes to be granted
+/// somewhere it was not meant to be.
+fn build_implementer_agent(
+    engine: &Arc<ScriptEngine>,
+    config: &RatatoskrConfig,
+    context: &PluginContext,
+    offer: ServerTools,
+) -> Result<(NodeAgentConfig, NodePlugins), PlanError> {
+    let plugins = context.for_node("implementer");
+    let mut tools = context.pool_for("implementer", offer);
+    tools
+        .local()
+        .tools
+        .extend(ratatoskr_agent::files::edit_declarations());
+    tools
+        .local()
+        .tools
+        .push(ratatoskr_agent::shell::declaration());
+    let cfg = node_agent_config(
+        engine,
+        config,
+        tools,
+        "implementer",
+        &implementer_default_tools(),
+        &plugins,
+    )?;
+    Ok((cfg, plugins))
+}
+
+/// The implementer's default `allow`: its rag-rat tools plus the ones that let it work — reading,
+/// editing, and running commands. A ruleset naming its own `allow` replaces this wholesale, and
+/// one that forgets `Write` or `Bash` leaves the node unable to do the job it exists for.
+fn implementer_default_tools() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = implementer::IMPLEMENTER_TOOLS.to_vec();
+    names.extend([
+        ratatoskr_agent::files::READ,
+        ratatoskr_agent::files::GREP,
+        ratatoskr_agent::files::GLOB,
+        ratatoskr_agent::files::WRITE,
+        ratatoskr_agent::files::EDIT,
+        ratatoskr_agent::shell::BASH,
+    ]);
+    names
+}
+
 /// The verifier is opt-in on having somewhere to run, the same way the red-team classifier is.
 fn verifier_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> bool {
     config.models.contains_key("verifier")
@@ -2135,11 +2185,19 @@ async fn fork_and_converge(
             false => None,
         },
     };
+    let (impl_cfg, impl_plugins) =
+        build_implementer_agent(engine, config, context, client.offer())?;
     let implementer = ImplementerNode {
         repo_path: repo_path.clone(),
         worktree_root: config.worktree.root.clone(),
         sandbox: config.sandbox.clone(),
-        implementer: config.implementer.clone(),
+        route: impl_cfg.route,
+        tools: impl_cfg.tools,
+        policy: impl_cfg.policy,
+        max_turns: impl_cfg.max_turns,
+        system_prompt: impl_cfg.system_prompt,
+        plugins: impl_plugins,
+        ledger: Some(Arc::clone(ledger)),
         run_id: run_id.to_string(),
         issue: issue.to_string(),
         analyst: plan.analyst.clone(),
@@ -2154,7 +2212,7 @@ async fn fork_and_converge(
     };
 
     // Built before the fork so a misconfigured verifier fails the run here rather than after an
-    // ACP session and a sandboxed test run have already been spent on it.
+    // implementer session and a sandboxed test run have already been spent on it.
     let review = Review::build(run, plan)?;
 
     // Fork: both branches run concurrently off the same frozen post-analyst state. join! (not
@@ -2179,8 +2237,8 @@ async fn fork_and_converge(
         run_id,
         node: "implementer",
         output: &impl_out,
-        // The implementer drives a coding CLI over ACP rather than a model turn here, so the
-        // ledger has nothing for it; its row carries the iteration and the outcome.
+        // The implementer's own model turn is on the ledger under this name, and the row also
+        // carries the iteration and the outcome.
         input: Some(serde_json::to_string(&plan.analyst)?),
         iteration: Some(1),
         ledger: Some(ledger),
@@ -2662,7 +2720,8 @@ mod agent_config_tests {
         assert!(fork_is_needed(&analyst_saying(true), &config));
         assert!(
             !fork_is_needed(&analyst_saying(false), &config),
-            "a task that changes no code does not pay for a baseline test run and an ACP session"
+            "a task that changes no code does not pay for a baseline test run and an implementer \
+             session"
         );
 
         // The override only ever adds work. There is no configuration that skips the fork when the

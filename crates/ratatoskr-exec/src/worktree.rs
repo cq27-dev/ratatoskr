@@ -52,7 +52,8 @@ pub async fn create(
     branch: &str,
 ) -> Result<WorktreePath, ExecError> {
     // The path must be absolute: git resolves a relative worktree path against `repo_root`, but
-    // downstream consumers (the ACP session's `cwd`) require an absolute path.
+    // downstream consumers (the sandbox's workdir, the implementer's file tools) require an
+    // absolute path.
     let abs_root = if worktree_root.is_absolute() {
         worktree_root.to_path_buf()
     } else {

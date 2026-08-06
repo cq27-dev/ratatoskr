@@ -75,9 +75,9 @@ model = "kimi-k2.5"
 # provider = "moonshot"
 # model = "kimi-k2.5"
 
-# Phase 3: the implementer drives a coding CLI via ACP in an isolated worktree.
+# The implementer edits an isolated worktree and runs its checks in the sandbox. It needs a
+# [models.implementer] route like any other node.
 [implementer]
-cli = "claude"          # which coding CLI to drive (Claude Code via its ACP adapter)
 max_iterations = 3      # converge re-runs the implementer at most this many times
 # The least severe review finding that sends a change back to be fixed: "P1" (must-fix only),
 # "P2" (the default, also should-fix), or "P3" (nits too). Findings below it are still recorded.
@@ -86,8 +86,8 @@ max_iterations = 3      # converge re-runs the implementer at most this many tim
 verify_threshold = "P2"
 # The analyst decides whether carrying out its plan means changing code. When it says no —
 # research, a review, an architecture question — the fork is skipped and the run finishes
-# `no_code_change` instead of paying for a baseline test run and an ACP session to produce an
-# empty diff. Set this to override that judgement; it only ever adds the fork back.
+# `no_code_change` instead of paying for a baseline test run and an implementer session to produce
+# an empty diff. Set this to override that judgement; it only ever adds the fork back.
 always_fork = false
 
 # Phase 3: red-team and implementer run the repo's tests in a sandbox.

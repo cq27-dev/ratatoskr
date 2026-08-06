@@ -81,24 +81,11 @@ pub fn implementation(name: &str, root: &Path) -> Option<DynamicTool> {
     if name != GH {
         return None;
     }
-    let declaration = declaration();
-    let schema = serde_json::Value::Object((*declaration.input_schema).clone());
-    let description = declaration
-        .description
-        .clone()
-        .unwrap_or_default()
-        .to_string();
     let root = root.to_path_buf();
-
-    Some(DynamicTool::new(
-        GH.to_string(),
-        description,
-        schema,
-        move |_ctx, args| {
-            let root = root.clone();
-            Box::pin(async move { run(&root, &args).await.map(ToolOutput::text) })
-        },
-    ))
+    Some(crate::answered_by(declaration(), move |_ctx, args| {
+        let root = root.clone();
+        Box::pin(async move { run(&root, &args).await.map(ToolOutput::text) })
+    }))
 }
 
 /// Whether `args` name a permitted subcommand.

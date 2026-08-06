@@ -1,19 +1,29 @@
-//! Implementer: drive the coding CLI (Claude Code via ACP) to make edits in an isolated worktree,
-//! then run the repo's tests in a sandbox against that worktree. Converge iterates this node on the
-//! same worktree with a diagnostic prompt when the change introduces new failures.
+//! Implementer: make edits in an isolated worktree, then run the repo's acceptance checks in a
+//! sandbox against that worktree. Converge iterates this node on the same worktree with a
+//! diagnostic prompt when the change introduces new failures.
+//!
+//! The model is driven here, with this pipeline's own tools, rather than by handing the task to a
+//! coding CLI. A CLI is built around a human who is watching: it decides for itself what it may
+//! run, asks when it is unsure, and reports progress to a terminal. None of that is available in a
+//! run — nobody answers, and a question is a stopped node. Driving the model directly is also what
+//! puts every command inside the run's own sandbox and every model turn on the run's ledger.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use ratatoskr_core::{ImplementerConfig, SandboxConfig};
+use ratatoskr_agent::RunLedger;
+use ratatoskr_agent::shell::ShellAccess;
+use ratatoskr_core::{ModelRoute, SandboxConfig, ToolPolicy};
 use ratatoskr_exec::worktree::{self, WorktreePath};
-use ratatoskr_exec::{acp, create_worktree, remove_worktree};
-use ratatoskr_graph::NodeError;
+use ratatoskr_exec::{Mount, SandboxSpec, create_worktree, remove_worktree};
+use ratatoskr_graph::{NodeError, parse_validated};
+use ratatoskr_mcp::ToolSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::analyst::AnalystOutput;
-use crate::testrun::{Characterizer, by_exit_code, run_acceptance};
+use crate::testrun::{Characterizer, GUEST_WORKSPACE, by_exit_code, run_acceptance};
 
 /// Implementer output. Test fields are deterministic; `diff_summary`/`touched_files`/`narrative`
 /// are best-effort context (relaxed) for the bookkeeper in Phase 4.
@@ -45,12 +55,42 @@ pub struct ImplementerOutput {
 /// off limits and why, and what to do when the session opens with a diagnostic rather than a plan.
 pub const NATIVE_PREAMBLE: &str = include_str!("../prompts/implementer.md");
 
-/// The implementer node. Holds everything needed to create the worktree and drive the CLI.
+/// The rag-rat tools the implementer gets by default.
+///
+/// Wider than a planning node's: it is the only node that changes code, and the prompt tells it to
+/// check the blast radius and the recorded memories of every symbol it touches — which it can only
+/// do if it can reach them.
+pub const IMPLEMENTER_TOOLS: &[&str] = &[
+    "impact_surface",
+    "symbol_lookup",
+    "semantic_search",
+    "find_callers",
+    "memory_search",
+    "read_chunk",
+];
+
+/// What the model reports when it stops. Everything that decides the run — the diff, the checks —
+/// is read from the worktree afterwards, so this carries only the part nothing else can see: what
+/// it believes it did.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct Report {
+    /// What was changed and why, for the reader of the run rather than for another node.
+    summary: String,
+}
+
+/// The implementer node. Holds everything needed to create the worktree and drive the model.
 pub struct ImplementerNode {
     pub repo_path: PathBuf,
     pub worktree_root: PathBuf,
     pub sandbox: SandboxConfig,
-    pub implementer: ImplementerConfig,
+    pub route: ModelRoute,
+    pub tools: ToolSet,
+    pub policy: Option<Arc<dyn ToolPolicy>>,
+    pub max_turns: Option<usize>,
+    /// Ruleset `systemPrompt`; replaces [`NATIVE_PREAMBLE`] when set.
+    pub system_prompt: Option<String>,
+    pub plugins: crate::NodePlugins,
+    pub ledger: Option<Arc<RunLedger>>,
     pub run_id: String,
     pub issue: String,
     pub analyst: AnalystOutput,
@@ -90,16 +130,39 @@ impl ImplementerNode {
         self.attempt(worktree, diagnostic).await
     }
 
-    /// One attempt: drive the CLI, then run the worktree's tests and read its diff.
+    /// One attempt: drive the model, then run the worktree's acceptance checks and read its diff.
     async fn attempt(
         &self,
         worktree: &WorktreePath,
         prompt: &str,
     ) -> Result<ImplementerOutput, NodeError> {
-        let command = acp_command(&self.implementer.cli)?;
-        let turn = acp::drive(&command, worktree.as_path(), prompt)
-            .await
-            .map_err(|e| NodeError::Failed(format!("ACP session failed: {e}")))?;
+        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
+            node: "implementer",
+            route: &self.route,
+            preamble: &crate::effective_preamble(
+                NATIVE_PREAMBLE,
+                self.system_prompt.as_deref(),
+                self.plugins.context.as_deref(),
+            ),
+            question: prompt,
+            tools: self.tools.clone(),
+            output_schema: schemars::schema_for!(Report),
+            policy: self.policy.clone(),
+            max_turns: self.max_turns,
+            // Nobody to ask. The prompt says so, and offering the tool would contradict it.
+            clarifier: None,
+            observer: self.plugins.observer.clone(),
+            skills: crate::skills::loaded(&self.plugins.skills),
+            // Rooted at the worktree, not the checkout: every path it reads or writes has to be
+            // the copy it owns, or one attempt edits the tree another node is reading.
+            files: Some(worktree.as_path().to_path_buf()),
+            shell: Some(self.shell_access(worktree)),
+            ledger: self.ledger.clone(),
+            produces: Some("a change that satisfies the plan and passes the acceptance checks"),
+        })
+        .await
+        .map_err(|e| NodeError::Failed(format!("implementer agent failed: {e}")))?;
+        let report = parse_validated::<Report>(&raw)?;
 
         let outcomes = run_acceptance(
             &self.sandbox,
@@ -125,8 +188,31 @@ impl ImplementerNode {
             failing_tests: tests.failing,
             passing_tests: tests.passing,
             exit_code: tests.exit_code,
-            narrative: Some(turn.output),
+            narrative: Some(report.summary),
         })
+    }
+
+    /// The sandbox this attempt's `Bash` calls run in: the same one its acceptance checks run in,
+    /// so a command that passes for the model passes for the run. Anything else and the model
+    /// would be debugging a different machine from the one that judges it.
+    fn shell_access(&self, worktree: &WorktreePath) -> ShellAccess {
+        ShellAccess {
+            spec: SandboxSpec {
+                backend: self.sandbox.backend.clone(),
+                name: format!("ratatoskr-impl-{}", self.short_id()),
+                image: self.sandbox.image.clone(),
+                workdir: GUEST_WORKSPACE.to_string(),
+                mounts: vec![Mount {
+                    host: worktree.as_path().to_path_buf(),
+                    guest: GUEST_WORKSPACE.to_string(),
+                }],
+                // Filled in per call.
+                command: Vec::new(),
+                cpus: 2,
+                memory_mib: 2048,
+                network: false,
+            },
+        }
     }
 
     fn short_id(&self) -> String {
@@ -159,23 +245,22 @@ impl ImplementerNode {
             }
             s.push('\n');
         }
+        if !self.acceptance.is_empty() {
+            s.push_str(
+                "The acceptance checks this change is judged by, which you can run yourself with \
+                 Bash:\n",
+            );
+            for step in &self.acceptance {
+                let _ = writeln!(s, "- {}: `{}`", step.name, step.command.join(" "));
+            }
+            s.push('\n');
+        }
         s.push_str(
             "Apply the change directly with your editing tools — do NOT ask for confirmation or \
-             present options to choose between; just make the fix. Then run the repo's tests and \
-             ensure they pass.",
+             present options to choose between; just make the fix. Then run the acceptance checks \
+             and make them pass.",
         );
         s
-    }
-}
-
-/// Map a config `implementer.cli` to the ACP agent command. Phase 3 supports Claude Code only.
-fn acp_command(cli: &str) -> Result<String, NodeError> {
-    match cli {
-        // The renamed Zed adapter (was @zed-industries/claude-code-acp) speaks ACP over stdio.
-        "claude" => Ok("npx -y @agentclientprotocol/claude-agent-acp".to_string()),
-        other => Err(NodeError::Failed(format!(
-            "unsupported implementer.cli {other:?}; only \"claude\" is wired in Phase 3"
-        ))),
     }
 }
 

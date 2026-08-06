@@ -117,8 +117,6 @@ impl PluginConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImplementerConfig {
-    /// Which coding CLI to drive via ACP (`"claude"`). One target per the Phase 3 non-goals.
-    pub cli: String,
     /// How many times converge may re-run the implementer before giving up.
     pub max_iterations: u32,
     /// The least severe review finding that sends the change back to be fixed.
@@ -145,7 +143,6 @@ pub struct ImplementerConfig {
 impl Default for ImplementerConfig {
     fn default() -> Self {
         ImplementerConfig {
-            cli: "claude".to_string(),
             max_iterations: 3,
             verify_threshold: default_verify_threshold(),
             always_fork: false,
@@ -316,7 +313,6 @@ impl RatatoskrConfig {
     /// features are present, whether the CLI is installed); those surface at run time.
     pub fn validate(&self) -> Result<(), ConfigError> {
         const BACKENDS: [&str; 2] = ["microsandbox", "landlock"];
-        const CLIS: [&str; 1] = ["claude"];
 
         if self.rag_rat.command.is_empty() {
             return Err(ConfigError::Invalid(
@@ -333,12 +329,6 @@ impl RatatoskrConfig {
             return Err(ConfigError::Invalid(format!(
                 "sandbox.backend `{}` is not one of {BACKENDS:?}",
                 self.sandbox.backend
-            )));
-        }
-        if !CLIS.contains(&self.implementer.cli.as_str()) {
-            return Err(ConfigError::Invalid(format!(
-                "implementer.cli `{}` is not one of {CLIS:?}",
-                self.implementer.cli
             )));
         }
         if self.implementer.max_iterations == 0 {
@@ -508,7 +498,6 @@ mod tests {
         invalid(|c| c.rag_rat.command.clear());
         invalid(|c| c.sandbox.test_command.clear());
         invalid(|c| c.sandbox.backend = "docker".to_string());
-        invalid(|c| c.implementer.cli = "aider".to_string());
         invalid(|c| c.implementer.max_iterations = 0);
     }
 
@@ -539,7 +528,6 @@ mod tests {
             [worktree]
             root = ".ratatoskr/worktrees"
             [implementer]
-            cli = "claude"
             max_iterations = 5
             verify_threshold = "P1"
             "#,
@@ -557,7 +545,6 @@ mod tests {
             [rag_rat]
             command = ["rag-rat", "mcp"]
             [implementer]
-            cli = "claude"
             max_iterations = 3
             verify_treshold = "P1"
         "#;

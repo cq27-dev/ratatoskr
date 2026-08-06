@@ -91,6 +91,13 @@ Write: whole-file replacement. Use for new files, or when a file needs so many c
 sequential edits would be error-prone. Never Write a file you have not read in its current state
 — you will silently destroy content.
 
+Bash: runs a command in your worktree, inside a sandbox. Two consequences worth planning around.
+There is no network — a step that wants to fetch something will fail, and that is the sandbox, not
+a broken repository, so do not work around it by vendoring or disabling the check. And the sandbox
+is the same one the acceptance run uses, so a command that passes for you passes for the run: use
+it to check your own work before you stop. Nothing you start outlives the call, so a server or a
+watcher is not something you can leave running and come back to.
+
 Repository-intelligence tools: prefer these over grep for "where is this concept" and "what
 calls this" questions — one call returns callers, callees, and bound memories that raw search
 cannot surface.

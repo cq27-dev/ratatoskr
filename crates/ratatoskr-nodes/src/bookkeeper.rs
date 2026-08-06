@@ -29,7 +29,7 @@ use crate::implementer::ImplementerOutput;
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RunFriction {
     /// The converge diagnostic each implementer iteration past the first was given — literally
-    /// "your change broke these, fix them". Each one cost a full ACP session.
+    /// "your change broke these, fix them". Each one cost a full implementer session.
     pub diagnostics: Vec<String>,
     /// Nodes that failed, and why. A node that had to be retried hit something.
     pub errors: Vec<NodeFailure>,
@@ -301,6 +301,8 @@ impl BookkeeperNode {
             observer: self.plugins.observer.clone(),
             skills: crate::skills::loaded(&self.plugins.skills),
             files: self.files.clone(),
+            // Reads and edits, but runs nothing.
+            shell: None,
             ledger: self.ledger.clone(),
             produces: Some(
                 "a decision per durable learning: create, revise or none, with the memory body and its anchor",

@@ -73,4 +73,3 @@ reqwest = { version = "0.13", default-features = false, features = ["json"] }
 tower-http = { version = "0.7", features = ["fs"] }
 # Phase 3 execution: MicroVM sandbox + ACP client for driving a coding CLI.
 microsandbox = "0.6.8"
-agent-client-protocol = "2.0.0"

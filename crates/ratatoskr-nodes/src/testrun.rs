@@ -181,6 +181,8 @@ impl Characterizer {
             observer: None,
             skills: Vec::new(),
             files: None,
+            // Reads output it was handed, and touches neither the tree nor a shell.
+            shell: None,
             ledger: self.ledger.clone(),
             // One turn over output it was handed: there is no history to outgrow, so a compaction
             // policy would only cost a summariser it never calls.

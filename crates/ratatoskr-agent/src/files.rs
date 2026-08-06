@@ -24,6 +24,10 @@ use serde_json::json;
 /// what `Grep` is for.
 const MAX_READ_BYTES: usize = 256 * 1024;
 
+/// Most of one line reported back. A minified bundle or an embedded data blob is a single line of
+/// hundreds of kilobytes, and no node ever needed the whole of it.
+const MAX_LINE_CHARS: usize = 2_000;
+
 /// Most matches or paths any one call reports.
 const MAX_RESULTS: usize = 200;
 
@@ -570,6 +574,20 @@ fn display(root: &Path, path: &Path) -> String {
 /// `Read`: one file's lines, numbered, from `offset` for `limit` lines.
 fn read(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionError> {
     let path = within(root, Some(arg(args, "file_path")?))?;
+    if path.is_dir() {
+        return Err(ToolExecutionError::invalid_args(format!(
+            "{} is a directory, not a file; list it with Glob",
+            display(root, &path)
+        )));
+    }
+    if is_binary(&path)? {
+        // Said plainly rather than left to fail as a UTF-8 error deeper in, which reads as a
+        // broken tool rather than as a file nobody should be asking for by line.
+        return Err(ToolExecutionError::invalid_args(format!(
+            "{} is a binary file and has no lines to read",
+            display(root, &path)
+        )));
+    }
     let offset = args
         .get("offset")
         .and_then(|v| v.as_u64())
@@ -583,18 +601,58 @@ fn read(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionEr
     // Streamed, not read whole: `offset` and `limit` bound what is *returned*, and a file large
     // enough to matter would otherwise be held in memory in full before either applied.
     let mut out = String::new();
+    let mut last = 0;
+    let mut cut = false;
     for (number, line) in lines_of(&path)?.enumerate().skip(offset - 1).take(limit) {
         let line = line.map_err(|e| {
             ToolExecutionError::other(format!("cannot read {}: {e}", path.display()))
         })?;
+        last = number + 1;
         // Numbered because that is how a node cites what it read, and how it asks for more.
-        out.push_str(&format!("{:>6}\t{line}\n", number + 1));
+        out.push_str(&format!("{:>6}\t{}\n", last, clip(&line)));
+        // Checked after the line is clipped, so the cap is a cap: a single minified line is not a
+        // way to hand back a megabyte from a tool that promised a quarter of one.
         if out.len() > MAX_READ_BYTES {
-            out.push_str("… truncated; read a narrower range or use Grep\n");
+            cut = true;
             break;
         }
     }
+    if out.is_empty() {
+        return Ok(match last {
+            0 if offset > 1 => format!("(no lines from offset {offset}; the file is shorter)"),
+            _ => "(empty file)".to_string(),
+        });
+    }
+    if cut {
+        // With the offset to continue from: "read less" leaves the model to work out where it got
+        // to, and it is the one thing this function knows for certain.
+        out.push_str(&format!(
+            "… stopped at the size cap; continue with offset={}",
+            last + 1
+        ));
+    }
     Ok(out)
+}
+
+/// One line, bounded. A generated or minified file is one line long, and it is never the line a
+/// node needed in full.
+fn clip(line: &str) -> String {
+    match line.char_indices().nth(MAX_LINE_CHARS) {
+        None => line.to_string(),
+        Some((at, _)) => format!("{}… (line clipped at {MAX_LINE_CHARS} chars)", &line[..at]),
+    }
+}
+
+/// Whether the file looks binary, by the same rule git uses: a NUL byte near the start.
+fn is_binary(path: &Path) -> Result<bool, ToolExecutionError> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| ToolExecutionError::other(format!("cannot read {}: {e}", path.display())))?;
+    let mut head = [0u8; 8192];
+    let n = file
+        .read(&mut head)
+        .map_err(|e| ToolExecutionError::other(format!("cannot read {}: {e}", path.display())))?;
+    Ok(head[..n].contains(&0))
 }
 
 /// One file's lines, read as they are needed.
@@ -846,6 +904,62 @@ mod tests {
         let err = grep(&root, &json!({})).expect_err("refused");
         assert!(err.to_string().contains("`pattern` is required"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_bounds_what_one_pathological_file_can_return() {
+        let root = scratch("read-bounds");
+
+        // One enormous line. Without a per-line clip the byte cap is decorative: the check happens
+        // after a line is appended, so a single minified bundle returns in full.
+        let minified = root.join("bundle.min.js");
+        std::fs::write(&minified, "x".repeat(MAX_READ_BYTES * 2)).unwrap();
+        let out = read(&root, &json!({ "file_path": "bundle.min.js" })).unwrap();
+        assert!(out.len() < MAX_READ_BYTES, "returned {} bytes", out.len());
+        assert!(out.contains("line clipped"), "{out}");
+
+        // A binary file is refused by name rather than failing as a UTF-8 error, which reads as a
+        // broken tool instead of a file nobody should be reading by line.
+        let binary = root.join("logo.png");
+        std::fs::write(&binary, [0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02]).unwrap();
+        let err = read(&root, &json!({ "file_path": "logo.png" }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("binary"), "{err}");
+
+        // A directory says what to use instead. A node that reads one is looking for a listing.
+        let err = read(&root, &json!({ "file_path": "." }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("directory") && err.contains("Glob"), "{err}");
+    }
+
+    #[test]
+    fn read_says_when_there_is_nothing_rather_than_returning_nothing() {
+        // An empty answer is ambiguous — unreadable, empty, or past the end all look identical —
+        // and a model that cannot tell which will read it again.
+        let root = scratch("read-empty");
+        std::fs::write(root.join("empty.rs"), "").unwrap();
+        assert!(
+            read(&root, &json!({ "file_path": "empty.rs" }))
+                .unwrap()
+                .contains("empty file")
+        );
+
+        std::fs::write(root.join("short.rs"), "one\ntwo\n").unwrap();
+        let past = read(&root, &json!({ "file_path": "short.rs", "offset": 99 })).unwrap();
+        assert!(past.contains("shorter"), "{past}");
+    }
+
+    #[test]
+    fn a_truncated_read_says_where_to_continue_from() {
+        // "read less" leaves the model to work out where it got to; the offset is the one thing
+        // this function knows for certain.
+        let root = scratch("read-continue");
+        let line = format!("{}\n", "y".repeat(500));
+        std::fs::write(root.join("big.rs"), line.repeat(2000)).unwrap();
+        let out = read(&root, &json!({ "file_path": "big.rs" })).unwrap();
+        assert!(out.contains("continue with offset="), "{out}");
     }
 
     fn scratch(case: &str) -> PathBuf {

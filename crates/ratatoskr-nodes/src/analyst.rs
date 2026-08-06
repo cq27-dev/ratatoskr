@@ -173,6 +173,8 @@ impl Node for AnalystNode {
             observer: self.plugins.observer.clone(),
             skills: crate::skills::loaded(&self.plugins.skills),
             files: self.files.clone(),
+            // Reads and edits, but runs nothing.
+            shell: None,
             ledger: self.ledger.clone(),
             produces: Some(
                 "an impact summary, the symbols and paths touched, risks, the concrete requirements the implementation must satisfy, and the acceptance steps that prove it done",

@@ -57,7 +57,7 @@ pub struct WorkflowContext {
     /// Set by `implement`, read by `iterate` and cleanup. The script never sees a raw path.
     worktree: Mutex<Option<WorktreePath>>,
     implement_started: AtomicBool,
-    /// Serializes `iterate` calls — two concurrent ACP sessions on one worktree would corrupt it.
+    /// Serializes `iterate` calls — two implementers editing one worktree would corrupt it.
     iterate_lock: tokio::sync::Mutex<()>,
     invocations: AtomicUsize,
     iterations: AtomicU32,
@@ -442,8 +442,17 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
-fn build_implementer(ctx: &WorkflowContext, analyst: AnalystOutput) -> ImplementerNode {
-    ImplementerNode {
+fn build_implementer(
+    ctx: &WorkflowContext,
+    analyst: AnalystOutput,
+) -> Result<ImplementerNode, PlanError> {
+    let (cfg, plugins) = crate::build_implementer_agent(
+        &ctx.engine,
+        &ctx.config,
+        &ctx.plugin_context,
+        ctx.rag_rat.clone(),
+    )?;
+    Ok(ImplementerNode {
         acceptance: ctx.acceptance(&analyst.acceptance),
         characterizer: crate::build_characterizer(
             &ctx.engine,
@@ -457,11 +466,17 @@ fn build_implementer(ctx: &WorkflowContext, analyst: AnalystOutput) -> Implement
         repo_path: ctx.repo_path.clone(),
         worktree_root: ctx.config.worktree.root.clone(),
         sandbox: ctx.config.sandbox.clone(),
-        implementer: ctx.config.implementer.clone(),
+        route: cfg.route,
+        tools: cfg.tools,
+        policy: cfg.policy,
+        max_turns: cfg.max_turns,
+        system_prompt: cfg.system_prompt,
+        plugins,
+        ledger: Some(Arc::clone(&ctx.ledger)),
         run_id: ctx.run_id.clone(),
         issue: ctx.issue.clone(),
         analyst,
-    }
+    })
 }
 
 #[derive(Deserialize)]
@@ -477,7 +492,7 @@ async fn implement_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String
     }
     let input: ImplementArg =
         serde_json::from_str(&arg).map_err(|e| format!("implement arg: {e}"))?;
-    let node = build_implementer(&ctx, input.analyst);
+    let node = build_implementer(&ctx, input.analyst).map_err(|e| e.to_string())?;
     let (worktree, out) = node.run().await.map_err(|e| e.to_string())?;
     *ctx.worktree.lock().unwrap() = Some(worktree);
     note(&ctx, "implementer", &out, Some(arg)).await?;
@@ -487,7 +502,7 @@ async fn implement_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String
 async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String, String> {
     ctx.guard()?;
     // One iterate at a time — reject overlapping calls (e.g. `Promise.all([iterate(), iterate()])`)
-    // that would drive two ACP sessions against the same worktree. Held for the whole call.
+    // that would drive two implementers against the same worktree. Held for the whole call.
     let _iterate = ctx
         .iterate_lock
         .try_lock()
@@ -541,7 +556,7 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String,
     let analyst: AnalystOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "analyst")
         .await
         .map_err(|e| e.to_string())?;
-    let node = build_implementer(&ctx, analyst);
+    let node = build_implementer(&ctx, analyst).map_err(|e| e.to_string())?;
     let out = node
         .iterate(&worktree, &diagnostic)
         .await
