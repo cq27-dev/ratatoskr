@@ -80,28 +80,36 @@ pub trait Clarifier: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>;
 }
 
-/// Runs a node's tool calls past the hooks its plugins register (implemented in
-/// `ratatoskr-nodes`, which is where a node's plugin bindings are known).
+/// What a node's run reports to the plugins bound to it (implemented in `ratatoskr-nodes`, which
+/// is where a node's plugin bindings are known).
 ///
-/// Both sides answer with context for the model and nothing else: whether a call proceeds is a
-/// ruleset's `onToolCall` decision, not a plugin's. Neither may fail — a hook that breaks
-/// contributes no text and the call is unaffected.
-pub trait ToolObserver: Send + Sync {
-    /// Before the call, having seen its arguments.
-    fn before<'a>(
-        &'a self,
-        tool: &'a str,
-        args: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
+/// Every one of these answers with context for the model and nothing else: whether a call proceeds
+/// is a ruleset's `onToolCall` decision, not a plugin's. None may fail — a hook that breaks
+/// contributes no text and the node is unaffected.
+pub trait PluginHooks: Send + Sync {
+    /// The node is starting. Its context opens the node's conversation.
+    fn starting<'a>(&'a self, node: &'a str) -> Answer<'a>;
+
+    /// The node is about to be prompted. Its context rides alongside the prompt.
+    fn prompting<'a>(&'a self, prompt: &'a str) -> Answer<'a>;
+
+    /// Before a tool call, having seen its arguments.
+    fn before<'a>(&'a self, tool: &'a str, args: &'a str) -> Answer<'a>;
 
     /// After it, having seen what the tool answered.
-    fn after<'a>(
-        &'a self,
-        tool: &'a str,
-        args: &'a str,
-        result: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
+    fn after<'a>(&'a self, tool: &'a str, args: &'a str, result: &'a str) -> Answer<'a>;
+
+    /// The node has finished — with the last thing it said, or with why it could not.
+    ///
+    /// Fired on both paths, because a plugin that opened something at `starting` has to be told
+    /// the node is over however it ended. Nothing is injected: the node's answer is already made,
+    /// and its next reader is a schema. A hook here runs for what it *does* — recording,
+    /// notifying, syncing — and any context it returns is reported as unused rather than dropped.
+    fn finished<'a>(&'a self, node: &'a str, outcome: Result<&'a str, &'a str>) -> Answer<'a>;
 }
+
+/// What a plugin hook contributes, once it has run.
+pub type Answer<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
 
 /// Errors running an agent turn.
 #[derive(Debug, thiserror::Error)]
@@ -291,6 +299,14 @@ fn bind_tools<M: CompletionModel + 'static>(
         };
     }
     bound.build()
+}
+
+/// Text with a plugin's contribution ahead of it, labelled for what it is.
+fn prefixed(text: &str, context: Option<String>) -> String {
+    match context {
+        Some(context) => format!("{PLUGIN_NOTE}\n{context}\n\n{text}"),
+        None => text.to_string(),
+    }
 }
 
 /// Bind a tool this host answers itself: a built-in file tool, or — for the synthetic ones a hook
@@ -603,7 +619,7 @@ struct PendingContext(std::collections::HashMap<String, Option<String>>);
 /// presentation is left exactly as it was and the note is added beside it, so structured output
 /// stays structured.
 struct PluginHook {
-    observer: Arc<dyn ToolObserver>,
+    observer: Arc<dyn PluginHooks>,
 }
 
 /// How a plugin's aside is labelled in the tool result.
@@ -677,8 +693,8 @@ pub struct NodeRun<'a> {
     pub max_turns: Option<usize>,
     /// Who answers this node's `ask` calls; `None` opts the node out of asking.
     pub clarifier: Option<Arc<dyn Clarifier>>,
-    /// The node's plugins, run around each tool call; `None` when it binds none that hook one.
-    pub observer: Option<Arc<dyn ToolObserver>>,
+    /// The node's plugins; `None` when it binds none that hook anything it does.
+    pub observer: Option<Arc<dyn PluginHooks>>,
     /// Skills the node may load, answered in-conversation by the synthetic `Skill` tool.
     pub skills: Vec<Skill>,
     /// The repository the node's built-in file tools read within; `None` when it has none.
@@ -726,8 +742,18 @@ where
         files,
         ..
     } = run;
+    // `SubagentStart` opens the node's conversation, `UserPromptSubmit` rides with the prompt —
+    // where each lands in the format, and a cleaner place for a plugin to speak than a tool result.
+    let (preamble, question) = match &observer {
+        Some(hooks) => (
+            prefixed(preamble, hooks.starting(node).await),
+            prefixed(question, hooks.prompting(question).await),
+        ),
+        None => (preamble.to_string(), question.to_string()),
+    };
+
     let mut builder = AgentBuilder::new(model)
-        .preamble(preamble)
+        .preamble(&preamble)
         .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
         .output_schema_raw(output_schema)
         // Force the synthetic output-tool: Auto can resolve to native structured output, which
@@ -756,7 +782,7 @@ where
     // Last, so plugins observe the calls that actually run: a hook that skips a call — the
     // clarifier answering an `ask`, the ruleset denying a tool — short-circuits the rest of the
     // chain, and a plugin has nothing to say about a call that never happened.
-    if let Some(observer) = observer {
+    if let Some(observer) = observer.clone() {
         builder = builder.add_hook(PluginHook { observer });
     }
     let agent = bind_tools(builder, &tools, files.as_deref());
@@ -764,10 +790,29 @@ where
     // Tag every log line for this run — the hook's tool-call/text lines and rig-agent's own turn
     // logs — with the node name, so a run's agents are distinguishable in the logs. `prompt()` is
     // IntoFuture (not Future), so instrument the awaiting block rather than the request.
-    async move { agent.prompt(question).await }
+    let answer = async move { agent.prompt(&question).await }
         .instrument(tracing::info_span!("agent", node))
         .await
-        .map_err(|e| AgentError::Prompt(e.to_string()))
+        .map_err(|e| AgentError::Prompt(e.to_string()));
+
+    // The node is over either way. A plugin told it was starting has to be told it stopped, or a
+    // pairing it opened there is never closed.
+    if let Some(hooks) = &observer {
+        let failure = answer.as_ref().err().map(ToString::to_string);
+        let outcome = match (&answer, &failure) {
+            (Ok(answer), _) => Ok(answer.as_str()),
+            (_, Some(failure)) => Err(failure.as_str()),
+            (Err(_), None) => Err(""),
+        };
+        if let Some(unused) = hooks.finished(node, outcome).await {
+            tracing::info!(
+                node,
+                chars = unused.len(),
+                "a hook answered after the node finished; its context has nowhere to go"
+            );
+        }
+    }
+    answer
 }
 
 #[cfg(test)]

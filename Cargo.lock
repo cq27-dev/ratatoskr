@@ -5462,6 +5462,7 @@ dependencies = [
 name = "ratatoskr-plugin"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "ratatoskr-core",
  "regex",
  "serde",

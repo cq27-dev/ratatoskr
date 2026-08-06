@@ -103,7 +103,18 @@ pub async fn run_plan(
     let context =
         PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
             .await?;
-    plan_half(client, config, store, run_id, issue, engine, &context).await
+    let outcome = plan_half(client, config, store, run_id, issue, engine, &context).await;
+    // Closed by whoever owns the run's lifetime: a `plan` ends here, a `run` carries on.
+    context.session_end(status_of(&outcome)).await;
+    outcome
+}
+
+/// The status a finished plan reports, which is also the reason its session ended.
+fn status_of(outcome: &Result<PlanOutcome, PlanError>) -> &'static str {
+    match outcome.is_ok() {
+        true => RunStatus::Planned.as_str(),
+        false => RunStatus::Failed.as_str(),
+    }
 }
 
 /// The planning half, against an already-resolved plugin context. `run_full` resolves it once and
@@ -153,7 +164,6 @@ async fn plan_half(
     if let Err(e) = store.upsert_run(run_id, None, final_status.as_str()).await {
         tracing::warn!("failed to record final run status: {e}");
     }
-
     outcome
 }
 
@@ -373,7 +383,7 @@ pub struct NodePlugins {
     pub context: Option<String>,
     /// Runs the node's tool calls past its plugins' `PreToolUse`/`PostToolUse` hooks. `None` when
     /// nothing it binds registers one, so a node that gains nothing pays nothing.
-    pub observer: Option<Arc<dyn ratatoskr_agent::ToolObserver>>,
+    pub observer: Option<Arc<dyn ratatoskr_agent::PluginHooks>>,
     /// Skills the plugins it binds ship, in binding order.
     pub skills: Vec<ratatoskr_plugin::Skill>,
 }
@@ -390,38 +400,29 @@ struct NodeObserver {
 }
 
 impl NodeObserver {
-    fn run<'a>(
-        &'a self,
-        event: &'a str,
-        tool: &'a str,
-        args: &'a str,
-        response: Option<&'a str>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
-        Box::pin(async move {
-            ratatoskr_plugin::tool_hooks(
-                &self.plugins,
-                ratatoskr_plugin::ToolEvent {
-                    event,
-                    tool,
-                    input: args,
-                    response,
-                },
-                &self.cwd,
-                &self.limits,
-                &self.hook_time,
-            )
-            .await
-        })
+    /// Run one event past this node's plugins.
+    fn run<'a>(&'a self, event: ratatoskr_plugin::HookEvent<'a>) -> ratatoskr_agent::Answer<'a> {
+        Box::pin(ratatoskr_plugin::run_event(
+            &self.plugins,
+            event,
+            &self.cwd,
+            &self.limits,
+            &self.hook_time,
+        ))
     }
 }
 
-impl ratatoskr_agent::ToolObserver for NodeObserver {
-    fn before<'a>(
-        &'a self,
-        tool: &'a str,
-        args: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
-        self.run("PreToolUse", tool, args, None)
+impl ratatoskr_agent::PluginHooks for NodeObserver {
+    fn starting<'a>(&'a self, node: &'a str) -> ratatoskr_agent::Answer<'a> {
+        self.run(ratatoskr_plugin::HookEvent::subagent_start(node))
+    }
+
+    fn prompting<'a>(&'a self, prompt: &'a str) -> ratatoskr_agent::Answer<'a> {
+        self.run(ratatoskr_plugin::HookEvent::user_prompt_submit(prompt))
+    }
+
+    fn before<'a>(&'a self, tool: &'a str, args: &'a str) -> ratatoskr_agent::Answer<'a> {
+        self.run(ratatoskr_plugin::HookEvent::pre_tool_use(tool, args))
     }
 
     fn after<'a>(
@@ -429,14 +430,50 @@ impl ratatoskr_agent::ToolObserver for NodeObserver {
         tool: &'a str,
         args: &'a str,
         result: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
-        self.run("PostToolUse", tool, args, Some(result))
+    ) -> ratatoskr_agent::Answer<'a> {
+        self.run(ratatoskr_plugin::HookEvent::post_tool_use(
+            tool, args, result,
+        ))
+    }
+
+    fn finished<'a>(
+        &'a self,
+        node: &'a str,
+        outcome: Result<&'a str, &'a str>,
+    ) -> ratatoskr_agent::Answer<'a> {
+        Box::pin(async move {
+            // Both, because the format has both and a plugin may register either: a node is the
+            // subagent that stopped, and the turn that ended. A turn that failed ended as
+            // `StopFailure`, which is what that event is for — `Stop` keeps meaning a turn that
+            // produced an answer. `SubagentStop` fires either way: the subagent is over.
+            let ended = match outcome {
+                Ok(last) => ratatoskr_plugin::HookEvent::stop(node, last),
+                Err(error) => ratatoskr_plugin::HookEvent::stop_failure(node, error),
+            };
+            let last = outcome.unwrap_or_else(|error| error);
+            let stop = self.run(ended).await;
+            let subagent = self
+                .run(ratatoskr_plugin::HookEvent::subagent_stop(node, last))
+                .await;
+            match [stop, subagent].into_iter().flatten().collect::<Vec<_>>() {
+                parts if parts.is_empty() => None,
+                parts => Some(parts.join("\n\n")),
+            }
+        })
     }
 }
 
-/// The hook events that fire around a node's tool calls. Every other event a plugin registers is
-/// for a host with a different lifecycle and is not ours to run.
-const TOOL_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUse"];
+/// The events a run actually has. Every other event a plugin registers describes a session with a
+/// person in it, or a lifecycle this host does not have, and is not ours to fire.
+const NODE_EVENTS: [&str; 7] = [
+    "SubagentStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+    "StopFailure",
+    "SubagentStop",
+];
 
 /// One connected server, and the plugin that declared it — which is what a node binds, not the
 /// server's own name, and what the format names its tools after.
@@ -512,6 +549,29 @@ impl PluginContext {
         })
     }
 
+    /// Tell every plugin the run is over, and why.
+    ///
+    /// Run-level rather than per node, like `SessionStart`: a plugin that keeps state across a
+    /// session closes it once, not once per node. Nothing is injected — there is no conversation
+    /// left to inject into — so this runs for what a hook *does*.
+    pub async fn session_end(&self, reason: &str) {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if let Some(unused) = ratatoskr_plugin::run_event(
+            &self.plugins,
+            ratatoskr_plugin::HookEvent::session_end(reason),
+            &cwd,
+            &self.limits,
+            &self.hook_time,
+        )
+        .await
+        {
+            tracing::info!(
+                chars = unused.len(),
+                "a hook answered at the end of the run; its context has nowhere to go"
+            );
+        }
+    }
+
     /// What the plugins `node` binds give it: their session context, and a hook runner when any of
     /// them registers one for a tool call.
     pub fn for_node(&self, node: &str) -> NodePlugins {
@@ -523,7 +583,7 @@ impl PluginContext {
             .filter(|p| {
                 p.hooks
                     .iter()
-                    .any(|h| TOOL_EVENTS.contains(&h.event.as_str()))
+                    .any(|h| NODE_EVENTS.contains(&h.event.as_str()))
             })
             .cloned()
             .collect();
@@ -543,7 +603,7 @@ impl PluginContext {
                     cwd: std::env::current_dir().unwrap_or_default(),
                     hook_time: Arc::clone(&self.hook_time),
                     limits: self.limits.clone(),
-                }) as Arc<dyn ratatoskr_agent::ToolObserver>
+                }) as Arc<dyn ratatoskr_agent::PluginHooks>
             }),
         }
     }
@@ -800,7 +860,13 @@ pub async fn run_full(
     let plan_context =
         PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
             .await?;
-    let plan = plan_half(client, config, store, run_id, issue, engine, &plan_context).await?;
+    let plan = match plan_half(client, config, store, run_id, issue, engine, &plan_context).await {
+        Ok(plan) => plan,
+        Err(e) => {
+            plan_context.session_end(RunStatus::Failed.as_str()).await;
+            return Err(e);
+        }
+    };
     // `plan.state.clarifications` already holds the plan-half asks; the fork/bookkeep half gets its
     // own clarifier, drained and appended at the end.
     let mut state = plan.state.clone();
@@ -840,6 +906,7 @@ pub async fn run_full(
     if let Err(e) = store.upsert_run(run_id, None, status.as_str()).await {
         tracing::warn!("failed to record final run status: {e}");
     }
+    plan_context.session_end(status.as_str()).await;
 
     let (red_team, implementer, worktree, status, iterations) = result?;
     state.red_team = Some(serde_json::to_value(&red_team)?);

@@ -514,37 +514,17 @@ pub async fn session_start(
 ) -> BTreeMap<String, String> {
     let mut contexts = BTreeMap::new();
 
+    // Per plugin, because nodes bind different sets and each composes from this map. Run through
+    // the same path as every other event, so `SessionStart`'s matcher — which is read against the
+    // *source*, not a tool name — is applied the same way.
     for plugin in plugins {
-        let mut parts: Vec<String> = Vec::new();
-        for hook in plugin
-            .hooks
-            .iter()
-            // `SessionStart`'s matcher is written against the *source*, not a tool name — a hook
-            // scoped to `resume` or `compact` describes a session this host never has.
-            .filter(|h| h.event == "SessionStart" && h.matches(SESSION_SOURCE))
-        {
-            let payload = serde_json::json!({
-                "session_id": "",
-                "cwd": cwd.display().to_string(),
-                "hook_event_name": "SessionStart",
-                "source": SESSION_SOURCE,
-            });
-            let Some(text) = run_hook(plugin, hook, hook.timeout(limits), &payload, cwd).await
-            else {
-                continue;
-            };
-            let text = text.trim();
-            if !text.is_empty() {
-                parts.push(text.to_string());
-            }
-        }
-        if parts.is_empty() {
+        let one = std::slice::from_ref(plugin);
+        let Some(text) = session_output(one, cwd, limits).await else {
             continue;
-        }
+        };
         // Whole plugins in or out, decided here rather than at composition: half a digest is
         // worse than none of one, and refusing it now means nothing over the budget is held
         // resident for the run.
-        let text = parts.join("\n\n");
         if text.len() > limits.output_budget {
             tracing::warn!(
                 plugin = plugin.name,
@@ -558,15 +538,155 @@ pub async fn session_start(
     contexts
 }
 
-/// One tool call, as the plugins around it see it.
-pub struct ToolEvent<'a> {
-    /// `PreToolUse` before the call, `PostToolUse` after it.
-    pub event: &'a str,
-    pub tool: &'a str,
-    /// The call's JSON arguments.
-    pub input: &'a str,
-    /// What the tool answered — `PostToolUse` only.
-    pub response: Option<&'a str>,
+/// One plugin's `SessionStart` output.
+///
+/// `SessionStart` answers with plain text on stdout — no envelope — so its own reader is used
+/// rather than [`run_event`]'s. Everything else about it is the same.
+async fn session_output(plugins: &[Plugin], cwd: &Path, limits: &HookLimits) -> Option<String> {
+    let plugin = plugins.first()?;
+    let payload = envelope(&HookEvent::session_start(), cwd);
+    let matching: Vec<&Hook> = plugin
+        .hooks
+        .iter()
+        .filter(|h| h.event == "SessionStart" && h.matches(SESSION_SOURCE))
+        .collect();
+
+    let started = std::time::Instant::now();
+    let answers = futures::future::join_all(
+        matching
+            .iter()
+            .map(|hook| run_hook(plugin, hook, hook.timeout(limits), &payload, cwd)),
+    )
+    .await;
+    // Not charged to the tool-hook budget: that bounds what plugins cost a node *per tool call*,
+    // and this runs once for the whole run.
+    let _ = started;
+
+    let parts: Vec<String> = answers
+        .into_iter()
+        .flatten()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// One thing that happened, as the plugins around it see it.
+pub struct HookEvent<'a> {
+    /// The event's name in the format: `PreToolUse`, `Stop`, `SessionEnd`, and so on.
+    pub name: &'a str,
+    /// What a matcher is tested against, which differs per event — a tool name for the tool
+    /// events, the source for `SessionStart`, the node for the subagent pair. Empty for the
+    /// events the format gives no matcher at all.
+    pub subject: &'a str,
+    /// The event's own payload fields, merged into the envelope every event carries.
+    pub fields: serde_json::Value,
+}
+
+impl<'a> HookEvent<'a> {
+    /// Before a tool call.
+    pub fn pre_tool_use(tool: &'a str, input: &str) -> Self {
+        HookEvent {
+            name: "PreToolUse",
+            subject: tool,
+            fields: serde_json::json!({ "tool_name": tool, "tool_input": parsed(input) }),
+        }
+    }
+
+    /// After one, with what the tool answered.
+    pub fn post_tool_use(tool: &'a str, input: &str, response: &str) -> Self {
+        HookEvent {
+            name: "PostToolUse",
+            subject: tool,
+            fields: serde_json::json!({
+                "tool_name": tool,
+                "tool_input": parsed(input),
+                "tool_response": response,
+            }),
+        }
+    }
+
+    /// A node is about to be prompted. The format gives this event no matcher.
+    pub fn user_prompt_submit(prompt: &str) -> Self {
+        HookEvent {
+            name: "UserPromptSubmit",
+            subject: "",
+            fields: serde_json::json!({ "prompt": prompt }),
+        }
+    }
+
+    /// A node begins.
+    pub fn subagent_start(node: &'a str) -> Self {
+        HookEvent {
+            name: "SubagentStart",
+            subject: node,
+            fields: serde_json::json!({ "agent_type": node }),
+        }
+    }
+
+    /// A node finishes, with the last thing it said.
+    pub fn subagent_stop(node: &'a str, last: &str) -> Self {
+        HookEvent {
+            name: "SubagentStop",
+            subject: node,
+            fields: serde_json::json!({
+                "agent_type": node,
+                "last_assistant_message": last,
+                "stop_hook_active": false,
+            }),
+        }
+    }
+
+    /// A node's turn ends because it failed. The format's own event for the case, and the reason
+    /// `Stop` can keep meaning what it says: a turn that produced an answer.
+    pub fn stop_failure(node: &'a str, error: &str) -> Self {
+        HookEvent {
+            name: "StopFailure",
+            subject: "",
+            fields: serde_json::json!({
+                "agent_type": node,
+                "error": "unknown",
+                "error_details": error,
+                "last_assistant_message": error,
+            }),
+        }
+    }
+
+    /// A node's turn ends.
+    pub fn stop(node: &'a str, last: &str) -> Self {
+        HookEvent {
+            name: "Stop",
+            subject: "",
+            fields: serde_json::json!({
+                "agent_type": node,
+                "last_assistant_message": last,
+                "stop_hook_active": false,
+            }),
+        }
+    }
+
+    /// The run is over, and why.
+    pub fn session_end(reason: &'a str) -> Self {
+        HookEvent {
+            name: "SessionEnd",
+            subject: reason,
+            fields: serde_json::json!({ "reason": reason }),
+        }
+    }
+
+    /// The run has begun.
+    pub fn session_start() -> Self {
+        HookEvent {
+            name: "SessionStart",
+            subject: SESSION_SOURCE,
+            fields: serde_json::json!({ "source": SESSION_SOURCE }),
+        }
+    }
+}
+
+/// A tool call's arguments as JSON, or null when they are not JSON at all.
+fn parsed(input: &str) -> serde_json::Value {
+    serde_json::from_str(input).unwrap_or(serde_json::Value::Null)
 }
 
 /// A tool hook's answer. Only `additionalContext` is read.
@@ -586,18 +706,19 @@ struct SpecificOutput {
     additional_context: Option<String>,
 }
 
-/// Run the hooks `plugins` register for one tool call, and return what they want the model to see.
+/// Run the hooks `plugins` register for `event`, and return what they want the model to see.
 ///
-/// Every matching hook runs; their answers are joined in plugin order and capped at
-/// [`TOOL_CONTEXT_BUDGET`], whole hooks in or out. A hook that fails, times out, or answers with
-/// something that isn't the envelope contributes nothing — this text is an aside on a tool result,
-/// and nothing about it may disturb the call it rode in on.
+/// Every matching hook runs, and they run *together* — the format says so, and a node waiting on
+/// three five-second hooks in turn waits fifteen seconds for no reason. Their answers are joined
+/// in plugin order, which keeps the result the same however the timings fall, and capped at
+/// [`HookLimits::output_budget`] with whole hooks in or out. A hook that fails, times out, or
+/// answers with something that is not the envelope contributes nothing.
 ///
-/// `spent` accumulates the wall-clock these hooks cost; once it passes [`TOOL_HOOK_BUDGET`] this
-/// returns immediately without running anything, for the rest of the run.
-pub async fn tool_hooks(
+/// `spent` accumulates the wall-clock these cost. Once it passes the configured tool-hook budget
+/// this returns immediately without running anything, for the rest of the run.
+pub async fn run_event(
     plugins: &[Plugin],
-    event: ToolEvent<'_>,
+    event: HookEvent<'_>,
     cwd: &Path,
     limits: &HookLimits,
     spent: &AtomicU64,
@@ -607,61 +728,75 @@ pub async fn tool_hooks(
         return None;
     }
     let started = std::time::Instant::now();
-    let mut parts: Vec<String> = Vec::new();
-    let mut used = 0usize;
 
-    for plugin in plugins {
-        for hook in plugin
-            .hooks
-            .iter()
-            .filter(|h| h.event == event.event && h.matches(event.tool))
-        {
-            let mut payload = serde_json::json!({
-                "session_id": "",
-                "cwd": cwd.display().to_string(),
-                "hook_event_name": event.event,
-                "tool_name": event.tool,
-                "tool_input": serde_json::from_str::<serde_json::Value>(event.input)
-                    .unwrap_or(serde_json::Value::Null),
-            });
-            if let Some(response) = event.response {
-                payload["tool_response"] = serde_json::json!(response);
-            }
-
-            let Some(raw) = run_hook(plugin, hook, hook.timeout(limits), &payload, cwd).await
-            else {
-                continue;
-            };
-            let Some(text) = additional_context(&raw, &plugin.name) else {
-                continue;
-            };
-            // Whole hooks in or out: half an aside is worse than none of one.
-            if used + text.len() > limits.output_budget {
-                tracing::debug!(
-                    plugin = plugin.name,
-                    tool = event.tool,
-                    "dropping a tool hook's context: over budget"
-                );
-                continue;
-            }
-            used += text.len();
-            parts.push(text);
-        }
+    let matching: Vec<(&Plugin, &Hook)> = plugins
+        .iter()
+        .flat_map(|plugin| {
+            plugin
+                .hooks
+                .iter()
+                .filter(|h| h.event == event.name && h.matches(event.subject))
+                .map(move |hook| (plugin, hook))
+        })
+        .collect();
+    if matching.is_empty() {
+        return None;
     }
 
-    // Warn exactly on the call that exhausts it, so a run says once that its plugins went quiet.
-    let cost = started.elapsed();
+    let payload = envelope(&event, cwd);
+    let answers = futures::future::join_all(matching.iter().map(|(plugin, hook)| async {
+        let raw = run_hook(plugin, hook, hook.timeout(limits), &payload, cwd).await?;
+        additional_context(&raw, &plugin.name)
+    }))
+    .await;
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for ((plugin, _), text) in matching.iter().zip(answers) {
+        let Some(text) = text else { continue };
+        // Whole hooks in or out: half an aside is worse than none of one.
+        if used + text.len() > limits.output_budget {
+            tracing::debug!(
+                plugin = plugin.name,
+                event = event.name,
+                "dropping a hook's context: over budget"
+            );
+            continue;
+        }
+        used += text.len();
+        parts.push(text);
+    }
+
+    charge(spent, started.elapsed(), budget);
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// The envelope every event carries, plus the event's own fields.
+fn envelope(event: &HookEvent<'_>, cwd: &Path) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "session_id": "",
+        "cwd": cwd.display().to_string(),
+        "hook_event_name": event.name,
+    });
+    if let (Some(payload), Some(fields)) = (payload.as_object_mut(), event.fields.as_object()) {
+        for (key, value) in fields {
+            payload.insert(key.clone(), value.clone());
+        }
+    }
+    payload
+}
+
+/// Charge a batch of hooks to the run's budget, warning on the one that exhausts it.
+fn charge(spent: &AtomicU64, cost: Duration, budget: Option<Duration>) {
     let before = Duration::from_millis(spent.fetch_add(cost.as_millis() as u64, Ordering::Relaxed));
     if let Some(budget) = budget
         && before < budget
         && before + cost >= budget
     {
         tracing::warn!(
-            "plugins have spent their {budget:?} of tool-hook time; \
-             no more tool hooks will run this run"
+            "plugins have spent their {budget:?} of hook time; no more hooks will run this run"
         );
     }
-    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 /// The run's tool-hook time budget, or `None` when it is unlimited.
@@ -1225,15 +1360,10 @@ mod tests {
         let root = tool_plugin("envelope", "^semantic_search$", "PreToolUse", ENVELOPE);
         let plugins = discover(std::slice::from_ref(&root));
         let spent = AtomicU64::new(0);
-        let event = |tool| ToolEvent {
-            event: "PreToolUse",
-            tool,
-            input: r#"{"query":"x"}"#,
-            response: None,
-        };
+        let event = |tool| HookEvent::pre_tool_use(tool, r#"{"query":"x"}"#);
 
         assert_eq!(
-            tool_hooks(
+            run_event(
                 &plugins,
                 event("semantic_search"),
                 Path::new("."),
@@ -1245,7 +1375,7 @@ mod tests {
         );
         // The matcher decides; an unmatched tool runs nothing at all.
         assert_eq!(
-            tool_hooks(
+            run_event(
                 &plugins,
                 event("impact_surface"),
                 Path::new("."),
@@ -1257,12 +1387,9 @@ mod tests {
         );
         // So does the event: a PreToolUse hook has nothing to say after the call.
         assert_eq!(
-            tool_hooks(
+            run_event(
                 &plugins,
-                ToolEvent {
-                    event: "PostToolUse",
-                    ..event("semantic_search")
-                },
+                HookEvent::post_tool_use("semantic_search", r#"{"query":"x"}"#, "answer"),
                 Path::new("."),
                 &limits(),
                 &spent
@@ -1289,14 +1416,9 @@ mod tests {
         let spent = AtomicU64::new(0);
         for root in [&plain, &deny, &quiet] {
             let plugins = discover(std::slice::from_ref(root));
-            let got = tool_hooks(
+            let got = run_event(
                 &plugins,
-                ToolEvent {
-                    event: "PreToolUse",
-                    tool: "Read",
-                    input: "{}",
-                    response: None,
-                },
+                HookEvent::pre_tool_use("Read", "{}"),
                 Path::new("."),
                 &limits(),
                 &spent,
@@ -1318,14 +1440,9 @@ mod tests {
         let spent = AtomicU64::new(0);
 
         let started = std::time::Instant::now();
-        let got = tool_hooks(
+        let got = run_event(
             &plugins,
-            ToolEvent {
-                event: "PostToolUse",
-                tool: "Read",
-                input: "{}",
-                response: Some(&huge),
-            },
+            HookEvent::post_tool_use("Read", "{}", &huge),
             Path::new("."),
             &limits(),
             &spent,
@@ -1341,20 +1458,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_events_hooks_run_together_rather_than_in_turn() {
+        // The format says so, and a node waiting on three one-second hooks in turn waits three
+        // seconds for no reason.
+        let root = plugin_dir(
+            "parallel",
+            r#"{"name": "parallel"}"#,
+            Some(
+                r#"{"hooks": {"PreToolUse": [{"hooks": [
+                    {"type": "command", "command": "sh", "args": ["-c", "sleep 1; exit 0"]},
+                    {"type": "command", "command": "sh", "args": ["-c", "sleep 1; exit 0"]},
+                    {"type": "command", "command": "sh", "args": ["-c", "sleep 1; exit 0"]}
+                ]}]}}"#,
+            ),
+        );
+        let plugins = discover(std::slice::from_ref(&root));
+        let spent = AtomicU64::new(0);
+
+        let started = std::time::Instant::now();
+        let _ = run_event(
+            &plugins,
+            HookEvent::pre_tool_use("Read", "{}"),
+            Path::new("."),
+            &limits(),
+            &spent,
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "three one-second hooks took {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_events_a_run_has_reach_the_hooks_written_for_them() {
+        // Each event's matcher is read against a different subject, and each carries the payload
+        // fields a plugin written for that host inspects.
+        let root = plugin_dir(
+            "lifecycle",
+            r#"{"name": "lifecycle"}"#,
+            Some(
+                r#"{"hooks": {
+                    "UserPromptSubmit": [{"hooks": [{"type": "command",
+                        "command": "sh", "args": ["-c", "cat"]}]}],
+                    "SubagentStop": [{"matcher": "analyst", "hooks": [{"type": "command",
+                        "command": "sh", "args": ["-c", "cat"]}]}]
+                }}"#,
+            ),
+        );
+        let plugins = discover(std::slice::from_ref(&root));
+        let spent = AtomicU64::new(0);
+        // `cat` echoes the payload back, which is not the envelope — so nothing is contributed,
+        // but the payload it saw is what this is checking, via the events that do and don't match.
+        let seen =
+            |event| async { run_event(&plugins, event, Path::new("."), &limits(), &spent).await };
+
+        // A matcher on the subagent pair selects the node.
+        assert!(
+            seen(HookEvent::subagent_stop("analyst", "done"))
+                .await
+                .is_none()
+        );
+        assert!(
+            seen(HookEvent::subagent_stop("scout", "done"))
+                .await
+                .is_none()
+        );
+        // `UserPromptSubmit` has no matcher at all in the format, so it always fires.
+        assert!(
+            seen(HookEvent::user_prompt_submit("do a thing"))
+                .await
+                .is_none()
+        );
+
+        // The payloads themselves: each event carries what a plugin reads.
+        let payload = |e: HookEvent<'_>| envelope(&e, Path::new("."));
+        assert_eq!(payload(HookEvent::user_prompt_submit("hi"))["prompt"], "hi");
+        assert_eq!(
+            payload(HookEvent::subagent_start("scout"))["agent_type"],
+            "scout"
+        );
+        assert_eq!(
+            payload(HookEvent::stop("scout", "the answer"))["last_assistant_message"],
+            "the answer"
+        );
+        assert_eq!(
+            payload(HookEvent::session_end("Converged"))["reason"],
+            "Converged"
+        );
+        assert_eq!(
+            payload(HookEvent::post_tool_use(
+                "Read",
+                r#"{"file_path":"x"}"#,
+                "text"
+            ))["tool_input"]["file_path"],
+            "x"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn a_spent_run_stops_running_tool_hooks() {
         // A per-hook timeout bounds one call; this is what bounds a hundred of them.
         let root = tool_plugin("budget", ".*", "PreToolUse", ENVELOPE);
         let plugins = discover(std::slice::from_ref(&root));
-        let event = || ToolEvent {
-            event: "PreToolUse",
-            tool: "Read",
-            input: "{}",
-            response: None,
-        };
+        let event = || HookEvent::pre_tool_use("Read", "{}");
 
         let spent = AtomicU64::new(0);
         assert!(
-            tool_hooks(&plugins, event(), Path::new("."), &limits(), &spent)
+            run_event(&plugins, event(), Path::new("."), &limits(), &spent)
                 .await
                 .is_some()
         );
@@ -1370,7 +1584,7 @@ mod tests {
         let exhausted =
             AtomicU64::new(Duration::from_secs(budgeted.tool_time_budget_secs).as_millis() as u64);
         assert_eq!(
-            tool_hooks(&plugins, event(), Path::new("."), &budgeted, &exhausted).await,
+            run_event(&plugins, event(), Path::new("."), &budgeted, &exhausted).await,
             None,
             "past its budget a run runs no more tool hooks"
         );
