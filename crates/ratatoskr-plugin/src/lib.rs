@@ -21,6 +21,10 @@ use regex::Regex;
 use serde::Deserialize;
 pub use skill::Skill;
 
+/// What a run reports as its `SessionStart` source, and what a `SessionStart` matcher is tested
+/// against. A run always begins; it is never resumed, cleared, or compacted.
+const SESSION_SOURCE: &str = "startup";
+
 /// Most output read from a single hook before it is cut off and the process killed.
 ///
 /// A hard limit rather than a budget: the *read* has to be bounded, not just the text kept, or a
@@ -53,16 +57,76 @@ pub struct McpServerSpec {
     pub env: BTreeMap<String, String>,
 }
 
+/// What a hook's `matcher` means. Three forms, decided once at load.
+///
+/// Not "always a regex": the format reads a matcher of only letters, digits, `_`, `-`, spaces,
+/// `,` and `|` as an exact name or a `|`/`,`-separated list of them. Treating those as a regex
+/// over-fires — `Write|Edit` would match `NotebookEdit` and `MultiEdit` too.
+#[derive(Debug, Clone)]
+enum Matcher {
+    /// No matcher, the empty string, or `*`.
+    Everything,
+    /// One or more exact names.
+    Exactly(Vec<String>),
+    /// An unanchored regular expression.
+    Pattern(Regex),
+    /// A pattern that would not compile. Matches nothing, so a broken one costs its own hook.
+    Nothing,
+}
+
+impl Matcher {
+    fn parse(matcher: Option<&str>) -> Self {
+        let Some(raw) = matcher.map(str::trim) else {
+            return Matcher::Everything;
+        };
+        if raw.is_empty() || raw == "*" {
+            return Matcher::Everything;
+        }
+        // The "safe" set. Anything outside it makes the whole value a regex.
+        if raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' ' | ',' | '|'))
+        {
+            return Matcher::Exactly(
+                raw.split(['|', ','])
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            );
+        }
+        match Regex::new(raw) {
+            Ok(re) => Matcher::Pattern(re),
+            Err(e) => {
+                tracing::warn!("ignoring hook matcher `{raw}`: {e}");
+                Matcher::Nothing
+            }
+        }
+    }
+
+    fn matches(&self, subject: &str) -> bool {
+        match self {
+            Matcher::Everything => true,
+            Matcher::Exactly(names) => names.iter().any(|n| n == subject),
+            Matcher::Pattern(re) => re.is_match(subject),
+            Matcher::Nothing => false,
+        }
+    }
+}
+
 /// One hook a plugin registers.
 #[derive(Debug, Clone)]
 pub struct Hook {
     pub event: String,
-    /// Regex over the tool name, as written. Unused for `SessionStart`.
+    /// The matcher as written, for logs.
     pub matcher: Option<String>,
-    /// The compiled `matcher`, or `None` when there is none — or when it would not compile, which
-    /// is treated as "matches nothing" so a broken pattern costs its own hook and no other.
-    pattern: Option<Regex>,
+    /// What it means, decided at load because it is evaluated on every tool call.
+    rule: Matcher,
     pub command: String,
+    /// Argument list. When present, `command` is an executable spawned directly, with no shell.
+    pub args: Option<Vec<String>>,
+    /// `bash` or `powershell`; the format defaults to `bash`. Ignored when `args` is set.
+    pub shell: Option<String>,
     /// The hook's own `timeout`, in seconds, when it declares one. Resolved against
     /// [`HookLimits`] at run time rather than at load, so a config change needs no reload.
     pub timeout: Option<u64>,
@@ -75,28 +139,91 @@ impl Hook {
         Duration::from_secs(asked.min(limits.max_timeout_secs))
     }
 
-    /// Whether this hook fires for `tool`. A hook with no matcher fires for every tool.
-    pub fn matches(&self, tool: &str) -> bool {
-        match (&self.matcher, &self.pattern) {
-            (None, _) => true,
-            (Some(_), Some(re)) => re.is_match(tool),
-            (Some(_), None) => false,
-        }
+    /// Whether this hook fires for `subject` — a tool name for the tool events, and the session
+    /// `source` for `SessionStart`, which is what its matcher is written against.
+    pub fn matches(&self, subject: &str) -> bool {
+        self.rule.matches(subject)
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
     name: Option<String>,
+    /// `mcpServers` and `hooks` are both `string | array | object`. Typing either as only the
+    /// object form is not a missing feature — serde fails the whole manifest, `load` returns
+    /// `None`, and the plugin vanishes along with everything else it ships.
     #[serde(default, rename = "mcpServers")]
-    mcp_servers: BTreeMap<String, ServerEntry>,
+    mcp_servers: Option<Source<McpServers>>,
+    #[serde(default)]
+    hooks: Option<Source<HookEvents>>,
 }
 
-/// The `.mcp.json` a plugin may carry instead of (or as well as) a manifest `mcpServers` block.
+/// A component the manifest either points at or spells out — or several of both.
 #[derive(Debug, Deserialize)]
-struct McpFile {
-    #[serde(default, rename = "mcpServers")]
-    mcp_servers: BTreeMap<String, ServerEntry>,
+#[serde(untagged)]
+enum Source<T> {
+    /// A path relative to the plugin root, or a bundle we cannot open.
+    Path(String),
+    Inline(T),
+    Many(Vec<Source<T>>),
+}
+
+impl<T: for<'de> Deserialize<'de>> Source<T> {
+    /// Every inline value this source resolves to, in declaration order — later wins on a
+    /// conflict, which is how the manifest overrides a file the plugin also ships.
+    fn resolve(self, root: &Path, what: &str) -> Vec<T> {
+        match self {
+            Source::Inline(value) => vec![value],
+            Source::Many(sources) => sources
+                .into_iter()
+                .flat_map(|s| s.resolve(root, what))
+                .collect(),
+            Source::Path(path) => {
+                // A bundle is a packaging format, not JSON we can read.
+                if path.ends_with(".mcpb") || path.ends_with(".dxt") {
+                    tracing::warn!("ignoring {what} bundle `{path}`: bundles are not supported");
+                    return Vec::new();
+                }
+                let full = root.join(path.trim_start_matches("./"));
+                let Ok(raw) = std::fs::read_to_string(&full) else {
+                    tracing::warn!("ignoring {what} path `{}`: cannot read it", full.display());
+                    return Vec::new();
+                };
+                match serde_json::from_str::<T>(&raw) {
+                    Ok(value) => vec![value],
+                    Err(e) => {
+                        tracing::warn!("ignoring {what} at {}: {e}", full.display());
+                        Vec::new()
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A server declaration in either spelling: the file shape a `.mcp.json` uses, and the bare map
+/// the manifest's inline form uses.
+///
+/// `Wrapped` requires its key rather than defaulting it — with a default, an inline block would
+/// match it and resolve to nothing, because every field of a `ServerEntry` is optional and so
+/// almost any object parses as a bare map.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum McpServers {
+    Wrapped {
+        #[serde(rename = "mcpServers")]
+        mcp_servers: BTreeMap<String, ServerEntry>,
+    },
+    Bare(BTreeMap<String, ServerEntry>),
+}
+
+impl McpServers {
+    fn into_servers(self) -> BTreeMap<String, ServerEntry> {
+        match self {
+            McpServers::Wrapped { mcp_servers } => mcp_servers,
+            McpServers::Bare(servers) => servers,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,10 +237,28 @@ struct ServerEntry {
     env: BTreeMap<String, String>,
 }
 
+/// A hooks declaration in either spelling: the file shape a `hooks.json` uses, and the bare event
+/// map the manifest's inline form uses. Both occur, so both are read.
 #[derive(Debug, Deserialize)]
-struct HooksFile {
-    #[serde(default)]
-    hooks: BTreeMap<String, Vec<HookGroup>>,
+#[serde(untagged)]
+enum HookEvents {
+    /// `{"hooks": {"PreToolUse": [...]}}` — and any sibling keys, which are ignored. The key is
+    /// required, not defaulted: a default would make a bare event map match this variant and
+    /// resolve to nothing.
+    Wrapped {
+        hooks: BTreeMap<String, Vec<HookGroup>>,
+    },
+    /// `{"PreToolUse": [...]}`
+    Bare(BTreeMap<String, Vec<HookGroup>>),
+}
+
+impl HookEvents {
+    fn into_events(self) -> BTreeMap<String, Vec<HookGroup>> {
+        match self {
+            HookEvents::Wrapped { hooks } => hooks,
+            HookEvents::Bare(events) => events,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +274,10 @@ struct HookEntry {
     #[serde(default, rename = "type")]
     kind: Option<String>,
     command: String,
+    #[serde(default)]
+    args: Option<Vec<String>>,
+    #[serde(default)]
+    shell: Option<String>,
     #[serde(default)]
     timeout: Option<u64>,
 }
@@ -181,7 +330,7 @@ fn load(root: &Path) -> Option<Plugin> {
 
     Some(Plugin {
         name,
-        hooks: read_hooks(root),
+        hooks: read_hooks(root, manifest.hooks),
         mcp_servers: read_mcp_servers(root, manifest.mcp_servers),
         skills: skill::read_skills(root),
         root: root.to_path_buf(),
@@ -193,17 +342,20 @@ fn load(root: &Path) -> Option<Plugin> {
 /// Both spellings are in use, and a plugin commonly carries the same block twice so it works in
 /// hosts that read one or the other. The manifest wins on a shared name so the file cannot
 /// silently redirect a server the manifest already described.
-fn read_mcp_servers(root: &Path, manifest: BTreeMap<String, ServerEntry>) -> Vec<McpServerSpec> {
-    let mut declared = manifest;
+fn read_mcp_servers(root: &Path, manifest: Option<Source<McpServers>>) -> Vec<McpServerSpec> {
+    // `.mcp.json` first, then everything the manifest names, so the manifest wins a shared key.
+    let mut declared: BTreeMap<String, ServerEntry> = BTreeMap::new();
     if let Ok(raw) = std::fs::read_to_string(root.join(".mcp.json")) {
-        match serde_json::from_str::<McpFile>(&raw) {
-            Ok(file) => {
-                for (name, entry) in file.mcp_servers {
-                    declared.entry(name).or_insert(entry);
-                }
-            }
+        match serde_json::from_str::<McpServers>(&raw) {
+            Ok(file) => declared.extend(file.into_servers()),
             Err(e) => tracing::warn!("ignoring .mcp.json for plugin at {}: {e}", root.display()),
         }
+    }
+    for block in manifest
+        .into_iter()
+        .flat_map(|s| s.resolve(root, "mcpServers"))
+    {
+        declared.extend(block.into_servers());
     }
 
     declared
@@ -234,21 +386,27 @@ fn substitute_root(text: &str, root: &Path) -> String {
     text.replace("${CLAUDE_PLUGIN_ROOT}", &root.display().to_string())
 }
 
-/// Hooks are conventional, not declared in the manifest, and a plugin without them is normal.
-fn read_hooks(root: &Path) -> Vec<Hook> {
-    let Ok(raw) = std::fs::read_to_string(root.join("hooks/hooks.json")) else {
-        return Vec::new();
-    };
-    let parsed: HooksFile = match serde_json::from_str(&raw) {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::warn!("ignoring hooks for plugin at {}: {e}", root.display());
-            return Vec::new();
-        }
-    };
+/// The hooks a plugin registers: the conventional `hooks/hooks.json`, plus anything the manifest's
+/// `hooks` key names.
+///
+/// The manifest key *adds* rather than replaces, so a plugin can carry both — and one that carries
+/// only the key (naming a differently-named file) is not silently left with no hooks at all.
+fn read_hooks(root: &Path, manifest: Option<Source<HookEvents>>) -> Vec<Hook> {
+    let mut events: BTreeMap<String, Vec<HookGroup>> = BTreeMap::new();
 
-    parsed
-        .hooks
+    if let Ok(raw) = std::fs::read_to_string(root.join("hooks/hooks.json")) {
+        match serde_json::from_str::<HookEvents>(&raw) {
+            Ok(file) => events.extend(file.into_events()),
+            Err(e) => tracing::warn!("ignoring hooks for plugin at {}: {e}", root.display()),
+        }
+    }
+    for block in manifest.into_iter().flat_map(|s| s.resolve(root, "hooks")) {
+        for (event, groups) in block.into_events() {
+            events.entry(event).or_default().extend(groups);
+        }
+    }
+
+    events
         .into_iter()
         .flat_map(|(event, groups)| {
             groups.into_iter().flat_map(move |group| {
@@ -260,14 +418,12 @@ fn read_hooks(root: &Path) -> Vec<Hook> {
                     }
                     Some(Hook {
                         event: event.clone(),
-                        // Compiled once at load: these are matched on every tool call.
-                        pattern: matcher.as_deref().and_then(|m| {
-                            Regex::new(m)
-                                .inspect_err(|e| tracing::warn!("ignoring hook matcher `{m}`: {e}"))
-                                .ok()
-                        }),
+                        // Decided once at load: matched on every tool call.
+                        rule: Matcher::parse(matcher.as_deref()),
                         matcher: matcher.clone(),
                         command: entry.command,
+                        args: entry.args,
+                        shell: entry.shell,
                         timeout: entry.timeout,
                     })
                 })
@@ -290,13 +446,18 @@ pub async fn session_start(
 
     for plugin in plugins {
         let mut parts: Vec<String> = Vec::new();
-        for hook in plugin.hooks.iter().filter(|h| h.event == "SessionStart") {
+        for hook in plugin
+            .hooks
+            .iter()
+            // `SessionStart`'s matcher is written against the *source*, not a tool name — a hook
+            // scoped to `resume` or `compact` describes a session this host never has.
+            .filter(|h| h.event == "SessionStart" && h.matches(SESSION_SOURCE))
+        {
             let payload = serde_json::json!({
                 "session_id": "",
                 "cwd": cwd.display().to_string(),
                 "hook_event_name": "SessionStart",
-                // Plugins commonly gate on this; a run beginning is a startup.
-                "source": "startup",
+                "source": SESSION_SOURCE,
             });
             let Some(text) = run_hook(plugin, hook, hook.timeout(limits), &payload, cwd).await
             else {
@@ -494,13 +655,38 @@ async fn run_hook(
 ) -> Option<String> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    // Commands are written for a shell — they carry their own quoting.
-    let mut child = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(&hook.command)
-        // Plugins address their own files through this; `sh` expands it from the environment, so
-        // the path is never spliced into the command text.
+    let mut command = match &hook.args {
+        // Exec form: `command` is an executable, spawned directly with no shell and no
+        // tokenization. A shell here would re-split arguments the plugin already separated.
+        Some(args) => {
+            let mut command = tokio::process::Command::new(&hook.command);
+            command.args(args);
+            command
+        }
+        // Shell form: the command carries its own quoting. The format's default shell is `bash`,
+        // and plugins write for it — `sh` is a different language for anything beyond the basics.
+        None => {
+            let shell = hook.shell.as_deref().unwrap_or("bash");
+            let mut command = tokio::process::Command::new(shell);
+            command.arg("-c").arg(&hook.command);
+            command
+        }
+    };
+
+    // A hook inherits this process's environment, which in a run started from a coding CLI already
+    // holds that host's `CLAUDE_*` values — a plugin would then read another host's data directory
+    // as its own. Clear them all and set the three this host actually defines.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("CLAUDE_") {
+            command.env_remove(&key);
+        }
+    }
+    let mut child = command
+        // Plugins address their own files through these; the shell expands them from the
+        // environment, so no path is ever spliced into the command text.
         .env("CLAUDE_PLUGIN_ROOT", &plugin.root)
+        .env("CLAUDE_PROJECT_DIR", cwd)
+        .env("CLAUDE_PLUGIN_DATA", plugin_data_dir(&plugin.name, cwd))
         .current_dir(cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -532,22 +718,60 @@ async fn run_hook(
             if let Some(stdout) = stdout.as_mut() {
                 let _ = stdout.take(MAX_HOOK_OUTPUT).read_to_end(&mut buf).await;
             }
-            buf
+            let capped = buf.len() as u64 >= MAX_HOOK_OUTPUT;
+            (buf, capped)
         };
         tokio::join!(write, read).1
     };
 
-    match tokio::time::timeout(timeout, collect).await {
-        Ok(buf) => {
-            // Reap it, but never wait on it: the output is already in hand.
-            let _ = child.start_kill();
-            Some(String::from_utf8_lossy(&buf).into_owned())
+    let Ok((buf, capped)) = tokio::time::timeout(timeout, collect).await else {
+        tracing::warn!("plugin {} hook timed out after {timeout:?}", plugin.name);
+        return None;
+    };
+    if capped {
+        // Already past any budget its output could have fit, and waiting for a hook that writes
+        // without end to exit would cost the whole timeout for something certain to be dropped.
+        let _ = child.start_kill();
+        tracing::warn!("plugin {} hook wrote without stopping", plugin.name);
+        return None;
+    }
+
+    // Only exit 0 means the output is an answer. The format is explicit that stdout is read only
+    // on success; a hook that failed is telling us so on stderr, and treating what it managed to
+    // print as context is how a broken hook quietly steers a node.
+    match child.wait().await {
+        Ok(status) if status.success() => Some(String::from_utf8_lossy(&buf).into_owned()),
+        Ok(status) => {
+            tracing::warn!("plugin {} hook exited with {status}", plugin.name);
+            None
         }
-        Err(_) => {
-            tracing::warn!("plugin {} hook timed out after {timeout:?}", plugin.name);
+        Err(e) => {
+            tracing::warn!("plugin {} hook could not be waited on: {e}", plugin.name);
             None
         }
     }
+}
+
+/// Where a plugin keeps state that outlives one run.
+///
+/// Deliberately under the project rather than in the coding CLI's own plugin directory: this is a
+/// different host, and a plugin's data here is not that host's to read or ours to overwrite.
+fn plugin_data_dir(plugin: &str, cwd: &Path) -> PathBuf {
+    let safe: String = plugin
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let dir = cwd.join(".ratatoskr/plugin-data").join(safe);
+    // The format's own host creates it on first reference; a hook that appends to a file in it
+    // should not have to make the directory first.
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 #[cfg(test)]
@@ -637,6 +861,180 @@ mod tests {
 
     const ENVELOPE: &str = r#"{"hookSpecificOutput":
         {"hookEventName": "PreToolUse", "additionalContext": "  mind the clones  "}}"#;
+
+    #[test]
+    fn a_component_the_manifest_points_at_is_read_rather_than_losing_the_plugin() {
+        // `mcpServers` and `hooks` are both `string | array | object`. Typed as only the object
+        // form, the path spelling failed the whole manifest and the plugin disappeared with it.
+        let root = plugin_dir(
+            "pointed",
+            r#"{ "name": "pointed",
+                 "mcpServers": ["./one.json", { "inline": { "command": "true" } }],
+                 "hooks": "./extra-hooks.json" }"#,
+            // Also a conventional hooks file: the manifest key adds to it rather than replacing.
+            Some(
+                r#"{"hooks": {"PreToolUse": [{"matcher": "Read",
+                "hooks": [{"type": "command", "command": "conventional"}]}]}}"#,
+            ),
+        );
+        std::fs::write(
+            root.join("one.json"),
+            r#"{"mcpServers": {"from-path": {"command": "npx", "args": ["-y", "x"]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("extra-hooks.json"),
+            r#"{"hooks": {"PostToolUse": [{"hooks": [{"type": "command", "command": "extra"}]}]}}"#,
+        )
+        .unwrap();
+
+        let found = discover(std::slice::from_ref(&root));
+        assert_eq!(found.len(), 1, "the plugin loads at all");
+        assert_eq!(
+            found[0]
+                .mcp_servers
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["from-path", "inline"],
+            "an array mixing a path and an inline block resolves to both"
+        );
+        let commands: Vec<&str> = found[0].hooks.iter().map(|h| h.command.as_str()).collect();
+        assert!(commands.contains(&"conventional") && commands.contains(&"extra"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_safe_matcher_is_an_exact_list_and_not_a_regex() {
+        // The defect this replaces: as an unanchored regex, `Write|Edit` also caught
+        // `NotebookEdit` and `MultiEdit`, so a hook fired on tools it never asked for.
+        let list = Matcher::parse(Some("Write|Edit"));
+        assert!(list.matches("Write") && list.matches("Edit"));
+        assert!(!list.matches("NotebookEdit") && !list.matches("MultiEdit"));
+
+        // Commas separate too, with whitespace around them, and hyphens stay exact.
+        let spaced = Matcher::parse(Some("Edit, Write"));
+        assert!(spaced.matches("Edit") && spaced.matches("Write"));
+        let hyphen = Matcher::parse(Some("code-reviewer"));
+        assert!(hyphen.matches("code-reviewer") && !hyphen.matches("senior-code-reviewer"));
+
+        // One character outside the safe set makes the whole value a regex, still unanchored.
+        let pattern = Matcher::parse(Some("^Notebook"));
+        assert!(pattern.matches("NotebookEdit") && !pattern.matches("Edit"));
+        let unanchored = Matcher::parse(Some("mcp__memory__.*"));
+        assert!(unanchored.matches("mcp__memory__get"));
+
+        // Absent, empty, and `*` all mean everything.
+        for all in [None, Some(""), Some("*")] {
+            assert!(Matcher::parse(all).matches("anything at all"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hook_gets_this_hosts_variables_and_not_the_surrounding_ones() {
+        // A run started from a coding CLI inherits that host's `CLAUDE_*` values. A plugin reading
+        // them would take another host's data directory for its own.
+        unsafe {
+            std::env::set_var("CLAUDE_PLUGIN_DATA", "/somewhere/else/entirely");
+            std::env::set_var("CLAUDE_PROJECT_DIR", "/not/this/project");
+        }
+        // Reported through the exec form, so no shell quoting stands between us and the values.
+        let root = tool_plugin("environment", ".*", "SessionStart", "");
+        std::fs::write(
+            root.join("hooks/hooks.json"),
+            r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command",
+                "command": "sh", "args": ["-c",
+                "echo [$CLAUDE_PROJECT_DIR][$CLAUDE_PLUGIN_DATA]"]}]}]}}"#,
+        )
+        .unwrap();
+
+        let plugins = discover(std::slice::from_ref(&root));
+        let contexts = session_start(&plugins, Path::new("."), &limits()).await;
+        let seen = contexts.get("environment").expect("the hook ran").clone();
+
+        assert!(
+            !seen.contains("/somewhere/else") && !seen.contains("/not/this/project"),
+            "the surrounding host's values did not leak in: {seen}"
+        );
+        assert!(
+            seen.contains("[.]"),
+            "the project directory is this run's: {seen}"
+        );
+        assert!(
+            seen.contains(".ratatoskr/plugin-data/environment"),
+            "the data directory belongs to this host and this plugin: {seen}"
+        );
+        unsafe {
+            std::env::remove_var("CLAUDE_PLUGIN_DATA");
+            std::env::remove_var("CLAUDE_PROJECT_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(".ratatoskr/plugin-data/environment");
+    }
+
+    #[tokio::test]
+    async fn only_a_hook_that_succeeded_is_believed() {
+        // The format reads stdout only on exit 0. A hook that printed and then failed is not
+        // offering context; treating what it managed to print as context is how a broken hook
+        // quietly steers a node.
+        let failed = tool_plugin("exit-nonzero", ".*", "SessionStart", "");
+        std::fs::write(
+            failed.join("hooks/hooks.json"),
+            r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command",
+                "command": "echo half an answer; exit 1"}]}]}}"#,
+        )
+        .unwrap();
+
+        let plugins = discover(std::slice::from_ref(&failed));
+        let contexts = session_start(&plugins, Path::new("."), &limits()).await;
+        assert!(
+            contexts.is_empty(),
+            "what a failing hook printed is not context: {contexts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&failed);
+    }
+
+    #[tokio::test]
+    async fn the_exec_form_does_not_go_through_a_shell() {
+        // With `args`, the command is an executable spawned directly. A shell would re-split
+        // arguments the plugin already separated — here, on the spaces inside one of them.
+        let root = tool_plugin("exec-form", ".*", "SessionStart", "");
+        std::fs::write(
+            root.join("hooks/hooks.json"),
+            r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command",
+                "command": "echo", "args": ["one argument; not two"]}]}]}}"#,
+        )
+        .unwrap();
+
+        let plugins = discover(std::slice::from_ref(&root));
+        let contexts = session_start(&plugins, Path::new("."), &limits()).await;
+        assert_eq!(
+            contexts.get("exec-form").map(String::as_str),
+            Some("one argument; not two")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_session_start_matcher_is_read_against_the_source() {
+        // It matches the session source, not a tool name. A run always starts; it is never
+        // resumed or compacted, so a hook scoped to those describes a session we never have.
+        let ours = tool_plugin("src-startup", "startup|clear", "SessionStart", "");
+        std::fs::write(ours.join("answer"), "for a fresh session").unwrap();
+        let theirs = tool_plugin("src-resume", "resume", "SessionStart", "");
+        std::fs::write(theirs.join("answer"), "should not run").unwrap();
+
+        let plugins = discover(&[ours.clone(), theirs.clone()]);
+        let contexts = session_start(&plugins, Path::new("."), &limits()).await;
+        assert_eq!(
+            contexts.get("src-startup").map(String::as_str),
+            Some("for a fresh session")
+        );
+        assert!(!contexts.contains_key("src-resume"));
+
+        let _ = std::fs::remove_dir_all(&ours);
+        let _ = std::fs::remove_dir_all(&theirs);
+    }
 
     #[test]
     fn a_matcher_selects_tools_and_a_broken_one_selects_none() {
