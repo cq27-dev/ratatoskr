@@ -20,7 +20,11 @@ const PREAMBLE: &str = "You are the analyst in a code-planning pipeline. You are
     Produce: an impact summary, the specific symbols/paths touched, a list of risks (each a short \
     line — lead with the severity if it's clear-cut), a list of concrete requirements the \
     implementation must satisfy, and a residual-risk note capturing what remains uncertain or \
-    unknown after your analysis. You are also the pipeline's fallback answerer: when another node \
+    unknown after your analysis. Also set `changes_code`: true when carrying out this plan means \
+    editing code in this repository, false when it does not — research, a review, an architecture \
+    answer, or expanding an issue's description all produce no code change. Judge the task you \
+    were given, not the breadth of what it touches: a question about eight files is still a \
+    question. You are also the pipeline's fallback answerer: when another node \
     cannot resolve something on its own, its question routes to you, so hold clear, present-tense \
     judgments about the change that you can share when asked.";
 
@@ -49,6 +53,24 @@ pub struct AnalystOutput {
     /// What remains uncertain after analysis — drives Phase 5's clarification edge later.
     #[serde(default)]
     pub residual_risk: String,
+    /// Whether carrying out this plan means editing code in this repository.
+    ///
+    /// The one signal that decides whether the fork runs at all. A plain bool on purpose: the
+    /// structured `{description, severity}` risk on this same type had to be reverted because the
+    /// model wrote values that failed schema validation, and a flag has no such failure mode.
+    ///
+    /// Defaults to `true` when the model omits it, so a missing field costs a fork rather than
+    /// silently skipping the work. Note that `touched` is NOT this signal — it lists what the
+    /// eventual change would touch, which a research task has plenty of.
+    #[serde(default = "changes_code_by_default")]
+    pub changes_code: bool,
+}
+
+/// A plan is assumed to involve a code change unless the analyst says otherwise. The failure this
+/// guards is asymmetric: wrongly running the fork wastes a sandboxed test run, wrongly skipping it
+/// drops the work the run was asked to do.
+fn changes_code_by_default() -> bool {
+    true
 }
 
 /// The analyst node: a stronger agent restricted to impact/lookup tools.
@@ -170,5 +192,27 @@ mod tests {
             parse_validated::<AnalystOutput>(raw),
             Err(NodeError::InvalidOutput(_))
         ));
+    }
+
+    #[test]
+    fn an_omitted_changes_code_costs_a_fork_rather_than_skipping_the_work() {
+        // The failure is asymmetric: wrongly forking wastes a sandboxed test run, wrongly skipping
+        // drops the work the run was asked to do. A model that never learns the field must land on
+        // the wasteful side.
+        let raw = r#"{"impact_summary":"x"}"#;
+        let out = parse_validated::<AnalystOutput>(raw).unwrap();
+        assert!(out.changes_code);
+    }
+
+    #[test]
+    fn a_research_task_can_say_it_changes_no_code() {
+        let raw = r#"{"impact_summary":"answer the question","changes_code":false,
+                      "touched":["a.rs","b.rs"]}"#;
+        let out = parse_validated::<AnalystOutput>(raw).unwrap();
+        assert!(!out.changes_code);
+        // `touched` is a relevance list, not a work order — a question about two files is still a
+        // question, and reading it as a signal that code changes is how the fork ran on a run that
+        // produced an empty diff.
+        assert_eq!(out.touched.len(), 2);
     }
 }

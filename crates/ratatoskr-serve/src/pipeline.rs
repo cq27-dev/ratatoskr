@@ -50,10 +50,21 @@ pub struct NodeView {
 /// Statuses that mean the run is no longer executing. Note `planned` belongs here only because
 /// `run_full` now records `running` for its fork+converge phase — otherwise a full run in flight
 /// would be indistinguishable from a finished `plan`.
+///
+/// This matches `RunStatus`'s persisted strings, so the compiler cannot flag a new variant that
+/// belongs here — and one missing from the list leaves a finished run showing as still executing,
+/// forever. `every_run_status_is_classified` is what actually catches that.
 fn is_terminal(status: Option<&str>) -> bool {
     matches!(
         status,
-        Some("planned" | "converged" | "max_iterations_reached" | "failed" | "abandoned")
+        Some(
+            "planned"
+                | "converged"
+                | "max_iterations_reached"
+                | "no_code_change"
+                | "failed"
+                | "abandoned"
+        )
     )
 }
 
@@ -292,5 +303,34 @@ mod tests {
         assert!(!views.iter().any(|v| v.name == ISSUE_NODE));
         // ...and it doesn't advance the pipeline: scout is still the working node.
         assert_eq!(state_of(&views, "scout"), NodeState::Working);
+    }
+
+    #[test]
+    fn every_run_status_is_classified() {
+        use strum::IntoEnumIterator as _;
+
+        // `is_terminal` matches on the persisted strings, so the compiler cannot flag a new
+        // `RunStatus` variant that belongs in the list. A status missing from both sets leaves a
+        // finished run showing as executing forever, which is why every variant must be named here
+        // deliberately rather than falling through to a default.
+        let in_flight = ["pending", "running", "awaiting_clarification"];
+        for status in ratatoskr_core::RunStatus::iter() {
+            let s = status.as_str();
+            assert_ne!(
+                is_terminal(Some(s)),
+                in_flight.contains(&s),
+                "`{s}` is either terminal or in flight — classify it in one and only one"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_that_needed_no_code_change_is_finished() {
+        // The fork never ran, so there is no implementer checkpoint. That must read as "done",
+        // not as "still working on the fork".
+        assert!(is_terminal(Some("no_code_change")));
+        let views = derive(Some("no_code_change"), &[cp("analyst", "t")]);
+        assert_ne!(state_of(&views, "analyst"), NodeState::Working);
+        assert_ne!(state_of(&views, "implementer"), NodeState::Working);
     }
 }

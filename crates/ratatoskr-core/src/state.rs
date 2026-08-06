@@ -23,6 +23,7 @@ use serde_json::Value;
     strum::IntoStaticStr,
     strum::Display,
     strum::EnumString,
+    strum::EnumIter,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -38,6 +39,13 @@ pub enum RunStatus {
     /// Converge ran out of its `max_iterations` budget with a legible residual failure set —
     /// distinct from `Failed` (an error): the loop worked, it just didn't finish in budget.
     MaxIterationsReached,
+    /// The analyst judged that carrying out the plan means changing no code in this repository —
+    /// research, a review, an architecture answer — so the fork never ran.
+    ///
+    /// Its own status rather than `Converged`: that one means "the implementer's change held up
+    /// against the baseline", and reporting it for a run that produced no change describes a
+    /// success nobody had. Terminal and not a failure; the run's artifact is its plan.
+    NoCodeChange,
     Failed,
     Abandoned,
 }

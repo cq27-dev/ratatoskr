@@ -19,6 +19,10 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Only so `every_run_status_is_classified` can enumerate the real variants: `is_terminal` matches
+# on strings, so without this a new status silently reads as still-executing.
+ratatoskr-core.workspace = true
+strum = { workspace = true, features = ["derive"] }
 
 [lints]
 workspace = true

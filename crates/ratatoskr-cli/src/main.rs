@@ -582,7 +582,16 @@ fn print_run_summary(run_id: &str, outcome: &ratatoskr_nodes::RunOutcome) {
         outcome.status, outcome.iterations
     );
 
-    let rt = &outcome.red_team;
+    // The fork does not run when the analyst judged the task to call for no code change. The plan
+    // above is the whole result, and reporting an empty baseline against an empty diff would read
+    // as a change that passed rather than as work that was never asked for.
+    let (Some(rt), Some(im)) = (&outcome.red_team, &outcome.implementer) else {
+        println!(
+            "\nNO CODE CHANGE: the analyst judged this task to need none, so the fork did not run."
+        );
+        return;
+    };
+
     println!(
         "\nBASELINE (red-team): {} failing, {} passing",
         rt.failing_tests.len(),
@@ -597,7 +606,6 @@ fn print_run_summary(run_id: &str, outcome: &ratatoskr_nodes::RunOutcome) {
         println!("  [{}] {}{}", c.category, c.test, reason);
     }
 
-    let im = &outcome.implementer;
     println!(
         "AFTER CHANGE: {} failing, {} passing",
         im.failing_tests.len(),
