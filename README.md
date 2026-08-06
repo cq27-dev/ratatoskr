@@ -52,6 +52,9 @@ defineWorkflow({
 async function plan(input) { /* compose the node bindings */ }
 ```
 
+A workflow that introduces a node of its own lists it in `nodes`, so `.ratatoskr/rules/<node>.ts`
+is accepted rather than rejected as targeting something that does not exist.
+
 With one defined it is used; with several, name one with `--workflow <name>` — picking for you is
 the overseer's job, and choosing the alphabetically-first would look like a decision while being an
 accident. With none, the built-in flow above runs. A single `.ratatoskr/workflow.ts` still works and

@@ -772,28 +772,23 @@ async fn workflows() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The nodes a ruleset may govern — the LLM agents that go through `run_structured`. `memory` and
-/// `implementer` don't (no model/tool set to override), so targeting them is a config error.
-const RULESET_NODES: &[&str] = &[
-    "scout",
-    "analyst",
-    "bookkeeper",
-    "redteam",
-    "verifier",
-    "characterizer",
-];
-
 /// Load the `.ratatoskr/rules/*.ts` agent rulesets (empty engine if the dir is absent), rejecting
-/// any `defineAgent(name)` that isn't a governable node.
+/// any `defineAgent(name)` that no workflow governs.
+///
+/// The allowed set is the built-in nodes plus what every defined workflow declares — the union,
+/// because rulesets load before a workflow is selected. Validating here rather than at first use
+/// keeps a typo an error at startup instead of a node that silently ignores its ruleset.
 async fn load_rules() -> anyhow::Result<std::sync::Arc<ratatoskr_script::ScriptEngine>> {
     let engine = ratatoskr_script::ScriptEngine::load(Path::new(".ratatoskr/rules"))
         .await
         .context("loading .ratatoskr/rules")?;
+    let governable = ratatoskr_nodes::governable_nodes().await?;
     for name in engine.declared_agents() {
-        if !RULESET_NODES.contains(&name) {
+        if !governable.iter().any(|n| n == name) {
             bail!(
-                "defineAgent(\"{name}\") targets an unknown node; rulesets apply to: {}",
-                RULESET_NODES.join(", ")
+                "defineAgent(\"{name}\") targets a node no workflow governs; rulesets apply to: {}. \
+                 A workflow that introduces a node declares it with defineWorkflow({{ nodes: [...] }}).",
+                governable.join(", ")
             );
         }
     }
