@@ -8,18 +8,48 @@
 use ratatoskr_store::Checkpoint;
 use serde::Serialize;
 
-/// The pipeline in execution order, one entry per stage. The fork is a single stage with two
-/// nodes: `run_full` joins them, so in a built-in run both checkpoints land at the same moment.
-const PIPELINE: &[&[&str]] = &[
-    &["scout"],
-    &["memory"],
-    &["analyst"],
-    &["red_team", "implementer"],
-    // Optional, and `Idle` in a repo that has not given it a route — the same reading as any node
-    // that never runs for this kind of run.
-    &["verifier"],
-    &["bookkeeper"],
+/// One column of the pipeline. The fork is a single stage with two nodes: `run_full` joins them,
+/// so in a built-in run both checkpoints land at the same moment.
+struct Stage {
+    nodes: &'static [&'static str],
+    /// Whether this stage runs at all is a property of the config, not of the run — the overseer
+    /// only runs where a workflow has to be chosen, the verifier and publisher only where the repo
+    /// gave them a route. Nothing in the store says which, so an optional stage with no checkpoint
+    /// is never reported as working: a run sitting at the front of the pipeline is being gathered
+    /// for, not overseen, in every repo that never configured an overseer.
+    optional: bool,
+}
+
+const fn required(nodes: &'static [&'static str]) -> Stage {
+    Stage {
+        nodes,
+        optional: false,
+    }
+}
+
+const fn optional(nodes: &'static [&'static str]) -> Stage {
+    Stage {
+        nodes,
+        optional: true,
+    }
+}
+
+/// The pipeline in execution order.
+const PIPELINE: &[Stage] = &[
+    optional(&["overseer"]),
+    required(&["context"]),
+    required(&["analyst"]),
+    required(&["red_team", "implementer"]),
+    optional(&["verifier"]),
+    // The run's two deliveries: one writes to the memory graph, the other to the tracker. Neither
+    // needs the other's result, so `run_full` reaches them together. The publisher is opt-in; the
+    // bookkeeper always runs, but after the terminal status, so neither is ever reported working.
+    required(&["bookkeeper", "publisher"]),
 ];
+
+/// Nodes that run after the terminal status is written and whose failure is only logged. They can
+/// never be the reason a run failed, so they are never reported `Failed`.
+const CANNOT_FAIL_THE_RUN: &[&str] = &["bookkeeper", "publisher"];
 
 /// The issue text is checkpointed under this name so `bookkeep` can replay a stored run. It is
 /// not a node — it's the run's input, and it's the only record of the run's subject.
@@ -43,6 +73,11 @@ pub enum NodeState {
 pub struct NodeView {
     pub name: String,
     pub state: NodeState,
+    /// Which stage this node belongs to, and which lane within it. The pipeline's shape is the
+    /// server's to know — a workflow that declares its own nodes changes it — so the graph is
+    /// positioned from these rather than from a table the frontend maintains in parallel.
+    pub stage: usize,
+    pub lane: usize,
     /// How many checkpoints this node wrote. Only the implementer (per converge iteration) and
     /// the bookkeeper (via `ratatoskr bookkeep` replay) can exceed one.
     pub checkpoints: usize,
@@ -92,20 +127,36 @@ const FORK: usize = 3;
 pub fn derive(status: Option<&str>, checkpoints: &[Checkpoint]) -> Vec<NodeView> {
     let terminal = is_terminal(status);
     let failed = status == Some("failed");
-    let fork_started = PIPELINE[FORK].iter().any(|n| count(checkpoints, n) > 0);
+    let fork_started = PIPELINE[FORK]
+        .nodes
+        .iter()
+        .any(|n| count(checkpoints, n) > 0);
 
     // A node has finished only if it checkpointed *and* isn't the implementer mid-converge —
     // otherwise the fork would look complete on iteration 1 and the run's activity would be
     // attributed to the bookkeeper, which by the invariant above hasn't started.
     let finished =
         |name: &str| count(checkpoints, name) > 0 && !(name == "implementer" && !terminal);
-    let current = PIPELINE
+    // Where the run has got to: the first stage that has not finished and has nothing after it
+    // checkpointed. Without that second half a skipped verifier would hold the position forever
+    // and report every later node as not yet reached, on a run that has finished.
+    //
+    // Optional stages are never it. Whether one runs is decided by config the store does not
+    // record, so an empty optional stage is as likely skipped as pending — and claiming the
+    // overseer is working while the context node is what's actually running is the visible
+    // version of that guess.
+    let last_seen = PIPELINE
         .iter()
-        .position(|stage| stage.iter().any(|n| !finished(n)));
+        .rposition(|stage| stage.nodes.iter().any(|n| count(checkpoints, n) > 0));
+    let current = PIPELINE.iter().enumerate().position(|(idx, stage)| {
+        !stage.optional
+            && !(stage.nodes.iter().all(|n| finished(n))
+                || last_seen.is_some_and(|seen| seen > idx))
+    });
 
     let mut out = Vec::new();
     for (idx, stage) in PIPELINE.iter().enumerate() {
-        for name in *stage {
+        for (lane, name) in stage.nodes.iter().enumerate() {
             let times: Vec<&str> = checkpoints
                 .iter()
                 .filter(|c| c.node_name == *name)
@@ -124,8 +175,8 @@ pub fn derive(status: Option<&str>, checkpoints: &[Checkpoint]) -> Vec<NodeView>
                 match () {
                     // Later than where the run is: nothing to say about it yet.
                     _ if current != Some(idx) => NodeState::Idle,
-                    // The bookkeeper can't fail a run — a failure here belongs upstream.
-                    _ if *name == "bookkeeper" => NodeState::Idle,
+                    // A failure here belongs upstream: these run past the terminal status.
+                    _ if CANNOT_FAIL_THE_RUN.contains(name) => NodeState::Idle,
                     _ if failed => NodeState::Failed,
                     _ if !terminal => NodeState::Working,
                     _ => NodeState::Idle,
@@ -140,6 +191,8 @@ pub fn derive(status: Option<&str>, checkpoints: &[Checkpoint]) -> Vec<NodeView>
             out.push(NodeView {
                 name: (*name).to_string(),
                 state,
+                stage: idx,
+                lane,
                 checkpoints: times.len(),
                 first_at: times.first().map(|s| s.to_string()),
                 last_at: times.last().map(|s| s.to_string()),
@@ -172,18 +225,21 @@ mod tests {
 
     #[test]
     fn a_live_run_marks_the_next_uncheckpointed_node_working() {
-        let views = derive(Some("running"), &[cp("scout", "t1")]);
-        assert_eq!(state_of(&views, "scout"), NodeState::Done);
-        assert_eq!(state_of(&views, "memory"), NodeState::Working);
+        let views = derive(Some("running"), &[cp("context", "t1")]);
+        assert_eq!(state_of(&views, "context"), NodeState::Done);
+        assert_eq!(state_of(&views, "analyst"), NodeState::Working);
         // Nothing downstream of where the run sits is claimed to be doing anything.
-        assert_eq!(state_of(&views, "analyst"), NodeState::Idle);
+        assert_eq!(state_of(&views, "implementer"), NodeState::Idle);
         assert_eq!(state_of(&views, "bookkeeper"), NodeState::Idle);
+        // And the overseer, which this run never ran, reads as skipped rather than pending —
+        // something after it checkpointed, so the run is past it either way.
+        assert_eq!(state_of(&views, "overseer"), NodeState::Idle);
     }
 
     #[test]
     fn a_failed_run_marks_the_node_it_died_on() {
-        let views = derive(Some("failed"), &[cp("scout", "t1"), cp("memory", "t2")]);
-        assert_eq!(state_of(&views, "memory"), NodeState::Done);
+        let views = derive(Some("failed"), &[cp("context", "t1")]);
+        assert_eq!(state_of(&views, "context"), NodeState::Done);
         assert_eq!(state_of(&views, "analyst"), NodeState::Failed);
         // A failure doesn't retroactively implicate nodes that never got their turn.
         assert_eq!(state_of(&views, "implementer"), NodeState::Idle);
@@ -195,8 +251,7 @@ mod tests {
         let live = derive(
             Some("running"),
             &[
-                cp("scout", "t1"),
-                cp("memory", "t2"),
+                cp("context", "t1"),
                 cp("analyst", "t3"),
                 cp("red_team", "t4"),
                 cp("implementer", "t5"),
@@ -229,10 +284,7 @@ mod tests {
         // `planned` is terminal, so the fork nodes a `plan` run never reaches aren't shown as
         // work about to happen. This is only unambiguous because a full run records `running`
         // for its fork phase rather than staying `planned`.
-        let views = derive(
-            Some("planned"),
-            &[cp("scout", "t1"), cp("memory", "t2"), cp("analyst", "t3")],
-        );
+        let views = derive(Some("planned"), &[cp("context", "t1"), cp("analyst", "t3")]);
         assert_eq!(state_of(&views, "analyst"), NodeState::Done);
         assert_eq!(state_of(&views, "red_team"), NodeState::Idle);
         assert_eq!(state_of(&views, "implementer"), NodeState::Idle);
@@ -246,8 +298,7 @@ mod tests {
         let views = derive(
             Some("failed"),
             &[
-                cp("scout", "t1"),
-                cp("memory", "t2"),
+                cp("context", "t1"),
                 cp("analyst", "t3"),
                 cp("red_team", "t4"),
                 cp("implementer", "t5"),
@@ -264,8 +315,7 @@ mod tests {
         let views = derive(
             Some("failed"),
             &[
-                cp("scout", "t1"),
-                cp("memory", "t2"),
+                cp("context", "t1"),
                 cp("analyst", "t3"),
                 cp("red_team", "t4"),
                 cp("implementer", "t5"),
@@ -289,24 +339,51 @@ mod tests {
     #[test]
     fn awaiting_clarification_counts_as_live() {
         // A blocked node is still that run's active node, not an idle one.
-        let views = derive(Some("awaiting_clarification"), &[cp("scout", "t1")]);
-        assert_eq!(state_of(&views, "memory"), NodeState::Working);
+        let views = derive(Some("awaiting_clarification"), &[cp("context", "t1")]);
+        assert_eq!(state_of(&views, "analyst"), NodeState::Working);
     }
 
     #[test]
     fn a_run_with_no_status_row_is_still_derivable() {
         // The scripted path writes the issue checkpoint before the runs row exists.
-        let views = derive(None, &[cp("scout", "t1")]);
-        assert_eq!(state_of(&views, "scout"), NodeState::Done);
-        assert_eq!(state_of(&views, "memory"), NodeState::Working);
+        let views = derive(None, &[cp("context", "t1")]);
+        assert_eq!(state_of(&views, "context"), NodeState::Done);
+        assert_eq!(state_of(&views, "analyst"), NodeState::Working);
+    }
+
+    #[test]
+    fn a_skipped_optional_stage_does_not_hold_the_pipeline_behind_it() {
+        // The overseer and the verifier only run where they are configured. A run that skipped
+        // both still reached the bookkeeper, and reading the stage list literally would report
+        // every node after the first gap as never reached — on a run that has finished.
+        let views = derive(
+            Some("converged"),
+            &[
+                cp("context", "t1"),
+                cp("analyst", "t2"),
+                cp("red_team", "t3"),
+                cp("implementer", "t4"),
+                cp("bookkeeper", "t5"),
+            ],
+        );
+        assert_eq!(state_of(&views, "overseer"), NodeState::Idle);
+        assert_eq!(state_of(&views, "verifier"), NodeState::Idle);
+        assert_eq!(state_of(&views, "implementer"), NodeState::Done);
+        assert_eq!(state_of(&views, "bookkeeper"), NodeState::Done);
+        // Nothing is claimed to have failed, and nothing is left looking live.
+        assert!(!views.iter().any(|v| v.state == NodeState::Failed));
+        assert!(!views.iter().any(|v| v.state == NodeState::Working));
     }
 
     #[test]
     fn the_issue_pseudo_node_is_not_part_of_the_pipeline() {
         let views = derive(Some("running"), &[cp(ISSUE_NODE, "t0")]);
         assert!(!views.iter().any(|v| v.name == ISSUE_NODE));
-        // ...and it doesn't advance the pipeline: scout is still the working node.
-        assert_eq!(state_of(&views, "scout"), NodeState::Working);
+        // ...and it doesn't advance the pipeline: gathering context is still the working node.
+        // Not the overseer, even though it comes first — whether a run has one is config the
+        // store never sees, so it is not something to report a run as busy doing.
+        assert_eq!(state_of(&views, "context"), NodeState::Working);
+        assert_eq!(state_of(&views, "overseer"), NodeState::Idle);
     }
 
     #[test]

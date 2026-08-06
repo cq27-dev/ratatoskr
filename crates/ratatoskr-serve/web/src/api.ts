@@ -24,6 +24,9 @@ export interface NodeView {
   state: NodeState;
   /** Only the implementer (per converge iteration) and bookkeeper (replay) exceed one. */
   checkpoints: number;
+  /** Position in the pipeline: stage is the column, lane the row within it. */
+  stage: number;
+  lane: number;
   first_at: string | null;
   last_at: string | null;
 }

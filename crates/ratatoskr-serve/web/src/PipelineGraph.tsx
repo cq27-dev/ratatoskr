@@ -12,20 +12,25 @@ import {
 import type { NodeView } from "./api";
 
 /*
- * The pipeline's shape is fixed and known ahead of time, so the layout is hand-authored rather
- * than run through a general graph-layout pass: elkjs/dagre exist for graphs whose shape isn't
- * known until runtime, which is not this one.
+ * Positions are computed from the `stage` and `lane` the server sends with each node, not from a
+ * table here: the pipeline's shape is the server's to know, and a workflow that declares its own
+ * nodes changes it. A copy of the shape on this side would be a copy that goes stale silently,
+ * with the missing node logged to a console nobody has open.
  *
- * Coordinates use a 190px column pitch so the fork's two lanes stay aligned.
+ * A stage is a column; its nodes are the lanes within it, centred against the tallest stage. This
+ * is not a general graph layout — elkjs/dagre exist for graphs whose edges aren't known until
+ * runtime, and here every edge is "the stage before it".
  */
-const LAYOUT: Record<string, { x: number; y: number }> = {
-  scout: { x: 0, y: 70 },
-  memory: { x: 190, y: 70 },
-  analyst: { x: 380, y: 70 },
-  red_team: { x: 590, y: 0 },
-  implementer: { x: 590, y: 140 },
-  bookkeeper: { x: 800, y: 70 },
-};
+const COLUMN_PITCH = 210;
+const LANE_PITCH = 140;
+
+function position(node: NodeView, lanesInStage: number, maxLanes: number) {
+  const offset = (maxLanes - lanesInStage) / 2;
+  return {
+    x: node.stage * COLUMN_PITCH,
+    y: (node.lane + offset) * LANE_PITCH,
+  };
+}
 
 /**
  * Declared up front rather than measured. React Flow keeps a node `visibility: hidden` until a
@@ -35,14 +40,18 @@ const LAYOUT: Record<string, { x: number; y: number }> = {
  */
 const NODE_SIZE = { width: 150, height: 52 };
 
-const EDGES: ReadonlyArray<readonly [string, string]> = [
-  ["scout", "memory"],
-  ["memory", "analyst"],
-  ["analyst", "red_team"],
-  ["analyst", "implementer"],
-  ["red_team", "bookkeeper"],
-  ["implementer", "bookkeeper"],
-];
+/** Nodes grouped into their stages, in pipeline order, from what the server sent. */
+function stages(nodes: NodeView[]): NodeView[][] {
+  const byStage = new Map<number, NodeView[]>();
+  for (const n of nodes) {
+    const lanes = byStage.get(n.stage) ?? [];
+    lanes.push(n);
+    byStage.set(n.stage, lanes);
+  }
+  return [...byStage.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([, lanes]) => lanes.sort((a, b) => a.lane - b.lane));
+}
 
 type PipelineNodeData = { node: NodeView; isSelected: boolean };
 type PipelineNodeType = Node<PipelineNodeData, "pipeline">;
@@ -117,39 +126,37 @@ export default function PipelineGraph({ nodes, selected, onSelect }: Props) {
     [nodes],
   );
 
-  const rfNodes = useMemo<PipelineNodeType[]>(
-    () =>
-      nodes.flatMap((n) => {
-        const position = LAYOUT[n.name];
-        if (!position) {
-          // Loud rather than invisible: a stage added server-side without a layout entry would
-          // otherwise silently vanish from the graph.
-          console.warn(`no layout for pipeline node "${n.name}" — omitted from the graph`);
-          return [];
-        }
-        return [
-          {
-            id: n.name,
-            type: "pipeline" as const,
-            position,
-            data: { node: n, isSelected: selected === n.name },
-            draggable: false,
-            ...NODE_SIZE,
-          },
-        ];
-      }),
-    [nodes, selected],
-  );
+  const columns = useMemo(() => stages(nodes), [nodes]);
+
+  const rfNodes = useMemo<PipelineNodeType[]>(() => {
+    const maxLanes = Math.max(1, ...columns.map((c) => c.length));
+    return columns.flatMap((lanes) =>
+      lanes.map((n) => ({
+        id: n.name,
+        type: "pipeline" as const,
+        position: position(n, lanes.length, maxLanes),
+        data: { node: n, isSelected: selected === n.name },
+        draggable: false,
+        ...NODE_SIZE,
+      })),
+    );
+  }, [columns, selected]);
 
   const rfEdges = useMemo<Edge[]>(() => {
+    // Every node in a stage feeds every node in the next one — which is what a fork joining back
+    // together looks like, and the only edge relation the pipeline has.
     // `step`, not the default bezier: every corner on this substrate is 90 degrees.
-    const edges: Edge[] = EDGES.map(([source, target]) => ({
-      id: `${source}-${target}`,
-      source,
-      target,
-      type: "step",
-      pathOptions: { borderRadius: 0 },
-    }));
+    const edges: Edge[] = columns.flatMap((lanes, i) =>
+      (columns[i + 1] ?? []).flatMap((target) =>
+        lanes.map((source) => ({
+          id: `${source.name}-${target.name}`,
+          source: source.name,
+          target: target.name,
+          type: "step",
+          pathOptions: { borderRadius: 0 },
+        })),
+      ),
+    );
 
     // The converge loop only exists once the implementer has actually run.
     const impl = byName.get("implementer");
