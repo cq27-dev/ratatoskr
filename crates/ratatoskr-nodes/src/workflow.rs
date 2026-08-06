@@ -516,6 +516,7 @@ pub async fn run_plan_scripted(
     {
         tracing::warn!("failed to record final run status: {e}");
     }
+    ctx.plugin_context.session_end(status.as_str()).await;
     outcome
 }
 
@@ -569,6 +570,13 @@ pub async fn run_full_scripted(
             tracing::warn!("failed to record final run status: {e}");
         }
     }
+    // Closed here whichever way the script went, so a plugin cannot tell a scripted run from a
+    // built-in one by whether its session ever ended.
+    let reason = match &result {
+        Ok(outcome) => outcome.status,
+        Err(_) => RunStatus::Failed,
+    };
+    ctx.plugin_context.session_end(reason.as_str()).await;
     result
 }
 

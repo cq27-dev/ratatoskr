@@ -517,10 +517,9 @@ pub async fn session_start(
     // Per plugin, because nodes bind different sets and each composes from this map. Run through
     // the same path as every other event, so `SessionStart`'s matcher — which is read against the
     // *source*, not a tool name — is applied the same way.
-    let mut spent = AtomicU64::new(0);
     for plugin in plugins {
         let one = std::slice::from_ref(plugin);
-        let Some(text) = session_output(one, cwd, limits, &mut spent).await else {
+        let Some(text) = session_output(one, cwd, limits).await else {
             continue;
         };
         // Whole plugins in or out, decided here rather than at composition: half a digest is
@@ -543,12 +542,7 @@ pub async fn session_start(
 ///
 /// `SessionStart` answers with plain text on stdout — no envelope — so its own reader is used
 /// rather than [`run_event`]'s. Everything else about it is the same.
-async fn session_output(
-    plugins: &[Plugin],
-    cwd: &Path,
-    limits: &HookLimits,
-    spent: &mut AtomicU64,
-) -> Option<String> {
+async fn session_output(plugins: &[Plugin], cwd: &Path, limits: &HookLimits) -> Option<String> {
     let plugin = plugins.first()?;
     let payload = envelope(&HookEvent::session_start(), cwd);
     let matching: Vec<&Hook> = plugin
@@ -564,7 +558,9 @@ async fn session_output(
             .map(|hook| run_hook(plugin, hook, hook.timeout(limits), &payload, cwd)),
     )
     .await;
-    charge(spent, started.elapsed(), None);
+    // Not charged to the tool-hook budget: that bounds what plugins cost a node *per tool call*,
+    // and this runs once for the whole run.
+    let _ = started;
 
     let parts: Vec<String> = answers
         .into_iter()
@@ -637,6 +633,21 @@ impl<'a> HookEvent<'a> {
                 "agent_type": node,
                 "last_assistant_message": last,
                 "stop_hook_active": false,
+            }),
+        }
+    }
+
+    /// A node's turn ends because it failed. The format's own event for the case, and the reason
+    /// `Stop` can keep meaning what it says: a turn that produced an answer.
+    pub fn stop_failure(node: &'a str, error: &str) -> Self {
+        HookEvent {
+            name: "StopFailure",
+            subject: "",
+            fields: serde_json::json!({
+                "agent_type": node,
+                "error": "unknown",
+                "error_details": error,
+                "last_assistant_message": error,
             }),
         }
     }

@@ -436,13 +436,22 @@ impl ratatoskr_agent::PluginHooks for NodeObserver {
         ))
     }
 
-    fn finished<'a>(&'a self, node: &'a str, last: &'a str) -> ratatoskr_agent::Answer<'a> {
+    fn finished<'a>(
+        &'a self,
+        node: &'a str,
+        outcome: Result<&'a str, &'a str>,
+    ) -> ratatoskr_agent::Answer<'a> {
         Box::pin(async move {
             // Both, because the format has both and a plugin may register either: a node is the
-            // subagent that stopped, and the turn that ended.
-            let stop = self
-                .run(ratatoskr_plugin::HookEvent::stop(node, last))
-                .await;
+            // subagent that stopped, and the turn that ended. A turn that failed ended as
+            // `StopFailure`, which is what that event is for — `Stop` keeps meaning a turn that
+            // produced an answer. `SubagentStop` fires either way: the subagent is over.
+            let ended = match outcome {
+                Ok(last) => ratatoskr_plugin::HookEvent::stop(node, last),
+                Err(error) => ratatoskr_plugin::HookEvent::stop_failure(node, error),
+            };
+            let last = outcome.unwrap_or_else(|error| error);
+            let stop = self.run(ended).await;
             let subagent = self
                 .run(ratatoskr_plugin::HookEvent::subagent_stop(node, last))
                 .await;
@@ -456,12 +465,13 @@ impl ratatoskr_agent::PluginHooks for NodeObserver {
 
 /// The events a run actually has. Every other event a plugin registers describes a session with a
 /// person in it, or a lifecycle this host does not have, and is not ours to fire.
-const NODE_EVENTS: [&str; 6] = [
+const NODE_EVENTS: [&str; 7] = [
     "SubagentStart",
     "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
     "Stop",
+    "StopFailure",
     "SubagentStop",
 ];
 

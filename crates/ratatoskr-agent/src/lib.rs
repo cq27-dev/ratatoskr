@@ -99,12 +99,13 @@ pub trait PluginHooks: Send + Sync {
     /// After it, having seen what the tool answered.
     fn after<'a>(&'a self, tool: &'a str, args: &'a str, result: &'a str) -> Answer<'a>;
 
-    /// The node has finished, with the last thing it said.
+    /// The node has finished — with the last thing it said, or with why it could not.
     ///
-    /// Nothing is injected: the node's answer is already made, and its next reader is a schema.
-    /// A hook here runs for what it *does* — recording, notifying, syncing — and any context it
-    /// returns is reported as unused rather than quietly dropped.
-    fn finished<'a>(&'a self, node: &'a str, last: &'a str) -> Answer<'a>;
+    /// Fired on both paths, because a plugin that opened something at `starting` has to be told
+    /// the node is over however it ended. Nothing is injected: the node's answer is already made,
+    /// and its next reader is a schema. A hook here runs for what it *does* — recording,
+    /// notifying, syncing — and any context it returns is reported as unused rather than dropped.
+    fn finished<'a>(&'a self, node: &'a str, outcome: Result<&'a str, &'a str>) -> Answer<'a>;
 }
 
 /// What a plugin hook contributes, once it has run.
@@ -794,17 +795,22 @@ where
         .await
         .map_err(|e| AgentError::Prompt(e.to_string()));
 
-    // The node has said its piece. A hook here runs for what it does rather than what it returns;
-    // there is nowhere left to put context, and the next reader of this answer is a schema.
-    if let (Some(hooks), Ok(answer)) = (&observer, &answer)
-        && let Some(unused) = hooks.finished(node, answer).await
-    {
-        tracing::info!(
-            node,
-            chars = unused.len(),
-            "a hook answered after the node finished; \
-             its context has nowhere to go and was not used"
-        );
+    // The node is over either way. A plugin told it was starting has to be told it stopped, or a
+    // pairing it opened there is never closed.
+    if let Some(hooks) = &observer {
+        let failure = answer.as_ref().err().map(ToString::to_string);
+        let outcome = match (&answer, &failure) {
+            (Ok(answer), _) => Ok(answer.as_str()),
+            (_, Some(failure)) => Err(failure.as_str()),
+            (Err(_), None) => Err(""),
+        };
+        if let Some(unused) = hooks.finished(node, outcome).await {
+            tracing::info!(
+                node,
+                chars = unused.len(),
+                "a hook answered after the node finished; its context has nowhere to go"
+            );
+        }
     }
     answer
 }

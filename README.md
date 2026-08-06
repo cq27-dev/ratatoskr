@@ -223,10 +223,11 @@ A plugin's hooks fire at the points a run actually has:
 | `SubagentStart` | a node begins | the node name | that node's preamble |
 | `UserPromptSubmit` | a node is prompted | *(the format gives it none)* | alongside the prompt |
 | `PreToolUse` / `PostToolUse` | around each tool call | the tool name | the tool's result |
-| `Stop` / `SubagentStop` | a node finishes | the node name (`SubagentStop`) | nowhere — see below |
+| `Stop` / `StopFailure` | a node's turn ends, or fails | *(the format gives them none)* | nowhere — see below |
+| `SubagentStop` | a node finishes, either way | the node name | nowhere — see below |
 | `SessionEnd` | once, when the run ends | the run's final status | nowhere — see below |
 
-`Stop`, `SubagentStop` and `SessionEnd` run for what they *do* — recording, notifying, syncing.
+`Stop`, `StopFailure`, `SubagentStop` and `SessionEnd` run for what they *do* — recording, notifying, syncing.
 There is no conversation left to add to by then, and a node's answer goes straight to a schema, so
 context returned there is reported as unused rather than quietly dropped.
 
