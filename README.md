@@ -147,6 +147,20 @@ and skipped, and the node simply gets less context. Naming a plugin that isn't i
 different — that is a typo, and it fails the run rather than silently binding less than you asked
 for.
 
+Hooks are read from `hooks/hooks.json` and from whatever the manifest's `hooks` key names, which
+adds to it rather than replacing it; `mcpServers` works the same way alongside `.mcp.json`. Both
+keys take a path, an inline block, or an array of either. A hook's `matcher` follows the format's
+three rules — absent, empty or `*` matches everything; a value of only letters, digits, `_`, `-`,
+spaces, `,` and `|` is an exact name or list of them; anything else is an unanchored regex — so
+`Write|Edit` matches those two tools and not `NotebookEdit`. `SessionStart`'s matcher is read
+against the session source, which here is always `startup`.
+
+A hook runs under `bash` (or its declared `shell`), or directly with no shell when it declares
+`args`. It is given `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PROJECT_DIR`, and a `CLAUDE_PLUGIN_DATA` under
+`.ratatoskr/plugin-data/<plugin>/` — and *only* those: any `CLAUDE_*` in the surrounding
+environment is cleared first, so a run started from a coding CLI cannot hand a plugin that host's
+state as its own. Its output is read only when it exits 0.
+
 Installing a plugin is enough to use it: with no declaration anywhere, every discovered plugin
 applies to every node. Rulesets *narrow* that, in the same place they govern a node's model and
 tools:
