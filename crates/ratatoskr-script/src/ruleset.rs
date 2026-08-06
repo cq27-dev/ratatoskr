@@ -50,9 +50,20 @@ globalThis.__staticConfig = function() {
         };
     }
     var d = globalThis.__defaults;
+    // Same reasoning as the plugins rule: a misspelled key would otherwise declare nothing and say
+    // nothing. `mayModifyTests` in particular is a safety exemption — silently binding nothing
+    // there means every legitimate test change fails to converge with no explanation.
+    for (var dk in d) {
+        if (dk !== 'plugins' && dk !== 'mayModifyTests') {
+            throw new Error("defineDefaults: unknown key '" + dk + "'");
+        }
+    }
     return JSON.stringify({
         agents: agents,
-        defaults: { plugins: (d.plugins === undefined) ? null : d.plugins }
+        defaults: {
+            plugins: (d.plugins === undefined) ? null : d.plugins,
+            mayModifyTests: d.mayModifyTests || []
+        }
     });
 };
 "#;
@@ -108,10 +119,19 @@ fn yes() -> bool {
 }
 
 /// What `defineDefaults` declared, inherited by every node.
+///
+/// Run-scoped, not per-agent: "which plugins this repo uses" and "which paths this task may change"
+/// are properties of the run, not of one node.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Defaults {
     #[serde(default)]
     pub plugins: Option<Vec<String>>,
+    /// Paths this task is allowed to change even though they are part of the referee (the tests and
+    /// the machinery that runs them). Declared up front by whoever wrote the task — the implementer
+    /// does not get to decide after the fact that the tests were the problem.
+    #[serde(default, rename = "mayModifyTests")]
+    pub may_modify_tests: Vec<String>,
 }
 
 /// The static (non-executable) config a ruleset declares for one agent.
@@ -270,6 +290,12 @@ impl ScriptEngine {
             node: node.to_string(),
             config: config.clone(),
         })
+    }
+
+    /// Paths this task declared it may change even though they are part of the referee — the
+    /// converge-time exemption. Empty means "the tests are off limits", which is the default.
+    pub fn may_modify_tests(&self) -> &[String] {
+        &self.defaults.may_modify_tests
     }
 
     /// Names of every agent a ruleset declared (for validating `defineAgent` targets).
@@ -529,6 +555,37 @@ mod tests {
         let mut declared = engine.declared_plugins();
         declared.sort();
         assert_eq!(declared, ["a", "b", "c", "rag-rat"]);
+    }
+
+    #[tokio::test]
+    async fn the_referee_exemption_is_declared_up_front_in_the_defaults() {
+        let engine = engine_with(
+            "may-modify",
+            r#"defineDefaults({ mayModifyTests: ["crates/foo/tests", "conftest.py"] });"#,
+        )
+        .await;
+        assert_eq!(
+            engine.may_modify_tests(),
+            ["crates/foo/tests", "conftest.py"]
+        );
+
+        // Undeclared is the default, and the strict reading: no exemption.
+        let none = engine_with("may-modify-absent", r#"defineDefaults({ plugins: [] });"#).await;
+        assert!(none.may_modify_tests().is_empty());
+
+        // A typo would otherwise exempt nothing and report nothing — the failure mode that turns a
+        // legitimate test-writing task into an unexplained MaxIterationsReached.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-defaults-typo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.ts"),
+            r#"defineDefaults({ mayModifyTest: ["tests"] });"#,
+        )
+        .unwrap();
+        assert!(ScriptEngine::load(&dir).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

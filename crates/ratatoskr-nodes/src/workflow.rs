@@ -128,9 +128,20 @@ async fn count_checkpoints(store: &Store, run_id: &str, node: &str) -> Result<u3
 }
 
 /// Terminal status, inferred from the baseline and the final implementer output — never trusted from
-/// the script. `Converged` only if the post run completed AND introduced no failures the baseline
-/// lacked; anything else is a wall hit.
-fn infer_status(red_team: &RedTeamOutput, implementer: &ImplementerOutput) -> RunStatus {
+/// the script. `Converged` only if the change left the referee alone AND the post run completed AND
+/// it introduced no failures the baseline lacked; anything else is a wall hit. The referee check
+/// comes first: once the tests or their runner have been edited, the test comparison is describing
+/// a bar the change wrote for itself.
+fn infer_status(
+    red_team: &RedTeamOutput,
+    implementer: &ImplementerOutput,
+    may_modify_tests: &[String],
+) -> RunStatus {
+    let referee = converge::referee_touches(&implementer.touched_files, may_modify_tests);
+    if !referee.is_empty() {
+        tracing::warn!(files = ?referee, "run touched the referee; not converged");
+        return RunStatus::MaxIterationsReached;
+    }
     let post_ran = converge::test_command_ran(
         &implementer.failing_tests,
         &implementer.passing_tests,
@@ -451,7 +462,12 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String,
         .map_err(|e| e.to_string())?;
     let post_ran =
         converge::test_command_ran(&prev.failing_tests, &prev.passing_tests, prev.exit_code);
-    let diagnostic = if !post_ran {
+    let referee = converge::referee_touches(&prev.touched_files, ctx.engine.may_modify_tests());
+    // Referee first, same as the built-in loop: a moved referee makes the test sets meaningless,
+    // so reverting it is what this iteration has to be told to do.
+    let diagnostic = if !referee.is_empty() {
+        converge::referee_correction(&referee)
+    } else if !post_ran {
         format!(
             "The test command did not run to completion (exit {}) — your change likely does not \
              compile. Fix it so the tests run and pass.",
@@ -650,7 +666,7 @@ async fn finish_full(ctx: &Arc<WorkflowContext>) -> Result<RunOutcome, PlanError
     let worktree = WorktreePath(PathBuf::from(&implementer.worktree_path));
 
     // Terminal status is Rust-inferred, never trusted from the script.
-    let status = infer_status(&red_team, &implementer);
+    let status = infer_status(&red_team, &implementer, ctx.engine.may_modify_tests());
     ctx.store
         .upsert_run(&ctx.run_id, None, status.as_str())
         .await?;
@@ -766,19 +782,36 @@ mod tests {
         let baseline = red(&["a"], &["b"], 1);
         // Post ran and introduced nothing the baseline lacked → converged.
         assert_eq!(
-            infer_status(&baseline, &imp(&["a"], &["b", "c"], 0)),
+            infer_status(&baseline, &imp(&["a"], &["b", "c"], 0), &[]),
             RunStatus::Converged
         );
         // Post introduced a new failure → wall, not converged.
         assert_eq!(
-            infer_status(&baseline, &imp(&["a", "c"], &["b"], 1)),
+            infer_status(&baseline, &imp(&["a", "c"], &["b"], 1), &[]),
             RunStatus::MaxIterationsReached
         );
         // Post didn't run to completion (no tests) → wall, even with an empty failing list — this is
         // the P1a check the hardcoded loop also applies to the implementer output.
         assert_eq!(
-            infer_status(&baseline, &imp(&[], &[], 101)),
+            infer_status(&baseline, &imp(&[], &[], 101), &[]),
             RunStatus::MaxIterationsReached
+        );
+    }
+
+    #[test]
+    fn a_clean_test_run_does_not_convert_a_touched_referee_into_success() {
+        // The BenchJack shape: every test passes, because a new conftest.py says so.
+        let baseline = red(&["a"], &["b"], 1);
+        let mut cheated = imp(&[], &["a", "b"], 0);
+        cheated.touched_files = vec!["conftest.py".to_string()];
+        assert_eq!(
+            infer_status(&baseline, &cheated, &[]),
+            RunStatus::MaxIterationsReached
+        );
+        // Unless the task declared it up front.
+        assert_eq!(
+            infer_status(&baseline, &cheated, &["conftest.py".to_string()]),
+            RunStatus::Converged
         );
     }
 

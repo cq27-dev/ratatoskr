@@ -1742,10 +1742,21 @@ async fn fork_and_converge(
         let tests_clean = post_ran
             && converge::is_converged(&red_team_out.failing_tests, &impl_out.failing_tests);
 
+        // Did the change edit the referee? Checked BEFORE `tests_clean` is trusted: a conftest.py
+        // that rewrites every outcome, or an edited test, makes the passing/failing sets describe a
+        // bar the change wrote for itself.
+        let referee = converge::referee_touches(&impl_out.touched_files, engine.may_modify_tests());
+
         // What to send back, or `None` to accept the change. The test gate goes first and the
         // review second, deliberately: a test result is stronger evidence than a model's
         // judgement, and reviewing a change that does not build wastes the call on noise.
-        let correction: Option<Correction> = if !tests_clean {
+        let correction: Option<Correction> = if !referee.is_empty() {
+            tracing::warn!(files = ?referee, "iteration touched the referee; not accepting it");
+            Some(Correction {
+                prompt: converge::referee_correction(&referee),
+                revised: None,
+            })
+        } else if !tests_clean {
             // A post-change run that didn't complete usually means the edit broke the build — say
             // that specifically instead of reporting "no new failures".
             let prompt = if !post_ran {
