@@ -5347,8 +5347,10 @@ dependencies = [
 name = "ratatoskr-agent"
 version = "0.1.0"
 dependencies = [
+ "glob",
  "ratatoskr-core",
  "ratatoskr-mcp",
+ "regex",
  "rig-agent",
  "rig-core",
  "rmcp",
@@ -5358,6 +5360,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "walkdir",
 ]
 
 [[package]]

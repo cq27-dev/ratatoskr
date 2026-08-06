@@ -213,6 +213,7 @@ async fn scout_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, St
     let node = ScoutNode {
         route: cfg.route,
         tools: cfg.tools,
+        files: cfg.files,
         policy: cfg.policy,
         max_turns: cfg.max_turns,
         // Node-to-node clarification is built-in-flow only for now; the scripted path opts out.
@@ -264,6 +265,7 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
     let node = AnalystNode {
         route: cfg.route,
         tools: cfg.tools,
+        files: cfg.files,
         policy: cfg.policy,
         max_turns: cfg.max_turns,
         system_prompt: cfg.system_prompt,
@@ -295,6 +297,7 @@ fn build_red_team(ctx: &WorkflowContext) -> Result<RedTeamNode, PlanError> {
             Some(redteam::RedTeamClassifier {
                 route: cfg.route,
                 tools: cfg.tools,
+                files: cfg.files,
                 policy: cfg.policy,
                 max_turns: cfg.max_turns,
                 clarifier: None,
@@ -648,6 +651,7 @@ async fn bookkeep_scripted(
     let node = BookkeeperNode {
         route: cfg.route,
         tools: cfg.tools,
+        files: cfg.files,
         sink: ctx.sink.clone(),
         policy: cfg.policy,
         max_turns: cfg.max_turns,

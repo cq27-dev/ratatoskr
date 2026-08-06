@@ -25,6 +25,9 @@ use rmcp::transport::TokioChildProcess;
 /// server ratatoskr already launches, and it must not be spawned twice.
 pub const RAG_RAT: &str = "rag-rat";
 
+/// The origin of tools this host answers itself rather than dispatching.
+pub const LOCAL: &str = "builtin";
+
 /// Errors connecting to or talking with an MCP server.
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
@@ -129,7 +132,7 @@ impl Connection {
     pub fn offer(&self) -> ServerTools {
         ServerTools {
             origin: self.origin.clone(),
-            sink: self.sink(),
+            sink: Some(self.sink()),
             tools: self.tools.clone(),
             prefix: None,
         }
@@ -187,7 +190,9 @@ impl RagRatClient {
 #[derive(Clone)]
 pub struct ServerTools {
     pub origin: String,
-    pub sink: ServerSink,
+    /// Where a call goes. `None` for tools this host answers itself — the synthetic ones a hook
+    /// intercepts, and the built-ins it implements.
+    pub sink: Option<ServerSink>,
     pub tools: Vec<Tool>,
     /// Prefixed onto every tool name this server offers, for the model and for everything that
     /// matches on a name. `None` for a server this host launched itself, whose tools keep the
@@ -297,7 +302,7 @@ impl ToolSet {
     /// The name is *taken*, not merely added: the hook that answers it matches on the name alone,
     /// so a server offering the same one would be shadowed anyway — silently, and with the wrong
     /// argument schema shown to the model. Any such tool is dropped here instead.
-    pub fn add_local(&mut self, tool: Tool, sink: ServerSink) {
+    pub fn add_local(&mut self, tool: Tool) {
         for group in &mut self.groups {
             let prefix = group.prefix.clone();
             group.tools.retain(|t| {
@@ -316,15 +321,23 @@ impl ToolSet {
                 !clash
             });
         }
-        match self.groups.first_mut() {
-            Some(group) => group.tools.push(tool),
-            None => self.groups.push(ServerTools {
-                origin: RAG_RAT.to_string(),
-                sink,
-                tools: vec![tool],
+        self.local().tools.push(tool);
+    }
+
+    /// The group of tools this host answers itself, created on first use.
+    pub fn local(&mut self) -> &mut ServerTools {
+        if !self.groups.iter().any(|g| g.sink.is_none()) {
+            self.groups.push(ServerTools {
+                origin: LOCAL.to_string(),
+                sink: None,
+                tools: Vec::new(),
                 prefix: None,
-            }),
+            });
         }
+        self.groups
+            .iter_mut()
+            .find(|g| g.sink.is_none())
+            .expect("just ensured")
     }
 
     /// Every tool name in the set, as the model sees it, in precedence order.

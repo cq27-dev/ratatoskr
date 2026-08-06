@@ -201,6 +201,15 @@ Where two servers still offer one name, the first one connected keeps it, and th
 logged with both server names. A server that will not start costs its plugin's tools and nothing
 else.
 
+Planning nodes carry three built-in tools — **`Read`, `Grep` and `Glob`** — under those names and
+with those argument shapes, because that is what a plugin matches on and inspects. They are
+offered before a ruleset narrows, so `tools.deny` removes them like anything else.
+
+Read-only, deliberately. `Write`, `Edit` and `Bash` belong to the implementer, which delegates them
+to a coding CLI inside a sandboxed worktree; a planning node that could edit the checkout it is
+reasoning about would undo that separation for nothing. Paths outside the repository are refused,
+and a search skips `.git`, `target`, `node_modules`, `.venv`, `dist` and dot-directories.
+
 A plugin's `PreToolUse` and `PostToolUse` hooks run around a node's tool calls, matched on the tool
 name by the group's `matcher` regex. Each answers with the usual envelope, and only
 `additionalContext` is read:
