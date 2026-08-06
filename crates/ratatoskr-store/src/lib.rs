@@ -32,6 +32,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("checkpoints", "output_tokens", "INTEGER"),
     ("checkpoints", "cached_input_tokens", "INTEGER"),
     ("checkpoints", "cache_creation_input_tokens", "INTEGER"),
+    ("checkpoints", "reasoning_tokens", "INTEGER"),
     ("checkpoints", "error", "TEXT"),
 ];
 
@@ -262,8 +263,9 @@ impl Store {
                 "INSERT INTO checkpoints (
                      run_id, node_name, output_json, input_json, iteration,
                      model, duration_ms, turns, error,
-                     input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     input_tokens, output_tokens, cached_input_tokens,
+                     cache_creation_input_tokens, reasoning_tokens
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     run_id,
                     node_name,
@@ -278,6 +280,7 @@ impl Store {
                     usage.output_tokens,
                     usage.cached_input_tokens,
                     usage.cache_creation_input_tokens,
+                    usage.reasoning_tokens,
                 ],
             )?;
             Ok::<_, StoreError>(())
@@ -296,7 +299,7 @@ impl Store {
                 "SELECT node_name, output_json, created_at, input_json, iteration,
                         model, duration_ms, turns, error,
                         input_tokens, output_tokens, cached_input_tokens,
-                        cache_creation_input_tokens
+                        cache_creation_input_tokens, reasoning_tokens
                  FROM checkpoints WHERE run_id = ?1 ORDER BY id ASC",
             )?;
             let rows = stmt
@@ -322,6 +325,7 @@ impl Store {
                                 cache_creation_input_tokens: row
                                     .get::<_, Option<u64>>(12)?
                                     .unwrap_or(0),
+                                reasoning_tokens: row.get::<_, Option<u64>>(13)?.unwrap_or(0),
                             },
                         },
                     })
@@ -511,6 +515,7 @@ mod tests {
                         output_tokens: 250,
                         cached_input_tokens: 800,
                         cache_creation_input_tokens: 200,
+                        reasoning_tokens: 4_000,
                     },
                 },
             })
@@ -529,6 +534,9 @@ mod tests {
         assert_eq!(cp.telemetry.usage.input_tokens, 1000);
         assert_eq!(cp.telemetry.usage.cached_input_tokens, 800);
         assert_eq!(cp.telemetry.usage.cache_creation_input_tokens, 200);
+        // Billed as output and reported apart from it: a node that thinks before every tool call
+        // reads as nearly free when this is dropped, and it is most of what the node spent.
+        assert_eq!(cp.telemetry.usage.reasoning_tokens, 4_000);
     }
 
     #[tokio::test]

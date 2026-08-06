@@ -23,6 +23,13 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
+    /// Tokens spent on the model's own reasoning before it answered.
+    ///
+    /// Billed as output and reported apart from it, so a node that thinks before every tool call
+    /// looks nearly free when only `output_tokens` is read — and thinking is the reason such a
+    /// node's turns are slow, which makes this the number that explains the wall-clock.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
 }
 
 impl TokenUsage {
@@ -33,6 +40,7 @@ impl TokenUsage {
         self.output_tokens += other.output_tokens;
         self.cached_input_tokens += other.cached_input_tokens;
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
     }
 }
 

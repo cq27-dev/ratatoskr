@@ -215,6 +215,10 @@ where
         "gen_ai.usage.input_tokens" = usage.input_tokens,
         "gen_ai.usage.output_tokens" = usage.output_tokens,
         "gen_ai.usage.cached_input_tokens" = usage.cached_input_tokens,
+        // The write half, and the expensive one: a cache write is billed above the ordinary input
+        // rate, so a cost read from hits alone reads as cheaper than it was.
+        "gen_ai.usage.cache_creation_input_tokens" = usage.cache_creation_input_tokens,
+        "gen_ai.usage.reasoning_tokens" = usage.reasoning_tokens,
         "ask usage"
     );
     answer.map_err(|e| AgentError::Prompt(e.to_string()))
@@ -468,6 +472,7 @@ impl AgentHook for UsageHook {
             turn = event.turn,
             input = event.usage.input_tokens,
             output = event.usage.output_tokens,
+            reasoning = event.usage.reasoning_tokens,
             cached = event.usage.cached_input_tokens,
             "turn usage"
         );
@@ -479,6 +484,7 @@ impl AgentHook for UsageHook {
                 output_tokens: event.usage.output_tokens,
                 cached_input_tokens: event.usage.cached_input_tokens,
                 cache_creation_input_tokens: event.usage.cache_creation_input_tokens,
+                reasoning_tokens: event.usage.reasoning_tokens,
             });
         ModelTurnAction::Continue
     }
@@ -1268,6 +1274,9 @@ where
             "gen_ai.usage.input_tokens" = telemetry.usage.input_tokens,
             "gen_ai.usage.output_tokens" = telemetry.usage.output_tokens,
             "gen_ai.usage.cached_input_tokens" = telemetry.usage.cached_input_tokens,
+            "gen_ai.usage.cache_creation_input_tokens" =
+                telemetry.usage.cache_creation_input_tokens,
+            "gen_ai.usage.reasoning_tokens" = telemetry.usage.reasoning_tokens,
             duration_ms = telemetry.duration_ms,
             "node usage"
         );
@@ -1400,16 +1409,21 @@ mod tests {
             output_tokens: 1,
             cached_input_tokens: 8,
             cache_creation_input_tokens: 2,
+            reasoning_tokens: 700,
         });
         total.add(TokenUsage {
             input_tokens: 5,
             output_tokens: 3,
+            reasoning_tokens: 300,
             ..Default::default()
         });
         assert_eq!(total.input_tokens, 15);
         assert_eq!(total.output_tokens, 4);
         assert_eq!(total.cached_input_tokens, 8);
         assert_eq!(total.cache_creation_input_tokens, 2);
+        // Thinking accumulates like the rest: a turn that thought and called one tool spent most
+        // of what it spent here, and a sum that drops it says the node was nearly free.
+        assert_eq!(total.reasoning_tokens, 1_000);
     }
 
     /// The whole write path against the real provider: declarations reach the model, it calls
