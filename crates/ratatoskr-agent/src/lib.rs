@@ -363,6 +363,13 @@ impl AgentHook for UsageHook {
         _event: CompletionResponseEvent<'_>,
     ) -> ObservationAction {
         self.calls.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            kind = "response_usage",
+            input = _event.usage.input_tokens,
+            output = _event.usage.output_tokens,
+            cached = _event.usage.cached_input_tokens,
+            "response usage"
+        );
         ObservationAction::Continue
     }
 
@@ -382,6 +389,16 @@ impl AgentHook for UsageHook {
         _ctx: &HookContext,
         event: ModelTurnFinished<'_>,
     ) -> ModelTurnAction {
+        // Per turn, at debug: a total that looks wrong is otherwise impossible to attribute — the
+        // question is always whether one turn was mismeasured or most turns reported nothing.
+        tracing::debug!(
+            kind = "turn_usage",
+            turn = event.turn,
+            input = event.usage.input_tokens,
+            output = event.usage.output_tokens,
+            cached = event.usage.cached_input_tokens,
+            "turn usage"
+        );
         self.total
             .lock()
             .expect("usage mutex poisoned")
