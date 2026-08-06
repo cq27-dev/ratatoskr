@@ -476,6 +476,7 @@ mod tests {
             node_name: node.to_string(),
             output_json: json.to_string(),
             created_at: "t".to_string(),
+            ..Default::default()
         }
     }
 

@@ -6,6 +6,7 @@
 pub mod config;
 pub mod policy;
 pub mod state;
+pub mod telemetry;
 
 pub use config::{
     ConfigError, HookLimits, ImplementerConfig, ModelRoute, PluginConfig, RagRatConfig,
@@ -13,3 +14,4 @@ pub use config::{
 };
 pub use policy::{ToolDecision, ToolPolicy};
 pub use state::{RunState, RunStatus};
+pub use telemetry::{NodeTelemetry, TokenUsage};
