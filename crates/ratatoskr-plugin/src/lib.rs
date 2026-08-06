@@ -319,17 +319,22 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<Plugin> {
             }
         }
     }
-    found.sort_by(|a, b| a.name.cmp(&b.name));
+    // Sorted by path as well as name: `read_dir` order is not guaranteed, and without this the
+    // tiebreak below would pick a different copy on different machines.
+    found.sort_by(|a, b| a.name.cmp(&b.name).then(a.root.cmp(&b.root)));
     found.dedup_by(|a, b| a.root == b.root);
-    one_per_name(found, &home())
+    one_per_name(found, home().as_deref())
 }
 
 /// The user's home directory, where a coding CLI records which plugins it has installed.
-fn home() -> PathBuf {
+///
+/// `None` rather than an empty path: joining the registry onto one would read a *relative* path
+/// under the working directory, which is some other file entirely.
+fn home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|home| !home.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_default()
 }
 
 /// One plugin per name.
@@ -339,10 +344,11 @@ fn home() -> PathBuf {
 /// them all runs one plugin's `SessionStart` hooks once per version and leaves which copy answers
 /// to directory order.
 ///
-/// The host records the current one, so that is used when it is known; otherwise the first found
-/// is kept, which is at least deterministic. Either way the run is told what it is not using.
-fn one_per_name(found: Vec<Plugin>, home: &Path) -> Vec<Plugin> {
-    let installed = registry::installed(home);
+/// The host records the current one, so that is used when it is known. Otherwise the first in path
+/// order is kept — a tiebreak, not a version comparison, and deterministic only because `discover`
+/// sorted first. Either way the run is told which copies it is not using.
+fn one_per_name(found: Vec<Plugin>, home: Option<&Path>) -> Vec<Plugin> {
+    let installed = home.map(registry::installed).unwrap_or_default();
     let mut kept: Vec<Plugin> = Vec::new();
 
     for plugin in found {
@@ -1476,7 +1482,7 @@ mod tests {
             .iter()
             .filter_map(|v| load(&cache.join("demo").join(v)))
             .collect();
-        let kept = one_per_name(all, &home);
+        let kept = one_per_name(all, Some(&home));
         assert_eq!(kept.len(), 1);
         assert!(kept[0].root.ends_with("0.21.0"), "{:?}", kept[0].root);
 

@@ -49,7 +49,12 @@ pub fn installed(home: &Path) -> BTreeMap<String, Vec<PathBuf>> {
 
     let mut found: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     for (key, entries) in registry.plugins {
-        let name = key.split('@').next().unwrap_or(&key).to_string();
+        // `<plugin>@<marketplace>`, split at the last `@` so a plugin whose own name contains one
+        // still resolves to its name rather than the first fragment of it.
+        let name = key
+            .rsplit_once('@')
+            .map_or(key.as_str(), |(name, _)| name)
+            .to_string();
         found
             .entry(name)
             .or_default()
@@ -132,6 +137,24 @@ mod tests {
         );
         // A plugin the registry says nothing about is nobody's business to judge.
         assert_eq!(is_current(&installed, "local-thing", Path::new("/x")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_key_is_split_at_the_marketplace_not_the_first_at_sign() {
+        let dir = home(
+            "scoped",
+            Some(
+                r#"{ "plugins": { "@acme/tools@their-marketplace": [
+                    { "installPath": "/cache/acme/tools/1.0.0" } ] } }"#,
+            ),
+        );
+        let installed = installed(&dir);
+        assert!(
+            installed.contains_key("@acme/tools"),
+            "the plugin's own name, not the first fragment of it: {:?}",
+            installed.keys().collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
