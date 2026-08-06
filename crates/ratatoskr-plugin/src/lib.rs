@@ -8,6 +8,7 @@
 //! Nothing here may fail a run. A plugin that is missing, malformed, slow, or broken is logged and
 //! skipped — a node that would have got some extra context simply doesn't.
 
+pub mod registry;
 pub mod skill;
 
 use std::collections::BTreeMap;
@@ -318,9 +319,63 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<Plugin> {
             }
         }
     }
-    found.sort_by(|a, b| a.name.cmp(&b.name));
+    // Sorted by path as well as name: `read_dir` order is not guaranteed, and without this the
+    // tiebreak below would pick a different copy on different machines.
+    found.sort_by(|a, b| a.name.cmp(&b.name).then(a.root.cmp(&b.root)));
     found.dedup_by(|a, b| a.root == b.root);
-    found
+    one_per_name(found, home().as_deref())
+}
+
+/// The user's home directory, where a coding CLI records which plugins it has installed.
+///
+/// `None` rather than an empty path: joining the registry onto one would read a *relative* path
+/// under the working directory, which is some other file entirely.
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+/// One plugin per name.
+///
+/// A path naming a plugin in a coding CLI's cache holds *every version ever installed*, because
+/// that cache is laid out `<marketplace>/<plugin>/<version>/` and older versions are kept. Loading
+/// them all runs one plugin's `SessionStart` hooks once per version and leaves which copy answers
+/// to directory order.
+///
+/// The host records the current one, so that is used when it is known. Otherwise the first in path
+/// order is kept — a tiebreak, not a version comparison, and deterministic only because `discover`
+/// sorted first. Either way the run is told which copies it is not using.
+fn one_per_name(found: Vec<Plugin>, home: Option<&Path>) -> Vec<Plugin> {
+    let installed = home.map(registry::installed).unwrap_or_default();
+    let mut kept: Vec<Plugin> = Vec::new();
+
+    for plugin in found {
+        let current = registry::is_current(&installed, &plugin.name, &plugin.root);
+        match kept.iter().position(|k| k.name == plugin.name) {
+            None => kept.push(plugin),
+            Some(at) => {
+                // Prefer the copy the host says is installed; failing that, keep the first.
+                let replace = current == Some(true)
+                    && registry::is_current(&installed, &kept[at].name, &kept[at].root)
+                        != Some(true);
+                let (dropped, reason) = match replace {
+                    true => (kept[at].root.clone(), "superseded by the installed copy"),
+                    false => (plugin.root.clone(), "another copy is already loaded"),
+                };
+                tracing::info!(
+                    plugin = plugin.name,
+                    path = %dropped.display(),
+                    "not loading this copy of the plugin: {reason}"
+                );
+                if replace {
+                    kept[at] = plugin;
+                }
+            }
+        }
+    }
+    kept
 }
 
 /// Read one plugin directory, or `None` if it isn't one.
@@ -1383,6 +1438,56 @@ mod tests {
         assert_eq!(session[0].timeout(&limits()), Duration::from_secs(5));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_plugin_is_loaded_once_however_many_copies_are_on_disk() {
+        // A path naming a plugin in a coding CLI's cache holds every version ever installed.
+        // Loading them all ran one plugin's SessionStart hooks once per version.
+        let cache = std::env::temp_dir().join(format!("ratatoskr-versions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+        for version in ["0.20.0", "0.21.0", "0.22.0"] {
+            let root = cache.join("demo").join(version);
+            std::fs::create_dir_all(root.join(".claude-plugin")).unwrap();
+            std::fs::write(
+                root.join(".claude-plugin/plugin.json"),
+                format!(r#"{{"name": "demo", "version": "{version}"}}"#),
+            )
+            .unwrap();
+        }
+
+        // With no registry to consult, one copy is kept and the run is told about the others.
+        let found = discover(&[cache.join("demo")]);
+        assert_eq!(
+            found.len(),
+            1,
+            "{:?}",
+            found.iter().map(|p| &p.root).collect::<Vec<_>>()
+        );
+
+        // With one, the copy the host says is installed is the copy that is used.
+        let home = std::env::temp_dir().join(format!("ratatoskr-vhome-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude/plugins")).unwrap();
+        std::fs::write(
+            home.join(".claude/plugins/installed_plugins.json"),
+            format!(
+                r#"{{"plugins": {{"demo@somewhere": [{{"installPath": "{}"}}]}}}}"#,
+                cache.join("demo/0.21.0").display()
+            ),
+        )
+        .unwrap();
+
+        let all: Vec<Plugin> = ["0.20.0", "0.21.0", "0.22.0"]
+            .iter()
+            .filter_map(|v| load(&cache.join("demo").join(v)))
+            .collect();
+        let kept = one_per_name(all, Some(&home));
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].root.ends_with("0.21.0"), "{:?}", kept[0].root);
+
+        let _ = std::fs::remove_dir_all(&cache);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
