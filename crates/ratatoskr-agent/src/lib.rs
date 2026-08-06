@@ -163,7 +163,7 @@ pub async fn ask(
                 source,
             })?;
             run(
-                client.completion_model(&route.model),
+                caching(client.completion_model(&route.model)),
                 preamble,
                 question,
                 tools,
@@ -178,6 +178,9 @@ pub async fn ask(
                 source,
             })?;
             run(
+                // Not `caching`: the field exists on this provider's model too, but whether the
+                // endpoint honours an Anthropic `cache_control` is its business, and sending one
+                // it rejects would cost the call rather than the cache.
                 client.completion_model(&route.model),
                 preamble,
                 question,
@@ -314,6 +317,28 @@ fn is_transport_error(message: &str) -> bool {
         "timed out",
     ];
     TRANSPORT.iter().any(|m| message.contains(m))
+}
+
+/// Anthropic prompt caching, which rig leaves off entirely.
+///
+/// Without it no `cache_control` is sent and an agent loop pays for its whole transcript on every
+/// turn: a live run showed the cache write growing 12k → 22k tokens across nine calls while the
+/// read stayed flat at 7k, the hit rate falling 36% → 24% as the conversation grew. The history
+/// was re-sent and re-written each turn — at the write premium — rather than read back.
+///
+/// Per-block markers only. Adding rig's top-level automatic breakpoint as well makes this *worse*,
+/// which is the opposite of what the two names suggest: with both set, rig hands the moving message
+/// point to the top-level breakpoint and stops marking messages itself, and this endpoint does
+/// nothing with that field — so the growing half ends up cached by nobody.
+///
+/// Captured from real requests. With both on, markers sit on the system prompt and the last tool
+/// and nowhere in `messages`. With only this one, the marker sits on the last message block and
+/// advances with the conversation — message 0, then message 2 — which is what lets each turn read
+/// the prefix instead of rewriting it.
+fn caching(
+    model: anthropic::completion::CompletionModel,
+) -> anthropic::completion::CompletionModel {
+    model.with_prompt_caching()
 }
 
 /// What one call asks of the provider, beyond the prompt and the tools.
@@ -1092,7 +1117,7 @@ pub async fn run_structured(run: NodeRun<'_>) -> Result<String, AgentError> {
                 provider: "anthropic".to_string(),
                 source,
             })?;
-            let model = client.completion_model(&run.route.model);
+            let model = caching(client.completion_model(&run.route.model));
             run_typed(model, run).await
         }
         Provider::Moonshot => {
