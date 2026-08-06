@@ -89,7 +89,7 @@ pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError>
         workflow,
     } = request;
     // A workflow, when this repo defines one, overrides the built-in sequencing.
-    if let Some(runtime) = select(workflows().await?, workflow)? {
+    if let Workflow::Scripted(runtime) = select(registry().await?, workflow)? {
         let plugin_context =
             PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
                 .await?;
@@ -459,15 +459,58 @@ async fn checkpoint<T: Serialize>(
 /// Where a repo keeps the workflows it defines.
 pub const WORKFLOW_DIR: &str = ".ratatoskr/workflows";
 
+/// The name of the flow this binary implements in Rust.
+pub const BUILT_IN: &str = "built-in";
+
+/// One workflow a run can use.
+///
+/// The built-in is not a script and deliberately is not going to become one. Its gates — the
+/// referee check, the verifier and the analyst re-entry it routes findings to, the frozen
+/// acceptance — live in `fork_and_converge`, and the scripted path does not have them. Rewriting it
+/// as a script would register it in the same list at the cost of the review gate, which is the
+/// opposite trade to the one worth making.
+pub enum Workflow {
+    /// scout → memory → analyst → (red-team ∥ implementer) → verify → converge → bookkeeper.
+    BuiltIn,
+    Scripted(WorkflowRuntime),
+}
+
+impl Workflow {
+    pub fn name(&self) -> &str {
+        match self {
+            Workflow::BuiltIn => BUILT_IN,
+            Workflow::Scripted(w) => &w.meta().name,
+        }
+    }
+
+    /// What it is for, for whatever is choosing.
+    pub fn purpose(&self) -> &str {
+        match self {
+            Workflow::BuiltIn => {
+                "Plan a change, implement it in an isolated worktree, and iterate until it passes \
+                 the acceptance check and survives review."
+            }
+            Workflow::Scripted(w) => &w.meta().purpose,
+        }
+    }
+}
+
 /// The single-script path, still honoured so a repo that has one keeps working untouched.
 const LEGACY_WORKFLOW: &str = ".ratatoskr/workflow.ts";
 
-/// Every workflow this repo defines, in name order.
+/// Every workflow a run could use: the built-in, then whatever this repo defines.
+pub async fn registry() -> Result<Vec<Workflow>, PlanError> {
+    let mut all = vec![Workflow::BuiltIn];
+    all.extend(defined().await?.into_iter().map(Workflow::Scripted));
+    Ok(all)
+}
+
+/// The workflows this repo defines, in name order.
 ///
 /// `.ratatoskr/workflows/*.ts` first, then a bare `.ratatoskr/workflow.ts` if one is there. Both,
 /// rather than one superseding the other: a repo that has the old file gets it as an ordinary
 /// entry in the registry rather than a migration to perform before anything runs.
-pub async fn workflows() -> Result<Vec<WorkflowRuntime>, PlanError> {
+pub async fn defined() -> Result<Vec<WorkflowRuntime>, PlanError> {
     let fail = |e: ratatoskr_script::ScriptError| {
         PlanError::node("workflow", NodeError::Failed(e.to_string()))
     };
@@ -489,46 +532,41 @@ pub async fn workflows() -> Result<Vec<WorkflowRuntime>, PlanError> {
 
 /// Pick the workflow a run should use.
 ///
-/// `wanted` names one explicitly and fails if it is not there — a run asked for a specific shape
-/// must not quietly get a different one. With nothing named, a lone workflow is used and anything
-/// else declines to guess: choosing between several is the overseer's job, and picking the
-/// alphabetically-first one would look like a decision while being an accident.
-pub fn select(
-    found: Vec<WorkflowRuntime>,
-    wanted: Option<&str>,
-) -> Result<Option<WorkflowRuntime>, PlanError> {
-    let names = || {
-        found
-            .iter()
-            .map(|w| w.meta().name.clone())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    match wanted {
-        Some(name) => {
-            let listed = names();
-            found
-                .into_iter()
-                .find(|w| w.meta().name == name)
-                .map(Some)
-                .ok_or_else(|| {
-                    PlanError::node(
-                        "workflow",
-                        NodeError::Failed(match listed.is_empty() {
-                            true => format!("no workflow named `{name}`; this repo defines none"),
-                            false => format!("no workflow named `{name}`; available: {listed}"),
-                        }),
-                    )
-                })
-        }
-        None if found.len() > 1 => Err(PlanError::node(
+/// `wanted` names one and fails if it is not there — a run that asked for a specific shape must not
+/// quietly get a different one, and the error lists what it could have asked for.
+///
+/// With nothing named, the *defined* workflows decide: none means the built-in, exactly one means
+/// that one, and several decline to guess. The built-in is deliberately not counted in that tally.
+/// It is always available, so counting it would make a repo with a single script ambiguous, and
+/// asking a repo to name a workflow it has only one of is a question with one answer.
+pub fn select(found: Vec<Workflow>, wanted: Option<&str>) -> Result<Workflow, PlanError> {
+    let listed = found
+        .iter()
+        .map(|w| w.name().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(name) = wanted {
+        return found.into_iter().find(|w| w.name() == name).ok_or_else(|| {
+            PlanError::node(
+                "workflow",
+                NodeError::Failed(format!("no workflow named `{name}`; available: {listed}")),
+            )
+        });
+    }
+
+    let mut defined: Vec<Workflow> = found
+        .into_iter()
+        .filter(|w| !matches!(w, Workflow::BuiltIn))
+        .collect();
+    match defined.len() {
+        0 => Ok(Workflow::BuiltIn),
+        1 => Ok(defined.remove(0)),
+        _ => Err(PlanError::node(
             "workflow",
             NodeError::Failed(format!(
-                "this repo defines several workflows ({}); name one with --workflow",
-                names()
+                "this repo defines several workflows; name one with --workflow. Available: {listed}"
             )),
         )),
-        None => Ok(found.into_iter().next()),
     }
 }
 
@@ -1156,7 +1194,15 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
         workflow,
     } = request;
     // A workflow, when this repo defines one, overrides the whole run flow.
-    if let Some(runtime) = select(workflows().await?, workflow)? {
+    if let Workflow::Scripted(runtime) = select(registry().await?, workflow)? {
+        // Said out loud because it is a gate the run will not have. The scripted path checkpoints,
+        // validates and enforces the referee and iteration limits, but it has no verifier binding
+        // — so a change that passes its tests is accepted without anything reading the diff.
+        tracing::warn!(
+            workflow = runtime.meta().name,
+            "this workflow does not run the verifier; the change will be accepted on its tests \
+             alone. `--workflow {BUILT_IN}` runs the flow that reviews the diff."
+        );
         let plugin_context =
             PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
                 .await?;
@@ -2367,7 +2413,8 @@ mod agent_config_tests {
         assert!(prompt.contains("any non-utf-8 path"));
     }
 
-    async fn workflows_in(case: &str, named: &[&str]) -> Vec<WorkflowRuntime> {
+    /// The registry a repo defining `named` would have: the built-in plus those.
+    async fn registry_of(case: &str, named: &[&str]) -> Vec<Workflow> {
         let dir = std::env::temp_dir().join(format!("ratatoskr-sel-{}-{case}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2380,44 +2427,60 @@ mod agent_config_tests {
         }
         let found = WorkflowRuntime::discover(&dir).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        found
+        let mut all = vec![Workflow::BuiltIn];
+        all.extend(found.into_iter().map(Workflow::Scripted));
+        all
     }
 
     #[tokio::test]
     async fn naming_a_workflow_that_is_not_there_fails_and_says_what_is() {
-        // A run asked for a specific shape must not quietly get a different one.
-        let found = workflows_in("missing", &["research", "fix"]).await;
-        let err = match select(found, Some("migrate")) {
+        // A run that asked for a specific shape must not quietly get a different one.
+        let err = match select(
+            registry_of("missing", &["research", "fix"]).await,
+            Some("migrate"),
+        ) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("an unknown workflow name must fail"),
         };
         assert!(err.contains("no workflow named `migrate`"), "{err}");
         assert!(err.contains("fix") && err.contains("research"), "{err}");
+        // The built-in is listed too — it is always something a run could have asked for.
+        assert!(err.contains(BUILT_IN), "{err}");
     }
 
     #[tokio::test]
     async fn choosing_between_several_is_not_done_by_accident() {
-        // Picking the alphabetically-first would look like a decision while being one nobody made.
-        // Until something can choose deliberately, several workflows means the caller must say.
-        let found = workflows_in("several", &["research", "fix"]).await;
-        let err = match select(found, None) {
+        // Picking the first would look like a decision while being one nobody made.
+        let err = match select(registry_of("several", &["research", "fix"]).await, None) {
             Err(e) => e.to_string(),
-            Ok(_) => panic!("several workflows with no name must not silently pick one"),
+            Ok(_) => panic!("several defined workflows with no name must not silently pick one"),
         };
         assert!(err.contains("--workflow"), "{err}");
 
-        // Named explicitly, it is used.
-        let found = workflows_in("several-named", &["research", "fix"]).await;
-        let picked = select(found, Some("fix")).unwrap().unwrap();
-        assert_eq!(picked.meta().name, "fix");
+        let picked = select(
+            registry_of("several-named", &["research", "fix"]).await,
+            Some("fix"),
+        )
+        .unwrap();
+        assert_eq!(picked.name(), "fix");
     }
 
     #[tokio::test]
-    async fn one_workflow_needs_no_naming_and_none_means_the_built_in_flow() {
-        let found = workflows_in("one", &["only"]).await;
-        assert_eq!(select(found, None).unwrap().unwrap().meta().name, "only");
+    async fn the_built_in_is_the_fallback_and_can_also_be_asked_for_by_name() {
+        // A repo defining nothing gets the built-in.
+        assert_eq!(
+            select(vec![Workflow::BuiltIn], None).unwrap().name(),
+            BUILT_IN
+        );
 
-        // No workflows at all is the ordinary case: the built-in Rust flow runs.
-        assert!(select(Vec::new(), None).unwrap().is_none());
+        // One defined workflow is used without being named — the built-in is always present, so
+        // counting it would make a repo with a single script ambiguous for no reason.
+        let picked = select(registry_of("one", &["only"]).await, None).unwrap();
+        assert_eq!(picked.name(), "only");
+
+        // And the built-in can be demanded even when scripts exist, which is the way back to the
+        // Rust flow's gates without deleting a file.
+        let picked = select(registry_of("override", &["only"]).await, Some(BUILT_IN)).unwrap();
+        assert!(matches!(picked, Workflow::BuiltIn));
     }
 }
