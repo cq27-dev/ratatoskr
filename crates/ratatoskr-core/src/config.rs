@@ -155,15 +155,58 @@ fn default_verify_threshold() -> String {
     "P2".to_string()
 }
 
-/// Phase 3 sandbox settings — where red-team and implementer run the repo's test command.
+/// Phase 3 sandbox settings — where red-team and implementer run the acceptance check.
+///
+/// Unknown keys are refused, for the same reason `ImplementerConfig` refuses them and with a
+/// sharper edge here: `pin_acceptance` is what stops a model choosing what proves the code works,
+/// and a misspelling of it fails open — the repo believes acceptance is pinned and it is not.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
     /// `"microsandbox"` (MicroVM, needs KVM) or `"landlock"` (bwrap+Landlock fallback).
     pub backend: String,
     /// OCI image the sandbox boots (microsandbox backend).
     pub image: String,
-    /// The target repo's test command, run inside the sandbox to characterize pass/fail.
+    /// The default acceptance check: one command, for the repo that has one and nothing to add.
+    /// Superseded per-task by the analyst's `acceptance` unless `pin_acceptance` is set.
     pub test_command: Vec<String>,
+    /// Ignore whatever acceptance the analyst proposes and always run `test_command`.
+    ///
+    /// The escape hatch for a repo that does not want a model deciding what proves its code works.
+    /// Off by default because what counts as done varies by change — a refactor is accepted by the
+    /// existing suite, a new endpoint is not accepted until something exercises the endpoint.
+    #[serde(default)]
+    pub pin_acceptance: bool,
+}
+
+/// One step of an acceptance check: a name to attribute a failure to, and the command to run.
+///
+/// A list of these replaces a single test command because acceptance is frequently a pipeline
+/// rather than an invocation — "build the wasm, then drive it in a browser" is two steps whose
+/// first produces an artifact and whose second reports nothing shaped like a test runner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AcceptanceStep {
+    /// Short label, used to attribute a failure when the step's output has no finer structure.
+    pub name: String,
+    /// argv, run inside the sandbox with the worktree mounted. Never run on the host.
+    pub command: Vec<String>,
+}
+
+impl SandboxConfig {
+    /// The acceptance to run, given what the analyst proposed.
+    ///
+    /// `pin_acceptance` wins, then a non-empty proposal, then the configured `test_command`. The
+    /// order matters: a repo that pinned its acceptance must not have it replaced by a plan, and a
+    /// plan that proposed nothing must still be checked against something.
+    pub fn acceptance(&self, proposed: &[AcceptanceStep]) -> Vec<AcceptanceStep> {
+        if !self.pin_acceptance && !proposed.is_empty() {
+            return proposed.to_vec();
+        }
+        vec![AcceptanceStep {
+            name: "tests".to_string(),
+            command: self.test_command.clone(),
+        }]
+    }
 }
 
 impl Default for SandboxConfig {
@@ -174,6 +217,7 @@ impl Default for SandboxConfig {
             backend: "landlock".to_string(),
             image: "docker.io/library/rust:1-slim".to_string(),
             test_command: vec!["cargo".to_string(), "test".to_string()],
+            pin_acceptance: false,
         }
     }
 }
@@ -477,5 +521,60 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("verify_treshold"), "{err}");
+    }
+
+    #[test]
+    fn acceptance_prefers_the_plan_but_a_pin_always_wins() {
+        let mut sandbox = SandboxConfig {
+            test_command: vec!["cargo".into(), "test".into()],
+            ..Default::default()
+        };
+        let planned = vec![
+            AcceptanceStep {
+                name: "wasm build".into(),
+                command: vec!["wasm-pack".into(), "build".into()],
+            },
+            AcceptanceStep {
+                name: "browser tests".into(),
+                command: vec!["npx".into(), "playwright".into(), "test".into()],
+            },
+        ];
+
+        // What a task's own plan asks for, in order.
+        let resolved = sandbox.acceptance(&planned);
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "wasm build");
+        assert_eq!(resolved[1].command, ["npx", "playwright", "test"]);
+
+        // A plan that proposes nothing is still checked against something.
+        let fallback = sandbox.acceptance(&[]);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].command, ["cargo", "test"]);
+
+        // The escape hatch: a repo that pinned its acceptance must not have a plan replace it.
+        // Misspelling it fails open, so the key is spelled once here and refused everywhere else.
+        assert!(
+            RatatoskrConfig::from_toml_str(
+                r#"
+                [rag_rat]
+                command = ["rag-rat", "mcp"]
+                [store]
+                path = "s"
+                [worktree]
+                root = "w"
+                [sandbox]
+                backend = "landlock"
+                image = "x"
+                test_command = ["cargo", "test"]
+                pin_acceptence = true
+                "#,
+            )
+            .is_err(),
+            "a misspelled pin must not read as unpinned"
+        );
+        sandbox.pin_acceptance = true;
+        let pinned = sandbox.acceptance(&planned);
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].command, ["cargo", "test"]);
     }
 }

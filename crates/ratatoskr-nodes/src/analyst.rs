@@ -24,7 +24,11 @@ const PREAMBLE: &str = "You are the analyst in a code-planning pipeline. You are
     editing code in this repository, false when it does not — research, a review, an architecture \
     answer, or expanding an issue's description all produce no code change. Judge the task you \
     were given, not the breadth of what it touches: a question about eight files is still a \
-    question. You are also the pipeline's fallback answerer: when another node \
+    question. When it does change code, also set `acceptance`: the ordered commands that must run \
+    and pass for this change to be believed done, each with a short name. Use the repo's own \
+    tooling, and include every step the check needs — building an artifact before testing it is \
+    two steps, not one. Leave it empty to accept the repository's configured test command, which \
+    is the right answer whenever the existing suite already covers the change. You are also the pipeline's fallback answerer: when another node \
     cannot resolve something on its own, its question routes to you, so hold clear, present-tense \
     judgments about the change that you can share when asked.";
 
@@ -93,6 +97,17 @@ pub struct AnalystOutput {
     /// eventual change would touch, which a research task has plenty of.
     #[serde(default = "changes_code_by_default")]
     pub changes_code: bool,
+    /// What must run and pass for this change to be believed done, as ordered named steps.
+    ///
+    /// The analyst decides because "done" varies by change, not just by repository: a refactor is
+    /// accepted by the existing suite, a new endpoint is not accepted until something exercises
+    /// the endpoint. Empty falls back to `[sandbox] test_command`, and `[sandbox] pin_acceptance`
+    /// ignores this entirely.
+    ///
+    /// Frozen once the fork starts. A revision (see `previous`) amends requirements and must never
+    /// touch this: a change that can move the bar it is judged against is not judged.
+    #[serde(default)]
+    pub acceptance: Vec<ratatoskr_core::AcceptanceStep>,
 }
 
 /// A plan is assumed to involve a code change unless the analyst says otherwise. The failure this

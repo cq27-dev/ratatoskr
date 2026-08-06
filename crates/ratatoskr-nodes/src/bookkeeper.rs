@@ -729,6 +729,7 @@ mod tests {
                 requirements: Vec::new(),
                 residual_risk: String::new(),
                 changes_code: true,
+                acceptance: Vec::new(),
             },
             implementer: ImplementerOutput {
                 worktree_path: "/tmp/wt".into(),
