@@ -34,6 +34,8 @@ use ratatoskr_mcp::{Connection, RagRatClient, ServerTools, ToolSet};
 use ratatoskr_script::{ScriptEngine, WorkflowRuntime};
 use ratatoskr_store::{Store, StoreError};
 
+use ratatoskr_agent::RunLedger;
+
 use crate::clarify::NodeClarifier;
 use serde::Serialize;
 
@@ -135,7 +137,10 @@ async fn plan_half(
         .upsert_run(run_id, None, RunStatus::Running.as_str())
         .await?;
 
+    record_provenance(store, run_id, config).await;
+
     let clarifier = NodeClarifier::new(config, store, engine, run_id, issue);
+    let ledger = Arc::new(RunLedger::default());
     let run = Run {
         client,
         config,
@@ -144,6 +149,7 @@ async fn plan_half(
         issue,
         engine,
         clarifier: &clarifier,
+        ledger: &ledger,
         context,
     };
     let outcome = run_nodes(&run)
@@ -177,6 +183,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         issue,
         engine,
         clarifier,
+        ledger,
         context,
     } = run;
     let sink = client.sink();
@@ -213,27 +220,46 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         system_prompt: scout_cfg.system_prompt,
         plugins: plugins_scout,
         files: scout_cfg.files,
+        ledger: Some(Arc::clone(ledger)),
     };
     let scout_out = scout
         .run(issue.to_string(), &state)
         .await
         .map_err(|e| PlanError::node("scout", e))?;
-    checkpoint(store, run_id, "scout", &scout_out).await?;
+    record(Record {
+        store,
+        run_id,
+        node: "scout",
+        output: &scout_out,
+        input: Some(serde_json::to_string(issue)?),
+        iteration: None,
+        ledger: Some(ledger),
+    })
+    .await?;
     state.scout_report = Some(serde_json::to_value(&scout_out)?);
 
     // --- memory ---
     let memory = MemoryNode { sink: sink.clone() };
+    let memory_in = memory::MemoryInput {
+        issue: issue.to_string(),
+        context: scout_out.papertrail_summary.clone(),
+    };
+    let memory_input_json = serde_json::to_string(&memory_in)?;
     let memory_out = memory
-        .run(
-            memory::MemoryInput {
-                issue: issue.to_string(),
-                context: scout_out.papertrail_summary.clone(),
-            },
-            &state,
-        )
+        .run(memory_in, &state)
         .await
         .map_err(|e| PlanError::node("memory", e))?;
-    checkpoint(store, run_id, "memory", &memory_out).await?;
+    record(Record {
+        store,
+        run_id,
+        node: "memory",
+        output: &memory_out,
+        input: Some(memory_input_json),
+        iteration: None,
+        // The memory node calls rag-rat directly rather than a model, so it reports no usage.
+        ledger: Some(ledger),
+    })
+    .await?;
     state.memories = memory_out
         .memories
         .iter()
@@ -258,19 +284,28 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         system_prompt: analyst_cfg.system_prompt,
         plugins: plugins_analyst,
         files: analyst_cfg.files,
+        ledger: Some(Arc::clone(ledger)),
     };
+    let analyst_in = analyst::AnalystInput {
+        issue: issue.to_string(),
+        scout: scout_out.clone(),
+        memory: memory_out.clone(),
+    };
+    let analyst_input_json = serde_json::to_string(&analyst_in)?;
     let analyst_out = analyst
-        .run(
-            analyst::AnalystInput {
-                issue: issue.to_string(),
-                scout: scout_out.clone(),
-                memory: memory_out.clone(),
-            },
-            &state,
-        )
+        .run(analyst_in, &state)
         .await
         .map_err(|e| PlanError::node("analyst", e))?;
-    checkpoint(store, run_id, "analyst", &analyst_out).await?;
+    record(Record {
+        store,
+        run_id,
+        node: "analyst",
+        output: &analyst_out,
+        input: Some(analyst_input_json),
+        iteration: None,
+        ledger: Some(ledger),
+    })
+    .await?;
     state.analysis = Some(serde_json::to_value(&analyst_out)?);
 
     state.status = RunStatus::Planned;
@@ -282,18 +317,137 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
     })
 }
 
+/// One checkpoint to write: which node, what it produced, and — for a node that ran a model — what
+/// it was given and what the turn cost.
+///
+/// `input` and `ledger` are optional because not every checkpoint has them: the `issue` row is the
+/// run's own input rather than a node's, and the implementer drives a coding CLI that reports no
+/// token usage. A missing value here means "there was none", never "we forgot to look".
+struct Record<'a, T> {
+    store: &'a Store,
+    run_id: &'a str,
+    node: &'a str,
+    output: &'a T,
+    /// What the node was given, already serialized. Without it a checkpoint shows what came out
+    /// with no way to ask why, which is the difference between a log and something a run can be
+    /// replayed from. Serialized by the caller because each node's input is a different type and
+    /// erasing it behind a trait object buys nothing but a `Send + Sync` bound to satisfy.
+    input: Option<String>,
+    /// Which pass of the converge loop this is; `None` for a node that runs once.
+    iteration: Option<u32>,
+    ledger: Option<&'a Arc<RunLedger>>,
+}
+
+async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
+    let json = serde_json::to_string(r.output)?;
+    let input_json = r.input;
+    // Claimed rather than borrowed: the ledger holds one entry per model turn, and taking it here
+    // is what keeps the converge loop's repeated implementer turns matched to their own rows.
+    let telemetry = r.ledger.and_then(|l| l.take(r.node)).unwrap_or_default();
+    r.store
+        .insert_checkpoint(ratatoskr_store::CheckpointWrite {
+            run_id: r.run_id,
+            node_name: r.node,
+            output_json: &json,
+            input_json: input_json.as_deref(),
+            iteration: r.iteration,
+            telemetry,
+        })
+        .await?;
+    // The third structured event: a node produced output. Tool calls and model text come from
+    // the agent's observability hook; this is what says a node actually finished.
+    tracing::info!(
+        kind = "checkpoint",
+        node = r.node,
+        bytes = json.len(),
+        "checkpoint"
+    );
+    Ok(())
+}
+
+/// Record what it would take to say two runs were the same experiment: the resolved config, a
+/// fingerprint of the graph that ran, and the commit it ran against.
+///
+/// Best-effort throughout. This is what makes runs comparable afterwards, which is never worth
+/// failing a run over — a run with no provenance is still a run, and one refused because `git` was
+/// slow is not.
+async fn record_provenance(store: &Store, run_id: &str, config: &RatatoskrConfig) {
+    let config_json = serde_json::to_string(config)
+        .inspect_err(|e| tracing::warn!("could not record the run's config: {e}"))
+        .ok();
+    let repo = std::env::current_dir().unwrap_or_default();
+    let repo_sha = ratatoskr_exec::head_sha(&repo).await.ok();
+    if let Err(e) = store
+        .record_run_provenance(
+            run_id,
+            config_json.as_deref(),
+            Some(&graph_fingerprint(&repo)),
+            repo_sha.as_deref(),
+        )
+        .await
+    {
+        tracing::warn!("could not record run provenance: {e}");
+    }
+}
+
+/// A fingerprint of the orchestration that ran: `.ratatoskr/workflow.ts` plus every ruleset, in a
+/// fixed order.
+///
+/// Deliberately not a cryptographic digest and deliberately not `DefaultHasher`. Nothing here
+/// defends against a forged match — it answers "did the graph change between these two runs", and
+/// for that it only has to be stable across processes and releases. `DefaultHasher` guarantees
+/// neither, so a stored value would silently stop matching on a toolchain bump; FNV-1a is fixed
+/// because it is written here.
+fn graph_fingerprint(repo: &std::path::Path) -> String {
+    let mut sources: Vec<PathBuf> = std::fs::read_dir(repo.join(".ratatoskr/rules"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "ts"))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Sorted, because `read_dir` order is the filesystem's business and a fingerprint that depends
+    // on it would differ between two checkouts of identical files.
+    sources.sort();
+    sources.insert(0, repo.join(".ratatoskr/workflow.ts"));
+
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for path in sources {
+        // A missing file still contributes its name, so adding a `workflow.ts` changes the
+        // fingerprint even if it is empty.
+        for byte in path
+            .file_name()
+            .map(|n| n.as_encoded_bytes().to_vec())
+            .unwrap_or_default()
+            .iter()
+            .chain(std::fs::read(&path).unwrap_or_default().iter())
+        {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{hash:016x}")
+}
+
+/// A checkpoint with nothing to measure: no recorded input, no model turn behind it.
 async fn checkpoint<T: Serialize>(
     store: &Store,
     run_id: &str,
     node: &str,
     output: &T,
 ) -> Result<(), PlanError> {
-    let json = serde_json::to_string(output)?;
-    store.insert_checkpoint(run_id, node, &json).await?;
-    // The third structured event: a node produced output. Tool calls and model text come from
-    // the agent's observability hook; this is what says a node actually finished.
-    tracing::info!(kind = "checkpoint", node, bytes = json.len(), "checkpoint");
-    Ok(())
+    record(Record {
+        store,
+        run_id,
+        node,
+        output,
+        input: None,
+        iteration: None,
+        ledger: None,
+    })
+    .await
 }
 
 /// Load `.ratatoskr/workflow.ts` if present — the optional scriptable-orchestration override.
@@ -347,6 +501,8 @@ struct Run<'a> {
     engine: &'a Arc<ScriptEngine>,
     clarifier: &'a Arc<NodeClarifier>,
     context: &'a PluginContext,
+    /// Where this run's nodes report what their turns cost, drained as each checkpoint is written.
+    ledger: &'a Arc<RunLedger>,
 }
 
 /// What each plugin contributed for this run.
@@ -886,6 +1042,7 @@ pub async fn run_full(
         tracing::warn!("failed to record run status before the fork: {e}");
     }
 
+    let ledger = Arc::new(RunLedger::default());
     let run = Run {
         client,
         config,
@@ -894,6 +1051,7 @@ pub async fn run_full(
         issue,
         engine,
         clarifier: &clarifier,
+        ledger: &ledger,
         // The plan half's context, reused: `SessionStart` runs once per run, not once per stage.
         context: &plan_context,
     };
@@ -971,6 +1129,7 @@ async fn bookkeep_and_checkpoint(
         run_id,
         engine,
         clarifier,
+        ledger,
         context,
         ..
     } = run;
@@ -995,12 +1154,23 @@ async fn bookkeep_and_checkpoint(
         system_prompt: cfg.system_prompt,
         plugins: plugins_bookkeeper,
         files: cfg.files,
+        ledger: Some(Arc::clone(ledger)),
     };
+    let input_json = serde_json::to_string(&input)?;
     let out = node
         .run(input)
         .await
         .map_err(|e| PlanError::node("bookkeeper", e))?;
-    checkpoint(store, run_id, "bookkeeper", &out).await?;
+    record(Record {
+        store,
+        run_id,
+        node: "bookkeeper",
+        output: &out,
+        input: Some(input_json),
+        iteration: None,
+        ledger: Some(run.ledger),
+    })
+    .await?;
     Ok(out)
 }
 
@@ -1052,6 +1222,7 @@ pub async fn run_bookkeeper(
     let context =
         PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
             .await?;
+    let ledger = Arc::new(RunLedger::default());
     let run = Run {
         client,
         config,
@@ -1060,6 +1231,7 @@ pub async fn run_bookkeeper(
         issue: &input.issue.clone(),
         engine,
         clarifier: &clarifier,
+        ledger: &ledger,
         context: &context,
     };
     bookkeep_and_checkpoint(&run, input).await
@@ -1088,6 +1260,7 @@ async fn fork_and_converge(
         issue,
         engine,
         clarifier,
+        ledger,
         context,
     } = run;
     let repo_path: PathBuf = std::env::current_dir()
@@ -1122,6 +1295,7 @@ async fn fork_and_converge(
                     system_prompt: cfg.system_prompt,
                     plugins: plugins_redteam,
                     files: cfg.files,
+                    ledger: Some(Arc::clone(ledger)),
                 })
             }
             false => None,
@@ -1144,8 +1318,28 @@ async fn fork_and_converge(
     let red_team_out = rt_res.map_err(|e| PlanError::node("red_team", e))?;
     let (worktree, mut impl_out) = impl_res.map_err(|e| PlanError::node("implementer", e))?;
 
-    checkpoint(store, run_id, "red_team", &red_team_out).await?;
-    checkpoint(store, run_id, "implementer", &impl_out).await?;
+    record(Record {
+        store,
+        run_id,
+        node: "red_team",
+        output: &red_team_out,
+        input: None,
+        iteration: Some(1),
+        ledger: Some(ledger),
+    })
+    .await?;
+    record(Record {
+        store,
+        run_id,
+        node: "implementer",
+        output: &impl_out,
+        // The implementer drives a coding CLI over ACP rather than a model turn here, so the
+        // ledger has nothing for it; its row carries the iteration and the outcome.
+        input: Some(serde_json::to_string(&plan.analyst)?),
+        iteration: Some(1),
+        ledger: Some(ledger),
+    })
+    .await?;
 
     // Hard guard: red-team must have actually characterized the baseline. If the test command
     // produced no tests, converge would compare against empty data and falsely "converge".
@@ -1209,7 +1403,18 @@ async fn fork_and_converge(
                 return Err(PlanError::node("implementer", e));
             }
         };
-        checkpoint(store, run_id, "implementer", &impl_out).await?;
+        record(Record {
+            store,
+            run_id,
+            node: "implementer",
+            output: &impl_out,
+            // The diagnostic is what this iteration was actually given — the thing that explains
+            // why it did what it did, and the one input a replay would need.
+            input: Some(serde_json::to_string(&diagnostic)?),
+            iteration: Some(iterations + 1),
+            ledger: Some(ledger),
+        })
+        .await?;
         iterations += 1;
     };
 
@@ -1512,5 +1717,44 @@ mod agent_config_tests {
             },
         );
         assert!(classifier_enabled(&engine, &config));
+    }
+
+    #[test]
+    fn the_graph_fingerprint_tracks_the_scripts_and_nothing_else() {
+        let root = std::env::temp_dir().join(format!("ratatoskr-fp-{}", std::process::id()));
+        let rules = root.join(".ratatoskr/rules");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(rules.join("scout.ts"), "a").unwrap();
+        std::fs::write(rules.join("analyst.ts"), "b").unwrap();
+
+        let base = graph_fingerprint(&root);
+        assert_eq!(
+            base,
+            graph_fingerprint(&root),
+            "same inputs, same fingerprint"
+        );
+
+        // A file the fingerprint doesn't cover must not move it, or every run of an unchanged
+        // graph would look like a different experiment.
+        std::fs::write(root.join(".ratatoskr/notes.md"), "irrelevant").unwrap();
+        assert_eq!(base, graph_fingerprint(&root));
+
+        // Editing a ruleset changes the graph.
+        std::fs::write(rules.join("scout.ts"), "a2").unwrap();
+        let edited = graph_fingerprint(&root);
+        assert_ne!(base, edited);
+
+        // So does adding one — even one whose contents match an existing file, because the name
+        // is folded in alongside the bytes.
+        std::fs::write(rules.join("redteam.ts"), "a2").unwrap();
+        assert_ne!(edited, graph_fingerprint(&root));
+
+        // And so does introducing a workflow script where there was none.
+        let with_rules = graph_fingerprint(&root);
+        std::fs::write(root.join(".ratatoskr/workflow.ts"), "x").unwrap();
+        assert_ne!(with_rules, graph_fingerprint(&root));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

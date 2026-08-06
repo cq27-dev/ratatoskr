@@ -57,6 +57,9 @@ pub struct WorkflowContext {
     iterations: AtomicU32,
     /// What plugins contributed for this run, prefixed to each node's preamble.
     plugin_context: crate::PluginContext,
+    /// Where this run's nodes report what their turns cost. A scripted run records the same
+    /// telemetry as a built-in one — the script chooses the order, not what gets measured.
+    ledger: Arc<ratatoskr_agent::RunLedger>,
 }
 
 impl WorkflowContext {
@@ -72,6 +75,7 @@ impl WorkflowContext {
         let repo_path = std::env::current_dir()
             .map_err(|e| PlanError::node("workflow", NodeError::Failed(format!("cwd: {e}"))))?;
         Ok(Arc::new(Self {
+            ledger: Arc::new(ratatoskr_agent::RunLedger::default()),
             plugin_context,
             config: config.clone(),
             store: store.clone(),
@@ -214,6 +218,7 @@ async fn scout_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, St
         route: cfg.route,
         tools: cfg.tools,
         files: cfg.files,
+        ledger: Some(Arc::clone(&ctx.ledger)),
         policy: cfg.policy,
         max_turns: cfg.max_turns,
         // Node-to-node clarification is built-in-flow only for now; the scripted path opts out.
@@ -225,9 +230,7 @@ async fn scout_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, St
         .run(issue, &RunState::new(&ctx.run_id, None))
         .await
         .map_err(|e| e.to_string())?;
-    checkpoint(&ctx.store, &ctx.run_id, "scout", &out)
-        .await
-        .map_err(|e| e.to_string())?;
+    note(&ctx, "scout", &out, Some(arg)).await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -242,9 +245,7 @@ async fn memory_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, S
         .run(input, &RunState::new(&ctx.run_id, None))
         .await
         .map_err(|e| e.to_string())?;
-    checkpoint(&ctx.store, &ctx.run_id, "memory", &out)
-        .await
-        .map_err(|e| e.to_string())?;
+    note(&ctx, "memory", &out, Some(arg)).await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -266,6 +267,7 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
         route: cfg.route,
         tools: cfg.tools,
         files: cfg.files,
+        ledger: Some(Arc::clone(&ctx.ledger)),
         policy: cfg.policy,
         max_turns: cfg.max_turns,
         system_prompt: cfg.system_prompt,
@@ -275,9 +277,7 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
         .run(input, &RunState::new(&ctx.run_id, None))
         .await
         .map_err(|e| e.to_string())?;
-    checkpoint(&ctx.store, &ctx.run_id, "analyst", &out)
-        .await
-        .map_err(|e| e.to_string())?;
+    note(&ctx, "analyst", &out, Some(arg)).await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -298,6 +298,7 @@ fn build_red_team(ctx: &WorkflowContext) -> Result<RedTeamNode, PlanError> {
                 route: cfg.route,
                 tools: cfg.tools,
                 files: cfg.files,
+                ledger: Some(Arc::clone(&ctx.ledger)),
                 policy: cfg.policy,
                 max_turns: cfg.max_turns,
                 clarifier: None,
@@ -315,14 +316,37 @@ fn build_red_team(ctx: &WorkflowContext) -> Result<RedTeamNode, PlanError> {
     })
 }
 
+/// Checkpoint a scripted node's output, claiming whatever its turn cost from the run's ledger.
+///
+/// A binding's `arg` is already the node's serialized input — the script hands it across the seam as
+/// JSON — so recording it costs nothing beyond passing it along.
+async fn note<T: serde::Serialize>(
+    ctx: &WorkflowContext,
+    node: &str,
+    out: &T,
+    input: Option<String>,
+) -> Result<(), String> {
+    crate::record(crate::Record {
+        store: &ctx.store,
+        run_id: &ctx.run_id,
+        node,
+        output: out,
+        input,
+        // A script chooses its own order, so a checkpoint's position in the loop is whatever the
+        // script made it; counting them here would invent an iteration the script never declared.
+        iteration: None,
+        ledger: Some(&ctx.ledger),
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String, String> {
     ctx.guard()?;
     let node = build_red_team(&ctx).map_err(|e| e.to_string())?;
     let out = node.run().await.map_err(|e| e.to_string())?;
     // Checkpoint before the guard so a failed baseline stays inspectable.
-    checkpoint(&ctx.store, &ctx.run_id, "red_team", &out)
-        .await
-        .map_err(|e| e.to_string())?;
+    note(&ctx, "red_team", &out, None).await?;
     // The false-convergence guard is enforced here — the script cannot skip it.
     if !converge::test_command_ran(&out.failing_tests, &out.passing_tests, out.exit_code) {
         return Err(format!(
@@ -361,9 +385,7 @@ async fn implement_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String
     let node = build_implementer(&ctx, input.analyst);
     let (worktree, out) = node.run().await.map_err(|e| e.to_string())?;
     *ctx.worktree.lock().unwrap() = Some(worktree);
-    checkpoint(&ctx.store, &ctx.run_id, "implementer", &out)
-        .await
-        .map_err(|e| e.to_string())?;
+    note(&ctx, "implementer", &out, Some(arg)).await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -424,9 +446,9 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String,
         .iterate(&worktree, &diagnostic)
         .await
         .map_err(|e| e.to_string())?;
-    checkpoint(&ctx.store, &ctx.run_id, "implementer", &out)
-        .await
-        .map_err(|e| e.to_string())?;
+    // The diagnostic, not the binding's argument: the script does not author it, so it is the one
+    // thing that explains what this iteration was actually asked to fix.
+    note(&ctx, "implementer", &out, Some(diagnostic)).await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -485,6 +507,9 @@ pub async fn run_plan_scripted(
     ctx.store
         .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
         .await?;
+    // A scripted run is measured the same way a built-in one is; the script picks the order, not
+    // whether the run is comparable to another afterwards.
+    crate::record_provenance(&ctx.store, &ctx.run_id, &ctx.config).await;
     checkpoint(
         &ctx.store,
         &ctx.run_id,
@@ -530,6 +555,9 @@ pub async fn run_full_scripted(
     ctx.store
         .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
         .await?;
+    // A scripted run is measured the same way a built-in one is; the script picks the order, not
+    // whether the run is comparable to another afterwards.
+    crate::record_provenance(&ctx.store, &ctx.run_id, &ctx.config).await;
     checkpoint(
         &ctx.store,
         &ctx.run_id,
@@ -660,6 +688,7 @@ async fn bookkeep_scripted(
         route: cfg.route,
         tools: cfg.tools,
         files: cfg.files,
+        ledger: Some(Arc::clone(&ctx.ledger)),
         sink: ctx.sink.clone(),
         policy: cfg.policy,
         max_turns: cfg.max_turns,
@@ -671,7 +700,9 @@ async fn bookkeep_scripted(
         .run(input)
         .await
         .map_err(|e| PlanError::node("bookkeeper", e))?;
-    checkpoint(&ctx.store, &ctx.run_id, "bookkeeper", &out).await?;
+    note(ctx, "bookkeeper", &out, None)
+        .await
+        .map_err(|e| PlanError::node("bookkeeper", NodeError::Failed(e)))?;
     Ok(out)
 }
 
@@ -734,19 +765,30 @@ mod tests {
         ));
 
         store
-            .insert_checkpoint(
-                "r1",
-                "scout",
-                r#"{"related_items":[],"papertrail_summary":"s"}"#,
-            )
+            .insert_checkpoint(ratatoskr_store::CheckpointWrite {
+                run_id: "r1",
+                node_name: "scout",
+                output_json: r#"{"related_items":[],"papertrail_summary":"s"}"#,
+                ..Default::default()
+            })
             .await
             .unwrap();
         store
-            .insert_checkpoint("r1", "memory", r#"{"memories":[]}"#)
+            .insert_checkpoint(ratatoskr_store::CheckpointWrite {
+                run_id: "r1",
+                node_name: "memory",
+                output_json: r#"{"memories":[]}"#,
+                ..Default::default()
+            })
             .await
             .unwrap();
         store
-            .insert_checkpoint("r1", "analyst", r#"{"impact_summary":"i"}"#)
+            .insert_checkpoint(ratatoskr_store::CheckpointWrite {
+                run_id: "r1",
+                node_name: "analyst",
+                output_json: r#"{"impact_summary":"i"}"#,
+                ..Default::default()
+            })
             .await
             .unwrap();
 
@@ -770,7 +812,12 @@ mod tests {
         let cp = r#"{"worktree_path":"/w","failing_tests":[],"passing_tests":["t"],"exit_code":0}"#;
         for _ in 0..3 {
             store
-                .insert_checkpoint("r1", "implementer", cp)
+                .insert_checkpoint(ratatoskr_store::CheckpointWrite {
+                    run_id: "r1",
+                    node_name: "implementer",
+                    output_json: cp,
+                    ..Default::default()
+                })
                 .await
                 .unwrap();
         }

@@ -110,7 +110,7 @@ pub struct BookkeeperOutput {
 }
 
 /// Everything the bookkeeper composes from.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct BookkeeperInput {
     pub issue: String,
     pub analyst: AnalystOutput,
@@ -147,6 +147,8 @@ pub struct BookkeeperNode {
     pub system_prompt: Option<String>,
     /// What the plugins this node binds contribute to it.
     pub plugins: crate::NodePlugins,
+    /// Where this node reports what its turn cost, for the checkpoint the executor writes.
+    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
     /// The repository its built-in file tools read within.
     pub files: Option<std::path::PathBuf>,
 }
@@ -181,6 +183,7 @@ impl BookkeeperNode {
             observer: self.plugins.observer.clone(),
             skills: crate::skills::loaded(&self.plugins.skills),
             files: self.files.clone(),
+            ledger: self.ledger.clone(),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("bookkeeper compose failed: {e}")))?;

@@ -8,14 +8,16 @@ pub mod files;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use ratatoskr_core::{ModelRoute, ToolDecision, ToolPolicy};
+use ratatoskr_core::{ModelRoute, NodeTelemetry, TokenUsage, ToolDecision, ToolPolicy};
 use ratatoskr_mcp::ToolSet;
 use rig_agent::AgentBuilder;
 use rig_agent::agent::{
-    Agent, AgentHook, HookContext, ModelTurnAction, ModelTurnFinished, NoToolConfig, OutputMode,
-    ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent, WithBuilderTools,
+    Agent, AgentHook, CompletionResponseEvent, HookContext, ModelTurnAction, ModelTurnFinished,
+    NoToolConfig, ObservationAction, OutputMode, ToolCall, ToolCallAction, ToolResultAction,
+    ToolResultEvent, WithBuilderTools,
 };
 use rig_agent::completion::Prompt;
 use rig_agent::tool::{DynamicTool, ToolExecutionError};
@@ -219,6 +221,40 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+/// Accumulates what the provider said each model call cost.
+///
+/// It counts on `on_completion_response`, not `on_model_turn_finished`, because a turn a hook later
+/// rejects and retries was still billed. Counting accepted turns only would report a number smaller
+/// than the invoice, which is the wrong direction for anything that decides whether to keep going.
+///
+/// The total is read back after the run, including when the run failed: the calls made before the
+/// failure cost the same as the ones before a success.
+#[derive(Default)]
+struct UsageHook {
+    total: Arc<Mutex<TokenUsage>>,
+    calls: Arc<AtomicU64>,
+}
+
+impl AgentHook for UsageHook {
+    async fn on_completion_response(
+        &self,
+        _ctx: &HookContext,
+        event: CompletionResponseEvent<'_>,
+    ) -> ObservationAction {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.total
+            .lock()
+            .expect("usage mutex poisoned")
+            .add(TokenUsage {
+                input_tokens: event.usage.input_tokens,
+                output_tokens: event.usage.output_tokens,
+                cached_input_tokens: event.usage.cached_input_tokens,
+                cache_creation_input_tokens: event.usage.cache_creation_input_tokens,
+            });
+        ObservationAction::Continue
     }
 }
 
@@ -676,6 +712,55 @@ impl AgentHook for PluginHook {
     }
 }
 
+/// Where a run's node turns report what they cost.
+///
+/// A node's `run` returns its typed output and nothing else — the graph vocabulary is about what a
+/// node produces, and threading measurements through every node's return type would put bookkeeping
+/// in the trait that models the work. Instead the executor creates one ledger per run, hands it to
+/// each node, and drains it when it writes that node's checkpoint.
+///
+/// Entries are claimed oldest-first per node name, which is what makes the converge loop work: the
+/// implementer runs once per iteration, and each checkpoint takes the turn that preceded it. The
+/// fork's concurrent nodes have different names, so they never contend for the same entry.
+#[derive(Default)]
+pub struct RunLedger {
+    entries: Mutex<Vec<(String, NodeTelemetry)>>,
+}
+
+impl RunLedger {
+    /// Record what one node turn cost.
+    pub fn record(&self, node: &str, telemetry: NodeTelemetry) {
+        self.entries
+            .lock()
+            .expect("ledger mutex poisoned")
+            .push((node.to_string(), telemetry));
+    }
+
+    /// Claim the oldest unclaimed entry for `node`, if it made a model turn at all. A node that
+    /// drives a coding CLI rather than a model (the implementer) never records one, so `None` here
+    /// is ordinary and means "nothing to report", not "something went missing".
+    pub fn take(&self, node: &str) -> Option<NodeTelemetry> {
+        let mut entries = self.entries.lock().expect("ledger mutex poisoned");
+        let at = entries.iter().position(|(name, _)| name == node)?;
+        Some(entries.remove(at).1)
+    }
+
+    /// The names of turns nobody claimed.
+    ///
+    /// Always empty on a finished run. Anything left means a node ran a model under one name and
+    /// was checkpointed under another, and its cost went in the bin — the exact failure this whole
+    /// table exists to stop, and one that is otherwise invisible because a dropped number reads
+    /// identically to a node that never called a model.
+    pub fn unclaimed(&self) -> Vec<String> {
+        self.entries
+            .lock()
+            .expect("ledger mutex poisoned")
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+}
+
 /// One node's structured agent turn: what to run it on, what it may call, and the gates around it.
 ///
 /// A parameter struct because these travel together from every node, and as a positional list
@@ -699,6 +784,8 @@ pub struct NodeRun<'a> {
     pub skills: Vec<Skill>,
     /// The repository the node's built-in file tools read within; `None` when it has none.
     pub files: Option<std::path::PathBuf>,
+    /// Where this turn reports what it cost; `None` outside a run that records checkpoints.
+    pub ledger: Option<Arc<RunLedger>>,
 }
 
 /// Run one node's turn with an output schema, so its final answer is structured JSON.
@@ -730,6 +817,7 @@ where
 {
     let NodeRun {
         node,
+        route,
         preamble,
         question,
         tools,
@@ -740,8 +828,9 @@ where
         observer,
         skills,
         files,
-        ..
+        ledger,
     } = run;
+    let model_name = format!("{}/{}", route.provider, route.model);
     // `SubagentStart` opens the node's conversation, `UserPromptSubmit` rides with the prompt —
     // where each lands in the format, and a cleaner place for a plugin to speak than a tool result.
     let (preamble, question) = match &observer {
@@ -763,6 +852,10 @@ where
         // Log tool calls + model text for every node run; added first so it observes calls before
         // the clarification/ruleset hooks can skip them.
         .add_hook(ObservabilityHook);
+    // Count every model call, including ones a later hook rejects — all of them are billed.
+    let usage = UsageHook::default();
+    let (total, calls) = (Arc::clone(&usage.total), Arc::clone(&usage.calls));
+    builder = builder.add_hook(usage);
     // Answer `ask` calls in-conversation. Added before the ruleset hook so an `ask` is handled here
     // (and short-circuits) rather than reaching the ruleset gate.
     if let Some(clarifier) = clarifier {
@@ -790,10 +883,42 @@ where
     // Tag every log line for this run — the hook's tool-call/text lines and rig-agent's own turn
     // logs — with the node name, so a run's agents are distinguishable in the logs. `prompt()` is
     // IntoFuture (not Future), so instrument the awaiting block rather than the request.
+    // Field names follow the OpenTelemetry GenAI semantic conventions. Those are still unstable and
+    // not worth an SDK dependency yet, but naming to match now makes adopting one a layer swap
+    // rather than a rename of every field a dashboard reads.
+    let started = std::time::Instant::now();
     let answer = async move { agent.prompt(&question).await }
-        .instrument(tracing::info_span!("agent", node))
+        .instrument(tracing::info_span!(
+            "agent",
+            node,
+            "gen_ai.operation.name" = "invoke_agent",
+            "gen_ai.agent.name" = node,
+            "gen_ai.request.model" = %model_name,
+        ))
         .await
         .map_err(|e| AgentError::Prompt(e.to_string()));
+
+    if let Some(ledger) = &ledger {
+        let telemetry = NodeTelemetry {
+            model: Some(model_name),
+            duration_ms: Some(started.elapsed().as_millis() as u64),
+            usage: *total.lock().expect("usage mutex poisoned"),
+            turns: Some(calls.load(Ordering::Relaxed)),
+            // A node that failed still spent what it spent, and why it failed is the most useful
+            // thing about its row.
+            error: answer.as_ref().err().map(ToString::to_string),
+        };
+        tracing::info!(
+            kind = "usage",
+            node,
+            "gen_ai.usage.input_tokens" = telemetry.usage.input_tokens,
+            "gen_ai.usage.output_tokens" = telemetry.usage.output_tokens,
+            "gen_ai.usage.cached_input_tokens" = telemetry.usage.cached_input_tokens,
+            duration_ms = telemetry.duration_ms,
+            "node usage"
+        );
+        ledger.record(node, telemetry);
+    }
 
     // The node is over either way. A plugin told it was starting has to be told it stopped, or a
     // pairing it opened there is never closed.
@@ -883,5 +1008,53 @@ mod tests {
         ));
         assert!(parse_provider("anthropic").is_ok());
         assert!(parse_provider("moonshot").is_ok());
+    }
+
+    #[test]
+    fn the_ledger_hands_each_checkpoint_its_own_turn() {
+        let ledger = RunLedger::default();
+        let cost = |n: u64| NodeTelemetry {
+            usage: TokenUsage {
+                input_tokens: n,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // The converge loop runs the implementer repeatedly; each checkpoint must claim the turn
+        // that preceded it, not the newest one.
+        ledger.record("implementer", cost(1));
+        ledger.record("red_team", cost(9));
+        ledger.record("implementer", cost(2));
+
+        assert_eq!(ledger.take("implementer").unwrap().usage.input_tokens, 1);
+        assert_eq!(ledger.take("implementer").unwrap().usage.input_tokens, 2);
+        assert!(
+            ledger.take("implementer").is_none(),
+            "a claimed entry is not handed out twice"
+        );
+        // A different node's entry is untouched by the drain of another's.
+        assert_eq!(ledger.take("red_team").unwrap().usage.input_tokens, 9);
+        // A node that never ran a model turn reports nothing rather than someone else's numbers.
+        assert!(ledger.take("bookkeeper").is_none());
+    }
+
+    #[test]
+    fn usage_accumulates_across_a_turn() {
+        let mut total = TokenUsage::default();
+        total.add(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 1,
+            cached_input_tokens: 8,
+            cache_creation_input_tokens: 2,
+        });
+        total.add(TokenUsage {
+            input_tokens: 5,
+            output_tokens: 3,
+            ..Default::default()
+        });
+        assert_eq!(total.input_tokens, 15);
+        assert_eq!(total.output_tokens, 4);
+        assert_eq!(total.cached_input_tokens, 8);
+        assert_eq!(total.cache_creation_input_tokens, 2);
     }
 }

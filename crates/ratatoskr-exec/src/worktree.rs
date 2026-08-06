@@ -197,6 +197,15 @@ pub async fn prune(repo_root: &Path) -> Result<(), ExecError> {
     Ok(())
 }
 
+/// The commit `repo_root` is currently on.
+///
+/// What a run was measured against: two runs of the same graph on different commits are not
+/// comparable, and nothing else in a checkpoint says which tree the work started from.
+pub async fn head_sha(repo_root: &Path) -> Result<String, ExecError> {
+    let out = git(repo_root, "rev-parse HEAD", &["rev-parse", "HEAD"]).await?;
+    Ok(out.trim().to_string())
+}
+
 /// A `git diff --stat` summary of the worktree's changes (tracked + newly-added, via intent-to-add).
 pub async fn diff_stat(worktree: &WorktreePath) -> Result<String, ExecError> {
     let cwd = worktree.as_path();

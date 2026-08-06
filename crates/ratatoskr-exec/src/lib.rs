@@ -10,8 +10,9 @@ pub use acp::{AcpError, AcpTurnResult};
 pub use sandbox::{ExecOutput, Mount, SandboxError, SandboxSpec, run as sandbox_run};
 pub use worktree::{
     ManagedWorktree, WorktreePath, WorktreeSurvey, create as create_worktree,
-    delete_branch as delete_worktree_branch, managed_branches as managed_worktree_branches,
-    prune as prune_worktrees, remove as remove_worktree, survey as survey_worktrees,
+    delete_branch as delete_worktree_branch, head_sha,
+    managed_branches as managed_worktree_branches, prune as prune_worktrees,
+    remove as remove_worktree, survey as survey_worktrees,
 };
 
 /// Errors from the worktree module (git subprocess failures).

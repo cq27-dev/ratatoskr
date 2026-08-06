@@ -67,6 +67,8 @@ pub struct RedTeamClassifier {
     pub system_prompt: Option<String>,
     /// What the plugins this node binds contribute to it.
     pub plugins: crate::NodePlugins,
+    /// Where this node reports what its turn cost, for the checkpoint the executor writes.
+    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
     /// The repository its built-in file tools read within.
     pub files: Option<std::path::PathBuf>,
 }
@@ -100,6 +102,7 @@ impl RedTeamClassifier {
             observer: self.plugins.observer.clone(),
             skills: crate::skills::loaded(&self.plugins.skills),
             files: self.files.clone(),
+            ledger: self.ledger.clone(),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("red-team classifier failed: {e}")))?;
