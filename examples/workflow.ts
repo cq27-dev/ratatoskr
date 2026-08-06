@@ -14,6 +14,16 @@
 //   redTeam() -> RedTeamOutput                     // baseline; throws if it ran no tests
 //   implement({analyst}) -> ImplementerOutput      // creates the worktree (once)
 //   iterate({}) -> ImplementerOutput               // re-drives the CLI on that worktree
+//   verify({analyst}) -> VerifyResult              // reviews the diff against the plan
+//
+// `verify()` returns { configured, unavailable, findings, blocking, needsReplan }. Rust applies
+// `[implementer] verify_threshold` — a script decides *whether* to review and what to do about
+// findings, never what counts as blocking. `needsReplan` means a blocking finding faults the PLAN,
+// so the useful response is `analyze({...., previous, findings})` before `iterate()`, rather than
+// re-driving the implementer at a requirement already shown to be wrong.
+//
+// A run that calls verify() and returns with blocking findings standing does NOT converge: the
+// terminal status is inferred from the verifier checkpoint, not from what the script returns.
 //   isConverged({baseline, post}) -> boolean
 //   testCommandRan(output) -> boolean
 //   newlyIntroducedFailures({baseline, post}) -> string[]
