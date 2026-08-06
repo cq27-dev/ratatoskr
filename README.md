@@ -29,6 +29,17 @@ scout ──→ memory ──→ analyst ─┬─→ red-team ─────�
    failures (`converged`) or the iteration budget runs out (`max_iterations_reached`).
 6. **bookkeeper** distils one durable learning and writes it to rag-rat via `memory_create`.
 
+Converge only believes a test run the change did not referee. An iteration that touches the tests,
+their runner config (`conftest.py`, `pytest.ini`, `jest.config.*`, `Cargo.toml`, `package.json`, …)
+or a file the runner auto-loads is sent back to revert it, named file by name — passing by editing
+what decides passing is the one shortcut the gate exists to refuse. A task that is *meant* to change
+tests says so before the work starts, in the ruleset:
+
+```ts
+// .ratatoskr/rules/_defaults.ts
+defineDefaults({ mayModifyTests: ["crates/foo/tests"] });
+```
+
 Every node's output is validated against its JSON Schema and checkpointed before the next node
 runs, so a failure stops the run with `status = failed` attributed to the node that failed, and the
 work up to that point is inspectable.

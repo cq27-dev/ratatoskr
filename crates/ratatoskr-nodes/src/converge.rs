@@ -29,6 +29,95 @@ pub fn test_command_ran(failing: &[String], passing: &[String], exit_code: i32) 
     !failing.is_empty() || !passing.is_empty() || exit_code == 0
 }
 
+/// Runner configuration, by exact filename. `Cargo.toml` and `package.json` are referee files only
+/// in part (`[dev-dependencies]`, `[[test]]`, `scripts`), but the touched-file list is path-granular
+/// — any touch counts, so a run that legitimately bumps a dependency needs the exemption too.
+const RUNNER_FILES: &[&str] = &[
+    // pytest imports conftest.py without being asked: the BenchJack exploit is a new one that
+    // rewrites every test's reported outcome.
+    "conftest.py",
+    "pytest.ini",
+    "tox.ini",
+    "noxfile.py",
+    "setup.cfg",
+    "pyproject.toml",
+    "Cargo.toml",
+    "package.json",
+    "Makefile",
+    "justfile",
+];
+
+/// Runner config whose extension varies (`jest.config.ts`, `.mocharc.yml`, ...).
+const RUNNER_PREFIXES: &[&str] = &[
+    "jest.config.",
+    "vitest.config.",
+    "karma.conf.",
+    "playwright.config.",
+    ".mocharc.",
+];
+
+/// Filename fragments that name a test across the ecosystems we run: `foo_test.go`,
+/// `foo.test.ts`, `foo.spec.js`, `test_foo.py`.
+const TEST_INFIXES: &[&str] = &[".test.", ".spec.", "_test.", "_spec."];
+
+/// Directory names whose contents are tests.
+const TEST_DIRS: &[&str] = &["test", "tests", "spec", "specs", "__tests__"];
+
+/// The files the implementer touched that are part of the *referee* — the tests themselves and the
+/// machinery that decides what they report. Empty means the iteration left the referee alone.
+///
+/// This must be checked before the test comparison is believed: once the referee moves, the
+/// passing/failing sets describe a bar the change wrote for itself. "No new failing tests" is
+/// cheapest to satisfy by making the tests stop failing some other way.
+///
+/// Two known ceilings, both structural:
+/// - *Auto-loaded* files can't be enumerated. `conftest.py` is the known one; every runner has its
+///   own auto-load surface (plugin entry points, `sitecustomize.py`, a shell rc the sandbox reads).
+///   This narrows the class, it does not close it.
+/// - Detection is path-granular, so a section-level distinction (`[dependencies]` vs
+///   `[dev-dependencies]`) can't be made. Manifests count as referee touches outright.
+///
+/// `exempt` is the task's up-front declaration (`defineDefaults({ mayModifyTests: [...] })`),
+/// matched as a path prefix at segment boundaries.
+pub fn referee_touches(touched: &[String], exempt: &[String]) -> Vec<String> {
+    touched
+        .iter()
+        .filter(|p| is_referee(p) && !exempt.iter().any(|e| under(p, e)))
+        .cloned()
+        .collect()
+}
+
+/// What to send back when the iteration moved the referee. Names the offending files *and* the
+/// exemption, so a task that legitimately writes tests but never declared it learns how to instead
+/// of churning silently to the iteration wall.
+pub fn referee_correction(referee: &[String]) -> String {
+    format!(
+        "You changed files that decide whether this task is done: {}. Revert them and make the \
+         change satisfy the tests as they stand — editing the tests, their runner config, or \
+         anything the runner auto-loads is not a way to pass. If this task really is supposed to \
+         change them, that has to be declared up front, before the work, in \
+         .ratatoskr/rules/*.ts with `defineDefaults({{ mayModifyTests: [\"<path>\"] }})`.",
+        referee.join(", ")
+    )
+}
+
+/// Whether `path` is at or under `prefix`, by segment — so exempting `tests` does not also exempt
+/// `tests_helper.rs`.
+fn under(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+fn is_referee(path: &str) -> bool {
+    let mut segments = path.split('/').collect::<Vec<_>>();
+    let file = segments.pop().unwrap_or(path);
+    segments.iter().any(|d| TEST_DIRS.contains(d))
+        || RUNNER_FILES.contains(&file)
+        || RUNNER_PREFIXES.iter().any(|p| file.starts_with(p))
+        || file.starts_with("test_")
+        || TEST_INFIXES.iter().any(|i| file.contains(i))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,6 +148,53 @@ mod tests {
             &v(&["a::pre_existing"]),
             &v(&["a::pre_existing", "b::broke"])
         ));
+    }
+
+    #[test]
+    fn a_touched_referee_is_named() {
+        let touched = v(&[
+            "src/lib.rs",
+            "crates/foo/tests/api.rs",
+            "conftest.py",
+            "pytest.ini",
+            "Cargo.toml",
+            "package.json",
+            "jest.config.ts",
+            "app/foo.test.ts",
+            "app/test_foo.py",
+        ]);
+        let mut found = referee_touches(&touched, &[]);
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "Cargo.toml",
+                "app/foo.test.ts",
+                "app/test_foo.py",
+                "conftest.py",
+                "crates/foo/tests/api.rs",
+                "jest.config.ts",
+                "package.json",
+                "pytest.ini",
+            ]
+        );
+        // Ordinary source is not the referee.
+        assert!(referee_touches(&v(&["src/lib.rs"]), &[]).is_empty());
+    }
+
+    #[test]
+    fn the_declared_exemption_covers_its_subtree_and_nothing_else() {
+        let touched = v(&["crates/foo/tests/api.rs", "crates/bar/tests/api.rs"]);
+        assert_eq!(
+            referee_touches(&touched, &v(&["crates/foo/tests"])),
+            ["crates/bar/tests/api.rs"]
+        );
+        // A prefix that isn't a path boundary doesn't exempt: `tests` ≠ `tests_helper`.
+        assert_eq!(
+            referee_touches(&v(&["tests_helper/conftest.py"]), &v(&["tests"])),
+            ["tests_helper/conftest.py"]
+        );
+        assert!(referee_touches(&touched, &v(&["crates"])).is_empty());
     }
 
     #[test]
