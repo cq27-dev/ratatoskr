@@ -45,6 +45,7 @@ globalThis.__staticConfig = function() {
             tools: a.tools || null,
             maxTurns: (typeof a.maxTurns === 'number') ? a.maxTurns : null,
             systemPrompt: (typeof a.systemPrompt === 'string') ? a.systemPrompt : null,
+            systemPromptFile: (typeof a.systemPromptFile === 'string') ? a.systemPromptFile : null,
             plugins: (a.plugins === undefined) ? null : a.plugins,
             hasOnToolCall: typeof a.onToolCall === 'function'
         };
@@ -146,6 +147,14 @@ pub struct AgentRuleset {
     /// Replaces the node's built-in preamble when set.
     #[serde(default, rename = "systemPrompt")]
     pub system_prompt: Option<String>,
+    /// A file to read the preamble from instead, resolved against the rules directory.
+    ///
+    /// The same override as `systemPrompt`, for a prompt long enough that inlining it as a TS
+    /// string literal is how it stops being editable — which is the state the built-in prompts were
+    /// in before they moved to files. Read at load, so a missing file is a startup error rather
+    /// than a node that runs with its built-in preamble and no indication why.
+    #[serde(default, rename = "systemPromptFile")]
+    pub system_prompt_file: Option<String>,
     /// Which plugins this node gets; `None` means "whatever the defaults say".
     #[serde(default)]
     pub plugins: Option<PluginRule>,
@@ -222,8 +231,25 @@ impl ScriptEngine {
             })
             .await?;
 
-        let static_config: StaticConfig = serde_json::from_str(&agents_json)
+        let mut static_config: StaticConfig = serde_json::from_str(&agents_json)
             .map_err(|e| ScriptError::Eval(format!("static config parse: {e}")))?;
+        for (node, agent) in &mut static_config.agents {
+            let Some(file) = agent.system_prompt_file.clone() else {
+                continue;
+            };
+            if agent.system_prompt.is_some() {
+                return Err(ScriptError::Eval(format!(
+                    "defineAgent(\"{node}\") sets both systemPrompt and systemPromptFile; \
+                     one of them would be silently ignored"
+                )));
+            }
+            // Beside the ruleset that names it, so a workflow's prompts live with the rules that
+            // select them rather than somewhere a reader has to be told about.
+            let path = rules_dir.join(&file);
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| ScriptError::Io(path.display().to_string(), e))?;
+            agent.system_prompt = Some(text);
+        }
 
         Ok(Arc::new(ScriptEngine {
             _runtime: runtime,
@@ -626,5 +652,72 @@ mod tests {
         let bk = engine.ruleset("bookkeeper").unwrap();
         assert!(bk.config().model.is_none());
         assert!(bk.config().system_prompt.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_ruleset_can_read_its_preamble_from_a_file_beside_it() {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-prompt-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("research-analyst.md"),
+            "You are analysing a question, not planning a change.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("analyst.ts"),
+            r#"defineAgent("analyst", { systemPromptFile: "research-analyst.md" });"#,
+        )
+        .unwrap();
+
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let prompt = engine
+            .ruleset("analyst")
+            .unwrap()
+            .config()
+            .system_prompt
+            .clone();
+        assert_eq!(
+            prompt.as_deref(),
+            Some("You are analysing a question, not planning a change.\n"),
+            "the file's contents become the preamble, same as an inline systemPrompt"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_missing_prompt_file_and_a_double_declaration_are_both_startup_errors() {
+        let dir = std::env::temp_dir().join(format!("ratatoskr-prompt-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A missing file must not leave the node running its built-in preamble with no indication.
+        std::fs::write(
+            dir.join("a.ts"),
+            r#"defineAgent("analyst", { systemPromptFile: "gone.md" });"#,
+        )
+        .unwrap();
+        let err = match ScriptEngine::load(&dir).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a missing prompt file must fail at load"),
+        };
+        assert!(err.contains("gone.md"), "{err}");
+
+        // Both set is ambiguous, and silently preferring one is how a prompt edit does nothing.
+        std::fs::write(
+            dir.join("a.ts"),
+            r#"defineAgent("analyst", { systemPrompt: "inline", systemPromptFile: "x.md" });"#,
+        )
+        .unwrap();
+        let err = match ScriptEngine::load(&dir).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("declaring both must fail"),
+        };
+        assert!(
+            err.contains("both systemPrompt and systemPromptFile"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

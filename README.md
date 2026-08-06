@@ -53,7 +53,14 @@ async function plan(input) { /* compose the node bindings */ }
 ```
 
 A workflow that introduces a node of its own lists it in `nodes`, so `.ratatoskr/rules/<node>.ts`
-is accepted rather than rejected as targeting something that does not exist.
+is accepted rather than rejected as targeting something that does not exist. A node's preamble is
+replaced per workflow through the ruleset that already governs it — inline for a short one, or from
+a file beside the ruleset when it is long enough that a TS string literal stops being editable:
+
+```ts
+// .ratatoskr/rules/analyst.ts
+defineAgent("analyst", { systemPromptFile: "research-analyst.md" });
+```
 
 With one defined it is used; with several, name one with `--workflow <name>` — picking for you is
 the overseer's job, and choosing the alphabetically-first would look like a decision while being an
