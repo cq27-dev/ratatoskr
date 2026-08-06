@@ -26,6 +26,15 @@ pub struct AnalystInput {
     pub issue: String,
     pub scout: ScoutOutput,
     pub memory: MemoryOutput,
+    /// What the context node distilled: what a planner needs to know before starting.
+    ///
+    /// Defaulted, so a script still composing `scout` and `memory` by hand keeps working — it just
+    /// hands over the evidence without the synthesis.
+    #[serde(default)]
+    pub brief: String,
+    /// What this task must respect, each traced to the memory it was read from.
+    #[serde(default)]
+    pub constraints: Vec<crate::context::Constraint>,
     /// The plan being revised, when this is a revision. The analyst amends rather than re-derives:
     /// a blank sheet would discard the reasoning that was right along with the part that was not.
     #[serde(default)]
@@ -43,6 +52,21 @@ impl AnalystInput {
             issue,
             scout,
             memory,
+            previous: None,
+            findings: Vec::new(),
+            brief: String::new(),
+            constraints: Vec::new(),
+        }
+    }
+
+    /// A first plan from a context node's output.
+    pub fn from_context(issue: String, context: crate::context::ContextOutput) -> Self {
+        AnalystInput {
+            issue,
+            scout: context.scout,
+            memory: context.memory,
+            brief: context.brief,
+            constraints: context.constraints,
             previous: None,
             findings: Vec::new(),
         }
@@ -178,6 +202,22 @@ fn render_prompt(input: &AnalystInput) -> String {
         );
     }
     let _ = write!(s, "ISSUE:\n{}\n\n", input.issue);
+    // First, because it is the one section written for a reader about to plan rather than a record
+    // of what was found.
+    if !input.brief.is_empty() {
+        let _ = write!(s, "WHAT BEARS ON THIS:\n{}\n\n", input.brief);
+    }
+    if !input.constraints.is_empty() {
+        s.push_str("CONSTRAINTS THIS MUST RESPECT:\n");
+        for c in &input.constraints {
+            let from = match c.from_memory_id.as_str() {
+                "" => String::new(),
+                id => format!(" [{id}]"),
+            };
+            let _ = writeln!(s, "- {}{from}", c.says);
+        }
+        s.push('\n');
+    }
     if let Some(previous) = &input.previous {
         let _ = write!(s, "YOUR PREVIOUS PLAN:\n{}\n", previous.impact_summary);
         if !previous.requirements.is_empty() {
@@ -280,5 +320,55 @@ mod tests {
         // question, and reading it as a signal that code changes is how the fork ran on a run that
         // produced an empty diff.
         assert_eq!(out.touched.len(), 2);
+    }
+
+    #[test]
+    fn the_brief_and_its_constraints_lead_the_analyst_prompt() {
+        use crate::context::{Constraint, ContextOutput};
+        let context = ContextOutput {
+            brief: "The store migrates by ALTER, not by rewriting schema.sql.".into(),
+            constraints: vec![
+                Constraint {
+                    says: "a new column needs both schema.sql and ADDED_COLUMNS".into(),
+                    from_memory_id: "mem_1".into(),
+                },
+                Constraint {
+                    says: "read from the code, not a memory".into(),
+                    from_memory_id: String::new(),
+                },
+            ],
+            scout: ScoutOutput {
+                related_items: Vec::new(),
+                papertrail_summary: "nothing in the tracker".into(),
+            },
+            memory: MemoryOutput {
+                memories: Vec::new(),
+            },
+        };
+        let input = AnalystInput::from_context("Add repo_sha.".into(), context);
+        let prompt = render_prompt(&input);
+
+        // The distillation is written for a reader about to plan; the record of what was found is
+        // not, so it comes first.
+        let brief_at = prompt.find("WHAT BEARS ON THIS").unwrap();
+        assert!(brief_at < prompt.find("SCOUT SUMMARY").unwrap());
+        assert!(prompt.contains("ALTER, not by rewriting"));
+
+        // A constraint carries its source so the analyst can check the wording against it.
+        assert!(prompt.contains("[mem_1]"), "{prompt}");
+        // One drawn from the code has no id to cite, and does not get an empty bracket.
+        assert!(!prompt.contains("[]"), "{prompt}");
+    }
+
+    #[test]
+    fn a_hand_composed_analyst_input_still_works_without_a_brief() {
+        // A script that composes `scout()` and `memory()` itself hands over the evidence with no
+        // synthesis. That has to keep working, not fail schema validation.
+        let raw = r#"{"issue":"x","scout":{"papertrail_summary":"s"},"memory":{"memories":[]}}"#;
+        let input: AnalystInput = serde_json::from_str(raw).unwrap();
+        assert!(input.brief.is_empty());
+        assert!(input.constraints.is_empty());
+        let prompt = render_prompt(&input);
+        assert!(!prompt.contains("WHAT BEARS ON THIS"));
     }
 }

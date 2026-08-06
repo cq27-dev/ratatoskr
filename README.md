@@ -11,7 +11,7 @@ of starting from zero.
 ```
              ┌─────────── informs the next run ───────────┐
              ▼                                            │
-scout ──→ memory ──→ analyst ─┬─→ red-team ─────┬─→ bookkeeper
+context ──→ analyst ─┬─→ red-team ─────┬─→ bookkeeper
                               └─→ implementer ──┘
                                     ↑        │
                                     └────────┘
