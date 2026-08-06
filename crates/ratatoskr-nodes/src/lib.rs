@@ -987,6 +987,20 @@ pub struct RunOutcome {
     pub bookkeeper: Option<BookkeeperOutput>,
 }
 
+/// The run's friction, read back from its checkpoints.
+///
+/// Best-effort: a store read that fails costs the bookkeeper its richest input, and failing the
+/// run over it would discard completed work to record less about it.
+async fn friction_of(store: &Store, run_id: &str) -> bookkeeper::RunFriction {
+    match store.checkpoints_for_run(run_id).await {
+        Ok(checkpoints) => bookkeeper::RunFriction::from_checkpoints(&checkpoints),
+        Err(e) => {
+            tracing::warn!("could not read the run's checkpoints for bookkeeping: {e}");
+            bookkeeper::RunFriction::default()
+        }
+    }
+}
+
 /// Whether to run the fork at all.
 ///
 /// The analyst owns this call — it is the node that turns a task into a plan, so it is the one that
@@ -1134,12 +1148,15 @@ pub async fn run_full(
         status,
         RunStatus::Converged | RunStatus::MaxIterationsReached
     ) {
+        // Read back what the run's own checkpoints recorded about its path. The same source the
+        // `bookkeep` replay reads, so a replay composes from exactly what the live run did.
         let input = BookkeeperInput {
             issue: issue.to_string(),
             analyst: plan.analyst.clone(),
             implementer: implementer.clone(),
             iterations,
             converged: status == RunStatus::Converged,
+            friction: friction_of(store, run_id).await,
         };
         match bookkeep_and_checkpoint(&run, input).await {
             Ok(bk) => {
@@ -1274,6 +1291,7 @@ pub async fn run_bookkeeper(
         implementer,
         iterations,
         converged,
+        friction: bookkeeper::RunFriction::from_checkpoints(&checkpoints),
     };
     let context =
         PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
