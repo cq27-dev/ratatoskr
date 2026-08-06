@@ -158,10 +158,7 @@ pub async fn ask(
 ) -> Result<String, AgentError> {
     match parse_provider(&route.provider)? {
         Provider::Anthropic => {
-            let client = anthropic::Client::from_env().map_err(|source| AgentError::Provider {
-                provider: "anthropic".to_string(),
-                source,
-            })?;
+            let client = anthropic_client(&uuid::Uuid::new_v4().to_string())?;
             run(
                 caching(client.completion_model(&route.model)),
                 preamble,
@@ -302,6 +299,84 @@ const TOOL_USE_GUIDANCE: &str = "\n\n## Calling tools\n\nWhen you need several t
     them depends on another's result, ask for them all in the same turn rather than one at a time. \
     Reading four files is one turn with four calls, not four turns. Only wait for a result when \
     what you do next actually depends on it.";
+
+/// The headers one request carries: this deployment's static set, plus the session id when the
+/// endpoint keys a session off one.
+///
+/// Separate from building the client so it can be checked without a provider or a network. The
+/// failure worth catching is a header that never reaches the wire, and that is decided here.
+fn endpoint_headers(
+    endpoint: Option<&ratatoskr_core::EndpointConfig>,
+    session: &str,
+) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    for (name, value) in endpoint.map(|e| &e.headers).into_iter().flatten() {
+        match (
+            http::HeaderName::try_from(name.as_str()),
+            http::HeaderValue::try_from(value.as_str()),
+        ) {
+            (Ok(n), Ok(v)) => {
+                headers.insert(n, v);
+            }
+            // Warned rather than failed: a malformed header is a config typo, and taking the run
+            // down for it is a worse answer than sending the request without it.
+            _ => tracing::warn!(
+                header = %name,
+                "ignoring an `[endpoint] headers` entry that is not a valid HTTP header"
+            ),
+        }
+    }
+    if let Some(name) = endpoint.and_then(|e| e.session_header.as_deref())
+        && let (Ok(n), Ok(v)) = (
+            http::HeaderName::try_from(name),
+            http::HeaderValue::try_from(session),
+        )
+    {
+        headers.insert(n, v);
+    }
+    headers
+}
+
+/// How this client addresses the endpoint, set once from config at startup.
+///
+/// Process-wide rather than threaded through `NodeRun` because it describes the deployment, not
+/// the node: every node in a run talks to the same endpoint, and passing it down twenty call sites
+/// would put the same value in twenty places for nobody's benefit.
+static ENDPOINT: std::sync::OnceLock<ratatoskr_core::EndpointConfig> = std::sync::OnceLock::new();
+
+/// Tell the agent layer how to address the endpoint. Called once, before any node runs.
+pub fn configure_endpoint(endpoint: ratatoskr_core::EndpointConfig) {
+    let _ = ENDPOINT.set(endpoint);
+}
+
+/// An Anthropic client carrying this deployment's headers.
+///
+/// `from_env` reads `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` and nothing else, so the builder
+/// is spelled out here to add them. `session` is fresh per node attempt and constant across that
+/// attempt's turns — an endpoint that keys a session off it then continues one conversation rather
+/// than rebuilding it every turn.
+fn anthropic_client(session: &str) -> Result<anthropic::Client, AgentError> {
+    let key = std::env::var("ANTHROPIC_API_KEY").map_err(|source| AgentError::Provider {
+        provider: "anthropic".to_string(),
+        source: ProviderClientError::EnvironmentVariable {
+            name: "ANTHROPIC_API_KEY",
+            source,
+        },
+    })?;
+    let mut builder = anthropic::Client::builder().api_key(key);
+    if let Ok(base) = std::env::var("ANTHROPIC_BASE_URL") {
+        builder = builder.base_url(&base);
+    }
+
+    let headers = endpoint_headers(ENDPOINT.get(), session);
+    if !headers.is_empty() {
+        builder = builder.http_headers(headers);
+    }
+    builder.build().map_err(|source| AgentError::Provider {
+        provider: "anthropic".to_string(),
+        source: source.into(),
+    })
+}
 
 /// Whether a failure was the call not completing, rather than the model answering unfavourably.
 ///
@@ -1113,10 +1188,9 @@ pub struct NodeRun<'a> {
 pub async fn run_structured(run: NodeRun<'_>) -> Result<String, AgentError> {
     match parse_provider(&run.route.provider)? {
         Provider::Anthropic => {
-            let client = anthropic::Client::from_env().map_err(|source| AgentError::Provider {
-                provider: "anthropic".to_string(),
-                source,
-            })?;
+            // One session per node attempt, held across its turns: an endpoint that tracks
+            // sessions then continues this conversation instead of rebuilding it every turn.
+            let client = anthropic_client(&uuid::Uuid::new_v4().to_string())?;
             let model = caching(client.completion_model(&run.route.model));
             run_typed(model, run).await
         }
@@ -1591,6 +1665,29 @@ mod tests {
         // Input is reported too, and the turn count is separate from the usage.
         assert!(telemetry.usage.input_tokens > 0);
         assert!(telemetry.turns.unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn the_endpoint_is_told_who_is_calling_and_which_conversation_this_is() {
+        // What reaches the wire decides how the far side treats us. An endpoint that adapts per
+        // client defaults an unrecognised one to somebody else's adapter, and one that tracks
+        // sessions rebuilds the conversation every turn without an id to match it to.
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("x-meridian-agent".to_string(), "passthrough".to_string());
+        headers.insert("not a header".to_string(), "dropped".to_string());
+        let cfg = ratatoskr_core::EndpointConfig {
+            headers,
+            session_header: Some("x-litellm-session-id".to_string()),
+        };
+
+        let sent = endpoint_headers(Some(&cfg), "session-abc");
+        assert_eq!(sent.get("x-meridian-agent").unwrap(), "passthrough");
+        assert_eq!(sent.get("x-litellm-session-id").unwrap(), "session-abc");
+        // A typo costs its own header and nothing else — not the run.
+        assert_eq!(sent.len(), 2);
+
+        // Unconfigured is the default, and sends nothing of its own.
+        assert!(endpoint_headers(None, "session-abc").is_empty());
     }
 
     #[test]

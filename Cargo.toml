@@ -69,6 +69,8 @@ tokio-stream = "0.1"
 # Already in the tree via rig; a direct dep so a run can reach the dashboard to ask a human.
 # No TLS features: the only thing a run talks to here is a loopback dashboard over plain HTTP.
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
+# Header types for the model endpoint. Already in the tree via rig, which takes an `http::HeaderMap`.
+http = "1"
 # `fs` only: ServeDir/ServeFile for the built dashboard assets.
 tower-http = { version = "0.7", features = ["fs"] }
 # Phase 3 execution: MicroVM sandbox + ACP client for driving a coding CLI.

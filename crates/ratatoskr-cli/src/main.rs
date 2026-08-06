@@ -750,6 +750,11 @@ fn load_config(path: &Path) -> anyhow::Result<RatatoskrConfig> {
     config
         .validate()
         .with_context(|| format!("in config {}", path.display()))?;
+    // Here rather than at each command, because every command that reaches a model reaches it
+    // through this function — and a command that loaded the config but not the endpoint's headers
+    // would talk to it as an unidentified client, which is how a run gets whatever default the
+    // endpoint keeps for somebody else.
+    ratatoskr_agent::configure_endpoint(config.endpoint.clone());
     Ok(config)
 }
 

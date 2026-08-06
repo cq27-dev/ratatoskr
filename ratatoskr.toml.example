@@ -139,6 +139,22 @@ enabled = false
 # A coding CLI's cache keeps every version it has installed, so a path naming the plugin rather
 # than one version is the right thing to write — the installed one is the one that loads:
 #   paths = ["~/.claude/plugins/cache/rag-rat/rag-rat"]
+# How to address the model endpoint, beyond its URL and key. Both optional and empty by default.
+#
+# A local endpoint in front of a provider is not always a proxy. One that reconstructs the request
+# — replaying it as a prompt into its own agent session — decides for itself what is cached and
+# what is discarded, and decides it from what the client looks like. A client it does not
+# recognise gets whatever default its author picked for someone else, which for a tool-calling
+# run means the conversation is rebuilt on every turn instead of read back from cache.
+#
+# `headers` is what identifies this client. `session_header` names the header carrying a
+# per-conversation id: one is generated per node attempt and held for every turn of that attempt,
+# so an endpoint that tracks sessions can continue the conversation rather than start it again.
+#
+#   [endpoint]
+#   headers = { "x-meridian-agent" = "passthrough" }
+#   session_header = "x-litellm-session-id"
+
 [plugins]
 paths = []
 

@@ -119,6 +119,12 @@ cargo run -p ratatoskr-cli -- run "Fix the flaky retry in the store"
 
 `ratatoskr.toml` is gitignored; `ratatoskr.toml.example` is the committed template.
 
+If the models are reached through something local rather than the provider directly, see
+`[endpoint]` in that template. A gateway that adapts requests per client has to be told which
+client this is — an unrecognised one gets whatever default its author chose for somebody else, and
+for a tool-calling run that usually means the conversation is rebuilt on every turn rather than
+read back from cache.
+
 ## Commands
 
 | Command | What it does |

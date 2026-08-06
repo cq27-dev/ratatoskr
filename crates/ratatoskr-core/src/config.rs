@@ -22,6 +22,33 @@ pub struct RatatoskrConfig {
     pub plugins: PluginConfig,
     #[serde(default)]
     pub publish: PublishConfig,
+    #[serde(default)]
+    pub endpoint: EndpointConfig,
+}
+
+/// How to address the model endpoint, beyond its URL and key.
+///
+/// Exists because a local endpoint in front of a provider is not always a proxy. One that
+/// reconstructs the request — replaying it as a prompt into its own agent session — decides for
+/// itself what is cached and what is discarded, and it decides that from what the client looks
+/// like. A client it does not recognise gets whatever default the author picked for someone else.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointConfig {
+    /// Headers sent with every model request.
+    ///
+    /// What identifies this client to the thing in front of the provider. Empty by default: this
+    /// is the address of a specific deployment, not a property of ratatoskr, and a header invented
+    /// here would be a guess about somebody else's software.
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    /// Header carrying a per-conversation id, when the endpoint keys a session off one.
+    ///
+    /// Each node attempt gets a fresh id, held for every turn of that attempt. An endpoint that
+    /// tracks sessions can then continue one conversation rather than rebuilding it per turn —
+    /// which is the difference between reading the history back and paying to write it again.
+    #[serde(default)]
+    pub session_header: Option<String>,
 }
 
 /// Where to look for agent plugins. `.ratatoskr/plugins/` is always searched; `paths` adds
@@ -376,6 +403,7 @@ impl Default for RatatoskrConfig {
         };
         RatatoskrConfig {
             publish: PublishConfig::default(),
+            endpoint: EndpointConfig::default(),
             rag_rat: RagRatConfig {
                 // `--json` makes rag-rat emit JSON (not its default TOON), so nodes that parse
                 // tool results directly (MemoryNode) get a stable shape.
