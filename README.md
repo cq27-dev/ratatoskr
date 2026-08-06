@@ -372,8 +372,13 @@ express its own ordering, fan-out, and gating over the same nodes. See
 [`examples/workflow.ts`](examples/workflow.ts). Every safety gate stays enforced in Rust on the
 bindings rather than delegated to the script.
 
-`.ratatoskr/` otherwise holds runtime state — logs, the store, worktrees — and is gitignored, except
-for `rules/` and `workflow.ts`, which are version-controlled.
+`.ratatoskr/` otherwise holds runtime state — logs and the store — and is gitignored, except for
+`rules/` and `workflow.ts`, which are version-controlled.
+
+Per-run worktrees live outside the checkout (`[worktree] root`). Build tools find their project root
+by walking up, so a worktree nested inside the repository resolves to the outer project rather than
+to itself — cargo, for one, then builds into the outer `target/`, which the sandbox mounts
+read-only. Ratatoskr warns when it is pointed at a nested root.
 
 ## Workspace
 

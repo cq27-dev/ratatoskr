@@ -13,7 +13,11 @@ path = ".ratatoskr/state.sqlite3"
 [worktree]
 # Root for per-run git worktrees. `run` leaves a converged run's worktree here for review;
 # `ratatoskr clean` reclaims them (and their `ratatoskr/*` branches) when you're done.
-root = ".ratatoskr/worktrees"
+#
+# Keep this OUTSIDE the repository. Build tools find their project root by walking up, so a
+# worktree nested in the checkout resolves to the outer project instead of itself — cargo, for
+# one, then builds into the outer `target/`, which the sandbox mounts read-only.
+root = "../.ratatoskr-worktrees"
 
 # Per-node model routing. `ask` is the only route used in Phase 1; provider is one of
 # "anthropic" or "moonshot", read from ANTHROPIC_API_KEY / MOONSHOT_API_KEY. The rest are

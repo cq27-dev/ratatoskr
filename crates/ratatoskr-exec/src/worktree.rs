@@ -59,6 +59,7 @@ pub async fn create(
         repo_root.join(worktree_root)
     };
     std::fs::create_dir_all(&abs_root)?;
+    warn_if_nested(repo_root, &abs_root);
     let path = abs_root.join(branch);
     let path_s = path_str(&path)?;
     git(
@@ -68,6 +69,37 @@ pub async fn create(
     )
     .await?;
     Ok(WorktreePath(path))
+}
+
+/// Warn when worktrees are kept inside the repository they are worktrees of.
+///
+/// Build tools find their project root by walking *up* from the working directory, and a worktree
+/// nested in the checkout has the original's project files above it. Cargo resolves such a worktree
+/// to the outer workspace and builds into the outer `target/` — so the sandbox, which binds only
+/// the worktree writable, fails on a read-only filesystem, and a build that did succeed would be
+/// building the wrong tree. The same applies to any tool that resolves a root by walking up.
+///
+/// A warning rather than an error: the run still works for repositories whose acceptance command
+/// does not care, and where the worktrees live is the operator's decision.
+fn warn_if_nested(repo_root: &Path, worktree_root: &Path) {
+    let (Ok(repo), Ok(root)) = (repo_root.canonicalize(), worktree_root.canonicalize()) else {
+        return;
+    };
+    if is_nested(&repo, &root) {
+        tracing::warn!(
+            worktree_root = %root.display(),
+            repo_root = %repo.display(),
+            "worktrees are kept inside the repository; a build tool that finds its project root by \
+             walking up will resolve the outer checkout instead of the worktree. Point `[worktree] \
+             root` at a directory outside the repository."
+        );
+    }
+}
+
+/// Whether `worktree_root` is inside `repo_root`. Both are expected canonical, so a symlinked or
+/// `..`-relative root is judged by where it actually lands rather than by how it was spelled.
+fn is_nested(repo_root: &Path, worktree_root: &Path) -> bool {
+    worktree_root.starts_with(repo_root)
 }
 
 /// Remove a worktree (force, so uncommitted changes don't block cleanup).
@@ -271,6 +303,20 @@ pub async fn touched_files(worktree: &WorktreePath) -> Result<Vec<String>, ExecE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_worktree_root_inside_the_repository_is_nested() {
+        // Why it matters: a build tool walking up from the worktree finds the outer project's
+        // files first, builds the wrong tree, and writes where the sandbox mounts read-only.
+        let repo = Path::new("/src/app");
+        assert!(is_nested(repo, Path::new("/src/app/.ratatoskr/worktrees")));
+        assert!(is_nested(repo, repo));
+
+        assert!(!is_nested(repo, Path::new("/src/.ratatoskr-worktrees")));
+        assert!(!is_nested(repo, Path::new("/var/tmp/worktrees")));
+        // A sibling whose name merely starts with the repo's path is not inside it.
+        assert!(!is_nested(repo, Path::new("/src/app-worktrees")));
+    }
 
     async fn init_repo(dir: &Path) {
         // A throwaway repo with one commit, so `worktree add -b` has a HEAD to branch from.
