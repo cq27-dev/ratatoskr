@@ -66,8 +66,17 @@ pub(crate) fn skill_tool(skills: &[ratatoskr_plugin::Skill]) -> Option<Tool> {
 /// drop is logged — a skill silently missing from the listing can never be chosen.
 fn within_budget(skills: &[ratatoskr_plugin::Skill]) -> Vec<&ratatoskr_plugin::Skill> {
     let mut used = 0usize;
-    let mut kept = Vec::new();
+    let mut kept: Vec<&ratatoskr_plugin::Skill> = Vec::new();
     for skill in skills {
+        // Two bound plugins can ship a skill of the same name. Offering it twice would put a
+        // duplicate in the enum and leave which one loads to discovery order.
+        if kept.iter().any(|k| k.name == skill.name) {
+            tracing::warn!(
+                skill = skill.name,
+                "not offering skill: another bound plugin already offers that name"
+            );
+            continue;
+        }
         let cost = skill.name.len() + skill.description.len() + 4;
         if used + cost > LISTING_BUDGET {
             tracing::warn!(
@@ -151,6 +160,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["small", "also-small"]
         );
+    }
+
+    #[test]
+    fn one_name_is_offered_once_however_many_plugins_ship_it() {
+        // Otherwise the enum holds a duplicate and which body loads is discovery order.
+        let skills = [
+            skill("shared", "from the first"),
+            skill("shared", "from the second"),
+        ];
+        let offered = within_budget(&skills);
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].description, "from the first");
     }
 
     #[test]

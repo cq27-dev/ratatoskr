@@ -98,15 +98,17 @@ fn read_skill(dir: &Path) -> Option<Skill> {
 /// file is then the body, and the skill is named and described from what is there.
 fn split_frontmatter(raw: &str) -> (&str, &str) {
     let text = raw.trim_start_matches('\u{feff}');
-    // The opening delimiter is `---` on its own first line.
-    let Some(rest) = text
-        .strip_prefix("---\n")
-        .or_else(|| text.strip_prefix("---\r\n"))
-    else {
-        return ("", text);
-    };
+    let mut lines = text.split_inclusive('\n');
 
-    // The closing delimiter is the next line that is exactly `---`.
+    // Both delimiters are `---` alone on a line, judged the same way. Holding the opening one to a
+    // stricter rule than the closing one is how a file with a trailing space after the first `---`
+    // becomes all body — and then its frontmatter is read as prose and described from.
+    let opening = lines.next().unwrap_or_default();
+    if opening.trim_end() != "---" {
+        return ("", text);
+    }
+    let rest = &text[opening.len()..];
+
     let mut end = 0usize;
     for line in rest.split_inclusive('\n') {
         if line.trim_end() == "---" {
@@ -161,7 +163,7 @@ fn block<'a>(lines: &mut impl Iterator<Item = &'a str>, join: &str) -> String {
     parts.join(join).trim().to_string()
 }
 
-/// Strip one layer of matching quotes.
+/// Strip one layer of matching quotes, or a trailing comment from a plain scalar.
 fn unquote(value: &str) -> String {
     for quote in ['"', '\''] {
         if let Some(inner) = value
@@ -171,7 +173,13 @@ fn unquote(value: &str) -> String {
             return inner.to_string();
         }
     }
-    value.to_string()
+    // YAML's rule: ` #` opens a comment in a plain scalar, and means nothing inside a quoted one.
+    // Worth honouring, because otherwise a description ends with the author's note to themselves,
+    // shown to the model as part of the instruction.
+    match value.find(" #") {
+        Some(at) => value[..at].trim_end().to_string(),
+        None => value.to_string(),
+    }
 }
 
 /// The body's first prose paragraph, for a skill whose frontmatter describes nothing.
@@ -262,6 +270,34 @@ mod tests {
         assert!(skill.name.ends_with("-unclosed"));
         assert!(skill.body.starts_with("---"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_two_delimiters_are_judged_the_same_way() {
+        // A trailing space after the opening `---` used to make the whole file body, and the
+        // frontmatter was then read as prose — a wrong description rather than none.
+        let root = skill_dir("loose", "--- \nname: x\ndescription: real\n---\nbody");
+        let skill = read_skill(&root).unwrap();
+        assert_eq!(skill.name, "x");
+        assert_eq!(skill.description, "real");
+        assert_eq!(skill.body, "body");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // CRLF throughout, which is the same rule seen from the other side.
+        let root = skill_dir("crlf", "---\r\nname: y\r\ndescription: real\r\n---\r\nbody");
+        let skill = read_skill(&root).unwrap();
+        assert_eq!(skill.name, "y");
+        assert_eq!(skill.description, "real");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_trailing_comment_is_not_part_of_the_description() {
+        // YAML's rule, and worth honouring: the alternative shows the model the author's aside.
+        assert_eq!(unquote("does a thing # revisit later"), "does a thing");
+        // Inside quotes it is text, not a comment.
+        assert_eq!(unquote("\"issue #123\""), "issue #123");
+        assert_eq!(unquote("no comment here"), "no comment here");
     }
 
     #[test]
