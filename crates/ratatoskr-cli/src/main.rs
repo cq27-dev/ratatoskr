@@ -114,6 +114,8 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         max_runs: usize,
     },
+    /// List the workflows a run can be given, and what each is for.
+    Workflows,
     /// Reclaim ratatoskr's per-run worktrees and their `ratatoskr/*` branches.
     ///
     /// Without `--force` it only lists what would be removed. Removal is destructive: it discards
@@ -160,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
             projects,
             max_runs,
         }) => serve(addr, &config, projects, max_runs).await,
+        Some(Command::Workflows) => workflows().await,
         Some(Command::Clean { force }) => clean(force).await,
         None => {
             Cli::command().print_help()?;
@@ -748,6 +751,25 @@ fn load_config(path: &Path) -> anyhow::Result<RatatoskrConfig> {
         .validate()
         .with_context(|| format!("in config {}", path.display()))?;
     Ok(config)
+}
+
+/// Print the registry. What `--workflow` accepts, and what each entry claims to be for — the same
+/// declaration whatever chooses automatically will read.
+async fn workflows() -> anyhow::Result<()> {
+    let found = ratatoskr_nodes::registry().await?;
+    for workflow in &found {
+        println!("{}", workflow.name());
+        let purpose = workflow.purpose();
+        if !purpose.is_empty() {
+            println!("    {purpose}");
+        }
+    }
+    // A repo that has defined none still has the built-in, so this says which one a bare `run`
+    // would use rather than leaving it to be inferred from a list of one.
+    if found.len() == 1 {
+        println!("\nThis repo defines no workflows of its own; `run` uses the built-in.");
+    }
+    Ok(())
 }
 
 /// The nodes a ruleset may govern — the LLM agents that go through `run_structured`. `memory` and
