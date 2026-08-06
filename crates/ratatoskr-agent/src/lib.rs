@@ -744,6 +744,21 @@ impl RunLedger {
         let at = entries.iter().position(|(name, _)| name == node)?;
         Some(entries.remove(at).1)
     }
+
+    /// The names of turns nobody claimed.
+    ///
+    /// Always empty on a finished run. Anything left means a node ran a model under one name and
+    /// was checkpointed under another, and its cost went in the bin — the exact failure this whole
+    /// table exists to stop, and one that is otherwise invisible because a dropped number reads
+    /// identically to a node that never called a model.
+    pub fn unclaimed(&self) -> Vec<String> {
+        self.entries
+            .lock()
+            .expect("ledger mutex poisoned")
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
 }
 
 /// One node's structured agent turn: what to run it on, what it may call, and the gates around it.
