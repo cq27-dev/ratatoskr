@@ -435,10 +435,23 @@ impl ratatoskr_agent::ToolObserver for NodeObserver {
 const TOOL_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUse"];
 
 /// One connected server, and the plugin that declared it — which is what a node binds, not the
-/// server's own name.
+/// server's own name, and what the format names its tools after.
 struct PluginServer {
     plugin: String,
     connection: Connection,
+}
+
+impl PluginServer {
+    /// This server's tools, named the way the format names a plugin's.
+    fn offer(&self) -> ServerTools {
+        ServerTools {
+            prefix: Some(ratatoskr_mcp::qualified_prefix(
+                &self.plugin,
+                self.connection.origin(),
+            )),
+            ..self.connection.offer()
+        }
+    }
 }
 
 impl PluginContext {
@@ -549,7 +562,7 @@ impl PluginContext {
             self.servers
                 .iter()
                 .filter(|s| bound.contains(&s.plugin))
-                .map(|s| s.connection.offer()),
+                .map(PluginServer::offer),
         );
         ToolSet::from_servers(servers)
     }
@@ -671,7 +684,7 @@ fn node_agent_config(
     let offered = tools.names();
     let missing: Vec<&String> = allow
         .iter()
-        .filter(|n| !offered.contains(&n.as_str()) && !deny.contains(n))
+        .filter(|n| !offered.contains(n) && !deny.contains(n))
         .collect();
     if !missing.is_empty() {
         tracing::warn!(node, ?missing, "no connected MCP server offers these tools");

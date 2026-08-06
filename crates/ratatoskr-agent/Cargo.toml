@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 ratatoskr-core.workspace = true
 ratatoskr-mcp.workspace = true
+tokio = { workspace = true, features = ["time"] }
 rig-core.workspace = true
 rig-agent.workspace = true
 rmcp.workspace = true

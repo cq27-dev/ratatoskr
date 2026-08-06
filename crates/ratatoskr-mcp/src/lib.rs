@@ -131,6 +131,7 @@ impl Connection {
             origin: self.origin.clone(),
             sink: self.sink(),
             tools: self.tools.clone(),
+            prefix: None,
         }
     }
 
@@ -188,6 +189,62 @@ pub struct ServerTools {
     pub origin: String,
     pub sink: ServerSink,
     pub tools: Vec<Tool>,
+    /// Prefixed onto every tool name this server offers, for the model and for everything that
+    /// matches on a name. `None` for a server this host launched itself, whose tools keep the
+    /// names they were always called by.
+    pub prefix: Option<String>,
+}
+
+/// How the plugin format names the tools of a server a plugin declared:
+/// `mcp__plugin_<plugin>_<server>__<tool>`.
+///
+/// The bare `mcp__<server>__<tool>` form belongs to a server the *user* configured. rag-rat is
+/// that case here, and keeps its plain names — every node's built-in tool list, every ruleset and
+/// every recorded memory names `semantic_search`, not a qualified spelling of it.
+pub fn qualified_prefix(plugin: &str, server: &str) -> String {
+    format!("mcp__plugin_{}_{}__", segment(plugin), segment(server))
+}
+
+/// One name segment, with everything outside the format's allowed set replaced.
+fn segment(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+impl ServerTools {
+    /// The name the model sees for `tool`.
+    pub fn display_name(&self, tool: &Tool) -> String {
+        match &self.prefix {
+            Some(prefix) => format!("{prefix}{}", tool.name),
+            None => tool.name.to_string(),
+        }
+    }
+
+    /// Every name this server contributes, in order.
+    pub fn display_names(&self) -> Vec<String> {
+        self.tools.iter().map(|t| self.display_name(t)).collect()
+    }
+
+    /// This server's tools as the model is offered them: named as it will call them, paired with
+    /// the name the server itself answers to.
+    pub fn offered(&self) -> Vec<(Tool, String)> {
+        self.tools
+            .iter()
+            .map(|tool| {
+                let wire = tool.name.to_string();
+                let mut renamed = tool.clone();
+                renamed.name = self.display_name(tool).into();
+                (renamed, wire)
+            })
+            .collect()
+    }
 }
 
 /// The tools one node may call, grouped by the server that serves each.
@@ -204,19 +261,21 @@ impl ToolSet {
     ///
     /// **Name collisions: the first server to offer a name keeps it**, and the loser is dropped
     /// with a warning naming both. rag-rat is passed first, so a plugin can never shadow a tool a
-    /// node's prompt was written against. The alternative — qualifying a plugin's tools with its
-    /// name — would change the string a ruleset's `allow`/`deny` and an `onToolCall` gate match on,
-    /// and rig's MCP adapter sends the tool's name straight back to the server as the call's
-    /// method, so a qualified name would have to be unqualified again on the way out.
+    /// node's prompt was written against — which matters much less now that a plugin server's
+    /// tools are qualified and so rarely collide at all, but still settles the case where two
+    /// plugins declare one server name.
+    ///
+    /// Every rule here is applied to the *display* name, because that is the string a ruleset's
+    /// `allow`/`deny`, an `onToolCall` gate, a hook matcher and the model all see.
     pub fn from_servers(mut servers: Vec<ServerTools>) -> Self {
-        let kept = claim_names(
-            &servers
-                .iter()
-                .map(|s| (s.origin.as_str(), s.tools.as_slice()))
-                .collect::<Vec<_>>(),
-        );
-        for (server, tools) in servers.iter_mut().zip(kept) {
-            server.tools = tools;
+        let named: Vec<(&str, Vec<String>)> = servers
+            .iter()
+            .map(|s| (s.origin.as_str(), s.display_names()))
+            .collect();
+        let kept = claim_names(&named);
+        for (server, keep) in servers.iter_mut().zip(kept) {
+            let mut mask = keep.into_iter();
+            server.tools.retain(|_| mask.next().unwrap_or(false));
         }
         servers.retain(|s| !s.tools.is_empty());
         ToolSet { groups: servers }
@@ -225,7 +284,8 @@ impl ToolSet {
     /// Keep only the tools named in `allow`, then drop those named in `deny`.
     pub fn narrow(&mut self, allow: &[String], deny: &[String]) {
         for group in &mut self.groups {
-            group.tools = narrowed(&group.tools, allow, deny);
+            let mut mask = narrowed(&group.display_names(), allow, deny).into_iter();
+            group.tools.retain(|_| mask.next().unwrap_or(false));
         }
         self.groups.retain(|g| !g.tools.is_empty());
     }
@@ -239,11 +299,16 @@ impl ToolSet {
     /// argument schema shown to the model. Any such tool is dropped here instead.
     pub fn add_local(&mut self, tool: Tool, sink: ServerSink) {
         for group in &mut self.groups {
+            let prefix = group.prefix.clone();
             group.tools.retain(|t| {
-                let clash = t.name == tool.name;
+                let shown = match &prefix {
+                    Some(prefix) => format!("{prefix}{}", t.name),
+                    None => t.name.to_string(),
+                };
+                let clash = shown == tool.name;
                 if clash {
                     tracing::warn!(
-                        tool = %t.name,
+                        tool = %shown,
                         server = %group.origin,
                         "dropping a server's tool: the name is answered inside the run"
                     );
@@ -257,16 +322,14 @@ impl ToolSet {
                 origin: RAG_RAT.to_string(),
                 sink,
                 tools: vec![tool],
+                prefix: None,
             }),
         }
     }
 
-    /// Every tool name in the set, in precedence order.
-    pub fn names(&self) -> Vec<&str> {
-        self.groups
-            .iter()
-            .flat_map(|g| g.tools.iter().map(|t| t.name.as_ref()))
-            .collect()
+    /// Every tool name in the set, as the model sees it, in precedence order.
+    pub fn names(&self) -> Vec<String> {
+        self.groups.iter().flat_map(|g| g.display_names()).collect()
     }
 
     /// Every tool name offered by a server other than `origin`, in precedence order.
@@ -277,7 +340,7 @@ impl ToolSet {
         self.groups
             .iter()
             .filter(|g| g.origin != origin)
-            .flat_map(|g| g.tools.iter().map(|t| t.name.to_string()))
+            .flat_map(|g| g.display_names())
             .collect()
     }
 
@@ -298,19 +361,19 @@ impl ToolSet {
 
 /// Settle name collisions across servers: each group keeps the names no earlier group claimed.
 ///
-/// Separate from [`ToolSet::from_servers`] because the rule is the interesting part and a
-/// [`ServerSink`] only exists behind a live subprocess.
-fn claim_names(groups: &[(&str, &[Tool])]) -> Vec<Vec<Tool>> {
+/// Returns a keep-mask per group rather than the tools themselves, so the rule stays a pure
+/// function of the names — a [`ServerSink`] only exists behind a live subprocess.
+fn claim_names(groups: &[(&str, Vec<String>)]) -> Vec<Vec<bool>> {
     let mut claimed: BTreeMap<&str, &str> = BTreeMap::new();
     groups
         .iter()
-        .map(|(origin, tools)| {
-            tools
+        .map(|(origin, names)| {
+            names
                 .iter()
-                .filter(|tool| match claimed.get(tool.name.as_ref()) {
+                .map(|name| match claimed.get(name.as_str()) {
                     Some(owner) => {
                         tracing::warn!(
-                            tool = %tool.name,
+                            tool = name,
                             kept = owner,
                             dropped = origin,
                             "two MCP servers offer the same tool; the first one connected keeps it"
@@ -318,23 +381,20 @@ fn claim_names(groups: &[(&str, &[Tool])]) -> Vec<Vec<Tool>> {
                         false
                     }
                     None => {
-                        claimed.insert(tool.name.as_ref(), origin);
+                        claimed.insert(name, origin);
                         true
                     }
                 })
-                .cloned()
                 .collect()
         })
         .collect()
 }
 
-/// The tools that survive an `allow`/`deny` pair: named in `allow`, and not in `deny`.
-fn narrowed(tools: &[Tool], allow: &[String], deny: &[String]) -> Vec<Tool> {
-    let named = |names: &[String], tool: &Tool| names.iter().any(|n| n == tool.name.as_ref());
-    tools
+/// Which names survive an `allow`/`deny` pair: in `allow`, and not in `deny`.
+fn narrowed(names: &[String], allow: &[String], deny: &[String]) -> Vec<bool> {
+    names
         .iter()
-        .filter(|t| named(allow, t) && !named(deny, t))
-        .cloned()
+        .map(|name| allow.contains(name) && !deny.contains(name))
         .collect()
 }
 
@@ -359,65 +419,107 @@ mod tests {
         ));
     }
 
-    fn tool(name: &'static str) -> Tool {
-        Tool::new(
-            name,
-            "",
-            std::sync::Arc::new(rmcp::model::JsonObject::new()),
-        )
+    /// The names a keep-mask leaves, per group.
+    fn kept(names: &[Vec<String>], masks: &[Vec<bool>]) -> Vec<Vec<String>> {
+        names
+            .iter()
+            .zip(masks)
+            .map(|(group, mask)| {
+                group
+                    .iter()
+                    .zip(mask)
+                    .filter(|(_, keep)| **keep)
+                    .map(|(n, _)| n.clone())
+                    .collect()
+            })
+            .collect()
     }
 
-    fn names(groups: &[Vec<Tool>]) -> Vec<Vec<&str>> {
-        groups
-            .iter()
-            .map(|g| g.iter().map(|t| t.name.as_ref()).collect())
-            .collect()
+    fn say(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
     fn the_first_server_to_offer_a_name_keeps_it() {
         // rag-rat is claimed first, so a plugin can never shadow a tool a node's prompt was
         // written against — and the plugin keeps everything that doesn't collide.
-        let rag_rat = [tool("semantic_search"), tool("memory_create")];
-        let plugin = [tool("semantic_search"), tool("lint")];
-        let other = [tool("lint")];
-
-        let kept = claim_names(&[
-            (RAG_RAT, &rag_rat[..]),
-            ("linty", &plugin[..]),
-            ("also-linty", &other[..]),
-        ]);
+        let groups = [
+            (RAG_RAT, say(&["semantic_search", "memory_create"])),
+            ("linty", say(&["semantic_search", "lint"])),
+            ("also-linty", say(&["lint"])),
+        ];
+        let masks = claim_names(&groups);
+        let names: Vec<Vec<String>> = groups.iter().map(|(_, n)| n.clone()).collect();
         assert_eq!(
-            names(&kept),
+            kept(&names, &masks),
             vec![
-                vec!["semantic_search", "memory_create"],
-                vec!["lint"],
-                Vec::<&str>::new(),
+                say(&["semantic_search", "memory_create"]),
+                say(&["lint"]),
+                Vec::<String>::new(),
             ]
         );
     }
 
     #[test]
+    fn a_plugin_servers_tools_are_named_the_way_the_format_names_them() {
+        assert_eq!(
+            qualified_prefix("my-plugin", "database-tools"),
+            "mcp__plugin_my-plugin_database-tools__"
+        );
+        // Anything outside the allowed set becomes `_`, per segment.
+        assert_eq!(
+            qualified_prefix("acme.tools", "db/main"),
+            "mcp__plugin_acme_tools_db_main__"
+        );
+    }
+
+    #[test]
     fn allow_selects_and_deny_removes() {
-        let tools = [
-            tool("semantic_search"),
-            tool("impact_surface"),
-            tool("lint"),
-        ];
-        let say = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let offered = [say(&["semantic_search", "impact_surface", "lint"])];
 
         assert_eq!(
-            names(&[narrowed(&tools, &say(&["semantic_search", "lint"]), &[])]),
-            vec![vec!["semantic_search", "lint"]]
+            kept(
+                &offered,
+                &[narrowed(
+                    &offered[0],
+                    &say(&["semantic_search", "lint"]),
+                    &[]
+                )]
+            ),
+            vec![say(&["semantic_search", "lint"])]
         );
         // deny wins over allow, and a name nothing offers is simply absent.
         assert_eq!(
-            names(&[narrowed(
-                &tools,
-                &say(&["semantic_search", "nope"]),
-                &say(&["semantic_search"])
-            )]),
-            vec![Vec::<&str>::new()]
+            kept(
+                &offered,
+                &[narrowed(
+                    &offered[0],
+                    &say(&["semantic_search", "nope"]),
+                    &say(&["semantic_search"])
+                )]
+            ),
+            vec![Vec::<String>::new()]
+        );
+    }
+
+    #[test]
+    fn a_ruleset_and_a_hook_matcher_see_the_qualified_name() {
+        // The whole point: the string every gate matches on is the one the model calls, so a
+        // plugin's tool is denied and matched under the name that plugin's author would write.
+        let prefix = qualified_prefix("linty", "lint");
+        let offered = [vec![format!("{prefix}check")]];
+
+        assert_eq!(
+            kept(&offered, &[narrowed(&offered[0], &offered[0], &[])]),
+            vec![vec!["mcp__plugin_linty_lint__check".to_string()]]
+        );
+        // Its bare name is not a name anything sees, so denying it does nothing.
+        assert_eq!(
+            kept(
+                &offered,
+                &[narrowed(&offered[0], &offered[0], &say(&["check"]))]
+            ),
+            vec![vec!["mcp__plugin_linty_lint__check".to_string()]]
         );
     }
 
