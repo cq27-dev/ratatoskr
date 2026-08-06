@@ -191,6 +191,9 @@ impl VerifierNode {
             skills: crate::skills::loaded(&self.plugins.skills),
             files: self.files.clone(),
             ledger: self.ledger.clone(),
+            produces: Some(
+                "findings on the diff — each with a severity, a plan/execution kind, and a concrete failure scenario — or none",
+            ),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("verifier agent failed: {e}")))?;

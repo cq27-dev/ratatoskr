@@ -93,6 +93,9 @@ impl Node for ScoutNode {
             skills: crate::skills::loaded(&self.plugins.skills),
             files: self.files.clone(),
             ledger: self.ledger.clone(),
+            produces: Some(
+                "a papertrail summary of what the tracker and history say about this task, plus the related items found",
+            ),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("scout agent failed: {e}")))?;

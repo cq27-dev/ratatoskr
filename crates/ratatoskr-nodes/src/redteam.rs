@@ -103,6 +103,9 @@ impl RedTeamClassifier {
             skills: crate::skills::loaded(&self.plugins.skills),
             files: self.files.clone(),
             ledger: self.ledger.clone(),
+            produces: Some(
+                "a classification of each baseline test failure as flaky or real, with the reason",
+            ),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("red-team classifier failed: {e}")))?;

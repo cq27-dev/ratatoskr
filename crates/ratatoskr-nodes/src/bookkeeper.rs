@@ -361,6 +361,9 @@ impl BookkeeperNode {
             skills: crate::skills::loaded(&self.plugins.skills),
             files: self.files.clone(),
             ledger: self.ledger.clone(),
+            produces: Some(
+                "a decision per durable learning: create, revise or none, with the memory body and its anchor",
+            ),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("bookkeeper compose failed: {e}")))?;

@@ -4,6 +4,7 @@
 //! rather than a registry. The agent's own multi-turn loop (from `rig-agent`) does the tool
 //! calling — we hand it the tools and a client handle via `.rmcp_tools()`.
 
+pub mod compaction;
 pub mod files;
 
 use std::future::Future;
@@ -790,6 +791,13 @@ pub struct NodeRun<'a> {
     pub files: Option<std::path::PathBuf>,
     /// Where this turn reports what it cost; `None` outside a run that records checkpoints.
     pub ledger: Option<Arc<RunLedger>>,
+    /// What this node has to end up producing, in one line, for the compactor.
+    ///
+    /// A summary can only be judged against what the node still needs to do — what a scout must
+    /// keep to write a papertrail summary is not what an implementer must keep to finish an edit.
+    /// `None` leaves the node without compaction, which is right for one whose history cannot grow:
+    /// a single-turn transcription has nothing to summarise and would only pay for the policy.
+    pub produces: Option<&'a str>,
 }
 
 /// Run one node's turn with an output schema, so its final answer is structured JSON.
@@ -820,6 +828,11 @@ where
     M: CompletionModel + 'static,
 {
     let max_tokens = run.route.max_tokens();
+    // The compactor summarises with the same model the node runs on. Cheaper would be tempting, but
+    // a summary is the only record of the turns it replaces: the reader that has to reconstruct a
+    // session from it is this model, and a weaker one deciding what that reader needs is a false
+    // economy paid for in rediscovery.
+    let for_compaction = model.clone();
     let NodeRun {
         node,
         route,
@@ -834,6 +847,7 @@ where
         skills,
         files,
         ledger,
+        produces,
     } = run;
     let model_name = format!("{}/{}", route.provider, route.model);
     // `SubagentStart` opens the node's conversation, `UserPromptSubmit` rides with the prompt —
@@ -887,6 +901,17 @@ where
     // chain, and a plugin has nothing to say about a call that never happened.
     if let Some(observer) = observer.clone() {
         builder = builder.add_hook(PluginHook { observer });
+    }
+    // Summarise the oldest turns rather than dropping them, once history outgrows the budget. A
+    // plain window would evict exactly the turn that discovered a constraint — it is the oldest —
+    // and the node would rediscover it, or retry the approach it ruled out.
+    if let Some(produces) = produces {
+        builder = builder.memory(compaction::compacting_memory(
+            for_compaction,
+            node,
+            produces,
+            compaction::default_budget(),
+        ));
     }
     let agent = bind_tools(builder, &tools, files.as_deref());
 
@@ -1066,5 +1091,77 @@ mod tests {
         assert_eq!(total.output_tokens, 4);
         assert_eq!(total.cached_input_tokens, 8);
         assert_eq!(total.cache_creation_input_tokens, 2);
+    }
+
+    /// The whole write path against the real provider: declarations reach the model, it calls
+    /// `Write` and `Edit`, and the file on disk is what it asked for.
+    ///
+    /// Ignored by default because it spends money and needs `ANTHROPIC_API_KEY`. It exists because
+    /// the unit tests call `write`/`edit` directly — they prove the functions behave, and say
+    /// nothing about whether a model can actually drive them through the schema they are declared
+    /// with. That gap is where a tool that works in isolation turns out to be unusable.
+    #[tokio::test]
+    #[ignore = "calls the Anthropic API; run with --ignored"]
+    async fn a_model_can_drive_the_write_tools_end_to_end() {
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct Done {
+            /// What was changed.
+            summary: String,
+        }
+
+        let root = std::env::temp_dir().join(format!("ratatoskr-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut tools = ratatoskr_mcp::ToolSet::default();
+        tools.local().tools.extend(files::declarations());
+        tools.local().tools.extend(files::edit_declarations());
+
+        let route = ModelRoute {
+            provider: "anthropic".into(),
+            model: "claude-haiku-4-5-20251001".into(),
+            max_tokens: None,
+        };
+        let answer = run_structured(NodeRun {
+            node: "livetest",
+            route: &route,
+            preamble: "You edit files with the tools you are given. Do exactly what is asked.",
+            question: "Create `greet.py` containing exactly these two lines:\n\
+                       def greet(name):\n\
+                       \x20   return \"hello \" + name\n\
+                       Then use Edit to change the word hello to goodbye. Then report what you did.",
+            tools,
+            output_schema: schemars::schema_for!(Done),
+            policy: None,
+            max_turns: Some(12),
+            clarifier: None,
+            observer: None,
+            skills: Vec::new(),
+            files: Some(root.clone()),
+            ledger: None,
+            produces: Some("a summary of the change"),
+        })
+        .await
+        .expect("the live run should complete");
+
+        let written = std::fs::read_to_string(root.join("greet.py"))
+            .expect("the model should have created greet.py");
+        assert!(written.contains("def greet(name)"), "{written}");
+        assert!(
+            written.contains("goodbye") && !written.contains("hello"),
+            "the Edit should have replaced hello with goodbye:\n{written}"
+        );
+        // The structured output still has to parse — a run that edited the file correctly but
+        // could not fill its schema is a node failure, not a success.
+        let done: Done = serde_json::from_str(
+            answer
+                .find('{')
+                .zip(answer.rfind('}'))
+                .map(|(a, b)| &answer[a..=b])
+                .expect("structured output"),
+        )
+        .expect("the answer should match the schema");
+        assert!(!done.summary.trim().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

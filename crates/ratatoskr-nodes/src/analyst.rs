@@ -166,6 +166,9 @@ impl Node for AnalystNode {
             skills: crate::skills::loaded(&self.plugins.skills),
             files: self.files.clone(),
             ledger: self.ledger.clone(),
+            produces: Some(
+                "an impact summary, the symbols and paths touched, risks, the concrete requirements the implementation must satisfy, and the acceptance steps that prove it done",
+            ),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("analyst agent failed: {e}")))?;
