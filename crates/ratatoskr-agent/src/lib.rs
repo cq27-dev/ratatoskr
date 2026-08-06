@@ -4,6 +4,8 @@
 //! rather than a registry. The agent's own multi-turn loop (from `rig-agent`) does the tool
 //! calling — we hand it the tools and a client handle via `.rmcp_tools()`.
 
+pub mod files;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -190,6 +192,7 @@ where
             .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
             .add_hook(ObservabilityHook),
         &tools,
+        None,
     );
 
     agent
@@ -257,27 +260,58 @@ impl AgentHook for ObservabilityHook {
 fn bind_tools<M: CompletionModel + 'static>(
     builder: AgentBuilder<M, NoToolConfig>,
     tools: &ToolSet,
+    files: Option<&std::path::Path>,
 ) -> Agent<M> {
     // An empty dynamic set moves the builder out of `NoToolConfig` without binding anything, which
     // is what lets the groups below be a plain loop over two different binding calls.
     let mut bound: AgentBuilder<M, WithBuilderTools> = builder.dynamic_tools(Vec::new());
     for group in tools.groups() {
-        bound = match &group.prefix {
+        bound = match (&group.sink, &group.prefix) {
             // Named as the server names them: rig's own adapter, which sends the tool's name
             // straight back to the server as the call's method.
-            None => bound.rmcp_tools(group.tools.clone(), group.sink.clone()),
+            (Some(sink), None) => bound.rmcp_tools(group.tools.clone(), sink.clone()),
             // Named as the plugin format names them, which is not what the server answers to.
             // `DynamicTool` takes a runtime name and a closure, so the two are independent.
-            Some(_) => bound.dynamic_tools(
+            (Some(sink), Some(_)) => bound.dynamic_tools(
                 group
                     .offered()
                     .into_iter()
-                    .map(|(tool, wire)| renamed_tool(tool, wire, group.sink.clone()))
+                    .map(|(tool, wire)| renamed_tool(tool, wire, sink.clone()))
+                    .collect(),
+            ),
+            // Answered by this host: a built-in it implements, or a synthetic one a hook
+            // intercepts before dispatch — for which the implementation is never reached.
+            (None, _) => bound.dynamic_tools(
+                group
+                    .tools
+                    .iter()
+                    .map(|tool| local_tool(tool, files))
                     .collect(),
             ),
         };
     }
     bound.build()
+}
+
+/// Bind a tool this host answers itself: a built-in file tool, or — for the synthetic ones a hook
+/// answers in-conversation — a stand-in that says so if it is ever actually dispatched.
+fn local_tool(tool: &Tool, files: Option<&std::path::Path>) -> DynamicTool {
+    if let Some(root) = files
+        && let Some(implemented) = files::implementation(&tool.name, root)
+    {
+        return implemented;
+    }
+    let name = tool.name.to_string();
+    let schema = serde_json::Value::Object((*tool.input_schema).clone());
+    let description = tool.description.clone().unwrap_or_default().to_string();
+    DynamicTool::new(name.clone(), description, schema, move |_ctx, _args| {
+        let name = name.clone();
+        Box::pin(async move {
+            Err(ToolExecutionError::other(format!(
+                "{name} is answered inside the run and should never have been dispatched"
+            )))
+        })
+    })
 }
 
 /// Bind one MCP tool under a name the server does not know it by.
@@ -647,6 +681,8 @@ pub struct NodeRun<'a> {
     pub observer: Option<Arc<dyn ToolObserver>>,
     /// Skills the node may load, answered in-conversation by the synthetic `Skill` tool.
     pub skills: Vec<Skill>,
+    /// The repository the node's built-in file tools read within; `None` when it has none.
+    pub files: Option<std::path::PathBuf>,
 }
 
 /// Run one node's turn with an output schema, so its final answer is structured JSON.
@@ -687,6 +723,7 @@ where
         clarifier,
         observer,
         skills,
+        files,
         ..
     } = run;
     let mut builder = AgentBuilder::new(model)
@@ -722,7 +759,7 @@ where
     if let Some(observer) = observer {
         builder = builder.add_hook(PluginHook { observer });
     }
-    let agent = bind_tools(builder, &tools);
+    let agent = bind_tools(builder, &tools, files.as_deref());
 
     // Tag every log line for this run — the hook's tool-call/text lines and rig-agent's own turn
     // logs — with the node name, so a run's agents are distinguishable in the logs. `prompt()` is

@@ -61,6 +61,8 @@ pub struct AnalystNode {
     pub system_prompt: Option<String>,
     /// What the plugins this node binds contribute to it.
     pub plugins: crate::NodePlugins,
+    /// The repository its built-in file tools read within.
+    pub files: Option<std::path::PathBuf>,
 }
 
 impl Node for AnalystNode {
@@ -94,6 +96,7 @@ impl Node for AnalystNode {
             clarifier: None,
             observer: self.plugins.observer.clone(),
             skills: crate::skills::loaded(&self.plugins.skills),
+            files: self.files.clone(),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("analyst agent failed: {e}")))?;

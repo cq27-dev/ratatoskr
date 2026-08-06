@@ -8,6 +8,9 @@ rust-version.workspace = true
 [dependencies]
 ratatoskr-core.workspace = true
 ratatoskr-mcp.workspace = true
+glob.workspace = true
+regex.workspace = true
+walkdir.workspace = true
 tokio = { workspace = true, features = ["time"] }
 rig-core.workspace = true
 rig-agent.workspace = true

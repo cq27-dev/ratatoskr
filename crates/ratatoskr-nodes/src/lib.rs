@@ -193,7 +193,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         &plugins_scout,
     )?;
     let mut scout_tools = scout_cfg.tools;
-    scout_tools.add_local(clarify::ask_tool(), sink.clone());
+    scout_tools.add_local(clarify::ask_tool());
     let scout = ScoutNode {
         route: scout_cfg.route,
         tools: scout_tools,
@@ -202,6 +202,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         clarifier: Some(clarifier.as_dyn()),
         system_prompt: scout_cfg.system_prompt,
         plugins: plugins_scout,
+        files: scout_cfg.files,
     };
     let scout_out = scout
         .run(issue.to_string(), &state)
@@ -246,6 +247,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         max_turns: analyst_cfg.max_turns,
         system_prompt: analyst_cfg.system_prompt,
         plugins: plugins_analyst,
+        files: analyst_cfg.files,
     };
     let analyst_out = analyst
         .run(
@@ -313,6 +315,8 @@ fn classifier_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> b
 struct NodeAgentConfig {
     route: ratatoskr_core::ModelRoute,
     tools: ToolSet,
+    /// The repository the node's built-in file tools read within.
+    files: Option<PathBuf>,
     policy: Option<Arc<dyn ToolPolicy>>,
     max_turns: Option<usize>,
     /// Replaces the node's built-in preamble when the ruleset declares one.
@@ -647,9 +651,17 @@ fn node_agent_config(
     default_tools: &[&str],
     plugins: &NodePlugins,
 ) -> Result<NodeAgentConfig, PlanError> {
-    // Taken before narrowing: the synthetic tools below need a sink to nominally belong to, and
-    // a node whose ruleset denied everything would otherwise have no group left to take one from.
-    let sink = tools.groups().first().map(|g| g.sink.clone());
+    // Offered before narrowing, so `deny` can take them away: a node reasons about a repository,
+    // and reading a file it found is the ordinary case rather than the dangerous one. These are
+    // also the names a plugin's hooks are written against — `Read`, `Grep`, `Glob` — which is what
+    // makes an unmodified plugin's `PreToolUse` fire for a planning node at all.
+    let files = std::env::current_dir().ok();
+    if files.is_some() {
+        tools
+            .local()
+            .tools
+            .extend(ratatoskr_agent::files::declarations());
+    }
     let ruleset = engine.ruleset(node);
     let rc = ruleset.as_ref().map(|r| r.config());
 
@@ -714,13 +726,14 @@ fn node_agent_config(
     // Every node reaches this function, which is why the skill tool is added here rather than at
     // each construction site: a node that binds a skill and is never offered it is the failure
     // this seam exists to prevent.
-    if let (Some(tool), Some(sink)) = (skills::skill_tool(&plugins.skills), sink) {
-        tools.add_local(tool, sink);
+    if let Some(tool) = skills::skill_tool(&plugins.skills) {
+        tools.add_local(tool);
     }
 
     Ok(NodeAgentConfig {
         route,
         tools,
+        files,
         policy,
         max_turns,
         system_prompt,
@@ -904,7 +917,7 @@ async fn bookkeep_and_checkpoint(
         &plugins_bookkeeper,
     )?;
     let mut tools = cfg.tools;
-    tools.add_local(clarify::ask_tool(), client.sink());
+    tools.add_local(clarify::ask_tool());
     let node = BookkeeperNode {
         route: cfg.route,
         tools,
@@ -914,6 +927,7 @@ async fn bookkeep_and_checkpoint(
         clarifier: Some(clarifier.as_dyn()),
         system_prompt: cfg.system_prompt,
         plugins: plugins_bookkeeper,
+        files: cfg.files,
     };
     let out = node
         .run(input)
@@ -1031,7 +1045,7 @@ async fn fork_and_converge(
                     &plugins_redteam,
                 )?;
                 let mut tools = cfg.tools;
-                tools.add_local(clarify::ask_tool(), client.sink());
+                tools.add_local(clarify::ask_tool());
                 Some(redteam::RedTeamClassifier {
                     route: cfg.route,
                     tools,
@@ -1040,6 +1054,7 @@ async fn fork_and_converge(
                     clarifier: Some(clarifier.as_dyn()),
                     system_prompt: cfg.system_prompt,
                     plugins: plugins_redteam,
+                    files: cfg.files,
                 })
             }
             false => None,

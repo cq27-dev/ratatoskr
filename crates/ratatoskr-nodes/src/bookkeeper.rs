@@ -147,6 +147,8 @@ pub struct BookkeeperNode {
     pub system_prompt: Option<String>,
     /// What the plugins this node binds contribute to it.
     pub plugins: crate::NodePlugins,
+    /// The repository its built-in file tools read within.
+    pub files: Option<std::path::PathBuf>,
 }
 
 impl BookkeeperNode {
@@ -178,6 +180,7 @@ impl BookkeeperNode {
             clarifier: self.clarifier.clone(),
             observer: self.plugins.observer.clone(),
             skills: crate::skills::loaded(&self.plugins.skills),
+            files: self.files.clone(),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("bookkeeper compose failed: {e}")))?;
