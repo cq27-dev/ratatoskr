@@ -385,6 +385,7 @@ fn build_red_team(
             &ctx.config,
             &ctx.plugin_context,
             ctx.rag_rat.clone(),
+            Some(Arc::clone(&ctx.ledger)),
         )?,
         repo_path: ctx.repo_path.clone(),
         sandbox: ctx.config.sandbox.clone(),
@@ -449,6 +450,7 @@ fn build_implementer(ctx: &WorkflowContext, analyst: AnalystOutput) -> Implement
             &ctx.config,
             &ctx.plugin_context,
             ctx.rag_rat.clone(),
+            Some(Arc::clone(&ctx.ledger)),
         )
         .ok()
         .flatten(),

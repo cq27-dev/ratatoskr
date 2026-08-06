@@ -156,6 +156,9 @@ pub struct Characterizer {
     pub route: ModelRoute,
     pub tools: ToolSet,
     pub max_turns: Option<usize>,
+    /// Where its cost is charged. It runs on every acceptance run — twice per converge iteration —
+    /// so leaving it unreported understated a run by one of its most frequent calls.
+    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
 }
 
 impl Characterizer {
@@ -178,7 +181,7 @@ impl Characterizer {
             observer: None,
             skills: Vec::new(),
             files: None,
-            ledger: None,
+            ledger: self.ledger.clone(),
             // One turn over output it was handed: there is no history to outgrow, so a compaction
             // policy would only cost a summariser it never calls.
             produces: None,
