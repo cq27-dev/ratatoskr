@@ -139,10 +139,14 @@ impl ImplementerNode {
         let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
             node: "implementer",
             route: &self.route,
-            preamble: &crate::effective_preamble(
-                NATIVE_PREAMBLE,
-                self.system_prompt.as_deref(),
-                self.plugins.context.as_deref(),
+            preamble: &format!(
+                "{}{}",
+                crate::effective_preamble(
+                    NATIVE_PREAMBLE,
+                    self.system_prompt.as_deref(),
+                    self.plugins.context.as_deref(),
+                ),
+                where_you_are(worktree),
             ),
             question: prompt,
             tools: self.tools.clone(),
@@ -264,9 +268,35 @@ impl ImplementerNode {
     }
 }
 
+/// Where the model is working, appended to its preamble.
+///
+/// On the preamble rather than in the task prompt because a re-driven attempt is a fresh
+/// conversation that receives only a diagnostic — it would otherwise have to rediscover this every
+/// iteration. Told rather than left to be found: a node that has to run `git rev-parse` and `ls`
+/// before it can start has spent two turns learning something nobody had a reason to withhold.
+fn where_you_are(worktree: &WorktreePath) -> String {
+    format!(
+        "\n\n# WHERE YOU ARE\n\nYour worktree is `{}`, and it is already checked out on your own \
+         branch. Your tools start there: a relative path is resolved against it, Bash starts there, \
+         and reading or writing outside it is refused. It is a full copy of the repository — the \
+         change you are asked for is made here, and nowhere else.",
+        worktree.as_path().display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_attempt_is_told_which_worktree_it_is_in() {
+        // Each attempt is a fresh conversation — a re-driven one receives only a diagnostic — so
+        // this rides on the preamble rather than the task prompt. Left out, the first thing a run
+        // does is spend turns on `git rev-parse` and `ls` to find out where it woke up.
+        let told = where_you_are(&WorktreePath(PathBuf::from("/w/ratatoskr/abc12345")));
+        assert!(told.contains("/w/ratatoskr/abc12345"), "{told}");
+        assert!(told.contains("branch"), "{told}");
+    }
 
     #[test]
     fn the_native_preamble_states_the_rules_a_run_actually_enforces() {
