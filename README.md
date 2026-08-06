@@ -142,6 +142,11 @@ already use — a `.claude-plugin/plugin.json` manifest and an optional `hooks/h
 plugin's `SessionStart` hook runs once per run and its output is prefixed to each node's preamble,
 so a node can open with the repository's shape instead of discovering it one tool call at a time.
 
+A path may name a plugin or a directory of them. A coding CLI's plugin cache keeps every version
+it has installed, so naming the plugin rather than one version is the right thing to configure:
+the copy that host records as installed is the one that loads, and a plugin is never loaded twice
+under one name.
+
 Nothing a plugin *does* can fail a run: one that is missing, malformed, slow, or broken is logged
 and skipped, and the node simply gets less context. Naming a plugin that isn't installed is
 different — that is a typo, and it fails the run rather than silently binding less than you asked

@@ -61,6 +61,10 @@ test_command = ["cargo", "test"]            # the target repo's test command
 # Agent plugins, in the format coding CLIs already use. `.ratatoskr/plugins/` is always searched;
 # these paths add plugins installed elsewhere, and may name a plugin or a directory of them.
 # A plugin's SessionStart hook runs once per run and its output is prefixed to each node's preamble.
+#
+# A coding CLI's cache keeps every version it has installed, so a path naming the plugin rather
+# than one version is the right thing to write — the installed one is the one that loads:
+#   paths = ["~/.claude/plugins/cache/rag-rat/rag-rat"]
 [plugins]
 paths = []
 
