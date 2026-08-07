@@ -158,7 +158,17 @@ pub fn read(headers: &HeaderMap, body: &Bytes, config: &GitHubConfig) -> Result<
         instruction_for(&payload.comment.body, &config.bot).ok_or(Refusal::NotForUs)?;
     // The bot's own comments mention it constantly — the questions it asks are addressed to
     // someone. Without this it answers itself in a loop.
-    if payload.comment.user.login.eq_ignore_ascii_case(&config.bot) {
+    //
+    // `[bot]` is stripped first. A GitHub App authors comments as `<slug>[bot]` while being
+    // mentioned as `<slug>`, so comparing the raw login never matches and the loop guard is a
+    // no-op for exactly the deployment most likely to be used.
+    let author = payload
+        .comment
+        .user
+        .login
+        .strip_suffix("[bot]")
+        .unwrap_or(&payload.comment.user.login);
+    if author.eq_ignore_ascii_case(&config.bot) {
         return Err(Refusal::NotForUs);
     }
     Ok(Request {
@@ -172,23 +182,39 @@ pub fn read(headers: &HeaderMap, body: &Bytes, config: &GitHubConfig) -> Result<
 
 /// What a comment is asking, if it is addressed to the bot.
 ///
-/// The mention has to be its own word: a comment discussing `@ratatoskr-docs`, or an email address
-/// ending in the handle, is not addressed to us. Everything after the mention on the rest of the
-/// comment is the instruction — a mention with nothing after it is a greeting, not a request.
+/// Both `@name` and `/name` are accepted, and they are not interchangeable in what they cost. `@`
+/// is a real mention, so it notifies whoever owns that account on GitHub — which is only harmless
+/// if the handle is one you own. `/` notifies nobody and collides with no username, so it works
+/// for an instance whose bot has no GitHub account at all, or whose preferred name is taken.
+///
+/// The trigger is matched as text either way. Nothing here resolves it against GitHub, so a
+/// deployment is free to choose whichever form suits it.
+///
+/// The trigger has to be its own word: a comment discussing a handle that merely begins with the
+/// bot's own, or an address ending in it, is not addressed to us. What follows on the rest of the
+/// comment is the instruction — a trigger with nothing after it is a greeting, not a request.
 fn instruction_for(body: &str, bot: &str) -> Option<String> {
-    let mention = format!("@{bot}");
+    ['@', '/']
+        .into_iter()
+        .filter_map(|sigil| find_trigger(body, &format!("{sigil}{bot}")))
+        .min_by_key(|(at, _)| *at)
+        .map(|(_, instruction)| instruction)
+}
+
+/// Where `trigger` appears as a whole word, and what follows it.
+fn find_trigger(body: &str, trigger: &str) -> Option<(usize, String)> {
     let at = body
-        .match_indices(&mention)
+        .match_indices(trigger)
         .find(|(i, _)| {
             let before = body[..*i].chars().next_back();
-            let after = body[i + mention.len()..].chars().next();
+            let after = body[i + trigger.len()..].chars().next();
             // Preceded by nothing or whitespace, and followed by nothing or a non-name character.
             before.is_none_or(char::is_whitespace)
                 && after.is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_')
         })
         .map(|(i, _)| i)?;
-    let rest = body[at + mention.len()..].trim();
-    (!rest.is_empty()).then(|| rest.to_string())
+    let rest = body[at + trigger.len()..].trim();
+    (!rest.is_empty()).then(|| (at, rest.to_string()))
 }
 
 /// Who is asking, if this instance knows them and trusts them to start a run.
@@ -355,6 +381,43 @@ mod tests {
         // this the first question starts a run that asks another question.
         let config = config();
         let body = comment("@ratatoskr what should I assume here?", "ratatoskr", 99);
+        assert_eq!(
+            read(
+                &headers(&body, &config.secret, "issue_comment"),
+                &body,
+                &config
+            ),
+            Err(Refusal::NotForUs)
+        );
+    }
+
+    #[test]
+    fn a_slash_command_triggers_as_well_as_a_mention() {
+        // The form that notifies nobody, for an instance whose bot has no GitHub account or whose
+        // preferred handle is already somebody else's.
+        assert_eq!(
+            instruction_for("/ratatoskr do the thing", "ratatoskr").as_deref(),
+            Some("do the thing")
+        );
+        assert_eq!(
+            instruction_for("please /ratatoskr fix the retry", "ratatoskr").as_deref(),
+            Some("fix the retry")
+        );
+        // Same whole-word rule, so a path is not a command.
+        assert_eq!(
+            instruction_for("see docs/ratatoskr-guide.md", "ratatoskr"),
+            None
+        );
+        assert_eq!(instruction_for("/ratatoskr", "ratatoskr"), None);
+    }
+
+    #[test]
+    fn a_github_app_recognises_its_own_comments() {
+        // An App is mentioned as `<slug>` and authors as `<slug>[bot]`. Comparing the raw login
+        // never matches, so without stripping the suffix the loop guard does nothing for exactly
+        // the deployment most likely to be used: the bot answers its own question forever.
+        let config = config();
+        let body = comment("@ratatoskr what should I assume?", "ratatoskr[bot]", 99);
         assert_eq!(
             read(
                 &headers(&body, &config.secret, "issue_comment"),

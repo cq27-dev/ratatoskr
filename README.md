@@ -212,15 +212,20 @@ disable reaches an open browser on its next request — neither waits for the se
 
 Mention the bot in an issue and it starts a run on that repository:
 
-> `@your-bot` the retry test flakes on CI, please fix it
+> `/ratatoskr` the retry test flakes on CI, please fix it
 
 ```sh
 ratatoskr users link-github kk 1234        # GitHub's numeric user id, not a login
-RATATOSKR_GITHUB_WEBHOOK_SECRET='...' ratatoskr serve --github-bot your-bot ...
+RATATOSKR_GITHUB_WEBHOOK_SECRET='...' ratatoskr serve --github-bot ratatoskr ...
 ```
 
 Point a repository webhook at `/api/integrations/github`, sending **issue comments**, with that
 same secret.
+
+Either `/ratatoskr …` or `@ratatoskr …` triggers it, and the difference is who gets notified. The
+trigger is matched as text — nothing resolves it against GitHub — so `/` collides with no username
+and notifies nobody, which is what you want unless the handle is an account you actually own.
+Mentioning one you do not own notifies a stranger every time somebody starts a run.
 
 Being able to comment is not being able to run anything. The person who mentioned the bot has to
 map to an operator here — that is what `link-github` establishes — and everyone else is ignored.

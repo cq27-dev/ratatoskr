@@ -117,12 +117,15 @@ enum Command {
         /// instance can watch several projects, and identity belongs to none of them.
         #[arg(long, default_value = ".ratatoskr/auth.sqlite3")]
         auth_db: PathBuf,
-        /// Enable the GitHub integration as this account, without the `@`.
+        /// Enable the GitHub integration under this trigger word, without any sigil.
         ///
-        /// Mentioning it in an issue starts a run, if the person mentioning it maps to an operator
-        /// (`ratatoskr users link-github`). The webhook secret comes from
-        /// RATATOSKR_GITHUB_WEBHOOK_SECRET; which repository a delivery is about is read from each
-        /// project's `origin`, so there is nothing to keep in step by hand.
+        /// A comment saying `/<word> …` or `@<word> …` starts a run, if whoever wrote it maps to
+        /// an operator here (`ratatoskr users link-github`). Prefer the slash form unless the word
+        /// is a GitHub account you own: an `@` is a real mention, so it notifies whoever does.
+        ///
+        /// The webhook secret comes from RATATOSKR_GITHUB_WEBHOOK_SECRET; which repository a
+        /// delivery is about is read from each project's `origin`, so there is nothing to keep in
+        /// step by hand.
         #[arg(long = "github-bot")]
         github_bot: Option<String>,
         /// Mark the session cookie `Secure`. Set this whenever the instance is reached over
