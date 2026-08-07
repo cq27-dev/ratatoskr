@@ -106,7 +106,9 @@ pub const IMPLEMENTER_TOOLS: &[&str] = &[
 /// it believes it did.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct Report {
-    /// What was changed and why, for the reader of the run rather than for another node.
+    /// What was changed and why. This becomes the commit's body, so write it for whoever reads
+    /// the change later with no memory of the run: what you did, and the reasoning that is not
+    /// recoverable from the diff. Not a list of files — the diff is already the list of files.
     summary: String,
     /// The conventional-commit type of this change: `feat`, `fix`, `chore`, `docs`, `perf`,
     /// `refactor`, `style`, `test`, `ci`, `build`.

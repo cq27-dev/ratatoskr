@@ -32,7 +32,11 @@ evidence of what they will say. A new failing check is a regression and the iter
 to you. If a subproblem turns out to be hard, that is a reason to find another route through the
 code, not a reason to stop early.
 
-Report `kind`, `scope` and `subject` alongside your summary: they become the commit's subject line,
+Your `summary` becomes the commit's body, so write it for whoever reads the change months later
+with no memory of the run: what you did, and the reasoning that cannot be recovered from the diff.
+Not a list of the files you touched — the diff is already that list.
+
+Report `kind`, `scope` and `subject` alongside it: they become the commit's subject line,
 so they describe **what this change did**, not what the issue asked for. A run that fixed one half
 of a two-part issue must not claim the whole of it in the history.
 
