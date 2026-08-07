@@ -60,7 +60,11 @@ body {
   grid-column: 1 / -1;
   background: var(--bg);
   display: flex;
-  align-items: baseline;
+  /* Centred, not baseline-aligned. The title is `clamp(1.1rem, 2.4vw, 2rem)` with a 0.9 line
+     height, so its baseline sits near the bottom of a much taller box — and the 10px items shared
+     with it then hang off that baseline, reading as low against the bar rather than aligned to
+     anything. Centring makes them agree with the bar they are in, at every title size. */
+  align-items: center;
   justify-content: space-between;
   padding: 14px 18px;
 }
@@ -1346,7 +1350,9 @@ a:focus-visible {
 .who,
 .signin {
   display: flex;
-  align-items: baseline;
+  /* Their own contents too: with the form open these are bordered inputs and buttons, not text,
+     and a baseline through a padded box lands nowhere useful. */
+  align-items: center;
   gap: 8px;
   font-size: 10px;
   letter-spacing: 0.12em;
