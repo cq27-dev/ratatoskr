@@ -155,6 +155,10 @@ pin_acceptance = false
 # which must be installed and authenticated.
 [publish]
 enabled = false
+# The label every pull request a run opens carries, so a reviewer can tell what wrote the change in
+# front of them. Set it to another word to use that instead, or to "" to add none — a repository
+# that already labels automation its own way should not be given a second scheme.
+label = "ratatoskr"
 
 # Optional: with a [models.publisher] route set and [publish] enabled, a finished run delivers what
 # it made to the tracker, in parallel with the bookkeeper recording what it learned.

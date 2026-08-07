@@ -22,15 +22,29 @@ pub const GH: &str = "gh";
 /// The name the push tool is offered under.
 pub const PUSH: &str = "git_push";
 
-/// The label every pull request a run opens carries.
-pub const RUN_LABEL: &str = "ratatoskr";
+/// The label every pull request a run opens carries, as this deployment configured it.
+///
+/// Process-wide for the same reason the endpoint is: it describes the repository this run publishes
+/// to, not any one node, and every pull request a run opens wants the same answer.
+static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Tell the publish layer what to label with. Called once, before any node runs.
+pub fn configure_label(label: String) {
+    let _ = LABEL.set(label);
+}
+
+/// The configured label, or none when a repository asked for none.
+fn run_label() -> Option<&'static str> {
+    let label = LABEL.get().map_or("ratatoskr", String::as_str).trim();
+    (!label.is_empty()).then_some(label)
+}
 
 /// Create the label if the repository does not have it yet.
 ///
 /// `gh pr create --label` fails outright on a label that does not exist, which would turn "this
 /// repository has not seen a run before" into a run that cannot deliver. Best-effort and silent:
 /// the common case is that it already exists, and `gh` says so on stderr, which is not news.
-async fn ensure_label(root: &Path) {
+async fn ensure_label(root: &Path, label: &str) {
     let _ = tokio::time::timeout(
         CALL_TIMEOUT,
         tokio::process::Command::new(GH)
@@ -38,7 +52,7 @@ async fn ensure_label(root: &Path) {
             .args([
                 "label",
                 "create",
-                RUN_LABEL,
+                label,
                 "--description",
                 "Opened by a ratatoskr run",
                 "--color",
@@ -169,10 +183,13 @@ async fn run(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecut
     // reviewer needs to know what wrote the thing in front of them, and a label a node has to
     // remember is one it will eventually forget. Adding it after the allowlist check means the
     // check still sees exactly what the caller asked for.
-    if argv.first().is_some_and(|a| a == "pr") && argv.get(1).is_some_and(|a| a == "create") {
-        ensure_label(root).await;
+    if argv.first().is_some_and(|a| a == "pr")
+        && argv.get(1).is_some_and(|a| a == "create")
+        && let Some(label) = run_label()
+    {
+        ensure_label(root, label).await;
         argv.push("--label".to_string());
-        argv.push(RUN_LABEL.to_string());
+        argv.push(label.to_string());
     }
     // Written by this code rather than by the caller: a body is prose with newlines and backticks
     // in it, and argv is where quoting bugs and injected arguments both live.
@@ -562,9 +579,14 @@ mod tests {
             Err(e) => format!("{e}"),
         };
         assert!(
-            text.contains(RUN_LABEL),
+            text.contains("--label ratatoskr"),
             "the label reaches the command: {text}"
         );
+
+        // The opt-out is real: with no label configured, nothing is added and `gh` is not asked
+        // to create one. Checked through `run_label` rather than by setting the OnceLock, which
+        // one test cannot un-set for the others.
+        assert_eq!(run_label(), Some("ratatoskr"), "the default, unconfigured");
 
         // A comment is not a pull request and is not labelled.
         let out = run(&root, &json!({ "command": ["issue", "comment", "1"] })).await;
