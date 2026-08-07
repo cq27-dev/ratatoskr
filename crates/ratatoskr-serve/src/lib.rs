@@ -223,6 +223,9 @@ struct RunDetail {
     last_activity: Option<String>,
     nodes: Vec<NodeView>,
     worktree: Option<WorktreeView>,
+    /// The pull request the run opened, if it opened one. Absent for comment-only or
+    /// nothing-published runs, and for older runs whose `publisher` checkpoint predates this.
+    pull_request: Option<PullRequestView>,
 }
 
 /// The implementer's worktree — the reviewable deliverable, kept on `converged` and
@@ -232,6 +235,14 @@ struct RunDetail {
 struct WorktreeView {
     path: String,
     exists: bool,
+}
+
+/// A pull request a run opened. The publisher's `url` is only a PR for `action` `pull_request`
+/// or `both`; `#number` is the URL's last path segment (`/pull/139` → `139`).
+#[derive(Debug, Serialize)]
+struct PullRequestView {
+    number: u64,
+    url: String,
 }
 
 /// One stored checkpoint, with its JSON parsed so the client gets structure rather than a string.
@@ -301,6 +312,7 @@ async fn run_detail(
         last_activity,
         nodes,
         worktree: worktree_view(&checkpoints),
+        pull_request: pull_request_view(&checkpoints),
     }))
 }
 
@@ -360,6 +372,38 @@ fn worktree_view(checkpoints: &[Checkpoint]) -> Option<WorktreeView> {
     let path = value.get("worktree_path")?.as_str()?.to_string();
     let exists = Path::new(&path).exists();
     Some(WorktreeView { path, exists })
+}
+
+/// The pull request the latest `publisher` checkpoint opened, if any. `url` is only a PR when
+/// `action` is `pull_request` or `both` — a `comment`/`none` url points at an issue comment and
+/// must not be shown as a PR. `both` collapses to the PR (the single `url` field). The number is
+/// the URL's last path segment; anything that doesn't yield a number (older run without the field,
+/// comment url, malformed JSON) is absence, not an error.
+fn pull_request_view(checkpoints: &[Checkpoint]) -> Option<PullRequestView> {
+    let raw = checkpoints
+        .iter()
+        .rev()
+        .find(|c| c.node_name == "publisher")?
+        .output_json
+        .as_str();
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    match value.get("action").and_then(|v| v.as_str()) {
+        Some("pull_request") | Some("both") => {}
+        _ => return None,
+    }
+    let url = value.get("url")?.as_str()?;
+    let number: u64 = url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()?
+        .split(['?', '#'])
+        .next()?
+        .parse()
+        .ok()?;
+    Some(PullRequestView {
+        number,
+        url: url.to_string(),
+    })
 }
 
 /// Parse stored JSON, falling back to the raw text so a malformed checkpoint is still visible
@@ -536,5 +580,110 @@ mod tests {
     fn a_malformed_checkpoint_still_renders() {
         assert_eq!(parse_or_raw(r#"{"a":1}"#), serde_json::json!({"a": 1}));
         assert_eq!(parse_or_raw("garbage"), serde_json::json!("garbage"));
+    }
+
+    // --- pull_request_view -------------------------------------------------
+    // The contract leaves `PullRequestView::number` as u64/i64/String; these tests read it as an
+    // integer (the `139` literal compiles for u64 or i64), which is the reading that makes the
+    // "last URL segment is numeric" requirement checkable. `url` is asserted as a `&str`.
+
+    #[test]
+    fn reads_the_pull_request_from_a_publisher_checkpoint() {
+        let cps = vec![cp(
+            "publisher",
+            r#"{"action":"pull_request","url":"https://github.com/o/r/pull/139","reasoning":"..."}"#,
+        )];
+        let pr = pull_request_view(&cps).unwrap();
+        assert_eq!(pr.number, 139);
+        assert_eq!(pr.url, "https://github.com/o/r/pull/139");
+    }
+
+    #[test]
+    fn action_both_still_yields_the_pull_request() {
+        let cps = vec![cp(
+            "publisher",
+            r#"{"action":"both","url":"https://github.com/o/r/pull/42","reasoning":"x"}"#,
+        )];
+        let pr = pull_request_view(&cps).unwrap();
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.url, "https://github.com/o/r/pull/42");
+    }
+
+    #[test]
+    fn takes_the_pull_request_from_the_latest_publisher_checkpoint() {
+        // Latest-wins, like worktree_view: the later publisher checkpoint is authoritative.
+        let cps = vec![
+            cp(
+                "publisher",
+                r#"{"action":"pull_request","url":"https://github.com/o/r/pull/1"}"#,
+            ),
+            cp(
+                "publisher",
+                r#"{"action":"pull_request","url":"https://github.com/o/r/pull/2"}"#,
+            ),
+        ];
+        let pr = pull_request_view(&cps).unwrap();
+        assert_eq!(pr.number, 2);
+        assert_eq!(pr.url, "https://github.com/o/r/pull/2");
+    }
+
+    #[test]
+    fn a_comment_is_never_presented_as_a_pull_request() {
+        let cps = vec![cp(
+            "publisher",
+            r#"{"action":"comment","url":"https://github.com/o/r/issues/12#issuecomment-999"}"#,
+        )];
+        assert!(pull_request_view(&cps).is_none());
+    }
+
+    #[test]
+    fn action_none_with_no_url_is_absent() {
+        let cps = vec![cp("publisher", r#"{"action":"none"}"#)];
+        assert!(pull_request_view(&cps).is_none());
+    }
+
+    #[test]
+    fn no_publisher_checkpoint_is_absent() {
+        assert!(pull_request_view(&[]).is_none());
+        let cps = vec![cp("implementer", r#"{"worktree_path":"/tmp/x"}"#)];
+        assert!(pull_request_view(&cps).is_none());
+    }
+
+    #[test]
+    fn a_malformed_publisher_checkpoint_is_absent_not_a_panic() {
+        assert!(pull_request_view(&[cp("publisher", "not json")]).is_none());
+    }
+
+    #[test]
+    fn a_pull_request_with_a_non_numeric_last_segment_is_absent() {
+        let cps = vec![cp(
+            "publisher",
+            r#"{"action":"pull_request","url":"https://github.com/o/r/pull/not-a-number"}"#,
+        )];
+        assert!(pull_request_view(&cps).is_none());
+        let empty_url = vec![cp("publisher", r#"{"action":"pull_request","url":""}"#)];
+        assert!(pull_request_view(&empty_url).is_none());
+    }
+
+    #[test]
+    fn a_pull_request_missing_the_url_field_is_absent() {
+        let cps = vec![cp("publisher", r#"{"action":"pull_request"}"#)];
+        assert!(pull_request_view(&cps).is_none());
+    }
+
+    #[test]
+    fn a_pull_request_view_serializes_number_and_url() {
+        // Mirrors `RunDetail.pull_request`: the JSON the API/api.ts consumer sees.
+        let cps = vec![cp(
+            "publisher",
+            r#"{"action":"pull_request","url":"https://github.com/o/r/pull/139"}"#,
+        )];
+        let pr = pull_request_view(&cps).unwrap();
+        let json = serde_json::to_value(&pr).unwrap();
+        assert_eq!(json["number"], serde_json::json!(139));
+        assert_eq!(
+            json["url"],
+            serde_json::json!("https://github.com/o/r/pull/139")
+        );
     }
 }

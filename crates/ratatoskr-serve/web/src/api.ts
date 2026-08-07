@@ -76,6 +76,11 @@ export interface WorktreeView {
   exists: boolean;
 }
 
+export interface PullRequestView {
+  number: number;
+  url: string;
+}
+
 export interface RunDetail {
   run_id: string;
   /** Null for a run with checkpoints but no `runs` row. */
@@ -86,6 +91,9 @@ export interface RunDetail {
   last_activity: string | null;
   nodes: NodeView[];
   worktree: WorktreeView | null;
+  /** The pull request the run opened, if any. Null for comment-only, nothing-published, or
+   * older runs whose publisher checkpoint predates this field. */
+  pull_request: PullRequestView | null;
 }
 
 export interface CheckpointView {

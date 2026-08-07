@@ -214,6 +214,20 @@ function RunMeta({ detail, lastEventAt }: { detail: RunDetail; lastEventAt: numb
             )}
           </dd>
         </div>
+        {detail.pull_request && (
+          <div>
+            <dt>Pull request</dt>
+            <dd>
+              <a
+                href={detail.pull_request.url}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                #{detail.pull_request.number}
+              </a>
+            </dd>
+          </div>
+        )}
       </dl>
     </header>
   );
