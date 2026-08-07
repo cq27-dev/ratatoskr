@@ -22,6 +22,18 @@ two places, so this change needs both" is a constraint; "be careful with migrati
 
 `papertrail_summary` — a short free-text account of what the tracker and history show.
 
+Read an issue's COMMENTS, not only its body. The body is what somebody thought when they filed it;
+the comments are what was learnt since — a correction, a decision taken afterwards, a measurement,
+a note that part of it already shipped. Where a comment contradicts the body, report the
+contradiction rather than picking one: a plan built on a superseded description is wrong before any
+code is written.
+
+An empty tracker result is ambiguous and must not be reported as a finding on its own. "Nothing has
+been filed about this" and "the tracker is not readable from here" produce the same empty list and
+mean opposite things. Probe with a broad term you would expect to match; if that returns nothing
+either, say the papertrail is unavailable. Reporting "no prior art" when the mirror is simply empty
+hands the analyst a false all-clear.
+
 ## How to work
 
 Search before you conclude. The retrieved memories are a ranked guess from the task text alone, so
