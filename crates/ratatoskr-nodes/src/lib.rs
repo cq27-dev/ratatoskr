@@ -2296,6 +2296,8 @@ async fn fork_and_converge(
 
     let red_team = RedTeamNode {
         repo_path: repo_path.clone(),
+        worktree_root: config.worktree.root.clone(),
+        baseline_branch: format!("ratatoskr/{short}-baseline"),
         sandbox: config.sandbox.clone(),
         name: format!("ratatoskr-redteam-{short}"),
         // Opt-in: classify baseline failures only when redteam has a route — from

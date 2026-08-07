@@ -241,11 +241,7 @@ fn within(root: &Path, path: Option<&str>) -> Result<PathBuf, ToolExecutionError
         Some(path) => base.join(path),
         None => base.clone(),
     };
-    // Canonicalising resolves symlinks, which is what stops one inside the repository pointing
-    // out of it. It also *fails* for a path that does not exist — and `starts_with` compares
-    // components without resolving `..`, so falling back to the raw path would let
-    // `<root>/../../etc/anything` pass. Normalise lexically first, so the check holds either way.
-    let real = joined.canonicalize().unwrap_or_else(|_| lexical(&joined));
+    let real = resolve(&joined);
     if !real.starts_with(&base) {
         return Err(ToolExecutionError::invalid_args(format!(
             "{} is outside this repository",
@@ -255,12 +251,22 @@ fn within(root: &Path, path: Option<&str>) -> Result<PathBuf, ToolExecutionError
     Ok(real)
 }
 
-/// Resolve `.` and `..` without touching the filesystem.
+/// Resolve a path as the OS will, as far as the filesystem can answer.
 ///
-/// For a path that exists, `canonicalize` does this and more. This is the fallback for one that
-/// does not, where the alternative is a containment check that compares `..` as if it were a
-/// directory name.
-fn lexical(path: &Path) -> PathBuf {
+/// `canonicalize` on the whole path is not enough, because it fails outright for a path whose last
+/// component does not exist — which is every `Write` that creates a file. Falling back to a purely
+/// lexical normalisation is not enough either: it treats a symlinked directory as a directory
+/// name, so `foo/new.txt` with `foo -> /tmp/elsewhere` passes a containment check and then lands
+/// wherever `foo` actually points.
+///
+/// So resolve one component at a time, canonicalising each prefix that exists. A symlink is
+/// followed where the filesystem knows about it, a name that does not exist yet is carried
+/// forward as written, and `..` pops from the resolved prefix rather than from the text.
+///
+/// This is a check, and the write that follows it is a second syscall: a symlink planted in
+/// between still wins. Closing that means performing the write inside the sandbox rather than
+/// deciding about it out here, which is the same boundary `Bash` already runs behind.
+fn resolve(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for part in path.components() {
         match part {
@@ -268,7 +274,12 @@ fn lexical(path: &Path) -> PathBuf {
                 out.pop();
             }
             std::path::Component::CurDir => {}
-            part => out.push(part),
+            part => {
+                out.push(part);
+                if let Ok(real) = out.canonicalize() {
+                    out = real;
+                }
+            }
         }
     }
     out
@@ -876,6 +887,46 @@ mod tests {
             assert!(err.to_string().contains("outside this repository"), "{err}");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_does_not_carry_a_write_out_of_the_repository() {
+        // The case a whole-path `canonicalize` cannot see: the file being written does not exist
+        // yet, so the call fails and the check falls back to something that has to decide about
+        // `link/new.txt` on its own. Treating `link` as a directory *name* passes it, and then the
+        // write follows the symlink at the OS level and lands wherever it points.
+        let root = repo("symlinked-parent");
+        let outside =
+            std::env::temp_dir().join(format!("ratatoskr-outside-the-repo-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        for tool in ["write", "read"] {
+            let args = json!({ "file_path": "link/new.txt", "content": "landed" });
+            let err = match tool {
+                "write" => write(&root, &args).expect_err("refused"),
+                _ => read(&root, &args).expect_err("refused"),
+            };
+            assert!(err.to_string().contains("outside this repository"), "{err}");
+        }
+        assert!(
+            !outside.join("new.txt").exists(),
+            "nothing was written outside the repository"
+        );
+
+        // The same directory reached the ordinary way is still fine: this refuses an escape, not
+        // every path with a symlink in it.
+        std::os::unix::fs::symlink(root.join("src"), root.join("inside")).unwrap();
+        write(
+            &root,
+            &json!({ "file_path": "inside/new.rs", "content": "fn x() {}" }),
+        )
+        .unwrap();
+        assert!(root.join("src/new.rs").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

@@ -1,6 +1,6 @@
-//! Red-team: characterize the baseline test run. No LLM in the core path — it mounts the existing
-//! checkout into a sandbox, runs the repo's tests, and parses pass/fail deterministically. That
-//! deterministic characterization is what converge compares the implementer's run against.
+//! Red-team: characterize the baseline test run. No LLM in the core path — it runs the repo's
+//! tests in a worktree of its own and parses pass/fail deterministically. That deterministic
+//! characterization is what converge compares the implementer's run against.
 //!
 //! An OPTIONAL classifier (enabled only when redteam has a model route — from `[models.redteam]` or
 //! its ruleset) adds one LLM
@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use ratatoskr_core::ModelRoute;
+use ratatoskr_exec::{WorktreePath, create_worktree, delete_worktree_branch, remove_worktree};
 use ratatoskr_graph::{NodeError, parse_validated};
 use ratatoskr_mcp::ToolSet;
 use schemars::JsonSchema;
@@ -216,6 +217,11 @@ fn author_prompt(issue: &str, interface: &[crate::analyst::InterfaceItem]) -> St
 
 pub struct RedTeamNode {
     pub repo_path: PathBuf,
+    /// Where the baseline's own worktree is created — the same root the implementer forks into.
+    pub worktree_root: PathBuf,
+    /// The branch the baseline's worktree is created on. Under `ratatoskr/`, so a run that dies
+    /// before cleanup leaves something `clean` reclaims rather than an orphan nobody owns.
+    pub baseline_branch: String,
     pub sandbox: ratatoskr_core::SandboxConfig,
     /// Unique sandbox name for this run.
     pub name: String,
@@ -284,16 +290,51 @@ impl RedTeamNode {
         }
     }
 
+    /// A fresh worktree at the commit the implementer forks from, for the baseline to run in.
+    ///
+    /// Not the live checkout. A sandbox mount is writable — that is what makes it a mount rather
+    /// than part of the read-only host root — and the checkout holds `.git/hooks`, which the host
+    /// executes on the next `git worktree add`, alongside `.ratatoskr/rules/`, `ratatoskr.toml`
+    /// and `.env`. It is also the wrong tree to measure: the baseline says what already failed
+    /// before the change, and it can only mean that if it ran where the change will run. A live
+    /// checkout carries installed dependencies and build output a fresh fork does not, so the two
+    /// runs disagree about things that have nothing to do with the change.
+    ///
+    /// Not the implementer's worktree either: the red team writes the change's tests into that one
+    /// at the same time, and a baseline that saw them would file the new tests as pre-existing
+    /// failures — which is precisely the set converge is told to ignore.
+    async fn baseline_worktree(&self) -> Result<WorktreePath, NodeError> {
+        create_worktree(&self.repo_path, &self.worktree_root, &self.baseline_branch)
+            .await
+            .map_err(|e| NodeError::Failed(format!("baseline worktree create failed: {e}")))
+    }
+
+    /// Remove the baseline's worktree and its branch. Best-effort: the measurement is already
+    /// taken, and failing the run over a leftover directory would trade a nuisance for a loss.
+    /// `clean` reclaims what this misses, which is why the branch is under `ratatoskr/`.
+    async fn discard(&self, worktree: WorktreePath) {
+        if let Err(e) = remove_worktree(&self.repo_path, &worktree).await {
+            tracing::warn!("failed to remove the baseline worktree: {e}");
+            return;
+        }
+        // Only once the worktree is gone: git refuses to delete a branch that is still checked out.
+        if let Err(e) = delete_worktree_branch(&self.repo_path, &self.baseline_branch).await {
+            tracing::warn!("failed to delete the baseline branch: {e}");
+        }
+    }
+
     pub async fn run(&self) -> Result<RedTeamOutput, NodeError> {
+        let worktree = self.baseline_worktree().await?;
         let outcomes = run_acceptance(
             &self.sandbox,
             "red_team",
             &self.name,
-            &self.repo_path,
+            worktree.as_path(),
             &self.acceptance,
         )
-        .await
-        .map_err(NodeError::Failed)?;
+        .await;
+        self.discard(worktree).await;
+        let outcomes = outcomes.map_err(NodeError::Failed)?;
         let results = match &self.characterizer {
             Some(c) => c.read(&outcomes).await,
             None => by_exit_code(&outcomes),
@@ -344,6 +385,108 @@ mod tests {
             happy: vec!["removes rows older than the cutoff and returns how many".into()],
             sad: vec!["a zero duration removes nothing and returns 0".into()],
         }
+    }
+
+    /// A repository with one commit, plus an untracked `node_modules/installed` — what a live
+    /// checkout carries and a fresh fork does not.
+    async fn checkout_with_dependencies_installed(tmp: &std::path::Path) -> PathBuf {
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(repo.join("node_modules")).unwrap();
+        std::fs::write(repo.join("src.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(repo.join("node_modules/installed"), "").unwrap();
+        std::fs::write(repo.join(".gitignore"), "node_modules/\n").unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "T"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "initial"],
+        ] {
+            let out = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(&args)
+                .output()
+                .await
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        repo
+    }
+
+    fn baseline_node(repo: &std::path::Path, tmp: &std::path::Path, steps: &[&str]) -> RedTeamNode {
+        RedTeamNode {
+            repo_path: repo.to_path_buf(),
+            worktree_root: tmp.join("worktrees"),
+            baseline_branch: "ratatoskr/test-baseline".into(),
+            sandbox: ratatoskr_core::SandboxConfig {
+                backend: "landlock".into(),
+                ..Default::default()
+            },
+            name: "ratatoskr-redteam-test".into(),
+            classifier: None,
+            acceptance: match steps.is_empty() {
+                true => Vec::new(),
+                false => vec![ratatoskr_core::AcceptanceStep {
+                    name: "deps".into(),
+                    command: steps.iter().map(|s| (*s).to_string()).collect(),
+                }],
+            },
+            characterizer: None,
+            author: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_baseline_gets_a_fresh_tree_and_never_the_live_checkout() {
+        // Two failures with one cause. The live checkout is bind-mounted *writable* by the
+        // sandbox, and it holds `.git/hooks` — which the host runs on the next `git worktree add`
+        // — along with `.ratatoskr/rules/`, `ratatoskr.toml` and `.env`. It is also the wrong tree
+        // to measure in: it carries installed dependencies and build output that the tree the
+        // change is written in does not, so the same command gives opposite answers for reasons
+        // that have nothing to do with the change.
+        let tmp = std::env::temp_dir().join(format!("ratatoskr-rt-{}", std::process::id()));
+        let repo = checkout_with_dependencies_installed(&tmp).await;
+        let node = baseline_node(&repo, &tmp, &[]);
+
+        let wt = node.baseline_worktree().await.unwrap();
+        assert_ne!(wt.as_path(), repo, "the baseline is not given the checkout");
+        assert!(wt.as_path().join("src.rs").exists(), "same commit");
+        assert!(
+            !wt.as_path().join("node_modules/installed").exists(),
+            "a fresh fork does not carry what was installed into the checkout"
+        );
+
+        // And it takes its own worktree and branch away with it, so a run does not leave one
+        // behind per baseline.
+        node.discard(wt.clone()).await;
+        assert!(!wt.as_path().exists());
+        let branches = ratatoskr_exec::managed_worktree_branches(&repo)
+            .await
+            .unwrap();
+        assert!(!branches.contains(&node.baseline_branch), "{branches:?}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires bwrap on the host; run with --ignored"]
+    async fn a_dependency_only_the_checkout_has_does_not_make_the_baseline_pass() {
+        // The observed failure, end to end: the baseline reported every step green because it ran
+        // where the dependencies were already installed, while the implementer's identical
+        // commands failed in a fresh worktree. Converge then compares two runs that differ by more
+        // than the change, which is the one thing it is not allowed to do.
+        let tmp = std::env::temp_dir().join(format!("ratatoskr-rt-e2e-{}", std::process::id()));
+        let repo = checkout_with_dependencies_installed(&tmp).await;
+        let node = baseline_node(&repo, &tmp, &["test", "-e", "node_modules/installed"]);
+
+        let out = node.run().await.unwrap();
+        assert_ne!(
+            out.exit_code, 0,
+            "the baseline saw a dependency that only the live checkout has"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
