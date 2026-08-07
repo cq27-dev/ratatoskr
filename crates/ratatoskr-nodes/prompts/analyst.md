@@ -15,8 +15,11 @@ string, because these run without a shell to split them:
     [{"name": "tests", "command": ["cargo", "test", "--workspace"]}]
 
 Use the repo's own tooling, and include every step the check needs — building an artifact before
-testing it is two steps, not one. Leave the list empty to accept the repository's configured test
-command, which is the right answer whenever the existing suite already covers the change.
+testing it is two steps, not one. The steps run in a fresh worktree with nothing installed, so a
+repository whose dependencies are not committed needs the install as its own first step: a check
+that assumes them fails on the framework rather than on the change, and says nothing about whether
+the change is right. Leave the list empty to accept the repository's configured test command, which
+is the right answer whenever the existing suite already covers the change.
 
 Also set `interface`: the surface this change is contracted to have. Someone else writes the tests
 from it — the red team, working only from what you say here — and the implementer builds against
