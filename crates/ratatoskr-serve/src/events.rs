@@ -148,14 +148,28 @@ fn run_id_of(record: &Value) -> Option<&str> {
 /// Same idea for the node: a field on checkpoint records, the `agent` span for everything an
 /// agent emits.
 fn node_of(record: &Value) -> Option<&str> {
-    if let Some(node) = record.get("node").and_then(Value::as_str) {
-        return Some(node);
+    let raw = record.get("node").and_then(Value::as_str).or_else(|| {
+        record
+            .get("spans")?
+            .as_array()?
+            .iter()
+            .find_map(|span| span.get("node").and_then(Value::as_str))
+    })?;
+    Some(stage_name(raw))
+}
+
+/// The name the pipeline knows a node by.
+///
+/// The red team checkpoints as `red_team` and runs as `redteam` — a split the run itself relies
+/// on. Everything downstream of here keys on the stage name, so an event arriving under the other
+/// spelling belongs to no stage at all: it groups on its own in the feed, and the node it came
+/// from never lights up while it is working. Normalising once here is cheaper than every consumer
+/// remembering which side of the split it is on.
+fn stage_name(node: &str) -> &str {
+    match node {
+        "redteam" => "red_team",
+        other => other,
     }
-    record
-        .get("spans")?
-        .as_array()?
-        .iter()
-        .find_map(|span| span.get("node").and_then(Value::as_str))
 }
 
 /// The argument worth showing for a tool call.
