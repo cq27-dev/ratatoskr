@@ -497,6 +497,7 @@ fn build_implementer(
         policy: cfg.policy,
         max_turns: cfg.max_turns,
         system_prompt: cfg.system_prompt,
+        conventions: crate::repo_conventions(&ctx.repo_path),
         plugins,
         ledger: Some(Arc::clone(&ctx.ledger)),
         run_id: ctx.run_id.clone(),

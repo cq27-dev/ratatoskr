@@ -154,6 +154,10 @@ pub struct TestAuthor {
     pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
     pub max_turns: Option<usize>,
     pub system_prompt: Option<String>,
+    /// The repository's own conventions (`AGENTS.md`), loaded once from the checkout and prefixed
+    /// to this node's preamble. `None` when the repo ships no conventions file. The test author
+    /// writes code, so it carries these; the classifier, which only reads, does not.
+    pub conventions: Option<String>,
     pub plugins: crate::NodePlugins,
     pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
 }
@@ -169,10 +173,14 @@ impl TestAuthor {
         let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
             node: "redteam",
             route: &self.route,
-            preamble: &crate::effective_preamble(
-                AUTHOR_PREAMBLE,
-                self.system_prompt.as_deref(),
-                self.plugins.context.as_deref(),
+            preamble: &crate::with_conventions(
+                "redteam",
+                self.conventions.as_deref(),
+                crate::effective_preamble(
+                    AUTHOR_PREAMBLE,
+                    self.system_prompt.as_deref(),
+                    self.plugins.context.as_deref(),
+                ),
             ),
             question: &author_prompt(issue, interface),
             tools: self.tools.clone(),
