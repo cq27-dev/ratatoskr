@@ -143,6 +143,22 @@ image = "docker.io/library/rust:1-slim"     # OCI image the sandbox boots (micro
 # "done" means per task and may replace this with an ordered pipeline — "build the wasm, then drive
 # it in a browser" is two steps, not one.
 test_command = ["cargo", "test"]
+# Programs an acceptance step may reach the network for, by name. Acceptance runs offline: a test
+# that reaches the network fails for reasons the repository does not control. But a repository whose
+# dependencies are not vendored cannot check anything until they are fetched — a fresh worktree has
+# no `node_modules`, so the type-checker fails on the framework rather than on the change.
+#
+# An entry matches the start of a step's command, so it can name a program or a program and its
+# subcommand. That distinction matters: in most ecosystems the installer and the test runner are
+# the same program, so a bare "npm" would put the checks online too.
+#
+#   network_allow = ["npm install", "npm ci"]
+#
+# Not by host. The sandbox's network namespace is all-or-nothing for one invocation, so a step that
+# can reach a registry can reach anything; restricting by hostname needs something that can see the
+# request, which a namespace cannot.
+network_allow = []
+
 # Ignore whatever the analyst proposes and always run test_command. For a repo that does not want
 # a model deciding what proves its code works.
 pin_acceptance = false

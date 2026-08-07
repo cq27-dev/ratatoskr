@@ -125,14 +125,71 @@ impl PluginConfig {
     pub fn search_paths(&self, root: &Path) -> Vec<PathBuf> {
         let mut dirs = vec![root.join(".ratatoskr/plugins")];
         dirs.extend(self.paths.iter().map(|p| {
-            if p.is_absolute() {
-                p.clone()
-            } else {
-                root.join(p)
-            }
+            let p = expand_home(p);
+            if p.is_absolute() { p } else { root.join(p) }
         }));
         dirs
     }
+}
+
+impl SandboxConfig {
+    /// Whether a step running `command` may reach the network.
+    ///
+    /// An entry matches a *prefix* of the command, token for token, with the program compared by
+    /// file name so `npm` covers `/usr/bin/npm`. A one-word entry therefore allows every use of
+    /// that program, and `"npm install"` allows only the install — which is the distinction that
+    /// matters, because `npm run build` is the same program as `npm install` and must not inherit
+    /// its network.
+    ///
+    /// Matching a prefix rather than searching the arguments is deliberate: an argument appearing
+    /// somewhere later cannot make a step allowed.
+    pub fn may_use_network(&self, command: &[String]) -> bool {
+        let Some(program) = command.first() else {
+            return false;
+        };
+        let program = Path::new(program)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| program.clone());
+
+        self.network_allow.iter().any(|entry| {
+            let wanted: Vec<&str> = entry.split_whitespace().collect();
+            let Some((first, rest)) = wanted.split_first() else {
+                return false;
+            };
+            // The entry must be no longer than the command, or a prefix comparison would pass on
+            // a command that simply ran out of arguments.
+            *first == program
+                && rest.len() < command.len()
+                && rest.iter().zip(&command[1..]).all(|(a, b)| a == b)
+        })
+    }
+}
+
+/// Expand a leading `~` against `HOME`.
+///
+/// A plugin installed by a coding CLI lives under the home directory, so `~/.claude/plugins/...` is
+/// the natural way to write it — and without this it is not absolute, so it is joined onto the
+/// repository root and searched for at `<repo>/~/.claude/...`. That directory never exists, so the
+/// plugin is silently absent: no error, no warning, just a node that never gets its tools.
+///
+/// Only a leading `~/` (or a bare `~`). A `~` elsewhere in a path is a literal character, and some
+/// editors really do create files with one.
+fn expand_home(path: &Path) -> PathBuf {
+    let Some(rest) = path.to_str().and_then(|p| p.strip_prefix('~')) else {
+        return path.to_path_buf();
+    };
+    if !rest.is_empty() && !rest.starts_with('/') {
+        // `~user` is somebody else's home, which resolving would guess at.
+        return path.to_path_buf();
+    }
+    let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())
+    else {
+        return path.to_path_buf();
+    };
+    PathBuf::from(home).join(rest.trim_start_matches('/'))
 }
 
 /// Phase 3 implementer settings.
@@ -235,6 +292,24 @@ pub struct SandboxConfig {
     /// The default acceptance check: one command, for the repo that has one and nothing to add.
     /// Superseded per-task by the analyst's `acceptance` unless `pin_acceptance` is set.
     pub test_command: Vec<String>,
+    /// Programs an acceptance step may reach the network for, by name.
+    ///
+    /// Acceptance runs offline: a test that reaches the network is a test that fails for reasons
+    /// nothing in the repository controls, and an isolated worktree is the point of the sandbox.
+    /// But a repository whose deps are not vendored cannot check anything without fetching them
+    /// first — a fresh worktree has no `node_modules`, so the type-checker fails on the framework
+    /// rather than on the change.
+    ///
+    /// An entry is matched against the start of a step's command, so it may name a program or a
+    /// program and its subcommand: `"npm install"` allows the install and leaves `npm run build`
+    /// offline. That distinction is the point — in most ecosystems the installer and the test
+    /// runner are the same program, so a bare `"npm"` would put the checks online too.
+    ///
+    /// Not by host: the sandbox's network namespace is all or nothing for one invocation, so a
+    /// step that can reach a registry can reach anything. Restricting by hostname needs something
+    /// that can see the request, which a namespace cannot.
+    #[serde(default)]
+    pub network_allow: Vec<String>,
     /// Ignore whatever acceptance the analyst proposes and always run `test_command`.
     ///
     /// The escape hatch for a repo that does not want a model deciding what proves its code works.
@@ -282,6 +357,7 @@ impl Default for SandboxConfig {
             backend: "landlock".to_string(),
             image: "docker.io/library/rust:1-slim".to_string(),
             test_command: vec!["cargo".to_string(), "test".to_string()],
+            network_allow: Vec::new(),
             pin_acceptance: false,
         }
     }
@@ -489,6 +565,112 @@ impl Default for RatatoskrConfig {
             sandbox: SandboxConfig::default(),
             plugins: PluginConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_network_tests {
+    use super::*;
+
+    fn cfg(allow: &[&str]) -> SandboxConfig {
+        SandboxConfig {
+            network_allow: allow.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn the_installer_can_be_allowed_without_the_test_runner() {
+        // The case this exists for: in most ecosystems the installer and the test runner are the
+        // same program. A bare `npm` would put the checks online with the install.
+        let allowed = cfg(&["npm install", "npm ci"]);
+        assert!(allowed.may_use_network(&argv(&["npm", "install"])));
+        assert!(allowed.may_use_network(&argv(&["npm", "install", "--no-audit"])));
+        assert!(allowed.may_use_network(&argv(&["npm", "ci"])));
+        // The checks stay offline, though they are the same program.
+        assert!(!allowed.may_use_network(&argv(&["npm", "run", "typecheck"])));
+        assert!(!allowed.may_use_network(&argv(&["npm", "run", "build"])));
+    }
+
+    #[test]
+    fn a_step_reaches_the_network_only_when_it_was_named() {
+        let allowed = cfg(&["npm", "pnpm install"]);
+        // A one-word entry allows every use of that program, which is what naming one means.
+        assert!(allowed.may_use_network(&argv(&["npm", "run", "build"])));
+        assert!(allowed.may_use_network(&argv(&["pnpm", "install", "--frozen-lockfile"])));
+
+        // A different program that merely starts the same way is not that program.
+        assert!(!allowed.may_use_network(&argv(&["npm-check", "--prod"])));
+        assert!(!allowed.may_use_network(&argv(&["cargo", "test"])));
+        assert!(!allowed.may_use_network(&argv(&[])));
+        // An entry longer than the command does not match on the part that happens to line up.
+        assert!(!allowed.may_use_network(&argv(&["pnpm"])));
+
+        // Offline is the default: naming nothing allows nothing.
+        assert!(!cfg(&[]).may_use_network(&argv(&["npm", "install"])));
+    }
+
+    #[test]
+    fn the_program_is_matched_by_name_and_never_by_its_arguments() {
+        let allowed = cfg(&["npm"]);
+        // A path to the same program still matches.
+        assert!(allowed.may_use_network(&argv(&["/usr/bin/npm", "ci"])));
+        // But an argument buried later cannot make a step allowed — the match is a prefix.
+        assert!(!allowed.may_use_network(&argv(&["sh", "-c", "npm install"])));
+        assert!(!allowed.may_use_network(&argv(&["curl", "https://npm"])));
+    }
+}
+
+#[cfg(test)]
+mod plugin_path_tests {
+    use super::*;
+
+    #[test]
+    fn a_home_relative_plugin_path_resolves_to_the_home_directory() {
+        // The failure this prevents is silent: `~/…` is not absolute, so it was joined onto the
+        // repository root and searched for at `<repo>/~/.claude/…`. Nothing is there, nothing
+        // errors, and the plugin simply never loads.
+        let home = std::env::var("HOME").expect("HOME is set in the test environment");
+        let config = PluginConfig {
+            paths: vec![PathBuf::from("~/.claude/plugins/cache/ponytail/ponytail")],
+            ..Default::default()
+        };
+        let found = config.search_paths(Path::new("/repo"));
+        assert_eq!(
+            found[1],
+            PathBuf::from(&home).join(".claude/plugins/cache/ponytail/ponytail")
+        );
+        assert!(!found[1].to_string_lossy().contains('~'), "{:?}", found[1]);
+    }
+
+    #[test]
+    fn only_a_leading_tilde_is_a_home_directory() {
+        let home = std::env::var("HOME").unwrap();
+        // A bare `~` is the home directory itself.
+        assert_eq!(expand_home(Path::new("~")), PathBuf::from(&home));
+        // `~user` is somebody else's home, and resolving it would be a guess.
+        assert_eq!(
+            expand_home(Path::new("~someone/plugins")),
+            PathBuf::from("~someone/plugins")
+        );
+        // A tilde that is not leading is a character in a name, and some editors write those.
+        assert_eq!(
+            expand_home(Path::new("plugins/backup~/thing")),
+            PathBuf::from("plugins/backup~/thing")
+        );
+        // An absolute path is untouched, and a relative one stays relative for the caller to root.
+        assert_eq!(
+            expand_home(Path::new("/abs/path")),
+            PathBuf::from("/abs/path")
+        );
+        assert_eq!(
+            expand_home(Path::new("rel/path")),
+            PathBuf::from("rel/path")
+        );
     }
 }
 

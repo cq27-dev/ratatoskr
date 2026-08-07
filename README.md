@@ -261,6 +261,32 @@ defineAgent("context", { plugins: { inherit: false, add: ["context-only"] } });
 defineAgent("bookkeeper", { plugins: ["rag-rat"] });
 ```
 
+A worked example — giving two nodes a behavioural plugin without giving it to the rest. `ponytail`
+pushes for the shortest solution that works, which is what you want from the node writing code and
+not from the one transcribing test output:
+
+```toml
+# ratatoskr.toml — `~` is expanded, and a path names the plugin rather than one of its versions:
+# a coding CLI's cache keeps every version it has installed, and the installed one is what loads.
+[plugins]
+paths = [
+  "~/.claude/plugins/cache/rag-rat/rag-rat",
+  "~/.claude/plugins/cache/ponytail/ponytail",
+]
+```
+
+```ts
+// .ratatoskr/rules/plugins.ts
+defineDefaults({ plugins: ["rag-rat"] });                    // the repository-wide set
+defineAgent("analyst", { plugins: { add: ["ponytail"] } });  // these two also get the mode
+defineAgent("implementer", { plugins: { add: ["ponytail"] } });
+```
+
+Note what reaches the node. A plugin's *skills* arrive as a `Skill` tool the node may call, so a
+skill applies only if the node decides to ask for it. A plugin's `SessionStart` hook output is
+prefixed to the node's preamble, so it applies to everything that node does. A behavioural plugin
+wants the second, which is why binding it is enough — there is nothing to invoke.
+
 Hooks still run once per run whichever way you bind them — each node composes its context from the
 plugins it holds, so per-node binding costs nothing extra.
 
