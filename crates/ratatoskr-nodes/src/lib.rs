@@ -1630,8 +1630,8 @@ async fn publish_and_checkpoint(
         .push(ratatoskr_agent::publish::declaration());
 
     // Push is offered only when there is a branch to push, and only ever THAT branch: the access
-    // carries it, and the tool takes no arguments. A run with no fork has nothing to publish and
-    // is not given the tool at all.
+    // carries it, and what the tool takes is a name's parts, never a ref. A run with no fork has
+    // nothing to publish and is not given the tool at all.
     let push = input
         .implementer
         .as_ref()
@@ -1640,6 +1640,9 @@ async fn publish_and_checkpoint(
         .map(|branch| ratatoskr_agent::publish::PushAccess {
             repo_root: cfg.files.clone().unwrap_or_else(|| ".".into()),
             branch,
+            // From the run, not from the publisher: the number is what the branch is *for*, and
+            // it is not the naming step's to choose.
+            issue: Some(input.issue.clone()),
         });
     if push.is_some() {
         tools
@@ -2640,7 +2643,46 @@ async fn fork_and_converge(
         iterations += 1;
     };
 
+    // The run's work becomes a commit on the run's own branch, whatever the outcome. A worktree
+    // left with uncommitted changes is work that exists nowhere a reviewer can reach: the branch
+    // still points where it forked from, so pushing it delivers nothing and a pull request against
+    // it is refused for having no commits — which is what happened before this existed.
+    //
+    // Whatever the outcome, because the commit is a record rather than an endorsement. A run that
+    // hit its iteration ceiling still produced something worth looking at, and publishing decides
+    // separately whether anyone should be asked to.
+    let branch = implementer.branch();
+    match ratatoskr_exec::commit_all(&worktree, &branch, &commit_message(issue, &impl_out)).await {
+        Ok(Some(sha)) => {
+            tracing::info!(kind = "committed", branch = %branch, sha = %sha, "committed")
+        }
+        Ok(None) => tracing::info!(branch = %branch, "nothing to commit"),
+        // Best-effort: the work and its checkpoints are already recorded, and failing the run here
+        // would discard them over a step that only makes them reachable.
+        Err(e) => tracing::warn!("could not commit the run's work to {branch}: {e}"),
+    }
+
     Ok((red_team_out, impl_out, worktree, status, iterations))
+}
+
+/// The message a run's commit carries.
+///
+/// Conventional-commit shaped, because this repository's history is, and pointing at the issue so
+/// the commit says what it was for. The body is the implementer's own account of what it changed —
+/// it is the only description written by the thing that made the change.
+fn commit_message(issue: &str, out: &ImplementerOutput) -> String {
+    let subject = issue
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("a change")
+        .trim();
+    let subject: String = subject.chars().take(72).collect();
+    let body = if out.diff_summary.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{}", out.diff_summary.trim())
+    };
+    format!("{subject}{body}")
 }
 
 #[cfg(test)]

@@ -182,7 +182,7 @@ fn default_verify_threshold() -> String {
 }
 
 /// Where a run's output goes when it is finished.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublishConfig {
     /// Whether the publisher may write to the tracker.
@@ -193,6 +193,31 @@ pub struct PublishConfig {
     /// somebody did.
     #[serde(default)]
     pub enabled: bool,
+    /// The label every pull request a run opens carries, so a reviewer can tell what wrote the
+    /// change in front of them.
+    ///
+    /// Set it to another word to use that instead, or to `""` to add none. A repository that
+    /// already labels automation its own way should not be given a second scheme, and one that
+    /// does not want the noise should not have to take it.
+    #[serde(default = "default_publish_label")]
+    pub label: String,
+}
+
+fn default_publish_label() -> String {
+    "ratatoskr".to_string()
+}
+
+/// Written out rather than derived, so a config built in code and one parsed from a file with the
+/// key absent agree about the label. `#[serde(default = …)]` covers only the parsing path, and a
+/// derived `Default` would give the empty string — which here means "add no label", a different
+/// answer to the same question depending on how the config was made.
+impl Default for PublishConfig {
+    fn default() -> Self {
+        PublishConfig {
+            enabled: false,
+            label: default_publish_label(),
+        }
+    }
 }
 
 /// Phase 3 sandbox settings — where red-team and implementer run the acceptance check.
@@ -464,6 +489,29 @@ impl Default for RatatoskrConfig {
             sandbox: SandboxConfig::default(),
             plugins: PluginConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod publish_label_tests {
+    use super::*;
+
+    #[test]
+    fn the_label_defaults_the_same_way_however_the_config_was_made() {
+        // Both paths answer the same question, and a config built in code must not quietly mean
+        // "add no label" while one parsed from a file with the key absent means "ratatoskr".
+        assert_eq!(PublishConfig::default().label, "ratatoskr");
+        let parsed: PublishConfig = toml::from_str("enabled = true").unwrap();
+        assert_eq!(parsed.label, "ratatoskr");
+    }
+
+    #[test]
+    fn a_repository_can_rename_the_label_or_ask_for_none() {
+        let renamed: PublishConfig = toml::from_str(r#"label = "automation""#).unwrap();
+        assert_eq!(renamed.label, "automation");
+        // The opt-out: empty means no label at all, not a label named "".
+        let none: PublishConfig = toml::from_str(r#"label = """#).unwrap();
+        assert!(none.label.is_empty());
     }
 }
 

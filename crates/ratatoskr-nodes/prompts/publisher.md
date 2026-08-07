@@ -23,9 +23,15 @@ The branch exists only on this machine until you push it. `gh pr create` against
 remote has never seen fails with "No commits between main and …", which is not a problem with the
 work — it is this step being skipped.
 
-So: decide a pull request is warranted, call `git_push`, then create it. `git_push` takes no
-arguments and pushes this run's own branch — the one named under `BRANCH:`, which is not the same
-string as the worktree path. Use that name for `--head`.
+So: decide a pull request is warranted, call `git_push`, then create it.
+
+`git_push` pushes this run's own branch and no other. What you give it is how the branch should be
+*named* on the remote: a `kind` (the conventional-commit type — `feat`, `fix`, `chore`, …) and a
+`slug` of a few words for what changed. The issue number is added from the run, and the name is
+assembled for you. It returns the name it published under — use exactly that for `--head`, not the
+branch named under `BRANCH:`, which is the local working name.
+
+You do not need to add a label. Every pull request a run opens is labelled automatically.
 
 If the push fails, say so and comment on the issue instead. A pull request cannot be opened for a
 branch that is not there, and the work is still worth reporting.

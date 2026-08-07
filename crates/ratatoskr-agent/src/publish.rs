@@ -22,6 +22,47 @@ pub const GH: &str = "gh";
 /// The name the push tool is offered under.
 pub const PUSH: &str = "git_push";
 
+/// The label every pull request a run opens carries, as this deployment configured it.
+///
+/// Process-wide for the same reason the endpoint is: it describes the repository this run publishes
+/// to, not any one node, and every pull request a run opens wants the same answer.
+static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Tell the publish layer what to label with. Called once, before any node runs.
+pub fn configure_label(label: String) {
+    let _ = LABEL.set(label);
+}
+
+/// The configured label, or none when a repository asked for none.
+fn run_label() -> Option<&'static str> {
+    let label = LABEL.get().map_or("ratatoskr", String::as_str).trim();
+    (!label.is_empty()).then_some(label)
+}
+
+/// Create the label if the repository does not have it yet.
+///
+/// `gh pr create --label` fails outright on a label that does not exist, which would turn "this
+/// repository has not seen a run before" into a run that cannot deliver. Best-effort and silent:
+/// the common case is that it already exists, and `gh` says so on stderr, which is not news.
+async fn ensure_label(root: &Path, label: &str) {
+    let _ = tokio::time::timeout(
+        CALL_TIMEOUT,
+        tokio::process::Command::new(GH)
+            .current_dir(root)
+            .args([
+                "label",
+                "create",
+                label,
+                "--description",
+                "Opened by a ratatoskr run",
+                "--color",
+                "5319E7",
+            ])
+            .output(),
+    )
+    .await;
+}
+
 /// How long one `gh` call may take. A tracker that is slow or unreachable must not hold a run open
 /// indefinitely — the work is already done and checkpointed by the time this runs.
 const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -138,6 +179,18 @@ async fn run(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecut
     }
 
     let mut argv = command;
+    // Every pull request a run opens is labelled as one, added here rather than asked for: a
+    // reviewer needs to know what wrote the thing in front of them, and a label a node has to
+    // remember is one it will eventually forget. Adding it after the allowlist check means the
+    // check still sees exactly what the caller asked for.
+    if argv.first().is_some_and(|a| a == "pr")
+        && argv.get(1).is_some_and(|a| a == "create")
+        && let Some(label) = run_label()
+    {
+        ensure_label(root, label).await;
+        argv.push("--label".to_string());
+        argv.push(label.to_string());
+    }
     // Written by this code rather than by the caller: a body is prose with newlines and backticks
     // in it, and argv is where quoting bugs and injected arguments both live.
     let body_file = match args.get("body").and_then(|v| v.as_str()) {
@@ -223,6 +276,77 @@ pub struct PushAccess {
     pub repo_root: PathBuf,
     /// The branch this run authored. Must be one this repository manages.
     pub branch: String,
+    /// The issue this run was given, when it was given one. It numbers the published branch, so
+    /// the name says what the work was for — and it comes from the run rather than from whoever is
+    /// naming the branch.
+    pub issue: Option<String>,
+}
+
+/// The commit types a published branch may be named for.
+const TYPES: &[&str] = &[
+    "feat", "fix", "chore", "docs", "perf", "refactor", "style", "test", "ci", "build",
+];
+
+/// Build the branch name a run publishes under, from parts it does not get to spell itself.
+///
+/// `ratatoskr/<run-id>` is right for working in — deterministic, and never a name a model chose —
+/// and wrong for reading. What lands on the remote is `<type>/<issue>-<slug>`, which says what kind
+/// of change it is and what it was for.
+///
+/// The caller supplies only the type and the slug, both constrained: the type is from a fixed list,
+/// and the slug is reduced to lowercase words joined by single hyphens. The `refs/heads/…` ref is
+/// assembled here from those and the run's own issue number, so no ref ever arrives ready-made.
+pub fn published_name(
+    kind: &str,
+    slug: &str,
+    issue: Option<&str>,
+    fallback: &str,
+) -> Option<String> {
+    let kind = kind.trim().to_ascii_lowercase();
+    if !TYPES.contains(&kind.as_str()) {
+        return None;
+    }
+    // Anything that is not a letter or digit becomes a separator; runs of separators collapse.
+    let slug: String = slug
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let slug: String = slug.chars().take(48).collect();
+    let slug = slug.trim_end_matches('-').to_string();
+    if slug.is_empty() {
+        return None;
+    }
+    // An issue reference is often written `#91` or `issue-91`; the number is the part that
+    // identifies it. Without one, the run's own id keeps the name unique.
+    let number: String = issue
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect();
+    let stem = if number.is_empty() {
+        // The run's own id, which is the last segment of `ratatoskr/<id>` — taking the front of
+        // the whole string would name every branch after the prefix they all share.
+        fallback
+            .rsplit('/')
+            .next()
+            .unwrap_or(fallback)
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(12)
+            .collect::<String>()
+    } else {
+        number
+    };
+    if stem.is_empty() {
+        return None;
+    }
+    Some(format!("{kind}/{stem}-{slug}"))
 }
 
 /// Whether `branch` is one a run authored and may therefore push.
@@ -248,33 +372,48 @@ pub fn pushable(branch: &str) -> bool {
 /// and the remote's configured refspecs to decide what it means, and this must mean one thing.
 /// No `--force`, no `--tags`, no `--delete` — a run publishes its own work and never rewrites
 /// anyone's history.
-fn push_argv(branch: &str) -> Vec<String> {
+fn push_argv(branch: &str, publish_as: &str) -> Vec<String> {
     vec![
         "push".to_string(),
         "--set-upstream".to_string(),
         "origin".to_string(),
-        format!("refs/heads/{branch}:refs/heads/{branch}"),
+        format!("refs/heads/{branch}:refs/heads/{publish_as}"),
     ]
 }
 
-/// The push tool's declaration: no parameters, deliberately.
+/// The push tool's declaration.
+///
+/// Two constrained words, and no ref. The branch pushed is always this run's own; what the caller
+/// chooses is how it should be *named* on the remote, and only in the parts a name is made of.
 pub fn push_declaration() -> Tool {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": TYPES,
+                "description": "What kind of change this is, as a conventional-commit type."
+            },
+            "slug": {
+                "type": "string",
+                "description": "A few words naming the change, for the branch: `history-from-store`.                     Lowercased and hyphenated for you; the issue number is added from the run."
+            }
+        },
+        "required": ["kind", "slug"]
+    });
     let mut tool = Tool::default();
     tool.name = PUSH.into();
     tool.description = Some(
-        "Push this run's own branch to `origin`, so a pull request can be opened against it. \
-         Takes no arguments: the branch is the one this run created, and no other branch can be \
-         pushed. Call it before `gh pr create` — a pull request cannot be opened for a branch the \
-         remote has never seen."
+        "Push this run's own branch to `origin`, under a readable name, so a pull request can be \
+         opened against it. No other branch can be pushed: the branch is the one this run created, \
+         and the name is assembled from your `kind` and `slug` plus the run's issue number. \
+         Returns the name it was published under — use exactly that for `gh pr create --head`. \
+         Call it before `pr create`: a pull request cannot be opened for a branch the remote has \
+         never seen."
             .to_string()
             .into(),
     );
-    tool.input_schema = Arc::new(
-        json!({ "type": "object", "properties": {} })
-            .as_object()
-            .cloned()
-            .expect("schema literal"),
-    );
+    tool.input_schema = Arc::new(schema.as_object().cloned().expect("schema literal"));
     tool
 }
 
@@ -284,16 +423,23 @@ pub fn push_implementation(name: &str, access: &PushAccess) -> Option<DynamicToo
         return None;
     }
     let access = access.clone();
-    Some(crate::answered_by(
-        push_declaration(),
-        move |_ctx, _args| {
-            let access = access.clone();
-            Box::pin(async move { push(&access).await.map(ToolOutput::text) })
-        },
-    ))
+    Some(crate::answered_by(push_declaration(), move |_ctx, args| {
+        let access = access.clone();
+        Box::pin(async move {
+            let field = |k: &str| {
+                args.get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            push(&access, &field("kind"), &field("slug"))
+                .await
+                .map(ToolOutput::text)
+        })
+    }))
 }
 
-async fn push(access: &PushAccess) -> Result<String, ToolExecutionError> {
+async fn push(access: &PushAccess, kind: &str, slug: &str) -> Result<String, ToolExecutionError> {
     // Checked here rather than only at construction: this is the last point before the process
     // runs, and it is the check that has to hold no matter how the access came to be built.
     if !pushable(&access.branch) {
@@ -302,12 +448,19 @@ async fn push(access: &PushAccess) -> Result<String, ToolExecutionError> {
             access.branch
         )));
     }
+    let Some(publish_as) = published_name(kind, slug, access.issue.as_deref(), &access.branch)
+    else {
+        return Err(ToolExecutionError::invalid_args(format!(
+            "`{kind}` is not one of {TYPES:?}, or `{slug}` has no words in it. The branch is named \
+             <kind>/<issue>-<slug>, and both parts have to be something a name can be made of"
+        )));
+    };
     let out = tokio::time::timeout(
         CALL_TIMEOUT,
         tokio::process::Command::new("git")
             .arg("-C")
             .arg(&access.repo_root)
-            .args(push_argv(&access.branch))
+            .args(push_argv(&access.branch, &publish_as))
             .output(),
     )
     .await
@@ -367,8 +520,11 @@ mod tests {
         let access = PushAccess {
             repo_root: ".".into(),
             branch: "main".to_string(),
+            issue: None,
         };
-        let err = push(&access).await.expect_err("must refuse");
+        let err = push(&access, "feat", "anything")
+            .await
+            .expect_err("must refuse");
         assert!(
             format!("{err}").contains("only the branch it authored"),
             "{err}"
@@ -376,17 +532,107 @@ mod tests {
     }
 
     #[test]
-    fn the_push_command_is_fully_qualified_and_never_forced() {
-        let argv = push_argv("ratatoskr/abc12345");
+    fn a_published_branch_is_named_from_parts_the_caller_cannot_spell_itself() {
+        let issue = Some("GitHub issue #125: history should read stored events");
+
+        assert_eq!(
+            published_name("feat", "history from store", issue, "ratatoskr/abc12345").as_deref(),
+            Some("feat/125-history-from-store")
+        );
+        // Whatever shape the words arrive in, one hyphen between them and nothing else.
+        assert_eq!(
+            published_name("Fix", "  Publisher::push  &&  PR!! ", issue, "x").as_deref(),
+            Some("fix/125-publisher-push-pr")
+        );
+
+        // A type that is not one of ours is refused rather than passed through, so the remote
+        // never grows a branch namespace nobody agreed to.
+        assert_eq!(published_name("wip", "a-thing", issue, "x"), None);
+        assert_eq!(published_name("", "a-thing", issue, "x"), None);
+        // And a slug with no words in it names nothing.
+        assert_eq!(published_name("feat", "///", issue, "x"), None);
+        assert_eq!(published_name("feat", "   ", issue, "x"), None);
+
+        // No issue: the run's own id keeps the name unique rather than colliding on the slug.
+        assert_eq!(
+            published_name("chore", "tidy up", None, "ratatoskr/abc12345").as_deref(),
+            Some("chore/abc12345-tidy-up")
+        );
+    }
+
+    #[tokio::test]
+    async fn every_pull_request_a_run_opens_is_labelled_as_one() {
+        // The label is added by this code, not asked of the caller: a reviewer has to be able to
+        // tell what wrote the change in front of them, and a label a node must remember is one it
+        // will eventually forget.
+        //
+        // Driven through `run` with a `gh` that is not installed here, so what is asserted is the
+        // argument list it built — the call itself failing is fine and expected.
+        let root = std::env::temp_dir();
+        let out = run(
+            &root,
+            &json!({ "command": ["pr", "create", "--title", "x"] }),
+        )
+        .await;
+        let text = match out {
+            Ok(t) => t,
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            text.contains("--label ratatoskr"),
+            "the label reaches the command: {text}"
+        );
+
+        // The opt-out is real: with no label configured, nothing is added and `gh` is not asked
+        // to create one. Checked through `run_label` rather than by setting the OnceLock, which
+        // one test cannot un-set for the others.
+        assert_eq!(run_label(), Some("ratatoskr"), "the default, unconfigured");
+
+        // A comment is not a pull request and is not labelled.
+        let out = run(&root, &json!({ "command": ["issue", "comment", "1"] })).await;
+        let text = match out {
+            Ok(t) => t,
+            Err(e) => format!("{e}"),
+        };
+        assert!(!text.contains("--label"), "{text}");
+    }
+
+    #[test]
+    fn the_push_tool_is_given_a_names_parts_and_never_a_ref() {
+        // The safety argument, now that it takes something: what a caller supplies are the two
+        // words a name is made of, not a branch, remote, refspec or flag. The ref is assembled
+        // from them and this run's own branch, so nothing arrives ready to push.
+        let d = push_declaration();
+        assert_eq!(d.name, PUSH);
+        let props = d.input_schema["properties"]
+            .as_object()
+            .expect("schema has properties");
+        let mut names: Vec<&str> = props.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["kind", "slug"]);
+        // The type is a closed set, so a branch namespace nobody agreed to cannot be invented.
+        assert!(props["kind"]["enum"].is_array());
+    }
+
+    #[test]
+    fn a_run_publishes_its_own_branch_under_the_new_name_and_no_other() {
+        // The ref pushed is assembled here: this run's branch on the left, the assembled name on
+        // the right. Nothing the caller supplies reaches either side whole.
+        let argv = push_argv("ratatoskr/abc12345", "feat/125-history-from-store");
         assert_eq!(
             argv,
             [
                 "push",
                 "--set-upstream",
                 "origin",
-                "refs/heads/ratatoskr/abc12345:refs/heads/ratatoskr/abc12345",
+                "refs/heads/ratatoskr/abc12345:refs/heads/feat/125-history-from-store",
             ]
         );
+    }
+
+    #[test]
+    fn the_push_command_is_fully_qualified_and_never_forced() {
+        let argv = push_argv("ratatoskr/abc12345", "feat/1-x");
         // The properties that matter, stated so a future edit has to break them deliberately.
         assert!(!argv.iter().any(|a| a.contains("force")), "{argv:?}");
         assert!(
@@ -395,19 +641,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_push_tool_takes_no_arguments_at_all() {
-        // The safety argument in one assertion: there is no branch, remote, refspec or flag for a
-        // model to supply, so there is no supplied string to validate.
-        let d = push_declaration();
-        assert_eq!(d.name, PUSH);
-        let props = d
-            .input_schema
-            .get("properties")
-            .expect("schema has properties");
-        assert!(props.as_object().is_some_and(|p| p.is_empty()), "{props:?}");
-        assert!(d.input_schema.get("required").is_none());
-    }
     use super::*;
 
     fn argv(args: &[&str]) -> Vec<String> {

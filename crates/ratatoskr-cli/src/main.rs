@@ -1048,6 +1048,7 @@ fn load_config(path: &Path) -> anyhow::Result<RatatoskrConfig> {
     // would talk to it as an unidentified client, which is how a run gets whatever default the
     // endpoint keeps for somebody else.
     ratatoskr_agent::configure_endpoint(config.endpoint.clone());
+    ratatoskr_agent::publish::configure_label(config.publish.label.clone());
     Ok(config)
 }
 
