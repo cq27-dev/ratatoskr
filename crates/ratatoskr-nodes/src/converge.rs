@@ -16,6 +16,20 @@ pub fn newly_introduced_failures(
         .collect()
 }
 
+/// Authored tests that are still failing after the change.
+///
+/// These need their own gate. They were written before the code, so they fail in the baseline as a
+/// matter of course — and [`is_converged`] asks only whether anything *newly* fails, which would
+/// wave through a change that satisfied none of them. A test written to specify the change is the
+/// one test the change is not allowed to leave failing.
+pub fn unsatisfied(authored: &[String], post_failing: &[String]) -> Vec<String> {
+    authored
+        .iter()
+        .filter(|t| post_failing.contains(t))
+        .cloned()
+        .collect()
+}
+
 /// Whether the change converged: it introduced no new failures.
 pub fn is_converged(baseline_failing: &[String], post_failing: &[String]) -> bool {
     newly_introduced_failures(baseline_failing, post_failing).is_empty()
@@ -25,8 +39,8 @@ pub fn is_converged(baseline_failing: &[String], post_failing: &[String]) -> boo
 /// command didn't run to completion (a broken build, a missing runner, a sandbox mis-mount) — NOT
 /// "no failures". Without this guard, both branches report zero tests and converge falsely reports
 /// success on empty data (the failure mode the first live run hit).
-pub fn test_command_ran(failing: &[String], passing: &[String], exit_code: i32) -> bool {
-    !failing.is_empty() || !passing.is_empty() || exit_code == 0
+pub fn test_command_ran(failing: &[String], passed: usize, exit_code: i32) -> bool {
+    !failing.is_empty() || passed > 0 || exit_code == 0
 }
 
 /// Runner configuration, by exact filename. `Cargo.toml` and `package.json` are referee files only
@@ -87,16 +101,22 @@ pub fn referee_touches(touched: &[String], exempt: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// What to send back when the iteration moved the referee. Names the offending files *and* the
-/// exemption, so a task that legitimately writes tests but never declared it learns how to instead
-/// of churning silently to the iteration wall.
+/// What to send back when the iteration rewrote the referee. Names the offending files *and* the
+/// exemption, so a task that legitimately rewrites tests but never declared it learns how to
+/// instead of churning silently to the iteration wall.
+///
+/// It also says what is *not* refused. The gate reads rewritten files, not touched ones, so a new
+/// test is always allowed — and an implementer that believes otherwise writes untested code and
+/// contorts its design to avoid a fixture it was never forbidden to extend.
 pub fn referee_correction(referee: &[String]) -> String {
     format!(
-        "You changed files that decide whether this task is done: {}. Revert them and make the \
-         change satisfy the tests as they stand — editing the tests, their runner config, or \
-         anything the runner auto-loads is not a way to pass. If this task really is supposed to \
-         change them, that has to be declared up front, before the work, in \
-         .ratatoskr/rules/*.ts with `defineDefaults({{ mayModifyTests: [\"<path>\"] }})`.",
+        "You rewrote files that decide whether this task is done: {}. Revert those edits and make \
+         the change satisfy the tests as they stand — rewriting a test, its runner config, or \
+         anything the runner auto-loads is not a way to pass. Note what this is not: *adding* a \
+         test is allowed and expected, and does not bring you here. Only removing or replacing \
+         lines that were already there does. If this task really is supposed to change existing \
+         tests, that has to be declared up front, before the work, in .ratatoskr/rules/*.ts with \
+         `defineDefaults({{ mayModifyTests: [\"<path>\"] }})`.",
         referee.join(", ")
     )
 }
@@ -183,6 +203,34 @@ mod tests {
     }
 
     #[test]
+    fn a_test_written_for_the_change_must_pass_even_though_it_failed_at_baseline() {
+        // The hole this closes: tests written before the code fail in the baseline as a matter of
+        // course, so `is_converged` — which asks only what is *newly* failing — would wave through
+        // a change that satisfied none of them.
+        let authored = v(&[
+            "store::prunes_old_rows",
+            "store::zero_duration_removes_nothing",
+        ]);
+        let baseline_failing = authored.clone();
+        let still_failing = v(&["store::zero_duration_removes_nothing"]);
+
+        assert!(
+            is_converged(&baseline_failing, &still_failing),
+            "nothing is newly failing, which is exactly why this is not enough on its own"
+        );
+        assert_eq!(
+            unsatisfied(&authored, &still_failing),
+            ["store::zero_duration_removes_nothing"],
+            "and the sad-path test nobody implemented is named"
+        );
+
+        // Satisfied: the change made them pass.
+        assert!(unsatisfied(&authored, &[]).is_empty());
+        // A run with no authored tests is unaffected.
+        assert!(unsatisfied(&[], &still_failing).is_empty());
+    }
+
+    #[test]
     fn the_declared_exemption_covers_its_subtree_and_nothing_else() {
         let touched = v(&["crates/foo/tests/api.rs", "crates/bar/tests/api.rs"]);
         assert_eq!(
@@ -200,10 +248,12 @@ mod tests {
     #[test]
     fn zero_tests_with_nonzero_exit_did_not_run() {
         // The false-convergence case: no tests parsed and the command failed.
-        assert!(!test_command_ran(&v(&[]), &v(&[]), 101));
+        assert!(!test_command_ran(&v(&[]), 0, 101));
         // A genuinely empty suite that exited 0 counts as "ran" (nothing to break).
-        assert!(test_command_ran(&v(&[]), &v(&[]), 0));
+        assert!(test_command_ran(&v(&[]), 0, 0));
         // Any parsed test means it ran, regardless of exit code.
-        assert!(test_command_ran(&v(&["a"]), &v(&[]), 101));
+        assert!(test_command_ran(&v(&["a"]), 0, 101));
+        // A passing count alone proves it ran, which is the whole reason the count is carried.
+        assert!(test_command_ran(&v(&[]), 285, 101));
     }
 }

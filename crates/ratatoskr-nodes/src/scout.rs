@@ -87,6 +87,10 @@ impl Node for ScoutNode {
             observer: self.plugins.observer.clone(),
             skills: crate::skills::loaded(&self.plugins.skills),
             files: self.files.clone(),
+            // Reads and edits, but runs nothing.
+            shell: None,
+            push: None,
+            conversation: None,
             ledger: self.ledger.clone(),
             produces: Some(
                 "a papertrail summary of what the tracker and history say about this task, plus the related items found",

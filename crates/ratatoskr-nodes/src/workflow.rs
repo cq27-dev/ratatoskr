@@ -57,7 +57,7 @@ pub struct WorkflowContext {
     /// Set by `implement`, read by `iterate` and cleanup. The script never sees a raw path.
     worktree: Mutex<Option<WorktreePath>>,
     implement_started: AtomicBool,
-    /// Serializes `iterate` calls — two concurrent ACP sessions on one worktree would corrupt it.
+    /// Serializes `iterate` calls — two implementers editing one worktree would corrupt it.
     iterate_lock: tokio::sync::Mutex<()>,
     invocations: AtomicUsize,
     iterations: AtomicU32,
@@ -163,7 +163,7 @@ fn infer_status(
     review: Option<&verifier::VerifierOutput>,
     threshold: verifier::Severity,
 ) -> RunStatus {
-    let referee = converge::referee_touches(&implementer.touched_files, may_modify_tests);
+    let referee = converge::referee_touches(&implementer.rewritten_files, may_modify_tests);
     if !referee.is_empty() {
         tracing::warn!(files = ?referee, "run touched the referee; not converged");
         return RunStatus::MaxIterationsReached;
@@ -181,9 +181,24 @@ fn infer_status(
             return RunStatus::MaxIterationsReached;
         }
     }
+    // The tests written for this change, before it existed. They fail in the baseline by
+    // construction, so `is_converged` alone would pass a change that satisfied none of them.
+    let authored = red_team
+        .authored
+        .as_ref()
+        .map(|a| a.tests.as_slice())
+        .unwrap_or_default();
+    let unsatisfied = converge::unsatisfied(authored, &implementer.failing_tests);
+    if !unsatisfied.is_empty() {
+        tracing::warn!(
+            tests = ?unsatisfied,
+            "the tests written for this change are still failing; not converged"
+        );
+        return RunStatus::MaxIterationsReached;
+    }
     let post_ran = converge::test_command_ran(
         &implementer.failing_tests,
-        &implementer.passing_tests,
+        implementer.passed_tests,
         implementer.exit_code,
     );
     if post_ran && converge::is_converged(&red_team.failing_tests, &implementer.failing_tests) {
@@ -240,7 +255,7 @@ struct RunShape {
     #[serde(default)]
     failing_tests: Vec<String>,
     #[serde(default)]
-    passing_tests: Vec<String>,
+    passed_tests: usize,
     #[serde(default)]
     exit_code: i32,
 }
@@ -328,6 +343,8 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
     )
     .map_err(|e| e.to_string())?;
     let node = AnalystNode {
+        // A revision continues the plan it revises, when the route asks for that.
+        conversation: Some(format!("{}-analyst", ctx.run_id)),
         route: cfg.route,
         tools: cfg.tools,
         files: cfg.files,
@@ -379,6 +396,10 @@ fn build_red_team(
         false => None,
     };
     Ok(RedTeamNode {
+        // The scripted path forks with its own sequencing and does not create the worktree before
+        // red-team runs, so there is nothing to write tests into. Authoring belongs to the built-in
+        // flow until a script can say where the tree is.
+        author: None,
         acceptance,
         characterizer: crate::build_characterizer(
             &ctx.engine,
@@ -433,7 +454,7 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
     // Checkpoint before the guard so a failed baseline stays inspectable.
     note(&ctx, "red_team", &out, None).await?;
     // The false-convergence guard is enforced here — the script cannot skip it.
-    if !converge::test_command_ran(&out.failing_tests, &out.passing_tests, out.exit_code) {
+    if !converge::test_command_ran(&out.failing_tests, out.passed_tests, out.exit_code) {
         return Err(format!(
             "the baseline acceptance run produced no checks (exit {}); check the analyst's acceptance, [sandbox] test_command and the sandbox backend",
             out.exit_code
@@ -442,8 +463,17 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
-fn build_implementer(ctx: &WorkflowContext, analyst: AnalystOutput) -> ImplementerNode {
-    ImplementerNode {
+fn build_implementer(
+    ctx: &WorkflowContext,
+    analyst: AnalystOutput,
+) -> Result<ImplementerNode, PlanError> {
+    let (cfg, plugins) = crate::build_implementer_agent(
+        &ctx.engine,
+        &ctx.config,
+        &ctx.plugin_context,
+        ctx.rag_rat.clone(),
+    )?;
+    Ok(ImplementerNode {
         acceptance: ctx.acceptance(&analyst.acceptance),
         characterizer: crate::build_characterizer(
             &ctx.engine,
@@ -457,11 +487,17 @@ fn build_implementer(ctx: &WorkflowContext, analyst: AnalystOutput) -> Implement
         repo_path: ctx.repo_path.clone(),
         worktree_root: ctx.config.worktree.root.clone(),
         sandbox: ctx.config.sandbox.clone(),
-        implementer: ctx.config.implementer.clone(),
+        route: cfg.route,
+        tools: cfg.tools,
+        policy: cfg.policy,
+        max_turns: cfg.max_turns,
+        system_prompt: cfg.system_prompt,
+        plugins,
+        ledger: Some(Arc::clone(&ctx.ledger)),
         run_id: ctx.run_id.clone(),
         issue: ctx.issue.clone(),
         analyst,
-    }
+    })
 }
 
 #[derive(Deserialize)]
@@ -477,7 +513,7 @@ async fn implement_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String
     }
     let input: ImplementArg =
         serde_json::from_str(&arg).map_err(|e| format!("implement arg: {e}"))?;
-    let node = build_implementer(&ctx, input.analyst);
+    let node = build_implementer(&ctx, input.analyst).map_err(|e| e.to_string())?;
     let (worktree, out) = node.run().await.map_err(|e| e.to_string())?;
     *ctx.worktree.lock().unwrap() = Some(worktree);
     note(&ctx, "implementer", &out, Some(arg)).await?;
@@ -487,7 +523,7 @@ async fn implement_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String
 async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String, String> {
     ctx.guard()?;
     // One iterate at a time — reject overlapping calls (e.g. `Promise.all([iterate(), iterate()])`)
-    // that would drive two ACP sessions against the same worktree. Held for the whole call.
+    // that would drive two implementers against the same worktree. Held for the whole call.
     let _iterate = ctx
         .iterate_lock
         .try_lock()
@@ -516,8 +552,8 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String,
         .await
         .map_err(|e| e.to_string())?;
     let post_ran =
-        converge::test_command_ran(&prev.failing_tests, &prev.passing_tests, prev.exit_code);
-    let referee = converge::referee_touches(&prev.touched_files, ctx.engine.may_modify_tests());
+        converge::test_command_ran(&prev.failing_tests, prev.passed_tests, prev.exit_code);
+    let referee = converge::referee_touches(&prev.rewritten_files, ctx.engine.may_modify_tests());
     // Referee first, same as the built-in loop: a moved referee makes the test sets meaningless,
     // so reverting it is what this iteration has to be told to do.
     let diagnostic = if !referee.is_empty() {
@@ -541,7 +577,7 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String,
     let analyst: AnalystOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "analyst")
         .await
         .map_err(|e| e.to_string())?;
-    let node = build_implementer(&ctx, analyst);
+    let node = build_implementer(&ctx, analyst).map_err(|e| e.to_string())?;
     let out = node
         .iterate(&worktree, &diagnostic)
         .await
@@ -562,7 +598,7 @@ async fn is_converged_host(_ctx: Arc<WorkflowContext>, arg: String) -> Result<St
 
 async fn test_command_ran_host(_ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
     let s: RunShape = serde_json::from_str(&arg).map_err(|e| format!("testCommandRan arg: {e}"))?;
-    let v = converge::test_command_ran(&s.failing_tests, &s.passing_tests, s.exit_code);
+    let v = converge::test_command_ran(&s.failing_tests, s.passed_tests, s.exit_code);
     serde_json::to_string(&v).map_err(|e| e.to_string())
 }
 
@@ -660,6 +696,8 @@ async fn verify_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, S
         .unwrap_or_default();
     let out = match node
         .run(verifier::VerifierInput {
+            // The scripted path reviews once per call and keeps no history of its own.
+            previous_findings: Vec::new(),
             issue: ctx.issue.clone(),
             analyst: input.analyst,
             diff,
@@ -988,8 +1026,9 @@ mod tests {
 
     fn red(failing: &[&str], passing: &[&str], exit: i32) -> RedTeamOutput {
         RedTeamOutput {
+            authored: None,
             failing_tests: failing.iter().map(|s| s.to_string()).collect(),
-            passing_tests: passing.iter().map(|s| s.to_string()).collect(),
+            passed_tests: passing.len(),
             exit_code: exit,
             classifications: vec![],
         }
@@ -997,11 +1036,13 @@ mod tests {
 
     fn imp(failing: &[&str], passing: &[&str], exit: i32) -> ImplementerOutput {
         ImplementerOutput {
+            branch: "ratatoskr/test".into(),
             worktree_path: "/wt".to_string(),
             diff_summary: String::new(),
             touched_files: vec![],
+            rewritten_files: Vec::new(),
             failing_tests: failing.iter().map(|s| s.to_string()).collect(),
-            passing_tests: passing.iter().map(|s| s.to_string()).collect(),
+            passed_tests: passing.len(),
             exit_code: exit,
             narrative: None,
         }
@@ -1047,11 +1088,13 @@ mod tests {
     }
 
     #[test]
-    fn a_clean_test_run_does_not_convert_a_touched_referee_into_success() {
-        // The BenchJack shape: every test passes, because a new conftest.py says so.
+    fn a_clean_test_run_does_not_convert_a_rewritten_referee_into_success() {
+        // The BenchJack shape: every test passes, because conftest.py was rewritten to say so.
         let baseline = red(&["a"], &["b"], 1);
         let mut cheated = imp(&[], &["a", "b"], 0);
         cheated.touched_files = vec!["conftest.py".to_string()];
+        cheated.rewritten_files = vec!["conftest.py".to_string()];
+        cheated.rewritten_files = vec!["conftest.py".to_string()];
         assert_eq!(
             infer_status(&baseline, &cheated, &[], None, verifier::Severity::P2),
             RunStatus::MaxIterationsReached
@@ -1065,6 +1108,22 @@ mod tests {
                 None,
                 verifier::Severity::P2
             ),
+            RunStatus::Converged
+        );
+    }
+
+    #[test]
+    fn adding_a_test_is_not_a_referee_touch() {
+        // The gate refuses rewriting a test to make failures stop; it must not refuse writing one.
+        // An implementer that believes otherwise ships untested code and contorts its design to
+        // avoid a fixture it was never forbidden to extend.
+        let baseline = red(&["a"], &["b"], 1);
+        let mut honest = imp(&[], &["a", "b"], 0);
+        honest.touched_files = vec!["src/lib.rs".to_string(), "tests/api.rs".to_string()];
+        // Only added lines, so nothing was rewritten.
+        honest.rewritten_files = vec!["src/lib.rs".to_string()];
+        assert_eq!(
+            infer_status(&baseline, &honest, &[], None, verifier::Severity::P2),
             RunStatus::Converged
         );
     }
@@ -1126,7 +1185,7 @@ mod tests {
     async fn iterations_count_from_implementer_checkpoints() {
         let store = Store::open_in_memory().unwrap();
         store.upsert_run("r1", None, "running").await.unwrap();
-        let cp = r#"{"worktree_path":"/w","failing_tests":[],"passing_tests":["t"],"exit_code":0}"#;
+        let cp = r#"{"worktree_path":"/w","failing_tests":[],"passed_tests":1,"exit_code":0}"#;
         for _ in 0..3 {
             store
                 .insert_checkpoint(ratatoskr_store::CheckpointWrite {

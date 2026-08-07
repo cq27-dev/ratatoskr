@@ -13,7 +13,11 @@ path = ".ratatoskr/state.sqlite3"
 [worktree]
 # Root for per-run git worktrees. `run` leaves a converged run's worktree here for review;
 # `ratatoskr clean` reclaims them (and their `ratatoskr/*` branches) when you're done.
-root = ".ratatoskr/worktrees"
+#
+# Keep this OUTSIDE the repository. Build tools find their project root by walking up, so a
+# worktree nested in the checkout resolves to the outer project instead of itself — cargo, for
+# one, then builds into the outer `target/`, which the sandbox mounts read-only.
+root = "../.ratatoskr-worktrees"
 
 # Per-node model routing. `ask` is the only route used in Phase 1; provider is one of
 # "anthropic" or "moonshot", read from ANTHROPIC_API_KEY / MOONSHOT_API_KEY. The rest are
@@ -22,9 +26,45 @@ root = ".ratatoskr/worktrees"
 provider = "anthropic"
 model = "claude-sonnet-4-6"
 
-[models.scout]
+[models.context]
 provider = "moonshot"
 model = "kimi-k2.5"
+# A route may also set `temperature`, and `params` for anything the provider takes that this
+# config has no word for. `params` is merged into the request verbatim.
+#
+# Extended thinking is the one worth knowing about: some endpoints turn it on as soon as a
+# request carries tools, and every node here carries tools. A node that thinks before each of
+# forty file reads spends most of its wall-clock reasoning about which file to open next, so it
+# is worth turning off for the nodes that explore and leaving on for the ones that judge.
+#
+#   [models.context.params.thinking]
+#   type = "disabled"
+#
+# Thinking tokens are billed as output and count against `max_tokens`; raise it alongside any
+# budget you set.
+#
+# `session` decides whether a node's endpoint session continues across attempts within a run.
+# "fresh" (the default) starts a new one each time; "reuse" keeps one for the node, so a node that
+# gets re-driven — the implementer on a converge iteration, the analyst on a revision — continues
+# where it stopped instead of meeting the repository again from nothing. Only worth it where a
+# later attempt genuinely continues the earlier one, and it needs `[endpoint] session_header` set
+# for anything to key off.
+#
+#   [models.implementer]
+#   session = "reuse"
+#
+# On thinking levels: leaving it unset is not the cheap option. Measured against one endpoint on a
+# reasoning-heavy prompt with tools present, the unset default ran 26-39s and was the least
+# predictable setting available; `output_config.effort` at low, medium and high all landed between
+# 23s and 30s with reasoning still on, and disabling thinking entirely at 24-25s. A node that
+# should think is better told how much:
+#
+#   [models.verifier.params.output_config]
+#   effort = "medium"
+#
+# Safe to send alongside a node's output schema: in `OutputMode::Tool`, which every node uses, the
+# schema becomes a `final_result` tool and the provider layer sets no `output_config` of its own,
+# so this is the only one in the request.
 
 [models.analyst]
 provider = "anthropic"
@@ -70,10 +110,17 @@ model = "kimi-k2.5"
 # [models.characterizer]
 # provider = "moonshot"
 # model = "kimi-k2.5"
+#
+# It transcribes; it never judges. Pin thinking off — an endpoint that turns reasoning on unasked
+# buys a reasoning pass in front of every transcription, and this node runs on every acceptance
+# run, twice per converge iteration.
+#
+#   [models.characterizer.params.thinking]
+#   type = "disabled"
 
-# Phase 3: the implementer drives a coding CLI via ACP in an isolated worktree.
+# The implementer edits an isolated worktree and runs its checks in the sandbox. It needs a
+# [models.implementer] route like any other node.
 [implementer]
-cli = "claude"          # which coding CLI to drive (Claude Code via its ACP adapter)
 max_iterations = 3      # converge re-runs the implementer at most this many times
 # The least severe review finding that sends a change back to be fixed: "P1" (must-fix only),
 # "P2" (the default, also should-fix), or "P3" (nits too). Findings below it are still recorded.
@@ -82,8 +129,8 @@ max_iterations = 3      # converge re-runs the implementer at most this many tim
 verify_threshold = "P2"
 # The analyst decides whether carrying out its plan means changing code. When it says no —
 # research, a review, an architecture question — the fork is skipped and the run finishes
-# `no_code_change` instead of paying for a baseline test run and an ACP session to produce an
-# empty diff. Set this to override that judgement; it only ever adds the fork back.
+# `no_code_change` instead of paying for a baseline test run and an implementer session to produce
+# an empty diff. Set this to override that judgement; it only ever adds the fork back.
 always_fork = false
 
 # Phase 3: red-team and implementer run the repo's tests in a sandbox.
@@ -122,6 +169,22 @@ enabled = false
 # A coding CLI's cache keeps every version it has installed, so a path naming the plugin rather
 # than one version is the right thing to write — the installed one is the one that loads:
 #   paths = ["~/.claude/plugins/cache/rag-rat/rag-rat"]
+# How to address the model endpoint, beyond its URL and key. Both optional and empty by default.
+#
+# A local endpoint in front of a provider is not always a proxy. One that reconstructs the request
+# — replaying it as a prompt into its own agent session — decides for itself what is cached and
+# what is discarded, and decides it from what the client looks like. A client it does not
+# recognise gets whatever default its author picked for someone else, which for a tool-calling
+# run means the conversation is rebuilt on every turn instead of read back from cache.
+#
+# `headers` is what identifies this client. `session_header` names the header carrying a
+# per-conversation id: one is generated per node attempt and held for every turn of that attempt,
+# so an endpoint that tracks sessions can continue the conversation rather than start it again.
+#
+#   [endpoint]
+#   headers = { "x-meridian-agent" = "passthrough" }
+#   session_header = "x-litellm-session-id"
+
 [plugins]
 paths = []
 

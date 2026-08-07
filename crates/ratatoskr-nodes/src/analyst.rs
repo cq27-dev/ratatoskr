@@ -116,6 +116,55 @@ pub struct AnalystOutput {
     /// touch this: a change that can move the bar it is judged against is not judged.
     #[serde(default)]
     pub acceptance: Vec<ratatoskr_core::AcceptanceStep>,
+    /// The surface the change is contracted to have, and what it should do when used.
+    ///
+    /// This is what lets the tests be written by someone other than the author. The red team turns
+    /// it into tests and the implementer builds against it, from the same description — so the
+    /// tests are not shaped around the implementation that happens to appear, which is the failure
+    /// an author writing their own tests cannot see in themselves.
+    ///
+    /// Empty when the change has no callable surface — an internal refactor, a doc fix. That is an
+    /// ordinary answer, and better than a contract invented to fill the field.
+    #[serde(default)]
+    pub interface: Vec<InterfaceItem>,
+}
+
+/// Render an interface as the prompts show it, with the labels the reading node needs.
+///
+/// Three nodes see this contract and each must see the same shape: the analyst that sets it, the
+/// red team that writes tests from it, and the implementer that builds to it. Rendering it three
+/// ways invites them to drift apart on a detail — a signature shown one way here and another
+/// there is exactly the mismatch the shared contract exists to prevent.
+pub(crate) fn render_interface(s: &mut String, items: &[InterfaceItem], happy: &str, sad: &str) {
+    use std::fmt::Write as _;
+    for item in items {
+        let _ = write!(s, "- {}\n  {}\n", item.name, item.shape);
+        for h in &item.happy {
+            let _ = writeln!(s, "  {happy}: {h}");
+        }
+        for entry in &item.sad {
+            let _ = writeln!(s, "  {sad}: {entry}");
+        }
+    }
+}
+
+/// One piece of surface the change adds or alters, with what it owes its caller.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct InterfaceItem {
+    /// What it is, as a caller names it: `path::function`, a CLI flag, an HTTP route, a config key.
+    pub name: String,
+    /// Its shape after the change — the signature, the parameters and their types, the fields.
+    /// Enough that someone could call it without reading the implementation, because they cannot:
+    /// it does not exist yet.
+    pub shape: String,
+    /// What it does when used correctly. One expectation per entry, each concrete enough to be
+    /// checked: the input, and the result it must produce.
+    #[serde(default)]
+    pub happy: Vec<String>,
+    /// What it does when misused, or when the world does not cooperate — a bad argument, a missing
+    /// file, a value at its limit. Same standard: an input, and the result it must produce.
+    #[serde(default)]
+    pub sad: Vec<String>,
 }
 
 /// A plan is assumed to involve a code change unless the analyst says otherwise. The failure this
@@ -139,6 +188,9 @@ pub struct AnalystNode {
     pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
     /// The repository its built-in file tools read within.
     pub files: Option<std::path::PathBuf>,
+    /// Names this analyst's conversation within the run, so a revision can continue the plan it is
+    /// revising rather than reading the repository again from nothing.
+    pub conversation: Option<String>,
 }
 
 impl Node for AnalystNode {
@@ -173,6 +225,10 @@ impl Node for AnalystNode {
             observer: self.plugins.observer.clone(),
             skills: crate::skills::loaded(&self.plugins.skills),
             files: self.files.clone(),
+            // Reads and edits, but runs nothing.
+            shell: None,
+            push: None,
+            conversation: self.conversation.as_deref(),
             ledger: self.ledger.clone(),
             produces: Some(
                 "an impact summary, the symbols and paths touched, risks, the concrete requirements the implementation must satisfy, and the acceptance steps that prove it done",
@@ -225,6 +281,18 @@ fn render_prompt(input: &AnalystInput) -> String {
             for r in &previous.requirements {
                 let _ = writeln!(s, "- {r}");
             }
+        }
+        if !previous.interface.is_empty() {
+            // Without this the analyst re-emits `interface` from nothing on every revision, and the
+            // tests the red team already wrote are pinned to the contract it cannot see. A revised
+            // signature does not fail those tests honestly — it strands them.
+            s.push_str(
+                "\nThe interface you contracted. Tests are already written against it, by \
+                 someone who cannot see the code. Restate it unchanged unless a finding is about \
+                 the interface itself: changing a name or a signature here breaks tests that are \
+                 not wrong.\n",
+            );
+            render_interface(&mut s, &previous.interface, "happy", "sad");
         }
         s.push('\n');
     }
@@ -282,6 +350,58 @@ mod tests {
         let out = parse_validated::<AnalystOutput>(raw).unwrap();
         assert_eq!(out.touched, ["ratatoskr-store::Store"]);
         assert_eq!(out.risks[0], "medium: lock contention");
+    }
+
+    #[test]
+    fn a_revision_shows_the_analyst_the_contract_it_already_set() {
+        // The red team writes its tests from `interface` and never sees the code. An analyst
+        // re-planning without that contract in front of it re-derives one from memory, and a
+        // signature that comes back different strands tests that were right all along.
+        let mut previous = parse_validated::<AnalystOutput>(
+            r#"{"impact_summary":"touches the store","requirements":["keep single-writer"]}"#,
+        )
+        .unwrap();
+        previous.interface.push(InterfaceItem {
+            name: "Store::claim".into(),
+            shape: "fn claim(&self, run: &str) -> Result<Claim, StoreError>".into(),
+            happy: vec!["an unclaimed run yields a Claim".into()],
+            sad: vec!["a claimed run errors rather than blocking".into()],
+        });
+        let findings = serde_json::from_str(
+            r#"[{"severity":"P1","kind":"plan","file":"","summary":"impossible as written",
+                 "failure_scenario":"a second writer is unavoidable under the stated shape"}]"#,
+        )
+        .unwrap();
+        let input = AnalystInput {
+            previous: Some(Box::new(previous)),
+            findings,
+            ..AnalystInput::fresh(
+                "keep the writer single".into(),
+                ScoutOutput {
+                    related_items: Vec::new(),
+                    papertrail_summary: String::new(),
+                },
+                MemoryOutput {
+                    memories: Vec::new(),
+                },
+            )
+        };
+        assert!(input.is_revision());
+
+        let prompt = render_prompt(&input);
+        assert!(prompt.contains("Store::claim"), "{prompt}");
+        assert!(
+            prompt.contains("fn claim(&self, run: &str) -> Result<Claim, StoreError>"),
+            "the signature is the part tests are pinned to: {prompt}"
+        );
+        assert!(
+            prompt.contains("a claimed run errors rather than blocking"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Tests are already written against it"),
+            "showing the contract is not enough — it has to say why it is expensive to churn: {prompt}"
+        );
     }
 
     #[test]

@@ -22,6 +22,33 @@ pub struct RatatoskrConfig {
     pub plugins: PluginConfig,
     #[serde(default)]
     pub publish: PublishConfig,
+    #[serde(default)]
+    pub endpoint: EndpointConfig,
+}
+
+/// How to address the model endpoint, beyond its URL and key.
+///
+/// Exists because a local endpoint in front of a provider is not always a proxy. One that
+/// reconstructs the request — replaying it as a prompt into its own agent session — decides for
+/// itself what is cached and what is discarded, and it decides that from what the client looks
+/// like. A client it does not recognise gets whatever default the author picked for someone else.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointConfig {
+    /// Headers sent with every model request.
+    ///
+    /// What identifies this client to the thing in front of the provider. Empty by default: this
+    /// is the address of a specific deployment, not a property of ratatoskr, and a header invented
+    /// here would be a guess about somebody else's software.
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    /// Header carrying a per-conversation id, when the endpoint keys a session off one.
+    ///
+    /// Each node attempt gets a fresh id, held for every turn of that attempt. An endpoint that
+    /// tracks sessions can then continue one conversation rather than rebuilding it per turn —
+    /// which is the difference between reading the history back and paying to write it again.
+    #[serde(default)]
+    pub session_header: Option<String>,
 }
 
 /// Where to look for agent plugins. `.ratatoskr/plugins/` is always searched; `paths` adds
@@ -117,8 +144,6 @@ impl PluginConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImplementerConfig {
-    /// Which coding CLI to drive via ACP (`"claude"`). One target per the Phase 3 non-goals.
-    pub cli: String,
     /// How many times converge may re-run the implementer before giving up.
     pub max_iterations: u32,
     /// The least severe review finding that sends the change back to be fixed.
@@ -145,7 +170,6 @@ pub struct ImplementerConfig {
 impl Default for ImplementerConfig {
     fn default() -> Self {
         ImplementerConfig {
-            cli: "claude".to_string(),
             max_iterations: 3,
             verify_threshold: default_verify_threshold(),
             always_fork: false,
@@ -275,6 +299,54 @@ pub struct ModelRoute {
     /// this. Lower it for a model whose own ceiling is below the default.
     #[serde(default)]
     pub max_tokens: Option<u64>,
+    /// Sampling temperature. `None` leaves the provider's default, which on Anthropic is 1.0.
+    ///
+    /// Worth setting to 0 for a node whose job is transcription or extraction rather than
+    /// judgement — the characterizer reads test output and names the checks in it, and a node
+    /// sampling creatively over that invents detail the output does not contain.
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Provider-specific request fields, merged into the call verbatim.
+    ///
+    /// The escape hatch for what a provider offers and this config has no word for — Anthropic's
+    /// extended thinking is the reason it exists:
+    ///
+    /// ```toml
+    /// [models.analyst.params.thinking]
+    /// type = "enabled"
+    /// budget_tokens = 4000
+    /// ```
+    ///
+    /// Passed through unvalidated, so a misspelling here is a provider error at the first call
+    /// rather than a config error at load. Thinking tokens count against `max_tokens`; raise it
+    /// alongside the budget or the call is rejected for a cap it cannot meet.
+    #[serde(default)]
+    pub params: Option<toml::Value>,
+    /// Whether this node's conversation continues across attempts, or starts over each time.
+    ///
+    /// A node that is re-driven — the implementer on a converge iteration, the analyst on a
+    /// revision — is given a diagnostic rather than the original task, and its message history
+    /// starts empty either way. What `Reuse` keeps is the *endpoint's* session: a gateway that
+    /// tracks one can carry what the previous attempt established, so the second attempt does not
+    /// re-read the tree it just edited.
+    ///
+    /// Default is `Fresh`, because reuse is only sound where a later attempt genuinely continues
+    /// the earlier one. A node re-run on an unrelated task under a reused session would inherit
+    /// context that has nothing to do with it.
+    #[serde(default)]
+    pub session: SessionScope,
+}
+
+/// Whether a node's endpoint session continues across attempts within a run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionScope {
+    /// A new session per attempt. The safe default.
+    #[default]
+    Fresh,
+    /// One session for this node across the whole run, so a re-driven attempt continues where the
+    /// last one stopped.
+    Reuse,
 }
 
 /// The per-call output cap when a route does not set one.
@@ -316,7 +388,6 @@ impl RatatoskrConfig {
     /// features are present, whether the CLI is installed); those surface at run time.
     pub fn validate(&self) -> Result<(), ConfigError> {
         const BACKENDS: [&str; 2] = ["microsandbox", "landlock"];
-        const CLIS: [&str; 1] = ["claude"];
 
         if self.rag_rat.command.is_empty() {
             return Err(ConfigError::Invalid(
@@ -335,12 +406,6 @@ impl RatatoskrConfig {
                 self.sandbox.backend
             )));
         }
-        if !CLIS.contains(&self.implementer.cli.as_str()) {
-            return Err(ConfigError::Invalid(format!(
-                "implementer.cli `{}` is not one of {CLIS:?}",
-                self.implementer.cli
-            )));
-        }
         if self.implementer.max_iterations == 0 {
             return Err(ConfigError::Invalid(
                 "implementer.max_iterations must be >= 1".to_string(),
@@ -356,11 +421,15 @@ impl Default for RatatoskrConfig {
     fn default() -> Self {
         let route = |provider: &str, model: &str| ModelRoute {
             max_tokens: None,
+            temperature: None,
+            params: None,
+            session: SessionScope::default(),
             provider: provider.to_string(),
             model: model.to_string(),
         };
         RatatoskrConfig {
             publish: PublishConfig::default(),
+            endpoint: EndpointConfig::default(),
             rag_rat: RagRatConfig {
                 // `--json` makes rag-rat emit JSON (not its default TOON), so nodes that parse
                 // tool results directly (MemoryNode) get a stable shape.
@@ -508,7 +577,6 @@ mod tests {
         invalid(|c| c.rag_rat.command.clear());
         invalid(|c| c.sandbox.test_command.clear());
         invalid(|c| c.sandbox.backend = "docker".to_string());
-        invalid(|c| c.implementer.cli = "aider".to_string());
         invalid(|c| c.implementer.max_iterations = 0);
     }
 
@@ -539,7 +607,6 @@ mod tests {
             [worktree]
             root = ".ratatoskr/worktrees"
             [implementer]
-            cli = "claude"
             max_iterations = 5
             verify_threshold = "P1"
             "#,
@@ -557,7 +624,6 @@ mod tests {
             [rag_rat]
             command = ["rag-rat", "mcp"]
             [implementer]
-            cli = "claude"
             max_iterations = 3
             verify_treshold = "P1"
         "#;

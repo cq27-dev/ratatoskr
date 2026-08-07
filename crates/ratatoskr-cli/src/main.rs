@@ -125,6 +125,76 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// List, tag, delete, export and import runs.
+    Runs {
+        #[command(subcommand)]
+        command: RunsCommand,
+        /// Path to the config file.
+        #[arg(long, default_value = "ratatoskr.toml")]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum RunsCommand {
+    /// List runs, most recent first.
+    List {
+        /// Only runs carrying this tag. Repeatable; a run must carry all of them.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Only runs with this status.
+        #[arg(long)]
+        status: Option<String>,
+        /// Only runs imported from this origin, or `local` for ones produced here.
+        #[arg(long)]
+        origin: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
+    /// Add tags to a run. Tags are what group runs into the arms of an experiment.
+    Tag {
+        run_id: String,
+        /// One or more tags.
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+    /// Remove tags from a run.
+    Untag {
+        run_id: String,
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+    /// Delete runs and everything recorded about them.
+    ///
+    /// Without `--force` it only lists what would go. Deletion takes the run's checkpoints and its
+    /// event history with it, and cannot be undone — export first if the run is worth keeping.
+    Rm {
+        #[arg(required = true)]
+        run_ids: Vec<String>,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Store a run's event history from the log files, so it survives their rotation.
+    ///
+    /// Runs automatically when a run finishes. Use this to backfill runs that finished before the
+    /// store kept histories, or whose ingest was interrupted. Idempotent.
+    Ingest {
+        /// Runs to ingest. Defaults to every run in the store.
+        run_ids: Vec<String>,
+    },
+    /// Write runs to a BSON bundle for someone else to analyse.
+    Export {
+        #[arg(required = true)]
+        run_ids: Vec<String>,
+        /// Where to write it.
+        #[arg(long, short)]
+        out: PathBuf,
+    },
+    /// Read a bundle exported somewhere else.
+    ///
+    /// Imported runs land alongside your own, tagged with where they came from. A run whose id is
+    /// already here is left alone rather than overwritten.
+    Import { bundle: PathBuf },
 }
 
 #[tokio::main]
@@ -164,6 +234,7 @@ async fn main() -> anyhow::Result<()> {
         }) => serve(addr, &config, projects, max_runs).await,
         Some(Command::Workflows) => workflows().await,
         Some(Command::Clean { force }) => clean(force).await,
+        Some(Command::Runs { command, config }) => runs(command, &config).await,
         None => {
             Cli::command().print_help()?;
             println!();
@@ -622,7 +693,7 @@ fn print_run_summary(run_id: &str, outcome: &ratatoskr_nodes::RunOutcome) {
     println!(
         "\nBASELINE (red-team): {} failing, {} passing",
         rt.failing_tests.len(),
-        rt.passing_tests.len()
+        rt.passed_tests
     );
     for c in &rt.classifications {
         let reason = if c.reason.is_empty() {
@@ -636,7 +707,7 @@ fn print_run_summary(run_id: &str, outcome: &ratatoskr_nodes::RunOutcome) {
     println!(
         "AFTER CHANGE: {} failing, {} passing",
         im.failing_tests.len(),
-        im.passing_tests.len()
+        im.passed_tests
     );
 
     let new_failures =
@@ -667,6 +738,217 @@ fn print_run_summary(run_id: &str, outcome: &ratatoskr_nodes::RunOutcome) {
 /// Reclaim ratatoskr's per-run worktrees and their `ratatoskr/*` branches. Only worktrees on a
 /// `ratatoskr/*` branch are touched — never the user's own or a foreign worktree. Needs no config;
 /// it works off the current repo's git worktree registry.
+/// Where this project's daily logs are written. Fixed, like the directory `run` writes them to.
+const LOG_DIR: &str = ".ratatoskr/logs";
+
+/// Shorten a run id to the prefix every listing shows.
+fn short(id: Option<&str>) -> String {
+    id.map(|s| s.chars().take(8).collect())
+        .unwrap_or_else(|| "—".to_string())
+}
+
+/// Make a run's event history durable, so it survives the log files rotating away.
+async fn ingest_run(
+    store: &ratatoskr_store::Store,
+    log_dir: &Path,
+    run_id: &str,
+) -> anyhow::Result<usize> {
+    let rows = ratatoskr_serve::events::rows_for_run(log_dir, run_id).await;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    Ok(store.ingest_events(run_id, rows).await?)
+}
+
+/// Who an export says it came from. Not identity — a label for telling one machine's runs from
+/// another's after they are side by side.
+fn exported_by() -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    let host = std::fs::read_to_string("/etc/hostname")
+        .map(|h| h.trim().to_string())
+        .unwrap_or_else(|_| "host".to_string());
+    format!("{user}@{host}")
+}
+
+async fn runs(command: RunsCommand, config_path: &Path) -> anyhow::Result<()> {
+    let config = load_config(config_path)?;
+    let store = ratatoskr_store::Store::open(&config.store.path)
+        .with_context(|| format!("opening the store at {}", config.store.path.display()))?;
+    let log_dir = PathBuf::from(LOG_DIR);
+    match command {
+        RunsCommand::List {
+            tags,
+            status,
+            origin,
+            limit,
+        } => {
+            let mut all = store.list_runs().await?;
+            store.attach_tags(&mut all).await?;
+            let matching: Vec<_> = all
+                .into_iter()
+                .filter(|r| status.as_ref().is_none_or(|s| &r.status == s))
+                .filter(|r| {
+                    origin.as_ref().is_none_or(|o| match o.as_str() {
+                        // The one origin that is not a name: runs this machine produced.
+                        "local" => r.origin.is_none(),
+                        want => r.origin.as_deref() == Some(want),
+                    })
+                })
+                .filter(|r| tags.iter().all(|t| r.tags.contains(t)))
+                .take(limit)
+                .collect();
+
+            if matching.is_empty() {
+                println!("no runs match");
+                return Ok(());
+            }
+            println!(
+                "{:<10} {:<8} {:<22} {:<24} ORIGIN",
+                "RUN", "ISSUE", "STATUS", "TAGS"
+            );
+            for r in &matching {
+                println!(
+                    "{:<10} {:<8} {:<22} {:<24} {}",
+                    short(Some(&r.run_id)),
+                    r.issue_id.as_deref().unwrap_or("—"),
+                    r.status,
+                    if r.tags.is_empty() {
+                        "—".to_string()
+                    } else {
+                        r.tags.join(",")
+                    },
+                    r.origin.as_deref().unwrap_or("local"),
+                );
+            }
+            Ok(())
+        }
+
+        RunsCommand::Tag { run_id, tags } => {
+            let run_id = resolve(&store, &run_id).await?;
+            store.tag_run(&run_id, tags.clone()).await?;
+            println!("tagged {} {}", short(Some(&run_id)), tags.join(","));
+            Ok(())
+        }
+
+        RunsCommand::Untag { run_id, tags } => {
+            let run_id = resolve(&store, &run_id).await?;
+            store.untag_run(&run_id, tags.clone()).await?;
+            println!("untagged {} {}", short(Some(&run_id)), tags.join(","));
+            Ok(())
+        }
+
+        RunsCommand::Rm { run_ids, force } => {
+            let mut resolved = Vec::new();
+            for id in &run_ids {
+                resolved.push(resolve(&store, id).await?);
+            }
+            if !force {
+                println!("would delete (re-run with --force):");
+                for id in &resolved {
+                    let events = store.events_for_run(id).await?.len();
+                    let checkpoints = store.checkpoints_for_run(id).await?.len();
+                    println!(
+                        "  {}  {checkpoints} checkpoints, {events} events",
+                        short(Some(id))
+                    );
+                }
+                return Ok(());
+            }
+            for id in &resolved {
+                if store.delete_run(id).await? {
+                    println!("deleted {}", short(Some(id)));
+                }
+            }
+            Ok(())
+        }
+
+        RunsCommand::Ingest { run_ids } => {
+            let ids = if run_ids.is_empty() {
+                store
+                    .list_runs()
+                    .await?
+                    .into_iter()
+                    .map(|r| r.run_id)
+                    .collect()
+            } else {
+                let mut out = Vec::new();
+                for id in &run_ids {
+                    out.push(resolve(&store, id).await?);
+                }
+                out
+            };
+            for id in ids {
+                let added = ingest_run(&store, &log_dir, &id).await?;
+                if added > 0 {
+                    println!("{}  +{added} events", short(Some(&id)));
+                }
+            }
+            Ok(())
+        }
+
+        RunsCommand::Export { run_ids, out } => {
+            let mut resolved = Vec::new();
+            for id in &run_ids {
+                resolved.push(resolve(&store, id).await?);
+            }
+            // Ingest first: a bundle whose events are still only in the log files would import as
+            // a run nobody can look through, which is most of the reason to send one.
+            for id in &resolved {
+                ingest_run(&store, &log_dir, id).await?;
+            }
+            let at = store.now().await?;
+            let bundle = store.export(&resolved, &exported_by(), &at).await?;
+            let bytes = ratatoskr_store::bundle::to_bytes(&bundle)?;
+            std::fs::write(&out, &bytes).with_context(|| format!("writing {}", out.display()))?;
+            let events: usize = bundle.runs.iter().map(|r| r.events.len()).sum();
+            println!(
+                "exported {} run(s), {events} events, {} KB to {}",
+                bundle.runs.len(),
+                bytes.len() / 1024,
+                out.display()
+            );
+            Ok(())
+        }
+
+        RunsCommand::Import { bundle } => {
+            let bytes =
+                std::fs::read(&bundle).with_context(|| format!("reading {}", bundle.display()))?;
+            let read = ratatoskr_store::bundle::from_bytes(&bytes)?;
+            let report = store.import(&read).await?;
+            println!("from {} ({})", read.exported_by, read.exported_at);
+            for r in &report {
+                if r.inserted {
+                    println!(
+                        "  imported {}  {} checkpoints, {} events",
+                        short(Some(&r.run_id)),
+                        r.checkpoints,
+                        r.events
+                    );
+                } else {
+                    println!("  skipped  {}  already here", short(Some(&r.run_id)));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Accept a run id prefix, the way every other tool that shows short ids does.
+async fn resolve(store: &ratatoskr_store::Store, prefix: &str) -> anyhow::Result<String> {
+    let matching: Vec<String> = store
+        .list_runs()
+        .await?
+        .into_iter()
+        .map(|r| r.run_id)
+        .filter(|id| id.starts_with(prefix))
+        .collect();
+    match matching.len() {
+        1 => Ok(matching.into_iter().next().expect("checked")),
+        0 => bail!("no run starts with `{prefix}`"),
+        n => bail!("`{prefix}` matches {n} runs; give more of the id"),
+    }
+}
+
 async fn clean(force: bool) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("resolving the current directory")?;
     // `main_root` is the stable anchor for every git call: it's never a removal target, so cleanup
@@ -750,6 +1032,11 @@ fn load_config(path: &Path) -> anyhow::Result<RatatoskrConfig> {
     config
         .validate()
         .with_context(|| format!("in config {}", path.display()))?;
+    // Here rather than at each command, because every command that reaches a model reaches it
+    // through this function — and a command that loaded the config but not the endpoint's headers
+    // would talk to it as an unidentified client, which is how a run gets whatever default the
+    // endpoint keeps for somebody else.
+    ratatoskr_agent::configure_endpoint(config.endpoint.clone());
     Ok(config)
 }
 

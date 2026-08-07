@@ -7,6 +7,7 @@
 pub mod compaction;
 pub mod files;
 pub mod publish;
+pub mod shell;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -157,17 +158,14 @@ pub async fn ask(
 ) -> Result<String, AgentError> {
     match parse_provider(&route.provider)? {
         Provider::Anthropic => {
-            let client = anthropic::Client::from_env().map_err(|source| AgentError::Provider {
-                provider: "anthropic".to_string(),
-                source,
-            })?;
+            let client = anthropic_client(&uuid::Uuid::new_v4().to_string())?;
             run(
-                client.completion_model(&route.model),
+                caching(client.completion_model(&route.model)),
                 preamble,
                 question,
                 tools,
                 max_turns,
-                route.max_tokens(),
+                route,
             )
             .await
         }
@@ -177,12 +175,15 @@ pub async fn ask(
                 source,
             })?;
             run(
+                // Not `caching`: the field exists on this provider's model too, but whether the
+                // endpoint honours an Anthropic `cache_control` is its business, and sending one
+                // it rejects would cost the call rather than the cache.
                 client.completion_model(&route.model),
                 preamble,
                 question,
                 tools,
                 max_turns,
-                route.max_tokens(),
+                route,
             )
             .await
         }
@@ -196,13 +197,13 @@ async fn run<M>(
     question: &str,
     tools: ToolSet,
     max_turns: Option<usize>,
-    max_tokens: u64,
+    route: &ModelRoute,
 ) -> Result<String, AgentError>
 where
     M: CompletionModel + 'static,
 {
-    let (builder, meter) = metered(model, preamble, max_turns, max_tokens);
-    let agent = bind_tools(builder, &tools, None);
+    let (builder, meter) = metered(model, preamble, max_turns, Request::of(route));
+    let agent = bind_tools(builder, &tools, None, None, None);
 
     let answer = agent.prompt(question).await;
     // No store to checkpoint to here, so it goes to the log. A one-shot question whose cost is
@@ -214,15 +215,58 @@ where
         "gen_ai.usage.input_tokens" = usage.input_tokens,
         "gen_ai.usage.output_tokens" = usage.output_tokens,
         "gen_ai.usage.cached_input_tokens" = usage.cached_input_tokens,
+        // The write half, and the expensive one: a cache write is billed above the ordinary input
+        // rate, so a cost read from hits alone reads as cheaper than it was.
+        "gen_ai.usage.cache_creation_input_tokens" = usage.cache_creation_input_tokens,
+        "gen_ai.usage.reasoning_tokens" = usage.reasoning_tokens,
         "ask usage"
     );
     answer.map_err(|e| AgentError::Prompt(e.to_string()))
 }
 
-/// Like [`ask`], but the agent is given an `output_schema`, so its final answer is the structured
-/// JSON matching that schema (rig's `OutputMode::Auto` resolves to a synthetic output tool that
-/// composes with the rag-rat tools). Returns the raw output string — best-effort, so the caller
-/// must still validate it (see `ratatoskr_graph::parse_validated`).
+/// Bind a tool declaration to the closure that answers it.
+///
+/// The name, description and schema a tool is offered under are the ones in its declaration.
+/// Unpacking them again at each implementation is how the two come to disagree — a tool described
+/// one way and answering to another.
+pub(crate) fn answered_by<F>(declaration: Tool, callback: F) -> DynamicTool
+where
+    F: for<'a> Fn(
+            &'a mut rig_agent::tool::ToolContext,
+            serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<ToolOutput, ToolExecutionError>> + Send + 'a>,
+        > + Send
+        + Sync
+        + 'static,
+{
+    DynamicTool::new(
+        declaration.name.to_string(),
+        declaration
+            .description
+            .clone()
+            .unwrap_or_default()
+            .to_string(),
+        serde_json::Value::Object((*declaration.input_schema).clone()),
+        callback,
+    )
+}
+
+/// Keep the last `max` chars of `s`, saying how much was dropped.
+///
+/// The end is the half worth keeping for anything a command printed: runners put their summary
+/// last, so a head-truncated failure is the part that says a suite ran and not the part that says
+/// what failed. Stating the loss matters as much — a reader not told it was cut reads a partial
+/// suite as a whole one.
+pub fn tail(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().skip(count - max).collect();
+    format!("[{} earlier characters omitted]\n{kept}", count - max)
+}
+
 /// Trim `s` to `max` chars for a log line, with an ellipsis when cut.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -230,6 +274,58 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}…", s.chars().take(max).collect::<String>())
     }
+}
+
+/// A tool call's arguments, bounded but still parseable.
+///
+/// Truncating the serialized JSON is what a reader wants and what a parser cannot use: cutting
+/// `{"file_path":"x","old_string":"..."}` mid-string leaves text that no longer parses, so every
+/// consumer downstream loses ALL the arguments rather than the long one. `Read` survived it only by
+/// being short enough to fit; `Edit` and `Write` never did. Bounding each value instead keeps the
+/// shape intact, so the field a reader identifies the call by is always there.
+/// Fields whose value is recoverable from somewhere better than a log line.
+///
+/// File contents live in the worktree and its branch, so a diff is reproducible from git long
+/// after the log has rotated; a prose body ends up on the pull request or the issue. Keeping them
+/// whole here would multiply the log by the size of the files a run touches to duplicate a record
+/// that already exists.
+const RECOVERABLE: &[&str] = &["content", "old_string", "new_string", "body"];
+
+/// Nothing else is recoverable, so nothing else is abridged — up to a ceiling no real argument
+/// reaches, which is there so one pathological call cannot swamp a day's log.
+const ARGUMENT_CEILING: usize = 4_000;
+
+fn abridged_args(raw: &str, bulk: usize) -> String {
+    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
+        // Not JSON to begin with — nothing to preserve, so bound the whole thing.
+        return truncate(raw, 200);
+    };
+    fn walk(v: &mut serde_json::Value, key: Option<&str>, bulk: usize) {
+        match v {
+            serde_json::Value::String(s) => {
+                // The command that ran, the pattern searched, the path read: short, and written
+                // down nowhere else. A run's account of what it did is only as good as these.
+                let max = match key {
+                    Some(k) if RECOVERABLE.contains(&k) => bulk,
+                    _ => ARGUMENT_CEILING,
+                };
+                if s.chars().count() > max {
+                    *s = truncate(s, max);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                items.iter_mut().for_each(|i| walk(i, key, bulk));
+            }
+            serde_json::Value::Object(map) => {
+                for (k, value) in map.iter_mut() {
+                    walk(value, Some(k.as_str()), bulk);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(&mut parsed, None, bulk);
+    parsed.to_string()
 }
 
 /// Start an agent, metered.
@@ -240,16 +336,225 @@ fn truncate(s: &str, max: usize) -> String {
 ///
 /// Returns the builder alongside the handles its usage accumulates into; the caller reads them
 /// after the prompt settles, including when it failed.
+/// Appended to every node's preamble.
+///
+/// A turn costs one round-trip to the model — measured at roughly six seconds against a large
+/// cached context, and growing with it — while the tools themselves answer in about a tenth of a
+/// second. A node that reads twelve files one per turn therefore spends over a minute waiting and
+/// barely a second working. Left unasked, that is exactly what happens: an unprompted node batches
+/// almost nothing, and the run's wall-clock is its turn count.
+///
+/// Nothing enforces this — it is the model's choice per turn — so it is worded as the default to
+/// depart from rather than a rule, since a call that genuinely depends on the previous result must
+/// still wait for it.
+const TOOL_USE_GUIDANCE: &str = "\n\n## Calling tools\n\nWhen you need several things and none of \
+    them depends on another's result, ask for them all in the same turn rather than one at a time. \
+    Reading four files is one turn with four calls, not four turns. Only wait for a result when \
+    what you do next actually depends on it.";
+
+/// Whether this route leaves the model free to reason before answering.
+///
+/// Read from the route's provider params, since that is the only place it can be turned off from
+/// here. `params.thinking.type = "disabled"` is the one shape that means no; anything else — a
+/// budget, another type, or no `thinking` key at all — leaves the decision to the endpoint.
+fn thinking_left_on(route: &ModelRoute) -> bool {
+    let Some(params) = route.params.as_ref() else {
+        return true;
+    };
+    params
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|t| t.as_str())
+        != Some("disabled")
+}
+
+/// The endpoint session this node attempt belongs to.
+///
+/// Fresh per attempt by default. `SessionScope::Reuse` keeps one session for the node across the
+/// whole run instead, so a re-driven attempt — the implementer on a converge iteration, the
+/// analyst on a revision — continues where the last one stopped rather than meeting the repository
+/// for the first time again. Reuse needs a `conversation` key to be stable across those attempts;
+/// without one there is nothing to be stable about, and it falls back to fresh.
+fn session_id(run: &NodeRun<'_>) -> String {
+    match (run.route.session, run.conversation) {
+        (ratatoskr_core::SessionScope::Reuse, Some(key)) => key.to_string(),
+        _ => uuid::Uuid::new_v4().to_string(),
+    }
+}
+
+/// The headers one request carries: this deployment's static set, plus the session id when the
+/// endpoint keys a session off one.
+///
+/// Separate from building the client so it can be checked without a provider or a network. The
+/// failure worth catching is a header that never reaches the wire, and that is decided here.
+fn endpoint_headers(
+    endpoint: Option<&ratatoskr_core::EndpointConfig>,
+    session: &str,
+) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    for (name, value) in endpoint.map(|e| &e.headers).into_iter().flatten() {
+        match (
+            http::HeaderName::try_from(name.as_str()),
+            http::HeaderValue::try_from(value.as_str()),
+        ) {
+            (Ok(n), Ok(v)) => {
+                headers.insert(n, v);
+            }
+            // Warned rather than failed: a malformed header is a config typo, and taking the run
+            // down for it is a worse answer than sending the request without it.
+            _ => tracing::warn!(
+                header = %name,
+                "ignoring an `[endpoint] headers` entry that is not a valid HTTP header"
+            ),
+        }
+    }
+    if let Some(name) = endpoint.and_then(|e| e.session_header.as_deref())
+        && let (Ok(n), Ok(v)) = (
+            http::HeaderName::try_from(name),
+            http::HeaderValue::try_from(session),
+        )
+    {
+        headers.insert(n, v);
+    }
+    headers
+}
+
+/// How this client addresses the endpoint, set once from config at startup.
+///
+/// Process-wide rather than threaded through `NodeRun` because it describes the deployment, not
+/// the node: every node in a run talks to the same endpoint, and passing it down twenty call sites
+/// would put the same value in twenty places for nobody's benefit.
+static ENDPOINT: std::sync::OnceLock<ratatoskr_core::EndpointConfig> = std::sync::OnceLock::new();
+
+/// Tell the agent layer how to address the endpoint. Called once, before any node runs.
+pub fn configure_endpoint(endpoint: ratatoskr_core::EndpointConfig) {
+    let _ = ENDPOINT.set(endpoint);
+}
+
+/// An Anthropic client carrying this deployment's headers.
+///
+/// `from_env` reads `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` and nothing else, so the builder
+/// is spelled out here to add them. `session` is fresh per node attempt and constant across that
+/// attempt's turns — an endpoint that keys a session off it then continues one conversation rather
+/// than rebuilding it every turn.
+fn anthropic_client(session: &str) -> Result<anthropic::Client, AgentError> {
+    let key = std::env::var("ANTHROPIC_API_KEY").map_err(|source| AgentError::Provider {
+        provider: "anthropic".to_string(),
+        source: ProviderClientError::EnvironmentVariable {
+            name: "ANTHROPIC_API_KEY",
+            source,
+        },
+    })?;
+    let mut builder = anthropic::Client::builder().api_key(key);
+    if let Ok(base) = std::env::var("ANTHROPIC_BASE_URL") {
+        builder = builder.base_url(&base);
+    }
+
+    let headers = endpoint_headers(ENDPOINT.get(), session);
+    if !headers.is_empty() {
+        builder = builder.http_headers(headers);
+    }
+    builder.build().map_err(|source| AgentError::Provider {
+        provider: "anthropic".to_string(),
+        source: source.into(),
+    })
+}
+
+/// Whether a failure was the call not completing, rather than the model answering unfavourably.
+///
+/// Matched on the message because that is all the provider client hands back — its error type
+/// erases the distinction, and the alternative is retrying everything or nothing. Kept narrow: a
+/// pattern that catches too much turns a permanent failure into two permanent failures.
+fn is_transport_error(message: &str) -> bool {
+    const TRANSPORT: [&str; 5] = [
+        "HttpError",
+        "error sending request",
+        "connection closed",
+        "connection reset",
+        "timed out",
+    ];
+    TRANSPORT.iter().any(|m| message.contains(m))
+}
+
+/// Anthropic prompt caching, which rig leaves off entirely.
+///
+/// Without it no `cache_control` is sent and an agent loop pays for its whole transcript on every
+/// turn: a live run showed the cache write growing 12k → 22k tokens across nine calls while the
+/// read stayed flat at 7k, the hit rate falling 36% → 24% as the conversation grew. The history
+/// was re-sent and re-written each turn — at the write premium — rather than read back.
+///
+/// Per-block markers only. Adding rig's top-level automatic breakpoint as well makes this *worse*,
+/// which is the opposite of what the two names suggest: with both set, rig hands the moving message
+/// point to the top-level breakpoint and stops marking messages itself, and this endpoint does
+/// nothing with that field — so the growing half ends up cached by nobody.
+///
+/// Captured from real requests. With both on, markers sit on the system prompt and the last tool
+/// and nowhere in `messages`. With only this one, the marker sits on the last message block and
+/// advances with the conversation — message 0, then message 2 — which is what lets each turn read
+/// the prefix instead of rewriting it.
+fn caching(
+    model: anthropic::completion::CompletionModel,
+) -> anthropic::completion::CompletionModel {
+    model.with_prompt_caching()
+}
+
+/// What one call asks of the provider, beyond the prompt and the tools.
+///
+/// A struct rather than three arguments because they arrive together from a route, and because the
+/// compactor has settings but no route — it summarises with the node's model and asks nothing
+/// extra of it.
+pub struct Request {
+    max_tokens: u64,
+    temperature: Option<f64>,
+    params: Option<serde_json::Value>,
+}
+
+impl Request {
+    /// What a route asks for.
+    pub fn of(route: &ModelRoute) -> Self {
+        Request {
+            max_tokens: route.max_tokens(),
+            temperature: route.temperature,
+            params: route.params.as_ref().and_then(|p| {
+                serde_json::to_value(p)
+                    .map_err(|e| {
+                        // Warned rather than failed: the run is otherwise fine, and a route that
+                        // cannot encode its own extras should not take the run down with it.
+                        tracing::warn!(
+                            model = %route.model,
+                            "could not encode this route's `params`, sending the call without \
+                             them: {e}"
+                        );
+                    })
+                    .ok()
+            }),
+        }
+    }
+
+    /// The defaults: a cap and nothing else. What the compactor asks for — a summary wants neither
+    /// a temperature of the node's choosing nor its extended thinking budget.
+    pub fn plain() -> Self {
+        Request {
+            max_tokens: ratatoskr_core::DEFAULT_MAX_TOKENS,
+            temperature: None,
+            params: None,
+        }
+    }
+}
+
 fn metered<M: CompletionModel + 'static>(
     model: M,
     preamble: &str,
     max_turns: Option<usize>,
-    max_tokens: u64,
+    request: Request,
 ) -> (AgentBuilder<M, NoToolConfig>, Meter) {
+    let preamble = &format!("{preamble}{TOOL_USE_GUIDANCE}");
     let usage = UsageHook::default();
+    let observability = ObservabilityHook::default();
     let meter = Meter {
         total: Arc::clone(&usage.total),
         calls: Arc::clone(&usage.calls),
+        used: Arc::clone(&observability.used),
     };
     let builder = AgentBuilder::new(model)
         .preamble(preamble)
@@ -258,11 +563,23 @@ fn metered<M: CompletionModel + 'static>(
         // known prefixes does not include models released after it was compiled, and a model that
         // falls through it goes out with no cap at all — which Anthropic rejects outright, losing
         // the run at that node's first call.
-        .max_tokens(max_tokens)
+        .max_tokens(request.max_tokens)
         // Log tool calls + model text; added before the gates so it observes calls the
         // clarification and ruleset hooks may skip.
-        .add_hook(ObservabilityHook)
+        .add_hook(observability)
         .add_hook(usage);
+    // Left to the provider's default when the route says nothing, rather than given a default
+    // here: "unset" is a position, and picking one for every node from one place would be picking
+    // it for nodes nobody thought about.
+    let builder = match request.temperature {
+        Some(t) => builder.temperature(t),
+        None => builder,
+    };
+    // Provider-specific fields, verbatim. Anthropic's extended thinking is the reason this exists.
+    let builder = match request.params {
+        Some(params) => builder.additional_params(params),
+        None => builder,
+    };
     (builder, meter)
 }
 
@@ -270,6 +587,9 @@ fn metered<M: CompletionModel + 'static>(
 pub struct Meter {
     total: Arc<Mutex<TokenUsage>>,
     calls: Arc<AtomicU64>,
+    /// Which tools the node actually called, as distinct from which it could have. Ordered, so a
+    /// reader sees the same list twice for the same run.
+    used: Arc<Mutex<std::collections::BTreeSet<String>>>,
 }
 
 impl Meter {
@@ -280,6 +600,16 @@ impl Meter {
             *self.total.lock().expect("usage mutex poisoned"),
             self.calls.load(Ordering::Relaxed),
         )
+    }
+
+    /// The tools the node called, in name order.
+    pub fn used(&self) -> Vec<String> {
+        self.used
+            .lock()
+            .expect("used-tools mutex poisoned")
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -306,6 +636,13 @@ impl AgentHook for UsageHook {
         _event: CompletionResponseEvent<'_>,
     ) -> ObservationAction {
         self.calls.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            kind = "response_usage",
+            input = _event.usage.input_tokens,
+            output = _event.usage.output_tokens,
+            cached = _event.usage.cached_input_tokens,
+            "response usage"
+        );
         ObservationAction::Continue
     }
 
@@ -325,6 +662,17 @@ impl AgentHook for UsageHook {
         _ctx: &HookContext,
         event: ModelTurnFinished<'_>,
     ) -> ModelTurnAction {
+        // Per turn, at debug: a total that looks wrong is otherwise impossible to attribute — the
+        // question is always whether one turn was mismeasured or most turns reported nothing.
+        tracing::debug!(
+            kind = "turn_usage",
+            turn = event.turn,
+            input = event.usage.input_tokens,
+            output = event.usage.output_tokens,
+            reasoning = event.usage.reasoning_tokens,
+            cached = event.usage.cached_input_tokens,
+            "turn usage"
+        );
         self.total
             .lock()
             .expect("usage mutex poisoned")
@@ -333,25 +681,68 @@ impl AgentHook for UsageHook {
                 output_tokens: event.usage.output_tokens,
                 cached_input_tokens: event.usage.cached_input_tokens,
                 cache_creation_input_tokens: event.usage.cache_creation_input_tokens,
+                reasoning_tokens: event.usage.reasoning_tokens,
             });
         ModelTurnAction::Continue
     }
 }
 
-/// Always-on hook that makes a run legible in the logs: every tool call (name + args) and the
-/// model's text at the end of each turn. Successful tool calls aren't otherwise surfaced, so without
-/// this a stuck node (e.g. an analyst churning through turns) looks like silence.
-struct ObservabilityHook;
+/// Always-on hook that makes a run legible in the logs: every tool call (name + args), how long it
+/// took, and the model's text at the end of each turn. Successful tool calls aren't otherwise
+/// surfaced, so without this a stuck node (e.g. an analyst churning through turns) looks like
+/// silence.
+///
+/// The duration is what makes a slow node diagnosable. Without it the only measurable interval is
+/// call-to-next-call, which is a tool's own time and the model's next response added together —
+/// and the two have completely different fixes.
+#[derive(Default)]
+struct ObservabilityHook {
+    /// Names of the tools this node called. Shared with the [`Meter`], which reports them
+    /// alongside the cost.
+    used: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// Start times by rig's correlation id. Entries are removed when the result arrives; a tool
+    /// whose result never comes leaves one behind, which is bounded by the turn ceiling.
+    started: Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
 
 impl AgentHook for ObservabilityHook {
     async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
+        if let Ok(mut used) = self.used.lock() {
+            used.insert(event.tool_name.to_string());
+        }
+        if let Ok(mut started) = self.started.lock() {
+            started.insert(
+                event.internal_call_id.to_string(),
+                std::time::Instant::now(),
+            );
+        }
         tracing::info!(
             kind = "tool_call",
             tool = event.tool_name,
-            args = %truncate(event.args, 200),
+            args = %abridged_args(event.args, 120),
             "tool call"
         );
         ToolCallAction::Run
+    }
+
+    async fn on_tool_result(
+        &self,
+        _ctx: &HookContext,
+        event: rig_agent::agent::ToolResultEvent<'_>,
+    ) -> ToolResultAction {
+        let elapsed = self
+            .started
+            .lock()
+            .ok()
+            .and_then(|mut started| started.remove(event.internal_call_id))
+            .map(|at| at.elapsed().as_millis() as u64);
+        tracing::info!(
+            kind = "tool_result",
+            tool = event.tool_name,
+            duration_ms = elapsed,
+            "tool result"
+        );
+        ToolResultAction::Keep
     }
 
     async fn on_model_turn_finished(
@@ -385,6 +776,8 @@ fn bind_tools<M: CompletionModel + 'static>(
     builder: AgentBuilder<M, NoToolConfig>,
     tools: &ToolSet,
     files: Option<&std::path::Path>,
+    shell: Option<&shell::ShellAccess>,
+    push: Option<&publish::PushAccess>,
 ) -> Agent<M> {
     // An empty dynamic set moves the builder out of `NoToolConfig` without binding anything, which
     // is what lets the groups below be a plain loop over two different binding calls.
@@ -409,7 +802,7 @@ fn bind_tools<M: CompletionModel + 'static>(
                 group
                     .tools
                     .iter()
-                    .map(|tool| local_tool(tool, files))
+                    .map(|tool| local_tool(tool, files, shell, push))
                     .collect(),
             ),
         };
@@ -427,7 +820,18 @@ fn prefixed(text: &str, context: Option<String>) -> String {
 
 /// Bind a tool this host answers itself: a built-in file tool, or — for the synthetic ones a hook
 /// answers in-conversation — a stand-in that says so if it is ever actually dispatched.
-fn local_tool(tool: &Tool, files: Option<&std::path::Path>) -> DynamicTool {
+fn local_tool(
+    tool: &Tool,
+    files: Option<&std::path::Path>,
+    shell: Option<&shell::ShellAccess>,
+    push: Option<&publish::PushAccess>,
+) -> DynamicTool {
+    if let Some(implemented) = shell.and_then(|s| shell::implementation(&tool.name, s)) {
+        return implemented;
+    }
+    if let Some(implemented) = push.and_then(|p| publish::push_implementation(&tool.name, p)) {
+        return implemented;
+    }
     if let Some(root) = files {
         if let Some(implemented) = files::implementation(&tool.name, root) {
             return implemented;
@@ -819,9 +1223,9 @@ impl RunLedger {
             .push((node.to_string(), telemetry));
     }
 
-    /// Claim the oldest unclaimed entry for `node`, if it made a model turn at all. A node that
-    /// drives a coding CLI rather than a model (the implementer) never records one, so `None` here
-    /// is ordinary and means "nothing to report", not "something went missing".
+    /// Claim the oldest unclaimed entry for `node`, if it made a model turn at all. `None` is
+    /// ordinary for a node that ran no model — it means "nothing to report", not "something went
+    /// missing", which is what [`RunLedger::unclaimed`] is for.
     pub fn take(&self, node: &str) -> Option<NodeTelemetry> {
         let mut entries = self.entries.lock().expect("ledger mutex poisoned");
         let at = entries.iter().position(|(name, _)| name == node)?;
@@ -867,6 +1271,20 @@ pub struct NodeRun<'a> {
     pub skills: Vec<Skill>,
     /// The repository the node's built-in file tools read within; `None` when it has none.
     pub files: Option<std::path::PathBuf>,
+    /// A key naming this node's conversation within the run, when the route asks for the endpoint
+    /// session to be reused across attempts.
+    ///
+    /// Only consulted for `SessionScope::Reuse`; ignored otherwise, so a node that supplies one is
+    /// not thereby opting into reuse — the route decides that.
+    pub conversation: Option<&'a str>,
+    /// The sandbox the node's `Bash` calls run in; `None` for a node that runs no commands.
+    ///
+    /// Separate from `files` because they are different powers: reading and editing a tree is not
+    /// running code in it, and only the node that has to build and test its own work is given the
+    /// second.
+    pub shell: Option<shell::ShellAccess>,
+    /// The branch this node may push, if any. Only the publisher is given one.
+    pub push: Option<publish::PushAccess>,
     /// Where this turn reports what it cost; `None` outside a run that records checkpoints.
     pub ledger: Option<Arc<RunLedger>>,
     /// What this node has to end up producing, in one line, for the compactor.
@@ -879,14 +1297,15 @@ pub struct NodeRun<'a> {
 }
 
 /// Run one node's turn with an output schema, so its final answer is structured JSON.
+/// Like [`ask`], but the agent is given an `output_schema`, so its final answer is the structured
+/// JSON matching that schema. Returns the raw output string — best-effort, so the caller must
+/// still validate it (see `ratatoskr_graph::parse_validated`), though a first answer that misses
+/// the schema is handed back for correction before it reaches one.
 pub async fn run_structured(run: NodeRun<'_>) -> Result<String, AgentError> {
     match parse_provider(&run.route.provider)? {
         Provider::Anthropic => {
-            let client = anthropic::Client::from_env().map_err(|source| AgentError::Provider {
-                provider: "anthropic".to_string(),
-                source,
-            })?;
-            let model = client.completion_model(&run.route.model);
+            let client = anthropic_client(&session_id(&run))?;
+            let model = caching(client.completion_model(&run.route.model));
             run_typed(model, run).await
         }
         Provider::Moonshot => {
@@ -905,7 +1324,6 @@ async fn run_typed<M>(model: M, run: NodeRun<'_>) -> Result<String, AgentError>
 where
     M: CompletionModel + 'static,
 {
-    let max_tokens = run.route.max_tokens();
     // The compactor summarises with the same model the node runs on. Cheaper would be tempting, but
     // a summary is the only record of the turns it replaces: the reader that has to reconstruct a
     // session from it is this model, and a weaker one deciding what that reader needs is a false
@@ -924,6 +1342,9 @@ where
         observer,
         skills,
         files,
+        shell,
+        push,
+        conversation,
         ledger,
         produces,
     } = run;
@@ -938,7 +1359,10 @@ where
         None => (preamble.to_string(), question.to_string()),
     };
 
-    let (builder, meter) = metered(model, &preamble, max_turns, max_tokens);
+    let (builder, meter) = metered(model, &preamble, max_turns, Request::of(route));
+    // Kept for the validation below: the builder consumes the schema, and a node's answer has to
+    // be checked against it here, where the agent that wrote it can still be asked to fix it.
+    let schema_value = serde_json::to_value(&output_schema).unwrap_or(serde_json::Value::Null);
     let mut builder = builder
         .output_schema_raw(output_schema)
         // Force the synthetic output-tool: Auto can resolve to native structured output, which
@@ -979,7 +1403,16 @@ where
             ledger.clone(),
         ));
     }
-    let agent = bind_tools(builder, &tools, files.as_deref());
+    // Before the set is handed to the agent: what the model could call is part of what this turn
+    // was, and a reader of the run cannot reconstruct it from a config that has since changed.
+    let tool_names = tools.names();
+    let agent = bind_tools(
+        builder,
+        &tools,
+        files.as_deref(),
+        shell.as_ref(),
+        push.as_ref(),
+    );
 
     // Tag every log line for this run — the hook's tool-call/text lines and rig-agent's own turn
     // logs — with the node name, so a run's agents are distinguishable in the logs. `prompt()` is
@@ -987,17 +1420,79 @@ where
     // Field names follow the OpenTelemetry GenAI semantic conventions. Those are still unstable and
     // not worth an SDK dependency yet, but naming to match now makes adopting one a layer swap
     // rather than a rename of every field a dashboard reads.
+    let span = tracing::info_span!(
+        "agent",
+        node,
+        "gen_ai.operation.name" = "invoke_agent",
+        "gen_ai.agent.name" = node,
+        "gen_ai.request.model" = %model_name,
+    );
+    // Announced at the start, because a checkpoint only exists once the node has finished — and
+    // the moment a reader most wants to know what a node is running on is while it is still
+    // running. The facts here are the configured ones; cost arrives with the checkpoint.
+    tracing::info!(
+        kind = "node_start",
+        node,
+        model = %model_name,
+        tools = %tool_names.join(","),
+        thinking = thinking_left_on(route),
+        reuses_session = matches!(route.session, ratatoskr_core::SessionScope::Reuse)
+            && conversation.is_some(),
+        "node started"
+    );
     let started = std::time::Instant::now();
-    let answer = async move { agent.prompt(&question).await }
-        .instrument(tracing::info_span!(
-            "agent",
-            node,
-            "gen_ai.operation.name" = "invoke_agent",
-            "gen_ai.agent.name" = node,
-            "gen_ai.request.model" = %model_name,
-        ))
+    let mut answer = async { agent.prompt(&question).await }
+        .instrument(span.clone())
         .await
         .map_err(|e| AgentError::Prompt(e.to_string()));
+
+    // One retry when the call never reached a verdict. A dropped connection is not an answer, and
+    // it cost a live run twenty minutes of implementer work at the last node before the diff: the
+    // request went out, the proxy in front of the API closed it, and the run failed holding a
+    // worktree full of finished edits. Retrying costs another attempt; not retrying costs all of
+    // the attempt already made.
+    //
+    // Transport only. A refusal, a bad request or an exhausted turn budget will answer the same
+    // way twice, and retrying those spends a node's budget to arrive back where it started.
+    if let Err(e) = &answer
+        && is_transport_error(&e.to_string())
+    {
+        tracing::warn!(
+            node,
+            "the model call failed in transport, retrying once: {e}"
+        );
+        answer = async { agent.prompt(&question).await }
+            .instrument(span.clone())
+            .await
+            .map_err(|e| AgentError::Prompt(e.to_string()));
+    }
+    let answer = answer;
+
+    // Give a malformed answer back to the agent that wrote it, once. The alternative is what a
+    // schema failure used to cost: the node's whole run discarded — every tool call, every file
+    // read, minutes of it — over a key in the wrong shape, which is the one kind of mistake a
+    // model corrects immediately when told. The correction is a fresh short prompt rather than a
+    // continuation, so the preamble and tools stay cached and the transcript does not grow.
+    let answer = match &answer {
+        Ok(raw) => match ratatoskr_graph::validate_raw(raw, &schema_value) {
+            Ok(_) => answer,
+            Err(invalid) => {
+                tracing::warn!(node, %invalid, "output failed its schema; asking for a correction");
+                let correction = format!(
+                    "Your answer did not match the schema you were given: {invalid}\n\n\
+                     Here is what you returned:\n{raw}\n\n\
+                     Return the same content corrected to match the schema. Change only what the \
+                     error names — keep every finding, do not shorten anything, and do not go and \
+                     look anything up again. Answer by calling the output tool.",
+                );
+                async { agent.prompt(&correction).await }
+                    .instrument(span)
+                    .await
+                    .map_err(|e| AgentError::Prompt(e.to_string()))
+            }
+        },
+        Err(_) => answer,
+    };
 
     let (usage, calls) = meter.read();
     if let Some(ledger) = &ledger {
@@ -1009,6 +1504,11 @@ where
             // A node that failed still spent what it spent, and why it failed is the most useful
             // thing about its row.
             error: answer.as_ref().err().map(ToString::to_string),
+            tools: tool_names,
+            tools_used: meter.used(),
+            reuses_session: matches!(route.session, ratatoskr_core::SessionScope::Reuse)
+                && conversation.is_some(),
+            thinking: thinking_left_on(route),
         };
         tracing::info!(
             kind = "usage",
@@ -1016,6 +1516,9 @@ where
             "gen_ai.usage.input_tokens" = telemetry.usage.input_tokens,
             "gen_ai.usage.output_tokens" = telemetry.usage.output_tokens,
             "gen_ai.usage.cached_input_tokens" = telemetry.usage.cached_input_tokens,
+            "gen_ai.usage.cache_creation_input_tokens" =
+                telemetry.usage.cache_creation_input_tokens,
+            "gen_ai.usage.reasoning_tokens" = telemetry.usage.reasoning_tokens,
             duration_ms = telemetry.duration_ms,
             "node usage"
         );
@@ -1044,6 +1547,62 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_edits_arguments_survive_being_bounded() {
+        // The dashboard identifies a call by `file_path`. Truncating the serialized JSON cut
+        // `Edit` mid-`old_string`, leaving text that would not parse — so the feed showed no
+        // argument at all for the one tool whose subject a reader most wants to see.
+        let long = "x".repeat(4000);
+        let raw = format!(
+            r#"{{"file_path":"crates/foo/src/lib.rs","old_string":"{long}","new_string":"{long}"}}"#
+        );
+        let out = super::abridged_args(&raw, 120);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("stays valid JSON, which is the whole point");
+        assert_eq!(parsed["file_path"], "crates/foo/src/lib.rs");
+        assert!(
+            parsed["old_string"].as_str().unwrap().chars().count() <= 121,
+            "the long value is still bounded"
+        );
+        assert!(
+            out.len() < 500,
+            "the log line stays readable: {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn what_a_run_did_is_kept_whole_and_what_it_wrote_is_not() {
+        // The distinction the log has to make: a command or a pattern exists nowhere else, so the
+        // account of what the run did is only as good as what is written here. File contents are
+        // reproducible from the branch the run worked on, so keeping them would duplicate a better
+        // record at the cost of multiplying the log by the size of the files touched.
+        let long = "x".repeat(3000);
+        let raw = format!(
+            r#"{{"command":"cargo test --workspace -- --nocapture {long}",
+                 "file_path":"crates/foo.rs","old_string":"{long}"}}"#
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&super::abridged_args(&raw, 120)).unwrap();
+
+        assert!(
+            parsed["command"].as_str().unwrap().len() > 3000,
+            "the command that ran is kept whole"
+        );
+        assert_eq!(parsed["file_path"], "crates/foo.rs");
+        assert!(
+            parsed["old_string"].as_str().unwrap().chars().count() <= 121,
+            "file contents are abridged: git has them"
+        );
+    }
+
+    #[test]
+    fn arguments_that_are_not_json_are_still_bounded() {
+        let out = super::abridged_args(&"y".repeat(9000), 120);
+        assert!(out.chars().count() <= 201, "{}", out.chars().count());
+    }
+
     use super::*;
 
     /// A result carrying one text block.
@@ -1148,16 +1707,21 @@ mod tests {
             output_tokens: 1,
             cached_input_tokens: 8,
             cache_creation_input_tokens: 2,
+            reasoning_tokens: 700,
         });
         total.add(TokenUsage {
             input_tokens: 5,
             output_tokens: 3,
+            reasoning_tokens: 300,
             ..Default::default()
         });
         assert_eq!(total.input_tokens, 15);
         assert_eq!(total.output_tokens, 4);
         assert_eq!(total.cached_input_tokens, 8);
         assert_eq!(total.cache_creation_input_tokens, 2);
+        // Thinking accumulates like the rest: a turn that thought and called one tool spent most
+        // of what it spent here, and a sum that drops it says the node was nearly free.
+        assert_eq!(total.reasoning_tokens, 1_000);
     }
 
     /// The whole write path against the real provider: declarations reach the model, it calls
@@ -1188,6 +1752,9 @@ mod tests {
             provider: "anthropic".into(),
             model: "claude-haiku-4-5-20251001".into(),
             max_tokens: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
         };
         let answer = run_structured(NodeRun {
             node: "livetest",
@@ -1205,6 +1772,9 @@ mod tests {
             observer: None,
             skills: Vec::new(),
             files: Some(root.clone()),
+            shell: None,
+            push: None,
+            conversation: None,
             ledger: None,
             produces: Some("a summary of the change"),
         })
@@ -1252,6 +1822,9 @@ mod tests {
             provider: "anthropic".into(),
             model: "claude-haiku-4-5-20251001".into(),
             max_tokens: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
         };
         let answer = run_structured(NodeRun {
             node: "usagetest",
@@ -1266,6 +1839,9 @@ mod tests {
             observer: None,
             skills: Vec::new(),
             files: None,
+            shell: None,
+            push: None,
+            conversation: None,
             ledger: Some(Arc::clone(&ledger)),
             produces: None,
         })
@@ -1294,6 +1870,97 @@ mod tests {
         // Input is reported too, and the turn count is separate from the usage.
         assert!(telemetry.usage.input_tokens > 0);
         assert!(telemetry.turns.unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn a_reused_session_is_stable_across_attempts_and_a_fresh_one_is_not() {
+        // What re-driving a node costs when it is wrong: a converge iteration that starts a new
+        // session meets the worktree it just edited for the first time again.
+        let route = |session| ModelRoute {
+            provider: "anthropic".into(),
+            model: "claude-opus-4-8".into(),
+            max_tokens: None,
+            temperature: None,
+            params: None,
+            session,
+        };
+        fn run<'a>(route: &'a ModelRoute, conversation: Option<&'a str>) -> NodeRun<'a> {
+            NodeRun {
+                node: "implementer",
+                route,
+                preamble: "",
+                question: "",
+                tools: ratatoskr_mcp::ToolSet::default(),
+                output_schema: schemars::schema_for!(String),
+                policy: None,
+                max_turns: None,
+                clarifier: None,
+                observer: None,
+                skills: Vec::new(),
+                files: None,
+                shell: None,
+                push: None,
+                conversation,
+                ledger: None,
+                produces: None,
+            }
+        }
+
+        let reuse = route(ratatoskr_core::SessionScope::Reuse);
+        let key = Some("run-7-implementer");
+        assert_eq!(session_id(&run(&reuse, key)), session_id(&run(&reuse, key)));
+
+        // Fresh is the default, and two attempts never share one.
+        let fresh = route(ratatoskr_core::SessionScope::Fresh);
+        assert_ne!(session_id(&run(&fresh, key)), session_id(&run(&fresh, key)));
+
+        // Reuse without a key has nothing to be stable about, so it does not pretend otherwise.
+        assert_ne!(
+            session_id(&run(&reuse, None)),
+            session_id(&run(&reuse, None))
+        );
+    }
+
+    #[test]
+    fn the_endpoint_is_told_who_is_calling_and_which_conversation_this_is() {
+        // What reaches the wire decides how the far side treats us. An endpoint that adapts per
+        // client defaults an unrecognised one to somebody else's adapter, and one that tracks
+        // sessions rebuilds the conversation every turn without an id to match it to.
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("x-meridian-agent".to_string(), "passthrough".to_string());
+        headers.insert("not a header".to_string(), "dropped".to_string());
+        let cfg = ratatoskr_core::EndpointConfig {
+            headers,
+            session_header: Some("x-litellm-session-id".to_string()),
+        };
+
+        let sent = endpoint_headers(Some(&cfg), "session-abc");
+        assert_eq!(sent.get("x-meridian-agent").unwrap(), "passthrough");
+        assert_eq!(sent.get("x-litellm-session-id").unwrap(), "session-abc");
+        // A typo costs its own header and nothing else — not the run.
+        assert_eq!(sent.len(), 2);
+
+        // Unconfigured is the default, and sends nothing of its own.
+        assert!(endpoint_headers(None, "session-abc").is_empty());
+    }
+
+    #[test]
+    fn only_a_call_that_never_landed_is_worth_retrying() {
+        // The one that cost a live run: the request went out, the proxy in front of the API closed
+        // it, and the node failed holding a worktree full of finished edits.
+        assert!(is_transport_error(
+            "CompletionError: HttpError: Http client error: error sending request for url \
+             (http://127.0.0.1:3456/v1/messages)"
+        ));
+        assert!(is_transport_error("connection reset by peer"));
+
+        // And the ones that will answer the same way twice, where a retry spends a node's budget
+        // to arrive back where it started.
+        assert!(!is_transport_error("MaxTurnsError: reached 100 turns"));
+        assert!(!is_transport_error(
+            "ProviderError: invalid_request_error: max_tokens is too large"
+        ));
+        assert!(!is_transport_error("output failed schema validation"));
     }
 
     #[test]

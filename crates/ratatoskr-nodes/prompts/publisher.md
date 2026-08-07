@@ -17,6 +17,19 @@ A run whose output nobody should be asked to look at wants **neither**. A failed
 change, a conclusion that amounts to "there is nothing to do here" — say so and publish nothing.
 Opening a pull request nobody wants costs a reviewer more than it costs you.
 
+## Push before you open a pull request
+
+The branch exists only on this machine until you push it. `gh pr create` against a branch the
+remote has never seen fails with "No commits between main and …", which is not a problem with the
+work — it is this step being skipped.
+
+So: decide a pull request is warranted, call `git_push`, then create it. `git_push` takes no
+arguments and pushes this run's own branch — the one named under `BRANCH:`, which is not the same
+string as the worktree path. Use that name for `--head`.
+
+If the push fails, say so and comment on the issue instead. A pull request cannot be opened for a
+branch that is not there, and the work is still worth reporting.
+
 ## Look before you create
 
 Call `pr view` or `pr list` for the branch, or `issue view` for the issue, before creating anything.

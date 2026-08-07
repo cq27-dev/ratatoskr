@@ -29,6 +29,10 @@ pub struct ProjectSpec {
 pub struct Project {
     pub slug: String,
     pub dir: PathBuf,
+    /// Where this project's config lives, so per-node routes can be read when a client asks. Read
+    /// per request rather than cached: a dashboard left open across a config edit should show the
+    /// routes a run would use now, not the ones it started with.
+    pub config_path: PathBuf,
     pub store: Store,
     pub log_dir: PathBuf,
     pub launcher: Arc<Launcher>,
@@ -135,6 +139,7 @@ pub fn open_all(
             Project {
                 slug,
                 log_dir: spec.dir.join(".ratatoskr/logs"),
+                config_path: spec.config_path.clone(),
                 dir: spec.dir,
                 store: Store::open(&spec.store_path)?,
                 launcher,

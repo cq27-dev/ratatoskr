@@ -45,8 +45,8 @@ to the built-in workflow and converges on its test result alone.
 3. **analyst** determines the blast radius, the requirements the change must satisfy, and the
    acceptance steps that prove it done.
 4. **red-team ∥ implementer** run concurrently: red-team characterises the *baseline* acceptance run
-   in a sandbox, while the implementer drives a coding CLI (Claude Code over ACP) in a fresh git
-   worktree.
+   in a sandbox, while the implementer edits a fresh git worktree — reading, writing and running its
+   checks with this pipeline's own tools.
 5. **converge** re-runs the implementer until the change introduces no new failures. An iteration
    that edited the tests or their runner is refused outright — a gate that can be satisfied by
    editing itself is not one.
@@ -119,6 +119,12 @@ cargo run -p ratatoskr-cli -- run "Fix the flaky retry in the store"
 
 `ratatoskr.toml` is gitignored; `ratatoskr.toml.example` is the committed template.
 
+If the models are reached through something local rather than the provider directly, see
+`[endpoint]` in that template. A gateway that adapts requests per client has to be told which
+client this is — an unrecognised one gets whatever default its author chose for somebody else, and
+for a tool-calling run that usually means the conversation is rebuilt on every turn rather than
+read back from cache.
+
 ## Commands
 
 | Command | What it does |
@@ -190,9 +196,9 @@ that declares a `model` needs no `[models.<node>]` entry at all, and that TOML e
 fallback:
 
 ```ts
-defineAgent("scout", {
+defineAgent("context", {
   model: { provider: "moonshot", model: "kimi-k2.5" },
-  systemPrompt: "You are the scout...",     // replaces the node's built-in preamble
+  systemPrompt: "You gather what the repo knows...",  // replaces the node's built-in preamble
   tools: { allow: ["semantic_search"] },    // REPLACES the default tool set; `deny` also supported
   maxTurns: 40,
   onToolCall({ tool }) {                    // per-call gate, consulted for every tool call
@@ -201,7 +207,8 @@ defineAgent("scout", {
 });
 ```
 
-Rulesets apply to `scout`, `analyst`, `bookkeeper`, and `redteam` — the nodes that are LLM agents.
+Rulesets apply to every node that is an LLM agent — `context`, `analyst`, `redteam`, `implementer`,
+`verifier`, `bookkeeper`, `overseer`, `publisher`, `characterizer`.
 TypeScript is transpiled and evaluated in-process; the types are for editor ergonomics and are
 stripped at load.
 
@@ -248,7 +255,7 @@ defineDefaults({ plugins: ["rag-rat"] });
 defineAgent("analyst", { plugins: { add: ["impact-lens"], remove: ["noisy"] } });
 
 // or start from nothing, said out loud
-defineAgent("scout", { plugins: { inherit: false, add: ["scout-only"] } });
+defineAgent("context", { plugins: { inherit: false, add: ["context-only"] } });
 
 // or name the set exactly
 defineAgent("bookkeeper", { plugins: ["rag-rat"] });
@@ -280,10 +287,18 @@ Planning nodes carry three built-in tools — **`Read`, `Grep` and `Glob`** — 
 with those argument shapes, because that is what a plugin matches on and inspects. They are
 offered before a ruleset narrows, so `tools.deny` removes them like anything else.
 
-Read-only, deliberately. `Write`, `Edit` and `Bash` belong to the implementer, which delegates them
-to a coding CLI inside a sandboxed worktree; a planning node that could edit the checkout it is
-reasoning about would undo that separation for nothing. Paths outside the repository are refused,
-and a search skips `.git`, `target`, `node_modules`, `.venv`, `dist` and dot-directories.
+Read-only, deliberately. **`Write`, `Edit` and `Bash`** are the implementer's, and only its: a
+planning node that could edit the checkout it is reasoning about would undo that separation for
+nothing. Its file tools are rooted at its own worktree rather than the checkout, and every `Bash`
+command runs in the same sandbox its acceptance checks run in — no network, and nothing outside the
+worktree is writable. Paths outside the root are refused, `Read` clips long lines and refuses
+binaries, and a search skips `.git`, `target`, `node_modules`, `.venv`, `dist` and dot-directories.
+
+The implementer is driven here, with these tools, rather than by handing the task to a coding CLI.
+A CLI is built around a human who is watching: it decides for itself what it may run, asks when it
+is unsure, and reports progress to a terminal. A run has nobody to answer, so a question is a
+stopped node. Driving the model directly is also what puts every command inside the run's own
+sandbox and every model turn on its ledger.
 
 A plugin's hooks fire at the points a run actually has:
 
@@ -337,9 +352,9 @@ tool_time_budget_secs = 0  # total seconds per run in tool-call hooks; 0 means n
 Hooks around tool calls fire on *every* call a node makes, so it is the only bound on what plugins
 cost a run as a whole — set it if you want one.
 
-Note that existing plugins match a coding CLI's tool vocabulary (`^(Grep|Read|Bash|Write|Edit)$`)
-and a planning node calls none of those — this is for hooks written against the tools nodes
-actually call, like `semantic_search` and `impact_surface`.
+Note that a plugin matching a coding CLI's tool vocabulary (`^(Grep|Read|Bash|Write|Edit)$`) fires
+for the implementer, which calls exactly those, but not for a planning node — those call
+`semantic_search` and `impact_surface` instead, and hooks meant for them must say so.
 
 A plugin's **skills** are offered to the nodes that bind it. Each is a `skills/<name>/SKILL.md` (or
 a bare `SKILL.md` for a plugin that is one skill) whose frontmatter says when it applies:
@@ -371,8 +386,13 @@ express its own ordering, fan-out, and gating over the same nodes. See
 [`examples/workflow.ts`](examples/workflow.ts). Every safety gate stays enforced in Rust on the
 bindings rather than delegated to the script.
 
-`.ratatoskr/` otherwise holds runtime state — logs, the store, worktrees — and is gitignored, except
-for `rules/` and `workflow.ts`, which are version-controlled.
+`.ratatoskr/` otherwise holds runtime state — logs and the store — and is gitignored, except for
+`rules/` and `workflow.ts`, which are version-controlled.
+
+Per-run worktrees live outside the checkout (`[worktree] root`). Build tools find their project root
+by walking up, so a worktree nested inside the repository resolves to the outer project rather than
+to itself — cargo, for one, then builds into the outer `target/`, which the sandbox mounts
+read-only. Ratatoskr warns when it is pointed at a nested root.
 
 ## Workspace
 
@@ -384,7 +404,7 @@ for `rules/` and `workflow.ts`, which are version-controlled.
 | `ratatoskr-agent` | Builds a `rig` agent bound to a model + rag-rat's tools; the per-call ruleset gate. |
 | `ratatoskr-script` | TypeScript rulesets and `workflow.ts`: transpile (swc) + evaluate (rquickjs). |
 | `ratatoskr-nodes` | The nodes, plus the `run_plan` / `run_full` executors and the converge loop. |
-| `ratatoskr-exec` | Git worktrees, sandboxed execution, and the ACP client that drives a coding CLI. |
+| `ratatoskr-exec` | Git worktrees and sandboxed command execution. |
 | `ratatoskr-store` | SQLite checkpoint store, single-writer by construction. |
 | `ratatoskr-serve` | Read-only HTTP API over the store, the run launcher, and the dashboard UI. |
 | `ratatoskr-cli` | The `ratatoskr` binary. |

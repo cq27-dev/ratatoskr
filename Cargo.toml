@@ -13,6 +13,10 @@ repository = "https://github.com/cq27-dev/ratatoskr"
 warnings = "deny"
 
 [workspace.dependencies]
+# The run-bundle format: a run exported for someone else to analyse. BSON rather than JSON because
+# a bundle is machine-to-machine, carries binary-ish payloads, and is read back in full.
+bson = { version = "3", features = ["serde"] }
+
 # Internal crates
 ratatoskr-core = { path = "crates/ratatoskr-core" }
 ratatoskr-agent = { path = "crates/ratatoskr-agent" }
@@ -69,8 +73,9 @@ tokio-stream = "0.1"
 # Already in the tree via rig; a direct dep so a run can reach the dashboard to ask a human.
 # No TLS features: the only thing a run talks to here is a loopback dashboard over plain HTTP.
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
+# Header types for the model endpoint. Already in the tree via rig, which takes an `http::HeaderMap`.
+http = "1"
 # `fs` only: ServeDir/ServeFile for the built dashboard assets.
 tower-http = { version = "0.7", features = ["fs"] }
 # Phase 3 execution: MicroVM sandbox + ACP client for driving a coding CLI.
 microsandbox = "0.6.8"
-agent-client-protocol = "2.0.0"

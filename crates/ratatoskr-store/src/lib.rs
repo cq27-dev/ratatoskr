@@ -20,6 +20,12 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// nullable and have no default beyond `NULL`: SQLite rewrites nothing on `ADD COLUMN`, so this
 /// stays an O(1) metadata change no matter how many runs are already recorded.
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    // Where an imported run came from. Null for one this machine produced, which is what makes
+    // "only mine" answerable after somebody else's runs have been imported alongside.
+    ("runs", "origin", "TEXT"),
+    // The graph the run executed, so it can be drawn afterwards by something whose own pipeline
+    // has changed — or that never had this one.
+    ("runs", "shape_json", "TEXT"),
     ("runs", "config_json", "TEXT"),
     ("runs", "graph_hash", "TEXT"),
     ("runs", "repo_sha", "TEXT"),
@@ -32,6 +38,11 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("checkpoints", "output_tokens", "INTEGER"),
     ("checkpoints", "cached_input_tokens", "INTEGER"),
     ("checkpoints", "cache_creation_input_tokens", "INTEGER"),
+    ("checkpoints", "reasoning_tokens", "INTEGER"),
+    ("checkpoints", "tools_json", "TEXT"),
+    ("checkpoints", "reuses_session", "INTEGER"),
+    ("checkpoints", "thinking", "INTEGER"),
+    ("checkpoints", "tools_used_json", "TEXT"),
     ("checkpoints", "error", "TEXT"),
 ];
 
@@ -44,10 +55,19 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("store task panicked")]
     Join(#[from] tokio::task::JoinError),
+    #[error("run bundle: {0}")]
+    Bundle(String),
+    #[error(
+        "this bundle is format version {found}; this build reads up to {}. Update ratatoskr to read it",
+        crate::bundle::FORMAT_VERSION
+    )]
+    Unsupported { found: u32 },
 }
 
+pub mod bundle;
+
 /// A per-node checkpoint snapshot read back from the `checkpoints` table.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Checkpoint {
     pub node_name: String,
     pub output_json: String,
@@ -76,7 +96,7 @@ pub struct CheckpointWrite<'a> {
 
 /// A row of the `runs` table. `updated_at` moves only on a status transition — it is not a
 /// heartbeat, so it can't be used alone to tell a live run from one that died mid-flight.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Run {
     pub run_id: String,
     pub issue_id: Option<String>,
@@ -89,6 +109,24 @@ pub struct Run {
     pub graph_hash: Option<String>,
     /// The commit the run started from.
     pub repo_sha: Option<String>,
+    /// Where this run came from, when it was not produced here. `None` for a local run.
+    pub origin: Option<String>,
+    /// The graph that ran, serialized. `None` for runs recorded before shapes were stored, which
+    /// fall back to the reader's built-in.
+    pub shape_json: Option<String>,
+    /// What it is for, as recorded by whoever ran it. Empty unless tagged.
+    pub tags: Vec<String>,
+}
+
+/// One event of a run's history: the raw log record, plus what it takes to order and filter them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EventRow {
+    pub seq: i64,
+    pub at: String,
+    pub kind: String,
+    pub node: Option<String>,
+    /// The log record verbatim. Kept whole so reading it back is the same parse as reading the log.
+    pub payload_json: String,
 }
 
 /// A handle to the checkpoint database. Cheap to clone (shares the guarded connection).
@@ -176,7 +214,7 @@ impl Store {
             let conn = conn.lock().expect("store mutex poisoned");
             let run = conn
                 .query_row(
-                    "SELECT run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha FROM runs WHERE run_id = ?1",
+                    "SELECT run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha, origin, shape_json FROM runs WHERE run_id = ?1",
                     params![run_id],
                     row_to_run,
                 )
@@ -192,7 +230,7 @@ impl Store {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().expect("store mutex poisoned");
             let mut stmt = conn.prepare(
-                "SELECT run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha FROM runs
+                "SELECT run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha, origin, shape_json FROM runs
                  ORDER BY updated_at DESC, run_id DESC",
             )?;
             let rows = stmt
@@ -212,13 +250,15 @@ impl Store {
         config_json: Option<&str>,
         graph_hash: Option<&str>,
         repo_sha: Option<&str>,
+        shape_json: Option<&str>,
     ) -> Result<(), StoreError> {
         let conn = Arc::clone(&self.conn);
-        let (run_id, config_json, graph_hash, repo_sha) = (
+        let (run_id, config_json, graph_hash, repo_sha, shape_json) = (
             run_id.to_string(),
             config_json.map(str::to_string),
             graph_hash.map(str::to_string),
             repo_sha.map(str::to_string),
+            shape_json.map(str::to_string),
         );
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().expect("store mutex poisoned");
@@ -228,9 +268,10 @@ impl Store {
                 "UPDATE runs SET
                      config_json = COALESCE(config_json, ?2),
                      graph_hash  = COALESCE(graph_hash, ?3),
-                     repo_sha    = COALESCE(repo_sha, ?4)
+                     repo_sha    = COALESCE(repo_sha, ?4),
+                     shape_json  = COALESCE(shape_json, ?5)
                  WHERE run_id = ?1",
-                params![run_id, config_json, graph_hash, repo_sha],
+                params![run_id, config_json, graph_hash, repo_sha, shape_json],
             )?;
             Ok::<_, StoreError>(())
         })
@@ -262,8 +303,11 @@ impl Store {
                 "INSERT INTO checkpoints (
                      run_id, node_name, output_json, input_json, iteration,
                      model, duration_ms, turns, error,
-                     input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     input_tokens, output_tokens, cached_input_tokens,
+                     cache_creation_input_tokens, reasoning_tokens, tools_json, reuses_session,
+                     thinking, tools_used_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                           ?17, ?18)",
                 params![
                     run_id,
                     node_name,
@@ -278,6 +322,11 @@ impl Store {
                     usage.output_tokens,
                     usage.cached_input_tokens,
                     usage.cache_creation_input_tokens,
+                    usage.reasoning_tokens,
+                    serde_json::to_string(&telemetry.tools).unwrap_or_default(),
+                    telemetry.reuses_session,
+                    telemetry.thinking,
+                    serde_json::to_string(&telemetry.tools_used).unwrap_or_default(),
                 ],
             )?;
             Ok::<_, StoreError>(())
@@ -296,7 +345,8 @@ impl Store {
                 "SELECT node_name, output_json, created_at, input_json, iteration,
                         model, duration_ms, turns, error,
                         input_tokens, output_tokens, cached_input_tokens,
-                        cache_creation_input_tokens
+                        cache_creation_input_tokens, reasoning_tokens, tools_json, reuses_session,
+                        thinking, tools_used_json
                  FROM checkpoints WHERE run_id = ?1 ORDER BY id ASC",
             )?;
             let rows = stmt
@@ -312,6 +362,18 @@ impl Store {
                             duration_ms: row.get(6)?,
                             turns: row.get(7)?,
                             error: row.get(8)?,
+                            // A pre-migration row has NULL for both: an empty tool list and a
+                            // fresh session are the honest reading of "not recorded".
+                            tools: row
+                                .get::<_, Option<String>>(14)?
+                                .and_then(|j| serde_json::from_str(&j).ok())
+                                .unwrap_or_default(),
+                            reuses_session: row.get::<_, Option<bool>>(15)?.unwrap_or(false),
+                            thinking: row.get::<_, Option<bool>>(16)?.unwrap_or(false),
+                            tools_used: row
+                                .get::<_, Option<String>>(17)?
+                                .and_then(|j| serde_json::from_str(&j).ok())
+                                .unwrap_or_default(),
                             usage: ratatoskr_core::TokenUsage {
                                 // A pre-migration row has NULL here, which is "unknown", not zero.
                                 // Reading it as 0 is the honest projection for a sum; the `model`
@@ -322,12 +384,216 @@ impl Store {
                                 cache_creation_input_tokens: row
                                     .get::<_, Option<u64>>(12)?
                                     .unwrap_or(0),
+                                reasoning_tokens: row.get::<_, Option<u64>>(13)?.unwrap_or(0),
                             },
                         },
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok::<_, StoreError>(rows)
+        })
+        .await?
+    }
+
+    /// Store a run's event history. Returns how many rows were new.
+    ///
+    /// Idempotent: `(run_id, seq)` is the key, so re-ingesting a log that was already read adds
+    /// nothing. That matters because the obvious way to use this is to run it again whenever you
+    /// are unsure whether it ran.
+    pub async fn ingest_events(
+        &self,
+        run_id: &str,
+        events: Vec<EventRow>,
+    ) -> Result<usize, StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().expect("store mutex poisoned");
+            let tx = conn.transaction()?;
+            let mut added = 0;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT OR IGNORE INTO events (run_id, seq, at, kind, node, payload_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                for e in &events {
+                    added +=
+                        stmt.execute(params![run_id, e.seq, e.at, e.kind, e.node, e.payload_json])?;
+                }
+            }
+            tx.commit()?;
+            Ok::<_, StoreError>(added)
+        })
+        .await?
+    }
+
+    /// A run's stored history, in order. Empty for a run never ingested.
+    pub async fn events_for_run(&self, run_id: &str) -> Result<Vec<EventRow>, StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT seq, at, kind, node, payload_json FROM events
+                 WHERE run_id = ?1 ORDER BY seq",
+            )?;
+            let rows = stmt
+                .query_map(params![run_id], |row| {
+                    Ok(EventRow {
+                        seq: row.get(0)?,
+                        at: row.get(1)?,
+                        kind: row.get(2)?,
+                        node: row.get(3)?,
+                        payload_json: row.get(4)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, StoreError>(rows)
+        })
+        .await?
+    }
+
+    /// Add tags to a run. Re-tagging with one it already has is a no-op.
+    pub async fn tag_run(&self, run_id: &str, tags: Vec<String>) -> Result<(), StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            for tag in tags {
+                conn.execute(
+                    "INSERT OR IGNORE INTO run_tags (run_id, tag) VALUES (?1, ?2)",
+                    params![run_id, tag.trim()],
+                )?;
+            }
+            Ok::<_, StoreError>(())
+        })
+        .await?
+    }
+
+    /// Remove tags from a run. Removing one it does not have is a no-op.
+    pub async fn untag_run(&self, run_id: &str, tags: Vec<String>) -> Result<(), StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            for tag in tags {
+                conn.execute(
+                    "DELETE FROM run_tags WHERE run_id = ?1 AND tag = ?2",
+                    params![run_id, tag.trim()],
+                )?;
+            }
+            Ok::<_, StoreError>(())
+        })
+        .await?
+    }
+
+    /// Fill in each run's tags. Separate from listing because most readers do not need them.
+    pub async fn attach_tags(&self, runs: &mut [Run]) -> Result<(), StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let ids: Vec<String> = runs.iter().map(|r| r.run_id.clone()).collect();
+        let found = tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let mut stmt =
+                conn.prepare("SELECT tag FROM run_tags WHERE run_id = ?1 ORDER BY tag")?;
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                let tags = stmt
+                    .query_map(params![id], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                out.push(tags);
+            }
+            Ok::<_, StoreError>(out)
+        })
+        .await??;
+        for (run, tags) in runs.iter_mut().zip(found) {
+            run.tags = tags;
+        }
+        Ok(())
+    }
+
+    /// Delete a run and everything recorded about it.
+    ///
+    /// In one transaction and children first, because `checkpoints.run_id` is a real foreign key
+    /// and this database enforces them — deleting the run row first fails rather than orphaning.
+    pub async fn delete_run(&self, run_id: &str) -> Result<bool, StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().expect("store mutex poisoned");
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM events WHERE run_id = ?1", params![run_id])?;
+            tx.execute("DELETE FROM run_tags WHERE run_id = ?1", params![run_id])?;
+            tx.execute("DELETE FROM checkpoints WHERE run_id = ?1", params![run_id])?;
+            let gone = tx.execute("DELETE FROM runs WHERE run_id = ?1", params![run_id])?;
+            tx.commit()?;
+            Ok::<_, StoreError>(gone > 0)
+        })
+        .await?
+    }
+
+    /// Insert an imported run whole, preserving what it recorded rather than restating it.
+    ///
+    /// `upsert_run` writes the fields a live run knows and stamps `updated_at` as now; an import
+    /// has to keep the run's own timestamps and provenance, or every imported run would claim to
+    /// have finished at the moment it was imported.
+    async fn insert_imported_run(&self, run: &Run, origin: &str) -> Result<(), StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let run = run.clone();
+        let origin = origin.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            conn.execute(
+                "INSERT INTO runs
+                   (run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha, origin, shape_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    run.run_id,
+                    run.issue_id,
+                    run.status,
+                    run.updated_at,
+                    run.config_json,
+                    run.graph_hash,
+                    run.repo_sha,
+                    // The bundle's own origin wins when it has one: a run that has already been
+                    // passed along keeps saying where it started, not who forwarded it.
+                    run.origin.clone().unwrap_or(origin),
+                    run.shape_json,
+                ],
+            )?;
+            Ok::<_, StoreError>(())
+        })
+        .await?
+    }
+
+    /// The current time, as this database writes timestamps.
+    ///
+    /// Taken from SQLite rather than the process clock so an exported bundle's `exported_at` is
+    /// the same kind of string, and in the same zone, as every timestamp beside it.
+    pub async fn now(&self) -> Result<String, StoreError> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let now =
+                conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            Ok::<_, StoreError>(now)
+        })
+        .await?
+    }
+
+    /// Record where a run came from. Set on import; never set for a run produced here.
+    pub async fn set_origin(&self, run_id: &str, origin: &str) -> Result<(), StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
+        let origin = origin.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            conn.execute(
+                "UPDATE runs SET origin = ?2 WHERE run_id = ?1",
+                params![run_id, origin],
+            )?;
+            Ok::<_, StoreError>(())
         })
         .await?
     }
@@ -343,6 +609,11 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         config_json: row.get(4)?,
         graph_hash: row.get(5)?,
         repo_sha: row.get(6)?,
+        origin: row.get(7)?,
+        shape_json: row.get(8)?,
+        // Filled by the caller when it wants them: a join on every listing would cost every reader
+        // for a column most of them do not look at.
+        tags: Vec::new(),
     })
 }
 
@@ -370,6 +641,97 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_runs_history_survives_being_ingested_twice() {
+        // Ingest is the obvious thing to re-run when unsure whether it ran, so running it again
+        // must cost nothing rather than double a run's history.
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("r1", None, "running").await.unwrap();
+        let events = vec![
+            EventRow {
+                seq: 0,
+                at: "2026-08-07T10:00:00Z".into(),
+                kind: "node_start".into(),
+                node: Some("context".into()),
+                payload_json: r#"{"kind":"node_start"}"#.into(),
+            },
+            EventRow {
+                seq: 1,
+                at: "2026-08-07T10:00:01Z".into(),
+                kind: "tool_call".into(),
+                node: Some("context".into()),
+                payload_json: r#"{"kind":"tool_call"}"#.into(),
+            },
+        ];
+        assert_eq!(store.ingest_events("r1", events.clone()).await.unwrap(), 2);
+        assert_eq!(store.ingest_events("r1", events).await.unwrap(), 0);
+        let back = store.events_for_run("r1").await.unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].kind, "node_start");
+        assert_eq!(back[1].seq, 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_run_takes_everything_recorded_about_it() {
+        // `checkpoints.run_id` is an enforced foreign key, so anything left behind would either
+        // block the delete or outlive the run it describes.
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("r1", None, "converged").await.unwrap();
+        store
+            .insert_checkpoint(CheckpointWrite {
+                run_id: "r1",
+                node_name: "analyst",
+                output_json: "{}",
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .ingest_events(
+                "r1",
+                vec![EventRow {
+                    seq: 0,
+                    at: "t".into(),
+                    kind: "checkpoint".into(),
+                    node: Some("analyst".into()),
+                    payload_json: "{}".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        store.tag_run("r1", vec!["baseline".into()]).await.unwrap();
+
+        assert!(store.delete_run("r1").await.unwrap());
+        assert!(store.run("r1").await.unwrap().is_none());
+        assert!(store.events_for_run("r1").await.unwrap().is_empty());
+        assert!(store.checkpoints_for_run("r1").await.unwrap().is_empty());
+        // Deleting one that is already gone is not an error, so a prune can be re-run.
+        assert!(!store.delete_run("r1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn tags_are_a_set_and_travel_with_the_run() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("r1", None, "converged").await.unwrap();
+        store
+            .tag_run(
+                "r1",
+                vec!["arm-a".into(), "baseline".into(), "arm-a".into()],
+            )
+            .await
+            .unwrap();
+        store.tag_run("r1", vec!["arm-a".into()]).await.unwrap();
+
+        let mut runs = store.list_runs().await.unwrap();
+        store.attach_tags(&mut runs).await.unwrap();
+        assert_eq!(runs[0].tags, ["arm-a", "baseline"]);
+
+        store.untag_run("r1", vec!["arm-a".into()]).await.unwrap();
+        let mut runs = store.list_runs().await.unwrap();
+        store.attach_tags(&mut runs).await.unwrap();
+        assert_eq!(runs[0].tags, ["baseline"]);
+    }
 
     #[tokio::test]
     async fn write_a_run_and_read_it_back() {
@@ -511,7 +873,12 @@ mod tests {
                         output_tokens: 250,
                         cached_input_tokens: 800,
                         cache_creation_input_tokens: 200,
+                        reasoning_tokens: 4_000,
                     },
+                    tools: vec!["Read".to_string(), "semantic_search".to_string()],
+                    tools_used: vec!["Read".to_string()],
+                    reuses_session: true,
+                    thinking: true,
                 },
             })
             .await
@@ -529,6 +896,16 @@ mod tests {
         assert_eq!(cp.telemetry.usage.input_tokens, 1000);
         assert_eq!(cp.telemetry.usage.cached_input_tokens, 800);
         assert_eq!(cp.telemetry.usage.cache_creation_input_tokens, 200);
+        // Billed as output and reported apart from it: a node that thinks before every tool call
+        // reads as nearly free when this is dropped, and it is most of what the node spent.
+        assert_eq!(cp.telemetry.usage.reasoning_tokens, 4_000);
+        // What the node could reach, and whether its memory carried over — neither is
+        // reconstructable later from a config that has since changed.
+        assert_eq!(cp.telemetry.tools, ["Read", "semantic_search"]);
+        // Given two, reached for one — the gap is the point.
+        assert_eq!(cp.telemetry.tools_used, ["Read"]);
+        assert!(cp.telemetry.reuses_session);
+        assert!(cp.telemetry.thinking);
     }
 
     #[tokio::test]
@@ -568,7 +945,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_run("run-1", None, "running").await.unwrap();
         store
-            .record_run_provenance("run-1", Some("{}"), Some("deadbeef"), Some("abc123"))
+            .record_run_provenance("run-1", Some("{}"), Some("deadbeef"), Some("abc123"), None)
             .await
             .unwrap();
 
@@ -576,7 +953,7 @@ mod tests {
         store.upsert_run("run-1", None, "converged").await.unwrap();
         // And a later provenance write that knows less must not erase what the first one knew.
         store
-            .record_run_provenance("run-1", None, None, None)
+            .record_run_provenance("run-1", None, None, None, None)
             .await
             .unwrap();
 

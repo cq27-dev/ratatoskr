@@ -6,7 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agent-client-protocol.workspace = true
 # Optional: pulls in a build script that downloads `agentd` from GitHub, which fails in the
 # no-network test sandbox. Off by default so the landlock backend builds offline; opt in with
 # `--features microsandbox` when you actually want the MicroVM backend.
@@ -21,7 +20,7 @@ tracing.workspace = true
 microsandbox = ["dep:microsandbox"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

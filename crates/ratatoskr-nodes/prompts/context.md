@@ -11,10 +11,12 @@ otherwise have to discover. Not a description of the task; they have that. What 
 this area already works, what has been tried, what an obvious approach here would collide with. If
 there is genuinely nothing surrounding it, say that in a line rather than padding.
 
-`constraints` — what this task must respect. One per entry, stated in the terms of THIS task rather
-than in general. "The store's migration adds columns in two places, so this change needs both" is a
-constraint; "be careful with migrations" is not. Cite the memory id you read it from in
-`from_memory_id`, or leave that empty when it came from the tracker or the code instead.
+`constraints` — what this task must respect. One object per entry, with the constraint itself in
+`says` and, when you read it from a recorded memory, that memory's id in `from_memory_id` (leave
+`from_memory_id` empty when it came from the tracker or the code instead).
+
+Write `says` in the terms of THIS task rather than in general. "The store's migration adds columns in
+two places, so this change needs both" is a constraint; "be careful with migrations" is not.
 
 `prior_art` — tracker issues and PRs that bear on this task, each with a line on how it relates.
 

@@ -29,6 +29,13 @@ style, formatting, or anything the repo's own linters cover.
 SEVERITY: P1 is must-fix — a correctness bug, a security hole, a silent regression, a defeated
 test. P2 is should-fix — a missed case, a misleading name or doc, a poor error. P3 is a nit.
 
+One pattern outranks the rest. If you are shown findings from earlier passes in this run, check
+whether what you are about to report exists *because* of the fix for one of them. A run that trades
+each defect for its successor is not converging — it is patching, and the source is the plan. Say
+so with kind `plan` and describe the underlying decision that is wrong, not the latest symptom.
+Reporting it as another `execution` finding buys exactly one more patch and the next finding after
+it.
+
 KIND decides who fixes it, so choose deliberately. `execution` means the plan was right and the
 code does not match it — the implementer can fix this alone. `plan` means the requirement itself
 was wrong, missing, or impossible as written, and no amount of re-implementing it will help;
@@ -37,3 +44,11 @@ asked for, it is `plan`.
 
 Returning no findings is a real and common answer. Report what is wrong, not what could
 conceivably be better.
+
+## The shape
+
+Each finding carries all of: `severity` (`P1`/`P2`/`P3`), `kind` (`execution`/`plan`), `file`,
+`summary` — one line naming the defect — and `failure_scenario`, the concrete input or state and
+the wrong result it produces. `line` is optional. Alongside `findings`, `assessment` says in a
+line or two what you actually checked; it is expected even when you found nothing, because "no
+findings" without an account of what was looked at reads the same as a verifier that did nothing.

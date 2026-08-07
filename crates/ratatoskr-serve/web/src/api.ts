@@ -24,6 +24,36 @@ export interface NodeView {
   state: NodeState;
   /** Only the implementer (per converge iteration) and bookkeeper (replay) exceed one. */
   checkpoints: number;
+  /** Position in the pipeline: stage is the column, lane the row within it. */
+  stage: number;
+  lane: number;
+  /** Absent for a node that has not run, or that ran no model. */
+  telemetry?: NodeTelemetry;
+  /** What the node *would* run on, from config. Present before it has run. */
+  planned?: PlannedNode;
+}
+
+/** Mirrors `pipeline::NodeTelemetryView`. */
+export interface NodeTelemetry {
+  model: string | null;
+  /** Model calls in the node's latest attempt. */
+  turns: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens: number;
+  /** Written to cache rather than read from it. Billed at a premium, and what separates a run that
+   *  reused its context from one that rebuilt it. */
+  cache_creation_input_tokens: number;
+  /** Non-zero when the model reasoned before answering. Zero from endpoints that never report it. */
+  reasoning_tokens: number;
+  /** Whether the node was left free to reason. Configured, not observed. */
+  thinking: boolean;
+  duration_ms: number | null;
+  tools: string[];
+  /** Of those, the ones it actually called. */
+  tools_used: string[];
+  /** The node's memory carried over from an earlier attempt in this run. */
+  reuses_session: boolean;
   first_at: string | null;
   last_at: string | null;
 }
@@ -126,6 +156,30 @@ export interface LiveEvent {
   detail: string;
   /** Present on a `question` event: what an answer is posted against. */
   question_id?: string;
+  /** The one argument that identifies a tool call: the path read, the pattern searched. */
+  arg?: string;
+  /** How long a tool took, on its `tool_result`. */
+  duration_ms?: number;
+  /** Present on `node_start` and `checkpoint`: what the node ran on. */
+  facts?: NodeFacts;
+  /** Present on `usage` and `checkpoint`: what the attempt cost. */
+  usage?: EventUsage;
+  /** Model calls the attempt took, on a `checkpoint`. */
+  turns?: number;
+  /** Why the node failed, on a `checkpoint`. Its presence is what makes a node read as failed. */
+  error?: string;
+  /** Which attempt this was, on a `checkpoint`. */
+  iteration?: number;
+}
+
+/** What one attempt cost, off the event stream. */
+export interface EventUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens: number;
+  cache_creation_input_tokens: number;
+  reasoning_tokens: number;
+  duration_ms: number;
 }
 
 /**
@@ -160,6 +214,10 @@ export async function answerQuestion(
  * The server replays recent history on connect and then streams, so a dashboard opened mid-run
  * shows what already happened instead of an empty pane.
  */
+/** Every event a run produced, oldest first — the record a historical view is rebuilt from. */
+export const getHistory = (project: string, runId: string) =>
+  getJSON<LiveEvent[]>(`${scope(project)}/runs/${encodeURIComponent(runId)}/history`);
+
 export function followRun(
   project: string,
   runId: string,
@@ -189,3 +247,18 @@ export const getNodeCheckpoints = (
   getJSON<CheckpointView[]>(
     `${scope(project)}/runs/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(node)}`,
   );
+
+/** Mirrors `pipeline::PlannedNode` — a node's configured route, known before it runs. */
+export interface PlannedNode {
+  model: string;
+  thinking: boolean;
+  reuses_session: boolean;
+}
+
+/** Mirrors `events::LiveNodeFacts` — what a node announced when it started. */
+export interface NodeFacts {
+  model: string;
+  tools: string[];
+  thinking: boolean;
+  reuses_session: boolean;
+}

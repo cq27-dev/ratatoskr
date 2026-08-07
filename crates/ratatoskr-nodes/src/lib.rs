@@ -268,6 +268,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         &plugins_analyst,
     )?;
     let analyst = AnalystNode {
+        conversation: Some(format!("{run_id}-analyst")),
         route: analyst_cfg.route,
         tools: analyst_cfg.tools,
         policy: analyst_cfg.policy,
@@ -354,11 +355,21 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
                 reported = telemetry.usage.output_tokens,
                 floor,
                 bytes = json.len(),
-                "the provider reported fewer output tokens than this node's output could contain; \
-                 the usage figures for this run are not trustworthy"
+                "fewer output tokens reported than this node's output could contain. The count \
+                 comes back short from the endpoint, not from anything this side computes: a \
+                 direct, non-streamed request returns `output_tokens: 4` for a response carrying \
+                 a whole reasoning block and a tool call. Input, cache and reasoning figures are \
+                 unaffected, so cost per turn is still readable from those. Run with \
+                 `RUST_LOG=ratatoskr_agent=debug` for per-turn usage, and treat this warning on a \
+                 tool-calling node as expected until the endpoint reports the real count"
             );
         }
     }
+    // The event carries the same measurements as the row, because a viewer reconstructing where a
+    // run WAS reads the log, not the store: the store holds only the latest state of each node, so
+    // deriving a past moment from it shows final numbers against a historical position. Everything
+    // the row records, the event has to be able to prove.
+    let logged = telemetry.clone();
     r.store
         .insert_checkpoint(ratatoskr_store::CheckpointWrite {
             run_id: r.run_id,
@@ -375,6 +386,20 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
         kind = "checkpoint",
         node = r.node,
         bytes = json.len(),
+        iteration = r.iteration,
+        model = logged.model.as_deref().unwrap_or_default(),
+        tools = logged.tools.join(","),
+        tools_used = logged.tools_used.join(","),
+        thinking = logged.thinking,
+        reuses_session = logged.reuses_session,
+        turns = logged.turns.unwrap_or_default(),
+        error = logged.error.as_deref().unwrap_or_default(),
+        duration_ms = logged.duration_ms.unwrap_or_default(),
+        "gen_ai.usage.input_tokens" = logged.usage.input_tokens,
+        "gen_ai.usage.output_tokens" = logged.usage.output_tokens,
+        "gen_ai.usage.cached_input_tokens" = logged.usage.cached_input_tokens,
+        "gen_ai.usage.cache_creation_input_tokens" = logged.usage.cache_creation_input_tokens,
+        "gen_ai.usage.reasoning_tokens" = logged.usage.reasoning_tokens,
         "checkpoint"
     );
     Ok(())
@@ -398,6 +423,11 @@ async fn record_provenance(store: &Store, run_id: &str, config: &RatatoskrConfig
             config_json.as_deref(),
             Some(&graph_fingerprint(&repo)),
             repo_sha.as_deref(),
+            // The graph itself, not just a hash of it. A hash says two runs differed; the shape is
+            // what lets a run be drawn by something that never had this pipeline.
+            serde_json::to_string(&ratatoskr_core::shape::built_in())
+                .ok()
+                .as_deref(),
         )
         .await
     {
@@ -1157,8 +1187,19 @@ fn node_agent_config(
     // and reading a file it found is the ordinary case rather than the dangerous one. These are
     // also the names a plugin's hooks are written against — `Read`, `Grep`, `Glob` — which is what
     // makes an unmodified plugin's `PreToolUse` fire for a planning node at all.
+    // Two different things, and conflating them cost the publisher its `gh`.
+    //
+    // Whether a node is *offered* the file tools follows from whether it declares any reach: an
+    // empty list has to mean none, or "no tools" quietly means "Read, Grep and Glob" and a node
+    // meant to transcribe output it was handed goes reading directories on the host.
+    //
+    // The root is separate, and always set. It is not a capability — it is where a tool resolves
+    // paths, and a node with no file tools can do nothing with one. The publisher declares no
+    // default tools on purpose, so `gh` cannot be handed to anyone by widening a shared constant,
+    // and it is the root that lets `gh` resolve at all. Gating the root on the list left it
+    // holding a stand-in that errors, which it dutifully reported as a reason not to publish.
     let files = std::env::current_dir().ok();
-    if files.is_some() {
+    if !default_tools.is_empty() {
         tools
             .local()
             .tools
@@ -1176,6 +1217,9 @@ fn node_agent_config(
             // A ruleset declares which model, not how much of it. The cap comes from the default,
             // which is always sent — so a ruleset naming a brand-new model still works.
             max_tokens: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
         },
         None => route(config, node)?,
     };
@@ -1425,7 +1469,8 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
     };
 
     // Some tasks call for no code change: research, a review, an architecture answer. Running the
-    // fork for one costs a sandboxed baseline test run and an ACP session to produce an empty diff,
+    // fork for one costs a sandboxed baseline test run and an implementer session to produce an
+    // empty diff,
     // and then reports `Converged` — a success claim about a change that was never made.
     if !fork_is_needed(&plan.analyst, config) {
         return no_code_change(&run, store, run_id, &plan_context, plan).await;
@@ -1577,14 +1622,34 @@ async fn publish_and_checkpoint(
         &plugins,
     )?;
     let mut tools = cfg.tools;
-    // The one tool that writes outside this machine. Added here rather than in the default list so
-    // no other node can be handed it by widening a shared constant.
+    // The tools that write outside this machine. Added here rather than in the default list so no
+    // other node can be handed one by widening a shared constant.
     tools
         .local()
         .tools
         .push(ratatoskr_agent::publish::declaration());
 
+    // Push is offered only when there is a branch to push, and only ever THAT branch: the access
+    // carries it, and the tool takes no arguments. A run with no fork has nothing to publish and
+    // is not given the tool at all.
+    let push = input
+        .implementer
+        .as_ref()
+        .map(|im| im.branch.clone())
+        .filter(|b| ratatoskr_agent::publish::pushable(b))
+        .map(|branch| ratatoskr_agent::publish::PushAccess {
+            repo_root: cfg.files.clone().unwrap_or_else(|| ".".into()),
+            branch,
+        });
+    if push.is_some() {
+        tools
+            .local()
+            .tools
+            .push(ratatoskr_agent::publish::push_declaration());
+    }
+
     let node = PublisherNode {
+        push,
         route: cfg.route,
         tools,
         policy: cfg.policy,
@@ -1764,13 +1829,16 @@ enum Reviewed {
     /// Nothing above the threshold. The change is accepted.
     Clean,
     /// Send this back.
-    Fix(Correction),
+    Fix(Box<Correction>),
     /// The verifier could not be asked. The reason is on its checkpoint.
     Unavailable,
 }
 
 /// What a review concluded the run should do next.
 struct Correction {
+    /// What the review found, carried so the next pass can see what the last one said — and notice
+    /// when a new finding exists only because of the fix for an old one.
+    found: Vec<verifier::Finding>,
     /// What to hand the implementer.
     prompt: String,
     /// The amended plan, when the analyst revised one. Kept so later reviews judge the change
@@ -1797,7 +1865,15 @@ pub(crate) fn build_characterizer(
     {
         return Ok(None);
     }
-    let plugins = context.for_node("characterizer");
+    // No skills either, and this is the seam that enforces it: `node_agent_config` grants the
+    // `Skill` tool whenever a node has skills bound, while the hook that answers it is installed
+    // from what the caller passes to `run_structured`. `Characterizer` passes none — so leaving
+    // skills bound here would offer it a tool whose result nothing can produce, and a node that
+    // reads a tool error as an instruction is a failure this repo has already paid for once.
+    let plugins = NodePlugins {
+        skills: Vec::new(),
+        ..context.for_node("characterizer")
+    };
     // No default tools: it transcribes output it was handed. Reading the repo would invite it to
     // decide whether a failure matters, which is the one thing it must not do.
     let cfg = node_agent_config(
@@ -1814,6 +1890,55 @@ pub(crate) fn build_characterizer(
         max_turns: cfg.max_turns,
         ledger,
     }))
+}
+
+/// The implementer's agent configuration.
+///
+/// Distinct from every other node's in what it may reach: the editing tools and a shell, on top of
+/// the read tools each node gets. Built in one place because those two powers belong together and
+/// to exactly one node — a second construction site is how one of them comes to be granted
+/// somewhere it was not meant to be.
+fn build_implementer_agent(
+    engine: &Arc<ScriptEngine>,
+    config: &RatatoskrConfig,
+    context: &PluginContext,
+    offer: ServerTools,
+) -> Result<(NodeAgentConfig, NodePlugins), PlanError> {
+    let plugins = context.for_node("implementer");
+    let mut tools = context.pool_for("implementer", offer);
+    tools
+        .local()
+        .tools
+        .extend(ratatoskr_agent::files::edit_declarations());
+    tools
+        .local()
+        .tools
+        .push(ratatoskr_agent::shell::declaration());
+    let cfg = node_agent_config(
+        engine,
+        config,
+        tools,
+        "implementer",
+        &implementer_default_tools(),
+        &plugins,
+    )?;
+    Ok((cfg, plugins))
+}
+
+/// The implementer's default `allow`: its rag-rat tools plus the ones that let it work — reading,
+/// editing, and running commands. A ruleset naming its own `allow` replaces this wholesale, and
+/// one that forgets `Write` or `Bash` leaves the node unable to do the job it exists for.
+fn implementer_default_tools() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = implementer::IMPLEMENTER_TOOLS.to_vec();
+    names.extend([
+        ratatoskr_agent::files::READ,
+        ratatoskr_agent::files::GREP,
+        ratatoskr_agent::files::GLOB,
+        ratatoskr_agent::files::WRITE,
+        ratatoskr_agent::files::EDIT,
+        ratatoskr_agent::shell::BASH,
+    ]);
+    names
 }
 
 /// The verifier is opt-in on having somewhere to run, the same way the red-team classifier is.
@@ -1885,6 +2010,7 @@ impl Review {
             verifier,
             threshold: parse_threshold(&config.implementer.verify_threshold),
             analyst: AnalystNode {
+                conversation: Some(format!("{}-analyst", run.run_id)),
                 route: acfg.route,
                 tools: acfg.tools,
                 policy: acfg.policy,
@@ -1909,6 +2035,7 @@ impl Review {
         impl_out: &ImplementerOutput,
         worktree: &WorktreePath,
         iteration: u32,
+        previous_findings: &[verifier::Finding],
     ) -> Result<Reviewed, PlanError> {
         let &Run {
             store,
@@ -1928,6 +2055,7 @@ impl Review {
             analyst: plan.clone(),
             diff,
             touched_files: impl_out.touched_files.clone(),
+            previous_findings: previous_findings.to_vec(),
         };
         let input_json = serde_json::to_string(&serde_json::json!({
             "requirements": plan.requirements,
@@ -1971,6 +2099,7 @@ impl Review {
         if blocking.is_empty() {
             return Ok(Reviewed::Clean);
         }
+        let found: Vec<verifier::Finding> = out.findings.clone();
         // Findings below the threshold were still recorded above; say what was set aside so a
         // reader of the logs does not read "2 findings" as "2 problems being fixed".
         tracing::info!(
@@ -1988,10 +2117,11 @@ impl Review {
             .map(|f| (*f).clone())
             .collect();
         if plan_faults.is_empty() {
-            return Ok(Reviewed::Fix(Correction {
+            return Ok(Reviewed::Fix(Box::new(Correction {
                 prompt: verifier::correction(&blocking),
                 revised: None,
-            }));
+                found,
+            })));
         }
 
         let revision = analyst::AnalystInput {
@@ -2022,10 +2152,73 @@ impl Review {
         })
         .await?;
 
-        Ok(Reviewed::Fix(Correction {
+        Ok(Reviewed::Fix(Box::new(Correction {
             prompt: replan(&revised, &blocking),
             revised: Some(revised),
-        }))
+            found,
+        })))
+    }
+}
+
+impl Review {
+    /// Ask the analyst to look at the plan when the iteration budget is spent.
+    ///
+    /// The evidence for doing this rather than recording another failed attempt: on the run that
+    /// prompted it, three passes found three *different* defects, each one existing because of the
+    /// fix for the one before, with severity climbing P2 → P2 → P1. A fourth attempt at the same
+    /// plan had nothing left to find. What was wrong was a decision made before any of it.
+    ///
+    /// Every finding goes over, not just the plan-tagged ones — the whole point is that the
+    /// verifier called them execution faults one at a time and the pattern only shows in the set.
+    async fn replan_at_ceiling(
+        &self,
+        run: &Run<'_>,
+        plan: &AnalystOutput,
+        findings: &[verifier::Finding],
+        iteration: u32,
+    ) -> Result<Option<(AnalystOutput, String)>, PlanError> {
+        let &Run {
+            store,
+            run_id,
+            issue,
+            ledger,
+            ..
+        } = run;
+        let revision = analyst::AnalystInput {
+            issue: issue.to_string(),
+            scout: self.scout.clone(),
+            memory: self.memory.clone(),
+            brief: self.brief.clone(),
+            constraints: self.constraints.clone(),
+            previous: Some(Box::new(plan.clone())),
+            findings: findings.to_vec(),
+        };
+        let revision_json = serde_json::to_string(&revision)?;
+        let revised = match self
+            .analyst
+            .run(revision, &RunState::new(run_id, None))
+            .await
+        {
+            Ok(revised) => revised,
+            // Best-effort, like every other recovery here: a failed re-plan leaves the run
+            // recording what it already knew rather than losing the work as well.
+            Err(e) => {
+                tracing::warn!("the analyst could not re-plan at the ceiling: {e}");
+                return Ok(None);
+            }
+        };
+        record(Record {
+            store,
+            run_id,
+            node: "analyst",
+            output: &revised,
+            input: Some(revision_json),
+            iteration: Some(iteration),
+            ledger: Some(ledger),
+        })
+        .await?;
+        let borrowed: Vec<&verifier::Finding> = findings.iter().collect();
+        Ok(Some((revised.clone(), replan(&revised, &borrowed))))
     }
 }
 
@@ -2134,12 +2327,51 @@ async fn fork_and_converge(
             }
             false => None,
         },
+        // Writing the change's tests needs the write tools the classifier has no use for, so the
+        // set is built separately even though both hang off the same route.
+        author: match classifier_enabled(engine, config) {
+            true => {
+                let plugins = context.for_node("redteam");
+                let mut tools = context.pool_for("redteam", client.offer());
+                tools
+                    .local()
+                    .tools
+                    .extend(ratatoskr_agent::files::edit_declarations());
+                let mut names: Vec<&str> = redteam::CLASSIFIER_TOOLS.to_vec();
+                names.extend([
+                    ratatoskr_agent::files::READ,
+                    ratatoskr_agent::files::GREP,
+                    ratatoskr_agent::files::GLOB,
+                    ratatoskr_agent::files::WRITE,
+                    ratatoskr_agent::files::EDIT,
+                ]);
+                let cfg = node_agent_config(engine, config, tools, "redteam", &names, &plugins)?;
+                Some(redteam::TestAuthor {
+                    route: cfg.route,
+                    tools: cfg.tools,
+                    policy: cfg.policy,
+                    max_turns: cfg.max_turns,
+                    system_prompt: cfg.system_prompt,
+                    plugins,
+                    ledger: Some(Arc::clone(ledger)),
+                })
+            }
+            false => None,
+        },
     };
+    let (impl_cfg, impl_plugins) =
+        build_implementer_agent(engine, config, context, client.offer())?;
     let implementer = ImplementerNode {
         repo_path: repo_path.clone(),
         worktree_root: config.worktree.root.clone(),
         sandbox: config.sandbox.clone(),
-        implementer: config.implementer.clone(),
+        route: impl_cfg.route,
+        tools: impl_cfg.tools,
+        policy: impl_cfg.policy,
+        max_turns: impl_cfg.max_turns,
+        system_prompt: impl_cfg.system_prompt,
+        plugins: impl_plugins,
+        ledger: Some(Arc::clone(ledger)),
         run_id: run_id.to_string(),
         issue: issue.to_string(),
         analyst: plan.analyst.clone(),
@@ -2154,15 +2386,33 @@ async fn fork_and_converge(
     };
 
     // Built before the fork so a misconfigured verifier fails the run here rather than after an
-    // ACP session and a sandboxed test run have already been spent on it.
+    // implementer session and a sandboxed test run have already been spent on it.
     let review = Review::build(run, plan)?;
 
-    // Fork: both branches run concurrently off the same frozen post-analyst state. join! (not
-    // spawn) because both are I/O-bound (subprocess/sandbox) and borrow their nodes.
-    let (rt_res, impl_res) = tokio::join!(red_team.run(), implementer.run());
+    // The worktree first, because the red team writes the change's tests into it and cannot do
+    // that until it exists.
+    let worktree = implementer
+        .prepare()
+        .await
+        .map_err(|e| PlanError::node("implementer", e))?;
 
-    let red_team_out = rt_res.map_err(|e| PlanError::node("red_team", e))?;
-    let (worktree, mut impl_out) = impl_res.map_err(|e| PlanError::node("implementer", e))?;
+    // Red team next, not alongside: it characterises the baseline and writes the tests the change
+    // will be judged against, and both have to be done before the implementer opens the tree. The
+    // concurrency this gives up is small — the baseline is a minute against the implementer's ten
+    // — and what it buys is that the tests are not written by the author of the code.
+    let red_team_out = red_team
+        .run_and_author(worktree.as_path(), issue, &plan.analyst.interface)
+        .await
+        .map_err(|e| PlanError::node("red_team", e))?;
+
+    let mut impl_out = match implementer.work(&worktree).await {
+        Ok(out) => out,
+        Err(e) => {
+            // A failed first attempt leaves nothing behind, as before.
+            implementer.discard(&worktree).await;
+            return Err(PlanError::node("implementer", e));
+        }
+    };
 
     record(Record {
         store,
@@ -2179,8 +2429,8 @@ async fn fork_and_converge(
         run_id,
         node: "implementer",
         output: &impl_out,
-        // The implementer drives a coding CLI over ACP rather than a model turn here, so the
-        // ledger has nothing for it; its row carries the iteration and the outcome.
+        // The implementer's own model turn is on the ledger under this name, and the row also
+        // carries the iteration and the outcome.
         input: Some(serde_json::to_string(&plan.analyst)?),
         iteration: Some(1),
         ledger: Some(ledger),
@@ -2191,7 +2441,7 @@ async fn fork_and_converge(
     // produced no tests, converge would compare against empty data and falsely "converge".
     if !converge::test_command_ran(
         &red_team_out.failing_tests,
-        &red_team_out.passing_tests,
+        red_team_out.passed_tests,
         red_team_out.exit_code,
     ) {
         return Err(PlanError::node(
@@ -2210,29 +2460,45 @@ async fn fork_and_converge(
     // was actually asked for by the end rather than against the requirement that was wrong.
     let mut in_force = plan.analyst.clone();
     let mut iterations = 1u32;
+    // Everything the review has said this run. Carried so a later pass can see the earlier ones,
+    // and so the ceiling has the evidence to hand the analyst.
+    let mut found_so_far: Vec<verifier::Finding> = Vec::new();
+    // At most one re-plan per run: a second would be the same escalation on the same evidence.
+    let mut replanned = false;
     let status = loop {
         let post_ran = converge::test_command_ran(
             &impl_out.failing_tests,
-            &impl_out.passing_tests,
+            impl_out.passed_tests,
             impl_out.exit_code,
         );
+        // Tests written for this change before it existed. They fail in the baseline as a matter
+        // of course, so "nothing newly failing" is not enough to call them satisfied.
+        let authored = red_team_out
+            .authored
+            .as_ref()
+            .map(|a| a.tests.as_slice())
+            .unwrap_or_default();
+        let unsatisfied = converge::unsatisfied(authored, &impl_out.failing_tests);
         let tests_clean = post_ran
+            && unsatisfied.is_empty()
             && converge::is_converged(&red_team_out.failing_tests, &impl_out.failing_tests);
 
         // Did the change edit the referee? Checked BEFORE `tests_clean` is trusted: a conftest.py
         // that rewrites every outcome, or an edited test, makes the passing/failing sets describe a
         // bar the change wrote for itself.
-        let referee = converge::referee_touches(&impl_out.touched_files, engine.may_modify_tests());
+        let referee =
+            converge::referee_touches(&impl_out.rewritten_files, engine.may_modify_tests());
 
         // What to do next. The referee check comes first, then the test gate, then the review: a
         // moved referee makes the test result meaningless, and a test result is stronger evidence
         // than a model's judgement, so reviewing a change that does not build wastes the call.
         let correction: Reviewed = if !referee.is_empty() {
             tracing::warn!(files = ?referee, "iteration touched the referee; not accepting it");
-            Reviewed::Fix(Correction {
+            Reviewed::Fix(Box::new(Correction {
                 prompt: converge::referee_correction(&referee),
                 revised: None,
-            })
+                found: Vec::new(),
+            }))
         } else if !tests_clean {
             // A post-change run that didn't complete usually means the edit broke the build — say
             // that specifically instead of reporting "no new failures".
@@ -2241,6 +2507,17 @@ async fn fork_and_converge(
                     "The test command did not run to completion (exit {}) — your change likely \
                      does not compile. Fix it so the tests run and pass.",
                     impl_out.exit_code
+                )
+            } else if !unsatisfied.is_empty() {
+                // Said apart from the regression case, because it is the opposite situation: these
+                // were failing before you started, and making them pass is the task.
+                format!(
+                    "These tests were written for this change, from the interface, before any code \
+                     existed to satisfy them — making them pass is what the change is for, and \
+                     they are still failing: {}. They are not yours to edit; implement what they \
+                     describe. If one of them is wrong about the contract rather than about your \
+                     code, say so in your summary and implement the rest.",
+                    unsatisfied.join(", ")
                 )
             } else {
                 let new_failures = converge::newly_introduced_failures(
@@ -2253,13 +2530,21 @@ async fn fork_and_converge(
                     new_failures.join(", ")
                 )
             };
-            Reviewed::Fix(Correction {
+            Reviewed::Fix(Box::new(Correction {
                 prompt,
                 revised: None,
-            })
+                found: Vec::new(),
+            }))
         } else if let Some(review) = &review {
             review
-                .review(run, &in_force, &impl_out, &worktree, iterations)
+                .review(
+                    run,
+                    &in_force,
+                    &impl_out,
+                    &worktree,
+                    iterations,
+                    &found_so_far,
+                )
                 .await?
         } else {
             Reviewed::Clean
@@ -2270,13 +2555,65 @@ async fn fork_and_converge(
             // The change passed its tests and nobody was able to review it. Saying `Converged`
             // would claim a review that did not happen; failing would discard work that did.
             Reviewed::Unavailable => break RunStatus::Unreviewed,
-            Reviewed::Fix(correction) => correction,
+            Reviewed::Fix(correction) => *correction,
         };
+        // Everything the review has said this run, so the next pass can recognise a finding that
+        // exists only because of the fix for an earlier one.
+        found_so_far.extend(correction.found.iter().cloned());
         if let Some(revised) = correction.revised {
             in_force = revised;
+            replanned = true;
         }
         if iterations >= config.implementer.max_iterations {
-            break RunStatus::MaxIterationsReached;
+            // The budget is spent. Stopping here records "ran out of attempts", which is the one
+            // reading the evidence usually does not support: a run that spends three iterations
+            // trading each defect for its successor did not need a fourth attempt at the same
+            // plan, it needed the plan looked at. So escalate once, then stop for real.
+            if replanned || found_so_far.is_empty() {
+                break RunStatus::MaxIterationsReached;
+            }
+            match review.as_ref() {
+                None => break RunStatus::MaxIterationsReached,
+                Some(review) => {
+                    tracing::warn!(
+                        iterations,
+                        findings = found_so_far.len(),
+                        "the iteration budget is spent; asking the analyst to look at the plan \
+                         rather than recording another failed attempt"
+                    );
+                    let revised = review
+                        .replan_at_ceiling(run, &in_force, &found_so_far, iterations)
+                        .await?;
+                    match revised {
+                        None => break RunStatus::MaxIterationsReached,
+                        Some((revised, prompt)) => {
+                            in_force = revised;
+                            replanned = true;
+                            iterations += 1;
+                            impl_out = match implementer.iterate(&worktree, &prompt).await {
+                                Ok(out) => out,
+                                Err(e) => {
+                                    if let Err(rm) = remove_worktree(&repo_path, &worktree).await {
+                                        tracing::warn!("failed to clean up worktree: {rm}");
+                                    }
+                                    return Err(PlanError::node("implementer", e));
+                                }
+                            };
+                            record(Record {
+                                store,
+                                run_id,
+                                node: "implementer",
+                                output: &impl_out,
+                                input: Some(serde_json::to_string(&in_force)?),
+                                iteration: Some(iterations),
+                                ledger: Some(ledger),
+                            })
+                            .await?;
+                            continue;
+                        }
+                    }
+                }
+            }
         }
         impl_out = match implementer.iterate(&worktree, &correction.prompt).await {
             Ok(out) => out,
@@ -2551,6 +2888,82 @@ mod agent_config_tests {
     }
 
     #[tokio::test]
+    async fn a_node_that_declares_no_tools_is_not_handed_the_file_tools() {
+        // "No tools" has to mean none. The characterizer transcribes output it was handed, and
+        // when this leaked it spent its turn reading directories on the host and inventing a
+        // diagnosis of the run instead of naming the checks.
+        let engine = engine("no-tools").await;
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "characterizer".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".into(),
+                model: "claude-haiku-4-5-20251001".into(),
+                max_tokens: None,
+                temperature: None,
+                params: None,
+                session: Default::default(),
+            },
+        );
+
+        let none = node_agent_config(
+            &engine,
+            &config,
+            ToolSet::default(),
+            "characterizer",
+            &[],
+            &NodePlugins::default(),
+        )
+        .unwrap();
+        assert!(none.tools.names().is_empty(), "{:?}", none.tools.names());
+        // The root is still set, and that is not a capability: with no file tools offered there is
+        // nothing to resolve against it. Gating the root on this list instead is what left the
+        // publisher holding a `gh` stand-in that errors — it declares no default tools on purpose,
+        // and the root is what lets the tool it *is* given resolve.
+        assert!(none.files.is_some(), "the root is not the capability");
+
+        // A node that does declare reach still gets them — this is the reading half of the
+        // pipeline, not an exception for one node.
+        let some = node_agent_config(
+            &engine,
+            &config,
+            ToolSet::default(),
+            "analyst",
+            analyst::ANALYST_TOOLS,
+            &NodePlugins::default(),
+        )
+        .unwrap();
+        assert!(some.files.is_some());
+        assert!(some.tools.names().iter().any(|n| n == "Read"));
+    }
+
+    #[test]
+    fn the_publishers_gh_resolves_to_something_that_can_actually_run() {
+        // The failure this guards, seen on a live run: `gh` fell through to the stand-in whose
+        // message says the tool "is answered inside the run and should never have been
+        // dispatched". The publisher read that as an instruction and reported publishing nothing,
+        // with reasoning that sounded entirely deliberate.
+        let root = std::env::current_dir().expect("a working directory");
+        assert!(
+            ratatoskr_agent::publish::implementation(ratatoskr_agent::publish::GH, &root).is_some(),
+            "with a root, `gh` is a real tool"
+        );
+        // Without one there is nothing to run it in, which is exactly the state the publisher was
+        // left in.
+        let mut tools = ToolSet::default();
+        tools
+            .local()
+            .tools
+            .push(ratatoskr_agent::publish::declaration());
+        assert!(
+            tools
+                .names()
+                .iter()
+                .any(|n| n == ratatoskr_agent::publish::GH)
+        );
+    }
+
+    #[tokio::test]
     async fn a_ruleset_without_a_model_still_falls_back_to_toml() {
         let engine = engine("toml-fallback").await;
         let config = RatatoskrConfig::default();
@@ -2600,6 +3013,9 @@ mod agent_config_tests {
                 provider: "openai".to_string(),
                 model: "gpt-5".to_string(),
                 max_tokens: None,
+                temperature: None,
+                params: None,
+                session: Default::default(),
             },
         );
         assert!(classifier_enabled(&engine, &config));
@@ -2653,6 +3069,7 @@ mod agent_config_tests {
             residual_risk: String::new(),
             changes_code,
             acceptance: Vec::new(),
+            interface: Vec::new(),
         }
     }
 
@@ -2662,7 +3079,8 @@ mod agent_config_tests {
         assert!(fork_is_needed(&analyst_saying(true), &config));
         assert!(
             !fork_is_needed(&analyst_saying(false), &config),
-            "a task that changes no code does not pay for a baseline test run and an ACP session"
+            "a task that changes no code does not pay for a baseline test run and an implementer \
+             session"
         );
 
         // The override only ever adds work. There is no configuration that skips the fork when the
@@ -2685,6 +3103,32 @@ mod agent_config_tests {
     }
 
     #[test]
+    fn the_characterizer_is_offered_no_tool_it_cannot_answer() {
+        // It passes no skills to `run_structured`, so the `SkillHook` is never installed. Granting
+        // it the `Skill` tool anyway leaves a tool whose call can only return an error — and a node
+        // reading a tool error as an instruction is exactly how the publisher once published
+        // nothing.
+        let plugins = NodePlugins {
+            skills: vec![ratatoskr_plugin::Skill {
+                name: "review".into(),
+                description: "how to review".into(),
+                body: "...".into(),
+                dir: std::path::PathBuf::new(),
+            }],
+            ..Default::default()
+        };
+        assert!(
+            crate::skills::skill_tool(&plugins.skills).is_some(),
+            "a node WITH skills bound is offered the tool — the grant itself is not the bug"
+        );
+        let stripped = NodePlugins {
+            skills: Vec::new(),
+            ..plugins
+        };
+        assert!(crate::skills::skill_tool(&stripped.skills).is_none());
+    }
+
+    #[test]
     fn the_replan_prompt_leads_with_the_amended_requirements() {
         let revised = AnalystOutput {
             impact_summary: "narrower than before".into(),
@@ -2694,6 +3138,7 @@ mod agent_config_tests {
             residual_risk: String::new(),
             changes_code: true,
             acceptance: Vec::new(),
+            interface: Vec::new(),
         };
         let finding = verifier::Finding {
             severity: verifier::Severity::P1,

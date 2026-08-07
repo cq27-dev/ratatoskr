@@ -43,24 +43,161 @@ pub struct LiveEvent {
     /// Set on a `question` event: what a viewer's answer has to be posted against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub question_id: Option<String>,
+    /// The one argument that identifies a tool call — the path read, the pattern searched, the
+    /// command run. Without it every call reads `Read`, and a feed of forty of those says only
+    /// that the node was busy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arg: Option<String>,
+    /// How long a tool took, on its `tool_result`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Model calls the attempt took, off a `checkpoint`. Not derivable from tool calls: a turn
+    /// that answers without calling anything still cost a call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u64>,
+    /// Why the node failed, off a `checkpoint`. Present is what makes a node render as failed
+    /// rather than done — the two are indistinguishable from the fact of a checkpoint alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Which attempt this was, off a `checkpoint`. The implementer checkpoints once per converge
+    /// iteration, so without it repeated attempts collapse into one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<u64>,
+    /// Set on a `usage` event: what the node's attempt cost.
+    ///
+    /// Carried so a node's box can be rebuilt from the stream alone. Without it the numbers exist
+    /// only on the checkpoint, which is the run's FINAL state — fine while following live, wrong
+    /// the moment you look at where a run was rather than where it ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<LiveUsage>,
+    /// Set on a `node_start` event: what the node is about to run on.
+    ///
+    /// A checkpoint carries the same facts, but only once the node has finished — and the moment
+    /// a viewer most wants them is while it is still working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facts: Option<LiveNodeFacts>,
+}
+
+/// What one attempt of a node cost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LiveUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub duration_ms: u64,
+}
+
+impl LiveUsage {
+    /// Read them off a `usage` record. `None` for every other kind.
+    ///
+    /// The keys are dotted OpenTelemetry names (`gen_ai.usage.input_tokens`), which are flat keys
+    /// in the JSON rather than nested objects — a `pointer()` lookup would find nothing.
+    fn of(record: &Value) -> Option<Self> {
+        if !matches!(
+            record.get("kind").and_then(Value::as_str)?,
+            "usage" | "checkpoint"
+        ) {
+            return None;
+        }
+        let n = |k: &str| record.get(k).and_then(Value::as_u64).unwrap_or(0);
+        Some(LiveUsage {
+            input_tokens: n("gen_ai.usage.input_tokens"),
+            output_tokens: n("gen_ai.usage.output_tokens"),
+            cached_input_tokens: n("gen_ai.usage.cached_input_tokens"),
+            cache_creation_input_tokens: n("gen_ai.usage.cache_creation_input_tokens"),
+            reasoning_tokens: n("gen_ai.usage.reasoning_tokens"),
+            duration_ms: n("duration_ms"),
+        })
+    }
+}
+
+/// What a node announced about itself when it started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LiveNodeFacts {
+    pub model: String,
+    pub tools: Vec<String>,
+    pub thinking: bool,
+    pub reuses_session: bool,
+}
+
+impl LiveNodeFacts {
+    /// Read them off a `node_start` record. `None` for every other kind.
+    fn of(record: &Value) -> Option<Self> {
+        // Both ends of an attempt carry them: `node_start` announces what the node was given,
+        // and `checkpoint` records what it turned out to have. A viewer moving through a run needs
+        // whichever came last.
+        if !matches!(
+            record.get("kind").and_then(Value::as_str)?,
+            "node_start" | "checkpoint"
+        ) {
+            return None;
+        }
+        // A checkpoint for a node that ran no model has no route to report.
+        if record
+            .get("model")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return None;
+        }
+        let flag = |k: &str| record.get(k).and_then(Value::as_bool).unwrap_or(false);
+        Some(LiveNodeFacts {
+            model: record.get("model").and_then(Value::as_str)?.to_string(),
+            // Joined for the log line, because a comma-separated list reads better there than a
+            // JSON array does; split back here.
+            tools: record
+                .get("tools")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .split(',')
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect(),
+            thinking: flag("thinking"),
+            reuses_session: flag("reuses_session"),
+        })
+    }
 }
 
 /// The newest daily log file, if any. `tracing-appender` suffixes the date (`ratatoskr.jsonl.
 /// 2026-08-05`), so there is never a bare `ratatoskr.jsonl`, and the dates sort lexicographically.
 pub async fn newest_log(dir: &Path) -> Option<PathBuf> {
-    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
-    let mut newest: Option<PathBuf> = None;
+    daily_logs(dir).await.pop()
+}
+
+/// Every daily log file, oldest first.
+async fn daily_logs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
         let is_jsonl = path
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with("ratatoskr.jsonl."));
-        if is_jsonl && newest.as_ref().is_none_or(|cur| path > *cur) {
-            newest = Some(path);
+        if is_jsonl {
+            found.push(path);
         }
     }
-    newest
+    found.sort();
+    found
+}
+
+/// Where a connecting viewer starts reading: the file before the newest, when there is one.
+///
+/// A run that was live across midnight has its beginning in the previous day's file, and replaying
+/// only the newest would show a run that has been going for hours as though it had just started —
+/// the more misleading answer, because the pane looks populated and is missing the half that
+/// explains the run. One file back covers a run spanning one rollover, which is every run that is
+/// not already pathological.
+async fn replay_from(dir: &Path) -> Option<PathBuf> {
+    let mut logs = daily_logs(dir).await;
+    logs.pop();
+    logs.pop()
 }
 
 /// Pull `run_id` out of a record: a plain field first (how the dashboard's own launch and reap
@@ -79,15 +216,62 @@ fn run_id_of(record: &Value) -> Option<&str> {
 /// Same idea for the node: a field on checkpoint records, the `agent` span for everything an
 /// agent emits.
 fn node_of(record: &Value) -> Option<&str> {
-    if let Some(node) = record.get("node").and_then(Value::as_str) {
-        return Some(node);
-    }
-    record
-        .get("spans")?
-        .as_array()?
-        .iter()
-        .find_map(|span| span.get("node").and_then(Value::as_str))
+    let raw = record.get("node").and_then(Value::as_str).or_else(|| {
+        record
+            .get("spans")?
+            .as_array()?
+            .iter()
+            .find_map(|span| span.get("node").and_then(Value::as_str))
+    })?;
+    Some(stage_name(raw))
 }
+
+/// The name the pipeline knows a node by.
+///
+/// The red team checkpoints as `red_team` and runs as `redteam` — a split the run itself relies
+/// on. Everything downstream of here keys on the stage name, so an event arriving under the other
+/// spelling belongs to no stage at all: it groups on its own in the feed, and the node it came
+/// from never lights up while it is working. Normalising once here is cheaper than every consumer
+/// remembering which side of the split it is on.
+fn stage_name(node: &str) -> &str {
+    match node {
+        "redteam" => "red_team",
+        other => other,
+    }
+}
+
+/// The argument worth showing for a tool call.
+///
+/// Tools name their subject differently — a path, a pattern, a command — so this takes the first
+/// field that identifies one, in the order a reader would look for it. Truncated hard: the feed is
+/// one line per call, and a `Write` carrying a file's whole contents would bury everything around
+/// it.
+fn tool_argument(record: &Value) -> Option<String> {
+    const IDENTIFYING: [&str; 7] = [
+        "file_path",
+        "command",
+        "pattern",
+        "path",
+        "query",
+        "symbol",
+        "name",
+    ];
+    let args: Value = serde_json::from_str(record.get("args")?.as_str()?).ok()?;
+    let found = IDENTIFYING
+        .iter()
+        .find_map(|k| args.get(k))
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })?;
+    Some(match found.char_indices().nth(ARG_LIMIT) {
+        Some((cut, _)) => format!("{}…", &found[..cut]),
+        None => found,
+    })
+}
+
+/// How much of a tool's argument the feed shows.
+const ARG_LIMIT: usize = 120;
 
 /// Normalise one log record, keeping only what a viewer can act on.
 fn to_event(record: &Value) -> LiveEvent {
@@ -111,7 +295,19 @@ fn to_event(record: &Value) -> LiveEvent {
 
     LiveEvent {
         at: str_field("timestamp").unwrap_or_default().to_string(),
+        arg: tool_argument(record),
+        duration_ms: record.get("duration_ms").and_then(Value::as_u64),
         question_id: str_field("question_id").map(str::to_string),
+        facts: LiveNodeFacts::of(record),
+        usage: LiveUsage::of(record),
+        turns: record
+            .get("turns")
+            .and_then(Value::as_u64)
+            .filter(|t| *t > 0),
+        error: str_field("error")
+            .filter(|e| !e.is_empty())
+            .map(str::to_string),
+        iteration: record.get("iteration").and_then(Value::as_u64),
         kind,
         node: node_of(record).map(str::to_string),
         detail,
@@ -127,6 +323,56 @@ fn events_for(run_id: &str, lines: &[&str]) -> Vec<LiveEvent> {
         .filter(|record| run_id_of(record) == Some(run_id))
         .map(|record| to_event(&record))
         .collect()
+}
+
+/// Every event this run produced, oldest first.
+///
+/// The scrubbing counterpart to [`follow`]: `follow` replays a tail and then tails, which is what
+/// a viewer watching a live run wants and useless for moving through a finished one. Untrimmed —
+/// a run is a few hundred events (a 42-minute run produced 654), so paging would cost more than
+/// it saves.
+///
+/// Bounded by what is on disk. Logs rotate daily and are eventually removed, so a run old enough
+/// to have lost its log has no timeline; its checkpoints are still in the store.
+pub async fn history(dir: &Path, run_id: &str) -> Vec<LiveEvent> {
+    let mut out = Vec::new();
+    for path in daily_logs(dir).await {
+        let Ok(text) = tokio::fs::read_to_string(&path).await else {
+            continue;
+        };
+        out.extend(events_for(run_id, &text.lines().collect::<Vec<_>>()));
+    }
+    out
+}
+
+/// A run's log lines as store rows, ready to be made durable.
+///
+/// The same parse the dashboard reads with, so what is stored is what was shown — and the payload
+/// is the raw record, so storing it loses nothing that a later reader might want.
+pub async fn rows_for_run(dir: &Path, run_id: &str) -> Vec<ratatoskr_store::EventRow> {
+    let mut out = Vec::new();
+    for path in daily_logs(dir).await {
+        let Ok(text) = tokio::fs::read_to_string(&path).await else {
+            continue;
+        };
+        for line in text.lines() {
+            let Ok(record) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if run_id_of(&record) != Some(run_id) {
+                continue;
+            }
+            let event = to_event(&record);
+            out.push(ratatoskr_store::EventRow {
+                seq: out.len() as i64,
+                at: event.at,
+                kind: event.kind,
+                node: event.node,
+                payload_json: line.to_string(),
+            });
+        }
+    }
+    out
 }
 
 /// Cap what a newly attached viewer is replayed.
@@ -215,7 +461,12 @@ impl Tail {
 /// everyone, but the task dies with its channel — no shared state to own, and no lifecycle to get
 /// wrong — and this is a local dashboard with a handful of viewers at most.
 pub async fn follow(dir: PathBuf, run_id: String, tx: mpsc::Sender<LiveEvent>) {
-    let mut tail = Tail::default();
+    // Starts one file back, so a run that began before the last rollover is replayed whole. The
+    // loop below walks forward to the newest file on its first pass.
+    let mut tail = Tail {
+        current: replay_from(&dir).await,
+        ..Default::default()
+    };
 
     loop {
         if tx.is_closed() {
@@ -259,6 +510,147 @@ mod tests {
     }
 
     #[test]
+    fn the_red_teams_two_names_arrive_as_the_one_the_pipeline_knows() {
+        // It checkpoints as `red_team` and runs as `redteam`. Unnormalised, its events belong to
+        // no stage: the node stays dark while it is plainly working, which is what a live run
+        // showed with 36 events under the other spelling.
+        let running: Value = serde_json::from_str(&agent_line("r1", "redteam")).unwrap();
+        assert_eq!(to_event(&running).node.as_deref(), Some("red_team"));
+
+        // The checkpoint side already uses the stage name and must pass through untouched.
+        let done: Value = serde_json::from_str(
+            r#"{"timestamp":"t","kind":"checkpoint","node":"red_team","spans":[{"run_id":"r1"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(to_event(&done).node.as_deref(), Some("red_team"));
+    }
+
+    #[test]
+    fn an_acceptance_step_is_attributed_to_the_node_running_it() {
+        // A suite takes minutes. Unattributed, the node running it reads as idle for the whole of
+        // it, and a run rebuilt from the stream shows nothing happening while the tests run.
+        let record: Value = serde_json::from_str(
+            r#"{"timestamp":"t","kind":"acceptance_step","node":"red_team","step":"tests",
+                "exit_code":0,"spans":[{"run_id":"r1"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(to_event(&record).node.as_deref(), Some("red_team"));
+    }
+
+    #[test]
+    fn a_checkpoint_carries_everything_its_stored_row_does() {
+        // The store keeps only each node's LATEST state, so a viewer reconstructing where a run
+        // WAS has to read the log. Anything the row records and the event omits is a number that
+        // would have to be back-filled from the present — which is how a historical view comes to
+        // show final figures against a past position.
+        let record: Value = serde_json::from_str(
+            r#"{"timestamp":"t","kind":"checkpoint","node":"implementer","bytes":21286,
+                "iteration":2,"model":"anthropic/claude-opus-4-8","tools":"Read,Bash",
+                "tools_used":"Bash","thinking":true,"reuses_session":true,"turns":31,"error":"",
+                "duration_ms":339000,"gen_ai.usage.input_tokens":7,
+                "gen_ai.usage.output_tokens":396,"gen_ai.usage.cached_input_tokens":1065945,
+                "gen_ai.usage.cache_creation_input_tokens":38998,
+                "gen_ai.usage.reasoning_tokens":0,"spans":[{"run_id":"r1"}]}"#,
+        )
+        .unwrap();
+        let e = to_event(&record);
+        assert_eq!(e.turns, Some(31));
+        assert_eq!(e.iteration, Some(2));
+        assert_eq!(e.error, None, "an empty error is not a failure");
+
+        let facts = e.facts.expect("a checkpoint reports what the node ran on");
+        assert_eq!(facts.model, "anthropic/claude-opus-4-8");
+        assert_eq!(facts.tools, ["Read", "Bash"]);
+        assert!(facts.thinking && facts.reuses_session);
+
+        let usage = e.usage.expect("a checkpoint reports what it cost");
+        assert_eq!(usage.cached_input_tokens, 1_065_945);
+        assert_eq!(usage.duration_ms, 339_000);
+    }
+
+    #[test]
+    fn a_failed_node_is_told_apart_from_a_finished_one() {
+        // Both write a checkpoint. Only the error distinguishes them, so it is what a box renders
+        // as failed rather than done.
+        let failed: Value = serde_json::from_str(
+            r#"{"timestamp":"t","kind":"checkpoint","node":"verifier",
+                "error":"verifier agent failed: UnknownToolCall","spans":[{"run_id":"r1"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            to_event(&failed).error.as_deref(),
+            Some("verifier agent failed: UnknownToolCall")
+        );
+    }
+
+    #[test]
+    fn a_usage_event_carries_the_numbers_a_box_is_rebuilt_from() {
+        // Dotted OpenTelemetry keys are flat in the JSON, not nested — read them as written or the
+        // node's cost silently reads as zero everywhere it is derived from the stream.
+        let record: Value = serde_json::from_str(
+            r#"{"timestamp":"t","kind":"usage","node":"context",
+                "gen_ai.usage.input_tokens":45,"gen_ai.usage.output_tokens":82,
+                "gen_ai.usage.cached_input_tokens":853598,
+                "gen_ai.usage.cache_creation_input_tokens":53807,
+                "gen_ai.usage.reasoning_tokens":0,"duration_ms":226362,
+                "spans":[{"run_id":"r1"}]}"#,
+        )
+        .unwrap();
+        let usage = to_event(&record)
+            .usage
+            .expect("a usage event carries usage");
+        assert_eq!(usage.input_tokens, 45);
+        assert_eq!(usage.cached_input_tokens, 853_598);
+        assert_eq!(usage.duration_ms, 226_362);
+
+        // Every other kind carries none, so a consumer can key on its presence.
+        let other: Value = serde_json::from_str(
+            r#"{"timestamp":"t","kind":"tool_call","tool":"Read","spans":[{"run_id":"r1"}]}"#,
+        )
+        .unwrap();
+        assert!(to_event(&other).usage.is_none());
+    }
+
+    #[test]
+    fn an_edit_is_identified_by_its_path_like_a_read_is() {
+        // These two halves live in different crates: the agent writes `args`, the dashboard reads
+        // it. When the agent bounded the serialized JSON rather than its values, an `Edit` arrived
+        // cut mid-`old_string`, parsed as nothing, and showed no path — while `Read` looked fine
+        // because its arguments were short enough to survive. Pin both shapes.
+        let record = |tool: &str, args: serde_json::Value| -> Value {
+            serde_json::json!({
+                "timestamp": "t",
+                "kind": "tool_call",
+                "tool": tool,
+                "args": args.to_string(),
+                "spans": [{"name": "run", "run_id": "r1"}],
+            })
+        };
+
+        let read = record(
+            "Read",
+            serde_json::json!({"file_path": "crates/foo/src/lib.rs"}),
+        );
+        assert_eq!(
+            to_event(&read).arg.as_deref(),
+            Some("crates/foo/src/lib.rs")
+        );
+
+        let edit = record(
+            "Edit",
+            serde_json::json!({
+                "file_path": "crates/foo/src/lib.rs",
+                "old_string": "a",
+                "new_string": "b",
+            }),
+        );
+        assert_eq!(
+            to_event(&edit).arg.as_deref(),
+            Some("crates/foo/src/lib.rs")
+        );
+    }
+
+    #[test]
     fn attribution_comes_from_a_field_or_the_span_list() {
         let from_span: Value = serde_json::from_str(&agent_line("r1", "scout")).unwrap();
         assert_eq!(run_id_of(&from_span), Some("r1"));
@@ -299,6 +691,13 @@ mod tests {
             node: None,
             detail: "which way?".into(),
             question_id: Some("q-1".into()),
+            arg: None,
+            duration_ms: None,
+            facts: None,
+            usage: None,
+            turns: None,
+            error: None,
+            iteration: None,
         };
         let noise = LiveEvent {
             at: "t1".into(),
@@ -306,6 +705,13 @@ mod tests {
             node: Some("scout".into()),
             detail: "semantic_search".into(),
             question_id: None,
+            arg: None,
+            duration_ms: None,
+            facts: None,
+            usage: None,
+            turns: None,
+            error: None,
+            iteration: None,
         };
 
         // The question is the oldest event, well outside the replay window.
@@ -385,6 +791,15 @@ mod tests {
         tokio::fs::write(dir.join("ratatoskr.log.2026-08-06"), "")
             .await
             .unwrap();
+
+        // A viewer connecting starts one file back, so a run that was live across the rollover is
+        // replayed whole rather than appearing to have just started.
+        let from = replay_from(&dir).await.expect("the previous day's log");
+        assert!(
+            from.to_string_lossy()
+                .ends_with("ratatoskr.jsonl.2026-08-04"),
+            "{from:?}"
+        );
 
         let newest = newest_log(&dir).await.expect("a log file");
         assert!(

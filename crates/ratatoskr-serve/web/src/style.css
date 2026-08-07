@@ -42,22 +42,6 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* Electron-beam sweep. Fixed and inert so it never intercepts a click. */
-body::after {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 9999;
-  background: repeating-linear-gradient(
-    0deg,
-    transparent,
-    transparent 2px,
-    rgba(0, 0, 0, 0.22) 2px,
-    rgba(0, 0, 0, 0.22) 4px
-  );
-}
-
 /* ── Shell ───────────────────────────────────────────────────────────────── */
 /* gap:1px over a --rule backdrop draws the dividing lines: no border bookkeeping. */
 .shell {
@@ -296,7 +280,8 @@ body::after {
 /* ── Stage: graph, plus a detail pane only once a node is selected ───────── */
 .stage {
   display: grid;
-  grid-template-rows: auto 1fr;
+  /* meta, scrubber, graph — the scrubber sits directly above the map it drives. */
+  grid-template-rows: auto auto 1fr;
   gap: 1px;
   background: var(--rule);
   overflow: hidden;
@@ -304,7 +289,7 @@ body::after {
 
 /* The lower half is always present now: even with no node selected there is a live feed to show. */
 .stage--split {
-  grid-template-rows: auto minmax(200px, 1fr) minmax(0, 46%);
+  grid-template-rows: auto auto minmax(200px, 1fr) minmax(0, 46%);
 }
 
 /* Activity beside output: the feed says what is happening, the pane what was produced. */
@@ -419,6 +404,36 @@ body::after {
   color: var(--hazard);
 }
 
+/* A grouped row is a button; strip the control look so it reads as the row it replaces. */
+.ev--group {
+  width: 100%;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+  text-align: left;
+  cursor: pointer;
+}
+.ev--group:hover {
+  background: var(--panel);
+}
+.ev--group:focus-visible {
+  outline: 1px solid var(--fg);
+  outline-offset: -2px;
+}
+
+/* The calls a group folded, indented under it and dimmed: the group is the fact, these are its
+   detail. */
+.ev--sub {
+  padding-left: 28px;
+  color: var(--muted);
+}
+.ev-k--sub {
+  color: var(--muted);
+}
+
 /* Flex, not grid: the node column is only rendered when no node is selected, so the column count
    varies and a fixed track list would wrap the detail onto its own row. */
 .ev {
@@ -439,6 +454,30 @@ body::after {
 .ev-d {
   flex: 1;
   min-width: 0;
+}
+
+/* The argument that distinguishes one call from the next. Takes the free space and truncates from
+   the left: the tail of a path is what identifies it, the leading directories are shared. */
+.ev-a {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+  color: var(--fg);
+}
+
+/* A collapsed run. Quiet — it is a count, not the point of the line. */
+.ev-x {
+  color: var(--muted);
+}
+
+/* How long a tool took, when it took long enough to be worth saying. */
+.ev-ms {
+  flex: none;
+  color: var(--muted);
 }
 
 .ev-t {
@@ -504,8 +543,62 @@ body::after {
   margin: 0 0 4px;
 }
 
-.graph {
+/* ── Scrubber ────────────────────────────────────────────────────────────── */
+.scrub {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 12px;
   background: var(--bg);
+  border-bottom: 1px solid var(--rule);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.scrub-live {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--rule);
+  padding: 3px 8px;
+  font: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+  flex: none;
+}
+.scrub-live.is-live {
+  color: var(--live);
+  border-color: var(--live);
+}
+
+.scrub input[type="range"] {
+  flex: 1;
+  accent-color: var(--hazard);
+  min-width: 0;
+}
+
+.scrub-at {
+  color: var(--muted);
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Electron-beam sweep, behind the node map only. Lines are LIGHT: the map sits on #0a0a0a, so a
+   darkening sweep — which is what reads as scanlines over a full viewport of text and panels —
+   is invisible here. Layered into the background so it never dims anything above it. */
+.graph {
+  background:
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(255, 255, 255, 0.011) 2px,
+      rgba(255, 255, 255, 0.011) 4px
+    ),
+    var(--bg);
+  /* React Flow's dark theme paints an opaque #141414 over its whole surface, which would bury the
+     texture below it. This is its own knob for that, so it survives their theme changing. */
+  --xy-background-color: transparent;
   position: relative;
   min-height: 0;
 }
@@ -558,8 +651,11 @@ body::after {
   height: 100%;
   background: var(--panel);
   border: 1px solid var(--rule);
-  padding: 7px 9px;
+  padding: 10px 12px;
   cursor: pointer;
+  /* The one exception to the square-corner reset above, which is `!important` on `*` to keep
+     React Flow's own radii off handles and controls — so the exception has to be too. */
+  border-radius: 3px !important;
 }
 
 .node--selected {
@@ -616,6 +712,44 @@ body::after {
   display: flex;
   justify-content: space-between;
   gap: 6px;
+}
+
+/* The model this node ran on, in the same register as the metadata rows but not competing with
+   the node's own name for the eye. Truncated rather than wrapped: the full string is on hover. */
+.node-model {
+  margin-top: 4px;
+  color: var(--fg);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Capabilities, as a row of glyphs. Muted until hovered — they are there to be scanned for
+   presence, and only read when a reader stops on one. */
+.node-icons {
+  margin-top: 5px;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  color: var(--muted);
+}
+.node-icon {
+  display: inline-flex;
+  cursor: help;
+  /* Available but untouched: present, and plainly not the story. */
+  opacity: 0.45;
+}
+/* Used. A step up in presence, not a highlight — no colour, no glow. The row should read as
+   "these three, of the five it had", at a glance and without drawing the eye off the diff. */
+.node-icon--used {
+  opacity: 1;
+  color: var(--fg);
+}
+.node-icon:hover {
+  opacity: 1;
+  color: var(--fg);
 }
 
 /* ── React Flow overrides: strip the consumer-UI defaults ────────────────── */

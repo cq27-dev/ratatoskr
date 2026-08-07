@@ -157,6 +157,10 @@ fn router(
             "/api/projects/{project}/runs/{run_id}/events",
             get(run_events),
         )
+        .route(
+            "/api/projects/{project}/runs/{run_id}/history",
+            get(run_history),
+        )
         // Answering is keyed by question id alone — unique across every project.
         .route(
             "/api/clarifications/{question_id}",
@@ -259,7 +263,9 @@ async fn run_detail(
     State(state): State<AppState>,
     AxumPath((project, run_id)): AxumPath<(String, String)>,
 ) -> Result<Json<RunDetail>, ApiError> {
-    let store = &state.project(&project)?.store;
+    let found = state.project(&project)?;
+    let store = &found.store;
+    let config_path = found.config_path.clone();
     let run = store.run(&run_id).await?;
     let checkpoints = store.checkpoints_for_run(&run_id).await?;
     if run.is_none() && checkpoints.is_empty() {
@@ -267,7 +273,18 @@ async fn run_detail(
     }
 
     let status = run.as_ref().map(|r| r.status.clone());
-    let nodes = pipeline::derive(status.as_deref(), &checkpoints);
+    // Best-effort: an unreadable or missing config costs the planned facts and nothing else, and a
+    // dashboard that refused to show a run because its config moved would be worse than one that
+    // shows the run without them.
+    let config = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|t| ratatoskr_core::RatatoskrConfig::from_toml_str(&t).ok());
+    let nodes = pipeline::derive_with(
+        status.as_deref(),
+        &checkpoints,
+        config.as_ref(),
+        run.as_ref().and_then(|r| r.shape_json.as_deref()),
+    );
     let last_activity = checkpoints
         .iter()
         .map(|c| c.created_at.as_str())
@@ -379,6 +396,15 @@ async fn start_run(
 /// Checkpoints only tell you a node *finished*; this is what it is doing in between. The stream
 /// replays the run's recent history on connect, then follows the log, and ends when the client
 /// disconnects — the tailing task is owned by the channel and dies with it.
+/// Every event a run produced, for moving through it after the fact.
+async fn run_history(
+    State(state): State<AppState>,
+    AxumPath((project, run_id)): AxumPath<(String, String)>,
+) -> Result<Json<Vec<events::LiveEvent>>, ApiError> {
+    let dir = state.project(&project)?.log_dir.clone();
+    Ok(Json(events::history(&dir, &run_id).await))
+}
+
 async fn run_events(
     State(state): State<AppState>,
     AxumPath((project, run_id)): AxumPath<(String, String)>,

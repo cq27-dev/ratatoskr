@@ -52,13 +52,15 @@ pub async fn create(
     branch: &str,
 ) -> Result<WorktreePath, ExecError> {
     // The path must be absolute: git resolves a relative worktree path against `repo_root`, but
-    // downstream consumers (the ACP session's `cwd`) require an absolute path.
+    // downstream consumers (the sandbox's workdir, the implementer's file tools) require an
+    // absolute path.
     let abs_root = if worktree_root.is_absolute() {
         worktree_root.to_path_buf()
     } else {
         repo_root.join(worktree_root)
     };
     std::fs::create_dir_all(&abs_root)?;
+    warn_if_nested(repo_root, &abs_root);
     let path = abs_root.join(branch);
     let path_s = path_str(&path)?;
     git(
@@ -68,6 +70,37 @@ pub async fn create(
     )
     .await?;
     Ok(WorktreePath(path))
+}
+
+/// Warn when worktrees are kept inside the repository they are worktrees of.
+///
+/// Build tools find their project root by walking *up* from the working directory, and a worktree
+/// nested in the checkout has the original's project files above it. Cargo resolves such a worktree
+/// to the outer workspace and builds into the outer `target/` — so the sandbox, which binds only
+/// the worktree writable, fails on a read-only filesystem, and a build that did succeed would be
+/// building the wrong tree. The same applies to any tool that resolves a root by walking up.
+///
+/// A warning rather than an error: the run still works for repositories whose acceptance command
+/// does not care, and where the worktrees live is the operator's decision.
+fn warn_if_nested(repo_root: &Path, worktree_root: &Path) {
+    let (Ok(repo), Ok(root)) = (repo_root.canonicalize(), worktree_root.canonicalize()) else {
+        return;
+    };
+    if is_nested(&repo, &root) {
+        tracing::warn!(
+            worktree_root = %root.display(),
+            repo_root = %repo.display(),
+            "worktrees are kept inside the repository; a build tool that finds its project root by \
+             walking up will resolve the outer checkout instead of the worktree. Point `[worktree] \
+             root` at a directory outside the repository."
+        );
+    }
+}
+
+/// Whether `worktree_root` is inside `repo_root`. Both are expected canonical, so a symlinked or
+/// `..`-relative root is judged by where it actually lands rather than by how it was spelled.
+fn is_nested(repo_root: &Path, worktree_root: &Path) -> bool {
+    worktree_root.starts_with(repo_root)
 }
 
 /// Remove a worktree (force, so uncommitted changes don't block cleanup).
@@ -268,9 +301,81 @@ pub async fn touched_files(worktree: &WorktreePath) -> Result<Vec<String>, ExecE
         .collect())
 }
 
+/// Files whose diff removed or replaced a line that was already there.
+///
+/// The distinction the referee gate needs. Adding a test is work anyone would want from an
+/// implementer; rewriting one is the shortcut the gate exists to refuse, and a path on its own
+/// cannot tell the two apart. `--numstat` reports added and deleted counts per file, and a purely
+/// additive change has a deleted count of zero.
+///
+/// A rename reports as a delete plus an add, so a renamed test file counts as rewritten. That is
+/// the right answer: the test that used to run under that name no longer does.
+pub async fn rewritten_files(worktree: &WorktreePath) -> Result<Vec<String>, ExecError> {
+    let cwd = worktree.as_path();
+    // As in `diff_stat`: `-N` makes a new file visible to `diff` without staging its content.
+    git(cwd, "add -N", &["add", "-N", "."]).await?;
+    let out = git(
+        cwd,
+        "diff --numstat",
+        &["--no-pager", "diff", "--numstat", "HEAD"],
+    )
+    .await?;
+    Ok(out.lines().filter_map(rewritten_in).collect())
+}
+
+/// One `--numstat` line, when it reports a deletion. Format is `added\tdeleted\tpath`, with `-`
+/// for a binary file — which is counted as rewritten, since nothing about it can be called additive.
+fn rewritten_in(line: &str) -> Option<String> {
+    let mut fields = line.split('\t');
+    let added = fields.next()?;
+    let deleted = fields.next()?;
+    let path = fields.next()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let binary = added == "-" || deleted == "-";
+    let removed_lines = deleted.parse::<u64>().unwrap_or(0) > 0;
+    (binary || removed_lines).then(|| path.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_change_that_removes_an_existing_line_counts_as_rewritten() {
+        // Adding a test is work worth having; rewriting one is the shortcut the referee refuses,
+        // and the path alone cannot tell them apart.
+        assert_eq!(rewritten_in("12\t0\tcrates/foo/tests/api.rs"), None);
+        assert_eq!(
+            rewritten_in("3\t4\tcrates/foo/tests/api.rs").as_deref(),
+            Some("crates/foo/tests/api.rs")
+        );
+        assert_eq!(
+            rewritten_in("0\t9\ttests/gone.rs").as_deref(),
+            Some("tests/gone.rs")
+        );
+        // A binary file has no additive reading.
+        assert_eq!(
+            rewritten_in("-\t-\ttests/fixture.bin").as_deref(),
+            Some("tests/fixture.bin")
+        );
+        assert_eq!(rewritten_in("garbage"), None);
+    }
+
+    #[test]
+    fn a_worktree_root_inside_the_repository_is_nested() {
+        // Why it matters: a build tool walking up from the worktree finds the outer project's
+        // files first, builds the wrong tree, and writes where the sandbox mounts read-only.
+        let repo = Path::new("/src/app");
+        assert!(is_nested(repo, Path::new("/src/app/.ratatoskr/worktrees")));
+        assert!(is_nested(repo, repo));
+
+        assert!(!is_nested(repo, Path::new("/src/.ratatoskr-worktrees")));
+        assert!(!is_nested(repo, Path::new("/var/tmp/worktrees")));
+        // A sibling whose name merely starts with the repo's path is not inside it.
+        assert!(!is_nested(repo, Path::new("/src/app-worktrees")));
+    }
 
     async fn init_repo(dir: &Path) {
         // A throwaway repo with one commit, so `worktree add -b` has a HEAD to branch from.

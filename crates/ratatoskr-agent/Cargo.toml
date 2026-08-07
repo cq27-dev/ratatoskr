@@ -7,6 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 ratatoskr-core.workspace = true
+ratatoskr-graph.workspace = true
+ratatoskr-exec.workspace = true
+http.workspace = true
+uuid.workspace = true
 ratatoskr-mcp.workspace = true
 glob.workspace = true
 regex.workspace = true

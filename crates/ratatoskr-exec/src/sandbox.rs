@@ -155,12 +155,27 @@ async fn run_bwrap(spec: SandboxSpec) -> Result<ExecOutput, SandboxError> {
     if !spec.network {
         args.push("--unshare-net".into());
     }
+    // A PID namespace, so the command cannot outlive the call. Without it a build that leaves a
+    // daemon behind keeps that daemon holding the inherited stdout pipe, and reading output waits
+    // for a process that has no reason to exit — the command finished, the call never returns.
+    // Here bwrap is the namespace's init: when it goes, everything it started goes with it.
+    // (`--proc /proc` above is what makes that namespace's /proc correct, and is already passed.)
+    args.push("--unshare-pid".into());
+    // And if this process dies, the sandbox does not outlive it.
+    args.push("--die-with-parent".into());
     args.push("--chdir".into());
     args.push(chdir);
     args.push("--".into());
     args.extend(spec.command.iter().cloned());
 
-    let output = Command::new("bwrap").args(&args).output().await?;
+    // Killed if this future is dropped — which is what a caller's timeout does. Without it a
+    // timeout abandons the command rather than stopping it: the caller reports a timeout and the
+    // work carries on unwatched, holding the worktree it was told to stop touching.
+    let output = Command::new("bwrap")
+        .args(&args)
+        .kill_on_drop(true)
+        .output()
+        .await?;
     Ok(ExecOutput {
         exit_code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -207,6 +222,31 @@ mod tests {
         let out = run(spec).await.unwrap();
         assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
         assert!(out.stdout.contains("sandbox-ok"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires bwrap on the host; run with --ignored"]
+    async fn a_command_that_leaves_a_process_behind_still_returns() {
+        // The failure this guards: a background child inherits stdout, so reading output waits on
+        // a process that will never exit even though the command finished seconds ago. The PID
+        // namespace is what ends it — the child cannot outlive the sandbox it was started in.
+        let spec = SandboxSpec {
+            backend: "landlock".into(),
+            name: "orphan".into(),
+            image: String::new(),
+            workdir: "/".into(),
+            mounts: vec![],
+            command: vec!["sh".into(), "-c".into(), "sleep 300 & echo started".into()],
+            cpus: 1,
+            memory_mib: 256,
+            network: false,
+        };
+        let out = tokio::time::timeout(std::time::Duration::from_secs(20), run(spec))
+            .await
+            .expect("the call must not wait on the process it left behind")
+            .unwrap();
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+        assert!(out.stdout.contains("started"));
     }
 
     #[cfg(feature = "microsandbox")]

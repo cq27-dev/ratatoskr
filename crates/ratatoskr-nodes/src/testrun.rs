@@ -47,7 +47,9 @@ impl StepOutcome {
 #[derive(Debug, Clone)]
 pub struct TestResults {
     pub failing: Vec<String>,
-    pub passing: Vec<String>,
+    /// How many checks passed. At the exit-code floor this counts whole steps; when a
+    /// characterizer read the output it counts individual checks.
+    pub passed: usize,
     /// The first non-zero exit across the steps; zero only if every step succeeded.
     pub exit_code: i32,
     /// Combined output — context for the optional failure classifier.
@@ -61,6 +63,7 @@ pub struct TestResults {
 /// why. The exit code carries the failure regardless of where it happened.
 pub async fn run_acceptance(
     cfg: &SandboxConfig,
+    node: &str,
     name: &str,
     host_path: &Path,
     steps: &[AcceptanceStep],
@@ -85,11 +88,27 @@ pub async fn run_acceptance(
         let out = sandbox_run(spec)
             .await
             .map_err(|e| format!("sandbox run of acceptance step `{}` failed: {e}", step.name))?;
+        // Logged here because this is the run's most consequential deterministic result and the
+        // only account of it otherwise is a model's paraphrase of it. A characterizer that
+        // misreads a read-only-filesystem error as "cargo is not installed" sends whoever reads
+        // the run after a problem that does not exist.
+        let combined = format!("{}\n{}", out.stdout, out.stderr);
+        // Attributed to the node running it. A suite takes minutes, and unattributed the node
+        // that is plainly working looks idle for the whole of it to anything reading the stream.
+        tracing::info!(
+            kind = "acceptance_step",
+            node,
+            step = %step.name,
+            command = %step.command.join(" "),
+            exit_code = out.exit_code,
+            output = %ratatoskr_agent::tail(combined.trim(), 2_000),
+            "acceptance step finished"
+        );
         outcomes.push(StepOutcome {
             name: step.name.clone(),
             command: step.command.clone(),
             exit_code: out.exit_code,
-            output: format!("{}\n{}", out.stdout, out.stderr),
+            output: combined,
         });
     }
     Ok(outcomes)
@@ -104,7 +123,7 @@ pub fn by_exit_code(outcomes: &[StepOutcome]) -> TestResults {
     let (failing, passing): (Vec<_>, Vec<_>) = outcomes.iter().partition(|o| !o.ok());
     TestResults {
         failing: failing.iter().map(|o| o.name.clone()).collect(),
-        passing: passing.iter().map(|o| o.name.clone()).collect(),
+        passed: passing.len(),
         exit_code: outcomes
             .iter()
             .map(|o| o.exit_code)
@@ -144,8 +163,13 @@ const PREAMBLE: &str = include_str!("../prompts/characterizer.md");
 struct Characterization {
     #[serde(default)]
     failing: Vec<String>,
+    /// How many checks passed — a count, never the names.
+    ///
+    /// Nothing downstream reads a passing check's name: converge compares failures, and the only
+    /// other readers ask "did anything run" and "how many". Transcribing a few hundred identifiers
+    /// to answer that is the single largest output in the pipeline, and it grows with the suite.
     #[serde(default)]
-    passing: Vec<String>,
+    passed: usize,
 }
 
 /// Reads an acceptance run's raw output and names the checks inside it.
@@ -181,6 +205,10 @@ impl Characterizer {
             observer: None,
             skills: Vec::new(),
             files: None,
+            // Reads output it was handed, and touches neither the tree nor a shell.
+            shell: None,
+            push: None,
+            conversation: None,
             ledger: self.ledger.clone(),
             // One turn over output it was handed: there is no history to outgrow, so a compaction
             // policy would only cost a summariser it never calls.
@@ -217,7 +245,9 @@ fn reconcile(read: Characterization, floor: TestResults) -> TestResults {
     }
     TestResults {
         failing: read.failing,
-        passing: read.passing,
+        // Never below what the exit codes already prove ran. A miscounted zero would read as "the
+        // command never ran" downstream and strand a green suite.
+        passed: read.passed.max(floor.passed),
         exit_code: floor.exit_code,
         raw_output: floor.raw_output,
     }
@@ -242,6 +272,15 @@ fn render_prompt(outcomes: &[StepOutcome]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_characterizer_is_told_there_is_nobody_to_ask() {
+        // On a live run it answered a failed acceptance step with "What would you like me to help
+        // with?" and a list of options, having invented a diagnosis of the sandbox. Its turn
+        // produced nothing, and the diagnosis was wrong and was believed.
+        assert!(PREAMBLE.contains("no human"), "the fact it lacked");
+        assert!(PREAMBLE.contains("exit code"), "why a guess is worse");
+    }
+
     fn outcome(name: &str, exit_code: i32, output: &str) -> StepOutcome {
         StepOutcome {
             name: name.to_string(),
@@ -258,7 +297,7 @@ mod tests {
             outcome("browser tests", 1, "1 failed"),
         ];
         let results = by_exit_code(&outcomes);
-        assert_eq!(results.passing, ["wasm build"]);
+        assert_eq!(results.passed, 1);
         assert_eq!(results.failing, ["browser tests"]);
         assert_eq!(results.exit_code, 1);
         // Every step's output is kept: a later step frequently explains an earlier failure.
@@ -271,9 +310,9 @@ mod tests {
         let results = by_exit_code(&[outcome("a", 0, ""), outcome("b", 0, "")]);
         assert!(results.failing.is_empty());
         assert_eq!(results.exit_code, 0);
-        // Non-empty passing matters: `converge::test_command_ran` reads empty-and-nonzero as "the
+        // A non-zero count matters: `converge::test_command_ran` reads nothing-and-nonzero as "the
         // command never ran", so a run that checked something must say so.
-        assert_eq!(results.passing.len(), 2);
+        assert_eq!(results.passed, 2);
     }
 
     #[test]
@@ -295,7 +334,7 @@ mod tests {
         // baseline and call a broken change converged.
         let blind = Characterization {
             failing: Vec::new(),
-            passing: vec!["everything".into()],
+            passed: 12,
         };
         let out = reconcile(blind, floor.clone());
         assert_eq!(
@@ -308,7 +347,7 @@ mod tests {
         // whether the run passed.
         let named = Characterization {
             failing: vec!["spec/login.spec.ts:12".into()],
-            passing: vec!["spec/home.spec.ts:3".into()],
+            passed: 3,
         };
         let out = reconcile(named, floor);
         assert_eq!(out.failing, ["spec/login.spec.ts:12"]);
@@ -320,11 +359,14 @@ mod tests {
         let floor = by_exit_code(&[outcome("tests", 0, "ok")]);
         let read = Characterization {
             failing: Vec::new(),
-            passing: vec!["store::opens".into()],
+            passed: 41,
         };
         let out = reconcile(read, floor);
         assert!(out.failing.is_empty());
-        assert_eq!(out.passing, ["store::opens"]);
+        assert_eq!(
+            out.passed, 41,
+            "the finer count is kept over the one-step floor"
+        );
     }
 
     #[test]
