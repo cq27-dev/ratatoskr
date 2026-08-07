@@ -285,8 +285,70 @@ function Question({
  * What the run is doing right now. Scoped to the selected node when there is one, because during
  * the fork two nodes are genuinely concurrent and an interleaved feed is the hardest possible read.
  */
+/** One line of the feed: an event, or a run of identical tool calls collapsed into one. */
+interface Row {
+  at: string;
+  node: string | null;
+  action: string;
+  detail: string;
+  /** The identifying argument, shown apart from the action so it can be styled as data. */
+  arg?: string;
+  /** How many identical calls this row stands for. 1 unless collapsed. */
+  count: number;
+  durationMs?: number;
+  kind: string;
+}
+
+/**
+ * Fold the raw stream into what a reader can scan.
+ *
+ * Three things happen here, all of them because a tool loop emits far more lines than it has
+ * events worth reading: a call and its result become one row, a run of the same call collapses to
+ * a count, and the argument that distinguishes one call from the next is kept.
+ */
+function rows(events: LiveEvent[]): Row[] {
+  const out: Row[] = [];
+  for (const e of events) {
+    // A result is not its own line — it finishes the call above it. Tools run one at a time, so
+    // the most recent matching call is the right one.
+    if (e.kind === "tool_result") {
+      const call = [...out].reverse().find((r) => r.kind === "tool_call" && r.node === e.node && r.action === e.detail);
+      if (call && e.duration_ms !== undefined) call.durationMs = (call.durationMs ?? 0) + e.duration_ms;
+      continue;
+    }
+    const last = out[out.length - 1];
+    // Reading four files in a row is one thing a reader wants to know, not four.
+    if (
+      last &&
+      e.kind === "tool_call" &&
+      last.kind === "tool_call" &&
+      last.node === e.node &&
+      last.action === e.detail
+    ) {
+      last.count += 1;
+      // The last argument, so the row still says where the run got to.
+      if (e.arg) last.arg = e.arg;
+      last.at = e.at;
+      continue;
+    }
+    out.push({
+      at: e.at,
+      node: e.node,
+      action: e.kind === "tool_call" ? e.detail : e.kind.replace("_", " "),
+      detail: e.kind === "tool_call" ? "" : e.detail,
+      ...(e.arg ? { arg: e.arg } : {}),
+      count: 1,
+      kind: e.kind,
+    });
+  }
+  return out;
+}
+
 function Feed({ events, node }: { events: LiveEvent[]; node: string | null }) {
-  const shown = node ? events.filter((e) => e.node === node) : events;
+  const shown = useMemo(
+    () => rows(node ? events.filter((e) => e.node === node) : events),
+    [events, node],
+  );
   const tail = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -300,12 +362,20 @@ function Feed({ events, node }: { events: LiveEvent[]; node: string | null }) {
         <output>{shown.length}</output>
       </div>
       {shown.length === 0 && <p className="empty">no activity recorded yet</p>}
-      {shown.map((e, i) => (
-        <div className="ev" key={`${e.at}-${i}`}>
-          <span className="ev-t">{clock(e.at)}</span>
-          <span className={`ev-k ev-k--${e.kind}`}>{e.kind.replace("_", " ")}</span>
-          {!node && <span className="ev-n">{e.node ?? "—"}</span>}
-          <span className="ev-d">{e.detail}</span>
+      {shown.map((r, i) => (
+        <div className="ev" key={`${r.at}-${i}`}>
+          <span className="ev-t">{clock(r.at)}</span>
+          {/* Who, then what. A feed reads as a sentence about a node, not a list of verbs. */}
+          {!node && <span className="ev-n">{r.node ?? "—"}</span>}
+          <span className={`ev-k ev-k--${r.kind}`}>
+            {r.action}
+            {r.count > 1 && <span className="ev-x"> {r.count}×</span>}
+          </span>
+          {r.arg && <span className="ev-a">{r.arg}</span>}
+          {r.detail && <span className="ev-d">{r.detail}</span>}
+          {r.durationMs !== undefined && r.durationMs >= 1000 && (
+            <span className="ev-ms">{(r.durationMs / 1000).toFixed(1)}s</span>
+          )}
         </div>
       ))}
       <div ref={tail} />

@@ -153,6 +153,10 @@ export interface LiveEvent {
   detail: string;
   /** Present on a `question` event: what an answer is posted against. */
   question_id?: string;
+  /** The one argument that identifies a tool call: the path read, the pattern searched. */
+  arg?: string;
+  /** How long a tool took, on its `tool_result`. */
+  duration_ms?: number;
   /** Present on a `node_start` event: what the node is about to run on. */
   facts?: NodeFacts;
 }

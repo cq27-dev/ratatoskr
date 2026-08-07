@@ -43,6 +43,14 @@ pub struct LiveEvent {
     /// Set on a `question` event: what a viewer's answer has to be posted against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub question_id: Option<String>,
+    /// The one argument that identifies a tool call — the path read, the pattern searched, the
+    /// command run. Without it every call reads `Read`, and a feed of forty of those says only
+    /// that the node was busy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arg: Option<String>,
+    /// How long a tool took, on its `tool_result`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     /// Set on a `node_start` event: what the node is about to run on.
     ///
     /// A checkpoint carries the same facts, but only once the node has finished — and the moment
@@ -150,6 +158,39 @@ fn node_of(record: &Value) -> Option<&str> {
         .find_map(|span| span.get("node").and_then(Value::as_str))
 }
 
+/// The argument worth showing for a tool call.
+///
+/// Tools name their subject differently — a path, a pattern, a command — so this takes the first
+/// field that identifies one, in the order a reader would look for it. Truncated hard: the feed is
+/// one line per call, and a `Write` carrying a file's whole contents would bury everything around
+/// it.
+fn tool_argument(record: &Value) -> Option<String> {
+    const IDENTIFYING: [&str; 7] = [
+        "file_path",
+        "command",
+        "pattern",
+        "path",
+        "query",
+        "symbol",
+        "name",
+    ];
+    let args: Value = serde_json::from_str(record.get("args")?.as_str()?).ok()?;
+    let found = IDENTIFYING
+        .iter()
+        .find_map(|k| args.get(k))
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })?;
+    Some(match found.char_indices().nth(ARG_LIMIT) {
+        Some((cut, _)) => format!("{}…", &found[..cut]),
+        None => found,
+    })
+}
+
+/// How much of a tool's argument the feed shows.
+const ARG_LIMIT: usize = 120;
+
 /// Normalise one log record, keeping only what a viewer can act on.
 fn to_event(record: &Value) -> LiveEvent {
     let kind = record
@@ -172,6 +213,8 @@ fn to_event(record: &Value) -> LiveEvent {
 
     LiveEvent {
         at: str_field("timestamp").unwrap_or_default().to_string(),
+        arg: tool_argument(record),
+        duration_ms: record.get("duration_ms").and_then(Value::as_u64),
         question_id: str_field("question_id").map(str::to_string),
         facts: LiveNodeFacts::of(record),
         kind,
@@ -366,6 +409,8 @@ mod tests {
             node: None,
             detail: "which way?".into(),
             question_id: Some("q-1".into()),
+            arg: None,
+            duration_ms: None,
             facts: None,
         };
         let noise = LiveEvent {
@@ -374,6 +419,8 @@ mod tests {
             node: Some("scout".into()),
             detail: "semantic_search".into(),
             question_id: None,
+            arg: None,
+            duration_ms: None,
             facts: None,
         };
 

@@ -441,6 +441,30 @@ body::after {
   min-width: 0;
 }
 
+/* The argument that distinguishes one call from the next. Takes the free space and truncates from
+   the left: the tail of a path is what identifies it, the leading directories are shared. */
+.ev-a {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+  color: var(--fg);
+}
+
+/* A collapsed run. Quiet — it is a count, not the point of the line. */
+.ev-x {
+  color: var(--muted);
+}
+
+/* How long a tool took, when it took long enough to be worth saying. */
+.ev-ms {
+  flex: none;
+  color: var(--muted);
+}
+
 .ev-t {
   color: var(--muted);
 }
