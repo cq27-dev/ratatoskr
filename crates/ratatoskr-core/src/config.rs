@@ -397,6 +397,39 @@ pub struct SandboxConfig {
     /// existing suite, a new endpoint is not accepted until something exercises the endpoint.
     #[serde(default)]
     pub pin_acceptance: bool,
+    /// Commands that populate the dependency cache, run once outside any run.
+    ///
+    /// The one place a project is allowed a network. `ratatoskr prepare` runs these in the same
+    /// image a run uses, with the network on and the [`cache`](Self::cache) mounts writable; a run
+    /// then mounts those same paths read-only and offline. So an acceptance check never resolves a
+    /// dependency, and the baseline and the post-change run cannot disagree about what a registry
+    /// served at two different moments.
+    ///
+    /// Whatever the ecosystem calls it: `cargo fetch --locked`, `bun install --frozen-lockfile`,
+    /// `go mod download`, `uv sync --frozen`. The frozen form is the point — a prepare that
+    /// resolves ranges puts unreviewed versions into every run that follows.
+    #[serde(default)]
+    pub prepare: Vec<Vec<String>>,
+    /// Prepared directories mounted into every run, read-only.
+    #[serde(default)]
+    pub cache: Vec<CacheMount>,
+}
+
+/// One prepared directory: where it lives on the host, and where a run sees it.
+///
+/// The indirection earns its keep because ecosystems disagree about where dependencies have to be.
+/// `node_modules` must sit at a specific place inside the project or the resolver will not find it;
+/// a cargo registry is wherever `CARGO_HOME` points, which is a property of the image. Naming both
+/// halves handles both without a special case for either.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CacheMount {
+    /// Directory under the project's cache root (`.ratatoskr/deps/`) that `prepare` fills.
+    pub from: String,
+    /// Where a run sees it. Absolute is taken as-is — an image-owned path like
+    /// `/usr/local/cargo/registry`. Relative is resolved against the worktree, which is what
+    /// `node_modules` needs.
+    pub at: String,
 }
 
 /// One step of an acceptance check: a name to attribute a failure to, and the command to run.
@@ -439,7 +472,46 @@ impl Default for SandboxConfig {
             test_command: vec!["cargo".to_string(), "test".to_string()],
             network_allow: Vec::new(),
             pin_acceptance: false,
+            // Nothing prepared and nothing mounted: a repository whose checks need no dependencies
+            // beyond the image works with no configuration, and one that does says so.
+            prepare: Vec::new(),
+            cache: Vec::new(),
         }
+    }
+}
+
+/// Where a project's prepared caches live, relative to its root.
+///
+/// Under `.ratatoskr/` with the rest of a project's runtime state, so it is already gitignored and
+/// already per-project — which is what several projects running at once need. A shared global cache
+/// would have to be keyed by project and locked against a `prepare` in another one.
+pub const CACHE_ROOT: &str = ".ratatoskr/deps";
+
+impl SandboxConfig {
+    /// The prepared caches a run mounts, as `(host, guest)` pairs. Always read-only to the run.
+    ///
+    /// `repo_root` is the project; `worktree` is the tree this run works in. Both are needed
+    /// because the two halves of a cache mount answer to different things — what was prepared
+    /// belongs to the project and is shared by every run of it, while where the toolchain has to
+    /// find it is frequently a path inside the tree.
+    ///
+    /// A cache that was never prepared is skipped rather than mounted: a runtime given a source
+    /// path that does not exist either invents an empty directory or refuses to start, and both
+    /// report the missing `prepare` as something else entirely.
+    pub fn cache_mounts(&self, repo_root: &Path, worktree: &Path) -> Vec<(PathBuf, PathBuf)> {
+        let root = repo_root.join(CACHE_ROOT);
+        self.cache
+            .iter()
+            .map(|c| {
+                let at = Path::new(&c.at);
+                let guest = match at.is_absolute() {
+                    true => at.to_path_buf(),
+                    false => worktree.join(at),
+                };
+                (root.join(&c.from), guest)
+            })
+            .filter(|(host, _)| host.exists())
+            .collect()
     }
 }
 
@@ -763,6 +835,75 @@ mod commit_subject_tests {
         // identifier still beats nothing.
         let one_word = d.commit_subject("fix", "", &"x".repeat(200));
         assert_eq!(one_word.chars().count(), MAX_SUBJECT_CHARS);
+    }
+}
+
+#[cfg(test)]
+mod cache_mount_tests {
+    use super::*;
+
+    fn cfg(cache: &[(&str, &str)]) -> SandboxConfig {
+        SandboxConfig {
+            cache: cache
+                .iter()
+                .map(|(from, at)| CacheMount {
+                    from: (*from).to_string(),
+                    at: (*at).to_string(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_cache_lands_where_the_ecosystem_needs_it() {
+        let repo = std::env::temp_dir().join(format!("ratatoskr-cache-{}", std::process::id()));
+        let worktree = repo.join("wt");
+        std::fs::create_dir_all(repo.join(CACHE_ROOT).join("node")).unwrap();
+        std::fs::create_dir_all(repo.join(CACHE_ROOT).join("cargo")).unwrap();
+
+        let cfg = cfg(&[
+            // `node_modules` has to sit inside the tree or the resolver will not find it…
+            ("node", "web/node_modules"),
+            // …while a cargo registry lives wherever the image put CARGO_HOME.
+            ("cargo", "/usr/local/cargo/registry"),
+        ]);
+        let mounts = cfg.cache_mounts(&repo, &worktree);
+        assert_eq!(
+            mounts,
+            [
+                (
+                    repo.join(CACHE_ROOT).join("node"),
+                    worktree.join("web/node_modules")
+                ),
+                (
+                    repo.join(CACHE_ROOT).join("cargo"),
+                    PathBuf::from("/usr/local/cargo/registry")
+                ),
+            ]
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_cache_nobody_prepared_is_not_mounted() {
+        // Mounting a source that does not exist gets an empty directory from one runtime and a
+        // refusal from another, and both report "you never ran prepare" as something else — a
+        // resolver failing on a dependency, or the sandbox failing to start at all.
+        let repo =
+            std::env::temp_dir().join(format!("ratatoskr-cache-none-{}", std::process::id()));
+        let mounts = cfg(&[("node", "web/node_modules")]).cache_mounts(&repo, &repo.join("wt"));
+        assert!(mounts.is_empty(), "{mounts:?}");
+    }
+
+    #[test]
+    fn a_project_with_nothing_to_prepare_mounts_nothing() {
+        assert!(
+            SandboxConfig::default()
+                .cache_mounts(Path::new("/repo"), Path::new("/wt"))
+                .is_empty()
+        );
     }
 }
 

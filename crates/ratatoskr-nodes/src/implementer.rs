@@ -16,14 +16,16 @@ use ratatoskr_agent::RunLedger;
 use ratatoskr_agent::shell::ShellAccess;
 use ratatoskr_core::{ModelRoute, SandboxConfig, ToolPolicy};
 use ratatoskr_exec::worktree::{self, WorktreePath};
-use ratatoskr_exec::{Mount, SandboxSpec, create_worktree, remove_worktree};
+use ratatoskr_exec::{SandboxSpec, create_worktree, remove_worktree};
 use ratatoskr_graph::{NodeError, parse_validated};
 use ratatoskr_mcp::ToolSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::analyst::AnalystOutput;
-use crate::testrun::{Characterizer, GUEST_WORKSPACE, by_exit_code, run_acceptance};
+use crate::testrun::{
+    Acceptance, Characterizer, GUEST_WORKSPACE, by_exit_code, mounts_for, run_acceptance,
+};
 
 /// Implementer output. Test fields are deterministic; `diff_summary`/`touched_files`/`narrative`
 /// are best-effort context (relaxed) for the bookkeeper in Phase 4.
@@ -234,13 +236,14 @@ impl ImplementerNode {
         .map_err(|e| NodeError::Failed(format!("implementer agent failed: {e}")))?;
         let report = parse_validated::<Report>(&raw)?;
 
-        let outcomes = run_acceptance(
-            &self.sandbox,
-            "implementer",
-            &format!("ratatoskr-impl-{}", self.short_id()),
-            worktree.as_path(),
-            &self.acceptance,
-        )
+        let outcomes = run_acceptance(Acceptance {
+            cfg: &self.sandbox,
+            node: "implementer",
+            name: &format!("ratatoskr-impl-{}", self.short_id()),
+            repo_root: &self.repo_path,
+            worktree: worktree.as_path(),
+            steps: &self.acceptance,
+        })
         .await
         .map_err(NodeError::Failed)?;
         let tests = match &self.characterizer {
@@ -281,12 +284,10 @@ impl ImplementerNode {
                 name: format!("ratatoskr-impl-{}", self.short_id()),
                 image: self.sandbox.image.clone(),
                 workdir: GUEST_WORKSPACE.to_string(),
-                mounts: vec![Mount {
-                    host: worktree.as_path().to_path_buf(),
-                    guest: GUEST_WORKSPACE.to_string(),
-                    // The node whose job is to change the tree.
-                    read_only: false,
-                }],
+                // The worktree it changes, plus whatever `prepare` left in the project's caches.
+                // The same set the acceptance check gets, so a command the implementer runs by
+                // hand behaves as it will when the check runs it.
+                mounts: mounts_for(&self.sandbox, &self.repo_path, worktree.as_path()),
                 // Filled in per call.
                 command: Vec::new(),
                 cpus: 2,

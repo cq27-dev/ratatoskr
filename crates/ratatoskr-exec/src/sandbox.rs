@@ -147,6 +147,13 @@ fn host_user() -> Option<String> {
 /// `~/.aws`, `~/.npmrc` — is not readable; the mounts are the only host filesystem in scope. And
 /// nothing carries this process's environment across: a container starts from the image's, which is
 /// the same guarantee `--clearenv` buys the bwrap backend, here by construction.
+///
+/// A mount lands at its `guest` path here, unlike the bwrap backend, which can only mount in place
+/// — the host root is `--ro-bind`ed there, so there is nowhere to create a fresh mount point. That
+/// difference is why a prepared dependency cache is a container-backend feature: putting
+/// `node_modules` where a resolver will find it means mounting one host path at a completely
+/// different guest path, which is exactly what mounting in place cannot do. (Under bwrap the host
+/// root is visible anyway, so the cache has nothing to add there.)
 fn container_argv(spec: &SandboxSpec, user: Option<&str>) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -169,21 +176,16 @@ fn container_argv(spec: &SandboxSpec, user: Option<&str>) -> Vec<String> {
     args.push("--memory".into());
     args.push(format!("{}m", spec.memory_mib));
 
-    // Mounted in place (guest path = host path), as the bwrap backend does, so a workdir and the
-    // paths in a command's output mean the same thing on both. Translate a guest workdir that
-    // names a mount to the corresponding host path.
-    let mut workdir = spec.workdir.clone();
+    // Each mount at the guest path it asked for, so `workdir` and the paths in a command's output
+    // are the guest's own and need no translation.
     for m in &spec.mounts {
         let host = m.host.to_string_lossy().into_owned();
-        if spec.workdir == m.guest {
-            workdir.clone_from(&host);
-        }
         args.push("--volume".into());
         let mode = if m.read_only { ":ro" } else { "" };
-        args.push(format!("{host}:{host}{mode}"));
+        args.push(format!("{host}:{}{mode}", m.guest));
     }
     args.push("--workdir".into());
-    args.push(workdir);
+    args.push(spec.workdir.clone());
     args.push(spec.image.clone());
     args.extend(spec.command.iter().cloned());
     args
@@ -482,15 +484,17 @@ mod tests {
             .filter(|(i, _)| i > &0 && argv[i - 1] == "--volume")
             .map(|(_, v)| v)
             .collect();
-        assert_eq!(volumes, [&format!("{tmp}:{tmp}")], "{argv:?}");
+        // At its guest path, not in place. This is what the bwrap backend cannot do — the host
+        // root is `--ro-bind`ed there, so there is nowhere to create a fresh mount point — and it
+        // is why a prepared cache is a container-backend feature: `node_modules` has to land where
+        // a resolver looks, which is not where the cache is stored.
+        assert_eq!(volumes, [&format!("{tmp}:/workspace")], "{argv:?}");
 
-        // The workdir names a mount, so it is translated to the host path the mount lands on —
-        // guest path equals host path here, the same contract the bwrap backend has.
         let at = argv
             .iter()
             .position(|a| a == "--workdir")
             .expect("a workdir");
-        assert_eq!(argv[at + 1], tmp, "{argv:?}");
+        assert_eq!(argv[at + 1], "/workspace", "{argv:?}");
 
         // Offline unless the step asked otherwise.
         assert!(
@@ -524,6 +528,26 @@ mod tests {
         assert!(
             argv.windows(2).any(|w| w == ["--user", "1000:1000"]),
             "{argv:?}"
+        );
+
+        // A read-only mount says so where the runtime reads it, which is what stops a check
+        // rewriting the prepared cache that several runs are reading at once.
+        let cached = container_argv(
+            &SandboxSpec {
+                mounts: vec![Mount {
+                    host: "/repo/.ratatoskr/deps/node".into(),
+                    guest: "/wt/web/node_modules".into(),
+                    read_only: true,
+                }],
+                ..container_spec(&["true"])
+            },
+            None,
+        );
+        assert!(
+            cached
+                .iter()
+                .any(|a| a == "/repo/.ratatoskr/deps/node:/wt/web/node_modules:ro"),
+            "{cached:?}"
         );
 
         // And on a host where the id cannot be read, the argument is omitted rather than guessed

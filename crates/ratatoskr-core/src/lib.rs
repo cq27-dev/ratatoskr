@@ -10,9 +10,9 @@ pub mod state;
 pub mod telemetry;
 
 pub use config::{
-    AcceptanceStep, ConfigError, DEFAULT_MAX_TOKENS, EndpointConfig, HookLimits, ImplementerConfig,
-    MAX_SUBJECT_CHARS, ModelRoute, PluginConfig, PublishConfig, RagRatConfig, RatatoskrConfig,
-    SandboxConfig, SessionScope, StoreConfig, WorktreeConfig,
+    AcceptanceStep, CACHE_ROOT, CacheMount, ConfigError, DEFAULT_MAX_TOKENS, EndpointConfig,
+    HookLimits, ImplementerConfig, MAX_SUBJECT_CHARS, ModelRoute, PluginConfig, PublishConfig,
+    RagRatConfig, RatatoskrConfig, SandboxConfig, SessionScope, StoreConfig, WorktreeConfig,
 };
 pub use policy::{ToolDecision, ToolPolicy};
 pub use state::{RunState, RunStatus};
