@@ -159,6 +159,31 @@ test_command = ["cargo", "test"]
 # request, which a namespace cannot.
 network_allow = []
 
+# Fetch this project's dependencies once, outside any run, with `ratatoskr prepare`. Runs then
+# mount what it left, read-only and with no network — so an acceptance check never resolves a
+# dependency, and the baseline and post-change runs cannot disagree about what a registry served at
+# two different moments. Requires `backend = "container"`: mounting one host path at a different
+# guest path is what puts `node_modules` where a resolver looks, and the bwrap backend can only
+# mount in place.
+#
+# The project is mounted READ-ONLY while these run, so use the frozen form of each command — a
+# prepare that rewrites its lockfile would make every later run depend on the day it ran.
+#
+#   prepare = [["npm", "ci"], ["cargo", "fetch", "--locked"]]
+#
+# Each cache names where it is stored (`from`, under `.ratatoskr/deps/`) and where a run sees it
+# (`at` — absolute taken as-is, for an image-owned path like a cargo registry; relative resolved
+# against the worktree, which is what `node_modules` needs).
+#
+#   [[sandbox.cache]]
+#   from = "node_modules"
+#   at   = "crates/ratatoskr-serve/web/node_modules"
+#
+#   [[sandbox.cache]]
+#   from = "cargo-registry"
+#   at   = "/usr/local/cargo/registry"
+prepare = []
+
 # Ignore whatever the analyst proposes and always run test_command. For a repo that does not want
 # a model deciding what proves its code works.
 pin_acceptance = false

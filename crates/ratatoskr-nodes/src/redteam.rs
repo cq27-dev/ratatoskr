@@ -16,7 +16,7 @@ use ratatoskr_mcp::ToolSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::testrun::{Characterizer, by_exit_code, run_acceptance};
+use crate::testrun::{Acceptance, Characterizer, by_exit_code, run_acceptance};
 
 /// rag-rat tools the classifier may use to inspect the failing tests' code.
 pub const CLASSIFIER_TOOLS: &[&str] = &["symbol_lookup", "semantic_search"];
@@ -325,13 +325,14 @@ impl RedTeamNode {
 
     pub async fn run(&self) -> Result<RedTeamOutput, NodeError> {
         let worktree = self.baseline_worktree().await?;
-        let outcomes = run_acceptance(
-            &self.sandbox,
-            "red_team",
-            &self.name,
-            worktree.as_path(),
-            &self.acceptance,
-        )
+        let outcomes = run_acceptance(Acceptance {
+            cfg: &self.sandbox,
+            node: "red_team",
+            name: &self.name,
+            repo_root: &self.repo_path,
+            worktree: worktree.as_path(),
+            steps: &self.acceptance,
+        })
         .await;
         self.discard(worktree).await;
         let outcomes = outcomes.map_err(NodeError::Failed)?;

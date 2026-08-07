@@ -56,18 +56,59 @@ pub struct TestResults {
     pub raw_output: String,
 }
 
+/// What an acceptance run needs: the policy, who is running it, and the two paths it spans.
+pub struct Acceptance<'a> {
+    pub cfg: &'a SandboxConfig,
+    /// The node running these steps, so a failure in the log is attributable.
+    pub node: &'a str,
+    /// Sandbox name prefix; each step gets its own suffix.
+    pub name: &'a str,
+    /// The project. Its prepared dependency caches are shared by every run of it.
+    pub repo_root: &'a Path,
+    /// The tree these steps run in — this run's worktree, never the checkout.
+    pub worktree: &'a Path,
+    pub steps: &'a [AcceptanceStep],
+}
+
+/// The worktree, writable, plus whatever `prepare` left in the project's caches, read-only.
+///
+/// The caches are how a check runs offline in a tree that was just forked and has no dependencies
+/// in it. Read-only for two reasons: several runs across several projects read them at once, and a
+/// check that could write to one would be changing what every later run sees.
+pub fn mounts_for(cfg: &SandboxConfig, repo_root: &Path, worktree: &Path) -> Vec<Mount> {
+    let mut mounts = vec![Mount {
+        host: worktree.to_path_buf(),
+        guest: GUEST_WORKSPACE.to_string(),
+        // Writable: a check builds, and a build writes — `target/`, `.pytest_cache`, a bundler's
+        // output. The tree is the run's own worktree, never the checkout.
+        read_only: false,
+    }];
+    mounts.extend(
+        cfg.cache_mounts(repo_root, worktree)
+            .into_iter()
+            .map(|(host, guest)| Mount {
+                host,
+                guest: guest.display().to_string(),
+                read_only: true,
+            }),
+    );
+    mounts
+}
+
 /// Run each acceptance step in a sandbox, in order.
 ///
 /// Steps run even after one fails: a later step's output frequently explains an earlier failure,
 /// and stopping early would report a build error as "the tests did not run" with nothing to say
 /// why. The exit code carries the failure regardless of where it happened.
-pub async fn run_acceptance(
-    cfg: &SandboxConfig,
-    node: &str,
-    name: &str,
-    host_path: &Path,
-    steps: &[AcceptanceStep],
-) -> Result<Vec<StepOutcome>, String> {
+pub async fn run_acceptance(a: Acceptance<'_>) -> Result<Vec<StepOutcome>, String> {
+    let Acceptance {
+        cfg,
+        node,
+        name,
+        repo_root,
+        worktree,
+        steps,
+    } = a;
     let mut outcomes = Vec::with_capacity(steps.len());
     for (i, step) in steps.iter().enumerate() {
         let spec = SandboxSpec {
@@ -76,10 +117,7 @@ pub async fn run_acceptance(
             name: format!("{name}-{i}"),
             image: cfg.image.clone(),
             workdir: GUEST_WORKSPACE.to_string(),
-            mounts: vec![Mount {
-                host: host_path.to_path_buf(),
-                guest: GUEST_WORKSPACE.to_string(),
-            }],
+            mounts: mounts_for(cfg, repo_root, worktree),
             command: step.command.clone(),
             cpus: 2,
             memory_mib: 2048,
@@ -275,6 +313,41 @@ fn render_prompt(outcomes: &[StepOutcome]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_check_may_write_its_tree_and_may_not_write_the_cache() {
+        // The distinction the whole prepared-cache design rests on. The worktree is this run's own
+        // and a build writes to it. The cache is shared by every run of the project — several of
+        // them at once — so a check that could write to one would be changing what the next run
+        // sees, and the baseline and post-change runs would stop being comparable.
+        let repo = std::env::temp_dir().join(format!("ratatoskr-mounts-{}", std::process::id()));
+        let worktree = repo.join("wt");
+        std::fs::create_dir_all(repo.join(ratatoskr_core::CACHE_ROOT).join("node")).unwrap();
+        let cfg = SandboxConfig {
+            cache: vec![ratatoskr_core::CacheMount {
+                from: "node".into(),
+                at: "web/node_modules".into(),
+            }],
+            ..Default::default()
+        };
+
+        let mounts = mounts_for(&cfg, &repo, &worktree);
+        assert_eq!(mounts.len(), 2, "{mounts:?}");
+        assert_eq!(mounts[0].host, worktree);
+        assert!(!mounts[0].read_only, "the tree a build writes to");
+        assert_eq!(
+            mounts[1].host,
+            repo.join(ratatoskr_core::CACHE_ROOT).join("node")
+        );
+        assert!(mounts[1].read_only, "the cache every run shares");
+        // And it lands where the resolver looks, not where it was stored.
+        assert_eq!(
+            mounts[1].guest,
+            worktree.join("web/node_modules").display().to_string()
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
 
     #[test]
     fn the_characterizer_is_told_there_is_nobody_to_ask() {
