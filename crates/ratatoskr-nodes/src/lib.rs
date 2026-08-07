@@ -1821,7 +1821,15 @@ pub(crate) fn build_characterizer(
     {
         return Ok(None);
     }
-    let plugins = context.for_node("characterizer");
+    // No skills either, and this is the seam that enforces it: `node_agent_config` grants the
+    // `Skill` tool whenever a node has skills bound, while the hook that answers it is installed
+    // from what the caller passes to `run_structured`. `Characterizer` passes none — so leaving
+    // skills bound here would offer it a tool whose result nothing can produce, and a node that
+    // reads a tool error as an instruction is a failure this repo has already paid for once.
+    let plugins = NodePlugins {
+        skills: Vec::new(),
+        ..context.for_node("characterizer")
+    };
     // No default tools: it transcribes output it was handed. Reading the repo would invite it to
     // decide whether a failure matters, which is the one thing it must not do.
     let cfg = node_agent_config(
@@ -2389,7 +2397,7 @@ async fn fork_and_converge(
     // produced no tests, converge would compare against empty data and falsely "converge".
     if !converge::test_command_ran(
         &red_team_out.failing_tests,
-        &red_team_out.passing_tests,
+        red_team_out.passed_tests,
         red_team_out.exit_code,
     ) {
         return Err(PlanError::node(
@@ -2416,7 +2424,7 @@ async fn fork_and_converge(
     let status = loop {
         let post_ran = converge::test_command_ran(
             &impl_out.failing_tests,
-            &impl_out.passing_tests,
+            impl_out.passed_tests,
             impl_out.exit_code,
         );
         // Tests written for this change before it existed. They fail in the baseline as a matter
@@ -3048,6 +3056,32 @@ mod agent_config_tests {
         // the default, which is stricter than P1, and warns.
         assert_eq!(parse_threshold("critical"), Severity::P2);
         assert_eq!(parse_threshold(""), Severity::P2);
+    }
+
+    #[test]
+    fn the_characterizer_is_offered_no_tool_it_cannot_answer() {
+        // It passes no skills to `run_structured`, so the `SkillHook` is never installed. Granting
+        // it the `Skill` tool anyway leaves a tool whose call can only return an error — and a node
+        // reading a tool error as an instruction is exactly how the publisher once published
+        // nothing.
+        let plugins = NodePlugins {
+            skills: vec![ratatoskr_plugin::Skill {
+                name: "review".into(),
+                description: "how to review".into(),
+                body: "...".into(),
+                dir: std::path::PathBuf::new(),
+            }],
+            ..Default::default()
+        };
+        assert!(
+            crate::skills::skill_tool(&plugins.skills).is_some(),
+            "a node WITH skills bound is offered the tool — the grant itself is not the bug"
+        );
+        let stripped = NodePlugins {
+            skills: Vec::new(),
+            ..plugins
+        };
+        assert!(crate::skills::skill_tool(&stripped.skills).is_none());
     }
 
     #[test]

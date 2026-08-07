@@ -110,6 +110,13 @@ model = "kimi-k2.5"
 # [models.characterizer]
 # provider = "moonshot"
 # model = "kimi-k2.5"
+#
+# It transcribes; it never judges. Pin thinking off — an endpoint that turns reasoning on unasked
+# buys a reasoning pass in front of every transcription, and this node runs on every acceptance
+# run, twice per converge iteration.
+#
+#   [models.characterizer.params.thinking]
+#   type = "disabled"
 
 # The implementer edits an isolated worktree and runs its checks in the sandbox. It needs a
 # [models.implementer] route like any other node.

@@ -685,7 +685,7 @@ mod tests {
                 touched_files: touched.iter().map(|s| (*s).to_string()).collect(),
                 rewritten_files: Vec::new(),
                 failing_tests: Vec::new(),
-                passing_tests: Vec::new(),
+                passed_tests: 0,
                 exit_code: 0,
                 narrative: None,
             },

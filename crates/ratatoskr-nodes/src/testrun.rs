@@ -47,7 +47,9 @@ impl StepOutcome {
 #[derive(Debug, Clone)]
 pub struct TestResults {
     pub failing: Vec<String>,
-    pub passing: Vec<String>,
+    /// How many checks passed. At the exit-code floor this counts whole steps; when a
+    /// characterizer read the output it counts individual checks.
+    pub passed: usize,
     /// The first non-zero exit across the steps; zero only if every step succeeded.
     pub exit_code: i32,
     /// Combined output — context for the optional failure classifier.
@@ -117,7 +119,7 @@ pub fn by_exit_code(outcomes: &[StepOutcome]) -> TestResults {
     let (failing, passing): (Vec<_>, Vec<_>) = outcomes.iter().partition(|o| !o.ok());
     TestResults {
         failing: failing.iter().map(|o| o.name.clone()).collect(),
-        passing: passing.iter().map(|o| o.name.clone()).collect(),
+        passed: passing.len(),
         exit_code: outcomes
             .iter()
             .map(|o| o.exit_code)
@@ -157,8 +159,13 @@ const PREAMBLE: &str = include_str!("../prompts/characterizer.md");
 struct Characterization {
     #[serde(default)]
     failing: Vec<String>,
+    /// How many checks passed — a count, never the names.
+    ///
+    /// Nothing downstream reads a passing check's name: converge compares failures, and the only
+    /// other readers ask "did anything run" and "how many". Transcribing a few hundred identifiers
+    /// to answer that is the single largest output in the pipeline, and it grows with the suite.
     #[serde(default)]
-    passing: Vec<String>,
+    passed: usize,
 }
 
 /// Reads an acceptance run's raw output and names the checks inside it.
@@ -233,7 +240,9 @@ fn reconcile(read: Characterization, floor: TestResults) -> TestResults {
     }
     TestResults {
         failing: read.failing,
-        passing: read.passing,
+        // Never below what the exit codes already prove ran. A miscounted zero would read as "the
+        // command never ran" downstream and strand a green suite.
+        passed: read.passed.max(floor.passed),
         exit_code: floor.exit_code,
         raw_output: floor.raw_output,
     }
@@ -283,7 +292,7 @@ mod tests {
             outcome("browser tests", 1, "1 failed"),
         ];
         let results = by_exit_code(&outcomes);
-        assert_eq!(results.passing, ["wasm build"]);
+        assert_eq!(results.passed, 1);
         assert_eq!(results.failing, ["browser tests"]);
         assert_eq!(results.exit_code, 1);
         // Every step's output is kept: a later step frequently explains an earlier failure.
@@ -296,9 +305,9 @@ mod tests {
         let results = by_exit_code(&[outcome("a", 0, ""), outcome("b", 0, "")]);
         assert!(results.failing.is_empty());
         assert_eq!(results.exit_code, 0);
-        // Non-empty passing matters: `converge::test_command_ran` reads empty-and-nonzero as "the
+        // A non-zero count matters: `converge::test_command_ran` reads nothing-and-nonzero as "the
         // command never ran", so a run that checked something must say so.
-        assert_eq!(results.passing.len(), 2);
+        assert_eq!(results.passed, 2);
     }
 
     #[test]
@@ -320,7 +329,7 @@ mod tests {
         // baseline and call a broken change converged.
         let blind = Characterization {
             failing: Vec::new(),
-            passing: vec!["everything".into()],
+            passed: 12,
         };
         let out = reconcile(blind, floor.clone());
         assert_eq!(
@@ -333,7 +342,7 @@ mod tests {
         // whether the run passed.
         let named = Characterization {
             failing: vec!["spec/login.spec.ts:12".into()],
-            passing: vec!["spec/home.spec.ts:3".into()],
+            passed: 3,
         };
         let out = reconcile(named, floor);
         assert_eq!(out.failing, ["spec/login.spec.ts:12"]);
@@ -345,11 +354,14 @@ mod tests {
         let floor = by_exit_code(&[outcome("tests", 0, "ok")]);
         let read = Characterization {
             failing: Vec::new(),
-            passing: vec!["store::opens".into()],
+            passed: 41,
         };
         let out = reconcile(read, floor);
         assert!(out.failing.is_empty());
-        assert_eq!(out.passing, ["store::opens"]);
+        assert_eq!(
+            out.passed, 41,
+            "the finer count is kept over the one-step floor"
+        );
     }
 
     #[test]

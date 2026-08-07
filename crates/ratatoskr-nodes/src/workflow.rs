@@ -198,7 +198,7 @@ fn infer_status(
     }
     let post_ran = converge::test_command_ran(
         &implementer.failing_tests,
-        &implementer.passing_tests,
+        implementer.passed_tests,
         implementer.exit_code,
     );
     if post_ran && converge::is_converged(&red_team.failing_tests, &implementer.failing_tests) {
@@ -255,7 +255,7 @@ struct RunShape {
     #[serde(default)]
     failing_tests: Vec<String>,
     #[serde(default)]
-    passing_tests: Vec<String>,
+    passed_tests: usize,
     #[serde(default)]
     exit_code: i32,
 }
@@ -454,7 +454,7 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
     // Checkpoint before the guard so a failed baseline stays inspectable.
     note(&ctx, "red_team", &out, None).await?;
     // The false-convergence guard is enforced here — the script cannot skip it.
-    if !converge::test_command_ran(&out.failing_tests, &out.passing_tests, out.exit_code) {
+    if !converge::test_command_ran(&out.failing_tests, out.passed_tests, out.exit_code) {
         return Err(format!(
             "the baseline acceptance run produced no checks (exit {}); check the analyst's acceptance, [sandbox] test_command and the sandbox backend",
             out.exit_code
@@ -552,7 +552,7 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String,
         .await
         .map_err(|e| e.to_string())?;
     let post_ran =
-        converge::test_command_ran(&prev.failing_tests, &prev.passing_tests, prev.exit_code);
+        converge::test_command_ran(&prev.failing_tests, prev.passed_tests, prev.exit_code);
     let referee = converge::referee_touches(&prev.rewritten_files, ctx.engine.may_modify_tests());
     // Referee first, same as the built-in loop: a moved referee makes the test sets meaningless,
     // so reverting it is what this iteration has to be told to do.
@@ -598,7 +598,7 @@ async fn is_converged_host(_ctx: Arc<WorkflowContext>, arg: String) -> Result<St
 
 async fn test_command_ran_host(_ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
     let s: RunShape = serde_json::from_str(&arg).map_err(|e| format!("testCommandRan arg: {e}"))?;
-    let v = converge::test_command_ran(&s.failing_tests, &s.passing_tests, s.exit_code);
+    let v = converge::test_command_ran(&s.failing_tests, s.passed_tests, s.exit_code);
     serde_json::to_string(&v).map_err(|e| e.to_string())
 }
 
@@ -1028,7 +1028,7 @@ mod tests {
         RedTeamOutput {
             authored: None,
             failing_tests: failing.iter().map(|s| s.to_string()).collect(),
-            passing_tests: passing.iter().map(|s| s.to_string()).collect(),
+            passed_tests: passing.len(),
             exit_code: exit,
             classifications: vec![],
         }
@@ -1041,7 +1041,7 @@ mod tests {
             touched_files: vec![],
             rewritten_files: Vec::new(),
             failing_tests: failing.iter().map(|s| s.to_string()).collect(),
-            passing_tests: passing.iter().map(|s| s.to_string()).collect(),
+            passed_tests: passing.len(),
             exit_code: exit,
             narrative: None,
         }
@@ -1184,7 +1184,7 @@ mod tests {
     async fn iterations_count_from_implementer_checkpoints() {
         let store = Store::open_in_memory().unwrap();
         store.upsert_run("r1", None, "running").await.unwrap();
-        let cp = r#"{"worktree_path":"/w","failing_tests":[],"passing_tests":["t"],"exit_code":0}"#;
+        let cp = r#"{"worktree_path":"/w","failing_tests":[],"passed_tests":1,"exit_code":0}"#;
         for _ in 0..3 {
             store
                 .insert_checkpoint(ratatoskr_store::CheckpointWrite {

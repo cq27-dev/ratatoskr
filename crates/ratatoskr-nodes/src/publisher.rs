@@ -135,7 +135,7 @@ fn render_prompt(input: &PublisherInput) -> String {
                 s,
                 "\nACCEPTANCE: {} failing, {} passing (exit {}).\n",
                 im.failing_tests.len(),
-                im.passing_tests.len(),
+                im.passed_tests,
                 im.exit_code
             );
             if !im.failing_tests.is_empty() {
@@ -170,7 +170,7 @@ mod tests {
             touched_files: vec!["store.rs".into()],
             rewritten_files: Vec::new(),
             failing_tests: failing.iter().map(|f| (*f).to_string()).collect(),
-            passing_tests: vec!["a".into(), "b".into()],
+            passed_tests: 2,
             exit_code: if failing.is_empty() { 0 } else { 101 },
             narrative: None,
         }

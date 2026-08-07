@@ -39,8 +39,8 @@ pub fn is_converged(baseline_failing: &[String], post_failing: &[String]) -> boo
 /// command didn't run to completion (a broken build, a missing runner, a sandbox mis-mount) — NOT
 /// "no failures". Without this guard, both branches report zero tests and converge falsely reports
 /// success on empty data (the failure mode the first live run hit).
-pub fn test_command_ran(failing: &[String], passing: &[String], exit_code: i32) -> bool {
-    !failing.is_empty() || !passing.is_empty() || exit_code == 0
+pub fn test_command_ran(failing: &[String], passed: usize, exit_code: i32) -> bool {
+    !failing.is_empty() || passed > 0 || exit_code == 0
 }
 
 /// Runner configuration, by exact filename. `Cargo.toml` and `package.json` are referee files only
@@ -248,10 +248,12 @@ mod tests {
     #[test]
     fn zero_tests_with_nonzero_exit_did_not_run() {
         // The false-convergence case: no tests parsed and the command failed.
-        assert!(!test_command_ran(&v(&[]), &v(&[]), 101));
+        assert!(!test_command_ran(&v(&[]), 0, 101));
         // A genuinely empty suite that exited 0 counts as "ran" (nothing to break).
-        assert!(test_command_ran(&v(&[]), &v(&[]), 0));
+        assert!(test_command_ran(&v(&[]), 0, 0));
         // Any parsed test means it ran, regardless of exit code.
-        assert!(test_command_ran(&v(&["a"]), &v(&[]), 101));
+        assert!(test_command_ran(&v(&["a"]), 0, 101));
+        // A passing count alone proves it ran, which is the whole reason the count is carried.
+        assert!(test_command_ran(&v(&[]), 285, 101));
     }
 }

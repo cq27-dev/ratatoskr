@@ -50,7 +50,11 @@ pub struct RedTeamOutput {
     #[serde(default)]
     pub authored: Option<AuthoredTests>,
     pub failing_tests: Vec<String>,
-    pub passing_tests: Vec<String>,
+    /// How many checks passed. Only the count is carried: nothing reads a passing check's name,
+    /// and a suite of several hundred costs the characterizer more output than the rest of the
+    /// pipeline combined to write out.
+    #[serde(default)]
+    pub passed_tests: usize,
     pub exit_code: i32,
     #[serde(default)]
     pub classifications: Vec<FailureClassification>,
@@ -302,7 +306,7 @@ impl RedTeamNode {
         Ok(RedTeamOutput {
             authored: None,
             failing_tests: results.failing,
-            passing_tests: results.passing,
+            passed_tests: results.passed,
             exit_code: results.exit_code,
             classifications,
         })

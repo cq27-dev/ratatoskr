@@ -622,7 +622,7 @@ fn print_run_summary(run_id: &str, outcome: &ratatoskr_nodes::RunOutcome) {
     println!(
         "\nBASELINE (red-team): {} failing, {} passing",
         rt.failing_tests.len(),
-        rt.passing_tests.len()
+        rt.passed_tests
     );
     for c in &rt.classifications {
         let reason = if c.reason.is_empty() {
@@ -636,7 +636,7 @@ fn print_run_summary(run_id: &str, outcome: &ratatoskr_nodes::RunOutcome) {
     println!(
         "AFTER CHANGE: {} failing, {} passing",
         im.failing_tests.len(),
-        im.passing_tests.len()
+        im.passed_tests
     );
 
     let new_failures =

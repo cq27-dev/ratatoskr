@@ -42,7 +42,11 @@ pub struct ImplementerOutput {
     #[serde(default)]
     pub rewritten_files: Vec<String>,
     pub failing_tests: Vec<String>,
-    pub passing_tests: Vec<String>,
+    /// How many checks passed. Only the count is carried: nothing reads a passing check's name,
+    /// and a suite of several hundred costs the characterizer more output than the rest of the
+    /// pipeline combined to write out.
+    #[serde(default)]
+    pub passed_tests: usize,
     pub exit_code: i32,
     /// The CLI's own narrative of what it did (optional).
     #[serde(default)]
@@ -225,7 +229,7 @@ impl ImplementerNode {
             touched_files,
             rewritten_files,
             failing_tests: tests.failing,
-            passing_tests: tests.passing,
+            passed_tests: tests.passed,
             exit_code: tests.exit_code,
             narrative: Some(report.summary),
         })
