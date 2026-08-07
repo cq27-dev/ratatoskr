@@ -64,6 +64,15 @@ impl Launcher {
     /// this server's memory — invisible in the store, lost on restart, and impossible to show
     /// honestly in a UI whose entire model is "what the store recorded". Refusing keeps every
     /// accepted run real.
+    /// How many runs this launcher has in flight.
+    ///
+    /// The only externally visible trace that a spawn happened, which is what lets a test assert
+    /// that a refused request refused it — a handler that answers 200 either way cannot be told
+    /// apart by its status.
+    pub fn in_flight(&self) -> usize {
+        self.max.saturating_sub(self.permits.available_permits())
+    }
+
     pub fn spawn(&self, issue: &str) -> Result<String, LaunchError> {
         if issue.trim().is_empty() {
             return Err(LaunchError::EmptyIssue);

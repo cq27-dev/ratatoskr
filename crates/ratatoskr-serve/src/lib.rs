@@ -13,6 +13,7 @@
 pub mod auth;
 pub mod clarify;
 pub mod events;
+pub mod github;
 pub mod launch;
 pub mod pipeline;
 pub mod project;
@@ -63,6 +64,9 @@ struct AppState {
     auth: AuthStore,
     /// Failed sign-ins, so a password cannot be guessed at network speed.
     throttle: Arc<auth::LoginThrottle>,
+    /// The GitHub integration, when one is configured. `None` leaves the webhook route refusing
+    /// everything, which is what an instance that has not set it up should do.
+    github: Option<Arc<github::GitHubConfig>>,
     /// Whether to mark the session cookie `Secure` and give it the `__Host-` prefix.
     ///
     /// Off for a loopback instance, where a browser would discard such a cookie outright, and on
@@ -142,6 +146,8 @@ pub struct ServeOptions {
     /// Whether this instance is reached over TLS, which decides the session cookie's attributes.
     /// See [`AppState::secure_cookies`].
     pub secure_cookies: bool,
+    /// The GitHub integration, if this instance has one.
+    pub github: Option<github::GitHubConfig>,
 }
 
 /// Serve the dashboard for one or more projects.
@@ -153,6 +159,7 @@ pub async fn serve(opts: ServeOptions) -> Result<(), ServeError> {
         max_runs,
         auth_db,
         secure_cookies,
+        github,
     } = opts;
     // Bind before opening the projects: a spawned run is told where to reach this server, and with
     // port 0 the real port isn't known until the listener exists.
@@ -180,12 +187,34 @@ pub async fn serve(opts: ServeOptions) -> Result<(), ServeError> {
             auth_db.display()
         );
     }
+    if let Some(config) = &github {
+        let addressable: Vec<&str> = projects
+            .values()
+            .filter_map(|p| p.repository.as_deref())
+            .collect();
+        if addressable.is_empty() {
+            // Configured but useless: nothing here has a GitHub origin, so every delivery would be
+            // about a repository this instance does not serve.
+            tracing::warn!(
+                "the GitHub integration is configured as /{}, but no project has a GitHub origin \
+                 — mentions will be ignored",
+                config.trigger
+            );
+        } else {
+            tracing::info!(
+                "@{} can start runs on {}",
+                config.trigger,
+                addressable.join(", ")
+            );
+        }
+    }
     let state = AppState {
         projects: Arc::clone(&projects),
         desk,
         auth,
         throttle: Arc::new(auth::LoginThrottle::default()),
         secure_cookies,
+        github: github.map(Arc::new),
     };
 
     for slug in projects.keys() {
@@ -254,6 +283,9 @@ fn router(state: AppState, web: Option<PathBuf>) -> Router {
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(whoami))
+        // Public by necessity: GitHub has to reach it. Its signature is what makes a delivery
+        // trustworthy — see the module docs.
+        .route("/api/integrations/github", post(github_webhook))
         .route("/api/projects", get(list_projects))
         .route(
             "/api/projects/{project}/runs",
@@ -298,6 +330,91 @@ fn internal_router(state: AppState) -> Router {
     Router::new()
         .route("/internal/clarifications", post(await_answer))
         .with_state(state)
+}
+
+/// Start a run because someone mentioned the bot in an issue.
+///
+/// Answers 200 to anything correctly signed, whether or not it did something. GitHub retries a
+/// delivery that fails, and there is nothing to retry about a comment that was not addressed to us
+/// or came from someone we do not know — a 4xx there would turn one ignored comment into a stream
+/// of them. What did or did not happen goes to the log, which is where an operator looks.
+async fn github_webhook(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, ApiError> {
+    let Some(config) = state.github.clone() else {
+        // Not configured. A 404 rather than a 501, so an instance that has not set this up does not
+        // advertise that it could.
+        return Err(ApiError::NotFound("no such endpoint".to_string()));
+    };
+
+    let request = match github::read(&headers, &body, &config) {
+        Ok(request) => request,
+        Err(github::Refusal::Unsigned) => {
+            // The only refusal that gets a status: an unsigned caller is not GitHub, and telling
+            // them apart from a caller we simply ignored is the point.
+            tracing::warn!(
+                kind = "github_unsigned",
+                "refused an unsigned webhook delivery"
+            );
+            return Err(ApiError::Unauthorized("bad signature".to_string()));
+        }
+        Err(_) => return Ok(StatusCode::OK),
+    };
+
+    let principal = match github::principal_for(&state.auth, &request).await {
+        Ok(principal) => principal,
+        Err(_) => {
+            // Named, because "why did the bot ignore me" is the question this log line answers.
+            tracing::info!(
+                kind = "github_unauthorized",
+                login = %request.sender_login,
+                id = %request.sender_id,
+                "ignored a mention from someone without operator"
+            );
+            return Ok(StatusCode::OK);
+        }
+    };
+
+    let Some(project) = state
+        .projects
+        .values()
+        .find(|p| p.repository.as_deref() == Some(request.repository.as_str()))
+    else {
+        tracing::info!(
+            kind = "github_unknown_repository",
+            repository = %request.repository,
+            "ignored a mention on a repository this instance does not serve"
+        );
+        return Ok(StatusCode::OK);
+    };
+
+    // The issue number travels with the instruction, because everything downstream — the branch
+    // name, the commit subject, the pull request — is built from it.
+    let issue = format!(
+        "GitHub issue #{}: {}\n\nRepository: {}",
+        request.issue_number, request.instruction, request.repository
+    );
+    match project.launcher.spawn(&issue) {
+        Ok(run_id) => tracing::info!(
+            kind = "run_started",
+            run_id = %run_id,
+            principal = %principal.principal_id,
+            login = %request.sender_login,
+            issue_number = request.issue_number,
+            "started run from a GitHub mention"
+        ),
+        // Capacity and a bad instruction are both "not now" from GitHub's point of view, and
+        // neither is worth a retry storm.
+        Err(error) => tracing::warn!(
+            kind = "github_launch_failed",
+            %error,
+            issue_number = request.issue_number,
+            "could not start a run from a GitHub mention"
+        ),
+    }
+    Ok(StatusCode::OK)
 }
 
 /// What the browser posts to log in.
@@ -842,6 +959,7 @@ mod access_tests {
                 slug.to_string(),
                 Project {
                     slug: slug.to_string(),
+                    repository: Some(format!("cq27-dev/{slug}")),
                     dir: PathBuf::from("/tmp").join(slug),
                     visibility,
                     config_path: PathBuf::from("ratatoskr.toml"),
@@ -863,6 +981,7 @@ mod access_tests {
             auth: AuthStore::open_in_memory().expect("in-memory identity database"),
             throttle: Arc::new(auth::LoginThrottle::default()),
             secure_cookies: false,
+            github: None,
         }
     }
 
@@ -1205,6 +1324,151 @@ mod access_tests {
             send(state, get("/api/projects/open/runs/deadbeef", None)).await,
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// The webhook, through the real router.
+    ///
+    /// Every one of these is about a request that reaches a public endpoint from the internet, so
+    /// what matters is not that the happy path works but that each way of being wrong stops.
+    mod github_webhook {
+        use super::*;
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        const SECRET: &str = "a webhook secret of some length";
+
+        async fn wired() -> AppState {
+            let mut state = state().await;
+            state.github = Some(Arc::new(github::GitHubConfig {
+                trigger: "ratatoskr".to_string(),
+                account: None,
+                secret: SECRET.to_string(),
+            }));
+            state
+        }
+
+        fn body(login: &str, id: u64, repo: &str) -> String {
+            serde_json::json!({
+                "action": "created",
+                "issue": { "number": 164 },
+                "comment": { "body": "@ratatoskr fix the retry", "user": { "id": id, "login": login } },
+                "repository": { "full_name": repo },
+            })
+            .to_string()
+        }
+
+        fn delivery(payload: &str, secret: &str) -> Request<Body> {
+            let mut mac =
+                Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("any key length");
+            mac.update(payload.as_bytes());
+            let signature = format!(
+                "sha256={}",
+                mac.finalize()
+                    .into_bytes()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            );
+            Request::builder()
+                .method("POST")
+                .uri("/api/integrations/github")
+                .header("content-type", "application/json")
+                .header("x-github-event", "issue_comment")
+                .header("x-hub-signature-256", signature)
+                .body(Body::from(payload.to_string()))
+                .expect("a valid request")
+        }
+
+        #[tokio::test]
+        async fn an_unsigned_delivery_is_refused() {
+            let state = wired().await;
+            let payload = body("kk", 1234, "cq27-dev/open");
+            assert_eq!(
+                send(state, delivery(&payload, "not the secret")).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        #[tokio::test]
+        async fn a_signed_mention_from_a_stranger_is_ignored_rather_than_refused() {
+            // 200 on purpose. GitHub retries anything else, and there is nothing to retry about a
+            // comment from someone this instance has never heard of — which is most comments on a
+            // public repository.
+            let state = wired().await;
+            let payload = body("stranger", 9999, "cq27-dev/open");
+            let launcher = Arc::clone(&state.projects["open"].launcher);
+            assert_eq!(
+                send(state, delivery(&payload, SECRET)).await,
+                StatusCode::OK
+            );
+            assert_eq!(launcher.in_flight(), 0, "a stranger started a run");
+        }
+
+        #[tokio::test]
+        async fn a_linked_viewer_still_cannot_start_a_run() {
+            // Being known is not being trusted: the role is checked exactly as it is in the
+            // browser, and a viewer with a GitHub identity is still a viewer.
+            let state = wired().await;
+            let principal = state
+                .auth
+                .create_local("kk", "hunter2", "KK", Role::Viewer)
+                .await
+                .expect("a principal");
+            state
+                .auth
+                .attach_identity(&principal.principal_id, github::GITHUB, "1234")
+                .await
+                .expect("a link");
+
+            let payload = body("kk", 1234, "cq27-dev/open");
+            let launcher = Arc::clone(&state.projects["open"].launcher);
+            assert_eq!(
+                send(state, delivery(&payload, SECRET)).await,
+                StatusCode::OK
+            );
+            // The assertion that matters. 200 is also what a *started* run answers, so the status
+            // alone cannot tell a refusal from a success.
+            assert_eq!(launcher.in_flight(), 0, "a viewer started a run");
+        }
+
+        #[tokio::test]
+        async fn a_repository_this_instance_does_not_serve_is_ignored() {
+            let state = wired().await;
+            let principal = state
+                .auth
+                .create_local("kk", "hunter2", "KK", Role::Operator)
+                .await
+                .expect("a principal");
+            state
+                .auth
+                .attach_identity(&principal.principal_id, github::GITHUB, "1234")
+                .await
+                .expect("a link");
+
+            let payload = body("kk", 1234, "someone-else/private-thing");
+            let launcher = Arc::clone(&state.projects["open"].launcher);
+            assert_eq!(
+                send(state, delivery(&payload, SECRET)).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                launcher.in_flight(),
+                0,
+                "a mention on another repository reached a project here"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_endpoint_does_not_exist_when_the_integration_is_not_configured() {
+            // A 404 rather than a 501: an instance that has not set this up should not advertise
+            // that it could.
+            let state = state().await;
+            let payload = body("kk", 1234, "cq27-dev/open");
+            assert_eq!(
+                send(state, delivery(&payload, SECRET)).await,
+                StatusCode::NOT_FOUND
+            );
+        }
     }
 
     #[tokio::test]

@@ -319,6 +319,84 @@ impl AuthStore {
         .await?
     }
 
+    /// Attach another way of proving you are an existing principal.
+    ///
+    /// This is what makes one person the same operator whether they sign in with a password or act
+    /// through a provider: the principal already exists, and this adds a second door to it.
+    ///
+    /// `subject` must be the provider's *immutable* id, not a login. A login can be changed and
+    /// then handed to someone else, at which point an identity keyed on it silently points at a
+    /// different person.
+    pub async fn attach_identity(
+        &self,
+        principal_id: &str,
+        provider: &str,
+        subject: &str,
+    ) -> Result<(), AuthError> {
+        let conn = Arc::clone(&self.conn);
+        let (principal_id, provider, subject) = (
+            principal_id.to_string(),
+            provider.to_string(),
+            subject.to_string(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("auth store mutex poisoned");
+            let added = conn.execute(
+                "INSERT OR IGNORE INTO identities (provider, subject, principal_id)                  VALUES (?1, ?2, ?3)",
+                params![provider, subject, principal_id],
+            )?;
+            if added == 0 {
+                return Err(AuthError::IdentityTaken { provider, subject });
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| AuthError::Store(StoreError::Join(e)))?
+    }
+
+    /// The principal a provider's user maps to, if any, and if they are not disabled.
+    ///
+    /// The lookup a webhook makes: a provider says which of *its* users did something, and this
+    /// answers whether that is anyone here. `None` means "not one of ours", which is the answer for
+    /// the overwhelming majority of people who can comment on a public repository.
+    pub async fn principal_for_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<Principal>, AuthError> {
+        let conn = Arc::clone(&self.conn);
+        let (provider, subject) = (provider.to_string(), subject.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("auth store mutex poisoned");
+            let found = conn
+                .query_row(
+                    "SELECT p.principal_id, p.display_name, p.role
+                     FROM identities i JOIN principals p USING (principal_id)
+                     WHERE i.provider = ?1 AND i.subject = ?2 AND p.disabled_at IS NULL",
+                    params![provider, subject],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((principal_id, display_name, role)) = found else {
+                return Ok(None);
+            };
+            let role = Role::from_str(&role).map_err(|_| AuthError::UnknownRole(role))?;
+            Ok(Some(Principal {
+                principal_id,
+                display_name,
+                role,
+            }))
+        })
+        .await
+        .map_err(|e| AuthError::Store(StoreError::Join(e)))?
+    }
+
     /// The principal behind a local username, for commands that address an account by name.
     ///
     /// Unlike [`AuthStore::authenticate`] this proves nothing and is not a login — it is the
@@ -710,6 +788,95 @@ mod tests {
         let principals = auth.list_principals().await.unwrap();
         assert_eq!(principals.len(), 1);
         assert!(auth.authenticate("kk", "hunter2").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn one_principal_can_be_reached_by_two_identities() {
+        // The whole reason identity is its own table: the same person signs in with a password and
+        // acts through a provider, and both have to be recognised as the same operator.
+        let auth = store().await;
+        let made = auth
+            .create_local("kk", "hunter2", "KK", Role::Operator)
+            .await
+            .unwrap();
+        auth.attach_identity(&made.principal_id, "github", "1234")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            auth.principal_for_identity("github", "1234")
+                .await
+                .unwrap()
+                .unwrap(),
+            made
+        );
+        assert_eq!(
+            auth.authenticate("kk", "hunter2").await.unwrap().unwrap(),
+            made
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_provider_user_is_nobody() {
+        // The answer for everyone who can comment on a public repository.
+        let auth = store().await;
+        assert!(
+            auth.principal_for_identity("github", "9999")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_principal_is_unreachable_through_its_provider_identity_too() {
+        // Disabling has to close every door, not just the password one — otherwise revoking
+        // someone leaves them able to drive runs through the integration.
+        let auth = store().await;
+        let made = auth
+            .create_local("kk", "hunter2", "KK", Role::Operator)
+            .await
+            .unwrap();
+        auth.attach_identity(&made.principal_id, "github", "1234")
+            .await
+            .unwrap();
+        auth.set_disabled(&made.principal_id, true).await.unwrap();
+        assert!(
+            auth.principal_for_identity("github", "1234")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn one_provider_identity_cannot_be_claimed_twice() {
+        let auth = store().await;
+        let a = auth
+            .create_local("ann", "pw-long-enough", "Ann", Role::Operator)
+            .await
+            .unwrap();
+        let b = auth
+            .create_local("bob", "pw-long-enough", "Bob", Role::Operator)
+            .await
+            .unwrap();
+        auth.attach_identity(&a.principal_id, "github", "1234")
+            .await
+            .unwrap();
+        assert!(matches!(
+            auth.attach_identity(&b.principal_id, "github", "1234")
+                .await,
+            Err(AuthError::IdentityTaken { .. })
+        ));
+        // And it still points where it did.
+        assert_eq!(
+            auth.principal_for_identity("github", "1234")
+                .await
+                .unwrap()
+                .unwrap()
+                .display_name,
+            "Ann"
+        );
     }
 
     #[tokio::test]

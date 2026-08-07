@@ -117,6 +117,24 @@ enum Command {
         /// instance can watch several projects, and identity belongs to none of them.
         #[arg(long, default_value = ".ratatoskr/auth.sqlite3")]
         auth_db: PathBuf,
+        /// Enable the GitHub integration under this trigger word, without any sigil.
+        ///
+        /// A comment saying `/<word> …` or `@<word> …` starts a run, if whoever wrote it maps to
+        /// an operator here (`ratatoskr users link-github`). Prefer the slash form unless the word
+        /// is a GitHub account you own: an `@` is a real mention, so it notifies whoever does.
+        ///
+        /// The webhook secret comes from RATATOSKR_GITHUB_WEBHOOK_SECRET; which repository a
+        /// delivery is about is read from each project's `origin`, so there is nothing to keep in
+        /// step by hand.
+        #[arg(long = "github-bot")]
+        github_bot: Option<String>,
+        /// The GitHub login the bot's own comments come from, if it has an account.
+        ///
+        /// Only needed when it differs from the trigger word — the account available on GitHub is
+        /// rarely the word people want to type. It is what stops the bot treating its own comments
+        /// as new instructions once it starts posting; a GitHub App's `[bot]` suffix is handled.
+        #[arg(long = "github-account")]
+        github_account: Option<String>,
         /// Mark the session cookie `Secure`. Set this whenever the instance is reached over
         /// https, and leave it off for loopback — a browser discards a `Secure` cookie sent over
         /// plain http, which looks exactly like sign-in silently failing.
@@ -216,6 +234,16 @@ enum UsersCommand {
     Disable { username: String },
     /// Let a disabled account sign in again.
     Enable { username: String },
+    /// Let an account act through GitHub, so mentioning the bot as them starts a run.
+    ///
+    /// Takes GitHub's numeric user id, not a login: a login can be changed and then handed to
+    /// someone else, and an identity keyed on it would follow the name rather than the person.
+    /// `curl -s https://api.github.com/users/<login> | jq .id` prints it.
+    LinkGithub {
+        username: String,
+        /// GitHub's numeric user id.
+        github_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -315,6 +343,8 @@ async fn main() -> anyhow::Result<()> {
             public,
             auth_db,
             secure_cookies,
+            github_bot,
+            github_account,
             config,
             projects,
             max_runs,
@@ -328,6 +358,8 @@ async fn main() -> anyhow::Result<()> {
                 max_runs,
                 auth_db,
                 secure_cookies,
+                github_bot,
+                github_account,
             })
             .await
         }
@@ -736,6 +768,8 @@ struct ServeArgs {
     max_runs: usize,
     auth_db: PathBuf,
     secure_cookies: bool,
+    github_bot: Option<String>,
+    github_account: Option<String>,
 }
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
@@ -748,6 +782,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         max_runs,
         auth_db,
         secure_cookies,
+        github_bot,
+        github_account,
     } = args;
     let config_path = config_path.as_path();
     let mut specs = if projects.is_empty() {
@@ -792,6 +828,29 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         );
     }
 
+    // From the environment, never a flag: a webhook secret in an argument is readable by every
+    // process on the machine and lands in shell history, and it is the only thing standing between
+    // a public endpoint and someone else's runs.
+    let github = match github_bot {
+        Some(bot) => {
+            let secret = std::env::var("RATATOSKR_GITHUB_WEBHOOK_SECRET").map_err(|_| {
+                anyhow::anyhow!(
+                    "--github-bot needs RATATOSKR_GITHUB_WEBHOOK_SECRET set to the same secret \
+                     the webhook was created with"
+                )
+            })?;
+            if secret.chars().count() < 16 {
+                bail!("that webhook secret is shorter than 16 characters");
+            }
+            Some(ratatoskr_serve::github::GitHubConfig {
+                trigger: bot.trim_start_matches(['@', '/']).to_string(),
+                account: github_account.map(|a| a.trim_start_matches('@').to_string()),
+                secret,
+            })
+        }
+        None => None,
+    };
+
     ratatoskr_serve::serve(ratatoskr_serve::ServeOptions {
         addr,
         internal_addr,
@@ -799,6 +858,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         max_runs,
         auth_db,
         secure_cookies,
+        github,
     })
     .await?;
     Ok(())
@@ -863,6 +923,32 @@ async fn users(command: UsersCommand, auth_db: &Path) -> anyhow::Result<()> {
             let principal_id = principal_id_for(&auth, &username).await?;
             auth.set_disabled(&principal_id, false).await?;
             println!("enabled {username}");
+        }
+        UsersCommand::LinkGithub {
+            username,
+            github_id,
+        } => {
+            if !github_id.chars().all(|c| c.is_ascii_digit()) {
+                bail!(
+                    "`{github_id}` is not a GitHub user id — it is numeric, and a login will not \
+                     do: logins can be changed and reassigned"
+                );
+            }
+            let principal = auth
+                .principal_for_local(&username)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no account called `{username}`"))?;
+            auth.attach_identity(&principal.principal_id, "github", &github_id)
+                .await?;
+            println!("{username} can now act through GitHub user {github_id}");
+            if principal.role < Role::Operator {
+                // Linked but powerless, which is a confusing state to leave someone in silently.
+                println!(
+                    "  note: {username} is a {} — mentioning the bot will be ignored until they \
+                     are an operator",
+                    principal.role.as_str()
+                );
+            }
         }
     }
     Ok(())

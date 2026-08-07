@@ -208,6 +208,50 @@ than by a rule that has to keep being enforced.
 `ratatoskr users list`, `role`, `passwd`, `disable` and `enable` manage accounts. A role change or a
 disable reaches an open browser on its next request — neither waits for the session to lapse.
 
+### Starting a run from GitHub
+
+Mention the bot in an issue and it starts a run on that repository:
+
+> `/ratatoskr` the retry test flakes on CI, please fix it
+
+```sh
+ratatoskr users link-github kk 1234        # GitHub's numeric user id, not a login
+RATATOSKR_GITHUB_WEBHOOK_SECRET='...' ratatoskr serve --github-bot ratatoskr ...
+```
+
+Point a repository webhook at `/api/integrations/github`, sending **issue comments**, with that
+same secret.
+
+Either `/ratatoskr …` or `@ratatoskr …` triggers it, and the difference is who gets notified. The
+trigger is matched as text — nothing resolves it against GitHub — so `/` collides with no username
+and notifies nobody, which is what you want unless the handle is an account you actually own.
+Mentioning one you do not own notifies a stranger every time somebody starts a run.
+
+An App is mentioned as `@name[bot]`, which is what GitHub's autocomplete inserts, and that form is
+accepted — the suffix is treated as part of the address rather than the start of the instruction.
+
+If the bot has its own GitHub account, name it with `--github-account`, with or without the
+`[bot]`. It is only needed when that
+login differs from the trigger word, which it usually does — the word people want to type is rarely
+the name still available on GitHub. It is what stops the bot reading its own comments as new
+instructions once it starts posting; a GitHub App's `[bot]` suffix is handled.
+
+Being able to comment is not being able to run anything. The person who mentioned the bot has to
+map to an operator here — that is what `link-github` establishes — and everyone else is ignored.
+The link is keyed on GitHub's numeric user id rather than a login, because a login can be changed
+and then handed to somebody else, and an identity keyed on the name would follow the name rather
+than the person.
+
+Which project a mention is about is read from each project's `origin`, so there is no mapping to
+keep in step; a project whose origin is not a GitHub repository simply cannot be addressed this
+way.
+
+The signature is the only thing that makes a delivery trustworthy. The endpoint is public by
+necessity, so every field in the body — including who GitHub says sent it — is attacker-controlled
+until the HMAC checks out. An unsigned delivery is refused; a correctly signed one that is not for
+us is answered `200` and logged, because GitHub retries anything else and there is nothing to retry
+about a comment that was not addressed to the bot.
+
 The UI is a separate build artifact and is optional: without it you still get the JSON API
 (`/api/runs`, `/api/runs/{id}`, `/api/runs/{id}/nodes/{node}`).
 
