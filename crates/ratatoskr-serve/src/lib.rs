@@ -401,8 +401,10 @@ async fn run_history(
     State(state): State<AppState>,
     AxumPath((project, run_id)): AxumPath<(String, String)>,
 ) -> Result<Json<Vec<events::LiveEvent>>, ApiError> {
-    let dir = state.project(&project)?.log_dir.clone();
-    Ok(Json(events::history(&dir, &run_id).await))
+    let project = state.project(&project)?;
+    Ok(Json(
+        events::history(&project.store, &project.log_dir, &run_id).await,
+    ))
 }
 
 async fn run_events(
