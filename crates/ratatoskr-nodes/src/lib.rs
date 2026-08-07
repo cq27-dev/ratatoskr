@@ -354,11 +354,13 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
                 reported = telemetry.usage.output_tokens,
                 floor,
                 bytes = json.len(),
-                "fewer output tokens reported than this node's output could contain. Known cause: \
-                 on the streaming path a tool-calling turn reports a placeholder output count \
-                 (1-8 tokens) and only the final turn reports a real one, so a node that called \
-                 tools is undercounted by roughly its turn count. Input and cache figures are \
-                 unaffected. Run with `RUST_LOG=ratatoskr_agent=debug` to see per-turn usage"
+                "fewer output tokens reported than this node's output could contain. The count \
+                 comes back short from the endpoint, not from anything this side computes: a \
+                 direct, non-streamed request returns `output_tokens: 4` for a response carrying \
+                 a whole reasoning block and a tool call. Input, cache and reasoning figures are \
+                 unaffected, so cost per turn is still readable from those. Run with \
+                 `RUST_LOG=ratatoskr_agent=debug` for per-turn usage, and treat this warning on a \
+                 tool-calling node as expected until the endpoint reports the real count"
             );
         }
     }
