@@ -85,7 +85,7 @@ impl Node for ScoutNode {
             max_turns: self.max_turns,
             clarifier: self.clarifier.clone(),
             observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills),
+            skills: crate::skills::loaded(&self.plugins.skills, "scout"),
             files: self.files.clone(),
             // Reads and edits, but runs nothing.
             shell: None,

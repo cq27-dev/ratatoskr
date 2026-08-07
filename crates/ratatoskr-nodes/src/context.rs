@@ -119,7 +119,7 @@ impl ContextNode {
             max_turns: self.max_turns,
             clarifier: self.clarifier.clone(),
             observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills),
+            skills: crate::skills::loaded(&self.plugins.skills, "context"),
             files: self.files.clone(),
             // Reads and edits, but runs nothing.
             shell: None,

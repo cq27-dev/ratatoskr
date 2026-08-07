@@ -163,7 +163,7 @@ impl VerifierNode {
             // let the node being reviewed-for shape the review.
             clarifier: None,
             observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills),
+            skills: crate::skills::loaded(&self.plugins.skills, "verifier"),
             files: self.files.clone(),
             // Reads the diff; runs nothing — the acceptance run already happened.
             shell: None,

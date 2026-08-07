@@ -1280,7 +1280,7 @@ fn node_agent_config(
     // Every node reaches this function, which is why the skill tool is added here rather than at
     // each construction site: a node that binds a skill and is never offered it is the failure
     // this seam exists to prevent.
-    if let Some(tool) = skills::skill_tool(&plugins.skills) {
+    if let Some(tool) = skills::skill_tool(&plugins.skills, node) {
         tools.add_local(tool);
     }
 
@@ -3252,14 +3252,14 @@ mod agent_config_tests {
             ..Default::default()
         };
         assert!(
-            crate::skills::skill_tool(&plugins.skills).is_some(),
+            crate::skills::skill_tool(&plugins.skills, "context").is_some(),
             "a node WITH skills bound is offered the tool — the grant itself is not the bug"
         );
         let stripped = NodePlugins {
             skills: Vec::new(),
             ..plugins
         };
-        assert!(crate::skills::skill_tool(&stripped.skills).is_none());
+        assert!(crate::skills::skill_tool(&stripped.skills, "context").is_none());
     }
 
     #[test]

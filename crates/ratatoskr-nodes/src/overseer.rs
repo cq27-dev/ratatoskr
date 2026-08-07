@@ -73,7 +73,7 @@ impl OverseerNode {
             // It chooses before any node exists to ask. There is nobody to clarify with.
             clarifier: None,
             observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills),
+            skills: crate::skills::loaded(&self.plugins.skills, "overseer"),
             files: self.files.clone(),
             // Reads and edits, but runs nothing.
             shell: None,

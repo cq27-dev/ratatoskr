@@ -223,7 +223,7 @@ impl Node for AnalystNode {
             // Analyst is the clarification terminus — it answers other nodes but never asks.
             clarifier: None,
             observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills),
+            skills: crate::skills::loaded(&self.plugins.skills, "analyst"),
             files: self.files.clone(),
             // Reads and edits, but runs nothing.
             shell: None,
