@@ -267,6 +267,19 @@ pub fn tail(s: &str, max: usize) -> String {
     format!("[{} earlier characters omitted]\n{kept}", count - max)
 }
 
+/// Strip invisible characters that carry no legitimate meaning in text entering a prompt.
+///
+/// Two ranges, both delivery mechanisms for instructions no renderer shows: Unicode Tag
+/// characters (U+E0000–U+E007F), and the zero-width set (ZWSP, ZWNJ, ZWJ, and the BOM/ZWNBSP).
+/// Ordinary text — including any legitimate non-ASCII — is left byte-identical. Deliberately not a
+/// filter for all format characters: the caller's content is machine output, so the named ranges
+/// are enough and a wider net would drop characters with real meaning elsewhere.
+pub fn sanitize(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(*c, '\u{E0000}'..='\u{E007F}' | '\u{200B}'..='\u{200D}' | '\u{FEFF}'))
+        .collect()
+}
+
 /// Trim `s` to `max` chars for a log line, with an ellipsis when cut.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -1579,6 +1592,28 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sanitize_strips_tag_and_zero_width_but_keeps_ordinary_text() {
+        // Unchanged when there is nothing to strip.
+        assert_eq!(super::sanitize("tests passed"), "tests passed");
+        // A tag char between visible ones is removed, the visible ones intact.
+        assert_eq!(super::sanitize(&format!("a{}b", '\u{E0041}')), "ab");
+        // Zero-width space and BOM/ZWNBSP removed, the rest intact.
+        assert_eq!(
+            super::sanitize(&format!("x{}y{}z", '\u{200B}', '\u{FEFF}')),
+            "xyz"
+        );
+        // Legitimate non-ASCII is byte-identical.
+        let text = "café — 日本語";
+        assert_eq!(super::sanitize(text), text);
+        // Edge cases: empty, and all-invisible.
+        assert_eq!(super::sanitize(""), "");
+        assert_eq!(
+            super::sanitize(&format!("{}{}", '\u{E0041}', '\u{200B}')),
+            ""
+        );
+    }
+
     #[test]
     fn a_fabricated_tool_result_is_recognised_as_transcript_continuation() {
         // The hardest real shape (issue #126, run 6fbb7f25): a reproduced `Read` result anchored
