@@ -325,6 +325,56 @@ fn events_for(run_id: &str, lines: &[&str]) -> Vec<LiveEvent> {
         .collect()
 }
 
+/// Every event this run produced, oldest first.
+///
+/// The scrubbing counterpart to [`follow`]: `follow` replays a tail and then tails, which is what
+/// a viewer watching a live run wants and useless for moving through a finished one. Untrimmed —
+/// a run is a few hundred events (a 42-minute run produced 654), so paging would cost more than
+/// it saves.
+///
+/// Bounded by what is on disk. Logs rotate daily and are eventually removed, so a run old enough
+/// to have lost its log has no timeline; its checkpoints are still in the store.
+pub async fn history(dir: &Path, run_id: &str) -> Vec<LiveEvent> {
+    let mut out = Vec::new();
+    for path in daily_logs(dir).await {
+        let Ok(text) = tokio::fs::read_to_string(&path).await else {
+            continue;
+        };
+        out.extend(events_for(run_id, &text.lines().collect::<Vec<_>>()));
+    }
+    out
+}
+
+/// A run's log lines as store rows, ready to be made durable.
+///
+/// The same parse the dashboard reads with, so what is stored is what was shown — and the payload
+/// is the raw record, so storing it loses nothing that a later reader might want.
+pub async fn rows_for_run(dir: &Path, run_id: &str) -> Vec<ratatoskr_store::EventRow> {
+    let mut out = Vec::new();
+    for path in daily_logs(dir).await {
+        let Ok(text) = tokio::fs::read_to_string(&path).await else {
+            continue;
+        };
+        for line in text.lines() {
+            let Ok(record) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if run_id_of(&record) != Some(run_id) {
+                continue;
+            }
+            let event = to_event(&record);
+            out.push(ratatoskr_store::EventRow {
+                seq: out.len() as i64,
+                at: event.at,
+                kind: event.kind,
+                node: event.node,
+                payload_json: line.to_string(),
+            });
+        }
+    }
+    out
+}
+
 /// Cap what a newly attached viewer is replayed.
 ///
 /// The tail, not the whole history — but never at the cost of a question. A run blocked on a

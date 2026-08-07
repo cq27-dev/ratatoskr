@@ -157,6 +157,10 @@ fn router(
             "/api/projects/{project}/runs/{run_id}/events",
             get(run_events),
         )
+        .route(
+            "/api/projects/{project}/runs/{run_id}/history",
+            get(run_history),
+        )
         // Answering is keyed by question id alone — unique across every project.
         .route(
             "/api/clarifications/{question_id}",
@@ -392,6 +396,15 @@ async fn start_run(
 /// Checkpoints only tell you a node *finished*; this is what it is doing in between. The stream
 /// replays the run's recent history on connect, then follows the log, and ends when the client
 /// disconnects — the tailing task is owned by the channel and dies with it.
+/// Every event a run produced, for moving through it after the fact.
+async fn run_history(
+    State(state): State<AppState>,
+    AxumPath((project, run_id)): AxumPath<(String, String)>,
+) -> Result<Json<Vec<events::LiveEvent>>, ApiError> {
+    let dir = state.project(&project)?.log_dir.clone();
+    Ok(Json(events::history(&dir, &run_id).await))
+}
+
 async fn run_events(
     State(state): State<AppState>,
     AxumPath((project, run_id)): AxumPath<(String, String)>,

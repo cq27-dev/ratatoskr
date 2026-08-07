@@ -55,10 +55,19 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("store task panicked")]
     Join(#[from] tokio::task::JoinError),
+    #[error("run bundle: {0}")]
+    Bundle(String),
+    #[error(
+        "this bundle is format version {found}; this build reads up to {}. Update ratatoskr to read it",
+        crate::bundle::FORMAT_VERSION
+    )]
+    Unsupported { found: u32 },
 }
 
+pub mod bundle;
+
 /// A per-node checkpoint snapshot read back from the `checkpoints` table.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Checkpoint {
     pub node_name: String,
     pub output_json: String,
@@ -87,7 +96,7 @@ pub struct CheckpointWrite<'a> {
 
 /// A row of the `runs` table. `updated_at` moves only on a status transition — it is not a
 /// heartbeat, so it can't be used alone to tell a live run from one that died mid-flight.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Run {
     pub run_id: String,
     pub issue_id: Option<String>,
@@ -522,6 +531,57 @@ impl Store {
         .await?
     }
 
+    /// Insert an imported run whole, preserving what it recorded rather than restating it.
+    ///
+    /// `upsert_run` writes the fields a live run knows and stamps `updated_at` as now; an import
+    /// has to keep the run's own timestamps and provenance, or every imported run would claim to
+    /// have finished at the moment it was imported.
+    async fn insert_imported_run(&self, run: &Run, origin: &str) -> Result<(), StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let run = run.clone();
+        let origin = origin.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            conn.execute(
+                "INSERT INTO runs
+                   (run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha, origin, shape_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    run.run_id,
+                    run.issue_id,
+                    run.status,
+                    run.updated_at,
+                    run.config_json,
+                    run.graph_hash,
+                    run.repo_sha,
+                    // The bundle's own origin wins when it has one: a run that has already been
+                    // passed along keeps saying where it started, not who forwarded it.
+                    run.origin.clone().unwrap_or(origin),
+                    run.shape_json,
+                ],
+            )?;
+            Ok::<_, StoreError>(())
+        })
+        .await?
+    }
+
+    /// The current time, as this database writes timestamps.
+    ///
+    /// Taken from SQLite rather than the process clock so an exported bundle's `exported_at` is
+    /// the same kind of string, and in the same zone, as every timestamp beside it.
+    pub async fn now(&self) -> Result<String, StoreError> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let now =
+                conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            Ok::<_, StoreError>(now)
+        })
+        .await?
+    }
+
     /// Record where a run came from. Set on import; never set for a run produced here.
     pub async fn set_origin(&self, run_id: &str, origin: &str) -> Result<(), StoreError> {
         let conn = Arc::clone(&self.conn);
@@ -581,6 +641,97 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_runs_history_survives_being_ingested_twice() {
+        // Ingest is the obvious thing to re-run when unsure whether it ran, so running it again
+        // must cost nothing rather than double a run's history.
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("r1", None, "running").await.unwrap();
+        let events = vec![
+            EventRow {
+                seq: 0,
+                at: "2026-08-07T10:00:00Z".into(),
+                kind: "node_start".into(),
+                node: Some("context".into()),
+                payload_json: r#"{"kind":"node_start"}"#.into(),
+            },
+            EventRow {
+                seq: 1,
+                at: "2026-08-07T10:00:01Z".into(),
+                kind: "tool_call".into(),
+                node: Some("context".into()),
+                payload_json: r#"{"kind":"tool_call"}"#.into(),
+            },
+        ];
+        assert_eq!(store.ingest_events("r1", events.clone()).await.unwrap(), 2);
+        assert_eq!(store.ingest_events("r1", events).await.unwrap(), 0);
+        let back = store.events_for_run("r1").await.unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].kind, "node_start");
+        assert_eq!(back[1].seq, 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_run_takes_everything_recorded_about_it() {
+        // `checkpoints.run_id` is an enforced foreign key, so anything left behind would either
+        // block the delete or outlive the run it describes.
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("r1", None, "converged").await.unwrap();
+        store
+            .insert_checkpoint(CheckpointWrite {
+                run_id: "r1",
+                node_name: "analyst",
+                output_json: "{}",
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .ingest_events(
+                "r1",
+                vec![EventRow {
+                    seq: 0,
+                    at: "t".into(),
+                    kind: "checkpoint".into(),
+                    node: Some("analyst".into()),
+                    payload_json: "{}".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        store.tag_run("r1", vec!["baseline".into()]).await.unwrap();
+
+        assert!(store.delete_run("r1").await.unwrap());
+        assert!(store.run("r1").await.unwrap().is_none());
+        assert!(store.events_for_run("r1").await.unwrap().is_empty());
+        assert!(store.checkpoints_for_run("r1").await.unwrap().is_empty());
+        // Deleting one that is already gone is not an error, so a prune can be re-run.
+        assert!(!store.delete_run("r1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn tags_are_a_set_and_travel_with_the_run() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("r1", None, "converged").await.unwrap();
+        store
+            .tag_run(
+                "r1",
+                vec!["arm-a".into(), "baseline".into(), "arm-a".into()],
+            )
+            .await
+            .unwrap();
+        store.tag_run("r1", vec!["arm-a".into()]).await.unwrap();
+
+        let mut runs = store.list_runs().await.unwrap();
+        store.attach_tags(&mut runs).await.unwrap();
+        assert_eq!(runs[0].tags, ["arm-a", "baseline"]);
+
+        store.untag_run("r1", vec!["arm-a".into()]).await.unwrap();
+        let mut runs = store.list_runs().await.unwrap();
+        store.attach_tags(&mut runs).await.unwrap();
+        assert_eq!(runs[0].tags, ["baseline"]);
+    }
 
     #[tokio::test]
     async fn write_a_run_and_read_it_back() {
@@ -794,7 +945,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_run("run-1", None, "running").await.unwrap();
         store
-            .record_run_provenance("run-1", Some("{}"), Some("deadbeef"), Some("abc123"))
+            .record_run_provenance("run-1", Some("{}"), Some("deadbeef"), Some("abc123"), None)
             .await
             .unwrap();
 
@@ -802,7 +953,7 @@ mod tests {
         store.upsert_run("run-1", None, "converged").await.unwrap();
         // And a later provenance write that knows less must not erase what the first one knew.
         store
-            .record_run_provenance("run-1", None, None, None)
+            .record_run_provenance("run-1", None, None, None, None)
             .await
             .unwrap();
 

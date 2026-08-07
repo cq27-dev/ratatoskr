@@ -13,6 +13,10 @@ repository = "https://github.com/cq27-dev/ratatoskr"
 warnings = "deny"
 
 [workspace.dependencies]
+# The run-bundle format: a run exported for someone else to analyse. BSON rather than JSON because
+# a bundle is machine-to-machine, carries binary-ish payloads, and is read back in full.
+bson = { version = "3", features = ["serde"] }
+
 # Internal crates
 ratatoskr-core = { path = "crates/ratatoskr-core" }
 ratatoskr-agent = { path = "crates/ratatoskr-agent" }
