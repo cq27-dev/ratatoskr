@@ -52,6 +52,19 @@ model = "kimi-k2.5"
 #
 #   [models.implementer]
 #   session = "reuse"
+#
+# On thinking levels: leaving it unset is not the cheap option. Measured against one endpoint on a
+# reasoning-heavy prompt with tools present, the unset default ran 26-39s and was the least
+# predictable setting available; `output_config.effort` at low, medium and high all landed between
+# 23s and 30s with reasoning still on, and disabling thinking entirely at 24-25s. A node that
+# should think is better told how much:
+#
+#   [models.verifier.params.output_config]
+#   effort = "medium"
+#
+# Safe to send alongside a node's output schema: in `OutputMode::Tool`, which every node uses, the
+# schema becomes a `final_result` tool and the provider layer sets no `output_config` of its own,
+# so this is the only one in the request.
 
 [models.analyst]
 provider = "anthropic"
