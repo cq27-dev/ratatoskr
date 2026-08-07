@@ -348,9 +348,22 @@ fn events_for(run_id: &str, lines: &[&str]) -> Vec<LiveEvent> {
 /// a run is a few hundred events (a 42-minute run produced 654), so paging would cost more than
 /// it saves.
 ///
-/// Bounded by what is on disk. Logs rotate daily and are eventually removed, so a run old enough
-/// to have lost its log has no timeline; its checkpoints are still in the store.
-pub async fn history(dir: &Path, run_id: &str) -> Vec<LiveEvent> {
+/// Stored events first, log files as the fallback. A run whose history was ingested — an imported
+/// run with no logs here, or one old enough to have lost them — is read from the store; a live run
+/// whose events reached the log before anything ingested them is read from disk. The store keeps
+/// each event's raw record in `payload_json`, so it parses back to the same [`LiveEvent`] the log
+/// walk produces. Read-only: `history` never writes the store.
+pub async fn history(store: &ratatoskr_store::Store, dir: &Path, run_id: &str) -> Vec<LiveEvent> {
+    if let Ok(rows) = store.events_for_run(run_id).await
+        && !rows.is_empty()
+    {
+        return rows
+            .iter()
+            .filter_map(|row| serde_json::from_str::<Value>(&row.payload_json).ok())
+            .map(|record| to_event(&record))
+            .collect();
+    }
+
     let mut out = Vec::new();
     for path in daily_logs(dir).await {
         let Ok(text) = tokio::fs::read_to_string(&path).await else {
@@ -513,6 +526,7 @@ pub async fn follow(dir: PathBuf, run_id: String, tx: mpsc::Sender<LiveEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatoskr_store::{EventRow, Store};
 
     /// A record shaped exactly like the agent's, where attribution lives in the span list.
     fn agent_line(run: &str, node: &str) -> String {
@@ -978,6 +992,143 @@ mod tests {
 
         let ended = tokio::time::timeout(Duration::from_secs(5), task).await;
         assert!(ended.is_ok(), "the tailing task must end with its receiver");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- history: the store is read first, the log dir is the fallback (issue #125) ---
+
+    #[tokio::test]
+    async fn history_reads_the_stored_events_when_the_run_has_any() {
+        // An imported or rotated-away run has no log files on this machine; its timeline can only
+        // come from the store. Each returned event must equal what `to_event` makes of the row's
+        // raw `payload_json`, so the same parse the log path uses applies unchanged.
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("r1", None, "running").await.unwrap();
+        let dir = scratch("history-store"); // deliberately empty: no log files for this run
+        let payload = agent_line("r1", "context");
+        store
+            .ingest_events(
+                "r1",
+                vec![EventRow {
+                    seq: 0,
+                    at: "2026-08-05T19:02:08Z".into(),
+                    kind: "tool_call".into(),
+                    node: Some("context".into()),
+                    payload_json: payload.clone(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let got = history(&store, &dir, "r1").await;
+        let expected = to_event(&serde_json::from_str::<Value>(&payload).unwrap());
+        assert_eq!(got, vec![expected]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn history_falls_back_to_the_logs_when_the_store_is_empty() {
+        // A live run's events reach the log before anything ingests them, so with no stored rows
+        // the timeline is exactly the log-only walk `history` produced before.
+        let store = Store::open_in_memory().unwrap();
+        let dir = scratch("history-logs");
+        std::fs::write(
+            dir.join("ratatoskr.jsonl.2026-08-05"),
+            format!(
+                "{}\n{}\n",
+                agent_line("r1", "scout"),
+                agent_line("r1", "analyst")
+            ),
+        )
+        .unwrap();
+
+        let got = history(&store, &dir, "r1").await;
+        assert_eq!(
+            got.iter().map(|e| e.node.clone()).collect::<Vec<_>>(),
+            vec![Some("scout".into()), Some("analyst".into())],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn history_prefers_the_store_and_leaves_the_logs_unread() {
+        // Present in both: the stored events win outright and the log file for that run is not read,
+        // so a run that has been ingested does not have its log lines appended on top (no duplication).
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("r1", None, "running").await.unwrap();
+        let dir = scratch("history-both");
+        // Logs say "scout"; the store says "context". Different on purpose so the source is visible.
+        std::fs::write(
+            dir.join("ratatoskr.jsonl.2026-08-05"),
+            format!("{}\n", agent_line("r1", "scout")),
+        )
+        .unwrap();
+        store
+            .ingest_events(
+                "r1",
+                vec![EventRow {
+                    seq: 0,
+                    at: "2026-08-05T19:02:08Z".into(),
+                    kind: "tool_call".into(),
+                    node: Some("context".into()),
+                    payload_json: agent_line("r1", "context"),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let got = history(&store, &dir, "r1").await;
+        assert_eq!(
+            got.len(),
+            1,
+            "exactly the stored events, no log duplication"
+        );
+        assert_eq!(got[0].node.as_deref(), Some("context"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn history_of_a_run_unknown_to_both_is_empty() {
+        // No rows and no logs is an empty timeline, not an error.
+        let store = Store::open_in_memory().unwrap();
+        let dir = scratch("history-none");
+        assert!(history(&store, &dir, "nope").await.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn history_skips_a_stored_row_whose_payload_is_not_json() {
+        // One unparseable row is dropped like an unparseable log line; the rest of the timeline
+        // still returns rather than the whole run aborting on it.
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("r1", None, "running").await.unwrap();
+        let dir = scratch("history-badrow");
+        store
+            .ingest_events(
+                "r1",
+                vec![
+                    EventRow {
+                        seq: 0,
+                        at: "2026-08-05T19:02:08Z".into(),
+                        kind: "junk".into(),
+                        node: None,
+                        payload_json: "not json at all".into(),
+                    },
+                    EventRow {
+                        seq: 1,
+                        at: "2026-08-05T19:02:09Z".into(),
+                        kind: "tool_call".into(),
+                        node: Some("context".into()),
+                        payload_json: agent_line("r1", "context"),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let got = history(&store, &dir, "r1").await;
+        assert_eq!(got.len(), 1, "the good row survives one bad one");
+        assert_eq!(got[0].node.as_deref(), Some("context"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

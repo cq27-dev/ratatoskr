@@ -517,7 +517,18 @@ async fn run_cmd(
         tracing::warn!("failed to shut down rag-rat cleanly: {e}");
     }
 
+    // Make the run's history durable now that it has finished, so it survives the log files
+    // rotating away without anyone remembering to run `runs ingest`. This happens before the
+    // error is propagated below, because a failed run's events are precisely the ones most worth
+    // reviewing later. Best-effort, like provenance: a store hiccup here must not mask the run's
+    // real outcome, and `runs ingest` remains the idempotent way to backfill if this does not land.
+    let log_dir = PathBuf::from(LOG_DIR);
+    if let Err(e) = ingest_run(&store, &log_dir, &run_id).await {
+        tracing::warn!(run_id = %run_id, "failed to ingest run events: {e}");
+    }
+
     let outcome = result.context("run failed")?;
+
     if json {
         println!("{}", serde_json::to_string_pretty(&outcome.state)?);
     } else {
