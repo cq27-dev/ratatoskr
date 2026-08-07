@@ -56,9 +56,11 @@ impl GitHubConfig {
     /// Falls back to the trigger when no account is configured, which is right for the common case
     /// where they are the same word and harmless when the bot posts nothing.
     fn is_self(&self, login: &str) -> bool {
-        let login = login.strip_suffix("[bot]").unwrap_or(login);
         let own = self.account.as_deref().unwrap_or(&self.trigger);
-        login.eq_ignore_ascii_case(own)
+        // Stripped on BOTH sides. GitHub shows an App as `name[bot]`, so that is what an operator
+        // copies into the config — and comparing a stripped login against an unstripped setting
+        // never matches, which silently disarms this guard for the one deployment it protects.
+        bare(login).eq_ignore_ascii_case(bare(own))
     }
 }
 
@@ -218,6 +220,11 @@ fn instruction_for(body: &str, bot: &str) -> Option<String> {
         .map(|(_, instruction)| instruction)
 }
 
+/// A login without GitHub's `[bot]` suffix, which an App carries and a person does not.
+fn bare(login: &str) -> &str {
+    login.strip_suffix("[bot]").unwrap_or(login)
+}
+
 /// Where `trigger` appears as a whole word, and what follows it.
 fn find_trigger(body: &str, trigger: &str) -> Option<(usize, String)> {
     let at = body
@@ -230,7 +237,12 @@ fn find_trigger(body: &str, trigger: &str) -> Option<(usize, String)> {
                 && after.is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_')
         })
         .map(|(i, _)| i)?;
-    let rest = body[at + trigger.len()..].trim();
+    // An App is mentioned as `@name[bot]`, which is what GitHub's own autocomplete inserts. The
+    // suffix belongs to the address, not to the instruction — left in, every such run would be
+    // asked to do something beginning "[bot]".
+    let after = &body[at + trigger.len()..];
+    let after = after.strip_prefix("[bot]").unwrap_or(after);
+    let rest = after.trim();
     (!rest.is_empty()).then(|| (at, rest.to_string()))
 }
 
@@ -427,6 +439,53 @@ mod tests {
             None
         );
         assert_eq!(instruction_for("/ratatoskr", "ratatoskr"), None);
+    }
+
+    #[test]
+    fn an_app_is_addressable_by_the_name_github_shows() {
+        // `@name[bot]` is what GitHub's autocomplete inserts for an App, so it is what people will
+        // type. The suffix is part of the address; leaving it in makes every instruction start
+        // with "[bot]".
+        assert_eq!(
+            instruction_for("@ratatoskr[bot] fix the flaky retry", "ratatoskr").as_deref(),
+            Some("fix the flaky retry")
+        );
+        assert_eq!(
+            instruction_for("/ratatoskr[bot] fix it", "ratatoskr").as_deref(),
+            Some("fix it")
+        );
+        // Still a whole word: the suffix does not turn a different handle into ours.
+        assert_eq!(
+            instruction_for("@ratatoskr-docs[bot] go", "ratatoskr"),
+            None
+        );
+        // And an address with nothing after it is still a greeting.
+        assert_eq!(instruction_for("@ratatoskr[bot]", "ratatoskr"), None);
+    }
+
+    #[test]
+    fn the_configured_account_may_carry_the_suffix_or_not() {
+        // Whichever form was copied out of GitHub has to work. Comparing a stripped login against
+        // an unstripped setting silently disarms the loop guard.
+        for configured in ["ratatoskr-bot", "ratatoskr-bot[bot]"] {
+            let config = GitHubConfig {
+                trigger: "ratatoskr".to_string(),
+                account: Some(configured.to_string()),
+                secret: "it's a secret to everybody".to_string(),
+            };
+            for login in ["ratatoskr-bot", "ratatoskr-bot[bot]"] {
+                let body = comment("@ratatoskr what should I assume?", login, 99);
+                assert_eq!(
+                    read(
+                        &headers(&body, &config.secret, "issue_comment"),
+                        &body,
+                        &config
+                    ),
+                    Err(Refusal::NotForUs),
+                    "configured {configured}, authored by {login}"
+                );
+            }
+        }
     }
 
     #[test]

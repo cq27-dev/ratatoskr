@@ -227,7 +227,11 @@ trigger is matched as text — nothing resolves it against GitHub — so `/` col
 and notifies nobody, which is what you want unless the handle is an account you actually own.
 Mentioning one you do not own notifies a stranger every time somebody starts a run.
 
-If the bot has its own GitHub account, name it with `--github-account`. It is only needed when that
+An App is mentioned as `@name[bot]`, which is what GitHub's autocomplete inserts, and that form is
+accepted — the suffix is treated as part of the address rather than the start of the instruction.
+
+If the bot has its own GitHub account, name it with `--github-account`, with or without the
+`[bot]`. It is only needed when that
 login differs from the trigger word, which it usually does — the word people want to type is rarely
 the name still available on GitHub. It is what stops the bot reading its own comments as new
 instructions once it starts posting; a GitHub App's `[bot]` suffix is handled.
