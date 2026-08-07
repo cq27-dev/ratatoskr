@@ -129,6 +129,25 @@ pub struct AnalystOutput {
     pub interface: Vec<InterfaceItem>,
 }
 
+/// Render an interface as the prompts show it, with the labels the reading node needs.
+///
+/// Three nodes see this contract and each must see the same shape: the analyst that sets it, the
+/// red team that writes tests from it, and the implementer that builds to it. Rendering it three
+/// ways invites them to drift apart on a detail — a signature shown one way here and another
+/// there is exactly the mismatch the shared contract exists to prevent.
+pub(crate) fn render_interface(s: &mut String, items: &[InterfaceItem], happy: &str, sad: &str) {
+    use std::fmt::Write as _;
+    for item in items {
+        let _ = write!(s, "- {}\n  {}\n", item.name, item.shape);
+        for h in &item.happy {
+            let _ = writeln!(s, "  {happy}: {h}");
+        }
+        for entry in &item.sad {
+            let _ = writeln!(s, "  {sad}: {entry}");
+        }
+    }
+}
+
 /// One piece of surface the change adds or alters, with what it owes its caller.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InterfaceItem {
@@ -262,6 +281,18 @@ fn render_prompt(input: &AnalystInput) -> String {
                 let _ = writeln!(s, "- {r}");
             }
         }
+        if !previous.interface.is_empty() {
+            // Without this the analyst re-emits `interface` from nothing on every revision, and the
+            // tests the red team already wrote are pinned to the contract it cannot see. A revised
+            // signature does not fail those tests honestly — it strands them.
+            s.push_str(
+                "\nThe interface you contracted. Tests are already written against it, by \
+                 someone who cannot see the code. Restate it unchanged unless a finding is about \
+                 the interface itself: changing a name or a signature here breaks tests that are \
+                 not wrong.\n",
+            );
+            render_interface(&mut s, &previous.interface, "happy", "sad");
+        }
         s.push('\n');
     }
     if !input.findings.is_empty() {
@@ -318,6 +349,58 @@ mod tests {
         let out = parse_validated::<AnalystOutput>(raw).unwrap();
         assert_eq!(out.touched, ["ratatoskr-store::Store"]);
         assert_eq!(out.risks[0], "medium: lock contention");
+    }
+
+    #[test]
+    fn a_revision_shows_the_analyst_the_contract_it_already_set() {
+        // The red team writes its tests from `interface` and never sees the code. An analyst
+        // re-planning without that contract in front of it re-derives one from memory, and a
+        // signature that comes back different strands tests that were right all along.
+        let mut previous = parse_validated::<AnalystOutput>(
+            r#"{"impact_summary":"touches the store","requirements":["keep single-writer"]}"#,
+        )
+        .unwrap();
+        previous.interface.push(InterfaceItem {
+            name: "Store::claim".into(),
+            shape: "fn claim(&self, run: &str) -> Result<Claim, StoreError>".into(),
+            happy: vec!["an unclaimed run yields a Claim".into()],
+            sad: vec!["a claimed run errors rather than blocking".into()],
+        });
+        let findings = serde_json::from_str(
+            r#"[{"severity":"P1","kind":"plan","file":"","summary":"impossible as written",
+                 "failure_scenario":"a second writer is unavoidable under the stated shape"}]"#,
+        )
+        .unwrap();
+        let input = AnalystInput {
+            previous: Some(Box::new(previous)),
+            findings,
+            ..AnalystInput::fresh(
+                "keep the writer single".into(),
+                ScoutOutput {
+                    related_items: Vec::new(),
+                    papertrail_summary: String::new(),
+                },
+                MemoryOutput {
+                    memories: Vec::new(),
+                },
+            )
+        };
+        assert!(input.is_revision());
+
+        let prompt = render_prompt(&input);
+        assert!(prompt.contains("Store::claim"), "{prompt}");
+        assert!(
+            prompt.contains("fn claim(&self, run: &str) -> Result<Claim, StoreError>"),
+            "the signature is the part tests are pinned to: {prompt}"
+        );
+        assert!(
+            prompt.contains("a claimed run errors rather than blocking"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Tests are already written against it"),
+            "showing the contract is not enough — it has to say why it is expensive to churn: {prompt}"
+        );
     }
 
     #[test]

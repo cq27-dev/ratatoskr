@@ -200,15 +200,7 @@ fn author_prompt(issue: &str, interface: &[crate::analyst::InterfaceItem]) -> St
         "THE INTERFACE. This is the contract, and it is all you get — the code does not exist \
          yet, and the person writing it is working from this same description:\n\n",
     );
-    for item in interface {
-        let _ = write!(s, "- {}\n  {}\n", item.name, item.shape);
-        for h in &item.happy {
-            let _ = writeln!(s, "  happy: {h}");
-        }
-        for sad in &item.sad {
-            let _ = writeln!(s, "  sad: {sad}");
-        }
-    }
+    crate::analyst::render_interface(&mut s, interface, "happy", "sad");
     s.push_str(
         "\nWrite tests for these. Follow the repository's own layout and conventions, cover the \
          sad cases as carefully as the happy ones, and change nothing that already exists.",

@@ -284,15 +284,7 @@ impl ImplementerNode {
                  signature that differs by a parameter name or an argument order will fail tests \
                  that are not wrong:\n\n",
             );
-            for item in &a.interface {
-                let _ = write!(s, "- {}\n  {}\n", item.name, item.shape);
-                for h in &item.happy {
-                    let _ = writeln!(s, "  must: {h}");
-                }
-                for sad in &item.sad {
-                    let _ = writeln!(s, "  must also: {sad}");
-                }
-            }
+            crate::analyst::render_interface(&mut s, &a.interface, "must", "must also");
             s.push('\n');
         }
         if !a.risks.is_empty() {
