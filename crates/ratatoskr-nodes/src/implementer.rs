@@ -232,7 +232,7 @@ impl ImplementerNode {
             // Nobody to ask. The prompt says so, and offering the tool would contradict it.
             clarifier: self.clarifier.clone(),
             observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills),
+            skills: crate::skills::loaded(&self.plugins.skills, "implementer"),
             // Rooted at the worktree, not the checkout: every path it reads or writes has to be
             // the copy it owns, or one attempt edits the tree another node is reading.
             files: Some(worktree.as_path().to_path_buf()),

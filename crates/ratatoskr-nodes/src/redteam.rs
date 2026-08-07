@@ -105,7 +105,7 @@ impl RedTeamClassifier {
             max_turns: self.max_turns,
             clarifier: self.clarifier.clone(),
             observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills),
+            skills: crate::skills::loaded(&self.plugins.skills, "redteam"),
             files: self.files.clone(),
             // Reads and edits, but runs nothing.
             shell: None,
@@ -181,7 +181,7 @@ impl TestAuthor {
             max_turns: self.max_turns,
             clarifier: None,
             observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills),
+            skills: crate::skills::loaded(&self.plugins.skills, "redteam"),
             // Rooted at the worktree: the tests have to land where the implementer will meet them.
             files: Some(worktree.to_path_buf()),
             // No shell. Writing a test is not running one, and the baseline run is what says

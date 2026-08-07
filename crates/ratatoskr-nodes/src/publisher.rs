@@ -82,7 +82,7 @@ impl PublisherNode {
             // It runs after everything that could answer it has finished.
             clarifier: None,
             observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills),
+            skills: crate::skills::loaded(&self.plugins.skills, "publisher"),
             files: self.files.clone(),
             // Reads and edits, but runs nothing.
             shell: None,
