@@ -113,6 +113,13 @@ pub struct VerifierInput {
     /// The change as a patch. Not a `--stat`: a summary cannot show a weakened assertion.
     pub diff: String,
     pub touched_files: Vec<String>,
+    /// What earlier passes in this run already found, oldest first.
+    ///
+    /// Without it every pass reviews as if it were the first, and the one pattern that matters
+    /// most is invisible: a finding that exists *because* of the fix for the last one. That is not
+    /// a fresh defect to patch, it is the plan being wrong, and saying so is the only way the run
+    /// stops trading one symptom for the next.
+    pub previous_findings: Vec<Finding>,
 }
 
 /// The verifier node: a reviewer restricted to read-only grounding tools.
@@ -198,6 +205,22 @@ fn render_prompt(input: &VerifierInput) -> String {
     if !input.touched_files.is_empty() {
         let _ = write!(s, "FILES CHANGED: {}\n\n", input.touched_files.join(", "));
     }
+    if !input.previous_findings.is_empty() {
+        s.push_str(
+            "WHAT YOU ALREADY FOUND IN THIS RUN, and the implementer has since tried to fix. Read \
+             these before the diff. If what you are about to report exists because of the fix for \
+             one of them, the plan is wrong and you must say so with kind `plan` — reporting it as \
+             another `execution` finding buys one more patch and the next finding after it:\n",
+        );
+        for f in &input.previous_findings {
+            let _ = writeln!(
+                s,
+                "- [{:?}/{:?}] {}: {}",
+                f.severity, f.kind, f.file, f.summary
+            );
+        }
+        s.push('\n');
+    }
     let _ = write!(s, "THE CHANGE:\n{}\n", input.diff);
     s
 }
@@ -280,6 +303,55 @@ mod tests {
         assert!(text.contains("a.rs:4"));
         assert!(text.contains("P1"));
         assert!(text.contains("scenario"));
+    }
+
+    #[test]
+    fn a_pass_is_shown_what_the_last_one_found() {
+        // The pattern this exists to surface: three passes on one live run found three different
+        // defects, each caused by the fix for the one before, severity climbing P2 -> P2 -> P1.
+        // A pass that cannot see the earlier findings reviews as if it were the first, reports
+        // another execution fault, and buys exactly one more patch.
+        let earlier = Finding {
+            severity: Severity::P2,
+            kind: FindingKind::Execution,
+            file: "lib.rs".into(),
+            line: None,
+            summary: "terminal gate not updated for the new status".into(),
+            failure_scenario: "a no-change run skips publishing".into(),
+        };
+        let input = VerifierInput {
+            issue: "i".into(),
+            analyst: AnalystOutput {
+                impact_summary: String::new(),
+                touched: Vec::new(),
+                risks: Vec::new(),
+                requirements: Vec::new(),
+                residual_risk: String::new(),
+                changes_code: true,
+                acceptance: Vec::new(),
+                interface: Vec::new(),
+            },
+            diff: "--- a
++++ b
+"
+            .into(),
+            touched_files: vec!["lib.rs".into()],
+            previous_findings: vec![earlier],
+        };
+        let p = render_prompt(&input);
+        assert!(p.contains("WHAT YOU ALREADY FOUND"), "the history is shown");
+        assert!(p.contains("terminal gate not updated"), "and its substance");
+        assert!(
+            p.contains("the plan is wrong"),
+            "with what it means when the new finding follows from the old fix"
+        );
+
+        // A first pass has none, and is not told to look for a pattern that cannot exist yet.
+        let first = VerifierInput {
+            previous_findings: Vec::new(),
+            ..input
+        };
+        assert!(!render_prompt(&first).contains("WHAT YOU ALREADY FOUND"));
     }
 
     #[test]

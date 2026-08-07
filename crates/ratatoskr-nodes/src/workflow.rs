@@ -696,6 +696,8 @@ async fn verify_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, S
         .unwrap_or_default();
     let out = match node
         .run(verifier::VerifierInput {
+            // The scripted path reviews once per call and keeps no history of its own.
+            previous_findings: Vec::new(),
             issue: ctx.issue.clone(),
             analyst: input.analyst,
             diff,

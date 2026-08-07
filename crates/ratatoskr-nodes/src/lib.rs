@@ -1785,13 +1785,16 @@ enum Reviewed {
     /// Nothing above the threshold. The change is accepted.
     Clean,
     /// Send this back.
-    Fix(Correction),
+    Fix(Box<Correction>),
     /// The verifier could not be asked. The reason is on its checkpoint.
     Unavailable,
 }
 
 /// What a review concluded the run should do next.
 struct Correction {
+    /// What the review found, carried so the next pass can see what the last one said — and notice
+    /// when a new finding exists only because of the fix for an old one.
+    found: Vec<verifier::Finding>,
     /// What to hand the implementer.
     prompt: String,
     /// The amended plan, when the analyst revised one. Kept so later reviews judge the change
@@ -1980,6 +1983,7 @@ impl Review {
         impl_out: &ImplementerOutput,
         worktree: &WorktreePath,
         iteration: u32,
+        previous_findings: &[verifier::Finding],
     ) -> Result<Reviewed, PlanError> {
         let &Run {
             store,
@@ -1999,6 +2003,7 @@ impl Review {
             analyst: plan.clone(),
             diff,
             touched_files: impl_out.touched_files.clone(),
+            previous_findings: previous_findings.to_vec(),
         };
         let input_json = serde_json::to_string(&serde_json::json!({
             "requirements": plan.requirements,
@@ -2042,6 +2047,7 @@ impl Review {
         if blocking.is_empty() {
             return Ok(Reviewed::Clean);
         }
+        let found: Vec<verifier::Finding> = out.findings.clone();
         // Findings below the threshold were still recorded above; say what was set aside so a
         // reader of the logs does not read "2 findings" as "2 problems being fixed".
         tracing::info!(
@@ -2059,10 +2065,11 @@ impl Review {
             .map(|f| (*f).clone())
             .collect();
         if plan_faults.is_empty() {
-            return Ok(Reviewed::Fix(Correction {
+            return Ok(Reviewed::Fix(Box::new(Correction {
                 prompt: verifier::correction(&blocking),
                 revised: None,
-            }));
+                found,
+            })));
         }
 
         let revision = analyst::AnalystInput {
@@ -2093,10 +2100,73 @@ impl Review {
         })
         .await?;
 
-        Ok(Reviewed::Fix(Correction {
+        Ok(Reviewed::Fix(Box::new(Correction {
             prompt: replan(&revised, &blocking),
             revised: Some(revised),
-        }))
+            found,
+        })))
+    }
+}
+
+impl Review {
+    /// Ask the analyst to look at the plan when the iteration budget is spent.
+    ///
+    /// The evidence for doing this rather than recording another failed attempt: on the run that
+    /// prompted it, three passes found three *different* defects, each one existing because of the
+    /// fix for the one before, with severity climbing P2 → P2 → P1. A fourth attempt at the same
+    /// plan had nothing left to find. What was wrong was a decision made before any of it.
+    ///
+    /// Every finding goes over, not just the plan-tagged ones — the whole point is that the
+    /// verifier called them execution faults one at a time and the pattern only shows in the set.
+    async fn replan_at_ceiling(
+        &self,
+        run: &Run<'_>,
+        plan: &AnalystOutput,
+        findings: &[verifier::Finding],
+        iteration: u32,
+    ) -> Result<Option<(AnalystOutput, String)>, PlanError> {
+        let &Run {
+            store,
+            run_id,
+            issue,
+            ledger,
+            ..
+        } = run;
+        let revision = analyst::AnalystInput {
+            issue: issue.to_string(),
+            scout: self.scout.clone(),
+            memory: self.memory.clone(),
+            brief: self.brief.clone(),
+            constraints: self.constraints.clone(),
+            previous: Some(Box::new(plan.clone())),
+            findings: findings.to_vec(),
+        };
+        let revision_json = serde_json::to_string(&revision)?;
+        let revised = match self
+            .analyst
+            .run(revision, &RunState::new(run_id, None))
+            .await
+        {
+            Ok(revised) => revised,
+            // Best-effort, like every other recovery here: a failed re-plan leaves the run
+            // recording what it already knew rather than losing the work as well.
+            Err(e) => {
+                tracing::warn!("the analyst could not re-plan at the ceiling: {e}");
+                return Ok(None);
+            }
+        };
+        record(Record {
+            store,
+            run_id,
+            node: "analyst",
+            output: &revised,
+            input: Some(revision_json),
+            iteration: Some(iteration),
+            ledger: Some(ledger),
+        })
+        .await?;
+        let borrowed: Vec<&verifier::Finding> = findings.iter().collect();
+        Ok(Some((revised.clone(), replan(&revised, &borrowed))))
     }
 }
 
@@ -2338,6 +2408,11 @@ async fn fork_and_converge(
     // was actually asked for by the end rather than against the requirement that was wrong.
     let mut in_force = plan.analyst.clone();
     let mut iterations = 1u32;
+    // Everything the review has said this run. Carried so a later pass can see the earlier ones,
+    // and so the ceiling has the evidence to hand the analyst.
+    let mut found_so_far: Vec<verifier::Finding> = Vec::new();
+    // At most one re-plan per run: a second would be the same escalation on the same evidence.
+    let mut replanned = false;
     let status = loop {
         let post_ran = converge::test_command_ran(
             &impl_out.failing_tests,
@@ -2367,10 +2442,11 @@ async fn fork_and_converge(
         // than a model's judgement, so reviewing a change that does not build wastes the call.
         let correction: Reviewed = if !referee.is_empty() {
             tracing::warn!(files = ?referee, "iteration touched the referee; not accepting it");
-            Reviewed::Fix(Correction {
+            Reviewed::Fix(Box::new(Correction {
                 prompt: converge::referee_correction(&referee),
                 revised: None,
-            })
+                found: Vec::new(),
+            }))
         } else if !tests_clean {
             // A post-change run that didn't complete usually means the edit broke the build — say
             // that specifically instead of reporting "no new failures".
@@ -2402,13 +2478,21 @@ async fn fork_and_converge(
                     new_failures.join(", ")
                 )
             };
-            Reviewed::Fix(Correction {
+            Reviewed::Fix(Box::new(Correction {
                 prompt,
                 revised: None,
-            })
+                found: Vec::new(),
+            }))
         } else if let Some(review) = &review {
             review
-                .review(run, &in_force, &impl_out, &worktree, iterations)
+                .review(
+                    run,
+                    &in_force,
+                    &impl_out,
+                    &worktree,
+                    iterations,
+                    &found_so_far,
+                )
                 .await?
         } else {
             Reviewed::Clean
@@ -2419,13 +2503,65 @@ async fn fork_and_converge(
             // The change passed its tests and nobody was able to review it. Saying `Converged`
             // would claim a review that did not happen; failing would discard work that did.
             Reviewed::Unavailable => break RunStatus::Unreviewed,
-            Reviewed::Fix(correction) => correction,
+            Reviewed::Fix(correction) => *correction,
         };
+        // Everything the review has said this run, so the next pass can recognise a finding that
+        // exists only because of the fix for an earlier one.
+        found_so_far.extend(correction.found.iter().cloned());
         if let Some(revised) = correction.revised {
             in_force = revised;
+            replanned = true;
         }
         if iterations >= config.implementer.max_iterations {
-            break RunStatus::MaxIterationsReached;
+            // The budget is spent. Stopping here records "ran out of attempts", which is the one
+            // reading the evidence usually does not support: a run that spends three iterations
+            // trading each defect for its successor did not need a fourth attempt at the same
+            // plan, it needed the plan looked at. So escalate once, then stop for real.
+            if replanned || found_so_far.is_empty() {
+                break RunStatus::MaxIterationsReached;
+            }
+            match review.as_ref() {
+                None => break RunStatus::MaxIterationsReached,
+                Some(review) => {
+                    tracing::warn!(
+                        iterations,
+                        findings = found_so_far.len(),
+                        "the iteration budget is spent; asking the analyst to look at the plan \
+                         rather than recording another failed attempt"
+                    );
+                    let revised = review
+                        .replan_at_ceiling(run, &in_force, &found_so_far, iterations)
+                        .await?;
+                    match revised {
+                        None => break RunStatus::MaxIterationsReached,
+                        Some((revised, prompt)) => {
+                            in_force = revised;
+                            replanned = true;
+                            iterations += 1;
+                            impl_out = match implementer.iterate(&worktree, &prompt).await {
+                                Ok(out) => out,
+                                Err(e) => {
+                                    if let Err(rm) = remove_worktree(&repo_path, &worktree).await {
+                                        tracing::warn!("failed to clean up worktree: {rm}");
+                                    }
+                                    return Err(PlanError::node("implementer", e));
+                                }
+                            };
+                            record(Record {
+                                store,
+                                run_id,
+                                node: "implementer",
+                                output: &impl_out,
+                                input: Some(serde_json::to_string(&in_force)?),
+                                iteration: Some(iterations),
+                                ledger: Some(ledger),
+                            })
+                            .await?;
+                            continue;
+                        }
+                    }
+                }
+            }
         }
         impl_out = match implementer.iterate(&worktree, &correction.prompt).await {
             Ok(out) => out,
