@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef } from "react";
+import { accent, wash } from "./tint";
 import {
   BaseEdge,
   Handle,
@@ -222,7 +223,18 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
     .join(" ");
 
   return (
-    <div className={cls}>
+    // `--tint` rather than a colour per property: the hue comes from the node's name, which CSS
+    // cannot derive, but everything downstream of it is ordinary styling and belongs in the
+    // stylesheet. The wash fades out before the top, so the state backgrounds below it still read.
+    <div
+      className={cls}
+      style={
+        {
+          "--tint": accent(node.name),
+          backgroundImage: wash(node.name),
+        } as React.CSSProperties
+      }
+    >
       {/* Named, all four of them: with more than one handle per type an edge that names none is
           resolved by whichever registered without an id, and that ordering is not ours to rely on.
           Unnamed, the stage edges vanished intermittently on re-render. */}
