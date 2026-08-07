@@ -132,6 +132,24 @@ impl PluginConfig {
     }
 }
 
+impl SandboxConfig {
+    /// Whether a step running `command` may reach the network.
+    ///
+    /// Matched on the program's file name, so `npm` covers `/usr/bin/npm`, and never on anything
+    /// the program is passed — a step is allowed or it is not, and an argument cannot make one
+    /// allowed.
+    pub fn may_use_network(&self, command: &[String]) -> bool {
+        let Some(program) = command.first() else {
+            return false;
+        };
+        let program = Path::new(program)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| program.clone());
+        self.network_allow.contains(&program)
+    }
+}
+
 /// Expand a leading `~` against `HOME`.
 ///
 /// A plugin installed by a coding CLI lives under the home directory, so `~/.claude/plugins/...` is
@@ -258,6 +276,20 @@ pub struct SandboxConfig {
     /// The default acceptance check: one command, for the repo that has one and nothing to add.
     /// Superseded per-task by the analyst's `acceptance` unless `pin_acceptance` is set.
     pub test_command: Vec<String>,
+    /// Programs an acceptance step may reach the network for, by name.
+    ///
+    /// Acceptance runs offline: a test that reaches the network is a test that fails for reasons
+    /// nothing in the repository controls, and an isolated worktree is the point of the sandbox.
+    /// But a repository whose deps are not vendored cannot check anything without fetching them
+    /// first — a fresh worktree has no `node_modules`, so the type-checker fails on the framework
+    /// rather than on the change.
+    ///
+    /// Naming a program here lets a step whose command is that program run with the network up.
+    /// It is per-step and by program name, not by host: the sandbox's network namespace is all or
+    /// nothing for one invocation, so a step that can reach a registry can reach anything. Name
+    /// the installer, not the test runner.
+    #[serde(default)]
+    pub network_allow: Vec<String>,
     /// Ignore whatever acceptance the analyst proposes and always run `test_command`.
     ///
     /// The escape hatch for a repo that does not want a model deciding what proves its code works.
@@ -305,6 +337,7 @@ impl Default for SandboxConfig {
             backend: "landlock".to_string(),
             image: "docker.io/library/rust:1-slim".to_string(),
             test_command: vec!["cargo".to_string(), "test".to_string()],
+            network_allow: Vec::new(),
             pin_acceptance: false,
         }
     }
@@ -512,6 +545,46 @@ impl Default for RatatoskrConfig {
             sandbox: SandboxConfig::default(),
             plugins: PluginConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_network_tests {
+    use super::*;
+
+    fn cfg(allow: &[&str]) -> SandboxConfig {
+        SandboxConfig {
+            network_allow: allow.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn a_step_reaches_the_network_only_when_its_program_was_named() {
+        let allowed = cfg(&["npm", "pnpm"]);
+        assert!(allowed.may_use_network(&argv(&["npm", "install"])));
+        assert!(allowed.may_use_network(&argv(&["pnpm", "install", "--frozen-lockfile"])));
+        // The test runner is not on the list, so the checks themselves stay offline.
+        assert!(!allowed.may_use_network(&argv(&["npm-check", "--prod"])));
+        assert!(!allowed.may_use_network(&argv(&["cargo", "test"])));
+        assert!(!allowed.may_use_network(&argv(&[])));
+
+        // Offline is the default: naming nothing allows nothing.
+        assert!(!cfg(&[]).may_use_network(&argv(&["npm", "install"])));
+    }
+
+    #[test]
+    fn the_program_is_matched_by_name_and_never_by_its_arguments() {
+        let allowed = cfg(&["npm"]);
+        // A path to the same program still matches.
+        assert!(allowed.may_use_network(&argv(&["/usr/bin/npm", "ci"])));
+        // But an argument cannot make a step allowed — the program is what is checked.
+        assert!(!allowed.may_use_network(&argv(&["sh", "-c", "npm install"])));
+        assert!(!allowed.may_use_network(&argv(&["curl", "https://npm"])));
     }
 }
 

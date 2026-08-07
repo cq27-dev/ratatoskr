@@ -83,7 +83,11 @@ pub async fn run_acceptance(
             command: step.command.clone(),
             cpus: 2,
             memory_mib: 2048,
-            network: false,
+            // Offline unless this step's program was named in `[sandbox] network_allow`. A test
+            // that reaches the network fails for reasons the repository does not control; an
+            // install step has to, and a repository whose deps are not vendored cannot check
+            // anything until it has run.
+            network: cfg.may_use_network(&step.command),
         };
         let out = sandbox_run(spec)
             .await
