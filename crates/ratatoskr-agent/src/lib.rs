@@ -283,24 +283,48 @@ fn truncate(s: &str, max: usize) -> String {
 /// consumer downstream loses ALL the arguments rather than the long one. `Read` survived it only by
 /// being short enough to fit; `Edit` and `Write` never did. Bounding each value instead keeps the
 /// shape intact, so the field a reader identifies the call by is always there.
-fn abridged_args(raw: &str, max_value: usize) -> String {
+/// Fields whose value is recoverable from somewhere better than a log line.
+///
+/// File contents live in the worktree and its branch, so a diff is reproducible from git long
+/// after the log has rotated; a prose body ends up on the pull request or the issue. Keeping them
+/// whole here would multiply the log by the size of the files a run touches to duplicate a record
+/// that already exists.
+const RECOVERABLE: &[&str] = &["content", "old_string", "new_string", "body"];
+
+/// Nothing else is recoverable, so nothing else is abridged — up to a ceiling no real argument
+/// reaches, which is there so one pathological call cannot swamp a day's log.
+const ARGUMENT_CEILING: usize = 4_000;
+
+fn abridged_args(raw: &str, bulk: usize) -> String {
     let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
         // Not JSON to begin with — nothing to preserve, so bound the whole thing.
         return truncate(raw, 200);
     };
-    fn walk(v: &mut serde_json::Value, max: usize) {
+    fn walk(v: &mut serde_json::Value, key: Option<&str>, bulk: usize) {
         match v {
             serde_json::Value::String(s) => {
+                // The command that ran, the pattern searched, the path read: short, and written
+                // down nowhere else. A run's account of what it did is only as good as these.
+                let max = match key {
+                    Some(k) if RECOVERABLE.contains(&k) => bulk,
+                    _ => ARGUMENT_CEILING,
+                };
                 if s.chars().count() > max {
                     *s = truncate(s, max);
                 }
             }
-            serde_json::Value::Array(items) => items.iter_mut().for_each(|i| walk(i, max)),
-            serde_json::Value::Object(map) => map.values_mut().for_each(|i| walk(i, max)),
+            serde_json::Value::Array(items) => {
+                items.iter_mut().for_each(|i| walk(i, key, bulk));
+            }
+            serde_json::Value::Object(map) => {
+                for (k, value) in map.iter_mut() {
+                    walk(value, Some(k.as_str()), bulk);
+                }
+            }
             _ => {}
         }
     }
-    walk(&mut parsed, max_value);
+    walk(&mut parsed, None, bulk);
     parsed.to_string()
 }
 
@@ -1545,6 +1569,31 @@ mod tests {
             out.len() < 500,
             "the log line stays readable: {}",
             out.len()
+        );
+    }
+
+    #[test]
+    fn what_a_run_did_is_kept_whole_and_what_it_wrote_is_not() {
+        // The distinction the log has to make: a command or a pattern exists nowhere else, so the
+        // account of what the run did is only as good as what is written here. File contents are
+        // reproducible from the branch the run worked on, so keeping them would duplicate a better
+        // record at the cost of multiplying the log by the size of the files touched.
+        let long = "x".repeat(3000);
+        let raw = format!(
+            r#"{{"command":"cargo test --workspace -- --nocapture {long}",
+                 "file_path":"crates/foo.rs","old_string":"{long}"}}"#
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&super::abridged_args(&raw, 120)).unwrap();
+
+        assert!(
+            parsed["command"].as_str().unwrap().len() > 3000,
+            "the command that ran is kept whole"
+        );
+        assert_eq!(parsed["file_path"], "crates/foo.rs");
+        assert!(
+            parsed["old_string"].as_str().unwrap().chars().count() <= 121,
+            "file contents are abridged: git has them"
         );
     }
 
