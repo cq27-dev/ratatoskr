@@ -310,6 +310,76 @@ pub async fn touched_files(worktree: &WorktreePath) -> Result<Vec<String>, ExecE
 ///
 /// A rename reports as a delete plus an add, so a renamed test file counts as rewritten. That is
 /// the right answer: the test that used to run under that name no longer does.
+/// Commit everything in `worktree`, on the branch the run was given and no other.
+///
+/// Returns the new commit's sha, or `None` when there was nothing to commit.
+///
+/// The branch is checked against `expected` before anything is staged. A worktree is a checkout
+/// like any other and `git commit` writes to whatever HEAD points at, so a run that has somehow
+/// ended up on another branch must not commit there — the point of a per-run branch is that a run's
+/// work lands on it and nowhere else.
+///
+/// Identity is set per invocation rather than read from the environment: a run is not the person
+/// whose `user.name` happens to be configured, and a commit that claims otherwise is a lie in the
+/// history.
+pub async fn commit_all(
+    worktree: &WorktreePath,
+    expected: &str,
+    message: &str,
+) -> Result<Option<String>, ExecError> {
+    let path = worktree.as_path();
+    let head = git(
+        path,
+        "rev-parse --abbrev-ref HEAD",
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+    )
+    .await?
+    .trim()
+    .to_string();
+    if head != expected {
+        return Err(ExecError::Git {
+            op: "commit".to_string(),
+            code: -1,
+            stderr: format!(
+                "refusing to commit: this worktree is on `{head}`, and the run's branch is \
+                 `{expected}`"
+            ),
+        });
+    }
+
+    git(path, "add -A", &["add", "-A"]).await?;
+    // Nothing staged is an ordinary outcome — a run that changed nothing has nothing to record.
+    let staged = git(
+        path,
+        "diff --cached --name-only",
+        &["diff", "--cached", "--name-only"],
+    )
+    .await?;
+    if staged.trim().is_empty() {
+        return Ok(None);
+    }
+    git(
+        path,
+        "commit",
+        &[
+            "-c",
+            "user.name=ratatoskr",
+            "-c",
+            "user.email=ratatoskr@localhost",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+    )
+    .await?;
+    let sha = git(path, "rev-parse HEAD", &["rev-parse", "HEAD"])
+        .await?
+        .trim()
+        .to_string();
+    Ok(Some(sha))
+}
+
 pub async fn rewritten_files(worktree: &WorktreePath) -> Result<Vec<String>, ExecError> {
     let cwd = worktree.as_path();
     // As in `diff_stat`: `-N` makes a new file visible to `diff` without staging its content.
@@ -444,6 +514,49 @@ branch refs/heads/feature/x
             managed[0].0,
             PathBuf::from("/repo/.ratatoskr/worktrees/ratatoskr/abc12345")
         );
+    }
+
+    #[tokio::test]
+    async fn a_run_commits_to_its_own_branch_and_refuses_any_other() {
+        let tmp = std::env::temp_dir().join(format!("ratatoskr-commit-{}", std::process::id()));
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo).await;
+        let wt = create(&repo, &tmp.join("wts"), "ratatoskr/abc12345")
+            .await
+            .unwrap();
+
+        // Nothing changed is not a failure — a run that touched nothing has nothing to record.
+        assert_eq!(
+            commit_all(&wt, "ratatoskr/abc12345", "no-op")
+                .await
+                .unwrap(),
+            None
+        );
+
+        std::fs::write(wt.as_path().join("new.rs"), "fn main() {}\n").unwrap();
+        let sha = commit_all(&wt, "ratatoskr/abc12345", "feat: a thing")
+            .await
+            .unwrap()
+            .expect("a change is committed");
+        assert_eq!(sha.len(), 40, "{sha}");
+        // And the branch actually moved, which is the whole point: a pushed branch with no commits
+        // is what a pull request cannot be opened against.
+        let log = git(wt.as_path(), "log", &["log", "--oneline", "-1"])
+            .await
+            .unwrap();
+        assert!(log.contains("feat: a thing"), "{log}");
+
+        // The guard: this worktree is on the run's branch, so committing to another name is
+        // refused rather than silently landing work somewhere nobody will look for it.
+        std::fs::write(wt.as_path().join("second.rs"), "fn other() {}\n").unwrap();
+        let err = commit_all(&wt, "ratatoskr/deadbeef", "wrong branch")
+            .await
+            .expect_err("must refuse");
+        assert!(format!("{err}").contains("the run's branch"), "{err}");
+
+        let _ = remove(&repo, &wt).await;
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
