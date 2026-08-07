@@ -23,6 +23,14 @@ import {
 const STALE_MS = 120_000;
 /** How many live events to keep on screen. Old ones scroll away; the log file keeps everything. */
 const FEED_LIMIT = 250;
+/**
+ * How often to re-read the run list while the tab is visible.
+ *
+ * A run started or deleted outside the dashboard produces no event to subscribe to, so this is
+ * the only way the list learns about it. Short enough that a run started in a terminal appears
+ * while you are still looking for it, long enough that a handful of rows is not worth streaming.
+ */
+const RUN_LIST_POLL_MS = 10_000;
 
 const short = (id: string | null) => (id ? id.slice(0, 8) : "—");
 const clock = (ts: string | null) => (ts ? ts.slice(11, 19) : "—");
@@ -650,7 +658,12 @@ export default function App() {
       const list = await listRuns(project);
       setRuns(list);
       setError(null);
-      setRunId((cur) => cur ?? list[0]?.run_id ?? null);
+      // Keep the current selection when it still exists, fall back to the newest when it does
+      // not. A run deleted by `ratatoskr runs rm` would otherwise stay selected: its row is gone
+      // from the list while the detail pane goes on showing it.
+      setRunId((cur) =>
+        cur && list.some((r) => r.run_id === cur) ? cur : (list[0]?.run_id ?? null),
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -659,6 +672,28 @@ export default function App() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // The run list changes outside this tab and nothing tells us: `ratatoskr run` in a terminal adds
+  // one, `runs rm` removes one, and neither goes through the dashboard. Without this the list is
+  // whatever it was when the project was selected, so a run in flight is invisible until a reload
+  // and a deleted run lingers indefinitely.
+  //
+  // Polled rather than streamed because there is no event for "the set of runs changed" — the
+  // per-run stream only exists once you know a run to subscribe to, which is the thing being
+  // missed. Only while the tab is visible, and immediately on becoming visible again, so a
+  // backgrounded dashboard costs nothing and a returning one is current at once.
+  useEffect(() => {
+    if (!project) return;
+    const tick = () => {
+      if (document.visibilityState === "visible") void refresh();
+    };
+    const id = window.setInterval(tick, RUN_LIST_POLL_MS);
+    document.addEventListener("visibilitychange", tick);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", tick);
+    };
+  }, [project, refresh]);
 
   // Switching project means a different store entirely, so nothing selected carries over. This
   // has to happen in the same update as the project change: as a reactive effect it would run
