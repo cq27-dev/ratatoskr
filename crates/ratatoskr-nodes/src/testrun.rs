@@ -79,6 +79,9 @@ pub async fn run_acceptance(
             mounts: vec![Mount {
                 host: host_path.to_path_buf(),
                 guest: GUEST_WORKSPACE.to_string(),
+                // Writable: a check builds, and a build writes — `target/`, `.pytest_cache`, a
+                // bundler's output. The tree is the run's own worktree, never the checkout.
+                read_only: false,
             }],
             command: step.command.clone(),
             cpus: 2,

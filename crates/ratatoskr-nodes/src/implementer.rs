@@ -284,6 +284,8 @@ impl ImplementerNode {
                 mounts: vec![Mount {
                     host: worktree.as_path().to_path_buf(),
                     guest: GUEST_WORKSPACE.to_string(),
+                    // The node whose job is to change the tree.
+                    read_only: false,
                 }],
                 // Filled in per call.
                 command: Vec::new(),

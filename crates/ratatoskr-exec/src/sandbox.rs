@@ -26,6 +26,12 @@ use tokio::process::Command;
 pub struct Mount {
     pub host: PathBuf,
     pub guest: String,
+    /// Whether the command may write here.
+    ///
+    /// Stated per mount rather than assumed, because a mount is the *only* writable host
+    /// filesystem a sandbox has, and giving one away by accident is how a run reaches something it
+    /// was never meant to touch. A dependency cache is read-only; the worktree is not.
+    pub read_only: bool,
 }
 
 /// What to run, where, and under what limits. Ratatoskr's own type — backend-neutral.
@@ -173,7 +179,8 @@ fn container_argv(spec: &SandboxSpec, user: Option<&str>) -> Vec<String> {
             workdir.clone_from(&host);
         }
         args.push("--volume".into());
-        args.push(format!("{host}:{host}"));
+        let mode = if m.read_only { ":ro" } else { "" };
+        args.push(format!("{host}:{host}{mode}"));
     }
     args.push("--workdir".into());
     args.push(workdir);
@@ -324,7 +331,7 @@ fn bwrap_argv(spec: &SandboxSpec) -> Vec<String> {
         if spec.workdir == m.guest {
             chdir = host.clone();
         }
-        args.push("--bind".into());
+        args.push(if m.read_only { "--ro-bind" } else { "--bind" }.into());
         args.push(host.clone());
         args.push(host);
     }
@@ -454,6 +461,7 @@ mod tests {
             mounts: vec![Mount {
                 host: std::env::temp_dir(),
                 guest: "/workspace".into(),
+                read_only: false,
             }],
             workdir: "/workspace".into(),
             ..spec(command)
@@ -544,6 +552,7 @@ mod tests {
             mounts: vec![Mount {
                 host: dir.clone(),
                 guest: "/workspace".into(),
+                read_only: false,
             }],
             ..container_spec(&["sh", "-c", "cat mounted; ls /root 2>&1 | head -1"])
         };
@@ -562,6 +571,7 @@ mod tests {
             mounts: vec![Mount {
                 host: dir.clone(),
                 guest: "/workspace".into(),
+                read_only: false,
             }],
             command: vec![
                 "sh".into(),
