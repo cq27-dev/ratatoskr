@@ -175,6 +175,22 @@ enabled = false
 # front of them. Set it to another word to use that instead, or to "" to add none — a repository
 # that already labels automation its own way should not be given a second scheme.
 label = "ratatoskr"
+# How a run's commit subject is built, over `{type}`, `{scope}` and `{summary}` — the three things
+# the implementer reports about its own change. Conventional-commit by default, because a run whose
+# commits do not match the surrounding history is a run whose commits get rewritten by hand. Set it
+# to what your log already looks like: "{summary}" for no convention, "[{scope}] {summary}", …
+# `({scope})` drops out whole when a change belongs to no particular part, so the default gives
+# `fix: …` rather than `fix(): …`. Subjects longer than 72 characters are cut at a word boundary.
+commit_subject = "{type}({scope}): {summary}"
+# Who a run's commits are authored by. Set per commit rather than read from the environment: a
+# commit claiming whoever happens to have `user.name` set on this machine is a lie in the history.
+# Give runs an address of their own — a forge attributes a commit to whichever account owns the
+# address, so a person's address credits that person with work they did not do. The default
+# resolves nowhere on purpose.
+committer_name = "ratatoskr"
+committer_email = "ratatoskr@localhost"
+
+
 
 # Optional: with a [models.publisher] route set and [publish] enabled, a finished run delivers what
 # it made to the tracker, in parallel with the bookkeeper recording what it learned.

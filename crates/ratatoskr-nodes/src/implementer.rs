@@ -59,6 +59,17 @@ pub struct ImplementerOutput {
     /// The CLI's own narrative of what it did (optional).
     #[serde(default)]
     pub narrative: Option<String>,
+    /// How the change describes itself for the commit: type, scope, and a one-line subject.
+    ///
+    /// From the implementer rather than from the issue, because they are different things. The
+    /// issue says what was wanted; the commit subject says what was done, and a run that fixed
+    /// half of a two-part issue should not claim the whole of it in its history.
+    #[serde(default)]
+    pub commit_kind: String,
+    #[serde(default)]
+    pub commit_scope: String,
+    #[serde(default)]
+    pub commit_subject: String,
 }
 
 /// What a natively-driven implementer is told.
@@ -95,6 +106,18 @@ pub const IMPLEMENTER_TOOLS: &[&str] = &[
 struct Report {
     /// What was changed and why, for the reader of the run rather than for another node.
     summary: String,
+    /// The conventional-commit type of this change: `feat`, `fix`, `chore`, `docs`, `perf`,
+    /// `refactor`, `style`, `test`, `ci`, `build`.
+    #[serde(default)]
+    kind: String,
+    /// The part of the repository this touches, as the log already names it — a crate, a module,
+    /// a subsystem. Empty when the change belongs to no particular part.
+    #[serde(default)]
+    scope: String,
+    /// One line, imperative, no trailing period, under 60 characters: what the commit does. Not a
+    /// restatement of the issue's title — what *this change* does.
+    #[serde(default)]
+    subject: String,
 }
 
 /// The implementer node. Holds everything needed to create the worktree and drive the model.
@@ -241,6 +264,9 @@ impl ImplementerNode {
             failing_tests: tests.failing,
             passed_tests: tests.passed,
             exit_code: tests.exit_code,
+            commit_kind: report.kind,
+            commit_scope: report.scope,
+            commit_subject: report.subject,
             narrative: Some(report.summary),
         })
     }

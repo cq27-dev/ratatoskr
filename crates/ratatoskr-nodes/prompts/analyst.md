@@ -21,6 +21,23 @@ that assumes them fails on the framework rather than on the change, and says not
 the change is right. Leave the list empty to accept the repository's configured test command, which
 is the right answer whenever the existing suite already covers the change.
 
+**Read the repository's CI configuration and take the acceptance from it**, when there is one —
+`.github/workflows/*.yml`, or whatever the repository uses. Those are the checks that decide
+whether the change can be merged, so a change that passes something weaker is a change that
+reddens CI and comes back. A run that tested only the suite while CI also ran a formatter has
+delivered work that fails the moment it is opened.
+
+Take the jobs that gate a change, and only those: the ones triggered by `push` or `pull_request`
+that build, test, lint or format. Do NOT take deploy, release, publish, or scheduled jobs — those
+act outside this machine, and running one from a sandbox is at best waste and at worst an
+unintended release. Do not reproduce a matrix either: one representative configuration is the
+check, and eight are the same check eight times at eight times the cost. Take the commands the
+workflow runs, not the workflow file — there is no CI runner here, so `actions/checkout` and a
+toolchain-install action have no equivalent and no purpose in a tree that is already checked out.
+
+Where CI's checks and the repository's documented ones disagree, prefer CI: it is the one that
+actually refuses the change.
+
 Also set `interface`: the surface this change is contracted to have. Someone else writes the tests
 from it — the red team, working only from what you say here — and the implementer builds against
 the same description. That is the point: tests written by the author of the code are shaped around

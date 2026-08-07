@@ -296,6 +296,41 @@ const TYPES: &[&str] = &[
 /// The caller supplies only the type and the slug, both constrained: the type is from a fixed list,
 /// and the slug is reduced to lowercase words joined by single hyphens. The `refs/heads/…` ref is
 /// assembled here from those and the run's own issue number, so no ref ever arrives ready-made.
+/// Most digits an issue number can have. Trackers number sequentially from one; six digits is a
+/// repository with a million issues in it, and anything longer is not a number, it is a date, a
+/// hash, or prose that happened to contain digits.
+const MAX_ISSUE_DIGITS: usize = 6;
+
+/// The issue's number, read out of the text a run was given.
+///
+/// The text is the whole issue — title and body, prose full of line numbers, version strings,
+/// counts and dates. So this reads the *reference* rather than the digits: the run after the first
+/// `#`, which is how a tracker writes one, and failing that the first run of digits on the first
+/// line, which is where a title puts it.
+///
+/// Collecting every digit in the text instead produced a fifty-character branch name on a live run
+/// — `126` followed by every line number and date in the body — because a test fixture was a
+/// one-line issue string and a real issue is not.
+fn issue_number(issue: &str) -> Option<String> {
+    let digits = |s: &str| -> Option<String> {
+        let n: String = s
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(char::is_ascii_digit)
+            .collect();
+        (!n.is_empty() && n.len() <= MAX_ISSUE_DIGITS).then_some(n)
+    };
+    // `#126` is unambiguous, wherever in the text it appears.
+    if let Some((_, after)) = issue.split_once('#')
+        && let Some(n) = digits(after.split_whitespace().next().unwrap_or(after))
+    {
+        return Some(n);
+    }
+    // Otherwise the first line, which is the title — "issue 126", "126: do the thing". Never the
+    // body, where every number is about something else.
+    digits(issue.lines().next().unwrap_or_default())
+}
+
 pub fn published_name(
     kind: &str,
     slug: &str,
@@ -322,13 +357,9 @@ pub fn published_name(
     if slug.is_empty() {
         return None;
     }
-    // An issue reference is often written `#91` or `issue-91`; the number is the part that
-    // identifies it. Without one, the run's own id keeps the name unique.
-    let number: String = issue
-        .unwrap_or_default()
-        .chars()
-        .filter(char::is_ascii_digit)
-        .collect();
+    // The issue's own number, if the text carries one. Without one, the run's id keeps the name
+    // unique.
+    let number = issue.and_then(issue_number).unwrap_or_default();
     let stem = if number.is_empty() {
         // The run's own id, which is the last segment of `ratatoskr/<id>` — taking the front of
         // the whole string would name every branch after the prefix they all share.
@@ -529,6 +560,48 @@ mod tests {
             format!("{err}").contains("only the branch it authored"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn the_issue_number_comes_from_the_reference_not_from_every_digit_in_the_body() {
+        // The fixture that matters: a real issue, not a one-line summary of one. Reading every
+        // digit in this produced
+        // `fix/1266725151691701711721731691701692026080766338225663-…` on a live run.
+        let real = "GitHub issue #126: A node's model text sometimes contains a fabricated tool \
+                    result\n\n\
+                    From run `6fbb7f25`, analyst, turn 15:\n\
+                    ```\n\
+                    [your Read crates/ratatoskr-cli/src/main.rs]:\n\
+                       169\t    /// Without `--force` it only lists what would go.\n\
+                       170\t    /// event history with it, and cannot be undone.\n\
+                    ```\n\
+                    Five occurrences across `.ratatoskr/logs/ratatoskr.jsonl.2026-08-07`, out of \
+                    663 `model_text` events. None in the 382 from the two days before.";
+        assert_eq!(issue_number(real).as_deref(), Some("126"));
+        assert_eq!(
+            published_name("fix", "drop fabricated model text", Some(real), "x").as_deref(),
+            Some("fix/126-drop-fabricated-model-text")
+        );
+
+        // A title without a `#` still numbers the branch.
+        assert_eq!(
+            issue_number("issue 91: seal the history").as_deref(),
+            Some("91")
+        );
+        assert_eq!(
+            issue_number("77 — a budget in the unit that matters").as_deref(),
+            Some("77")
+        );
+
+        // A body's digits are never read when the title has none — the run's own id names it.
+        assert_eq!(
+            issue_number("Make the scrubber sticky\n\nSee line 4032 of App.tsx."),
+            None
+        );
+
+        // Nor is something the size of a date or a hash an issue number.
+        assert_eq!(issue_number("#20260807120000 do a thing"), None);
+        assert_eq!(issue_number("no numbers here at all"), None);
     }
 
     #[test]
