@@ -255,7 +255,9 @@ impl BookkeeperInput {
 pub struct BookkeeperNode {
     pub route: ratatoskr_core::ModelRoute,
     pub tools: ToolSet,
-    pub sink: ServerSink,
+    /// `None` without rag-rat. The node then has nowhere to write, so it returns before spending
+    /// a model turn deciding what it would have written.
+    pub sink: Option<ServerSink>,
     pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
     pub max_turns: Option<usize>,
     pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
@@ -271,6 +273,12 @@ pub struct BookkeeperNode {
 
 impl BookkeeperNode {
     pub async fn run(&self, input: BookkeeperInput) -> Result<BookkeeperOutput, NodeError> {
+        // Nowhere to put anything. Checked before the friction check and before the model, because
+        // asking one to compose memories that cannot be stored spends a turn to produce nothing.
+        if self.sink.is_none() {
+            tracing::info!("no memory index in this repository; recording no memory");
+            return Ok(input.nothing_recorded("this repository keeps no memory index"));
+        }
         // A run that changed nothing AND hit nothing has nothing to teach. The friction check is
         // what keeps this from throwing away the interesting case: a run that fought its way to an
         // empty diff learned something expensive about why the change was not needed.
@@ -451,6 +459,8 @@ impl BookkeeperNode {
 
         let result = self
             .sink
+            .as_ref()
+            .ok_or_else(|| NodeError::Failed("no memory index to update".to_string()))?
             .call_tool(param)
             .await
             .map_err(|e| NodeError::Failed(format!("memory_update call failed: {e}")))?;
@@ -498,6 +508,8 @@ impl BookkeeperNode {
 
         let result = self
             .sink
+            .as_ref()
+            .ok_or_else(|| NodeError::Failed("no memory index to write to".to_string()))?
             .call_tool(param)
             .await
             .map_err(|e| NodeError::Failed(format!("memory_create call failed: {e}")))?;

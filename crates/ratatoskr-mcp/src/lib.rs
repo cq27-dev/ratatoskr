@@ -357,6 +357,15 @@ impl ToolSet {
             .collect()
     }
 
+    /// Whether a server of this origin contributed to the set.
+    ///
+    /// Distinguishes "that server offers no such tool" from "that server is not here at all",
+    /// which read the same from a name lookup and mean opposite things: one is a typo, the other
+    /// is how this repository is configured.
+    pub fn has_server(&self, origin: &str) -> bool {
+        self.groups.iter().any(|g| g.origin == origin)
+    }
+
     /// How many tools the set holds, across every server.
     pub fn len(&self) -> usize {
         self.groups.iter().map(|g| g.tools.len()).sum()

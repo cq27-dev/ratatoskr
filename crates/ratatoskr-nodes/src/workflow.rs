@@ -50,9 +50,11 @@ pub struct WorkflowContext {
     engine: Arc<ScriptEngine>,
     run_id: String,
     issue: String,
-    sink: ServerSink,
+    /// `None` without rag-rat. The nodes that call it outside the agent — the memory baseline and
+    /// the bookkeeper — check before reaching for it.
+    sink: Option<ServerSink>,
     /// rag-rat's whole offer, the base of every node's tool pool.
-    rag_rat: ServerTools,
+    rag_rat: Option<ServerTools>,
     repo_path: PathBuf,
     /// Set by `implement`, read by `iterate` and cleanup. The script never sees a raw path.
     worktree: Mutex<Option<WorktreePath>>,
@@ -77,7 +79,7 @@ pub struct WorkflowContext {
 
 impl WorkflowContext {
     pub fn new(
-        client: &RagRatClient,
+        client: Option<&RagRatClient>,
         config: &RatatoskrConfig,
         store: &Store,
         run_id: &str,
@@ -96,8 +98,8 @@ impl WorkflowContext {
             engine: Arc::clone(engine),
             run_id: run_id.to_string(),
             issue: issue.to_string(),
-            sink: client.sink(),
-            rag_rat: client.offer(),
+            sink: client.map(|c| c.sink()),
+            rag_rat: client.map(|c| c.offer()),
             repo_path,
             worktree: Mutex::new(None),
             implement_started: AtomicBool::new(false),

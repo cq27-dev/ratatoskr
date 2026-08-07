@@ -1,5 +1,7 @@
 # Example Ratatoskr configuration. Copy to `ratatoskr.toml` (or run `ratatoskr init`).
 
+# Optional. Delete this whole section to run the harness without a code index — see
+# `examples/without-rag-rat.toml` for what that costs and what still works.
 [rag_rat]
 # How to launch rag-rat's MCP server over stdio. `--json` selects JSON output (not the default
 # TOON) so nodes that parse tool results directly get a stable shape.

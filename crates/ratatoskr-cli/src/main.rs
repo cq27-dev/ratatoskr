@@ -496,23 +496,19 @@ async fn ask(question: &str, config_path: &Path) -> anyhow::Result<()> {
         .clone();
 
     // Keep the client alive for the whole turn; the subprocess dies when it's dropped/shut down.
-    let client = ratatoskr_mcp::RagRatClient::connect(config.rag_rat)
-        .await
-        .context("connecting to rag-rat")?;
+    let client = connect_rag_rat(&config.rag_rat).await?;
 
     let answer = ratatoskr_agent::ask(
         &route,
         ASK_PREAMBLE,
         question,
-        ratatoskr_mcp::ToolSet::from_servers(vec![client.offer()]),
+        ratatoskr_mcp::ToolSet::from_servers(client.iter().map(|c| c.offer()).collect()),
         None,
     )
     .await;
 
     // Tear down rag-rat regardless of how the agent turn went, so no subprocess is orphaned.
-    if let Err(e) = client.shutdown().await {
-        tracing::warn!("failed to shut down rag-rat cleanly: {e}");
-    }
+    shutdown_rag_rat(client).await;
 
     println!("{}", answer.context("agent failed to answer")?);
     Ok(())
@@ -531,14 +527,12 @@ async fn plan(
     let config = load_config(config_path)?;
     let store = ratatoskr_store::Store::open(&config.store.path)
         .with_context(|| format!("opening store at {}", config.store.path.display()))?;
-    let client = ratatoskr_mcp::RagRatClient::connect(config.rag_rat.clone())
-        .await
-        .context("connecting to rag-rat")?;
+    let client = connect_rag_rat(&config.rag_rat).await?;
 
     let engine = load_rules().await?;
     let run_id = uuid::Uuid::new_v4().to_string();
     let result = ratatoskr_nodes::run_plan(ratatoskr_nodes::RunRequest {
-        client: &client,
+        client: client.as_ref(),
         config: &config,
         store: &store,
         run_id: &run_id,
@@ -550,9 +544,7 @@ async fn plan(
     .await;
 
     // Tear down rag-rat regardless of outcome.
-    if let Err(e) = client.shutdown().await {
-        tracing::warn!("failed to shut down rag-rat cleanly: {e}");
-    }
+    shutdown_rag_rat(client).await;
 
     let outcome = result.context("plan run failed")?;
     if json {
@@ -620,9 +612,7 @@ async fn run_cmd(
     let config = load_config(config_path)?;
     let store = ratatoskr_store::Store::open(&config.store.path)
         .with_context(|| format!("opening store at {}", config.store.path.display()))?;
-    let client = ratatoskr_mcp::RagRatClient::connect(config.rag_rat.clone())
-        .await
-        .context("connecting to rag-rat")?;
+    let client = connect_rag_rat(&config.rag_rat).await?;
 
     let engine = load_rules().await?;
     let run_id = match run_id {
@@ -635,7 +625,7 @@ async fn run_cmd(
         None => uuid::Uuid::new_v4().to_string(),
     };
     let result = ratatoskr_nodes::run_full(ratatoskr_nodes::RunRequest {
-        client: &client,
+        client: client.as_ref(),
         config: &config,
         store: &store,
         run_id: &run_id,
@@ -646,9 +636,7 @@ async fn run_cmd(
     .instrument(tracing::info_span!("run", run_id = %run_id))
     .await;
 
-    if let Err(e) = client.shutdown().await {
-        tracing::warn!("failed to shut down rag-rat cleanly: {e}");
-    }
+    shutdown_rag_rat(client).await;
 
     // Make the run's history durable now that it has finished, so it survives the log files
     // rotating away without anyone remembering to run `runs ingest`. This happens before the
@@ -675,18 +663,14 @@ async fn bookkeep(run_id: &str, config_path: &Path) -> anyhow::Result<()> {
     let config = load_config(config_path)?;
     let store = ratatoskr_store::Store::open(&config.store.path)
         .with_context(|| format!("opening store at {}", config.store.path.display()))?;
-    let client = ratatoskr_mcp::RagRatClient::connect(config.rag_rat.clone())
-        .await
-        .context("connecting to rag-rat")?;
+    let client = connect_rag_rat(&config.rag_rat).await?;
 
     let engine = load_rules().await?;
-    let result = ratatoskr_nodes::run_bookkeeper(&client, &config, &store, run_id, &engine)
+    let result = ratatoskr_nodes::run_bookkeeper(client.as_ref(), &config, &store, run_id, &engine)
         .instrument(tracing::info_span!("run", run_id = %run_id))
         .await;
 
-    if let Err(e) = client.shutdown().await {
-        tracing::warn!("failed to shut down rag-rat cleanly: {e}");
-    }
+    shutdown_rag_rat(client).await;
 
     let out = result.context("bookkeeper failed")?;
     print_bookkeeper(&out);
@@ -1011,6 +995,38 @@ fn project_spec(dir: &Path, config_path: &Path) -> anyhow::Result<ratatoskr_serv
         // Overridden by `--public` in `serve`; private is the direction a mistake should fail in.
         visibility: Visibility::default(),
     })
+}
+
+/// Connect to rag-rat, unless this repository runs without it.
+///
+/// `None` is an ordinary answer, not a degraded one: a config with no `[rag_rat]` section is a
+/// repository that wants the harness and not a code index. What is lost is real — semantic search,
+/// the call graph, the papertrail, and memory — so it is said once, at `info`, rather than left for
+/// someone to infer from a node that never searches anything.
+async fn connect_rag_rat(
+    config: &ratatoskr_core::RagRatConfig,
+) -> anyhow::Result<Option<ratatoskr_mcp::RagRatClient>> {
+    if !config.configured() {
+        tracing::info!(
+            "no [rag_rat] in the config: running without semantic search, graph traversal, the \
+             papertrail, or memory"
+        );
+        return Ok(None);
+    }
+    Ok(Some(
+        ratatoskr_mcp::RagRatClient::connect(config.clone())
+            .await
+            .context("connecting to rag-rat")?,
+    ))
+}
+
+/// Tear down rag-rat if there was one. A failure here loses nothing but a subprocess.
+async fn shutdown_rag_rat(client: Option<ratatoskr_mcp::RagRatClient>) {
+    if let Some(client) = client
+        && let Err(e) = client.shutdown().await
+    {
+        tracing::warn!("failed to shut down rag-rat cleanly: {e}");
+    }
 }
 
 /// Read the issue text from a positional argument or `--file` (exactly one).

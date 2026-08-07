@@ -138,7 +138,7 @@ fn status_of(outcome: &Result<PlanOutcome, PlanError>) -> &'static str {
 /// The planning half, against an already-resolved plugin context. `run_full` resolves it once and
 /// reuses it for both halves, so a full run doesn't pay for every plugin's `SessionStart` twice.
 async fn plan_half(
-    client: &RagRatClient,
+    client: Option<&RagRatClient>,
     config: &RatatoskrConfig,
     store: &Store,
     run_id: &str,
@@ -202,7 +202,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         ledger,
         context,
     } = run;
-    let sink = client.sink();
+    let sink = client.map(|c| c.sink());
     let mut state = RunState::new(run_id, None);
     state.status = RunStatus::Running;
 
@@ -220,7 +220,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
     let ctx_cfg = node_agent_config(
         engine,
         config,
-        context.pool_for("context", client.offer()),
+        context.pool_for("context", client.map(|c| c.offer())),
         "context",
         context::CONTEXT_TOOLS,
         &plugins_context,
@@ -262,7 +262,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
     let analyst_cfg = node_agent_config(
         engine,
         config,
-        context.pool_for("analyst", client.offer()),
+        context.pool_for("analyst", client.map(|c| c.offer())),
         "analyst",
         analyst::ANALYST_TOOLS,
         &plugins_analyst,
@@ -715,7 +715,7 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
     let cfg = node_agent_config(
         request.engine,
         request.config,
-        context.pool_for("overseer", request.client.offer()),
+        context.pool_for("overseer", request.client.map(|c| c.offer())),
         "overseer",
         overseer::OVERSEER_TOOLS,
         &plugins,
@@ -767,7 +767,9 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
 /// points, and every one of them is a borrow of something the caller already holds, so a positional
 /// list grows with the run rather than with the job.
 pub struct RunRequest<'a> {
-    pub client: &'a RagRatClient,
+    /// `None` when this repository runs without rag-rat: the nodes keep their file tools and the
+    /// memory baseline is simply empty. See `RagRatConfig::configured`.
+    pub client: Option<&'a RagRatClient>,
     pub config: &'a RatatoskrConfig,
     pub store: &'a Store,
     pub run_id: &'a str,
@@ -814,7 +816,7 @@ struct NodeAgentConfig {
 /// A parameter struct because these travel together through every stage; passing them
 /// individually made each helper's signature grow with the run rather than with its job.
 struct Run<'a> {
-    client: &'a RagRatClient,
+    client: Option<&'a RagRatClient>,
     config: &'a RatatoskrConfig,
     store: &'a Store,
     run_id: &'a str,
@@ -1096,9 +1098,15 @@ impl PluginContext {
     /// Every tool `node` may call: rag-rat's catalogue, then the servers its plugins declare.
     ///
     /// rag-rat comes first so it wins any name collision — see [`ToolSet::from_servers`].
-    fn pool_for(&self, node: &str, rag_rat: ServerTools) -> ToolSet {
+    /// The tools one node may call: rag-rat's, when there is a rag-rat, plus the plugin servers
+    /// bound to that node.
+    ///
+    /// `None` omits the group rather than passing an empty one, so a pool without rag-rat is the
+    /// same shape as a pool that never had it — nothing downstream has to special-case a server
+    /// that offers nothing.
+    fn pool_for(&self, node: &str, rag_rat: Option<ServerTools>) -> ToolSet {
         let bound = self.bound(node);
-        let mut servers = vec![rag_rat];
+        let mut servers: Vec<ServerTools> = rag_rat.into_iter().collect();
         servers.extend(
             self.servers
                 .iter()
@@ -1311,7 +1319,19 @@ fn node_agent_config(
         .filter(|n| !offered.contains(n) && !deny.contains(n))
         .collect();
     if !missing.is_empty() {
-        tracing::warn!(node, ?missing, "no connected MCP server offers these tools");
+        // A built-in default list names rag-rat's tools, so in a repository configured without
+        // rag-rat every node would warn about every one of them — turning a supported setup into a
+        // wall of noise that hides the warning this exists for. An explicit ruleset `allow` is
+        // different: it named something by hand, so a name nothing offers is a typo either way.
+        if spelled_out.is_none() && !tools.has_server(ratatoskr_mcp::RAG_RAT) {
+            tracing::debug!(
+                node,
+                ?missing,
+                "no rag-rat in this repository; these tools are absent by configuration"
+            );
+        } else {
+            tracing::warn!(node, ?missing, "no connected MCP server offers these tools");
+        }
     }
     // An `allow` written before the plugin was bound is exhaustive too, so it silently excludes
     // every tool the plugin brought — the node gets that plugin's context and none of its reach.
@@ -1679,7 +1699,7 @@ async fn publish_and_checkpoint(
     let cfg = node_agent_config(
         engine,
         config,
-        context.pool_for("publisher", client.offer()),
+        context.pool_for("publisher", client.map(|c| c.offer())),
         "publisher",
         &[],
         &plugins,
@@ -1765,7 +1785,7 @@ async fn bookkeep_and_checkpoint(
     let cfg = node_agent_config(
         engine,
         config,
-        context.pool_for("bookkeeper", client.offer()),
+        context.pool_for("bookkeeper", client.map(|c| c.offer())),
         "bookkeeper",
         bookkeeper::BOOKKEEPER_TOOLS,
         &plugins_bookkeeper,
@@ -1775,7 +1795,7 @@ async fn bookkeep_and_checkpoint(
     let node = BookkeeperNode {
         route: cfg.route,
         tools,
-        sink: client.sink(),
+        sink: client.map(|c| c.sink()),
         policy: cfg.policy,
         max_turns: cfg.max_turns,
         clarifier: Some(clarifier.as_dyn()),
@@ -1805,7 +1825,7 @@ async fn bookkeep_and_checkpoint(
 /// Replay the bookkeeper alone against a previously-run run's stored checkpoints — no Phase 3
 /// re-run. Reads the issue/analyst/implementer checkpoints and composes a fresh memory.
 pub async fn run_bookkeeper(
-    client: &RagRatClient,
+    client: Option<&RagRatClient>,
     config: &RatatoskrConfig,
     store: &Store,
     run_id: &str,
@@ -1921,7 +1941,7 @@ pub(crate) fn build_characterizer(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     context: &PluginContext,
-    offer: ServerTools,
+    offer: Option<ServerTools>,
     ledger: Option<Arc<RunLedger>>,
 ) -> Result<Option<testrun::Characterizer>, PlanError> {
     if !config.models.contains_key("characterizer")
@@ -1968,7 +1988,7 @@ fn build_implementer_agent(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     context: &PluginContext,
-    offer: ServerTools,
+    offer: Option<ServerTools>,
 ) -> Result<(NodeAgentConfig, NodePlugins), PlanError> {
     let plugins = context.for_node("implementer");
     let mut tools = context.pool_for("implementer", offer);
@@ -2070,7 +2090,7 @@ impl Review {
         let cfg = node_agent_config(
             engine,
             config,
-            context.pool_for("verifier", client.offer()),
+            context.pool_for("verifier", client.map(|c| c.offer())),
             "verifier",
             verifier::VERIFIER_TOOLS,
             &plugins_verifier,
@@ -2095,7 +2115,7 @@ impl Review {
         let acfg = node_agent_config(
             engine,
             config,
-            context.pool_for("analyst", client.offer()),
+            context.pool_for("analyst", client.map(|c| c.offer())),
             "analyst",
             analyst::ANALYST_TOOLS,
             &plugins_analyst,
@@ -2397,7 +2417,7 @@ async fn fork_and_converge(
             engine,
             config,
             context,
-            client.offer(),
+            client.map(|c| c.offer()),
             Some(Arc::clone(ledger)),
         )?,
         classifier: match classifier_enabled(engine, config) {
@@ -2406,7 +2426,7 @@ async fn fork_and_converge(
                 let cfg = node_agent_config(
                     engine,
                     config,
-                    context.pool_for("redteam", client.offer()),
+                    context.pool_for("redteam", client.map(|c| c.offer())),
                     "redteam",
                     redteam::CLASSIFIER_TOOLS,
                     &plugins_redteam,
@@ -2432,7 +2452,7 @@ async fn fork_and_converge(
         author: match classifier_enabled(engine, config) {
             true => {
                 let plugins = context.for_node("redteam");
-                let mut tools = context.pool_for("redteam", client.offer());
+                let mut tools = context.pool_for("redteam", client.map(|c| c.offer()));
                 tools
                     .local()
                     .tools
@@ -2461,7 +2481,7 @@ async fn fork_and_converge(
         },
     };
     let (impl_cfg, impl_plugins) =
-        build_implementer_agent(engine, config, context, client.offer())?;
+        build_implementer_agent(engine, config, context, client.map(|c| c.offer()))?;
     let implementer = ImplementerNode {
         clarifier: Some(clarifier.as_dyn()),
         repo_path: repo_path.clone(),
@@ -2483,7 +2503,7 @@ async fn fork_and_converge(
             engine,
             config,
             context,
-            client.offer(),
+            client.map(|c| c.offer()),
             Some(Arc::clone(ledger)),
         )?,
     };

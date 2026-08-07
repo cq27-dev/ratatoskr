@@ -112,6 +112,11 @@ Rust workspace (2024 edition), crates in a layered DAG under `crates/`:
   one and still never writes to a project's store.
 - `ratatoskr-cli` — the `ratatoskr` binary (`init`, `ask`, `plan`, `run`, `bookkeep`, `status`).
 
+rag-rat is optional: an absent `[rag_rat]` section means the harness runs without a code index
+(`examples/without-rag-rat.toml`). The nodes keep their file tools, `context` gets an empty memory
+baseline, and `bookkeeper` returns without spending a turn. This repository does use it — the
+guidance above stands — but nothing may assume it is there.
+
 `ratatoskr.toml` (repo root, gitignored) configures models, rag-rat launch, sandbox, and store;
 `ratatoskr.toml.example` is the committed template. `.ratatoskr/` holds runtime state (logs, store,
 worktrees) and is gitignored — except `.ratatoskr/rules/`, which is version-controlled.

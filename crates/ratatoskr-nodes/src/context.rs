@@ -85,8 +85,10 @@ pub struct ContextOutput {
 pub struct ContextNode {
     pub route: ModelRoute,
     pub tools: ToolSet,
-    /// For the deterministic `memory_search` that runs whatever the model does.
-    pub sink: ServerSink,
+    /// For the deterministic `memory_search` that runs whatever the model does. `None` without
+    /// rag-rat, where the baseline is empty and the node still does its other half: distilling the
+    /// task from what it can read.
+    pub sink: Option<ServerSink>,
     pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
     pub max_turns: Option<usize>,
     pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
@@ -102,7 +104,10 @@ impl ContextNode {
         // The baseline retrieval happens before the model is asked anything, and it happens
         // whatever the model does. Making it a tool the model may call would make "were the repo's
         // recorded constraints consulted" a thing that varies per run.
-        let memory = crate::memory::search(&self.sink, issue, "").await?;
+        let memory = match &self.sink {
+            Some(sink) => crate::memory::search(sink, issue, "").await?,
+            None => crate::memory::MemoryOutput::default(),
+        };
 
         let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
             node: "context",
@@ -112,7 +117,7 @@ impl ContextNode {
                 self.system_prompt.as_deref(),
                 self.plugins.context.as_deref(),
             ),
-            question: &render_prompt(issue, &memory),
+            question: &render_prompt(issue, &memory, self.sink.is_some()),
             tools: self.tools.clone(),
             output_schema: schemars::schema_for!(Distillation),
             policy: self.policy.clone(),
@@ -153,14 +158,23 @@ impl ContextNode {
     }
 }
 
-fn render_prompt(issue: &str, memory: &MemoryOutput) -> String {
+fn render_prompt(issue: &str, memory: &MemoryOutput, searchable: bool) -> String {
     let mut s = String::new();
     let _ = write!(s, "TASK:\n{issue}\n\n");
     if memory.memories.is_empty() {
-        s.push_str(
-            "RECORDED MEMORIES: none matched this task. Search again yourself with different \
-             terms before concluding this repository records nothing about it.\n",
-        );
+        // Two different emptinesses. "Nothing matched" is worth searching again for; "there is no
+        // memory here" is not, and telling a node to search anyway sends it after a tool it does
+        // not have.
+        s.push_str(match searchable {
+            true => {
+                "RECORDED MEMORIES: none matched this task. Search again yourself with different \
+                 terms before concluding this repository records nothing about it.\n"
+            }
+            false => {
+                "RECORDED MEMORIES: this repository keeps none — there is no memory index here. \
+                 Work from what you can read.\n"
+            }
+        });
         return s;
     }
     s.push_str(
@@ -202,7 +216,7 @@ mod tests {
                 "schema.sql and ADDED_COLUMNS; neither alone migrates an existing store.",
             )],
         };
-        let prompt = render_prompt("Add a repo_sha column.", &memory);
+        let prompt = render_prompt("Add a repo_sha column.", &memory, true);
         assert!(prompt.contains("id: mem_1"));
         assert!(prompt.contains("ADDED_COLUMNS"), "the body arrives whole");
         assert!(prompt.contains("cite the id"));
@@ -212,9 +226,19 @@ mod tests {
     fn no_matches_is_told_apart_from_nothing_recorded() {
         // Otherwise an empty baseline reads as "this repo records nothing", and the model stops
         // looking — when the far more likely truth is that the ranked query missed.
-        let prompt = render_prompt("x", &MemoryOutput { memories: vec![] });
+        let prompt = render_prompt("x", &MemoryOutput { memories: vec![] }, true);
         assert!(prompt.contains("none matched"));
         assert!(prompt.contains("Search again"));
+    }
+
+    #[test]
+    fn a_repository_with_no_memory_index_is_not_told_to_search_again() {
+        // Three states, not two: matches, no matches, and no index. The middle one sends the node
+        // back to `memory_search`; the last one must not, because that tool is not in its pool and
+        // a node chasing a tool it does not have burns turns achieving nothing.
+        let prompt = render_prompt("x", &MemoryOutput { memories: vec![] }, false);
+        assert!(prompt.contains("keeps none"));
+        assert!(!prompt.contains("Search again"));
     }
 
     #[test]
