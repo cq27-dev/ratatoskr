@@ -159,6 +159,7 @@ mod tests {
             residual_risk: String::new(),
             changes_code: true,
             acceptance: Vec::new(),
+            interface: Vec::new(),
         }
     }
 

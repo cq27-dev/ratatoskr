@@ -116,6 +116,36 @@ pub struct AnalystOutput {
     /// touch this: a change that can move the bar it is judged against is not judged.
     #[serde(default)]
     pub acceptance: Vec<ratatoskr_core::AcceptanceStep>,
+    /// The surface the change is contracted to have, and what it should do when used.
+    ///
+    /// This is what lets the tests be written by someone other than the author. The red team turns
+    /// it into tests and the implementer builds against it, from the same description — so the
+    /// tests are not shaped around the implementation that happens to appear, which is the failure
+    /// an author writing their own tests cannot see in themselves.
+    ///
+    /// Empty when the change has no callable surface — an internal refactor, a doc fix. That is an
+    /// ordinary answer, and better than a contract invented to fill the field.
+    #[serde(default)]
+    pub interface: Vec<InterfaceItem>,
+}
+
+/// One piece of surface the change adds or alters, with what it owes its caller.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct InterfaceItem {
+    /// What it is, as a caller names it: `path::function`, a CLI flag, an HTTP route, a config key.
+    pub name: String,
+    /// Its shape after the change — the signature, the parameters and their types, the fields.
+    /// Enough that someone could call it without reading the implementation, because they cannot:
+    /// it does not exist yet.
+    pub shape: String,
+    /// What it does when used correctly. One expectation per entry, each concrete enough to be
+    /// checked: the input, and the result it must produce.
+    #[serde(default)]
+    pub happy: Vec<String>,
+    /// What it does when misused, or when the world does not cooperate — a bad argument, a missing
+    /// file, a value at its limit. Same standard: an input, and the result it must produce.
+    #[serde(default)]
+    pub sad: Vec<String>,
 }
 
 /// A plan is assumed to involve a code change unless the analyst says otherwise. The failure this

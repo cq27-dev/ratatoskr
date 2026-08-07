@@ -2198,6 +2198,37 @@ async fn fork_and_converge(
             }
             false => None,
         },
+        // Writing the change's tests needs the write tools the classifier has no use for, so the
+        // set is built separately even though both hang off the same route.
+        author: match classifier_enabled(engine, config) {
+            true => {
+                let plugins = context.for_node("redteam");
+                let mut tools = context.pool_for("redteam", client.offer());
+                tools
+                    .local()
+                    .tools
+                    .extend(ratatoskr_agent::files::edit_declarations());
+                let mut names: Vec<&str> = redteam::CLASSIFIER_TOOLS.to_vec();
+                names.extend([
+                    ratatoskr_agent::files::READ,
+                    ratatoskr_agent::files::GREP,
+                    ratatoskr_agent::files::GLOB,
+                    ratatoskr_agent::files::WRITE,
+                    ratatoskr_agent::files::EDIT,
+                ]);
+                let cfg = node_agent_config(engine, config, tools, "redteam", &names, &plugins)?;
+                Some(redteam::TestAuthor {
+                    route: cfg.route,
+                    tools: cfg.tools,
+                    policy: cfg.policy,
+                    max_turns: cfg.max_turns,
+                    system_prompt: cfg.system_prompt,
+                    plugins,
+                    ledger: Some(Arc::clone(ledger)),
+                })
+            }
+            false => None,
+        },
     };
     let (impl_cfg, impl_plugins) =
         build_implementer_agent(engine, config, context, client.offer())?;
@@ -2229,12 +2260,30 @@ async fn fork_and_converge(
     // implementer session and a sandboxed test run have already been spent on it.
     let review = Review::build(run, plan)?;
 
-    // Fork: both branches run concurrently off the same frozen post-analyst state. join! (not
-    // spawn) because both are I/O-bound (subprocess/sandbox) and borrow their nodes.
-    let (rt_res, impl_res) = tokio::join!(red_team.run(), implementer.run());
+    // The worktree first, because the red team writes the change's tests into it and cannot do
+    // that until it exists.
+    let worktree = implementer
+        .prepare()
+        .await
+        .map_err(|e| PlanError::node("implementer", e))?;
 
-    let red_team_out = rt_res.map_err(|e| PlanError::node("red_team", e))?;
-    let (worktree, mut impl_out) = impl_res.map_err(|e| PlanError::node("implementer", e))?;
+    // Red team next, not alongside: it characterises the baseline and writes the tests the change
+    // will be judged against, and both have to be done before the implementer opens the tree. The
+    // concurrency this gives up is small — the baseline is a minute against the implementer's ten
+    // — and what it buys is that the tests are not written by the author of the code.
+    let red_team_out = red_team
+        .run_and_author(worktree.as_path(), issue, &plan.analyst.interface)
+        .await
+        .map_err(|e| PlanError::node("red_team", e))?;
+
+    let mut impl_out = match implementer.work(&worktree).await {
+        Ok(out) => out,
+        Err(e) => {
+            // A failed first attempt leaves nothing behind, as before.
+            implementer.discard(&worktree).await;
+            return Err(PlanError::node("implementer", e));
+        }
+    };
 
     record(Record {
         store,
@@ -2288,7 +2337,16 @@ async fn fork_and_converge(
             &impl_out.passing_tests,
             impl_out.exit_code,
         );
+        // Tests written for this change before it existed. They fail in the baseline as a matter
+        // of course, so "nothing newly failing" is not enough to call them satisfied.
+        let authored = red_team_out
+            .authored
+            .as_ref()
+            .map(|a| a.tests.as_slice())
+            .unwrap_or_default();
+        let unsatisfied = converge::unsatisfied(authored, &impl_out.failing_tests);
         let tests_clean = post_ran
+            && unsatisfied.is_empty()
             && converge::is_converged(&red_team_out.failing_tests, &impl_out.failing_tests);
 
         // Did the change edit the referee? Checked BEFORE `tests_clean` is trusted: a conftest.py
@@ -2314,6 +2372,17 @@ async fn fork_and_converge(
                     "The test command did not run to completion (exit {}) — your change likely \
                      does not compile. Fix it so the tests run and pass.",
                     impl_out.exit_code
+                )
+            } else if !unsatisfied.is_empty() {
+                // Said apart from the regression case, because it is the opposite situation: these
+                // were failing before you started, and making them pass is the task.
+                format!(
+                    "These tests were written for this change, from the interface, before any code \
+                     existed to satisfy them — making them pass is what the change is for, and \
+                     they are still failing: {}. They are not yours to edit; implement what they \
+                     describe. If one of them is wrong about the contract rather than about your \
+                     code, say so in your summary and implement the rest.",
+                    unsatisfied.join(", ")
                 )
             } else {
                 let new_failures = converge::newly_introduced_failures(
@@ -2775,6 +2844,7 @@ mod agent_config_tests {
             residual_risk: String::new(),
             changes_code,
             acceptance: Vec::new(),
+            interface: Vec::new(),
         }
     }
 
@@ -2817,6 +2887,7 @@ mod agent_config_tests {
             residual_risk: String::new(),
             changes_code: true,
             acceptance: Vec::new(),
+            interface: Vec::new(),
         };
         let finding = verifier::Finding {
             severity: verifier::Severity::P1,

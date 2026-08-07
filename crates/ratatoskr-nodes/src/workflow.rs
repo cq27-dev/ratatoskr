@@ -181,6 +181,21 @@ fn infer_status(
             return RunStatus::MaxIterationsReached;
         }
     }
+    // The tests written for this change, before it existed. They fail in the baseline by
+    // construction, so `is_converged` alone would pass a change that satisfied none of them.
+    let authored = red_team
+        .authored
+        .as_ref()
+        .map(|a| a.tests.as_slice())
+        .unwrap_or_default();
+    let unsatisfied = converge::unsatisfied(authored, &implementer.failing_tests);
+    if !unsatisfied.is_empty() {
+        tracing::warn!(
+            tests = ?unsatisfied,
+            "the tests written for this change are still failing; not converged"
+        );
+        return RunStatus::MaxIterationsReached;
+    }
     let post_ran = converge::test_command_ran(
         &implementer.failing_tests,
         &implementer.passing_tests,
@@ -381,6 +396,10 @@ fn build_red_team(
         false => None,
     };
     Ok(RedTeamNode {
+        // The scripted path forks with its own sequencing and does not create the worktree before
+        // red-team runs, so there is nothing to write tests into. Authoring belongs to the built-in
+        // flow until a script can say where the tree is.
+        author: None,
         acceptance,
         characterizer: crate::build_characterizer(
             &ctx.engine,
@@ -1005,6 +1024,7 @@ mod tests {
 
     fn red(failing: &[&str], passing: &[&str], exit: i32) -> RedTeamOutput {
         RedTeamOutput {
+            authored: None,
             failing_tests: failing.iter().map(|s| s.to_string()).collect(),
             passing_tests: passing.iter().map(|s| s.to_string()).collect(),
             exit_code: exit,

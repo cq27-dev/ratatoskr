@@ -45,6 +45,10 @@ struct Classification {
 /// redteam has a route from `[models.redteam]` or its ruleset).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RedTeamOutput {
+    /// Tests written for this change before the code was, when the red team had a route to write
+    /// them with.
+    #[serde(default)]
+    pub authored: Option<AuthoredTests>,
     pub failing_tests: Vec<String>,
     pub passing_tests: Vec<String>,
     pub exit_code: i32,
@@ -113,6 +117,105 @@ impl RedTeamClassifier {
 }
 
 /// The red-team node: run the baseline checkout's tests in a sandbox, optionally classify failures.
+/// What the red team wrote, and what it says those tests cover.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AuthoredTests {
+    /// Files written or extended, as repository-relative paths.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// The tests written, named as the test runner will report them.
+    ///
+    /// Not decoration: a test written before the code fails in the baseline by construction, so
+    /// convergence — which asks only whether anything *newly* fails — would pass a change that
+    /// ignored every one of them. Naming them is what lets the run require them to pass.
+    #[serde(default)]
+    pub tests: Vec<String>,
+    /// One line per file on what it covers, or why nothing was written.
+    #[serde(default)]
+    pub covers: String,
+}
+
+const AUTHOR_PREAMBLE: &str = include_str!("../prompts/redteam-author.md");
+
+/// The red team's other half: writing the tests the change will be judged against.
+///
+/// Separate from the classifier because they are different jobs on different sides of the run —
+/// one reads a baseline that already happened, the other writes what has to become true. Both are
+/// opt-in on having a route.
+pub struct TestAuthor {
+    pub route: ModelRoute,
+    pub tools: ToolSet,
+    pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
+    pub max_turns: Option<usize>,
+    pub system_prompt: Option<String>,
+    pub plugins: crate::NodePlugins,
+    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
+}
+
+impl TestAuthor {
+    /// Write tests for `interface` into `worktree`, before any code exists to satisfy them.
+    pub async fn write(
+        &self,
+        worktree: &std::path::Path,
+        issue: &str,
+        interface: &[crate::analyst::InterfaceItem],
+    ) -> Result<AuthoredTests, NodeError> {
+        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
+            node: "redteam",
+            route: &self.route,
+            preamble: &crate::effective_preamble(
+                AUTHOR_PREAMBLE,
+                self.system_prompt.as_deref(),
+                self.plugins.context.as_deref(),
+            ),
+            question: &author_prompt(issue, interface),
+            tools: self.tools.clone(),
+            output_schema: schemars::schema_for!(AuthoredTests),
+            policy: self.policy.clone(),
+            max_turns: self.max_turns,
+            clarifier: None,
+            observer: self.plugins.observer.clone(),
+            skills: crate::skills::loaded(&self.plugins.skills),
+            // Rooted at the worktree: the tests have to land where the implementer will meet them.
+            files: Some(worktree.to_path_buf()),
+            // No shell. Writing a test is not running one, and the baseline run is what says
+            // whether these fail — which at this point they should.
+            shell: None,
+            conversation: None,
+            ledger: self.ledger.clone(),
+            produces: Some("tests covering the contracted interface, written before the code"),
+        })
+        .await
+        .map_err(|e| NodeError::Failed(format!("test author failed: {e}")))?;
+        parse_validated::<AuthoredTests>(&raw)
+    }
+}
+
+/// What the author is given: the task for context, and the contract it writes against.
+fn author_prompt(issue: &str, interface: &[crate::analyst::InterfaceItem]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = write!(s, "THE TASK, for context only:\n{issue}\n\n");
+    s.push_str(
+        "THE INTERFACE. This is the contract, and it is all you get — the code does not exist \
+         yet, and the person writing it is working from this same description:\n\n",
+    );
+    for item in interface {
+        let _ = write!(s, "- {}\n  {}\n", item.name, item.shape);
+        for h in &item.happy {
+            let _ = writeln!(s, "  happy: {h}");
+        }
+        for sad in &item.sad {
+            let _ = writeln!(s, "  sad: {sad}");
+        }
+    }
+    s.push_str(
+        "\nWrite tests for these. Follow the repository's own layout and conventions, cover the \
+         sad cases as carefully as the happy ones, and change nothing that already exists.",
+    );
+    s
+}
+
 pub struct RedTeamNode {
     pub repo_path: PathBuf,
     pub sandbox: ratatoskr_core::SandboxConfig,
@@ -125,9 +228,64 @@ pub struct RedTeamNode {
     pub acceptance: Vec<ratatoskr_core::AcceptanceStep>,
     /// Names the checks inside each step. `None` compares at step granularity instead.
     pub characterizer: Option<Characterizer>,
+    /// Writes the tests the change is judged against. Opt-in on a `[models.redteam]` route, like
+    /// the classifier — without one, the run falls back to whatever tests already exist.
+    pub author: Option<TestAuthor>,
 }
 
 impl RedTeamNode {
+    /// Characterise the baseline and write the change's tests, in one step.
+    ///
+    /// The two are independent — one reads the repository as it is, the other writes into a
+    /// worktree — so they run together. Both finish before the implementer starts, which is the
+    /// point: it meets the tests it has to satisfy rather than writing them itself.
+    pub async fn run_and_author(
+        &self,
+        worktree: &std::path::Path,
+        issue: &str,
+        interface: &[crate::analyst::InterfaceItem],
+    ) -> Result<RedTeamOutput, NodeError> {
+        let (baseline, authored) =
+            tokio::join!(self.run(), self.author_tests(worktree, issue, interface));
+        let mut out = baseline?;
+        out.authored = authored;
+        Ok(out)
+    }
+
+    /// Write the tests, when there is an author and something to write against.
+    ///
+    /// Best-effort, like the classifier: a failed authoring turn leaves the change to be judged by
+    /// the tests that already exist, which is where every run stood before this node could write
+    /// any. Failing the run instead would trade a weaker judgement for no judgement.
+    async fn author_tests(
+        &self,
+        worktree: &std::path::Path,
+        issue: &str,
+        interface: &[crate::analyst::InterfaceItem],
+    ) -> Option<AuthoredTests> {
+        let author = self.author.as_ref()?;
+        if interface.is_empty() {
+            return None;
+        }
+        match author.write(worktree, issue, interface).await {
+            Ok(written) => {
+                tracing::info!(
+                    kind = "authored_tests",
+                    files = %written.files.join(", "),
+                    "the red team wrote the change's tests"
+                );
+                Some(written)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "writing the change's tests failed; it will be judged by the tests that \
+                     already exist: {e}"
+                );
+                None
+            }
+        }
+    }
+
     pub async fn run(&self) -> Result<RedTeamOutput, NodeError> {
         let outcomes = run_acceptance(&self.sandbox, &self.name, &self.repo_path, &self.acceptance)
             .await
@@ -150,6 +308,7 @@ impl RedTeamNode {
         };
 
         Ok(RedTeamOutput {
+            authored: None,
             failing_tests: results.failing,
             passing_tests: results.passing,
             exit_code: results.exit_code,
@@ -172,6 +331,44 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn item() -> crate::analyst::InterfaceItem {
+        crate::analyst::InterfaceItem {
+            name: "store::prune".into(),
+            shape: "pub async fn prune(&self, older_than: Duration) -> Result<u64, StoreError>"
+                .into(),
+            happy: vec!["removes rows older than the cutoff and returns how many".into()],
+            sad: vec!["a zero duration removes nothing and returns 0".into()],
+        }
+    }
+
+    #[test]
+    fn the_author_is_given_the_contract_and_told_the_code_does_not_exist() {
+        // The whole reason this node writes the tests: it works from the contract, so its tests
+        // can be wrong about the implementation and still right about the requirement.
+        let p = author_prompt("Prune old rows", &[item()]);
+        assert!(p.contains("store::prune"), "the surface");
+        assert!(p.contains("older_than: Duration"), "and its exact shape");
+        assert!(p.contains("happy: removes rows older than the cutoff"));
+        assert!(p.contains("sad: a zero duration removes nothing"));
+        assert!(
+            p.contains("the code does not exist"),
+            "why it cannot read it"
+        );
+    }
+
+    #[test]
+    fn the_author_preamble_says_what_makes_these_tests_different() {
+        let p = AUTHOR_PREAMBLE.to_ascii_lowercase();
+        // Written before the code, so failing now is expected and must not be papered over.
+        assert!(
+            p.contains("fail now"),
+            "what a good test does at this point"
+        );
+        assert!(p.contains("asserting nothing"), "and what it must not do");
+        // It adds; it does not adjust the judge.
+        assert!(p.contains("do not modify tests that are already there"));
+    }
 
     #[test]
     fn parses_a_classifier_response() {

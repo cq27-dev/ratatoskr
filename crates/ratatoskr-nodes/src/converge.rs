@@ -16,6 +16,20 @@ pub fn newly_introduced_failures(
         .collect()
 }
 
+/// Authored tests that are still failing after the change.
+///
+/// These need their own gate. They were written before the code, so they fail in the baseline as a
+/// matter of course — and [`is_converged`] asks only whether anything *newly* fails, which would
+/// wave through a change that satisfied none of them. A test written to specify the change is the
+/// one test the change is not allowed to leave failing.
+pub fn unsatisfied(authored: &[String], post_failing: &[String]) -> Vec<String> {
+    authored
+        .iter()
+        .filter(|t| post_failing.contains(t))
+        .cloned()
+        .collect()
+}
+
 /// Whether the change converged: it introduced no new failures.
 pub fn is_converged(baseline_failing: &[String], post_failing: &[String]) -> bool {
     newly_introduced_failures(baseline_failing, post_failing).is_empty()
@@ -186,6 +200,34 @@ mod tests {
         );
         // Ordinary source is not the referee.
         assert!(referee_touches(&v(&["src/lib.rs"]), &[]).is_empty());
+    }
+
+    #[test]
+    fn a_test_written_for_the_change_must_pass_even_though_it_failed_at_baseline() {
+        // The hole this closes: tests written before the code fail in the baseline as a matter of
+        // course, so `is_converged` — which asks only what is *newly* failing — would wave through
+        // a change that satisfied none of them.
+        let authored = v(&[
+            "store::prunes_old_rows",
+            "store::zero_duration_removes_nothing",
+        ]);
+        let baseline_failing = authored.clone();
+        let still_failing = v(&["store::zero_duration_removes_nothing"]);
+
+        assert!(
+            is_converged(&baseline_failing, &still_failing),
+            "nothing is newly failing, which is exactly why this is not enough on its own"
+        );
+        assert_eq!(
+            unsatisfied(&authored, &still_failing),
+            ["store::zero_duration_removes_nothing"],
+            "and the sad-path test nobody implemented is named"
+        );
+
+        // Satisfied: the change made them pass.
+        assert!(unsatisfied(&authored, &[]).is_empty());
+        // A run with no authored tests is unaffected.
+        assert!(unsatisfied(&[], &still_failing).is_empty());
     }
 
     #[test]

@@ -112,19 +112,39 @@ impl ImplementerNode {
     /// Create the worktree and make the first attempt. Returns the worktree (for iteration and
     /// cleanup) alongside the output.
     pub async fn run(&self) -> Result<(WorktreePath, ImplementerOutput), NodeError> {
-        let branch = format!("ratatoskr/{}", self.short_id());
-        let worktree = create_worktree(&self.repo_path, &self.worktree_root, &branch)
-            .await
-            .map_err(|e| NodeError::Failed(format!("worktree create failed: {e}")))?;
+        let worktree = self.prepare().await?;
         // If the first attempt fails, remove the worktree so a failed run leaves nothing behind.
-        match self.attempt(&worktree, &self.initial_prompt()).await {
+        match self.work(&worktree).await {
             Ok(out) => Ok((worktree, out)),
             Err(e) => {
-                if let Err(rm) = remove_worktree(&self.repo_path, &worktree).await {
-                    tracing::warn!("failed to clean up worktree after implementer error: {rm}");
-                }
+                self.discard(&worktree).await;
                 Err(e)
             }
+        }
+    }
+
+    /// Create the branch and worktree this run will work in.
+    ///
+    /// Separate from doing the work because the worktree is not only the implementer's: the red
+    /// team writes its tests into the same tree before any code exists to satisfy them, and it
+    /// cannot do that until the tree is there.
+    pub async fn prepare(&self) -> Result<WorktreePath, NodeError> {
+        let branch = format!("ratatoskr/{}", self.short_id());
+        create_worktree(&self.repo_path, &self.worktree_root, &branch)
+            .await
+            .map_err(|e| NodeError::Failed(format!("worktree create failed: {e}")))
+    }
+
+    /// The first attempt, in a worktree that already exists.
+    pub async fn work(&self, worktree: &WorktreePath) -> Result<ImplementerOutput, NodeError> {
+        self.attempt(worktree, &self.initial_prompt()).await
+    }
+
+    /// Remove a worktree whose run is not going to finish. Best-effort: a leftover tree is a
+    /// nuisance, and failing the run over one would trade a nuisance for a loss.
+    pub async fn discard(&self, worktree: &WorktreePath) {
+        if let Err(rm) = remove_worktree(&self.repo_path, worktree).await {
+            tracing::warn!("failed to clean up worktree after implementer error: {rm}");
         }
     }
 
@@ -254,6 +274,24 @@ impl ImplementerNode {
             s.push_str("Requirements the implementation must satisfy:\n");
             for req in &a.requirements {
                 let _ = writeln!(s, "- {req}");
+            }
+            s.push('\n');
+        }
+        if !a.interface.is_empty() {
+            s.push_str(
+                "THE INTERFACE YOU ARE BUILDING TO. Someone else is writing tests against this \
+                 same description, without seeing your code. Match the shape exactly — a \
+                 signature that differs by a parameter name or an argument order will fail tests \
+                 that are not wrong:\n\n",
+            );
+            for item in &a.interface {
+                let _ = write!(s, "- {}\n  {}\n", item.name, item.shape);
+                for h in &item.happy {
+                    let _ = writeln!(s, "  must: {h}");
+                }
+                for sad in &item.sad {
+                    let _ = writeln!(s, "  must also: {sad}");
+                }
             }
             s.push('\n');
         }

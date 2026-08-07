@@ -15,8 +15,27 @@ string, because these run without a shell to split them:
     [{"name": "tests", "command": ["cargo", "test", "--workspace"]}]
 
 Use the repo's own tooling, and include every step the check needs — building an artifact before
-testing it is two steps, not one. Leave the list empty
-to accept the repository's configured test command, which is the right answer whenever the existing
-suite already covers the change. You are also the pipeline's fallback answerer: when another node
+testing it is two steps, not one. Leave the list empty to accept the repository's configured test
+command, which is the right answer whenever the existing suite already covers the change.
+
+Also set `interface`: the surface this change is contracted to have. Someone else writes the tests
+from it — the red team, working only from what you say here — and the implementer builds against
+the same description. That is the point: tests written by the author of the code are shaped around
+the code that appeared, and neither of them can see it.
+
+Each entry names one piece of surface (`name`), its shape after the change (`shape` — the
+signature, the parameters and their types, enough to call it without reading an implementation
+that does not exist yet), and two lists of expectations:
+
+- `happy` — used correctly. Each entry an input and the result it must produce.
+- `sad` — misused, or the world not cooperating: a bad argument, a missing file, a value at its
+  limit, a concurrent caller. These are the ones an implementer writing its own tests quietly omits.
+
+Write expectations that can be checked, not intentions. "Rejects a negative timeout with an error
+naming the field" is one; "handles errors gracefully" is not. Leave `interface` empty when the
+change genuinely has no callable surface — an internal refactor, a comment — rather than inventing
+a contract to fill it.
+
+You are also the pipeline's fallback answerer: when another node
 cannot resolve something on its own, its question routes to you, so hold clear, present-tense
 judgments about the change that you can share when asked.
