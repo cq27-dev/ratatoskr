@@ -1,5 +1,5 @@
 /*
- * RATATOSKR RUN TELEMETRY — tactical-telemetry substrate.
+ * RATATOSKR — tactical-telemetry substrate.
  *
  * Dark CRT substrate, monospace dominance, hairline compartmentalisation. No radii anywhere: every
  * corner is 90 degrees. Terminal green is reserved for exactly one thing — the WORKING state — so
@@ -10,7 +10,10 @@
   --bg: #0a0a0a;
   --panel: #121212;
   --rule: #2a2a2a;
-  --fg: #eaeaea;
+  /* Down from #eaeaea in two steps, 15% then 20%. Full-strength white phosphor on near-black
+     glares over a long session, and the node tints have to sit against this without shouting —
+     what a node said is coloured, so everything around it should recede. */
+  --fg: #9f9f9f;
   --muted: #6e6e6e;
   --hazard: #e61919;
   --live: #4af626;
@@ -439,16 +442,37 @@ body {
 .ev {
   display: flex;
   gap: 8px;
-  padding: 4px 12px;
+  /* Room to breathe, vertically. At 10px the default leading is about 12px, so a wrapped message
+     packed its own lines tighter than the gap between two rows — the eye read one paragraph as
+     several entries. The line-height opens the wrap and the padding keeps rows apart from each
+     other, which are two different problems that both looked like "too tight". */
+  padding: 7px 12px;
   border-bottom: 1px solid var(--rule);
   align-items: baseline;
   font-size: 10px;
+  line-height: 1.55;
 }
 
 .ev-t,
 .ev-k,
 .ev-n {
   flex: none;
+}
+
+/* Fixed to the longest name this run can show, set as `--node-col` by the feed. `ch` is exact here
+   because the feed is monospace, so the column is the name's width rather than a guess at it, and
+   the extra `ch` is the gutter — `box-sizing: border-box` means padding comes out of the width, so
+   it has to be added back or the last character is clipped.
+   Only this selector: the width belongs to the node column alone. Applied to the shared
+   `.ev-t, .ev-k, .ev-n` list it also pinned the kind column, and a tool name longer than a node
+   name — `SEMANTIC_SEARCH` against `CHARACTERIZER` — overflowed it and drew over the argument. */
+.ev-n {
+  width: calc(var(--node-col, 12ch) + 1ch);
+  padding-right: 1ch;
+  /* Ragged left, flush right: names differ by half the column's width — `ISSUE` against
+     `CHARACTERIZER` — and left-aligned they leave a gap of varying size against the icons that do
+     line up. Against the gutter, the end of every name sits the same distance from its row. */
+  text-align: right;
 }
 
 .ev-d {
@@ -514,10 +538,16 @@ body {
 .runmeta {
   background: var(--bg);
   padding: 12px 16px;
+  /* A grid item defaults to `min-width: auto`, which means "never narrower than my content" — so a
+     long run title stretched this header, and with it the whole stage, instead of being clipped by
+     the ellipsis that was already asking to clip it. Every `text-overflow` inside a grid or flex
+     item needs this on the item, not only on the text. */
+  min-width: 0;
 }
 
 .runmeta h2 {
   margin: 0 0 8px;
+  min-width: 0;
   font-family: var(--sans);
   font-weight: 900;
   font-size: clamp(0.95rem, 1.8vw, 1.4rem);
@@ -528,10 +558,21 @@ body {
 
 .runmeta dl {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  /* Five cells, one row. At `minmax(150px, …)` the row needed 822px and `auto-fit` dropped the
+     last cell — the pull request — onto a second line below that, which both hid it and made the
+     header a line taller on exactly the runs that had something to show. 110px fits all five
+     inside 620px and still collapses gracefully on a genuinely narrow window. */
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
   gap: 2px 18px;
   margin: 0;
   font-size: 10px;
+}
+
+/* A run id is one token with hyphens in it; letting it break anywhere else splits it mid-segment
+   and it stops being copyable by eye. */
+.runmeta dd {
+  overflow-wrap: normal;
+  word-break: normal;
 }
 
 .runmeta dt {
@@ -630,6 +671,32 @@ body {
   color: var(--muted);
   flex: none;
   font-variant-numeric: tabular-nums;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  /* The track beside this takes whatever is left, so a readout that grows when the numbers arrive
+     drags the slider narrower as the run loads. The placeholders match the real values glyph for
+     glyph, which is what actually holds the width; this floor covers the rest — note `ch` does not
+     include `letter-spacing`, so a reservation in `ch` alone came out 16px short of the text it
+     was reserving for. */
+  min-width: 120px;
+}
+
+/* Clock over elapsed, right-aligned so both columns of digits line up under each other and the
+   pair reads as one readout rather than two labels. Tight leading: two lines here must not make
+   the scrubber taller than the control it annotates. */
+.scrub-when {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  line-height: 1.15;
+}
+
+/* Time into the run. Dimmer than the clock because it is the derived one — the clock is what
+   matches a log file, and this is what places the moment inside the run. */
+.scrub-since {
+  color: var(--rule);
 }
 
 /* Electron-beam sweep, behind the node map only. Lines are LIGHT: the map sits on #0a0a0a, so a
@@ -649,7 +716,19 @@ body {
      texture below it. This is its own knob for that, so it survives their theme changing. */
   --xy-background-color: transparent;
   position: relative;
-  min-height: 0;
+  /* Holds its own height before there are any nodes to give it one. Without this the grid track
+     collapses to zero while the run loads, the feed below starts 357 pixels too high, and the
+     whole page steps down the moment the graph arrives. `min-height` on the item is what forces
+     the track, since the track's own `minmax(200px, 1fr)` is only a floor for content that
+     exists. */
+  min-height: 200px;
+}
+
+/* Nothing to scrub yet: present so its height is reserved, visibly not usable. */
+.scrub input[type="range"]:disabled,
+.scrub-live:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .detail {
@@ -830,8 +909,11 @@ body {
   stroke: var(--rule);
   stroke-width: 1;
 }
+/* A live edge carries the hue of the node it belongs to, not one shared "active" green. Which node
+   is running is the question the graph is being asked, and a colour every live thing shares cannot
+   answer it. Falls back to the green where an edge sets no tint. */
 .react-flow__edge.is-live .react-flow__edge-path {
-  stroke: var(--live);
+  stroke: var(--tint, var(--live));
 }
 .react-flow__edge-text {
   fill: var(--muted);
@@ -847,4 +929,409 @@ body {
 }
 .react-flow__panel {
   margin: 8px;
+}
+
+/* ── Structured output and model prose ──────────────────────────────────── */
+
+/* A JSON palette drawn from the existing scheme rather than a new one: strings and numbers are the
+   values you read, keys are structure, and punctuation should recede to nearly nothing. Nothing
+   here is red or the live green — those already mean failure and running, and a `false` in a
+   checkpoint is not a failure. */
+.json {
+  --j-dim: #4a4a4a;
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.j-key {
+  color: #9fb4c7;
+}
+.j-str {
+  color: #b9c99a;
+}
+.j-num {
+  color: #d9b98c;
+}
+.j-bool,
+.j-null {
+  color: #a89bc4;
+}
+.j-punc {
+  color: var(--j-dim);
+}
+
+/* Inline markers in model prose. Deliberately quiet: a feed row is one line among hundreds, and
+   emphasis that shouts costs more than the emphasis is worth. */
+.ev-d code,
+.ev-a code {
+  background: #1c1c1c;
+  border: 1px solid var(--rule);
+  padding: 0 3px;
+  color: #cfd8c4;
+}
+
+.ev-d strong {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.ev-d em {
+  color: var(--fg);
+  font-style: italic;
+}
+
+/* A fenced block inside a feed row: its own box, so a multi-line snippet does not read as more
+   feed rows. Scrolls rather than wraps — a wrapped shell command is a different command. */
+.ev-d .fence {
+  display: block;
+  margin: 4px 0 2px;
+  padding: 6px 8px;
+  background: #101010;
+  border-left: 2px solid var(--rule);
+  overflow-x: auto;
+  white-space: pre;
+  color: #cfd8c4;
+}
+
+/* A tool call's icon, inline with the tool's name. Baseline-aligned rather than centred: the row
+   is a line of text and the glyph is a word in it. */
+.ev-i {
+  display: inline-flex;
+  vertical-align: -2px;
+  margin-right: 5px;
+  opacity: 0.75;
+}
+
+/* A checkpoint row: the node's hue as a wash, with a rule down the left edge in the same hue at
+   full strength. The wash finds the boundary when scanning; the rule is what makes it a boundary
+   rather than a row that happens to be a different colour. */
+.ev--checkpoint {
+  background: var(--row-tint);
+  box-shadow: inset 2px 0 0 var(--tint);
+}
+
+/* ── Loading placeholder ────────────────────────────────────────────────── */
+
+/* Bars where the text will be. Not animated across the row: a travelling shimmer draws the eye to
+   the placeholder, which is the one thing on screen with nothing to read. A slow pulse says
+   "working" and then gets out of the way. */
+.skel {
+  background: var(--rule);
+  height: 8px;
+  align-self: center;
+  animation: breathe 1.6s ease-in-out infinite;
+}
+
+.ev--skel {
+  /* The rows are not interactive and should not look it. */
+  cursor: default;
+}
+
+/* The detail column is `flex: 1` for real rows, which stretches every placeholder bar to the same
+   full width — a stack of identical rules that reads as a table, not as text about to arrive. The
+   per-row widths only mean anything once it stops stretching. */
+.ev--skel .ev-d {
+  flex: none;
+}
+
+/* Staggered, so the rows do not pulse as one block — that reads as a single object flashing
+   rather than as several lines waiting. */
+.ev--skel:nth-child(2n) .skel {
+  animation-delay: 0.2s;
+}
+.ev--skel:nth-child(3n) .skel {
+  animation-delay: 0.4s;
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+/* Motion is a preference, and a pulsing placeholder is exactly the kind a reader may have turned
+   off. The bars stay; only the animation goes. */
+@media (prefers-reduced-motion: reduce) {
+  .skel {
+    animation: none;
+    opacity: 0.5;
+  }
+}
+
+/* The run's title, as a control rather than a heading: it toggles between one line and all of it.
+   Styled to look like the heading it replaced — a button here is for the keyboard and the screen
+   reader, not for the eye. */
+.title {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-align: left;
+  /* The heading sets `line-height: 0.95`, a line box shorter than the font itself. That is fine
+     where text can spill past its box, and not fine here: with `overflow: hidden` the clipping
+     takes the bottom off every descender, so `repository` lost the tails of its p and y. Enough
+     leading to contain them, and the margin below comes back down to keep the header's height. */
+  line-height: 1.2;
+  margin-bottom: -0.15em;
+  /* Explicit, because this element is sometimes a span and sometimes a button, and the two do not
+     inherit alike: the browser's own sheet sets `text-transform: none` on a button, and a rule
+     applied directly to an element beats one inherited from its parent. Without this the title
+     rendered in sentence case as a control and in capitals as plain text, so the moment the
+     measurement decided which it was, the whole heading changed case. */
+  text-transform: inherit;
+}
+
+/* Only when there is something to reveal — see `clipped` in RunMeta. */
+button.title {
+  cursor: pointer;
+}
+
+ /* Expanded, it wraps at spaces and nowhere else: a title broken mid-word costs more to read
+    than the line it saved. */
+.title {
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.title--clipped {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Links. There were none styled, so the one link in the interface — a run's pull request — used
+   the browser's default blue, which belongs to no palette here and reads as a mis-render. Text
+   colour with an underline instead: unmistakably a link, and made of the two things this scheme
+   already uses. */
+a {
+  color: var(--fg);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-thickness: 1px;
+}
+
+a:hover,
+a:focus-visible {
+  color: #fff;
+}
+
+/* ── Magnifier ──────────────────────────────────────────────────────────── */
+
+/*
+ * A node box is 202x104 with 9px text in it, drawn at whatever zoom the graph was fitted to — in a
+ * two-thirds-width window that is about 45%, which puts the text near 4px. Hovering enlarges the
+ * one you are looking at, and a selected node stays enlarged because it is the one you are reading.
+ *
+ * Scaled rather than re-laid-out: everything stays where it was relative to the box, so the node
+ * you were looking at is the node you are still looking at, only bigger. `--mag` comes from the
+ * viewport zoom, so this targets a readable size rather than a fixed multiple of a shrinking one.
+ */
+.react-flow__node .node {
+  transform-origin: center center;
+  /* Both properties animate: the lift arrives with the growth rather than after it. */
+  /* An even curve, not an expo-out: `cubic-bezier(0.22, 1, …)` put two thirds of the growth into
+     the first 80ms, which after a delay reads as a snap rather than a movement. */
+  transition:
+    transform 260ms cubic-bezier(0.4, 0, 0.2, 1),
+    box-shadow 260ms ease-out;
+  /* No `will-change: transform` here, deliberately. It pins the box into its own compositor layer
+     rasterised at its resting size, so magnifying stretches a 90px-wide bitmap up to 212px and the
+     text arrives blurry — the one thing this feature exists to prevent. Without it the browser
+     re-rasterises at the size actually on screen and the glyphs stay sharp. Eight small boxes
+     animating one property do not need the promotion. */
+}
+
+.react-flow__node:hover .node,
+.node--selected {
+  transform: scale(var(--mag, 1.6));
+  /* Reads as lifted rather than as overlapping: without it the enlarged box and the one behind it
+     are two rectangles of the same colour sharing an edge. */
+  box-shadow: 0 10px 30px rgb(0 0 0 / 0.65);
+}
+
+/* Delayed on the way in only. Crossing the graph to reach something passes over three or four
+   nodes, and without this each one lunges at the cursor on the way past. Leaving has no delay, so
+   it settles the moment you move off. A selected node is not delayed — the click already said
+   which one you meant. */
+.react-flow__node:hover .node {
+  transition-delay: 150ms;
+}
+
+/* Above their neighbours, or they grow underneath them. React Flow assigns z-index inline, so
+   these have to outrank it. */
+.react-flow__node:hover,
+.react-flow__node:has(.node--selected) {
+  z-index: 20 !important;
+}
+
+/* Hovering the selected node should not make it jump again. */
+.react-flow__node:hover .node--selected {
+  transition-delay: 0s;
+}
+
+/*
+ * Dragging the scrubber lifts whichever nodes were working at that moment.
+ *
+ * `active` is already derived from the scrubbed prefix, so a working node *is* a node that was
+ * working then — the graph is answering "who was running here" as you drag, and this is that answer
+ * made findable without hunting for the box that changed state.
+ *
+ * No JavaScript and no drag flag: a range input holds `:active` for the length of the drag, which
+ * is exactly the window we want. Short of the hover magnification on purpose — this is peripheral
+ * vision while your eye is on the slider, not something being read, and matching hover would make
+ * every drag a fight between two boxes claiming to be the one you meant.
+ *
+ * `--mag-scrub`, not `--mag`: several boxes grow at once here and none of them is on top, so the
+ * size is bounded by the room between them. See `CROWD_LIMIT`.
+ */
+.stage:has(.scrub input:active) .react-flow__node:not(:hover) .node--working:not(.node--selected) {
+  transform: scale(var(--mag-scrub, 1.3));
+  box-shadow: 0 6px 18px rgb(0 0 0 / 0.5);
+}
+
+.stage:has(.scrub input:active) .react-flow__node:has(.node--working) {
+  z-index: 15 !important;
+}
+
+/* Reduced motion asks for less movement, not for none: the growth is what makes the node readable
+   and removing it would remove the feature. Shortened to a blink, with no delay, so there is still
+   feedback that the hover did something. */
+@media (prefers-reduced-motion: reduce) {
+  .react-flow__node .node {
+    transition-duration: 90ms;
+  }
+  .react-flow__node:hover .node {
+    transition-delay: 0s;
+  }
+}
+
+/*
+ * ── Scrollbars ──────────────────────────────────────────────────────────────
+ *
+ * The platform's own are rounded, pale, and sized for a document; here they sit against near-black
+ * panels beside a graph and a monospace feed, and the default reads as a piece of someone else's
+ * application left in the frame.
+ *
+ * A slot with a bar in it: square, because nothing else here has a rounded corner, and the same
+ * `--rule` grey the dividers use, so the bar is furniture rather than a control competing with the
+ * tints. Transparent track and a transparent thumb border with `background-clip: padding-box` —
+ * the bar is inset by the padding it clips to, and the panel underneath shows through, so this
+ * works over `--bg`, `--panel` and the code blocks' `#101010` without naming any of them.
+ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--rule);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+
+/* Brightens under the pointer and again while dragged: the only feedback a bar this quiet gives. */
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:active {
+  background: var(--fg);
+  background-clip: padding-box;
+}
+
+/* Where a pane scrolls both ways. Left as substrate rather than the default pale square. */
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* The feed only. Its rows outrun its height within seconds of any run, so reserving the lane costs
+   nothing and stops the whole column reflowing narrower the moment the bar appears. Everywhere else
+   the pane usually fits, and a reserved gutter there is an empty track down the side of a pane that
+   never scrolls. */
+.feed {
+  scrollbar-gutter: stable;
+}
+
+/*
+ * The tooltip. One element, moved and refilled — see Tooltip.tsx.
+ *
+ * Square and monospace like everything else it sits over, and lifted off the substrate by a border
+ * plus a shadow rather than by being bright: it appears over the thing you are reading, so it has
+ * to be legible without becoming the loudest thing on screen.
+ */
+.tip {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 100;
+  /* The one radius in the interface, and it earns the exception: everything else here is substrate
+     — panes, rules, boxes that meet at 90 degrees — and this is the only thing that floats above
+     it. The soft corner is what says "not part of the board". `!important` because the global
+     reset zeroes every radius on the page, itself with `!important`. */
+  border-radius: 3px !important;
+  /* Fades and settles the last couple of pixels rather than appearing fully formed, which at this
+     size reads as a glitch. `forwards` holds the end state; the element is unmounted on hide, so
+     there is nothing to animate out of. */
+  animation: tip-in 130ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  max-width: 320px;
+  padding: 6px 9px;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 0.6);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+  letter-spacing: 0.03em;
+  /* Several of these explain a list of tool names, which wrap mid-name without it. */
+  overflow-wrap: anywhere;
+  /* It is an explanation of what is underneath, so it must never be what the pointer finds. */
+  pointer-events: none;
+}
+
+@keyframes tip-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Reduced motion keeps the fade and drops the travel: the fade is what stops it snapping into
+   existence, and it moves nothing across the screen. */
+@media (prefers-reduced-motion: reduce) {
+  .tip {
+    animation-name: tip-fade;
+  }
+}
+
+@keyframes tip-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
