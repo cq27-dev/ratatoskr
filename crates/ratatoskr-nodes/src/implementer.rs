@@ -141,8 +141,7 @@ impl ImplementerNode {
     /// team writes its tests into the same tree before any code exists to satisfy them, and it
     /// cannot do that until the tree is there.
     pub async fn prepare(&self) -> Result<WorktreePath, NodeError> {
-        let branch = format!("ratatoskr/{}", self.short_id());
-        create_worktree(&self.repo_path, &self.worktree_root, &branch)
+        create_worktree(&self.repo_path, &self.worktree_root, &self.branch())
             .await
             .map_err(|e| NodeError::Failed(format!("worktree create failed: {e}")))
     }

@@ -1,9 +1,14 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import {
   BaseEdge,
   Handle,
   Position,
   ReactFlow,
+  useEdgesState,
+  useNodesInitialized,
+  useNodesState,
+  useReactFlow,
+  useStore,
   type Edge,
   type EdgeProps,
   type Node,
@@ -33,7 +38,9 @@ import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode } from "./api";
 /* Pitch is the box plus the room an edge needs to turn in. Derived from NODE_SIZE rather than
  * written as a literal: the two drifted apart once already, leaving 20px for a right-angled edge
  * to route through, and the edges rendered as smears. */
-const NODE_SIZE = { width: 190, height: 96 };
+// Wide and tall enough that the meta line still fits on one row inside `.node`'s padding: the
+// cycles and token counts wrapped when the padding grew, and a wrapped count reads as two facts.
+const NODE_SIZE = { width: 202, height: 104 };
 const COLUMN_GAP = 96;
 const LANE_GAP = 62;
 const COLUMN_PITCH = NODE_SIZE.width + COLUMN_GAP;
@@ -216,7 +223,10 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
 
   return (
     <div className={cls}>
-      <Handle type="target" position={Position.Left} />
+      {/* Named, all four of them: with more than one handle per type an edge that names none is
+          resolved by whichever registered without an id, and that ordering is not ours to rely on.
+          Unnamed, the stage edges vanished intermittently on re-render. */}
+      <Handle type="target" id="in" position={Position.Left} />
       <div className="node-name">
         <span>{node.name.replace("_", " ")}</span>
         <span className="dot" aria-hidden="true" />
@@ -230,7 +240,7 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
       {(node.telemetry || data.live?.facts || node.planned) && (
         <NodeFacts telemetry={node.telemetry} live={data.live} planned={node.planned} />
       )}
-      <Handle type="source" position={Position.Right} />
+      <Handle type="source" id="out" position={Position.Right} />
       <Handle type="target" id="loop-in" position={Position.Bottom} />
       <Handle type="source" id="loop-out" position={Position.Bottom} />
     </div>
@@ -242,13 +252,15 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
  * a real edge rather than an annotation.
  */
 function ConvergeEdge({ id, sourceX, sourceY, label, markerEnd }: EdgeProps) {
-  // Sized off the node so the loop stays under its own box as the box changes.
+  // Sized off the node so the loop stays under its own box as the box changes, and symmetric about
+  // it: both handles sit at the bottom centre, so `sourceX` IS the centre and the two sides have to
+  // reach equally far or the loop hangs visibly off to one side of the node it belongs to.
   const drop = LANE_GAP / 2;
-  const half = NODE_SIZE.width / 2 - 14;
+  const reach = NODE_SIZE.width / 4;
   // Quadratic corners, to match the rounded stage edges rather than being the one square turn left.
   const r = 14;
-  const right = sourceX + 14;
-  const left = sourceX - half;
+  const right = sourceX + reach;
+  const left = sourceX - reach;
   const bottom = sourceY + drop;
   const path = [
     `M ${right},${sourceY}`,
@@ -264,7 +276,7 @@ function ConvergeEdge({ id, sourceX, sourceY, label, markerEnd }: EdgeProps) {
       <BaseEdge id={id} path={path} {...(markerEnd ? { markerEnd } : {})} />
       <text
         className="react-flow__edge-text"
-        x={sourceX - 16}
+        x={sourceX}
         y={sourceY + drop + 12}
         textAnchor="middle"
       >
@@ -272,6 +284,34 @@ function ConvergeEdge({ id, sourceX, sourceY, label, markerEnd }: EdgeProps) {
       </text>
     </>
   );
+}
+
+/**
+ * Centre the map once its boxes are measured, and again if the pane itself changes size.
+ *
+ * Two things defeat the `fitView` prop here. It fits at init, and at init there is nothing to fit:
+ * the nodes arrive from the server a moment later. And the pane is still settling — the scrubber
+ * and the feed take their rows after the first paint — so a fit computed against the taller pane
+ * leaves the map sitting low once the rows appear.
+ *
+ * So: fit when the boxes are measured, and refit while the pane is still resizing. `moved` stops
+ * that the instant someone pans or zooms, because after that the view is theirs and a refit would
+ * yank it back.
+ *
+ * Must be rendered INSIDE `<ReactFlow>`: that is what puts it in the provider's context.
+ */
+function FitToPane({ count, moved }: { count: number; moved: boolean }) {
+  const initialized = useNodesInitialized();
+  const { fitView } = useReactFlow();
+  // React Flow measures its own pane; taking the size from its store rather than observing the
+  // DOM means refitting on exactly the changes it has already noticed.
+  const width = useStore((s) => s.width);
+  const height = useStore((s) => s.height);
+  useEffect(() => {
+    if (moved || !initialized || count === 0 || width === 0 || height === 0) return;
+    void fitView({ padding: 0.3 });
+  }, [initialized, count, width, height, moved, fitView]);
+  return null;
 }
 
 const nodeTypes = { pipeline: PipelineNode };
@@ -289,10 +329,11 @@ interface Props {
   nodes: NodeView[];
   /** Keyed by node name. Fills the box while a node is still working. */
   live: Map<string, LiveNode>;
-  /** The node that last did something, from the event stream. Overrides the derived state. */
-  active: string | null;
+  /** Every node working right now — more than one late in a run, when nodes run in parallel. */
+  active: ReadonlySet<string>;
   selected: string | null;
-  onSelect: (name: string) => void;
+  /** `null` clears the selection, which returns the lower pane to the combined feed. */
+  onSelect: (name: string | null) => void;
 }
 
 export default function PipelineGraph({ nodes, live, active, selected, onSelect }: Props) {
@@ -311,11 +352,11 @@ export default function PipelineGraph({ nodes, live, active, selected, onSelect 
    * of them from the raw list is how the loop came to glow green while a different node worked.
    */
   const view = useMemo(() => {
-    if (!active) return nodes;
+    if (!active.size) return nodes;
     return nodes.map((n) => {
-      if (n.name === active) return { ...n, state: "working" as const };
-      // Something else is talking, so this is not working: fall back to what its checkpoints
-      // support. A node with one is done; a node with none never started.
+      if (active.has(n.name)) return { ...n, state: "working" as const };
+      // Nothing says this one is working: fall back to what its checkpoints support. A node with
+      // one is done; a node with none never started.
       if (n.state === "working") {
         return { ...n, state: (n.checkpoints > 0 ? "done" : "idle") as NodeView["state"] };
       }
@@ -326,7 +367,7 @@ export default function PipelineGraph({ nodes, live, active, selected, onSelect 
   const columns = useMemo(() => stages(view), [view]);
   const byName = useMemo(() => new Map(view.map((n) => [n.name, n])), [view]);
 
-  const rfNodes = useMemo<PipelineNodeType[]>(() => {
+  const desiredNodes = useMemo<PipelineNodeType[]>(() => {
     const maxLanes = Math.max(1, ...columns.map((c) => c.length));
     return columns.flatMap((lanes) =>
       lanes.map((n) => ({
@@ -340,7 +381,7 @@ export default function PipelineGraph({ nodes, live, active, selected, onSelect 
     );
   }, [columns, live, selected]);
 
-  const rfEdges = useMemo<Edge[]>(() => {
+  const desiredEdges = useMemo<Edge[]>(() => {
     // Every node in a stage feeds every node in the next one — which is what a fork joining back
     // together looks like, and the only edge relation the pipeline has.
     // Rounded rather than square: the boxes carry the substrate's right angles, and the wiring
@@ -351,6 +392,8 @@ export default function PipelineGraph({ nodes, live, active, selected, onSelect 
           id: `${source.name}-${target.name}`,
           source: source.name,
           target: target.name,
+          sourceHandle: "out",
+          targetHandle: "in",
           type: "smoothstep",
           pathOptions: { borderRadius: 24 },
         })),
@@ -374,22 +417,63 @@ export default function PipelineGraph({ nodes, live, active, selected, onSelect 
     return edges;
   }, [byName]);
 
+  /*
+   * React Flow is a controlled component: it owns node measurement and writes the result back
+   * through `onNodesChange`. Passing `nodes` with no change handler leaves it nowhere to put a
+   * measurement, so it re-measures on every render and edges — which cannot be routed until both
+   * endpoints are measured — were dropped whenever a re-read landed mid-measurement, permanently.
+   *
+   * These hooks are that channel. Server-derived data still drives the graph; it is applied to the
+   * state React Flow owns rather than replacing the object it is working on.
+   */
+  // Once someone pans or zooms, the view belongs to them and nothing refits it.
+  const moved = useRef(false);
+  const [rfNodes, setRfNodes, onNodesChange] = useNodesState<PipelineNodeType>([]);
+  const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState<Edge>([]);
+
+  useEffect(() => {
+    setRfNodes((prev) => {
+      const measured = new Map(prev.map((n) => [n.id, n]));
+      // Carry each node's existing measurement across a data update: it is the same box in the
+      // same place, and only `data` has changed.
+      return desiredNodes.map((n) => ({ ...measured.get(n.id), ...n }));
+    });
+  }, [desiredNodes, setRfNodes]);
+
+  useEffect(() => setRfEdges(desiredEdges), [desiredEdges, setRfEdges]);
+
   return (
     <ReactFlow
       nodes={rfNodes}
       edges={rfEdges}
+      onNodesChange={onNodesChange}
+      onEdgesChange={onEdgesChange}
       nodeTypes={nodeTypes}
       edgeTypes={edgeTypes}
       onNodeClick={(_, node) => onSelect(node.id)}
+      /* Clicking the substrate clears the selection, which puts the lower pane back to the
+         combined feed it starts on. Without it a node, once opened, could never be closed. */
+      onPaneClick={() => onSelect(null)}
+      /* Only a real gesture counts: `onMoveStart` fires with an event for a user pan or zoom and
+         without one for a programmatic `fitView`, which must not count as taking the view over. */
+      onMoveStart={(event) => {
+        if (event) moved.current = true;
+      }}
       fitView
       fitViewOptions={{ padding: 0.3 }}
       proOptions={{ hideAttribution: true }}
       nodesConnectable={false}
       nodesDraggable={false}
-      panOnScroll
+      /* Wheel and pinch zoom, drag to pan — what a map is expected to do. `panOnScroll` made the
+         wheel pan and left zooming to a double-click, which is a gesture for opening things. */
+      zoomOnScroll
+      zoomOnPinch
+      zoomOnDoubleClick={false}
       minZoom={0.4}
       maxZoom={1.6}
       colorMode="dark"
-    />
+    >
+      <FitToPane count={rfNodes.length} moved={moved.current} />
+    </ReactFlow>
   );
 }

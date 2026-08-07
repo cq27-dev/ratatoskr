@@ -681,6 +681,7 @@ mod tests {
                 interface: Vec::new(),
             },
             implementer: ImplementerOutput {
+                branch: "ratatoskr/test".into(),
                 worktree_path: "/tmp/wt".into(),
                 diff_summary: diff.into(),
                 touched_files: touched.iter().map(|s| (*s).to_string()).collect(),

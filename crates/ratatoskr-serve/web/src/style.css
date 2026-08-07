@@ -289,7 +289,7 @@ body {
 
 /* The lower half is always present now: even with no node selected there is a live feed to show. */
 .stage--split {
-  grid-template-rows: auto minmax(200px, 1fr) minmax(0, 46%);
+  grid-template-rows: auto auto minmax(200px, 1fr) minmax(0, 46%);
 }
 
 /* Activity beside output: the feed says what is happening, the pane what was produced. */
@@ -402,6 +402,36 @@ body {
 
 .ev-k--question {
   color: var(--hazard);
+}
+
+/* A grouped row is a button; strip the control look so it reads as the row it replaces. */
+.ev--group {
+  width: 100%;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+  text-align: left;
+  cursor: pointer;
+}
+.ev--group:hover {
+  background: var(--panel);
+}
+.ev--group:focus-visible {
+  outline: 1px solid var(--fg);
+  outline-offset: -2px;
+}
+
+/* The calls a group folded, indented under it and dimmed: the group is the fact, these are its
+   detail. */
+.ev--sub {
+  padding-left: 28px;
+  color: var(--muted);
+}
+.ev-k--sub {
+  color: var(--muted);
 }
 
 /* Flex, not grid: the node column is only rendered when no node is selected, so the column count
@@ -562,10 +592,13 @@ body {
       0deg,
       transparent,
       transparent 2px,
-      rgba(255, 255, 255, 0.045) 2px,
-      rgba(255, 255, 255, 0.045) 4px
+      rgba(255, 255, 255, 0.011) 2px,
+      rgba(255, 255, 255, 0.011) 4px
     ),
     var(--bg);
+  /* React Flow's dark theme paints an opaque #141414 over its whole surface, which would bury the
+     texture below it. This is its own knob for that, so it survives their theme changing. */
+  --xy-background-color: transparent;
   position: relative;
   min-height: 0;
 }
@@ -618,8 +651,11 @@ body {
   height: 100%;
   background: var(--panel);
   border: 1px solid var(--rule);
-  padding: 7px 9px;
+  padding: 10px 12px;
   cursor: pointer;
+  /* The one exception to the square-corner reset above, which is `!important` on `*` to keep
+     React Flow's own radii off handles and controls — so the exception has to be too. */
+  border-radius: 3px !important;
 }
 
 .node--selected {

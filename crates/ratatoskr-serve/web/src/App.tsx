@@ -299,6 +299,19 @@ interface Row {
   count: number;
   durationMs?: number;
   kind: string;
+  /**
+   * The calls this row folded together, in order.
+   *
+   * Collapsing answers "what was it doing" — four reads in a row is one fact. It also hides which
+   * four, which is the next question a reader has, so the parts are kept rather than counted.
+   */
+  parts: RowPart[];
+}
+
+interface RowPart {
+  at: string;
+  arg?: string;
+  durationMs?: number;
 }
 
 /**
@@ -419,16 +432,20 @@ function rows(events: LiveEvent[]): Row[] {
       // The last argument, so the row still says where the run got to.
       if (e.arg) last.arg = e.arg;
       last.at = e.at;
+      last.parts.push({ at: e.at, ...(e.arg ? { arg: e.arg } : {}) });
       continue;
     }
+    const action = e.kind === "tool_call" ? e.detail : e.kind.replace("_", " ");
     out.push({
       at: e.at,
       node: e.node,
-      action: e.kind === "tool_call" ? e.detail : e.kind.replace("_", " "),
-      detail: e.kind === "tool_call" ? "" : e.detail,
+      action,
+      // A message that only restates the action is not a second column: `checkpoint checkpoint`.
+      detail: e.kind === "tool_call" || detail === action ? "" : detail,
       ...(e.arg ? { arg: e.arg } : {}),
       count: 1,
       kind: e.kind,
+      parts: [{ at: e.at, ...(e.arg ? { arg: e.arg } : {}) }],
     });
   }
   return out;
@@ -440,6 +457,9 @@ function Feed({ events, node }: { events: LiveEvent[]; node: string | null }) {
     [events, node],
   );
   const tail = useRef<HTMLDivElement>(null);
+  // Which collapsed rows are open, by their own key rather than index: the feed grows from the
+  // end, and an index would move the open row out from under the reader.
+  const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
 
   useEffect(() => {
     tail.current?.scrollIntoView({ block: "end" });
@@ -452,22 +472,69 @@ function Feed({ events, node }: { events: LiveEvent[]; node: string | null }) {
         <output>{shown.length}</output>
       </div>
       {shown.length === 0 && <p className="empty">no activity recorded yet</p>}
-      {shown.map((r, i) => (
-        <div className="ev" key={`${r.at}-${i}`}>
-          <span className="ev-t">{clock(r.at)}</span>
-          {/* Who, then what. A feed reads as a sentence about a node, not a list of verbs. */}
-          {!node && <span className="ev-n">{r.node ?? "—"}</span>}
-          <span className={`ev-k ev-k--${r.kind}`}>
-            {r.action}
-            {r.count > 1 && <span className="ev-x"> {r.count}×</span>}
-          </span>
-          {r.arg && <span className="ev-a">{r.arg}</span>}
-          {r.detail && <span className="ev-d">{r.detail}</span>}
-          {r.durationMs !== undefined && r.durationMs >= 1000 && (
-            <span className="ev-ms">{(r.durationMs / 1000).toFixed(1)}s</span>
-          )}
-        </div>
-      ))}
+      {shown.map((r, i) => {
+        const key = `${r.at}-${i}`;
+        const grouped = r.count > 1;
+        const expanded = open.has(key);
+        const body = (
+          <>
+            <span className="ev-t">{clock(r.at)}</span>
+            {/* Who, then what. A feed reads as a sentence about a node, not a list of verbs. */}
+            {!node && <span className="ev-n">{r.node ?? "—"}</span>}
+            <span className={`ev-k ev-k--${r.kind}`}>
+              {r.action}
+              {grouped && (
+                <span className="ev-x">
+                  {" "}
+                  {r.count}× {expanded ? "▾" : "▸"}
+                </span>
+              )}
+            </span>
+            {r.arg && <span className="ev-a">{r.arg}</span>}
+            {r.detail && <span className="ev-d">{r.detail}</span>}
+            {r.durationMs !== undefined && r.durationMs >= 1000 && (
+              <span className="ev-ms">{(r.durationMs / 1000).toFixed(1)}s</span>
+            )}
+          </>
+        );
+        return (
+          <div key={key}>
+            {grouped ? (
+              // A real button, so it is reachable by keyboard and announces its state. A row that
+              // stands for several calls is the one place the feed hides something.
+              <button
+                type="button"
+                className="ev ev--group"
+                aria-expanded={expanded}
+                onClick={() =>
+                  setOpen((prev) => {
+                    const next = new Set(prev);
+                    if (!next.delete(key)) next.add(key);
+                    return next;
+                  })
+                }
+              >
+                {body}
+              </button>
+            ) : (
+              <div className="ev">{body}</div>
+            )}
+            {grouped &&
+              expanded &&
+              r.parts.map((p, n) => (
+                <div className="ev ev--sub" key={`${key}-${n}`}>
+                  <span className="ev-t">{clock(p.at)}</span>
+                  {!node && <span className="ev-n" />}
+                  <span className="ev-k ev-k--sub">{r.action}</span>
+                  {p.arg && <span className="ev-a">{p.arg}</span>}
+                  {p.durationMs !== undefined && p.durationMs >= 1000 && (
+                    <span className="ev-ms">{(p.durationMs / 1000).toFixed(1)}s</span>
+                  )}
+                </div>
+              ))}
+          </div>
+        );
+      })}
       <div ref={tail} />
     </div>
   );

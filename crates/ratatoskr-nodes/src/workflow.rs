@@ -1036,6 +1036,7 @@ mod tests {
 
     fn imp(failing: &[&str], passing: &[&str], exit: i32) -> ImplementerOutput {
         ImplementerOutput {
+            branch: "ratatoskr/test".into(),
             worktree_path: "/wt".to_string(),
             diff_summary: String::new(),
             touched_files: vec![],
