@@ -42,6 +42,16 @@ model = "kimi-k2.5"
 #
 # Thinking tokens are billed as output and count against `max_tokens`; raise it alongside any
 # budget you set.
+#
+# `session` decides whether a node's endpoint session continues across attempts within a run.
+# "fresh" (the default) starts a new one each time; "reuse" keeps one for the node, so a node that
+# gets re-driven — the implementer on a converge iteration, the analyst on a revision — continues
+# where it stopped instead of meeting the repository again from nothing. Only worth it where a
+# later attempt genuinely continues the earlier one, and it needs `[endpoint] session_header` set
+# for anything to key off.
+#
+#   [models.implementer]
+#   session = "reuse"
 
 [models.analyst]
 provider = "anthropic"

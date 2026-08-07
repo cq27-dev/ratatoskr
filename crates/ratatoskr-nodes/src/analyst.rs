@@ -139,6 +139,9 @@ pub struct AnalystNode {
     pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
     /// The repository its built-in file tools read within.
     pub files: Option<std::path::PathBuf>,
+    /// Names this analyst's conversation within the run, so a revision can continue the plan it is
+    /// revising rather than reading the repository again from nothing.
+    pub conversation: Option<String>,
 }
 
 impl Node for AnalystNode {
@@ -175,6 +178,7 @@ impl Node for AnalystNode {
             files: self.files.clone(),
             // Reads and edits, but runs nothing.
             shell: None,
+            conversation: self.conversation.as_deref(),
             ledger: self.ledger.clone(),
             produces: Some(
                 "an impact summary, the symbols and paths touched, risks, the concrete requirements the implementation must satisfy, and the acceptance steps that prove it done",

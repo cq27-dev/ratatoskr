@@ -33,6 +33,10 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("checkpoints", "cached_input_tokens", "INTEGER"),
     ("checkpoints", "cache_creation_input_tokens", "INTEGER"),
     ("checkpoints", "reasoning_tokens", "INTEGER"),
+    ("checkpoints", "tools_json", "TEXT"),
+    ("checkpoints", "reuses_session", "INTEGER"),
+    ("checkpoints", "thinking", "INTEGER"),
+    ("checkpoints", "tools_used_json", "TEXT"),
     ("checkpoints", "error", "TEXT"),
 ];
 
@@ -264,8 +268,10 @@ impl Store {
                      run_id, node_name, output_json, input_json, iteration,
                      model, duration_ms, turns, error,
                      input_tokens, output_tokens, cached_input_tokens,
-                     cache_creation_input_tokens, reasoning_tokens
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     cache_creation_input_tokens, reasoning_tokens, tools_json, reuses_session,
+                     thinking, tools_used_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                           ?17, ?18)",
                 params![
                     run_id,
                     node_name,
@@ -281,6 +287,10 @@ impl Store {
                     usage.cached_input_tokens,
                     usage.cache_creation_input_tokens,
                     usage.reasoning_tokens,
+                    serde_json::to_string(&telemetry.tools).unwrap_or_default(),
+                    telemetry.reuses_session,
+                    telemetry.thinking,
+                    serde_json::to_string(&telemetry.tools_used).unwrap_or_default(),
                 ],
             )?;
             Ok::<_, StoreError>(())
@@ -299,7 +309,8 @@ impl Store {
                 "SELECT node_name, output_json, created_at, input_json, iteration,
                         model, duration_ms, turns, error,
                         input_tokens, output_tokens, cached_input_tokens,
-                        cache_creation_input_tokens, reasoning_tokens
+                        cache_creation_input_tokens, reasoning_tokens, tools_json, reuses_session,
+                        thinking, tools_used_json
                  FROM checkpoints WHERE run_id = ?1 ORDER BY id ASC",
             )?;
             let rows = stmt
@@ -315,6 +326,18 @@ impl Store {
                             duration_ms: row.get(6)?,
                             turns: row.get(7)?,
                             error: row.get(8)?,
+                            // A pre-migration row has NULL for both: an empty tool list and a
+                            // fresh session are the honest reading of "not recorded".
+                            tools: row
+                                .get::<_, Option<String>>(14)?
+                                .and_then(|j| serde_json::from_str(&j).ok())
+                                .unwrap_or_default(),
+                            reuses_session: row.get::<_, Option<bool>>(15)?.unwrap_or(false),
+                            thinking: row.get::<_, Option<bool>>(16)?.unwrap_or(false),
+                            tools_used: row
+                                .get::<_, Option<String>>(17)?
+                                .and_then(|j| serde_json::from_str(&j).ok())
+                                .unwrap_or_default(),
                             usage: ratatoskr_core::TokenUsage {
                                 // A pre-migration row has NULL here, which is "unknown", not zero.
                                 // Reading it as 0 is the honest projection for a sum; the `model`
@@ -517,6 +540,10 @@ mod tests {
                         cache_creation_input_tokens: 200,
                         reasoning_tokens: 4_000,
                     },
+                    tools: vec!["Read".to_string(), "semantic_search".to_string()],
+                    tools_used: vec!["Read".to_string()],
+                    reuses_session: true,
+                    thinking: true,
                 },
             })
             .await
@@ -537,6 +564,13 @@ mod tests {
         // Billed as output and reported apart from it: a node that thinks before every tool call
         // reads as nearly free when this is dropped, and it is most of what the node spent.
         assert_eq!(cp.telemetry.usage.reasoning_tokens, 4_000);
+        // What the node could reach, and whether its memory carried over — neither is
+        // reconstructable later from a config that has since changed.
+        assert_eq!(cp.telemetry.tools, ["Read", "semantic_search"]);
+        // Given two, reached for one — the gap is the point.
+        assert_eq!(cp.telemetry.tools_used, ["Read"]);
+        assert!(cp.telemetry.reuses_session);
+        assert!(cp.telemetry.thinking);
     }
 
     #[tokio::test]

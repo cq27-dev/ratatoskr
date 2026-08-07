@@ -123,6 +123,7 @@ impl ContextNode {
             files: self.files.clone(),
             // Reads and edits, but runs nothing.
             shell: None,
+            conversation: None,
             ledger: self.ledger.clone(),
             produces: Some(
                 "a brief on what bears on this task, the constraints it must respect with their \

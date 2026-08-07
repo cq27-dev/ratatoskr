@@ -83,6 +83,91 @@ pub struct NodeView {
     pub checkpoints: usize,
     pub first_at: Option<String>,
     pub last_at: Option<String>,
+    /// What the node ran on and cost, from its most recent checkpoint. Absent for a node that has
+    /// not checkpointed, and for one that ran no model at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<NodeTelemetryView>,
+    /// What this node *would* run on, read from config. Present before the node has run, so the
+    /// pipeline says what it is going to do rather than staying blank until it does it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned: Option<PlannedNode>,
+}
+
+/// A node's configured route: what it will run on, and the two choices that change how it behaves.
+///
+/// Tools are absent on purpose. They come from the node's built-in list, its ruleset, and whatever
+/// the connected MCP servers actually offer — none of which this process can know without starting
+/// the script engine and the servers. They arrive when the node announces itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlannedNode {
+    pub model: String,
+    pub thinking: bool,
+    pub reuses_session: bool,
+}
+
+impl PlannedNode {
+    /// Read a node's route out of the config, if it has one. A node with no route never runs.
+    fn of(config: Option<&ratatoskr_core::RatatoskrConfig>, node: &str) -> Option<Self> {
+        // `red_team` checkpoints under that name but is routed as `redteam`.
+        let key = if node == "red_team" { "redteam" } else { node };
+        let route = config?.models.get(key)?;
+        Some(PlannedNode {
+            model: format!("{}/{}", route.provider, route.model),
+            thinking: route
+                .params
+                .as_ref()
+                .and_then(|p| p.get("thinking"))
+                .and_then(|t| t.get("type"))
+                .and_then(|t| t.as_str())
+                != Some("disabled"),
+            reuses_session: matches!(route.session, ratatoskr_core::SessionScope::Reuse),
+        })
+    }
+}
+
+/// A node's model, cost, and the two facts a reader cannot infer from either: which tools it could
+/// call, and whether it kept its session across attempts.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeTelemetryView {
+    pub model: Option<String>,
+    /// Model calls in the node's latest attempt.
+    pub turns: Option<u64>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    /// Non-zero when the model reasoned before answering. Zero from endpoints that do not report
+    /// it, which is why `thinking` exists alongside.
+    pub reasoning_tokens: u64,
+    /// Whether the node was left free to reason. Configured, not observed — see `reasoning_tokens`.
+    pub thinking: bool,
+    pub duration_ms: Option<u64>,
+    pub tools: Vec<String>,
+    /// Of those, the ones it actually called.
+    pub tools_used: Vec<String>,
+    /// The node's memory carried over from an earlier attempt in this run.
+    pub reuses_session: bool,
+}
+
+impl NodeTelemetryView {
+    /// The node's latest checkpoint, when it recorded a model turn. `None` for a node that ran no
+    /// model — the issue pseudo-node, or one whose turn was never claimed.
+    fn latest(checkpoints: &[Checkpoint], node: &str) -> Option<Self> {
+        let t = &checkpoints.iter().rfind(|c| c.node_name == node)?.telemetry;
+        t.model.as_ref()?;
+        Some(NodeTelemetryView {
+            model: t.model.clone(),
+            turns: t.turns,
+            input_tokens: t.usage.input_tokens,
+            output_tokens: t.usage.output_tokens,
+            cached_input_tokens: t.usage.cached_input_tokens,
+            reasoning_tokens: t.usage.reasoning_tokens,
+            thinking: t.thinking,
+            duration_ms: t.duration_ms,
+            tools: t.tools.clone(),
+            tools_used: t.tools_used.clone(),
+            reuses_session: t.reuses_session,
+        })
+    }
 }
 
 /// Statuses that mean the run is no longer executing. Note `planned` belongs here only because
@@ -125,6 +210,16 @@ const FORK: usize = 3;
 ///   fork is bookkeeping and that cannot fail the run, the implementer is where it stopped, even
 ///   though it has checkpoints from earlier iterations.
 pub fn derive(status: Option<&str>, checkpoints: &[Checkpoint]) -> Vec<NodeView> {
+    derive_with(status, checkpoints, None)
+}
+
+/// [`derive`], plus the config the run was started under — so a node that has not run yet can still
+/// say what it will run on.
+pub fn derive_with(
+    status: Option<&str>,
+    checkpoints: &[Checkpoint],
+    config: Option<&ratatoskr_core::RatatoskrConfig>,
+) -> Vec<NodeView> {
     let terminal = is_terminal(status);
     let failed = status == Some("failed");
     let fork_started = PIPELINE[FORK]
@@ -189,6 +284,8 @@ pub fn derive(status: Option<&str>, checkpoints: &[Checkpoint]) -> Vec<NodeView>
             };
 
             out.push(NodeView {
+                telemetry: NodeTelemetryView::latest(checkpoints, name),
+                planned: PlannedNode::of(config, name),
                 name: (*name).to_string(),
                 state,
                 stage: idx,
@@ -349,6 +446,92 @@ mod tests {
         let views = derive(None, &[cp("context", "t1")]);
         assert_eq!(state_of(&views, "context"), NodeState::Done);
         assert_eq!(state_of(&views, "analyst"), NodeState::Working);
+    }
+
+    #[test]
+    fn a_node_says_what_it_will_run_on_before_it_runs() {
+        // Otherwise the pipeline is blank until a node finishes, which is the wrong way round: a
+        // reader wants to know what is about to happen, not only what already did.
+        let mut config = ratatoskr_core::RatatoskrConfig::default();
+        config.models.insert(
+            "redteam".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-5".into(),
+                max_tokens: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Reuse,
+            },
+        );
+
+        let views = derive_with(None, &[], Some(&config));
+        // Routed as `redteam`, checkpointed as `red_team` — the view is keyed by the latter.
+        let planned = views
+            .iter()
+            .find(|v| v.name == "red_team")
+            .and_then(|v| v.planned.as_ref())
+            .expect("a routed node says what it will run on");
+        assert_eq!(planned.model, "anthropic/claude-sonnet-5");
+        assert!(planned.reuses_session);
+        assert!(planned.thinking, "nothing disabled it");
+
+        // A node with no route never runs, and claims nothing.
+        assert!(
+            views
+                .iter()
+                .find(|v| v.name == "publisher")
+                .unwrap()
+                .planned
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_node_reports_what_it_ran_on_and_what_it_could_reach() {
+        // The two facts a reader cannot get from anywhere else: the tools it could call and
+        // whether it kept its memory across attempts. Both are properties of the run, and the
+        // config that produced a past run may no longer exist.
+        let mut ran = cp("analyst", "t1");
+        ran.telemetry = ratatoskr_core::NodeTelemetry {
+            model: Some("anthropic/claude-opus-4-8".into()),
+            turns: Some(12),
+            usage: ratatoskr_core::TokenUsage {
+                input_tokens: 30,
+                output_tokens: 106,
+                cached_input_tokens: 132_771,
+                reasoning_tokens: 4_000,
+                ..Default::default()
+            },
+            tools: vec!["Read".into(), "semantic_search".into()],
+            tools_used: vec!["Read".into()],
+            reuses_session: true,
+            thinking: true,
+            ..Default::default()
+        };
+        let views = derive(Some("running"), &[ran]);
+        let t = views
+            .iter()
+            .find(|v| v.name == "analyst")
+            .and_then(|v| v.telemetry.as_ref())
+            .expect("the analyst ran a model");
+        assert_eq!(t.turns, Some(12));
+        assert_eq!(t.cached_input_tokens, 132_771);
+        assert!(t.reuses_session, "its memory carried over");
+        assert_eq!(t.reasoning_tokens, 4_000, "and it thought before answering");
+        assert!(t.thinking, "which the route left it free to do");
+        assert_eq!(t.tools, ["Read", "semantic_search"]);
+        assert_eq!(t.tools_used, ["Read"], "given two, reached for one");
+
+        // A node that ran no model reports none rather than a row of zeroes.
+        assert!(
+            derive(Some("running"), &[cp("analyst", "t1")])
+                .iter()
+                .find(|v| v.name == "analyst")
+                .unwrap()
+                .telemetry
+                .is_none()
+        );
     }
 
     #[test]

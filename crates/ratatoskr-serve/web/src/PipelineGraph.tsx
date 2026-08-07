@@ -9,7 +9,16 @@ import {
   type Node,
   type NodeProps,
 } from "@xyflow/react";
-import type { NodeView } from "./api";
+import {
+  Brain,
+  FileText,
+  Infinity as InfinityIcon,
+  Search,
+  Terminal,
+  Pencil,
+  Wrench,
+} from "lucide-react";
+import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode } from "./api";
 
 /*
  * Positions are computed from the `stage` and `lane` the server sends with each node, not from a
@@ -21,8 +30,14 @@ import type { NodeView } from "./api";
  * is not a general graph layout — elkjs/dagre exist for graphs whose edges aren't known until
  * runtime, and here every edge is "the stage before it".
  */
-const COLUMN_PITCH = 210;
-const LANE_PITCH = 140;
+/* Pitch is the box plus the room an edge needs to turn in. Derived from NODE_SIZE rather than
+ * written as a literal: the two drifted apart once already, leaving 20px for a right-angled edge
+ * to route through, and the edges rendered as smears. */
+const NODE_SIZE = { width: 190, height: 96 };
+const COLUMN_GAP = 96;
+const LANE_GAP = 62;
+const COLUMN_PITCH = NODE_SIZE.width + COLUMN_GAP;
+const LANE_PITCH = NODE_SIZE.height + LANE_GAP;
 
 function position(node: NodeView, lanesInStage: number, maxLanes: number) {
   const offset = (maxLanes - lanesInStage) / 2;
@@ -38,7 +53,143 @@ function position(node: NodeView, lanesInStage: number, maxLanes: number) {
  * removes the dependency on that callback ever firing, which is what decides whether the graph
  * appears at all. Keep in step with `.node` in style.css.
  */
-const NODE_SIZE = { width: 150, height: 52 };
+/** Thousands separators are noise at this size; magnitude is the whole message. */
+function short(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
+  return `${n}`;
+}
+
+/*
+ * Tools are grouped rather than listed: a node carries up to a dozen, and a dozen glyphs is a
+ * texture, not information. The grouping answers what a reader actually asks — can this node read,
+ * can it write, can it run things — and the title carries the exact names for when that is not
+ * enough.
+ */
+const TOOL_GROUPS: ReadonlyArray<{
+  icon: typeof FileText;
+  label: string;
+  match: (tool: string) => boolean;
+}> = [
+  { icon: Pencil, label: "edits files", match: (t) => t === "Write" || t === "Edit" },
+  { icon: Terminal, label: "runs commands", match: (t) => t === "Bash" },
+  { icon: FileText, label: "reads files", match: (t) => ["Read", "Grep", "Glob"].includes(t) },
+  { icon: Search, label: "searches the index", match: (t) => t.includes("search") || t.includes("symbol") || t.includes("impact") },
+];
+
+/**
+ * One node's capabilities and cost, as icons with the detail on hover.
+ *
+ * Takes whichever source has spoken. A finished node has a checkpoint carrying both what it ran on
+ * and what it cost; a working one has only what it announced at the start, so the cost line reads
+ * as pending rather than as zero — a node mid-flight has not spent nothing.
+ */
+function NodeFacts({
+  telemetry,
+  live,
+  planned,
+}: {
+  telemetry: NodeTelemetry | undefined;
+  live: LiveNode | undefined;
+  planned: PlannedNode | undefined;
+}) {
+  // Three sources, most-actual first: what the node recorded, what it announced when it started,
+  // and what config says it would use. The last is what fills a node that has not run yet.
+  const tools = telemetry?.tools?.length ? telemetry.tools : (live?.facts?.tools ?? []);
+  // What it reached for, as against what it was handed. A node given a shell it never used is
+  // worth seeing, so the two are drawn differently rather than the unused ones being dropped.
+  const used = telemetry?.tools_used?.length
+    ? new Set(telemetry.tools_used)
+    : (live?.used ?? new Set<string>());
+  const modelFull = telemetry?.model ?? live?.facts?.model ?? planned?.model ?? null;
+  const thinking = telemetry?.thinking ?? live?.facts?.thinking ?? planned?.thinking ?? false;
+  const reuses =
+    telemetry?.reuses_session ?? live?.facts?.reuses_session ?? planned?.reuses_session ?? false;
+  const cycles = telemetry?.turns ?? live?.cycles ?? null;
+  const groups = TOOL_GROUPS.filter((g) => tools.some(g.match));
+  const ungrouped = tools.filter((t) => !TOOL_GROUPS.some((g) => g.match(t)));
+  const model = modelFull?.split("/").pop() ?? "—";
+  const tokens = telemetry
+    ? `${short(telemetry.input_tokens + telemetry.cached_input_tokens)} in / ${short(telemetry.output_tokens)} out`
+    : "—";
+
+  return (
+    <>
+      <div className="node-model" title={modelFull ?? undefined}>
+        {model}
+      </div>
+      <div className="node-meta">
+        <span title="model calls in this node's latest attempt">
+          {cycles ?? "—"} {cycles === 1 ? "cycle" : "cycles"}
+        </span>
+        <span
+          title={
+            telemetry
+              ? `${telemetry.input_tokens} fresh + ${telemetry.cached_input_tokens} cached in, ${telemetry.output_tokens} out`
+              : "counted when the node checkpoints"
+          }
+        >
+          {tokens}
+        </span>
+      </div>
+      <div className="node-icons">
+        {/* Lucide takes no `title`, and a wrapper is the better hover target anyway. */}
+        {reuses && (
+          <span
+            className="node-icon"
+            /* Not a setting — this says the session was actually carried over. */
+            title="Compounding: this node keeps its memory when it is re-entered, so a later attempt continues the earlier one"
+          >
+            <InfinityIcon size={13} aria-label="compounding" />
+          </span>
+        )}
+        {thinking && (
+          <span
+            className="node-icon"
+            title={
+              telemetry && telemetry.reasoning_tokens > 0
+                ? `Thinking: ${short(telemetry.reasoning_tokens)} reasoning tokens before answering`
+                : "Thinking: this node is not stopped from reasoning before it answers (whether it does is the endpoint's call, and this one reports no reasoning tokens)"
+            }
+          >
+            <Brain size={13} aria-label="thinking" />
+          </span>
+        )}
+        {groups.map(({ icon: Icon, label, match }) => {
+          const mine = tools.filter(match);
+          const called = mine.filter((t) => used.has(t));
+          return (
+            <span
+              key={label}
+              className={`node-icon${called.length ? " node-icon--used" : ""}`}
+              title={
+                called.length
+                  ? `${label} — used: ${called.join(", ")}${
+                      mine.length > called.length
+                        ? ` (also available: ${mine.filter((t) => !used.has(t)).join(", ")})`
+                        : ""
+                    }`
+                  : `${label} — available, not used: ${mine.join(", ")}`
+              }
+            >
+              <Icon size={13} aria-label={label} />
+            </span>
+          );
+        })}
+        {ungrouped.length > 0 && (
+          <span
+            className={`node-icon${ungrouped.some((t) => used.has(t)) ? " node-icon--used" : ""}`}
+            title={ungrouped
+              .map((t) => (used.has(t) ? `${t} (used)` : t))
+              .join(", ")}
+          >
+            <Wrench size={13} aria-label="other tools" />
+          </span>
+        )}
+      </div>
+    </>
+  );
+}
 
 /** Nodes grouped into their stages, in pipeline order, from what the server sent. */
 function stages(nodes: NodeView[]): NodeView[][] {
@@ -53,7 +204,7 @@ function stages(nodes: NodeView[]): NodeView[][] {
     .map(([, lanes]) => lanes.sort((a, b) => a.lane - b.lane));
 }
 
-type PipelineNodeData = { node: NodeView; isSelected: boolean };
+type PipelineNodeData = { node: NodeView; live: LiveNode | undefined; isSelected: boolean };
 type PipelineNodeType = Node<PipelineNodeData, "pipeline">;
 
 /** One pipeline node: name, live dot, state, and its checkpoint count. */
@@ -72,8 +223,13 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
       </div>
       <div className="node-meta">
         <span className={`st st--${node.state}`}>{node.state}</span>
-        <span>{node.checkpoints > 0 ? `${node.checkpoints} CP` : "—"}</span>
+        <span title="checkpoints written">
+          {node.checkpoints > 0 ? `${node.checkpoints} CP` : "—"}
+        </span>
       </div>
+      {(node.telemetry || data.live?.facts || node.planned) && (
+        <NodeFacts telemetry={node.telemetry} live={data.live} planned={node.planned} />
+      )}
       <Handle type="source" position={Position.Right} />
       <Handle type="target" id="loop-in" position={Position.Bottom} />
       <Handle type="source" id="loop-out" position={Position.Bottom} />
@@ -82,18 +238,25 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
 }
 
 /**
- * The converge loop, drawn as a right-angled path below the implementer. React Flow imposes no
- * acyclicity, so the loop is a real edge rather than an annotation — and square corners keep it
- * consistent with the rest of the substrate.
+ * The converge loop, drawn below the implementer. React Flow imposes no acyclicity, so the loop is
+ * a real edge rather than an annotation.
  */
 function ConvergeEdge({ id, sourceX, sourceY, label, markerEnd }: EdgeProps) {
-  const drop = 30;
-  const half = 46;
+  // Sized off the node so the loop stays under its own box as the box changes.
+  const drop = LANE_GAP / 2;
+  const half = NODE_SIZE.width / 2 - 14;
+  // Quadratic corners, to match the rounded stage edges rather than being the one square turn left.
+  const r = 14;
+  const right = sourceX + 14;
+  const left = sourceX - half;
+  const bottom = sourceY + drop;
   const path = [
-    `M ${sourceX + 14},${sourceY}`,
-    `L ${sourceX + 14},${sourceY + drop}`,
-    `L ${sourceX - half},${sourceY + drop}`,
-    `L ${sourceX - half},${sourceY}`,
+    `M ${right},${sourceY}`,
+    `L ${right},${bottom - r}`,
+    `Q ${right},${bottom} ${right - r},${bottom}`,
+    `L ${left + r},${bottom}`,
+    `Q ${left},${bottom} ${left},${bottom - r}`,
+    `L ${left},${sourceY}`,
   ].join(" ");
 
   return (
@@ -114,13 +277,23 @@ function ConvergeEdge({ id, sourceX, sourceY, label, markerEnd }: EdgeProps) {
 const nodeTypes = { pipeline: PipelineNode };
 const edgeTypes = { converge: ConvergeEdge };
 
+/** What a node has said about itself so far, before it has checkpointed anything. */
+export interface LiveNode {
+  facts?: NodeFacts;
+  cycles: number;
+  /** Tools called so far in this attempt. */
+  used: Set<string>;
+}
+
 interface Props {
   nodes: NodeView[];
+  /** Keyed by node name. Fills the box while a node is still working. */
+  live: Map<string, LiveNode>;
   selected: string | null;
   onSelect: (name: string) => void;
 }
 
-export default function PipelineGraph({ nodes, selected, onSelect }: Props) {
+export default function PipelineGraph({ nodes, live, selected, onSelect }: Props) {
   const byName = useMemo(
     () => new Map(nodes.map((n) => [n.name, n])),
     [nodes],
@@ -135,7 +308,7 @@ export default function PipelineGraph({ nodes, selected, onSelect }: Props) {
         id: n.name,
         type: "pipeline" as const,
         position: position(n, lanes.length, maxLanes),
-        data: { node: n, isSelected: selected === n.name },
+        data: { node: n, live: live.get(n.name), isSelected: selected === n.name },
         draggable: false,
         ...NODE_SIZE,
       })),
@@ -145,15 +318,16 @@ export default function PipelineGraph({ nodes, selected, onSelect }: Props) {
   const rfEdges = useMemo<Edge[]>(() => {
     // Every node in a stage feeds every node in the next one — which is what a fork joining back
     // together looks like, and the only edge relation the pipeline has.
-    // `step`, not the default bezier: every corner on this substrate is 90 degrees.
+    // Rounded rather than square: the boxes carry the substrate's right angles, and the wiring
+    // reads better when it does not compete with them.
     const edges: Edge[] = columns.flatMap((lanes, i) =>
       (columns[i + 1] ?? []).flatMap((target) =>
         lanes.map((source) => ({
           id: `${source.name}-${target.name}`,
           source: source.name,
           target: target.name,
-          type: "step",
-          pathOptions: { borderRadius: 0 },
+          type: "smoothstep",
+          pathOptions: { borderRadius: 24 },
         })),
       ),
     );

@@ -64,4 +64,29 @@ pub struct NodeTelemetry {
     /// Why the node failed, when it did. A checkpoint is written for a failed node too — the reason
     /// it failed is the most useful thing about that row.
     pub error: Option<String>,
+    /// The tools this node could call, by the names the model saw.
+    ///
+    /// Recorded rather than looked up later because it is a property of the run: rulesets, plugins
+    /// and config all shape it, and the config that produced a past run may no longer exist.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Of those, the ones it actually called.
+    ///
+    /// Kept apart from `tools` rather than replacing it: what a node was *given* is a decision
+    /// someone made, and what it *reached for* is what it did with that. A node handed a shell it
+    /// never used is worth seeing.
+    #[serde(default)]
+    pub tools_used: Vec<String>,
+    /// Whether this node's endpoint session carried over from an earlier attempt in the run.
+    #[serde(default)]
+    pub reuses_session: bool,
+    /// Whether the node was left free to reason before answering.
+    ///
+    /// Recorded as configured rather than observed, because `usage.reasoning_tokens` comes back
+    /// zero from endpoints that do not report it — and a node that plainly thought would then look
+    /// like one that did not. `false` means the route disabled it explicitly; `true` means it was
+    /// not disabled, which is not quite the same as "it happened": with thinking left alone, the
+    /// endpoint decides, and several turn it on as soon as a request carries tools.
+    #[serde(default)]
+    pub thinking: bool,
 }

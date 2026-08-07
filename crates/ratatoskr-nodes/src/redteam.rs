@@ -100,6 +100,7 @@ impl RedTeamClassifier {
             files: self.files.clone(),
             // Reads and edits, but runs nothing.
             shell: None,
+            conversation: None,
             ledger: self.ledger.clone(),
             produces: Some(
                 "a classification of each baseline test failure as flaky or real, with the reason",

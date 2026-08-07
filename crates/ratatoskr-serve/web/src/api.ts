@@ -27,6 +27,30 @@ export interface NodeView {
   /** Position in the pipeline: stage is the column, lane the row within it. */
   stage: number;
   lane: number;
+  /** Absent for a node that has not run, or that ran no model. */
+  telemetry?: NodeTelemetry;
+  /** What the node *would* run on, from config. Present before it has run. */
+  planned?: PlannedNode;
+}
+
+/** Mirrors `pipeline::NodeTelemetryView`. */
+export interface NodeTelemetry {
+  model: string | null;
+  /** Model calls in the node's latest attempt. */
+  turns: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens: number;
+  /** Non-zero when the model reasoned before answering. Zero from endpoints that never report it. */
+  reasoning_tokens: number;
+  /** Whether the node was left free to reason. Configured, not observed. */
+  thinking: boolean;
+  duration_ms: number | null;
+  tools: string[];
+  /** Of those, the ones it actually called. */
+  tools_used: string[];
+  /** The node's memory carried over from an earlier attempt in this run. */
+  reuses_session: boolean;
   first_at: string | null;
   last_at: string | null;
 }
@@ -129,6 +153,8 @@ export interface LiveEvent {
   detail: string;
   /** Present on a `question` event: what an answer is posted against. */
   question_id?: string;
+  /** Present on a `node_start` event: what the node is about to run on. */
+  facts?: NodeFacts;
 }
 
 /**
@@ -192,3 +218,18 @@ export const getNodeCheckpoints = (
   getJSON<CheckpointView[]>(
     `${scope(project)}/runs/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(node)}`,
   );
+
+/** Mirrors `pipeline::PlannedNode` — a node's configured route, known before it runs. */
+export interface PlannedNode {
+  model: string;
+  thinking: boolean;
+  reuses_session: boolean;
+}
+
+/** Mirrors `events::LiveNodeFacts` — what a node announced when it started. */
+export interface NodeFacts {
+  model: string;
+  tools: string[];
+  thinking: boolean;
+  reuses_session: boolean;
+}

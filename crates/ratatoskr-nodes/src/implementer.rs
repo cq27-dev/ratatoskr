@@ -143,6 +143,9 @@ impl ImplementerNode {
         worktree: &WorktreePath,
         prompt: &str,
     ) -> Result<ImplementerOutput, NodeError> {
+        // One conversation for this node across the run, so a converge iteration continues the
+        // attempt it is fixing instead of meeting the worktree for the first time again.
+        let conversation = format!("{}-implementer", self.run_id);
         let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
             node: "implementer",
             route: &self.route,
@@ -168,6 +171,7 @@ impl ImplementerNode {
             // the copy it owns, or one attempt edits the tree another node is reading.
             files: Some(worktree.as_path().to_path_buf()),
             shell: Some(self.shell_access(worktree)),
+            conversation: Some(&conversation),
             ledger: self.ledger.clone(),
             produces: Some("a change that satisfies the plan and passes the acceptance checks"),
         })

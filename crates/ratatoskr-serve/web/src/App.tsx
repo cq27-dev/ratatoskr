@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import PipelineGraph from "./PipelineGraph";
 import {
   LIVE,
@@ -11,6 +11,7 @@ import {
   startRun,
   type CheckpointView,
   type LiveEvent,
+  type NodeFacts,
   type ProjectView,
   type RunDetail,
   type RunSummary,
@@ -156,12 +157,19 @@ function Rail({
   );
 }
 
-function RunMeta({ detail }: { detail: RunDetail }) {
+function RunMeta({ detail, lastEventAt }: { detail: RunDetail; lastEventAt: number | null }) {
+  // Checkpoints are minutes apart by design — the implementer runs for ten of them between two —
+  // so a run judged on those alone reads as stale while it is plainly working. The event stream is
+  // the finer signal: tool calls arrive every few seconds, and silence there is real silence.
+  const lastSeen = Math.max(
+    detail.last_activity ? Date.parse(detail.last_activity) : 0,
+    lastEventAt ?? 0,
+  );
   const stale =
     detail.status !== null &&
     LIVE.has(detail.status) &&
-    detail.last_activity !== null &&
-    Date.now() - Date.parse(detail.last_activity) > STALE_MS;
+    lastSeen > 0 &&
+    Date.now() - lastSeen > STALE_MS;
 
   return (
     <header className="runmeta">
@@ -356,6 +364,8 @@ export default function App() {
   const [node, setNode] = useState<string | null>(null);
   const [checkpoints, setCheckpoints] = useState<CheckpointView[] | null>(null);
   const [events, setEvents] = useState<LiveEvent[]>([]);
+  /** When the last live event arrived, as the liveness signal a checkpoint cannot give. */
+  const [lastEventAt, setLastEventAt] = useState<number | null>(null);
   const [answered, setAnswered] = useState<ReadonlySet<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
 
@@ -441,11 +451,13 @@ export default function App() {
   useEffect(() => {
     if (!runId || !project) return;
     setEvents([]);
+    setLastEventAt(null);
     setAnswered(new Set());
     const stop = followRun(project, runId, {
       onReset: () => setEvents([]),
       onEvent: (event) => {
         setEvents((prev) => [...prev.slice(-(FEED_LIMIT - 1)), event]);
+        setLastEventAt(Date.now());
         if (event.kind === "checkpoint" || event.kind.startsWith("run_")) {
           void load();
           void refresh();
@@ -454,6 +466,28 @@ export default function App() {
     });
     return stop;
   }, [runId, project, load, refresh]);
+
+  // What a node announced when it started, plus its tool calls so far. A checkpoint carries the
+  // same facts, but only once the node has stopped — this is what fills the box while it works.
+  const live = useMemo(() => {
+    const out = new Map<string, { facts?: NodeFacts; cycles: number; used: Set<string> }>();
+    for (const e of events) {
+      if (!e.node) continue;
+      const at = out.get(e.node) ?? { cycles: 0, used: new Set<string>() };
+      // A node_start means a fresh attempt: its counts start again.
+      if (e.kind === "node_start" && e.facts) {
+        out.set(e.node, { facts: e.facts, cycles: 0, used: new Set() });
+        continue;
+      }
+      if (e.kind === "tool_call") {
+        at.cycles += 1;
+        // `detail` is the tool name for this kind.
+        if (e.detail) at.used.add(e.detail);
+      }
+      out.set(e.node, at);
+    }
+    return out;
+  }, [events]);
 
   useEffect(() => {
     setNode(null);
@@ -522,10 +556,11 @@ export default function App() {
       <main className="stage stage--split">
         {detail ? (
           <>
-            <RunMeta detail={detail} />
+            <RunMeta detail={detail} lastEventAt={lastEventAt} />
             <div className="graph">
               <PipelineGraph
                 nodes={detail.nodes}
+                live={live}
                 selected={node}
                 onSelect={setNode}
               />

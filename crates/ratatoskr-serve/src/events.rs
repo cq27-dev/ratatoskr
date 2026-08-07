@@ -43,6 +43,46 @@ pub struct LiveEvent {
     /// Set on a `question` event: what a viewer's answer has to be posted against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub question_id: Option<String>,
+    /// Set on a `node_start` event: what the node is about to run on.
+    ///
+    /// A checkpoint carries the same facts, but only once the node has finished — and the moment
+    /// a viewer most wants them is while it is still working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facts: Option<LiveNodeFacts>,
+}
+
+/// What a node announced about itself when it started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LiveNodeFacts {
+    pub model: String,
+    pub tools: Vec<String>,
+    pub thinking: bool,
+    pub reuses_session: bool,
+}
+
+impl LiveNodeFacts {
+    /// Read them off a `node_start` record. `None` for every other kind.
+    fn of(record: &Value) -> Option<Self> {
+        if record.get("kind").and_then(Value::as_str)? != "node_start" {
+            return None;
+        }
+        let flag = |k: &str| record.get(k).and_then(Value::as_bool).unwrap_or(false);
+        Some(LiveNodeFacts {
+            model: record.get("model").and_then(Value::as_str)?.to_string(),
+            // Joined for the log line, because a comma-separated list reads better there than a
+            // JSON array does; split back here.
+            tools: record
+                .get("tools")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .split(',')
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect(),
+            thinking: flag("thinking"),
+            reuses_session: flag("reuses_session"),
+        })
+    }
 }
 
 /// The newest daily log file, if any. `tracing-appender` suffixes the date (`ratatoskr.jsonl.
@@ -133,6 +173,7 @@ fn to_event(record: &Value) -> LiveEvent {
     LiveEvent {
         at: str_field("timestamp").unwrap_or_default().to_string(),
         question_id: str_field("question_id").map(str::to_string),
+        facts: LiveNodeFacts::of(record),
         kind,
         node: node_of(record).map(str::to_string),
         detail,
@@ -325,6 +366,7 @@ mod tests {
             node: None,
             detail: "which way?".into(),
             question_id: Some("q-1".into()),
+            facts: None,
         };
         let noise = LiveEvent {
             at: "t1".into(),
@@ -332,6 +374,7 @@ mod tests {
             node: Some("scout".into()),
             detail: "semantic_search".into(),
             question_id: None,
+            facts: None,
         };
 
         // The question is the oldest event, well outside the replay window.

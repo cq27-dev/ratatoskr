@@ -328,6 +328,8 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
     )
     .map_err(|e| e.to_string())?;
     let node = AnalystNode {
+        // A revision continues the plan it revises, when the route asks for that.
+        conversation: Some(format!("{}-analyst", ctx.run_id)),
         route: cfg.route,
         tools: cfg.tools,
         files: cfg.files,

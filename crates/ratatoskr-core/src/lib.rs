@@ -11,7 +11,7 @@ pub mod telemetry;
 pub use config::{
     AcceptanceStep, ConfigError, DEFAULT_MAX_TOKENS, EndpointConfig, HookLimits, ImplementerConfig,
     ModelRoute, PluginConfig, PublishConfig, RagRatConfig, RatatoskrConfig, SandboxConfig,
-    StoreConfig, WorktreeConfig,
+    SessionScope, StoreConfig, WorktreeConfig,
 };
 pub use policy::{ToolDecision, ToolPolicy};
 pub use state::{RunState, RunStatus};

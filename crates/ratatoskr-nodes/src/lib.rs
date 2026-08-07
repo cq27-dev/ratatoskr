@@ -268,6 +268,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         &plugins_analyst,
     )?;
     let analyst = AnalystNode {
+        conversation: Some(format!("{run_id}-analyst")),
         route: analyst_cfg.route,
         tools: analyst_cfg.tools,
         policy: analyst_cfg.policy,
@@ -1947,6 +1948,7 @@ impl Review {
             verifier,
             threshold: parse_threshold(&config.implementer.verify_threshold),
             analyst: AnalystNode {
+                conversation: Some(format!("{}-analyst", run.run_id)),
                 route: acfg.route,
                 tools: acfg.tools,
                 policy: acfg.policy,

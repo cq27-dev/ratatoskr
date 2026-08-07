@@ -259,7 +259,9 @@ async fn run_detail(
     State(state): State<AppState>,
     AxumPath((project, run_id)): AxumPath<(String, String)>,
 ) -> Result<Json<RunDetail>, ApiError> {
-    let store = &state.project(&project)?.store;
+    let found = state.project(&project)?;
+    let store = &found.store;
+    let config_path = found.config_path.clone();
     let run = store.run(&run_id).await?;
     let checkpoints = store.checkpoints_for_run(&run_id).await?;
     if run.is_none() && checkpoints.is_empty() {
@@ -267,7 +269,13 @@ async fn run_detail(
     }
 
     let status = run.as_ref().map(|r| r.status.clone());
-    let nodes = pipeline::derive(status.as_deref(), &checkpoints);
+    // Best-effort: an unreadable or missing config costs the planned facts and nothing else, and a
+    // dashboard that refused to show a run because its config moved would be worse than one that
+    // shows the run without them.
+    let config = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|t| ratatoskr_core::RatatoskrConfig::from_toml_str(&t).ok());
+    let nodes = pipeline::derive_with(status.as_deref(), &checkpoints, config.as_ref());
     let last_activity = checkpoints
         .iter()
         .map(|c| c.created_at.as_str())

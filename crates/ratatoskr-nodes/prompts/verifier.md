@@ -37,3 +37,11 @@ asked for, it is `plan`.
 
 Returning no findings is a real and common answer. Report what is wrong, not what could
 conceivably be better.
+
+## The shape
+
+Each finding carries all of: `severity` (`P1`/`P2`/`P3`), `kind` (`execution`/`plan`), `file`,
+`summary` — one line naming the defect — and `failure_scenario`, the concrete input or state and
+the wrong result it produces. `line` is optional. Alongside `findings`, `assessment` says in a
+line or two what you actually checked; it is expected even when you found nothing, because "no
+findings" without an account of what was looked at reads the same as a verifier that did nothing.

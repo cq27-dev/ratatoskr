@@ -300,6 +300,36 @@ const TOOL_USE_GUIDANCE: &str = "\n\n## Calling tools\n\nWhen you need several t
     Reading four files is one turn with four calls, not four turns. Only wait for a result when \
     what you do next actually depends on it.";
 
+/// Whether this route leaves the model free to reason before answering.
+///
+/// Read from the route's provider params, since that is the only place it can be turned off from
+/// here. `params.thinking.type = "disabled"` is the one shape that means no; anything else — a
+/// budget, another type, or no `thinking` key at all — leaves the decision to the endpoint.
+fn thinking_left_on(route: &ModelRoute) -> bool {
+    let Some(params) = route.params.as_ref() else {
+        return true;
+    };
+    params
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|t| t.as_str())
+        != Some("disabled")
+}
+
+/// The endpoint session this node attempt belongs to.
+///
+/// Fresh per attempt by default. `SessionScope::Reuse` keeps one session for the node across the
+/// whole run instead, so a re-driven attempt — the implementer on a converge iteration, the
+/// analyst on a revision — continues where the last one stopped rather than meeting the repository
+/// for the first time again. Reuse needs a `conversation` key to be stable across those attempts;
+/// without one there is nothing to be stable about, and it falls back to fresh.
+fn session_id(run: &NodeRun<'_>) -> String {
+    match (run.route.session, run.conversation) {
+        (ratatoskr_core::SessionScope::Reuse, Some(key)) => key.to_string(),
+        _ => uuid::Uuid::new_v4().to_string(),
+    }
+}
+
 /// The headers one request carries: this deployment's static set, plus the session id when the
 /// endpoint keys a session off one.
 ///
@@ -468,9 +498,11 @@ fn metered<M: CompletionModel + 'static>(
 ) -> (AgentBuilder<M, NoToolConfig>, Meter) {
     let preamble = &format!("{preamble}{TOOL_USE_GUIDANCE}");
     let usage = UsageHook::default();
+    let observability = ObservabilityHook::default();
     let meter = Meter {
         total: Arc::clone(&usage.total),
         calls: Arc::clone(&usage.calls),
+        used: Arc::clone(&observability.used),
     };
     let builder = AgentBuilder::new(model)
         .preamble(preamble)
@@ -482,7 +514,7 @@ fn metered<M: CompletionModel + 'static>(
         .max_tokens(request.max_tokens)
         // Log tool calls + model text; added before the gates so it observes calls the
         // clarification and ruleset hooks may skip.
-        .add_hook(ObservabilityHook::default())
+        .add_hook(observability)
         .add_hook(usage);
     // Left to the provider's default when the route says nothing, rather than given a default
     // here: "unset" is a position, and picking one for every node from one place would be picking
@@ -503,6 +535,9 @@ fn metered<M: CompletionModel + 'static>(
 pub struct Meter {
     total: Arc<Mutex<TokenUsage>>,
     calls: Arc<AtomicU64>,
+    /// Which tools the node actually called, as distinct from which it could have. Ordered, so a
+    /// reader sees the same list twice for the same run.
+    used: Arc<Mutex<std::collections::BTreeSet<String>>>,
 }
 
 impl Meter {
@@ -513,6 +548,16 @@ impl Meter {
             *self.total.lock().expect("usage mutex poisoned"),
             self.calls.load(Ordering::Relaxed),
         )
+    }
+
+    /// The tools the node called, in name order.
+    pub fn used(&self) -> Vec<String> {
+        self.used
+            .lock()
+            .expect("used-tools mutex poisoned")
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -600,6 +645,9 @@ impl AgentHook for UsageHook {
 /// and the two have completely different fixes.
 #[derive(Default)]
 struct ObservabilityHook {
+    /// Names of the tools this node called. Shared with the [`Meter`], which reports them
+    /// alongside the cost.
+    used: Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// Start times by rig's correlation id. Entries are removed when the result arrives; a tool
     /// whose result never comes leaves one behind, which is bounded by the turn ceiling.
     started: Mutex<std::collections::HashMap<String, std::time::Instant>>,
@@ -607,6 +655,9 @@ struct ObservabilityHook {
 
 impl AgentHook for ObservabilityHook {
     async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
+        if let Ok(mut used) = self.used.lock() {
+            used.insert(event.tool_name.to_string());
+        }
         if let Ok(mut started) = self.started.lock() {
             started.insert(
                 event.internal_call_id.to_string(),
@@ -1163,6 +1214,12 @@ pub struct NodeRun<'a> {
     pub skills: Vec<Skill>,
     /// The repository the node's built-in file tools read within; `None` when it has none.
     pub files: Option<std::path::PathBuf>,
+    /// A key naming this node's conversation within the run, when the route asks for the endpoint
+    /// session to be reused across attempts.
+    ///
+    /// Only consulted for `SessionScope::Reuse`; ignored otherwise, so a node that supplies one is
+    /// not thereby opting into reuse — the route decides that.
+    pub conversation: Option<&'a str>,
     /// The sandbox the node's `Bash` calls run in; `None` for a node that runs no commands.
     ///
     /// Separate from `files` because they are different powers: reading and editing a tree is not
@@ -1188,9 +1245,7 @@ pub struct NodeRun<'a> {
 pub async fn run_structured(run: NodeRun<'_>) -> Result<String, AgentError> {
     match parse_provider(&run.route.provider)? {
         Provider::Anthropic => {
-            // One session per node attempt, held across its turns: an endpoint that tracks
-            // sessions then continues this conversation instead of rebuilding it every turn.
-            let client = anthropic_client(&uuid::Uuid::new_v4().to_string())?;
+            let client = anthropic_client(&session_id(&run))?;
             let model = caching(client.completion_model(&run.route.model));
             run_typed(model, run).await
         }
@@ -1229,6 +1284,7 @@ where
         skills,
         files,
         shell,
+        conversation,
         ledger,
         produces,
     } = run;
@@ -1287,6 +1343,9 @@ where
             ledger.clone(),
         ));
     }
+    // Before the set is handed to the agent: what the model could call is part of what this turn
+    // was, and a reader of the run cannot reconstruct it from a config that has since changed.
+    let tool_names = tools.names();
     let agent = bind_tools(builder, &tools, files.as_deref(), shell.as_ref());
 
     // Tag every log line for this run — the hook's tool-call/text lines and rig-agent's own turn
@@ -1301,6 +1360,19 @@ where
         "gen_ai.operation.name" = "invoke_agent",
         "gen_ai.agent.name" = node,
         "gen_ai.request.model" = %model_name,
+    );
+    // Announced at the start, because a checkpoint only exists once the node has finished — and
+    // the moment a reader most wants to know what a node is running on is while it is still
+    // running. The facts here are the configured ones; cost arrives with the checkpoint.
+    tracing::info!(
+        kind = "node_start",
+        node,
+        model = %model_name,
+        tools = %tool_names.join(","),
+        thinking = thinking_left_on(route),
+        reuses_session = matches!(route.session, ratatoskr_core::SessionScope::Reuse)
+            && conversation.is_some(),
+        "node started"
     );
     let started = std::time::Instant::now();
     let mut answer = async { agent.prompt(&question).await }
@@ -1366,6 +1438,11 @@ where
             // A node that failed still spent what it spent, and why it failed is the most useful
             // thing about its row.
             error: answer.as_ref().err().map(ToString::to_string),
+            tools: tool_names,
+            tools_used: meter.used(),
+            reuses_session: matches!(route.session, ratatoskr_core::SessionScope::Reuse)
+                && conversation.is_some(),
+            thinking: thinking_left_on(route),
         };
         tracing::info!(
             kind = "usage",
@@ -1574,6 +1651,7 @@ mod tests {
             skills: Vec::new(),
             files: Some(root.clone()),
             shell: None,
+            conversation: None,
             ledger: None,
             produces: Some("a summary of the change"),
         })
@@ -1639,6 +1717,7 @@ mod tests {
             skills: Vec::new(),
             files: None,
             shell: None,
+            conversation: None,
             ledger: Some(Arc::clone(&ledger)),
             produces: None,
         })
@@ -1667,6 +1746,54 @@ mod tests {
         // Input is reported too, and the turn count is separate from the usage.
         assert!(telemetry.usage.input_tokens > 0);
         assert!(telemetry.turns.unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn a_reused_session_is_stable_across_attempts_and_a_fresh_one_is_not() {
+        // What re-driving a node costs when it is wrong: a converge iteration that starts a new
+        // session meets the worktree it just edited for the first time again.
+        let route = |session| ModelRoute {
+            provider: "anthropic".into(),
+            model: "claude-opus-4-8".into(),
+            max_tokens: None,
+            temperature: None,
+            params: None,
+            session,
+        };
+        fn run<'a>(route: &'a ModelRoute, conversation: Option<&'a str>) -> NodeRun<'a> {
+            NodeRun {
+                node: "implementer",
+                route,
+                preamble: "",
+                question: "",
+                tools: ratatoskr_mcp::ToolSet::default(),
+                output_schema: schemars::schema_for!(String),
+                policy: None,
+                max_turns: None,
+                clarifier: None,
+                observer: None,
+                skills: Vec::new(),
+                files: None,
+                shell: None,
+                conversation,
+                ledger: None,
+                produces: None,
+            }
+        }
+
+        let reuse = route(ratatoskr_core::SessionScope::Reuse);
+        let key = Some("run-7-implementer");
+        assert_eq!(session_id(&run(&reuse, key)), session_id(&run(&reuse, key)));
+
+        // Fresh is the default, and two attempts never share one.
+        let fresh = route(ratatoskr_core::SessionScope::Fresh);
+        assert_ne!(session_id(&run(&fresh, key)), session_id(&run(&fresh, key)));
+
+        // Reuse without a key has nothing to be stable about, so it does not pretend otherwise.
+        assert_ne!(
+            session_id(&run(&reuse, None)),
+            session_id(&run(&reuse, None))
+        );
     }
 
     #[test]

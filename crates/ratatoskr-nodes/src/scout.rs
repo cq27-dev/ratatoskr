@@ -89,6 +89,7 @@ impl Node for ScoutNode {
             files: self.files.clone(),
             // Reads and edits, but runs nothing.
             shell: None,
+            conversation: None,
             ledger: self.ledger.clone(),
             produces: Some(
                 "a papertrail summary of what the tracker and history say about this task, plus the related items found",
