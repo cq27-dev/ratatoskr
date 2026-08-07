@@ -81,6 +81,33 @@ export function wash(node: string): string {
   return `linear-gradient(to top, hsl(${h} 60% 58% / 0.20), hsl(${h} 60% 58% / 0.05) 45%, transparent 78%)`;
 }
 
+/**
+ * Body text for what a node said: its hue, most of the colour taken out.
+ *
+ * Not [`accent`]. That is sized for a label of one or two words; a paragraph of it is exhausting to
+ * read and turns the feed into a rainbow. This keeps enough hue to attribute a line at a glance
+ * while staying close enough to plain text to read a screenful of.
+ */
+export function prose(node: string): string {
+  // Hue only. Saturation stays near zero because this is body text, not a label — the name column
+  // already carries the node at full strength, and the paragraph only has to agree with it.
+  // Lightness is fixed rather than taken from `tone`, so every node's text has the same weight and
+  // the tint is the one thing that varies.
+  return `hsl(${tone(node).h} 13% 66%)`;
+}
+
+/**
+ * A checkpoint row's background: the node's hue, barely there.
+ *
+ * A checkpoint is where a node stopped and produced something, so it is the one row in a stream of
+ * hundreds that marks a boundary. Alpha this low is not decoration — it is enough to find the
+ * boundaries when scanning the feed and not enough to compete with the text on the row.
+ */
+export function rowTint(node: string): string {
+  const { h } = tone(node);
+  return `hsl(${h} 60% 58% / 0.10)`;
+}
+
 /** One slice of the scrubber: a node and the share of the slot it takes. */
 type Slice = { node: string; colour: string };
 

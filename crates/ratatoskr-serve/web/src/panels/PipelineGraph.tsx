@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef } from "react";
-import { accent, wash } from "./tint";
+import { accent, wash } from "../ui/tint";
 import {
   BaseEdge,
   Handle,
@@ -15,16 +15,9 @@ import {
   type Node,
   type NodeProps,
 } from "@xyflow/react";
-import {
-  Brain,
-  FileText,
-  Infinity as InfinityIcon,
-  Search,
-  Terminal,
-  Pencil,
-  Wrench,
-} from "lucide-react";
-import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode } from "./api";
+import { Brain, Infinity as InfinityIcon, Wrench } from "lucide-react";
+import { TOOL_GROUPS } from "../ui/tools";
+import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode } from "../api";
 
 /*
  * Positions are computed from the `stage` and `lane` the server sends with each node, not from a
@@ -68,23 +61,6 @@ function short(n: number): string {
   return `${n}`;
 }
 
-/*
- * Tools are grouped rather than listed: a node carries up to a dozen, and a dozen glyphs is a
- * texture, not information. The grouping answers what a reader actually asks — can this node read,
- * can it write, can it run things — and the title carries the exact names for when that is not
- * enough.
- */
-const TOOL_GROUPS: ReadonlyArray<{
-  icon: typeof FileText;
-  label: string;
-  match: (tool: string) => boolean;
-}> = [
-  { icon: Pencil, label: "edits files", match: (t) => t === "Write" || t === "Edit" },
-  { icon: Terminal, label: "runs commands", match: (t) => t === "Bash" },
-  { icon: FileText, label: "reads files", match: (t) => ["Read", "Grep", "Glob"].includes(t) },
-  { icon: Search, label: "searches the index", match: (t) => t.includes("search") || t.includes("symbol") || t.includes("impact") },
-];
-
 /**
  * One node's capabilities and cost, as icons with the detail on hover.
  *
@@ -123,15 +99,15 @@ function NodeFacts({
 
   return (
     <>
-      <div className="node-model" title={modelFull ?? undefined}>
+      <div className="node-model" data-tip={modelFull ?? undefined}>
         {model}
       </div>
       <div className="node-meta">
-        <span title="model calls in this node's latest attempt">
+        <span data-tip="model calls in this node's latest attempt">
           {cycles ?? "—"} {cycles === 1 ? "cycle" : "cycles"}
         </span>
         <span
-          title={
+          data-tip={
             telemetry
               ? `${telemetry.input_tokens} fresh + ${telemetry.cached_input_tokens} cached in, ${telemetry.output_tokens} out`
               : "counted when the node checkpoints"
@@ -146,7 +122,7 @@ function NodeFacts({
           <span
             className="node-icon"
             /* Not a setting — this says the session was actually carried over. */
-            title="Compounding: this node keeps its memory when it is re-entered, so a later attempt continues the earlier one"
+            data-tip="Compounding: this node keeps its memory when it is re-entered, so a later attempt continues the earlier one"
           >
             <InfinityIcon size={13} aria-label="compounding" />
           </span>
@@ -154,7 +130,7 @@ function NodeFacts({
         {thinking && (
           <span
             className="node-icon"
-            title={
+            data-tip={
               telemetry && telemetry.reasoning_tokens > 0
                 ? `Thinking: ${short(telemetry.reasoning_tokens)} reasoning tokens before answering`
                 : "Thinking: this node is not stopped from reasoning before it answers (whether it does is the endpoint's call, and this one reports no reasoning tokens)"
@@ -170,7 +146,7 @@ function NodeFacts({
             <span
               key={label}
               className={`node-icon${called.length ? " node-icon--used" : ""}`}
-              title={
+              data-tip={
                 called.length
                   ? `${label} — used: ${called.join(", ")}${
                       mine.length > called.length
@@ -187,7 +163,7 @@ function NodeFacts({
         {ungrouped.length > 0 && (
           <span
             className={`node-icon${ungrouped.some((t) => used.has(t)) ? " node-icon--used" : ""}`}
-            title={ungrouped
+            data-tip={ungrouped
               .map((t) => (used.has(t) ? `${t} (used)` : t))
               .join(", ")}
           >
@@ -238,23 +214,23 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
       {/* Named, all four of them: with more than one handle per type an edge that names none is
           resolved by whichever registered without an id, and that ordering is not ours to rely on.
           Unnamed, the stage edges vanished intermittently on re-render. */}
-      <Handle type="target" id="in" position={Position.Left} />
+      <Handle type="target" id="in" position={Position.Left} isConnectable={false} />
       <div className="node-name">
         <span>{node.name.replace("_", " ")}</span>
         <span className="dot" aria-hidden="true" />
       </div>
       <div className="node-meta">
         <span className={`st st--${node.state}`}>{node.state}</span>
-        <span title="checkpoints written">
+        <span data-tip="checkpoints written">
           {node.checkpoints > 0 ? `${node.checkpoints} CP` : "—"}
         </span>
       </div>
       {(node.telemetry || data.live?.facts || node.planned) && (
         <NodeFacts telemetry={node.telemetry} live={data.live} planned={node.planned} />
       )}
-      <Handle type="source" id="out" position={Position.Right} />
-      <Handle type="target" id="loop-in" position={Position.Bottom} />
-      <Handle type="source" id="loop-out" position={Position.Bottom} />
+      <Handle type="source" id="out" position={Position.Right} isConnectable={false} />
+      <Handle type="target" id="loop-in" position={Position.Bottom} isConnectable={false} />
+      <Handle type="source" id="loop-out" position={Position.Bottom} isConnectable={false} />
     </div>
   );
 }
@@ -263,7 +239,7 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
  * The converge loop, drawn below the implementer. React Flow imposes no acyclicity, so the loop is
  * a real edge rather than an annotation.
  */
-function ConvergeEdge({ id, sourceX, sourceY, label, markerEnd }: EdgeProps) {
+function ConvergeEdge({ id, sourceX, sourceY, label, markerEnd, style }: EdgeProps) {
   // Sized off the node so the loop stays under its own box as the box changes, and symmetric about
   // it: both handles sit at the bottom centre, so `sourceX` IS the centre and the two sides have to
   // reach equally far or the loop hangs visibly off to one side of the node it belongs to.
@@ -285,7 +261,18 @@ function ConvergeEdge({ id, sourceX, sourceY, label, markerEnd }: EdgeProps) {
 
   return (
     <>
-      <BaseEdge id={id} path={path} {...(markerEnd ? { markerEnd } : {})} />
+      {/* `interactionWidth` 0 removes the invisible 20px-wide hit path React Flow lays over every
+          edge. The wiring is a diagram, not a control — it states a relation between two boxes and
+          has nothing to show when picked — and with the hit path there a click stuck the edge in
+          its selected stroke. Now the click is inert: the edge layer is not the pane, so this does
+          not clear an open node either, which is right for a miss between two boxes. */}
+      <BaseEdge
+        id={id}
+        path={path}
+        interactionWidth={0}
+        {...(style ? { style } : {})}
+        {...(markerEnd ? { markerEnd } : {})}
+      />
       <text
         className="react-flow__edge-text"
         x={sourceX}
@@ -312,6 +299,49 @@ function ConvergeEdge({ id, sourceX, sourceY, label, markerEnd }: EdgeProps) {
  *
  * Must be rendered INSIDE `<ReactFlow>`: that is what puts it in the provider's context.
  */
+/**
+ * Publishes the viewport's zoom as `--mag`: how much a node must grow to become readable.
+ *
+ * The graph is fitted to its pane, so in a two-thirds-width window every node draws at about 45%
+ * and its 9px text lands near 4px. A fixed magnification cannot fix that — it scales by the same
+ * factor whether the graph sits at 45% or 100%, so it is too little when zoomed out and absurd
+ * when zoomed in. Dividing by the zoom targets a *size* rather than a factor: the node reaches
+ * roughly what it was designed to be, whatever the graph is doing around it.
+ *
+ * Must be rendered INSIDE `<ReactFlow>` — that is what puts it in the provider's context.
+ */
+/**
+ * The most a node can grow while its neighbours grow too, before they touch.
+ *
+ * Hovering does not need this: it enlarges one box and lifts it above the others, so covering a
+ * neighbour is the point. Scrubbing enlarges every node that was working at that moment, and two of
+ * those can be adjacent — with no one on top, they have to fit. Growth is centred, so each of two
+ * neighbours reaches half the gap; the pair therefore has the whole gap to share, and `0.7` of it
+ * leaves a visible sliver rather than letting them meet edge to edge.
+ *
+ * Derived from the layout constants rather than written as a number, because it is a fact *about*
+ * them: change the pitch and the safe magnification changes with it.
+ */
+const CROWD_LIMIT = Math.min(
+  1 + (COLUMN_GAP * 0.7) / NODE_SIZE.width,
+  1 + (LANE_GAP * 0.7) / NODE_SIZE.height,
+);
+
+function Magnification() {
+  const zoom = useStore((s) => s.transform[2]);
+  useEffect(() => {
+    // Clamped: under 1.2 it is not worth the movement, and past 3 the node covers its whole
+    // neighbourhood and takes away the context that made it worth looking at.
+    const mag = Math.min(3, Math.max(1.2, 1.05 / (zoom || 1)));
+    const root = document.documentElement.style;
+    root.setProperty("--mag", mag.toFixed(2));
+    // Tracks `--mag` where there is room and stops where there is not, so a narrow pane — which is
+    // exactly where `--mag` is largest — does not turn the working nodes into one merged block.
+    root.setProperty("--mag-scrub", Math.min(1 + (mag - 1) * 0.7, CROWD_LIMIT).toFixed(2));
+  }, [zoom]);
+  return null;
+}
+
 function FitToPane({ count, moved }: { count: number; moved: boolean }) {
   const initialized = useNodesInitialized();
   const { fitView } = useReactFlow();
@@ -423,10 +453,17 @@ export default function PipelineGraph({ nodes, live, active, selected, onSelect 
         sourceHandle: "loop-out",
         targetHandle: "loop-in",
         label: `CONVERGE ×${impl.checkpoints}`,
+        // The loop is the implementer's, so a live one lights in the implementer's hue. Green said
+        // only "something is happening", which the graph says already; the hue says *who*, and
+        // matches the box the loop hangs off, its name in the feed, and its stretch of the
+        // scrubber. Kept as a variable so the idle stroke stays with the rest of the wiring.
+        style: { "--tint": accent("implementer") } as React.CSSProperties,
         ...(impl.state === "working" ? { className: "is-live" } : {}),
       });
     }
-    return edges;
+    // Not clickable, and not focusable by tab: an edge here states a relation between two nodes and
+    // has nothing to show when you pick it. See the note in `ConvergeEdge` on the hit path.
+    return edges.map((e) => ({ ...e, selectable: false, focusable: false, interactionWidth: 0 }));
   }, [byName]);
 
   /*
@@ -486,6 +523,7 @@ export default function PipelineGraph({ nodes, live, active, selected, onSelect 
       colorMode="dark"
     >
       <FitToPane count={rfNodes.length} moved={moved.current} />
+      <Magnification />
     </ReactFlow>
   );
 }
