@@ -87,6 +87,10 @@ microsandbox = "0.6.8"
 # leaked auth database cannot be replayed against a live server.
 argon2 = "0.5"
 sha2 = "0.10"
+# Verifying GitHub's `X-Hub-Signature-256`. `Mac::verify_slice` compares in constant time, which a
+# hand-rolled equality does not — and a comparison that returns early leaks how much of a guess was
+# right, one byte at a time.
+hmac = "0.12"
 # Pinned to 0.6 because that is the rand_core `password-hash` speaks, and `SaltString::generate`
 # takes its RNG trait — a 0.9 RNG will not satisfy it. `getrandom` is what makes `OsRng` exist at
 # all: argon2's own `rand` feature only enables the rand_core *dependency*, not its OS entropy

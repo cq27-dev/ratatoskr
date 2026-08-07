@@ -208,6 +208,36 @@ than by a rule that has to keep being enforced.
 `ratatoskr users list`, `role`, `passwd`, `disable` and `enable` manage accounts. A role change or a
 disable reaches an open browser on its next request — neither waits for the session to lapse.
 
+### Starting a run from GitHub
+
+Mention the bot in an issue and it starts a run on that repository:
+
+> `@your-bot` the retry test flakes on CI, please fix it
+
+```sh
+ratatoskr users link-github kk 1234        # GitHub's numeric user id, not a login
+RATATOSKR_GITHUB_WEBHOOK_SECRET='...' ratatoskr serve --github-bot your-bot ...
+```
+
+Point a repository webhook at `/api/integrations/github`, sending **issue comments**, with that
+same secret.
+
+Being able to comment is not being able to run anything. The person who mentioned the bot has to
+map to an operator here — that is what `link-github` establishes — and everyone else is ignored.
+The link is keyed on GitHub's numeric user id rather than a login, because a login can be changed
+and then handed to somebody else, and an identity keyed on the name would follow the name rather
+than the person.
+
+Which project a mention is about is read from each project's `origin`, so there is no mapping to
+keep in step; a project whose origin is not a GitHub repository simply cannot be addressed this
+way.
+
+The signature is the only thing that makes a delivery trustworthy. The endpoint is public by
+necessity, so every field in the body — including who GitHub says sent it — is attacker-controlled
+until the HMAC checks out. An unsigned delivery is refused; a correctly signed one that is not for
+us is answered `200` and logged, because GitHub retries anything else and there is nothing to retry
+about a comment that was not addressed to the bot.
+
 The UI is a separate build artifact and is optional: without it you still get the JSON API
 (`/api/runs`, `/api/runs/{id}`, `/api/runs/{id}/nodes/{node}`).
 

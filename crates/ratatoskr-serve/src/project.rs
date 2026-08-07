@@ -36,6 +36,13 @@ pub struct ProjectSpec {
 pub struct Project {
     pub slug: String,
     pub dir: PathBuf,
+    /// The GitHub repository this checkout pushes to, as `owner/name`, if it has one.
+    ///
+    /// Read from `origin` rather than configured, because a mapping written by hand is one that
+    /// can be wrong — and pointing an integration at the wrong checkout means a run against the
+    /// wrong repository. `None` for a project with no origin, no GitHub origin, or no git at all,
+    /// which simply means the integration cannot address it.
+    pub repository: Option<String>,
     /// See [`ProjectSpec::visibility`].
     pub visibility: Visibility,
     /// Where this project's config lives, so per-node routes can be read when a client asks. Read
@@ -108,6 +115,44 @@ fn slug_for(dir: &Path) -> String {
     }
 }
 
+/// The `owner/name` a checkout's `origin` points at on GitHub, if it does.
+///
+/// Shelled out rather than read with a git library: it runs once per project at startup, and `git`
+/// is already a hard requirement of every run. Both URL forms are handled — `git@host:owner/name`
+/// and `https://host/owner/name` — and anything that is not GitHub yields `None` rather than a
+/// guess, because the only use of this is deciding which checkout a GitHub webhook is about.
+fn github_repository(dir: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_github_remote(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+/// `owner/name` out of a remote URL, or `None` if it does not name a GitHub repository.
+fn parse_github_remote(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| url.strip_prefix("https://github.com/"))
+        .or_else(|| url.strip_prefix("http://github.com/"))?;
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let rest = rest.trim_end_matches('/');
+    // Exactly two segments. A URL with more is not a repository root, and one with fewer names no
+    // repository at all.
+    let mut parts = rest.split('/');
+    let (owner, name) = (parts.next()?, parts.next()?);
+    if parts.next().is_some() || owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{name}"))
+}
+
 /// Path segments the server answers itself, so no project may be named one.
 ///
 /// Kept in step with `router` and with `RESERVED` in the dashboard's url.ts. Short enough to be
@@ -169,6 +214,7 @@ pub fn open_all(
         projects.insert(
             slug.clone(),
             Project {
+                repository: github_repository(&spec.dir),
                 slug,
                 log_dir: spec.dir.join(".ratatoskr/logs"),
                 config_path: spec.config_path.clone(),
@@ -245,6 +291,40 @@ mod tests {
             "both names are reported so the operator knows which two collided"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_github_remote_is_read_in_either_form() {
+        for url in [
+            "git@github.com:cq27-dev/ratatoskr.git",
+            "git@github.com:cq27-dev/ratatoskr",
+            "https://github.com/cq27-dev/ratatoskr.git",
+            "https://github.com/cq27-dev/ratatoskr/",
+            "ssh://git@github.com/cq27-dev/ratatoskr.git",
+        ] {
+            assert_eq!(
+                parse_github_remote(url).as_deref(),
+                Some("cq27-dev/ratatoskr"),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_remote_that_is_not_a_github_repository_is_none_rather_than_a_guess() {
+        // Deciding which checkout a webhook is about off a wrong guess means running against the
+        // wrong repository, so anything unrecognised has to be no answer at all.
+        for url in [
+            "git@gitlab.com:cq27-dev/ratatoskr.git",
+            "https://example.com/cq27-dev/ratatoskr",
+            "https://github.com/cq27-dev",
+            "https://github.com/cq27-dev/ratatoskr/tree/main",
+            "https://github.com//ratatoskr",
+            "",
+            "not a url",
+        ] {
+            assert_eq!(parse_github_remote(url), None, "{url}");
+        }
     }
 
     #[test]

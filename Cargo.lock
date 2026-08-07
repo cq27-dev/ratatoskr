@@ -5473,10 +5473,12 @@ name = "ratatoskr-serve"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "hmac",
  "ratatoskr-core",
  "ratatoskr-store",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "strum 0.28.0",
  "thiserror 2.0.19",
  "tokio",
