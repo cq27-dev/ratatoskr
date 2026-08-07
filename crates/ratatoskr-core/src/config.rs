@@ -125,14 +125,37 @@ impl PluginConfig {
     pub fn search_paths(&self, root: &Path) -> Vec<PathBuf> {
         let mut dirs = vec![root.join(".ratatoskr/plugins")];
         dirs.extend(self.paths.iter().map(|p| {
-            if p.is_absolute() {
-                p.clone()
-            } else {
-                root.join(p)
-            }
+            let p = expand_home(p);
+            if p.is_absolute() { p } else { root.join(p) }
         }));
         dirs
     }
+}
+
+/// Expand a leading `~` against `HOME`.
+///
+/// A plugin installed by a coding CLI lives under the home directory, so `~/.claude/plugins/...` is
+/// the natural way to write it — and without this it is not absolute, so it is joined onto the
+/// repository root and searched for at `<repo>/~/.claude/...`. That directory never exists, so the
+/// plugin is silently absent: no error, no warning, just a node that never gets its tools.
+///
+/// Only a leading `~/` (or a bare `~`). A `~` elsewhere in a path is a literal character, and some
+/// editors really do create files with one.
+fn expand_home(path: &Path) -> PathBuf {
+    let Some(rest) = path.to_str().and_then(|p| p.strip_prefix('~')) else {
+        return path.to_path_buf();
+    };
+    if !rest.is_empty() && !rest.starts_with('/') {
+        // `~user` is somebody else's home, which resolving would guess at.
+        return path.to_path_buf();
+    }
+    let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())
+    else {
+        return path.to_path_buf();
+    };
+    PathBuf::from(home).join(rest.trim_start_matches('/'))
 }
 
 /// Phase 3 implementer settings.
@@ -489,6 +512,55 @@ impl Default for RatatoskrConfig {
             sandbox: SandboxConfig::default(),
             plugins: PluginConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod plugin_path_tests {
+    use super::*;
+
+    #[test]
+    fn a_home_relative_plugin_path_resolves_to_the_home_directory() {
+        // The failure this prevents is silent: `~/…` is not absolute, so it was joined onto the
+        // repository root and searched for at `<repo>/~/.claude/…`. Nothing is there, nothing
+        // errors, and the plugin simply never loads.
+        let home = std::env::var("HOME").expect("HOME is set in the test environment");
+        let config = PluginConfig {
+            paths: vec![PathBuf::from("~/.claude/plugins/cache/ponytail/ponytail")],
+            ..Default::default()
+        };
+        let found = config.search_paths(Path::new("/repo"));
+        assert_eq!(
+            found[1],
+            PathBuf::from(&home).join(".claude/plugins/cache/ponytail/ponytail")
+        );
+        assert!(!found[1].to_string_lossy().contains('~'), "{:?}", found[1]);
+    }
+
+    #[test]
+    fn only_a_leading_tilde_is_a_home_directory() {
+        let home = std::env::var("HOME").unwrap();
+        // A bare `~` is the home directory itself.
+        assert_eq!(expand_home(Path::new("~")), PathBuf::from(&home));
+        // `~user` is somebody else's home, and resolving it would be a guess.
+        assert_eq!(
+            expand_home(Path::new("~someone/plugins")),
+            PathBuf::from("~someone/plugins")
+        );
+        // A tilde that is not leading is a character in a name, and some editors write those.
+        assert_eq!(
+            expand_home(Path::new("plugins/backup~/thing")),
+            PathBuf::from("plugins/backup~/thing")
+        );
+        // An absolute path is untouched, and a relative one stays relative for the caller to root.
+        assert_eq!(
+            expand_home(Path::new("/abs/path")),
+            PathBuf::from("/abs/path")
+        );
+        assert_eq!(
+            expand_home(Path::new("rel/path")),
+            PathBuf::from("rel/path")
+        );
     }
 }
 

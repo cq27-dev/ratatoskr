@@ -507,8 +507,12 @@ pub const WORKFLOW_DIR: &str = ".ratatoskr/workflows";
 pub const BUILT_IN: &str = "built-in";
 
 /// The nodes a ruleset may govern out of the box — the LLM agents that go through
-/// `run_structured`. `memory` and `implementer` are absent because they have no model or tool set
-/// to override, so targeting one is a config error rather than a no-op.
+/// `run_structured`. `memory` is absent because it is a direct rag-rat call with no model or tool
+/// set to override, so targeting it is a config error rather than a no-op.
+///
+/// The implementer belongs here now that it drives a model directly rather than a coding CLI: it
+/// resolves through `node_agent_config` like every other node, so a ruleset already shapes its
+/// route, prompt, tools and plugins — this list was the only thing saying otherwise.
 ///
 /// Lives here rather than in the CLI because this crate is what decides which nodes exist. A
 /// workflow may add to this set; see [`Workflow::nodes`].
@@ -518,6 +522,7 @@ pub const BUILT_IN_NODES: &[&str] = &[
     "context",
     "scout",
     "analyst",
+    "implementer",
     "bookkeeper",
     "redteam",
     "verifier",
@@ -3292,12 +3297,14 @@ mod agent_config_tests {
         assert_eq!(declared.nodes(), ["reviewer2", "triager"]);
         let _ = std::fs::remove_dir_all(&dir);
 
-        // The standard set is what a repo defining nothing may govern, and `memory`/`implementer`
-        // are deliberately absent — neither has a model or tool set to override, so targeting one
-        // is a config error rather than a no-op.
+        // The standard set is what a repo defining nothing may govern. `memory` is deliberately
+        // absent — a direct rag-rat call with no model or tool set to override, so targeting it is
+        // a config error rather than a no-op.
         assert!(BUILT_IN_NODES.contains(&"verifier"));
         assert!(!BUILT_IN_NODES.contains(&"memory"));
-        assert!(!BUILT_IN_NODES.contains(&"implementer"));
+        // The implementer resolves through `node_agent_config` like every other node now that it
+        // drives a model rather than a coding CLI, so a ruleset shapes it like any other.
+        assert!(BUILT_IN_NODES.contains(&"implementer"));
     }
 
     /// Whether `choose` would spend a model call, given what the repo defines and what was asked.
