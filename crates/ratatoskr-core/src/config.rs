@@ -270,6 +270,21 @@ pub struct PublishConfig {
     /// yields `fix: …` rather than `fix(): …`.
     #[serde(default = "default_commit_subject")]
     pub commit_subject: String,
+    /// The name a run's commits are authored by.
+    ///
+    /// Set per commit rather than read from the environment, and configurable rather than fixed: a
+    /// commit that claims the name of whoever happens to have `user.name` set on this machine is a
+    /// lie in the history, and "ratatoskr" is only the right answer for a deployment that has not
+    /// been told otherwise.
+    #[serde(default = "default_committer_name")]
+    pub committer_name: String,
+    /// The address those commits carry.
+    ///
+    /// The default resolves nowhere on purpose. A forge attributes a commit to whichever account
+    /// owns the address, so a real one belonging to a person would credit that person with work
+    /// they did not do — give runs an address of their own, or leave this unable to match anybody.
+    #[serde(default = "default_committer_email")]
+    pub committer_email: String,
 }
 
 fn default_publish_label() -> String {
@@ -278,6 +293,14 @@ fn default_publish_label() -> String {
 
 fn default_commit_subject() -> String {
     "{type}({scope}): {summary}".to_string()
+}
+
+fn default_committer_name() -> String {
+    "ratatoskr".to_string()
+}
+
+fn default_committer_email() -> String {
+    "ratatoskr@localhost".to_string()
 }
 
 /// Most of a commit subject. The git convention, and what every log viewer truncates at.
@@ -328,6 +351,8 @@ impl Default for PublishConfig {
             enabled: false,
             label: default_publish_label(),
             commit_subject: default_commit_subject(),
+            committer_name: default_committer_name(),
+            committer_email: default_committer_email(),
         }
     }
 }

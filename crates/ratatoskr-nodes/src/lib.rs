@@ -2663,6 +2663,10 @@ async fn fork_and_converge(
         &worktree,
         &branch,
         &commit_message(&config.publish, issue, &impl_out),
+        ratatoskr_exec::Committer {
+            name: &config.publish.committer_name,
+            email: &config.publish.committer_email,
+        },
     )
     .await
     {

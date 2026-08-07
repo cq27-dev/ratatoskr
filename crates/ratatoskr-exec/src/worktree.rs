@@ -310,6 +310,18 @@ pub async fn touched_files(worktree: &WorktreePath) -> Result<Vec<String>, ExecE
 ///
 /// A rename reports as a delete plus an add, so a renamed test file counts as rewritten. That is
 /// the right answer: the test that used to run under that name no longer does.
+/// Who a run's commits are authored by.
+///
+/// A pair rather than two arguments because git will not take one without the other: a name with
+/// no address, or an address with no name, is a half-configured identity and git's own fallback
+/// fills the gap from the environment — which is the person running this, and the one answer that
+/// must not appear.
+#[derive(Debug, Clone, Copy)]
+pub struct Committer<'a> {
+    pub name: &'a str,
+    pub email: &'a str,
+}
+
 /// Commit everything in `worktree`, on the branch the run was given and no other.
 ///
 /// Returns the new commit's sha, or `None` when there was nothing to commit.
@@ -326,6 +338,7 @@ pub async fn commit_all(
     worktree: &WorktreePath,
     expected: &str,
     message: &str,
+    who: Committer<'_>,
 ) -> Result<Option<String>, ExecError> {
     let path = worktree.as_path();
     let head = git(
@@ -363,9 +376,9 @@ pub async fn commit_all(
         "commit",
         &[
             "-c",
-            "user.name=ratatoskr",
+            &format!("user.name={}", who.name),
             "-c",
-            "user.email=ratatoskr@localhost",
+            &format!("user.email={}", who.email),
             "commit",
             "-q",
             "-m",
@@ -445,6 +458,13 @@ mod tests {
         assert!(!is_nested(repo, Path::new("/var/tmp/worktrees")));
         // A sibling whose name merely starts with the repo's path is not inside it.
         assert!(!is_nested(repo, Path::new("/src/app-worktrees")));
+    }
+
+    fn who() -> Committer<'static> {
+        Committer {
+            name: "ratatoskr",
+            email: "ratatoskr@localhost",
+        }
     }
 
     async fn init_repo(dir: &Path) {
@@ -528,14 +548,14 @@ branch refs/heads/feature/x
 
         // Nothing changed is not a failure — a run that touched nothing has nothing to record.
         assert_eq!(
-            commit_all(&wt, "ratatoskr/abc12345", "no-op")
+            commit_all(&wt, "ratatoskr/abc12345", "no-op", who())
                 .await
                 .unwrap(),
             None
         );
 
         std::fs::write(wt.as_path().join("new.rs"), "fn main() {}\n").unwrap();
-        let sha = commit_all(&wt, "ratatoskr/abc12345", "feat: a thing")
+        let sha = commit_all(&wt, "ratatoskr/abc12345", "feat: a thing", who())
             .await
             .unwrap()
             .expect("a change is committed");
@@ -547,10 +567,46 @@ branch refs/heads/feature/x
             .unwrap();
         assert!(log.contains("feat: a thing"), "{log}");
 
+        // Authored by who the caller said, and never by whoever is configured on this machine. A
+        // run is not a person, and a forge attributes a commit to whichever account owns the
+        // address — so the wrong one here credits somebody with work they did not do.
+        let author = git(
+            wt.as_path(),
+            "log author",
+            &["log", "-1", "--format=%an <%ae>"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(author.trim(), "ratatoskr <ratatoskr@localhost>");
+
+        // Whatever the deployment configures is what lands, so this is genuinely a setting and not
+        // a constant with a parameter in front of it.
+        std::fs::write(wt.as_path().join("third.rs"), "fn third() {}\n").unwrap();
+        commit_all(
+            &wt,
+            "ratatoskr/abc12345",
+            "feat: another",
+            Committer {
+                name: "somebody else",
+                email: "runs@example.invalid",
+            },
+        )
+        .await
+        .unwrap()
+        .expect("a change is committed");
+        let author = git(
+            wt.as_path(),
+            "log author",
+            &["log", "-1", "--format=%an <%ae>"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(author.trim(), "somebody else <runs@example.invalid>");
+
         // The guard: this worktree is on the run's branch, so committing to another name is
         // refused rather than silently landing work somewhere nobody will look for it.
         std::fs::write(wt.as_path().join("second.rs"), "fn other() {}\n").unwrap();
-        let err = commit_all(&wt, "ratatoskr/deadbeef", "wrong branch")
+        let err = commit_all(&wt, "ratatoskr/deadbeef", "wrong branch", who())
             .await
             .expect_err("must refuse");
         assert!(format!("{err}").contains("the run's branch"), "{err}");
