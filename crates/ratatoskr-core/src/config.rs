@@ -640,7 +640,9 @@ impl RatatoskrConfig {
     /// checks only — this does not probe the environment (whether the sandbox backend's kernel
     /// features are present, whether the CLI is installed); those surface at run time.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        const BACKENDS: [&str; 2] = ["microsandbox", "landlock"];
+        // Kept in step with `sandbox::run`'s dispatch in ratatoskr-exec: a name it accepts and
+        // this rejects is a backend nobody can select, and the reverse fails deep in a run.
+        const BACKENDS: [&str; 3] = ["container", "landlock", "microsandbox"];
 
         if self.rag_rat.command.is_empty() {
             return Err(ConfigError::Invalid(

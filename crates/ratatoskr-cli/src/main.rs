@@ -116,6 +116,19 @@ enum Command {
     },
     /// List the workflows a run can be given, and what each is for.
     Workflows,
+    /// Fetch this project's dependencies into the caches a run mounts.
+    ///
+    /// The one place a project is allowed a network. Runs it in the configured image with the
+    /// network on and the caches writable; every run afterwards mounts them read-only and offline,
+    /// so an acceptance check never resolves a dependency and the baseline and post-change runs
+    /// cannot disagree about what a registry served at two different moments.
+    ///
+    /// Re-run it when a lockfile changes. Nothing runs it for you: that is the point.
+    Prepare {
+        /// Path to the config file.
+        #[arg(long, default_value = "ratatoskr.toml")]
+        config: PathBuf,
+    },
     /// Reclaim ratatoskr's per-run worktrees and their `ratatoskr/*` branches.
     ///
     /// Without `--force` it only lists what would be removed. Removal is destructive: it discards
@@ -233,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
             max_runs,
         }) => serve(addr, &config, projects, max_runs).await,
         Some(Command::Workflows) => workflows().await,
+        Some(Command::Prepare { config }) => prepare(&config).await,
         Some(Command::Clean { force }) => clean(force).await,
         Some(Command::Runs { command, config }) => runs(command, &config).await,
         None => {
@@ -958,6 +972,118 @@ async fn resolve(store: &ratatoskr_store::Store, prefix: &str) -> anyhow::Result
         0 => bail!("no run starts with `{prefix}`"),
         n => bail!("`{prefix}` matches {n} runs; give more of the id"),
     }
+}
+
+/// Populate the project's dependency caches, so runs can check things offline.
+///
+/// The project is mounted **read-only** and the caches writable, which is the shape that makes the
+/// result reproducible: a prepare step may fetch and unpack, and may not rewrite the lockfile it is
+/// supposed to be obeying. A command that wants to — `npm install` against a `^` range rather than
+/// `npm ci` — fails here rather than quietly making every later run depend on the day it ran.
+async fn prepare(config_path: &Path) -> anyhow::Result<()> {
+    let config = load_config(config_path)?;
+    let sandbox = &config.sandbox;
+    if sandbox.prepare.is_empty() {
+        println!(
+            "Nothing to prepare: `[sandbox] prepare` is empty. A project whose checks need no \
+             dependencies beyond the image needs nothing here."
+        );
+        return Ok(());
+    }
+    let repo_root = std::env::current_dir().context("resolving the current directory")?;
+
+    // Created before the mounts are built, because a runtime handed a source path that does not
+    // exist either invents an empty directory or refuses to start — and `cache_mounts` skips a
+    // cache that is not there, which would silently prepare into nothing.
+    let cache_root = repo_root.join(ratatoskr_core::CACHE_ROOT);
+    for cache in &sandbox.cache {
+        std::fs::create_dir_all(cache_root.join(&cache.from))
+            .with_context(|| format!("creating the {} cache", cache.from))?;
+        // And the mountpoint, when the cache lands inside the project. The project is mounted
+        // read-only here, and a runtime cannot create a mountpoint inside a read-only mount — it
+        // fails with a rootfs error naming an overlay path, which says nothing about the cause.
+        // A run does not need this: its worktree is writable, so the runtime makes its own.
+        let at = Path::new(&cache.at);
+        if at.is_relative() {
+            std::fs::create_dir_all(repo_root.join(at))
+                .with_context(|| format!("creating the mountpoint {}", cache.at))?;
+        }
+    }
+
+    // The project read-only at the workspace path, each cache writable where a run will see it.
+    let workspace = Path::new(ratatoskr_nodes::testrun::GUEST_WORKSPACE);
+    let mut mounts = vec![ratatoskr_exec::Mount {
+        host: repo_root.clone(),
+        guest: ratatoskr_nodes::testrun::GUEST_WORKSPACE.to_string(),
+        read_only: true,
+    }];
+    mounts.extend(
+        sandbox
+            .cache_mounts(&repo_root, workspace)
+            .into_iter()
+            .map(|(host, guest)| ratatoskr_exec::Mount {
+                host,
+                guest: guest.display().to_string(),
+                read_only: false,
+            }),
+    );
+
+    for (i, command) in sandbox.prepare.iter().enumerate() {
+        if command.is_empty() {
+            anyhow::bail!("`[sandbox] prepare` entry {i} is an empty command");
+        }
+        println!("→ {}", command.join(" "));
+        let out = ratatoskr_exec::sandbox_run(ratatoskr_exec::SandboxSpec {
+            backend: sandbox.backend.clone(),
+            name: format!("ratatoskr-prepare-{}-{i}", std::process::id()),
+            image: sandbox.image.clone(),
+            workdir: ratatoskr_nodes::testrun::GUEST_WORKSPACE.to_string(),
+            mounts: mounts.clone(),
+            command: command.clone(),
+            cpus: 2,
+            memory_mib: 4096,
+            // The whole reason this is a separate command rather than part of a run.
+            network: true,
+        })
+        .await
+        .with_context(|| format!("running `{}`", command.join(" ")))?;
+
+        if !out.stdout.trim().is_empty() {
+            println!("{}", out.stdout.trim());
+        }
+        if !out.success() {
+            // A prepare that tries to write to the project hits the read-only mount, and the
+            // package manager reports it as a filesystem error — `EROFS`, `rofs`, "read-only file
+            // system" — which says nothing about why the filesystem is read-only. It is read-only
+            // because a prepare may fetch and may not rewrite the lockfile it is obeying, and the
+            // fix is the frozen form of the same command.
+            let stderr = out.stderr.trim();
+            let hint = match stderr.to_ascii_lowercase().contains("read-only")
+                || stderr.contains("EROFS")
+                || stderr.contains("rofs")
+            {
+                true => {
+                    "\n\nThe project is mounted read-only during prepare, so a command that \
+                     rewrites a lockfile fails here rather than making every later run depend on \
+                     the day it ran. Use the frozen form: `npm ci`, `bun install \
+                     --frozen-lockfile`, `cargo fetch --locked`, `uv sync --frozen`."
+                }
+                false => "",
+            };
+            anyhow::bail!(
+                "`{}` failed (exit {}): {stderr}{hint}",
+                command.join(" "),
+                out.exit_code,
+            );
+        }
+    }
+
+    println!(
+        "\nPrepared {} cache(s) under {}. Runs mount them read-only, with no network.",
+        sandbox.cache.len(),
+        cache_root.display()
+    );
+    Ok(())
 }
 
 async fn clean(force: bool) -> anyhow::Result<()> {
