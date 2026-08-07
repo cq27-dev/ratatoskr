@@ -293,11 +293,11 @@ fn is_transcript_continuation(text: &str) -> bool {
         return true;
     }
     // A reproduced tool result opening the block: `[your <tool> …]:`.
-    if let Some(rest) = text.strip_prefix("[your ") {
-        if let Some(close) = rest.find(']') {
-            // A tool name must sit between the bracket and its close, and the header ends in `]:`.
-            return !rest[..close].trim().is_empty() && rest[close..].starts_with("]:");
-        }
+    if let Some(rest) = text.strip_prefix("[your ")
+        && let Some(close) = rest.find(']')
+    {
+        // A tool name must sit between the bracket and its close, and the header ends in `]:`.
+        return !rest[..close].trim().is_empty() && rest[close..].starts_with("]:");
     }
     false
 }
@@ -1610,7 +1610,9 @@ mod tests {
 
         // Edge cases the anchor must not trip on.
         assert!(!super::is_transcript_continuation(""));
-        assert!(!super::is_transcript_continuation("your change looks correct"));
+        assert!(!super::is_transcript_continuation(
+            "your change looks correct"
+        ));
         assert!(
             !super::is_transcript_continuation("   169\t"),
             "a bare gutter fragment without the bracket header is not enough"
