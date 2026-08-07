@@ -276,6 +276,32 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// True when the text is the model writing the *other side* of the conversation — a fabricated
+/// tool result — rather than its own output. The endpoint reconstructs each request as a prompt
+/// into a coding-CLI session, so the model sees a transcript and sometimes continues it past its
+/// own turn, inventing what it expects a tool to return. Such text is not model output and must
+/// not be recorded as `model_text` (issue #126).
+///
+/// Anchored tightly on the bracketed header the harness uses: `[your <tool> …]:` at the start, or
+/// `user[your ` anywhere. Callers strip the harness's `No response requested.` filler prefix
+/// first, so this sees the text that follows it. The bare word `your` is not enough — a genuine
+/// turn may mention it — so the bracket is the anchor.
+fn is_transcript_continuation(text: &str) -> bool {
+    let text = text.trim_start();
+    // The other party's turn injected mid-stream: `user[your <tool> …]:`.
+    if text.contains("user[your ") {
+        return true;
+    }
+    // A reproduced tool result opening the block: `[your <tool> …]:`.
+    if let Some(rest) = text.strip_prefix("[your ")
+        && let Some(close) = rest.find(']')
+    {
+        // A tool name must sit between the bracket and its close, and the header ends in `]:`.
+        return !rest[..close].trim().is_empty() && rest[close..].starts_with("]:");
+    }
+    false
+}
+
 /// A tool call's arguments, bounded but still parseable.
 ///
 /// Truncating the serialized JSON is what a reader wants and what a parser cannot use: cutting
@@ -753,7 +779,13 @@ impl AgentHook for ObservabilityHook {
         for content in event.content.iter() {
             if let AssistantContent::Text(text) = content {
                 let text = text.text.trim();
-                if !text.is_empty() {
+                // The harness's filler when a turn ends having only called tools; four of five real
+                // fabrications carry it, so strip it before recognising the continuation.
+                let body = text
+                    .strip_prefix("No response requested.")
+                    .map(str::trim_start)
+                    .unwrap_or(text);
+                if !text.is_empty() && !is_transcript_continuation(body) {
                     tracing::info!(
                         kind = "model_text",
                         turn = event.turn,
@@ -1548,6 +1580,46 @@ where
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_fabricated_tool_result_is_recognised_as_transcript_continuation() {
+        // The hardest real shape (issue #126, run 6fbb7f25): a reproduced `Read` result anchored
+        // on one true line, then diverging into invented file contents — same gutter, same
+        // truncation format, indistinguishable from a real result by eye.
+        let fabricated = "[your Read crates/ratatoskr-cli/src/main.rs]:\n\
+   169\t    /// Without `--force` it only lists what would go. Deletion takes the run's checkpoints and its\n\
+   170\t    /// events; the run row and its provenance are kept, so a re-import can restore it.\n\
+   171\t    Prune {\n\
+   172\t        /// Runs to delete. Defaults to nothing — you must name at least one.\n\
+   173\t        run_ids: Vec<String>,";
+        assert!(
+            super::is_transcript_continuation(fabricated),
+            "the anchor-then-diverge Read block must be caught"
+        );
+
+        // The other-side turn injected mid-string.
+        assert!(super::is_transcript_continuation(
+            "some preamble user[your Grep model_text]: matches"
+        ));
+
+        // Ordinary analyst prose is genuine output and must be kept.
+        assert!(
+            !super::is_transcript_continuation(
+                "The Rm variant deletes checkpoints; I'll plan from the real file."
+            ),
+            "genuine prose must be classified as genuine"
+        );
+
+        // Edge cases the anchor must not trip on.
+        assert!(!super::is_transcript_continuation(""));
+        assert!(!super::is_transcript_continuation(
+            "your change looks correct"
+        ));
+        assert!(
+            !super::is_transcript_continuation("   169\t"),
+            "a bare gutter fragment without the bracket header is not enough"
+        );
+    }
+
+    #[test]
     fn an_edits_arguments_survive_being_bounded() {
         // The dashboard identifies a call by `file_path`. Truncating the serialized JSON cut
         // `Edit` mid-`old_string`, leaving text that would not parse — so the feed showed no
@@ -1983,5 +2055,73 @@ mod tests {
             built, 2,
             "an agent is constructed somewhere other than `metered`, so its calls are unmetered"
         );
+    }
+
+    // Recognising a `model_text` that is the model writing the *other side* of the conversation
+    // (issue #126). The interface leaves the predicate's exact name to the implementer but fixes
+    // its shape: a free `fn(&str) -> bool`. These tests are written against the name given in the
+    // contract, `is_transcript_continuation`; if the implementer chooses a different name, only the
+    // reference here needs to follow it — the cases are the contract.
+
+    /// The real fabricated block from run `6fbb7f25`, analyst turn 15: a `[your Read …]:` header
+    /// anchored on one true line and diverging into invented file contents, reproduced with the
+    /// `Read` tool's own gutter (`   169\t`). This is the shape the acceptance says a future change
+    /// must not quietly stop catching.
+    #[test]
+    fn a_fabricated_read_block_is_recognised_as_transcript_continuation() {
+        let fabricated = "[your Read crates/ratatoskr-cli/src/main.rs]:\n\
+             \x20  169\t    /// Without `--force` it only lists what would go. Deletion takes the run's checkpoints and its\n\
+             \x20  170\t    /// events; the run row and its provenance are kept, so a re-import can restore it.\n\
+             \x20  171\t    Prune {\n\
+             \x20  172\t        /// Runs to delete. Defaults to nothing — you must name at least one.\n\
+             \x20  173\t        run_ids: Vec<String>,";
+        assert!(is_transcript_continuation(fabricated));
+    }
+
+    /// The marker can appear mid-string rather than at the very start.
+    #[test]
+    fn an_embedded_user_your_tool_marker_is_recognised() {
+        assert!(is_transcript_continuation(
+            "Let me check the logs. user[your Grep model_text]: 5 matches found"
+        ));
+    }
+
+    /// The caller strips the `No response requested.` filler before calling the predicate, so what
+    /// the predicate sees begins with the `[your <tool> …]:` header. It must still recognise it.
+    #[test]
+    fn after_the_filler_is_stripped_a_tool_header_is_still_recognised() {
+        // The filler has already been removed by the logging site; this is the residue.
+        let after_strip = "[your Grep model_text]:\ncrates/ratatoskr-agent/src/lib.rs";
+        assert!(is_transcript_continuation(after_strip));
+    }
+
+    /// Genuine model prose — even prose that talks about the same subject matter — is the node's
+    /// own output and must be kept.
+    #[test]
+    fn genuine_analyst_prose_is_not_a_continuation() {
+        assert!(!is_transcript_continuation(
+            "The Rm variant deletes checkpoints; I'll plan from the real file."
+        ));
+    }
+
+    /// The empty string never produces an event, and the predicate must handle it without panic.
+    #[test]
+    fn an_empty_string_is_not_a_continuation() {
+        assert!(!is_transcript_continuation(""));
+    }
+
+    /// The anchor is the bracketed `[your <tool> …]:` form, not the bare word `your`. Ordinary
+    /// prose that mentions the word must not be mistaken for a transcript.
+    #[test]
+    fn the_bare_word_your_is_not_the_bracket_anchor() {
+        assert!(!is_transcript_continuation("your change looks correct"));
+    }
+
+    /// A line that is only the tab-gutter fragment, with no `[your …]:` header above it, is code
+    /// that happens to contain gutter-shaped text — anchoring on the bracket header avoids that
+    /// false positive.
+    #[test]
+    fn a_lone_gutter_fragment_without_a_header_is_not_a_continuation() {
+        assert!(!is_transcript_continuation("   169\t"));
     }
 }
