@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { accent, band } from "./tint";
 import { applyDerived, nodesFromEvents } from "./derive";
 import PipelineGraph from "./PipelineGraph";
 import {
@@ -354,11 +355,14 @@ function Scrubber({
   total,
   cursor,
   at,
+  nodes,
   onScrub,
 }: {
   total: number;
   cursor: number | null;
   at: string | null;
+  /** The node each event belongs to, in timeline order. Colours the track. */
+  nodes: (string | null)[];
   onScrub: (cursor: number | null) => void;
 }) {
   // Nothing to move through until the history has loaded.
@@ -382,6 +386,10 @@ function Scrubber({
         min={0}
         max={total - 1}
         value={position}
+        // The track is which node each stretch of the run belongs to, in the same hue as that
+        // node's box and its name in the feed. It replaces the flat accent colour: a bar that was
+        // one colour end to end said only "this is a slider", which the slider already said.
+        style={{ backgroundImage: band(nodes) }}
         onChange={(e) => {
           const next = Number(e.target.value);
           // Landing on the last event means following again, so the view resumes on its own
@@ -502,7 +510,11 @@ function Feed({ events, node }: { events: LiveEvent[]; node: string | null }) {
           <>
             <span className="ev-t">{clock(r.at)}</span>
             {/* Who, then what. A feed reads as a sentence about a node, not a list of verbs. */}
-            {!node && <span className="ev-n">{r.node ?? "—"}</span>}
+            {!node && (
+              <span className="ev-n" style={r.node ? { color: accent(r.node) } : undefined}>
+                {r.node ?? "—"}
+              </span>
+            )}
             <span className={`ev-k ev-k--${r.kind}`}>
               {r.action}
               {grouped && (
@@ -816,6 +828,15 @@ export default function App() {
     return [...history, ...events.filter((e) => e.at > last)];
   }, [history, events]);
 
+  /**
+   * Which node each event belongs to, in timeline order — what colours the scrubber's track.
+   *
+   * Its own memo rather than derived inside `Scrubber`: the timeline is the longest list on the
+   * page and this walks all of it, so recomputing on every cursor move would cost a pass per drag
+   * frame for a value that does not change while dragging.
+   */
+  const timelineNodes = useMemo(() => timeline.map((e) => e.node ?? null), [timeline]);
+
   /** The instant being looked at while scrubbing; `null` when following the run's end. */
   const shownEvents = useMemo(
     () => (cursor === null ? timeline : timeline.slice(0, cursor + 1)),
@@ -963,6 +984,7 @@ export default function App() {
               total={timeline.length}
               cursor={cursor}
               at={shownEvents.length ? shownEvents[shownEvents.length - 1]!.at : null}
+              nodes={timelineNodes}
               onScrub={setCursor}
             />
             <div className="graph">
