@@ -148,11 +148,15 @@ test_command = ["cargo", "test"]
 # dependencies are not vendored cannot check anything until they are fetched — a fresh worktree has
 # no `node_modules`, so the type-checker fails on the framework rather than on the change.
 #
-# Per step and by program name, not by host: the sandbox's network namespace is all-or-nothing for
-# one invocation, so a step that can reach a registry can reach anything. Name the installer, not
-# the test runner.
+# An entry matches the start of a step's command, so it can name a program or a program and its
+# subcommand. That distinction matters: in most ecosystems the installer and the test runner are
+# the same program, so a bare "npm" would put the checks online too.
 #
-#   network_allow = ["npm"]
+#   network_allow = ["npm install", "npm ci"]
+#
+# Not by host. The sandbox's network namespace is all-or-nothing for one invocation, so a step that
+# can reach a registry can reach anything; restricting by hostname needs something that can see the
+# request, which a namespace cannot.
 network_allow = []
 
 # Ignore whatever the analyst proposes and always run test_command. For a repo that does not want
