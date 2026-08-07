@@ -1,9 +1,21 @@
 //! Sandboxed command execution behind a backend-agnostic interface.
 //!
-//! `run(SandboxSpec)` is Ratatoskr's own contract — no microsandbox type leaks into it, so the
-//! bwrap/Landlock fallback is a genuine swap rather than a rewrite. Two backends implement it:
-//! `microsandbox` (a MicroVM, needs KVM + an OCI image) and `landlock` (bubblewrap + the host
-//! filesystem, no image, works wherever `bwrap` + Landlock are present).
+//! `run(SandboxSpec)` is Ratatoskr's own contract — no backend's types leak into it, so swapping
+//! one for another is a genuine swap rather than a rewrite.
+//!
+//! Three backends implement it, and they are three rungs of the same ladder rather than three
+//! alternatives of equal standing:
+//!
+//! - `landlock` — bubblewrap over the **host root**, read-only, with the worktree bind-mounted
+//!   writable. Needs no image and no daemon, so it works anywhere `bwrap` does. Weakest: the host
+//!   filesystem is readable, which is why `~/.ssh` and `~/.npmrc` are in scope and why the
+//!   environment has to be cleared by hand.
+//! - `container` — an **OCI container**, so the toolchain comes from an image and the mounts are
+//!   the only host filesystem there is. Needs an ordinary container runtime and nothing else. This
+//!   is the rung that removes the host root without requiring KVM, and it is where a run that
+//!   installs anything belongs.
+//! - `microsandbox` — a **MicroVM**, adding a VM boundary on top of the image. Needs KVM, and is
+//!   behind `--features microsandbox` because its build script needs the network.
 
 use std::path::PathBuf;
 
@@ -19,11 +31,13 @@ pub struct Mount {
 /// What to run, where, and under what limits. Ratatoskr's own type — backend-neutral.
 #[derive(Debug, Clone)]
 pub struct SandboxSpec {
-    /// `"microsandbox"` or `"landlock"`.
+    /// `"container"`, `"landlock"` or `"microsandbox"` — see the module docs for what each buys.
     pub backend: String,
-    /// Unique sandbox name (microsandbox requires one; ignored by the bwrap backend).
+    /// Unique sandbox name. The container and microsandbox backends need one; the bwrap backend
+    /// ignores it. A runtime rejects a name under two characters, so it is never a bare index.
     pub name: String,
-    /// OCI image to boot (microsandbox only; the bwrap backend uses the host root).
+    /// OCI image to run in. Used by the container and microsandbox backends; the bwrap backend has
+    /// no image and runs the host's toolchain instead.
     pub image: String,
     /// Working directory inside the sandbox — usually a mount's guest path.
     pub workdir: String,
@@ -53,7 +67,9 @@ impl ExecOutput {
 /// Errors from a sandboxed run.
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
-    #[error("unknown sandbox backend {0:?} (expected \"microsandbox\" or \"landlock\")")]
+    #[error(
+        "unknown sandbox backend {0:?} (expected \"container\", \"landlock\" or \"microsandbox\")"
+    )]
     UnknownBackend(String),
     #[error("empty sandbox command")]
     EmptyCommand,
@@ -61,6 +77,16 @@ pub enum SandboxError {
     Microsandbox(String),
     #[error("bwrap not found or failed to launch: {0}")]
     Bwrap(#[from] std::io::Error),
+    #[error(
+        "no container runtime found; the `container` backend needs one of {} on PATH",
+        RUNTIMES.join(" or ")
+    )]
+    NoContainerRuntime,
+    #[error("{runtime} failed to launch: {source}")]
+    Container {
+        runtime: &'static str,
+        source: std::io::Error,
+    },
 }
 
 /// Run `spec.command` in a sandbox, returning its captured output. Dispatches on `spec.backend`.
@@ -77,9 +103,109 @@ pub async fn run(spec: SandboxSpec) -> Result<ExecOutput, SandboxError> {
              --features microsandbox"
                 .to_string(),
         )),
+        "container" | "docker" | "podman" => run_container(spec).await,
         "landlock" | "bwrap" => run_bwrap(spec).await,
         other => Err(SandboxError::UnknownBackend(other.to_string())),
     }
+}
+
+/// The container runtimes this knows how to drive, in preference order. Both take the subset of
+/// arguments used here identically, so the choice is availability rather than configuration.
+const RUNTIMES: &[&str] = &["docker", "podman"];
+
+/// The first runtime on `PATH`, or nothing.
+fn container_runtime() -> Option<&'static str> {
+    RUNTIMES.iter().copied().find(|runtime| {
+        std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).any(|dir| dir.join(runtime).is_file()))
+            .unwrap_or(false)
+    })
+}
+
+/// The uid:gid a container should run its command as.
+///
+/// Not a detail. A rootful runtime runs as root by default, so everything written into the mounted
+/// worktree comes out owned by root — the host then cannot read the diff it is supposed to review,
+/// and `git worktree remove` cannot delete the tree. Read from `/proc/self`, which is owned by this
+/// process's real user, so it needs no libc and no assumption about the environment.
+fn host_user() -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let me = std::fs::metadata("/proc/self").ok()?;
+    Some(format!("{}:{}", me.uid(), me.gid()))
+}
+
+/// Exactly what the runtime is exec'd with. Split out so the argument list is a thing a test can
+/// assert on, as with [`bwrap_argv`].
+///
+/// What is *absent* is the point of this backend. There is no host root, so `$HOME` — `~/.ssh`,
+/// `~/.aws`, `~/.npmrc` — is not readable; the mounts are the only host filesystem in scope. And
+/// nothing carries this process's environment across: a container starts from the image's, which is
+/// the same guarantee `--clearenv` buys the bwrap backend, here by construction.
+fn container_argv(spec: &SandboxSpec, user: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        // Nothing to reap afterwards: the container is the unit of isolation and it does not
+        // outlive the call it was created for.
+        "--rm".into(),
+        "--name".into(),
+        spec.name.clone(),
+    ];
+    if let Some(user) = user {
+        args.push("--user".into());
+        args.push(user.to_string());
+    }
+    if !spec.network {
+        args.push("--network".into());
+        args.push("none".into());
+    }
+    args.push("--cpus".into());
+    args.push(spec.cpus.to_string());
+    args.push("--memory".into());
+    args.push(format!("{}m", spec.memory_mib));
+
+    // Mounted in place (guest path = host path), as the bwrap backend does, so a workdir and the
+    // paths in a command's output mean the same thing on both. Translate a guest workdir that
+    // names a mount to the corresponding host path.
+    let mut workdir = spec.workdir.clone();
+    for m in &spec.mounts {
+        let host = m.host.to_string_lossy().into_owned();
+        if spec.workdir == m.guest {
+            workdir.clone_from(&host);
+        }
+        args.push("--volume".into());
+        args.push(format!("{host}:{host}"));
+    }
+    args.push("--workdir".into());
+    args.push(workdir);
+    args.push(spec.image.clone());
+    args.extend(spec.command.iter().cloned());
+    args
+}
+
+/// OCI container backend: the toolchain comes from an image, the worktree is the only host
+/// filesystem in scope, and the network is off unless the step asked for it.
+///
+/// Between the bwrap backend (host root, no image, no special support) and microsandbox (a MicroVM,
+/// needs KVM), this is the rung that removes the host filesystem without requiring anything beyond
+/// an ordinary container runtime.
+async fn run_container(spec: SandboxSpec) -> Result<ExecOutput, SandboxError> {
+    let runtime = container_runtime().ok_or(SandboxError::NoContainerRuntime)?;
+    let args = container_argv(&spec, host_user().as_deref());
+
+    // `kill_on_drop` reaches the client, and `--rm` plus the client's own signal handling is what
+    // stops the container: dropping the future kills the `run` process, and the runtime tears the
+    // container down with it.
+    let output = Command::new(runtime)
+        .args(&args)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|source| SandboxError::Container { runtime, source })?;
+    Ok(ExecOutput {
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 /// microsandbox (MicroVM) backend: boot the image with the mounts, run, tear down.
@@ -316,6 +442,148 @@ mod tests {
                 "{name} is set but not on the passlist"
             );
         }
+    }
+
+    fn container_spec(command: &[&str]) -> SandboxSpec {
+        SandboxSpec {
+            backend: "container".into(),
+            // As a run names them. A runtime rejects a name shorter than two characters, and every
+            // real one is `ratatoskr-<node>-<run>-<step>`, so the fixture uses that shape too.
+            name: format!("ratatoskr-test-{}", std::process::id()),
+            image: "docker.io/library/alpine:3".into(),
+            mounts: vec![Mount {
+                host: std::env::temp_dir(),
+                guest: "/workspace".into(),
+            }],
+            workdir: "/workspace".into(),
+            ..spec(command)
+        }
+    }
+
+    #[test]
+    fn a_container_gets_the_mounts_and_no_host_root() {
+        // The whole argument for this backend: what a command can read is the mounts, and nothing
+        // else. There is no equivalent of `--ro-bind / /` here, so `$HOME` is not in scope — and a
+        // test that asserted its absence would be asserting the absence of a string, so what is
+        // checked is that every host path named is one the caller asked for.
+        let argv = container_argv(&container_spec(&["true"]), Some("1000:1000"));
+        let tmp = std::env::temp_dir().display().to_string();
+        let volumes: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i > &0 && argv[i - 1] == "--volume")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(volumes, [&format!("{tmp}:{tmp}")], "{argv:?}");
+
+        // The workdir names a mount, so it is translated to the host path the mount lands on —
+        // guest path equals host path here, the same contract the bwrap backend has.
+        let at = argv
+            .iter()
+            .position(|a| a == "--workdir")
+            .expect("a workdir");
+        assert_eq!(argv[at + 1], tmp, "{argv:?}");
+
+        // Offline unless the step asked otherwise.
+        assert!(
+            argv.windows(2).any(|w| w == ["--network", "none"]),
+            "{argv:?}"
+        );
+        let online = container_argv(
+            &SandboxSpec {
+                network: true,
+                ..container_spec(&["true"])
+            },
+            Some("1000:1000"),
+        );
+        assert!(!online.iter().any(|a| a == "--network"), "{online:?}");
+
+        // The image and the command come last, in that order, so nothing the caller supplies is
+        // read as an option to the runtime.
+        let image = argv
+            .iter()
+            .position(|a| a == "docker.io/library/alpine:3")
+            .expect("the image");
+        assert_eq!(argv[image + 1..], ["true"], "{argv:?}");
+    }
+
+    #[test]
+    fn a_container_writes_as_the_host_user_not_as_root() {
+        // A rootful runtime runs as root by default, and everything it writes into the mounted
+        // worktree comes out owned by root: the host cannot then read its own diff, and
+        // `git worktree remove` cannot delete the tree. Reported as a run that produced nothing.
+        let argv = container_argv(&container_spec(&["true"]), Some("1000:1000"));
+        assert!(
+            argv.windows(2).any(|w| w == ["--user", "1000:1000"]),
+            "{argv:?}"
+        );
+
+        // And on a host where the id cannot be read, the argument is omitted rather than guessed
+        // at — a wrong uid is worse than the runtime's default, which at least fails visibly.
+        let argv = container_argv(&container_spec(&["true"]), None);
+        assert!(!argv.iter().any(|a| a == "--user"), "{argv:?}");
+    }
+
+    #[test]
+    fn the_host_user_is_this_process_own() {
+        // The value the argv test uses a literal for. `/proc/self` is owned by the real user, so
+        // this is the same pair `id -u`/`id -g` reports, without a libc dependency.
+        let user = host_user().expect("a uid:gid on linux");
+        let (uid, gid) = user.split_once(':').expect("uid:gid");
+        assert!(uid.parse::<u32>().is_ok(), "{user}");
+        assert!(gid.parse::<u32>().is_ok(), "{user}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a container runtime and the alpine image; run with --ignored"]
+    async fn the_container_backend_runs_a_command_and_cannot_see_the_host_root() {
+        let dir = std::env::temp_dir().join(format!("ratatoskr-ctr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mounted"), "visible").unwrap();
+        let spec = SandboxSpec {
+            mounts: vec![Mount {
+                host: dir.clone(),
+                guest: "/workspace".into(),
+            }],
+            ..container_spec(&["sh", "-c", "cat mounted; ls /root 2>&1 | head -1"])
+        };
+
+        let out = run(spec).await.unwrap();
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+        // The mount is there…
+        assert!(out.stdout.contains("visible"), "{}", out.stdout);
+        // …and the host's home is not: what `/root` holds is the image's, which is empty.
+        assert!(!out.stdout.contains(".ssh"), "{}", out.stdout);
+
+        // And what it writes into the mount belongs to the host user. Owned by root instead, the
+        // host cannot read the diff it is meant to review and cannot remove the worktree — a run
+        // that did the work and delivered nothing.
+        let out = run(SandboxSpec {
+            mounts: vec![Mount {
+                host: dir.clone(),
+                guest: "/workspace".into(),
+            }],
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "echo made > from-container".into(),
+            ],
+            ..container_spec(&[])
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+
+        use std::os::unix::fs::MetadataExt as _;
+        let written = std::fs::metadata(dir.join("from-container")).unwrap();
+        let me = std::fs::metadata("/proc/self").unwrap();
+        assert_eq!(
+            (written.uid(), written.gid()),
+            (me.uid(), me.gid()),
+            "the container wrote as somebody else"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
