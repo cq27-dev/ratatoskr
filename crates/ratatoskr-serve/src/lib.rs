@@ -196,14 +196,14 @@ pub async fn serve(opts: ServeOptions) -> Result<(), ServeError> {
             // Configured but useless: nothing here has a GitHub origin, so every delivery would be
             // about a repository this instance does not serve.
             tracing::warn!(
-                "the GitHub integration is configured as @{}, but no project has a GitHub origin \
+                "the GitHub integration is configured as /{}, but no project has a GitHub origin \
                  — mentions will be ignored",
-                config.bot
+                config.trigger
             );
         } else {
             tracing::info!(
                 "@{} can start runs on {}",
-                config.bot,
+                config.trigger,
                 addressable.join(", ")
             );
         }
@@ -1340,7 +1340,8 @@ mod access_tests {
         async fn wired() -> AppState {
             let mut state = state().await;
             state.github = Some(Arc::new(github::GitHubConfig {
-                bot: "ratatoskr".to_string(),
+                trigger: "ratatoskr".to_string(),
+                account: None,
                 secret: SECRET.to_string(),
             }));
             state

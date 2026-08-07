@@ -30,10 +30,36 @@ const EVENT: &str = "x-github-event";
 /// What this integration needs to be usable at all.
 #[derive(Clone)]
 pub struct GitHubConfig {
-    /// The account the bot posts as, without the `@`. A comment must mention it to be a request.
-    pub bot: String,
+    /// The word that starts a run: `/<trigger>` or `@<trigger>` in a comment.
+    ///
+    /// Matched as text, so it need not be a GitHub account at all.
+    pub trigger: String,
+    /// The login the bot's own comments are authored by, when it has one.
+    ///
+    /// Separate from `trigger`, because they are only the same string by coincidence: people type
+    /// what is short to type, and the account is whatever name was available. Conflating them
+    /// breaks the loop guard below in the direction that costs money — the bot stops recognising
+    /// its own comments and answers its own questions.
+    ///
+    /// `None` for an instance whose bot never posts, where there is nothing to recognise.
+    pub account: Option<String>,
     /// The webhook secret, shared with GitHub. Never logged, never echoed.
     pub secret: String,
+}
+
+impl GitHubConfig {
+    /// Whether a comment by `login` is the bot's own.
+    ///
+    /// `[bot]` is stripped first: a GitHub App is installed as `<slug>` and authors comments as
+    /// `<slug>[bot]`, so a raw comparison never matches for the deployment most likely to be used.
+    ///
+    /// Falls back to the trigger when no account is configured, which is right for the common case
+    /// where they are the same word and harmless when the bot posts nothing.
+    fn is_self(&self, login: &str) -> bool {
+        let login = login.strip_suffix("[bot]").unwrap_or(login);
+        let own = self.account.as_deref().unwrap_or(&self.trigger);
+        login.eq_ignore_ascii_case(own)
+    }
 }
 
 /// Why a webhook did not start a run.
@@ -155,20 +181,11 @@ pub fn read(headers: &HeaderMap, body: &Bytes, config: &GitHubConfig) -> Result<
         return Err(Refusal::NotForUs);
     }
     let instruction =
-        instruction_for(&payload.comment.body, &config.bot).ok_or(Refusal::NotForUs)?;
+        instruction_for(&payload.comment.body, &config.trigger).ok_or(Refusal::NotForUs)?;
     // The bot's own comments mention it constantly — the questions it asks are addressed to
     // someone. Without this it answers itself in a loop.
     //
-    // `[bot]` is stripped first. A GitHub App authors comments as `<slug>[bot]` while being
-    // mentioned as `<slug>`, so comparing the raw login never matches and the loop guard is a
-    // no-op for exactly the deployment most likely to be used.
-    let author = payload
-        .comment
-        .user
-        .login
-        .strip_suffix("[bot]")
-        .unwrap_or(&payload.comment.user.login);
-    if author.eq_ignore_ascii_case(&config.bot) {
+    if config.is_self(&payload.comment.user.login) {
         return Err(Refusal::NotForUs);
     }
     Ok(Request {
@@ -244,7 +261,8 @@ mod tests {
 
     fn config() -> GitHubConfig {
         GitHubConfig {
-            bot: "ratatoskr".to_string(),
+            trigger: "ratatoskr".to_string(),
+            account: None,
             secret: "it's a secret to everybody".to_string(),
         }
     }
@@ -409,6 +427,47 @@ mod tests {
             None
         );
         assert_eq!(instruction_for("/ratatoskr", "ratatoskr"), None);
+    }
+
+    #[test]
+    fn the_bot_knows_its_own_comments_when_its_account_differs_from_the_trigger() {
+        // The case this separation exists for: people type `/ratatoskr`, the account available on
+        // GitHub was `ratatoskr-bot`. Conflated, the guard compares against the wrong string and
+        // the bot answers its own questions — which costs money for as long as nobody notices.
+        let config = GitHubConfig {
+            trigger: "ratatoskr".to_string(),
+            account: Some("ratatoskr-bot".to_string()),
+            secret: "it's a secret to everybody".to_string(),
+        };
+        let body = comment("@ratatoskr what should I assume?", "ratatoskr-bot", 99);
+        assert_eq!(
+            read(
+                &headers(&body, &config.secret, "issue_comment"),
+                &body,
+                &config
+            ),
+            Err(Refusal::NotForUs)
+        );
+        // And as an App, where the login carries the suffix.
+        let body = comment("@ratatoskr what should I assume?", "ratatoskr-bot[bot]", 99);
+        assert_eq!(
+            read(
+                &headers(&body, &config.secret, "issue_comment"),
+                &body,
+                &config
+            ),
+            Err(Refusal::NotForUs)
+        );
+        // Someone else who merely mentions the trigger is still a real request.
+        let body = comment("@ratatoskr fix it", "kk", 1234);
+        assert!(
+            read(
+                &headers(&body, &config.secret, "issue_comment"),
+                &body,
+                &config
+            )
+            .is_ok()
+        );
     }
 
     #[test]

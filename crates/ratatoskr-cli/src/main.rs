@@ -128,6 +128,13 @@ enum Command {
         /// step by hand.
         #[arg(long = "github-bot")]
         github_bot: Option<String>,
+        /// The GitHub login the bot's own comments come from, if it has an account.
+        ///
+        /// Only needed when it differs from the trigger word — the account available on GitHub is
+        /// rarely the word people want to type. It is what stops the bot treating its own comments
+        /// as new instructions once it starts posting; a GitHub App's `[bot]` suffix is handled.
+        #[arg(long = "github-account")]
+        github_account: Option<String>,
         /// Mark the session cookie `Secure`. Set this whenever the instance is reached over
         /// https, and leave it off for loopback — a browser discards a `Secure` cookie sent over
         /// plain http, which looks exactly like sign-in silently failing.
@@ -337,6 +344,7 @@ async fn main() -> anyhow::Result<()> {
             auth_db,
             secure_cookies,
             github_bot,
+            github_account,
             config,
             projects,
             max_runs,
@@ -351,6 +359,7 @@ async fn main() -> anyhow::Result<()> {
                 auth_db,
                 secure_cookies,
                 github_bot,
+                github_account,
             })
             .await
         }
@@ -760,6 +769,7 @@ struct ServeArgs {
     auth_db: PathBuf,
     secure_cookies: bool,
     github_bot: Option<String>,
+    github_account: Option<String>,
 }
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
@@ -773,6 +783,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         auth_db,
         secure_cookies,
         github_bot,
+        github_account,
     } = args;
     let config_path = config_path.as_path();
     let mut specs = if projects.is_empty() {
@@ -832,7 +843,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 bail!("that webhook secret is shorter than 16 characters");
             }
             Some(ratatoskr_serve::github::GitHubConfig {
-                bot: bot.trim_start_matches('@').to_string(),
+                trigger: bot.trim_start_matches(['@', '/']).to_string(),
+                account: github_account.map(|a| a.trim_start_matches('@').to_string()),
                 secret,
             })
         }
