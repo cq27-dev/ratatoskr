@@ -2659,7 +2659,13 @@ async fn fork_and_converge(
     // hit its iteration ceiling still produced something worth looking at, and publishing decides
     // separately whether anyone should be asked to.
     let branch = implementer.branch();
-    match ratatoskr_exec::commit_all(&worktree, &branch, &commit_message(issue, &impl_out)).await {
+    match ratatoskr_exec::commit_all(
+        &worktree,
+        &branch,
+        &commit_message(&config.publish, issue, &impl_out),
+    )
+    .await
+    {
         Ok(Some(sha)) => {
             tracing::info!(kind = "committed", branch = %branch, sha = %sha, "committed")
         }
@@ -2674,16 +2680,35 @@ async fn fork_and_converge(
 
 /// The message a run's commit carries.
 ///
-/// Conventional-commit shaped, because this repository's history is, and pointing at the issue so
-/// the commit says what it was for. The body is the implementer's own account of what it changed —
-/// it is the only description written by the thing that made the change.
-fn commit_message(issue: &str, out: &ImplementerOutput) -> String {
-    let subject = issue
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("a change")
-        .trim();
-    let subject: String = subject.chars().take(72).collect();
+/// The subject is composed from what the implementer said about its own change — type, scope and a
+/// one-line subject — through `[publish] commit_subject`, so a repository whose history is not
+/// conventional-commit shaped can say so rather than have this one imposed on it.
+///
+/// It is not the issue's first line. The issue says what was wanted and the commit says what was
+/// done, and taking the former let a title longer than the limit be cut mid-word — a subject
+/// ending "a fabricated tool res" reads as a truncated change, not a truncated string.
+///
+/// The body is the implementer's own account of what it changed, which is the only description
+/// written by the thing that made the change.
+fn commit_message(
+    publish: &ratatoskr_core::PublishConfig,
+    issue: &str,
+    out: &ImplementerOutput,
+) -> String {
+    // A model that reported nothing usable still has to produce a commit, and the issue's first
+    // line is the only other thing that describes the work. Trimmed to a word boundary by the same
+    // renderer, so the fallback cannot reintroduce the truncation it replaced.
+    let subject = match out.commit_subject.trim().is_empty() {
+        false => publish.commit_subject(&out.commit_kind, &out.commit_scope, &out.commit_subject),
+        true => publish.commit_subject(
+            "chore",
+            "",
+            issue
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("a change"),
+        ),
+    };
     let body = if out.diff_summary.trim().is_empty() {
         String::new()
     } else {

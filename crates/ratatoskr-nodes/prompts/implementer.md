@@ -19,6 +19,16 @@ evidence of what they will say. A new failing check is a regression and the iter
 to you. If a subproblem turns out to be hard, that is a reason to find another route through the
 code, not a reason to stop early.
 
+Report `kind`, `scope` and `subject` alongside your summary: they become the commit's subject line,
+so they describe **what this change did**, not what the issue asked for. A run that fixed one half
+of a two-part issue must not claim the whole of it in the history.
+
+- `kind` — one of `feat`, `fix`, `chore`, `docs`, `perf`, `refactor`, `style`, `test`, `ci`,
+  `build`.
+- `scope` — the part of the repository this touches, spelled as the existing log spells it. Read
+  the recent history and match it. Empty when the change belongs to no particular part.
+- `subject` — one line, imperative, no trailing period, under 60 characters.
+
 # TESTS
 
 Write them. New behaviour should arrive with a test the way the surrounding code does, and adding

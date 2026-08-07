@@ -258,10 +258,64 @@ pub struct PublishConfig {
     /// does not want the noise should not have to take it.
     #[serde(default = "default_publish_label")]
     pub label: String,
+    /// How a run's commit subject is built, as a template over `{type}`, `{scope}` and
+    /// `{summary}` — the three things the implementer reports about its own change.
+    ///
+    /// Conventional-commit by default because most repositories that automate anything are, and a
+    /// run whose commits do not match the surrounding history is a run whose commits get rewritten
+    /// by hand. A repository with another convention sets its own: `"{summary}"` for none at all,
+    /// `"[{scope}] {summary}"`, whatever its log already looks like.
+    ///
+    /// `({scope})` drops out whole when the change belongs to no particular part, so the default
+    /// yields `fix: …` rather than `fix(): …`.
+    #[serde(default = "default_commit_subject")]
+    pub commit_subject: String,
 }
 
 fn default_publish_label() -> String {
     "ratatoskr".to_string()
+}
+
+fn default_commit_subject() -> String {
+    "{type}({scope}): {summary}".to_string()
+}
+
+/// Most of a commit subject. The git convention, and what every log viewer truncates at.
+pub const MAX_SUBJECT_CHARS: usize = 72;
+
+impl PublishConfig {
+    /// The subject line for a change the implementer described as `kind`/`scope`/`summary`.
+    ///
+    /// Over-long subjects are cut at a word boundary rather than mid-token: a subject that ends
+    /// "a fabricated tool res" reads as a truncated *sentence*, which is what a reader will assume
+    /// the change was too.
+    pub fn commit_subject(&self, kind: &str, scope: &str, summary: &str) -> String {
+        let kind = kind.trim();
+        let scope = scope.trim();
+        let template = match scope.is_empty() {
+            true => self.commit_subject.replace("({scope})", ""),
+            false => self.commit_subject.clone(),
+        };
+        let rendered = template
+            .replace("{type}", kind)
+            .replace("{scope}", scope)
+            .replace("{summary}", summary.trim())
+            .trim()
+            .to_string();
+        if rendered.chars().count() <= MAX_SUBJECT_CHARS {
+            return rendered;
+        }
+        let cut: String = rendered.chars().take(MAX_SUBJECT_CHARS).collect();
+        match cut.rsplit_once(' ') {
+            // Only if trimming to the word boundary leaves something worth reading; a first
+            // "word" longer than the limit is a path or an identifier, and half of one is worse
+            // than none.
+            Some((head, _)) if head.chars().count() >= MAX_SUBJECT_CHARS / 2 => {
+                head.trim_end_matches([' ', ',', ';', '-']).to_string()
+            }
+            _ => cut,
+        }
+    }
 }
 
 /// Written out rather than derived, so a config built in code and one parsed from a file with the
@@ -273,6 +327,7 @@ impl Default for PublishConfig {
         PublishConfig {
             enabled: false,
             label: default_publish_label(),
+            commit_subject: default_commit_subject(),
         }
     }
 }
@@ -622,6 +677,67 @@ mod sandbox_network_tests {
         // But an argument buried later cannot make a step allowed — the match is a prefix.
         assert!(!allowed.may_use_network(&argv(&["sh", "-c", "npm install"])));
         assert!(!allowed.may_use_network(&argv(&["curl", "https://npm"])));
+    }
+}
+
+#[cfg(test)]
+mod commit_subject_tests {
+    use super::*;
+
+    #[test]
+    fn a_commit_subject_is_conventional_by_default_and_overridable() {
+        let d = PublishConfig::default();
+        assert_eq!(
+            d.commit_subject("fix", "agent", "drop fabricated model text"),
+            "fix(agent): drop fabricated model text"
+        );
+        // No particular part of the repository: the parentheses go with the scope rather than
+        // leaving `fix(): …` behind.
+        assert_eq!(
+            d.commit_subject("chore", "", "tidy the run log"),
+            "chore: tidy the run log"
+        );
+
+        // A repository with another convention says so, and gets it.
+        let plain = PublishConfig {
+            commit_subject: "{summary}".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            plain.commit_subject("fix", "agent", "do the thing"),
+            "do the thing"
+        );
+        let bracketed = PublishConfig {
+            commit_subject: "[{scope}] {summary}".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            bracketed.commit_subject("fix", "agent", "do the thing"),
+            "[agent] do the thing"
+        );
+    }
+
+    #[test]
+    fn an_over_long_subject_is_cut_at_a_word_not_through_one() {
+        // The observed failure: an 81-character issue title cut at 72 produced a subject ending
+        // "a fabricated tool res", which reads as a truncated change rather than a truncated
+        // string — a reader concludes the commit did half of something.
+        let d = PublishConfig::default();
+        let words = "a node's model text sometimes contains a fabricated tool result and it is bad";
+        let long = d.commit_subject("fix", "agent", words);
+        assert!(long.chars().count() <= MAX_SUBJECT_CHARS, "{long}");
+        assert!(!long.ends_with(' '), "{long}");
+        // Whatever it ends on is a whole word.
+        let last = long.rsplit(' ').next().unwrap();
+        assert!(
+            words.split(' ').any(|w| w == last),
+            "cut through {last:?}: {long}"
+        );
+
+        // A single token longer than the limit has no word boundary to cut at, and half an
+        // identifier still beats nothing.
+        let one_word = d.commit_subject("fix", "", &"x".repeat(200));
+        assert_eq!(one_word.chars().count(), MAX_SUBJECT_CHARS);
     }
 }
 
