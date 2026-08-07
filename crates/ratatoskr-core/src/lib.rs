@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod policy;
+pub mod shape;
 pub mod state;
 pub mod telemetry;
 

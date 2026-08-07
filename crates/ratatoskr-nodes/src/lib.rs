@@ -423,6 +423,11 @@ async fn record_provenance(store: &Store, run_id: &str, config: &RatatoskrConfig
             config_json.as_deref(),
             Some(&graph_fingerprint(&repo)),
             repo_sha.as_deref(),
+            // The graph itself, not just a hash of it. A hash says two runs differed; the shape is
+            // what lets a run be drawn by something that never had this pipeline.
+            serde_json::to_string(&ratatoskr_core::shape::built_in())
+                .ok()
+                .as_deref(),
         )
         .await
     {

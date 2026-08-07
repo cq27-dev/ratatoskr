@@ -275,7 +275,12 @@ async fn run_detail(
     let config = std::fs::read_to_string(&config_path)
         .ok()
         .and_then(|t| ratatoskr_core::RatatoskrConfig::from_toml_str(&t).ok());
-    let nodes = pipeline::derive_with(status.as_deref(), &checkpoints, config.as_ref());
+    let nodes = pipeline::derive_with(
+        status.as_deref(),
+        &checkpoints,
+        config.as_ref(),
+        run.as_ref().and_then(|r| r.shape_json.as_deref()),
+    );
     let last_activity = checkpoints
         .iter()
         .map(|c| c.created_at.as_str())

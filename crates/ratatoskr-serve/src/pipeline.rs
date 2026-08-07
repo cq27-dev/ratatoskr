@@ -8,45 +8,6 @@
 use ratatoskr_store::Checkpoint;
 use serde::Serialize;
 
-/// One column of the pipeline. The fork is a single stage with two nodes: `run_full` joins them,
-/// so in a built-in run both checkpoints land at the same moment.
-struct Stage {
-    nodes: &'static [&'static str],
-    /// Whether this stage runs at all is a property of the config, not of the run — the overseer
-    /// only runs where a workflow has to be chosen, the verifier and publisher only where the repo
-    /// gave them a route. Nothing in the store says which, so an optional stage with no checkpoint
-    /// is never reported as working: a run sitting at the front of the pipeline is being gathered
-    /// for, not overseen, in every repo that never configured an overseer.
-    optional: bool,
-}
-
-const fn required(nodes: &'static [&'static str]) -> Stage {
-    Stage {
-        nodes,
-        optional: false,
-    }
-}
-
-const fn optional(nodes: &'static [&'static str]) -> Stage {
-    Stage {
-        nodes,
-        optional: true,
-    }
-}
-
-/// The pipeline in execution order.
-const PIPELINE: &[Stage] = &[
-    optional(&["overseer"]),
-    required(&["context"]),
-    required(&["analyst"]),
-    required(&["red_team", "implementer"]),
-    optional(&["verifier"]),
-    // The run's two deliveries: one writes to the memory graph, the other to the tracker. Neither
-    // needs the other's result, so `run_full` reaches them together. The publisher is opt-in; the
-    // bookkeeper always runs, but after the terminal status, so neither is ever reported working.
-    required(&["bookkeeper", "publisher"]),
-];
-
 /// Nodes that run after the terminal status is written and whose failure is only logged. They can
 /// never be the reason a run failed, so they are never reported `Failed`.
 const CANNOT_FAIL_THE_RUN: &[&str] = &["bookkeeper", "publisher"];
@@ -204,9 +165,6 @@ fn is_terminal(status: Option<&str>) -> bool {
     )
 }
 
-/// Index of the fork stage (`red_team` ∥ `implementer`) in [`PIPELINE`].
-const FORK: usize = 3;
-
 /// Derive each node's state from the run status and its checkpoints.
 ///
 /// Three non-uniformities are handled explicitly:
@@ -222,7 +180,7 @@ const FORK: usize = 3;
 ///   fork is bookkeeping and that cannot fail the run, the implementer is where it stopped, even
 ///   though it has checkpoints from earlier iterations.
 pub fn derive(status: Option<&str>, checkpoints: &[Checkpoint]) -> Vec<NodeView> {
-    derive_with(status, checkpoints, None)
+    derive_with(status, checkpoints, None, None)
 }
 
 /// [`derive`], plus the config the run was started under — so a node that has not run yet can still
@@ -231,13 +189,24 @@ pub fn derive_with(
     status: Option<&str>,
     checkpoints: &[Checkpoint],
     config: Option<&ratatoskr_core::RatatoskrConfig>,
+    shape_json: Option<&str>,
 ) -> Vec<NodeView> {
+    // The graph the run recorded, not the one this build happens to have. A run from another
+    // machine — or from this one before the pipeline changed — is drawn against its own shape.
+    let shape = ratatoskr_core::shape::recorded_or_built_in(shape_json);
+    let stages = stages_of(&shape);
     let terminal = is_terminal(status);
     let failed = status == Some("failed");
-    let fork_started = PIPELINE[FORK]
-        .nodes
+    // The fork is wherever the implementer is in THIS run's shape, not a fixed index.
+    let fork = shape
         .iter()
-        .any(|n| count(checkpoints, n) > 0);
+        .find(|n| n.name == "implementer")
+        .map(|n| n.stage);
+    let fork_started = fork.is_some_and(|f| {
+        stages
+            .get(f)
+            .is_some_and(|nodes| nodes.iter().any(|n| count(checkpoints, &n.name) > 0))
+    });
 
     // A node has finished only if it checkpointed *and* isn't the implementer mid-converge —
     // otherwise the fork would look complete on iteration 1 and the run's activity would be
@@ -252,28 +221,29 @@ pub fn derive_with(
     // record, so an empty optional stage is as likely skipped as pending — and claiming the
     // overseer is working while the context node is what's actually running is the visible
     // version of that guess.
-    let last_seen = PIPELINE
+    let last_seen = stages
         .iter()
-        .rposition(|stage| stage.nodes.iter().any(|n| count(checkpoints, n) > 0));
-    let current = PIPELINE.iter().enumerate().position(|(idx, stage)| {
-        !stage.optional
-            && !(stage.nodes.iter().all(|n| finished(n))
+        .rposition(|nodes| nodes.iter().any(|n| count(checkpoints, &n.name) > 0));
+    let current = stages.iter().enumerate().position(|(idx, nodes)| {
+        !nodes.iter().all(|n| n.optional)
+            && !(nodes.iter().all(|n| finished(&n.name))
                 || last_seen.is_some_and(|seen| seen > idx))
     });
 
     let mut out = Vec::new();
-    for (idx, stage) in PIPELINE.iter().enumerate() {
-        for (lane, name) in stage.nodes.iter().enumerate() {
+    for (idx, nodes) in stages.iter().enumerate() {
+        for node in nodes {
+            let (lane, name) = (node.lane, &node.name);
             let times: Vec<&str> = checkpoints
                 .iter()
                 .filter(|c| c.node_name == *name)
                 .map(|c| c.created_at.as_str())
                 .collect();
 
-            let state = if failed && idx == FORK && fork_started {
+            let state = if failed && Some(idx) == fork && fork_started {
                 // Converge died. Whatever the implementer checkpointed came from earlier
                 // iterations; red-team ran to completion if it recorded anything.
-                match *name {
+                match name.as_str() {
                     "implementer" => NodeState::Failed,
                     _ if times.is_empty() => NodeState::Failed,
                     _ => NodeState::Done,
@@ -283,12 +253,12 @@ pub fn derive_with(
                     // Later than where the run is: nothing to say about it yet.
                     _ if current != Some(idx) => NodeState::Idle,
                     // A failure here belongs upstream: these run past the terminal status.
-                    _ if CANNOT_FAIL_THE_RUN.contains(name) => NodeState::Idle,
+                    _ if CANNOT_FAIL_THE_RUN.contains(&name.as_str()) => NodeState::Idle,
                     _ if failed => NodeState::Failed,
                     _ if !terminal => NodeState::Working,
                     _ => NodeState::Idle,
                 }
-            } else if *name == "implementer" && !terminal {
+            } else if name == "implementer" && !terminal {
                 // Checkpointed at least once, but converge may still be iterating on it.
                 NodeState::Working
             } else {
@@ -298,7 +268,7 @@ pub fn derive_with(
             out.push(NodeView {
                 telemetry: NodeTelemetryView::latest(checkpoints, name),
                 planned: PlannedNode::of(config, name),
-                name: (*name).to_string(),
+                name: name.clone(),
                 state,
                 stage: idx,
                 lane,
@@ -308,7 +278,77 @@ pub fn derive_with(
             });
         }
     }
+    append_unknown(&mut out, checkpoints, config);
     out
+}
+
+/// Add nodes the run has data for that this build's pipeline does not contain.
+///
+/// The shape above is compiled in, so a run of the standard pipeline renders anywhere — including
+/// on an installation with no config at all, which is what an imported run has to survive. A run
+/// from a DIFFERENT graph is the case this covers: a custom workflow's nodes are not in the list,
+/// and without this its checkpoints would be silently dropped and the run would appear to have
+/// done nothing.
+///
+/// They go in trailing stages, in the order they first ran. That is not the shape they executed
+/// in — it cannot be recovered from checkpoints alone — but it shows every node with its output
+/// and its cost, which is what someone analysing a foreign run came for.
+fn append_unknown(
+    out: &mut Vec<NodeView>,
+    checkpoints: &[Checkpoint],
+    config: Option<&ratatoskr_core::RatatoskrConfig>,
+) {
+    let known: std::collections::HashSet<&str> = out.iter().map(|n| n.name.as_str()).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut extra: Vec<&str> = Vec::new();
+    for c in checkpoints {
+        let name = c.node_name.as_str();
+        // The issue pseudo-node writes a checkpoint and is deliberately not a pipeline node: it
+        // records what the run was asked to do, which is not a stage of doing it.
+        if name != ISSUE_NODE && !known.contains(name) && seen.insert(name) {
+            extra.push(name);
+        }
+    }
+    let base = out.iter().map(|n| n.stage).max().map_or(0, |s| s + 1);
+    for (i, name) in extra.into_iter().enumerate() {
+        let times = node_times(checkpoints, name);
+        out.push(NodeView {
+            telemetry: NodeTelemetryView::latest(checkpoints, name),
+            planned: PlannedNode::of(config, name),
+            name: name.to_string(),
+            // A foreign node that wrote a checkpoint has run; nothing here can say more than that.
+            state: NodeState::Done,
+            stage: base + i,
+            lane: 0,
+            checkpoints: times.len(),
+            first_at: times.first().map(|s| s.to_string()),
+            last_at: times.last().map(|s| s.to_string()),
+        });
+    }
+}
+
+/// Group a shape's nodes into stages, indexed by column.
+fn stages_of(
+    shape: &[ratatoskr_core::shape::ShapeNode],
+) -> Vec<Vec<&ratatoskr_core::shape::ShapeNode>> {
+    let width = shape.iter().map(|n| n.stage).max().map_or(0, |s| s + 1);
+    let mut stages: Vec<Vec<_>> = vec![Vec::new(); width];
+    for node in shape {
+        stages[node.stage].push(node);
+    }
+    for nodes in &mut stages {
+        nodes.sort_by_key(|n| n.lane);
+    }
+    stages
+}
+
+/// When each of `node`'s checkpoints was written, in order.
+fn node_times(checkpoints: &[Checkpoint], node: &str) -> Vec<String> {
+    checkpoints
+        .iter()
+        .filter(|c| c.node_name == node)
+        .map(|c| c.created_at.clone())
+        .collect()
 }
 
 fn count(checkpoints: &[Checkpoint], node: &str) -> usize {
@@ -477,7 +517,7 @@ mod tests {
             },
         );
 
-        let views = derive_with(None, &[], Some(&config));
+        let views = derive_with(None, &[], Some(&config), None);
         // Routed as `redteam`, checkpointed as `red_team` — the view is keyed by the latter.
         let planned = views
             .iter()

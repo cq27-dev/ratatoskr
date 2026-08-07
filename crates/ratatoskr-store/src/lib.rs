@@ -20,6 +20,12 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// nullable and have no default beyond `NULL`: SQLite rewrites nothing on `ADD COLUMN`, so this
 /// stays an O(1) metadata change no matter how many runs are already recorded.
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    // Where an imported run came from. Null for one this machine produced, which is what makes
+    // "only mine" answerable after somebody else's runs have been imported alongside.
+    ("runs", "origin", "TEXT"),
+    // The graph the run executed, so it can be drawn afterwards by something whose own pipeline
+    // has changed — or that never had this one.
+    ("runs", "shape_json", "TEXT"),
     ("runs", "config_json", "TEXT"),
     ("runs", "graph_hash", "TEXT"),
     ("runs", "repo_sha", "TEXT"),
@@ -94,6 +100,24 @@ pub struct Run {
     pub graph_hash: Option<String>,
     /// The commit the run started from.
     pub repo_sha: Option<String>,
+    /// Where this run came from, when it was not produced here. `None` for a local run.
+    pub origin: Option<String>,
+    /// The graph that ran, serialized. `None` for runs recorded before shapes were stored, which
+    /// fall back to the reader's built-in.
+    pub shape_json: Option<String>,
+    /// What it is for, as recorded by whoever ran it. Empty unless tagged.
+    pub tags: Vec<String>,
+}
+
+/// One event of a run's history: the raw log record, plus what it takes to order and filter them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EventRow {
+    pub seq: i64,
+    pub at: String,
+    pub kind: String,
+    pub node: Option<String>,
+    /// The log record verbatim. Kept whole so reading it back is the same parse as reading the log.
+    pub payload_json: String,
 }
 
 /// A handle to the checkpoint database. Cheap to clone (shares the guarded connection).
@@ -181,7 +205,7 @@ impl Store {
             let conn = conn.lock().expect("store mutex poisoned");
             let run = conn
                 .query_row(
-                    "SELECT run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha FROM runs WHERE run_id = ?1",
+                    "SELECT run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha, origin, shape_json FROM runs WHERE run_id = ?1",
                     params![run_id],
                     row_to_run,
                 )
@@ -197,7 +221,7 @@ impl Store {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().expect("store mutex poisoned");
             let mut stmt = conn.prepare(
-                "SELECT run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha FROM runs
+                "SELECT run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha, origin, shape_json FROM runs
                  ORDER BY updated_at DESC, run_id DESC",
             )?;
             let rows = stmt
@@ -217,13 +241,15 @@ impl Store {
         config_json: Option<&str>,
         graph_hash: Option<&str>,
         repo_sha: Option<&str>,
+        shape_json: Option<&str>,
     ) -> Result<(), StoreError> {
         let conn = Arc::clone(&self.conn);
-        let (run_id, config_json, graph_hash, repo_sha) = (
+        let (run_id, config_json, graph_hash, repo_sha, shape_json) = (
             run_id.to_string(),
             config_json.map(str::to_string),
             graph_hash.map(str::to_string),
             repo_sha.map(str::to_string),
+            shape_json.map(str::to_string),
         );
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().expect("store mutex poisoned");
@@ -233,9 +259,10 @@ impl Store {
                 "UPDATE runs SET
                      config_json = COALESCE(config_json, ?2),
                      graph_hash  = COALESCE(graph_hash, ?3),
-                     repo_sha    = COALESCE(repo_sha, ?4)
+                     repo_sha    = COALESCE(repo_sha, ?4),
+                     shape_json  = COALESCE(shape_json, ?5)
                  WHERE run_id = ?1",
-                params![run_id, config_json, graph_hash, repo_sha],
+                params![run_id, config_json, graph_hash, repo_sha, shape_json],
             )?;
             Ok::<_, StoreError>(())
         })
@@ -358,6 +385,158 @@ impl Store {
         })
         .await?
     }
+
+    /// Store a run's event history. Returns how many rows were new.
+    ///
+    /// Idempotent: `(run_id, seq)` is the key, so re-ingesting a log that was already read adds
+    /// nothing. That matters because the obvious way to use this is to run it again whenever you
+    /// are unsure whether it ran.
+    pub async fn ingest_events(
+        &self,
+        run_id: &str,
+        events: Vec<EventRow>,
+    ) -> Result<usize, StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().expect("store mutex poisoned");
+            let tx = conn.transaction()?;
+            let mut added = 0;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT OR IGNORE INTO events (run_id, seq, at, kind, node, payload_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                for e in &events {
+                    added +=
+                        stmt.execute(params![run_id, e.seq, e.at, e.kind, e.node, e.payload_json])?;
+                }
+            }
+            tx.commit()?;
+            Ok::<_, StoreError>(added)
+        })
+        .await?
+    }
+
+    /// A run's stored history, in order. Empty for a run never ingested.
+    pub async fn events_for_run(&self, run_id: &str) -> Result<Vec<EventRow>, StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT seq, at, kind, node, payload_json FROM events
+                 WHERE run_id = ?1 ORDER BY seq",
+            )?;
+            let rows = stmt
+                .query_map(params![run_id], |row| {
+                    Ok(EventRow {
+                        seq: row.get(0)?,
+                        at: row.get(1)?,
+                        kind: row.get(2)?,
+                        node: row.get(3)?,
+                        payload_json: row.get(4)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, StoreError>(rows)
+        })
+        .await?
+    }
+
+    /// Add tags to a run. Re-tagging with one it already has is a no-op.
+    pub async fn tag_run(&self, run_id: &str, tags: Vec<String>) -> Result<(), StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            for tag in tags {
+                conn.execute(
+                    "INSERT OR IGNORE INTO run_tags (run_id, tag) VALUES (?1, ?2)",
+                    params![run_id, tag.trim()],
+                )?;
+            }
+            Ok::<_, StoreError>(())
+        })
+        .await?
+    }
+
+    /// Remove tags from a run. Removing one it does not have is a no-op.
+    pub async fn untag_run(&self, run_id: &str, tags: Vec<String>) -> Result<(), StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            for tag in tags {
+                conn.execute(
+                    "DELETE FROM run_tags WHERE run_id = ?1 AND tag = ?2",
+                    params![run_id, tag.trim()],
+                )?;
+            }
+            Ok::<_, StoreError>(())
+        })
+        .await?
+    }
+
+    /// Fill in each run's tags. Separate from listing because most readers do not need them.
+    pub async fn attach_tags(&self, runs: &mut [Run]) -> Result<(), StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let ids: Vec<String> = runs.iter().map(|r| r.run_id.clone()).collect();
+        let found = tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let mut stmt =
+                conn.prepare("SELECT tag FROM run_tags WHERE run_id = ?1 ORDER BY tag")?;
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                let tags = stmt
+                    .query_map(params![id], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                out.push(tags);
+            }
+            Ok::<_, StoreError>(out)
+        })
+        .await??;
+        for (run, tags) in runs.iter_mut().zip(found) {
+            run.tags = tags;
+        }
+        Ok(())
+    }
+
+    /// Delete a run and everything recorded about it.
+    ///
+    /// In one transaction and children first, because `checkpoints.run_id` is a real foreign key
+    /// and this database enforces them — deleting the run row first fails rather than orphaning.
+    pub async fn delete_run(&self, run_id: &str) -> Result<bool, StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().expect("store mutex poisoned");
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM events WHERE run_id = ?1", params![run_id])?;
+            tx.execute("DELETE FROM run_tags WHERE run_id = ?1", params![run_id])?;
+            tx.execute("DELETE FROM checkpoints WHERE run_id = ?1", params![run_id])?;
+            let gone = tx.execute("DELETE FROM runs WHERE run_id = ?1", params![run_id])?;
+            tx.commit()?;
+            Ok::<_, StoreError>(gone > 0)
+        })
+        .await?
+    }
+
+    /// Record where a run came from. Set on import; never set for a run produced here.
+    pub async fn set_origin(&self, run_id: &str, origin: &str) -> Result<(), StoreError> {
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
+        let origin = origin.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            conn.execute(
+                "UPDATE runs SET origin = ?2 WHERE run_id = ?1",
+                params![run_id, origin],
+            )?;
+            Ok::<_, StoreError>(())
+        })
+        .await?
+    }
 }
 
 /// Shared row mapper for the `runs` columns, in the order both queries select them.
@@ -370,6 +549,11 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         config_json: row.get(4)?,
         graph_hash: row.get(5)?,
         repo_sha: row.get(6)?,
+        origin: row.get(7)?,
+        shape_json: row.get(8)?,
+        // Filled by the caller when it wants them: a join on every listing would cost every reader
+        // for a column most of them do not look at.
+        tags: Vec::new(),
     })
 }
 
