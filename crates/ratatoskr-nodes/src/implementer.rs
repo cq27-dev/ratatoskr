@@ -135,6 +135,11 @@ pub struct ImplementerNode {
     pub max_turns: Option<usize>,
     /// Ruleset `systemPrompt`; replaces [`NATIVE_PREAMBLE`] when set.
     pub system_prompt: Option<String>,
+    /// The repository's own conventions (`AGENTS.md`), loaded once from the checkout and prefixed
+    /// to this node's preamble. `None` when the repo ships no conventions file — the preamble is
+    /// then exactly what it was before. It is the only node besides the test author that writes
+    /// code, so it is one of the two that carry these.
+    pub conventions: Option<String>,
     pub plugins: crate::NodePlugins,
     pub ledger: Option<Arc<RunLedger>>,
     /// Who answers when the implementer cannot resolve something itself.
@@ -215,14 +220,18 @@ impl ImplementerNode {
         let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
             node: "implementer",
             route: &self.route,
-            preamble: &format!(
-                "{}{}",
-                crate::effective_preamble(
-                    NATIVE_PREAMBLE,
-                    self.system_prompt.as_deref(),
-                    self.plugins.context.as_deref(),
+            preamble: &crate::with_conventions(
+                "implementer",
+                self.conventions.as_deref(),
+                format!(
+                    "{}{}",
+                    crate::effective_preamble(
+                        NATIVE_PREAMBLE,
+                        self.system_prompt.as_deref(),
+                        self.plugins.context.as_deref(),
+                    ),
+                    where_you_are(worktree),
                 ),
-                where_you_are(worktree),
             ),
             question: prompt,
             tools: self.tools.clone(),
@@ -442,5 +451,55 @@ mod tests {
             p.contains("not for permission"),
             "and what does not earn one"
         );
+    }
+
+    #[test]
+    fn conventions_are_loaded_when_present_and_reach_only_the_writing_nodes() {
+        let dir = std::env::temp_dir().join(format!("ratatoskr-conv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No conventions file: the loader is None and a writing node's preamble is byte-identical
+        // to the plain composition — no header, no separator.
+        assert_eq!(crate::repo_conventions(&dir), None);
+        let plain = crate::effective_preamble(NATIVE_PREAMBLE, None, None);
+        assert_eq!(
+            crate::with_conventions("implementer", None, plain.clone()),
+            plain,
+            "no conventions must leave the preamble untouched"
+        );
+
+        // Present: bounded Some, and a writing node carries it while a non-writing node does not.
+        std::fs::write(
+            dir.join("AGENTS.md"),
+            "# House rules\nUse parameter structs.\n",
+        )
+        .unwrap();
+        let conv = crate::repo_conventions(&dir).expect("AGENTS.md is loaded");
+        assert!(conv.contains("Use parameter structs"));
+        assert!(!conv.is_empty() && conv.len() <= crate::CONVENTIONS_BUDGET);
+
+        let writer = crate::with_conventions("implementer", Some(&conv), plain.clone());
+        assert!(writer.contains("Use parameter structs"), "writer gets them");
+        // A non-writing node composes with effective_preamble and never sees with_conventions.
+        assert!(
+            !plain.contains("Use parameter structs"),
+            "non-writing preamble stays free of conventions"
+        );
+
+        // CLAUDE.md is honoured when AGENTS.md is absent (the ecosystem's alternative name).
+        std::fs::remove_file(dir.join("AGENTS.md")).unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "from claude\n").unwrap();
+        assert_eq!(
+            crate::repo_conventions(&dir).as_deref(),
+            Some("from claude\n")
+        );
+
+        // Over budget: clipped to the bound, not silently past it.
+        let big = "x".repeat(crate::CONVENTIONS_BUDGET * 2);
+        std::fs::write(dir.join("AGENTS.md"), &big).unwrap();
+        let clipped = crate::repo_conventions(&dir).unwrap();
+        assert_eq!(clipped.len(), crate::CONVENTIONS_BUDGET);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

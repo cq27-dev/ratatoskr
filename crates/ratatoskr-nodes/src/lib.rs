@@ -1175,6 +1175,64 @@ pub(crate) fn effective_preamble(
     }
 }
 
+/// The most of `AGENTS.md` a writing node's preamble will carry. It is paid on every model call
+/// the node makes, so a file large enough to matter is reported and clipped rather than silently
+/// taxing every turn. Generous enough for the ~130-line file this repo ships, a ceiling for a
+/// runaway one.
+pub(crate) const CONVENTIONS_BUDGET: usize = 16 * 1024;
+
+/// The repository's own coding conventions, discovered by convention rather than configuration:
+/// `AGENTS.md` at the repo root, falling back to `CLAUDE.md`. `None` when neither exists (or the
+/// path is unreadable), so a caller leaves its preamble exactly as it is today.
+///
+/// Read from the repo root at plan-build time, not from an implementer's worktree — the worktree
+/// is a copy, and loading once from the checkout keeps every converge iteration and the test
+/// author on the same text. `AGENTS.md` is read first and `CLAUDE.md` only when it is absent, so
+/// this repo's `CLAUDE.md`-symlink-to-`AGENTS.md` layout is read once, never doubled.
+///
+/// Bounded to [`CONVENTIONS_BUDGET`]: a file over the bound is clipped and logged (naming the file
+/// and its full vs. injected size) rather than truncated in silence.
+pub(crate) fn repo_conventions(repo_root: &std::path::Path) -> Option<String> {
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        let path = repo_root.join(name);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if text.len() > CONVENTIONS_BUDGET {
+            let mut end = CONVENTIONS_BUDGET;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            let clipped = &text[..end];
+            tracing::warn!(
+                file = %path.display(),
+                full_bytes = text.len(),
+                injected_bytes = clipped.len(),
+                "repository conventions exceed the preamble budget; injecting a prefix, not the whole file"
+            );
+            return Some(clipped.to_string());
+        }
+        return Some(text);
+    }
+    None
+}
+
+/// Prefix a writing node's preamble with the repository conventions, recording how much of the
+/// composed preamble came from them. `None` conventions (no `AGENTS.md`) leaves `base` byte-for-byte
+/// unchanged — no header, no separator — so a repo with no conventions file runs exactly as before.
+pub(crate) fn with_conventions(node: &str, conventions: Option<&str>, base: String) -> String {
+    let Some(conventions) = conventions else {
+        return base;
+    };
+    tracing::info!(
+        node,
+        conventions_chars = conventions.len(),
+        preamble_chars = conventions.len() + base.len(),
+        "repository conventions injected into node preamble"
+    );
+    format!("{conventions}\n\n{base}")
+}
+
 /// Resolve a node's agent settings. The ruleset is authoritative where it speaks: its `model` is
 /// the route (so a fully-declared node needs no `[models.<node>]` entry — that's only the
 /// fallback), `allow` (if given) REPLACES `default_tools`, `deny` is always removed,
@@ -2289,6 +2347,10 @@ async fn fork_and_converge(
     let repo_path: PathBuf = std::env::current_dir()
         .map_err(|e| PlanError::node("fork", NodeError::Failed(format!("cwd: {e}"))))?;
     let short: String = run_id.chars().take(8).collect();
+    // The repository's own conventions (`AGENTS.md`), loaded once from the checkout — not from an
+    // implementer worktree, which is a copy — so every converge iteration and the test author see
+    // the same text. Only the two nodes that write code carry it.
+    let conventions = repo_conventions(&repo_path);
     // Resolved once and shared by both branches: the baseline and the post-change run must execute
     // the same steps, or the two sets converge compares are not comparable. Frozen here for the
     // whole run — a later analyst revision amends requirements, never the bar.
@@ -2366,6 +2428,7 @@ async fn fork_and_converge(
                     policy: cfg.policy,
                     max_turns: cfg.max_turns,
                     system_prompt: cfg.system_prompt,
+                    conventions: conventions.clone(),
                     plugins,
                     ledger: Some(Arc::clone(ledger)),
                 })
@@ -2385,6 +2448,7 @@ async fn fork_and_converge(
         policy: impl_cfg.policy,
         max_turns: impl_cfg.max_turns,
         system_prompt: impl_cfg.system_prompt,
+        conventions,
         plugins: impl_plugins,
         ledger: Some(Arc::clone(ledger)),
         run_id: run_id.to_string(),
@@ -3524,5 +3588,111 @@ mod agent_config_tests {
         // A node that produced almost nothing has almost no floor to clear.
         assert_eq!(plausible_output_tokens(0), 0);
         assert_eq!(plausible_output_tokens(7), 0);
+    }
+}
+
+#[cfg(test)]
+mod repo_conventions_tests {
+    use super::*;
+
+    /// A fresh, empty directory unique to this test and process, so concurrent tests never share
+    /// a repo root — the same pid-keying the agent-config fixtures use for the same reason.
+    fn repo_root(case: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-conventions-{}-{case}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn agents_md_at_the_root_is_read() {
+        // Happy: AGENTS.md at the root → Some(its content), non-empty, within the bound.
+        let root = repo_root("agents");
+        let conventions = "# Conventions\nParameter structs over long argument trains.\n";
+        std::fs::write(root.join("AGENTS.md"), conventions).unwrap();
+
+        let got = repo_conventions(&root).expect("AGENTS.md is present");
+        assert_eq!(got, conventions);
+        assert!(!got.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_md_is_the_honoured_alternative_name() {
+        // Happy: no AGENTS.md, but a CLAUDE.md regular file → its content. The ecosystem's
+        // alternative name is honoured.
+        let root = repo_root("claude");
+        let conventions = "# Conventions\nInjected time and ids.\n";
+        std::fs::write(root.join("CLAUDE.md"), conventions).unwrap();
+
+        assert_eq!(repo_conventions(&root).as_deref(), Some(conventions));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_claude_symlink_to_agents_is_read_once_not_duplicated() {
+        // Happy: this repo's own layout — CLAUDE.md is a symlink to AGENTS.md. AGENTS.md is
+        // preferred and its content comes back once, not concatenated with itself.
+        // (Unix-only symlink, matching where a run actually runs.)
+        let root = repo_root("symlink");
+        let conventions = "# Conventions\nClosed enums behind stable string tokens.\n";
+        std::fs::write(root.join("AGENTS.md"), conventions).unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
+
+        assert_eq!(repo_conventions(&root).as_deref(), Some(conventions));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn neither_file_present_yields_none() {
+        // Sad: a repo with neither file → None, so the caller leaves the preamble exactly as it is
+        // today and a repo with no conventions file runs unchanged.
+        let root = repo_root("none");
+        assert_eq!(repo_conventions(&root), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_larger_than_the_bound_is_truncated_not_dropped() {
+        // Sad: an AGENTS.md far larger than the bound → bounded text, never a silent drop and
+        // never injected whole. The exact preamble budget is not part of the contract, so this
+        // asserts the observable guarantee: the result is non-empty and strictly shorter than an
+        // input placed well past any plausible bound. (The contract also requires a log record
+        // naming the file and its full vs. injected size; that side effect needs a tracing
+        // subscriber this crate has no test harness for, so it is not asserted here.)
+        let root = repo_root("huge");
+        let huge = "x".repeat(1_000_000);
+        std::fs::write(root.join("AGENTS.md"), &huge).unwrap();
+
+        let got = repo_conventions(&root).expect("a huge file is still injected, bounded");
+        assert!(!got.is_empty());
+        assert!(
+            got.len() < huge.len(),
+            "a file past the bound is truncated, not injected whole: {} vs {}",
+            got.len(),
+            huge.len()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_root_that_is_not_a_directory_yields_none_rather_than_erroring() {
+        // Sad: an unreadable / non-directory root → None rather than an error that fails the run.
+        let missing = std::env::temp_dir().join(format!(
+            "ratatoskr-conventions-absent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(repo_conventions(&missing), None);
+
+        // A path that exists but is a regular file, not a repo directory.
+        let root = repo_root("not-a-dir");
+        let file = root.join("AGENTS.md");
+        std::fs::write(&file, "conventions").unwrap();
+        assert_eq!(repo_conventions(&file), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
