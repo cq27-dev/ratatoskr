@@ -264,10 +264,26 @@ fn tool_argument(record: &Value) -> Option<String> {
             Value::String(s) => s.clone(),
             other => other.to_string(),
         })?;
-    Some(match found.char_indices().nth(ARG_LIMIT) {
-        Some((cut, _)) => format!("{}…", &found[..cut]),
-        None => found,
-    })
+    Some(shorten(&found))
+}
+
+/// Shorten a tool's argument to what the feed can show, keeping the end.
+///
+/// The end is the part that identifies the call — the file name, not the directories above it, and
+/// the tail of a long command rather than its first flag. Trimming from the front and marking it
+/// with a leading `…` says so in the text itself.
+///
+/// The alternative was `direction: rtl` on the element, which puts the CSS ellipsis at the start
+/// without changing the string. It also reverses how the text selects, and reorders a neutral
+/// character sitting at either end of the string — an absolute path rendered with its leading `/`
+/// moved to the far end, which reads as a directory it is not.
+fn shorten(arg: &str) -> String {
+    let count = arg.chars().count();
+    if count <= ARG_LIMIT {
+        return arg.to_string();
+    }
+    let tail: String = arg.chars().skip(count - ARG_LIMIT).collect();
+    format!("…{tail}")
 }
 
 /// How much of a tool's argument the feed shows.
@@ -609,6 +625,27 @@ mod tests {
         )
         .unwrap();
         assert!(to_event(&other).usage.is_none());
+    }
+
+    #[test]
+    fn a_long_argument_keeps_the_end_that_identifies_it() {
+        // The file name is the part a reader is looking for, so a path too long to show loses its
+        // leading directories rather than its tail.
+        let deep = format!(
+            "/home/kk/{}/crates/ratatoskr-serve/src/events.rs",
+            "nested/".repeat(20)
+        );
+        let short = shorten(&deep);
+        assert!(short.starts_with('…'), "{short}");
+        assert!(
+            short.ends_with("crates/ratatoskr-serve/src/events.rs"),
+            "{short}"
+        );
+        assert_eq!(short.chars().count(), ARG_LIMIT + 1);
+
+        // Anything that fits is untouched — no marker, and no reordering of a leading slash.
+        let fits = "/home/kk/src/lib.rs";
+        assert_eq!(shorten(fits), fits);
     }
 
     #[test]
