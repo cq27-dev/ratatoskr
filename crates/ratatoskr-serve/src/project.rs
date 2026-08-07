@@ -78,6 +78,11 @@ pub enum ProjectError {
          names, which is not two projects"
     )]
     SharedStore(String, String, PathBuf),
+    #[error(
+        "`{0}` is not a usable project name: the dashboard puts the project in the URL path, and \
+         /{0} is already the server's own. Rename the directory or serve it from elsewhere"
+    )]
+    ReservedSlug(String),
     #[error("no projects to serve")]
     Empty,
     #[error("store error: {0}")]
@@ -103,6 +108,12 @@ fn slug_for(dir: &Path) -> String {
     }
 }
 
+/// Path segments the server answers itself, so no project may be named one.
+///
+/// Kept in step with `router` and with `RESERVED` in the dashboard's url.ts. Short enough to be
+/// obvious, and a mismatch shows up as the ordinary duplicate-name error rather than silently.
+const RESERVED_SLUGS: &[&str] = &["api", "assets", "internal"];
+
 /// Open every project, keyed by slug.
 ///
 /// A missing store is an error rather than an empty dashboard: `Store::open` would happily create
@@ -123,6 +134,12 @@ pub fn open_all(
             return Err(ProjectError::NoStore(spec.store_path));
         }
         let slug = slug_for(&spec.dir);
+        // The dashboard addresses a project by the first path segment, and these are matched
+        // ahead of the fallback that serves it — so a project called `api` would be a page nobody
+        // could open. Caught here, where the name is chosen, rather than as a mystery 404 later.
+        if RESERVED_SLUGS.contains(&slug.as_str()) {
+            return Err(ProjectError::ReservedSlug(slug));
+        }
         if let Some(existing) = projects.get(&slug) {
             return Err(ProjectError::DuplicateSlug(
                 slug,
@@ -226,6 +243,32 @@ mod tests {
             matches!(&opened, Err(ProjectError::SharedStore(first, second, _))
                 if first == "alpha" && second == "beta"),
             "both names are reported so the operator knows which two collided"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_project_named_after_a_server_route_is_refused() {
+        // `/api/...` is matched before the fallback that serves the dashboard, so a project called
+        // `api` would be addressable by the API and by nothing else.
+        let dir = std::env::temp_dir().join(format!("ratatoskr-reserved-{}", std::process::id()));
+        let api = dir.join("api");
+        std::fs::create_dir_all(&api).unwrap();
+        std::fs::write(api.join("state.sqlite3"), "").unwrap();
+
+        let opened = open_all(
+            vec![ProjectSpec {
+                dir: api.clone(),
+                config_path: api.join("ratatoskr.toml"),
+                store_path: api.join("state.sqlite3"),
+                visibility: Visibility::default(),
+            }],
+            1,
+            "http://127.0.0.1:1",
+        );
+        assert!(
+            matches!(&opened, Err(ProjectError::ReservedSlug(s)) if s == "api"),
+            "a reserved name has to be refused where it is chosen, not 404 later"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryState } from "nuqs";
 import { applyDerived, nodesFromEvents } from "./derive";
-import { elapsedAt, indexAtElapsed, parseAsElapsed } from "./url";
+import {
+  elapsedAt,
+  indexAtElapsed,
+  parseAsElapsed,
+  readPath,
+  sameRun,
+  writePath,
+} from "./url";
 import Tooltips from "./ui/Tooltip";
 import PipelineGraph from "./panels/PipelineGraph";
 import { Detail } from "./panels/Detail";
@@ -63,10 +70,16 @@ export default function App() {
    * reload lands where it was, and the address pasted into a message shows the same thing to
    * someone else. Everything else on this page is derived from these four and is fetched again on
    * its own. See url.ts for why they replace the history entry instead of pushing.
+   *
+   * Split across the two halves of the URL by what each one is. The project and the run are the
+   * thing being looked at, so they are the path; the node and the position are views into it, so
+   * they are query parameters. Ordinary React state here, seeded from the path once and written
+   * back by the effect below — the path has two segments and no parsing worth a library.
    */
-  const [project, setProject] = useQueryState("project");
+  const opened = useRef(readPath());
+  const [project, setProject] = useState<string | null>(opened.current.project);
   const [runs, setRuns] = useState<RunSummary[]>([]);
-  const [runId, setRunId] = useQueryState("run");
+  const [runId, setRunId] = useState<string | null>(opened.current.run);
   const [detail, setDetail] = useState<RunDetail | null>(null);
   /** The run's whole event history, loaded once so a finished run can be moved through. */
   const [history, setHistory] = useState<LiveEvent[] | null>(null);
@@ -87,6 +100,10 @@ export default function App() {
   /** When the last live event arrived, as the liveness signal a checkpoint cannot give. */
   const [answered, setAnswered] = useState<ReadonlySet<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    writePath({ project, run: runId });
+  }, [project, runId]);
 
   // Who is looking. Read before anything else, because it decides what the rest of these calls
   // are even allowed to return.
@@ -130,9 +147,14 @@ export default function App() {
       // Keep the current selection when it still exists, fall back to the newest when it does
       // not. A run deleted by `ratatoskr runs rm` would otherwise stay selected: its row is gone
       // from the list while the detail pane goes on showing it.
-      setRunId((cur) =>
-        cur && list.some((r) => r.run_id === cur) ? cur : (list[0]?.run_id ?? null),
-      );
+      // `startsWith`, not equality: a link carries an eight-character run id, so what is selected
+      // on a cold open is a prefix. Matching it here replaces it with the full id, which is what
+      // the rest of the page compares against — and the address bar keeps showing the short form
+      // either way, since that is what `writePath` writes.
+      setRunId((cur) => {
+        const known = cur && list.find((r) => r.run_id.startsWith(cur));
+        return known ? known.run_id : (list[0]?.run_id ?? null);
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -186,22 +208,30 @@ export default function App() {
     [refresh],
   );
 
-  // What the view is actually on, so a slow response for something we've since left can be
-  // dropped instead of overwriting the current one. Keyed by project as well as run: switching
-  // project can leave a request for the same-named run in flight.
-  const shown = useRef<string | null>(null);
-  const showing = project && runId ? `${project}/${runId}` : null;
+  /*
+   * What the view is actually on, so a slow response for something we've since left can be dropped
+   * instead of overwriting the current one. Keyed by project as well as run: switching project can
+   * leave a request for the same-named run in flight.
+   *
+   * Compared with `sameRun` rather than by string. On a cold open the request goes out under the
+   * eight-character id from the link and the run list expands it to the full one moments later —
+   * so an exact comparison declared the reply stale and dropped the history the page was waiting
+   * for, leaving the scrubber on the live tail with no way back.
+   */
+  const shown = useRef<{ project: string; run: string } | null>(null);
   useEffect(() => {
-    shown.current = showing;
-  }, [showing]);
+    shown.current = project && runId ? { project, run: runId } : null;
+  }, [project, runId]);
+  const stillShowing = (forProject: string, forRun: string) =>
+    shown.current?.project === forProject && sameRun(shown.current.run, forRun);
 
   const load = useCallback(async () => {
     if (!runId || !project) return;
     try {
       const d = await getRun(project, runId);
-      if (shown.current === `${project}/${runId}`) setDetail(d);
+      if (stillShowing(project, runId)) setDetail(d);
     } catch (e) {
-      if (shown.current === `${project}/${runId}`) {
+      if (stillShowing(project, runId)) {
         setError(e instanceof Error ? e.message : String(e));
       }
     }
@@ -231,11 +261,11 @@ export default function App() {
     historyReadAt.current = now;
     try {
       const h = await getHistory(project, runId);
-      if (shown.current === `${project}/${runId}`) setHistory(h);
+      if (stillShowing(project, runId)) setHistory(h);
     } catch {
       // A run whose log has rotated away and was never ingested has no timeline. The live feed
       // still works, and the boxes fall back to what the store knows.
-      if (shown.current === `${project}/${runId}`) setHistory([]);
+      if (stillShowing(project, runId)) setHistory([]);
     }
   }, [runId, project]);
 
@@ -426,7 +456,10 @@ export default function App() {
   useEffect(() => {
     setCheckpoints(null);
     setHistory(null);
-    if (seenRun.current !== null && seenRun.current !== runId) {
+    // `sameRun`, not `!==`. A link names a run in eight characters and the run list names it in
+    // thirty-six, so the id changes once on a cold open as the prefix is expanded — and reading
+    // that as a switch cleared the node and position the link had just supplied.
+    if (seenRun.current !== null && !sameRun(seenRun.current, runId)) {
       void setNode(null);
       setCursor(null);
       void setAt(null);
@@ -442,7 +475,7 @@ export default function App() {
    */
   const seededRun = useRef<string | null>(null);
   useEffect(() => {
-    if (!runId || history === null || seededRun.current === runId) return;
+    if (!runId || history === null || sameRun(seededRun.current, runId)) return;
     seededRun.current = runId;
     if (at !== null) setCursor(indexAtElapsed(timeline, at));
   }, [runId, history, timeline, at]);
