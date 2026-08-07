@@ -2034,6 +2034,25 @@ fn parse_threshold(raw: &str) -> verifier::Severity {
 }
 
 impl Review {
+    /// Point the verifier's file tools at the tree the change is actually in.
+    ///
+    /// The verifier is handed the diff as text and then reads the repository to check it against.
+    /// Without this it reads the process's working directory — the main checkout — which does not
+    /// contain the change, so every `Read` and `Grep` it makes describes the code as it was before.
+    /// On a live run that produced three consecutive blocking findings saying the diff's changes
+    /// "are not actually present in the repository": true of the tree it could see, and the wrong
+    /// conclusion, which sent the implementer back to fix work that was never broken.
+    ///
+    /// Set here rather than at construction because [`Review::build`] runs before the worktree
+    /// exists — deliberately, so a misconfigured verifier fails the run before an implementer
+    /// session has been spent on it. This is the earliest moment the path is known.
+    ///
+    /// The analyst kept alive for revisions is left rooted at the checkout: it owns the plan and
+    /// reasons about the repository, not about the diff.
+    fn rooted_at(&mut self, worktree: &std::path::Path) {
+        self.verifier.files = Some(worktree.to_path_buf());
+    }
+
     fn build(run: &Run<'_>, plan: &PlanOutcome) -> Result<Option<Self>, PlanError> {
         let &Run {
             client,
@@ -2063,7 +2082,12 @@ impl Review {
             max_turns: cfg.max_turns,
             system_prompt: cfg.system_prompt,
             plugins: plugins_verifier,
-            files: cfg.files,
+            // Left unset here, and set by `rooted_at` once the worktree exists. `cfg.files` is the
+            // process's working directory — the main checkout — which does not contain the change
+            // this node reviews. Leaving it None means a review that was never rooted loses its file
+            // tools and says so, rather than quietly reading the wrong tree and reporting the change
+            // as missing.
+            files: None,
             ledger: Some(Arc::clone(ledger)),
         };
 
@@ -2466,7 +2490,7 @@ async fn fork_and_converge(
 
     // Built before the fork so a misconfigured verifier fails the run here rather than after an
     // implementer session and a sandboxed test run have already been spent on it.
-    let review = Review::build(run, plan)?;
+    let mut review = Review::build(run, plan)?;
 
     // The worktree first, because the red team writes the change's tests into it and cannot do
     // that until it exists.
@@ -2474,6 +2498,12 @@ async fn fork_and_converge(
         .prepare()
         .await
         .map_err(|e| PlanError::node("implementer", e))?;
+
+    // And now the verifier can be told where the change lives. It is built above, before there is
+    // a worktree to name, so this is the earliest point it can be rooted — see `rooted_at`.
+    if let Some(review) = review.as_mut() {
+        review.rooted_at(worktree.as_path());
+    }
 
     // Red team next, not alongside: it characterises the baseline and writes the tests the change
     // will be judged against, and both have to be done before the implementer opens the tree. The
