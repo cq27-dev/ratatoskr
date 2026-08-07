@@ -276,6 +276,34 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// A tool call's arguments, bounded but still parseable.
+///
+/// Truncating the serialized JSON is what a reader wants and what a parser cannot use: cutting
+/// `{"file_path":"x","old_string":"..."}` mid-string leaves text that no longer parses, so every
+/// consumer downstream loses ALL the arguments rather than the long one. `Read` survived it only by
+/// being short enough to fit; `Edit` and `Write` never did. Bounding each value instead keeps the
+/// shape intact, so the field a reader identifies the call by is always there.
+fn abridged_args(raw: &str, max_value: usize) -> String {
+    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
+        // Not JSON to begin with — nothing to preserve, so bound the whole thing.
+        return truncate(raw, 200);
+    };
+    fn walk(v: &mut serde_json::Value, max: usize) {
+        match v {
+            serde_json::Value::String(s) => {
+                if s.chars().count() > max {
+                    *s = truncate(s, max);
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|i| walk(i, max)),
+            serde_json::Value::Object(map) => map.values_mut().for_each(|i| walk(i, max)),
+            _ => {}
+        }
+    }
+    walk(&mut parsed, max_value);
+    parsed.to_string()
+}
+
 /// Start an agent, metered.
 ///
 /// The only place in this crate that constructs one. Every model call therefore carries the usage
@@ -667,7 +695,7 @@ impl AgentHook for ObservabilityHook {
         tracing::info!(
             kind = "tool_call",
             tool = event.tool_name,
-            args = %truncate(event.args, 200),
+            args = %abridged_args(event.args, 120),
             "tool call"
         );
         ToolCallAction::Run
@@ -1481,6 +1509,37 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_edits_arguments_survive_being_bounded() {
+        // The dashboard identifies a call by `file_path`. Truncating the serialized JSON cut
+        // `Edit` mid-`old_string`, leaving text that would not parse — so the feed showed no
+        // argument at all for the one tool whose subject a reader most wants to see.
+        let long = "x".repeat(4000);
+        let raw = format!(
+            r#"{{"file_path":"crates/foo/src/lib.rs","old_string":"{long}","new_string":"{long}"}}"#
+        );
+        let out = super::abridged_args(&raw, 120);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("stays valid JSON, which is the whole point");
+        assert_eq!(parsed["file_path"], "crates/foo/src/lib.rs");
+        assert!(
+            parsed["old_string"].as_str().unwrap().chars().count() <= 121,
+            "the long value is still bounded"
+        );
+        assert!(
+            out.len() < 500,
+            "the log line stays readable: {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn arguments_that_are_not_json_are_still_bounded() {
+        let out = super::abridged_args(&"y".repeat(9000), 120);
+        assert!(out.chars().count() <= 201, "{}", out.chars().count());
+    }
+
     use super::*;
 
     /// A result carrying one text block.

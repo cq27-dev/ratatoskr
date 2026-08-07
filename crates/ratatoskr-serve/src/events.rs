@@ -383,6 +383,61 @@ mod tests {
     }
 
     #[test]
+    fn the_red_teams_two_names_arrive_as_the_one_the_pipeline_knows() {
+        // It checkpoints as `red_team` and runs as `redteam`. Unnormalised, its events belong to
+        // no stage: the node stays dark while it is plainly working, which is what a live run
+        // showed with 36 events under the other spelling.
+        let running: Value = serde_json::from_str(&agent_line("r1", "redteam")).unwrap();
+        assert_eq!(to_event(&running).node.as_deref(), Some("red_team"));
+
+        // The checkpoint side already uses the stage name and must pass through untouched.
+        let done: Value = serde_json::from_str(
+            r#"{"timestamp":"t","kind":"checkpoint","node":"red_team","spans":[{"run_id":"r1"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(to_event(&done).node.as_deref(), Some("red_team"));
+    }
+
+    #[test]
+    fn an_edit_is_identified_by_its_path_like_a_read_is() {
+        // These two halves live in different crates: the agent writes `args`, the dashboard reads
+        // it. When the agent bounded the serialized JSON rather than its values, an `Edit` arrived
+        // cut mid-`old_string`, parsed as nothing, and showed no path — while `Read` looked fine
+        // because its arguments were short enough to survive. Pin both shapes.
+        let record = |tool: &str, args: serde_json::Value| -> Value {
+            serde_json::json!({
+                "timestamp": "t",
+                "kind": "tool_call",
+                "tool": tool,
+                "args": args.to_string(),
+                "spans": [{"name": "run", "run_id": "r1"}],
+            })
+        };
+
+        let read = record(
+            "Read",
+            serde_json::json!({"file_path": "crates/foo/src/lib.rs"}),
+        );
+        assert_eq!(
+            to_event(&read).arg.as_deref(),
+            Some("crates/foo/src/lib.rs")
+        );
+
+        let edit = record(
+            "Edit",
+            serde_json::json!({
+                "file_path": "crates/foo/src/lib.rs",
+                "old_string": "a",
+                "new_string": "b",
+            }),
+        );
+        assert_eq!(
+            to_event(&edit).arg.as_deref(),
+            Some("crates/foo/src/lib.rs")
+        );
+    }
+
+    #[test]
     fn attribution_comes_from_a_field_or_the_span_list() {
         let from_span: Value = serde_json::from_str(&agent_line("r1", "scout")).unwrap();
         assert_eq!(run_id_of(&from_span), Some("r1"));
