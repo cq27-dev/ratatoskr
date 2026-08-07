@@ -409,6 +409,8 @@ fn build_red_team(
             Some(Arc::clone(&ctx.ledger)),
         )?,
         repo_path: ctx.repo_path.clone(),
+        worktree_root: ctx.config.worktree.root.clone(),
+        baseline_branch: format!("ratatoskr/{short}-baseline"),
         sandbox: ctx.config.sandbox.clone(),
         name: format!("ratatoskr-redteam-{short}"),
         classifier,
