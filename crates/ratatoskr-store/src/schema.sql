@@ -60,7 +60,11 @@ CREATE TABLE IF NOT EXISTS events (
     PRIMARY KEY (run_id, seq)
 );
 
-CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, seq);
+-- No index on (run_id, seq) here: the PRIMARY KEY above already is one, and on a rowid table
+-- SQLite backs it with exactly that. A second identical index served no query and doubled the
+-- index writes on the highest-volume table in the schema — every event of every run. Dropped
+-- rather than merely not created, so an existing store loses it too.
+DROP INDEX IF EXISTS idx_events_run;
 
 -- What a run is FOR, which nothing else in the schema can answer.
 --
@@ -73,3 +77,9 @@ CREATE TABLE IF NOT EXISTS run_tags (
 );
 
 CREATE INDEX IF NOT EXISTS idx_run_tags_tag ON run_tags(tag);
+
+-- The run list, which is the only query on a timer: every open dashboard re-reads it every ten
+-- seconds. Without this it is a full scan of `runs` plus a temp B-tree for the sort — nothing at
+-- seven runs, a scan per tab per ten seconds at ten thousand. The columns and their directions
+-- match the ORDER BY exactly, because a mismatch leaves SQLite sorting anyway.
+CREATE INDEX IF NOT EXISTS idx_runs_recent ON runs(updated_at DESC, run_id DESC);
