@@ -167,7 +167,46 @@ merged, and a project switcher appears once there is more than one:
 cargo run -p ratatoskr-cli -- serve --project ~/src/one --project ~/src/two
 ```
 
-Bind it to loopback — the default — and keep it there. There is no auth, and it can start runs.
+### Hosting it
+
+Loopback — the default — needs no accounts: whoever can reach the port already owns the checkout.
+An instance other people can reach is different, because the dashboard can start runs, and a run
+drives a coding CLI against the repository and spends API credits.
+
+Two things are gated. **Acting** — starting a run, answering a node's clarification — always needs
+an `operator` session, on every project. **Reading** needs a session too, unless the project was
+named with `--public`.
+
+```sh
+RATATOSKR_PASSWORD='...' ratatoskr users add kk --role operator
+ratatoskr serve --addr 0.0.0.0:7878 --public ratatoskr --secure-cookies
+```
+
+The password comes from the environment, never an argument: an argument is visible to every process
+on the machine through `ps` and is written to your shell history.
+
+`--public` means genuinely public. Everything a run recorded is then readable by anyone: the issue
+text, the model's output, and the contents of every file its tools read. A private project is
+hidden rather than refused — a stranger gets the same answer for "private" as for "no such
+project", so the list of repositories this machine works on stays private too.
+
+Put TLS in front of it and pass `--secure-cookies`, which marks the session cookie `Secure` and
+gives it the `__Host-` prefix. Leave it off for loopback: a browser discards a `Secure` cookie sent
+over plain http, and sign-in then fails in a way that looks like a wrong password.
+
+The endpoint a run process calls to ask a human a question is not on that listener at all. It binds
+loopback separately (`--internal-addr`), so it is unreachable from outside by construction rather
+than by a rule that has to keep being enforced.
+
+| | reads a public project | reads a private one | starts runs, answers questions | manages accounts |
+|---|---|---|---|---|
+| nobody | yes | | | |
+| `viewer` | yes | yes | | |
+| `operator` | yes | yes | yes | |
+| `admin` | yes | yes | yes | yes |
+
+`ratatoskr users list`, `role`, `passwd`, `disable` and `enable` manage accounts. A role change or a
+disable reaches an open browser on its next request — neither waits for the session to lapse.
 
 The UI is a separate build artifact and is optional: without it you still get the JSON API
 (`/api/runs`, `/api/runs/{id}`, `/api/runs/{id}/nodes/{node}`).
@@ -432,7 +471,7 @@ read-only. Ratatoskr warns when it is pointed at a nested root.
 | `ratatoskr-nodes` | The nodes, plus the `run_plan` / `run_full` executors and the converge loop. |
 | `ratatoskr-exec` | Git worktrees and sandboxed command execution. |
 | `ratatoskr-store` | SQLite checkpoint store, single-writer by construction. |
-| `ratatoskr-serve` | Read-only HTTP API over the store, the run launcher, and the dashboard UI. |
+| `ratatoskr-serve` | HTTP API over the store (read-only on it), the run launcher, sessions and roles, and the dashboard UI. |
 | `ratatoskr-cli` | The `ratatoskr` binary. |
 
 ## Development

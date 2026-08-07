@@ -11,6 +11,12 @@ bson.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
+# Hosted-instance identity: argon2 for passwords, sha2 for session-token digests. `uuid` for
+# principal ids. See src/auth.rs.
+argon2.workspace = true
+rand_core.workspace = true
+sha2.workspace = true
+uuid.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 

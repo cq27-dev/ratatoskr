@@ -77,5 +77,18 @@ reqwest = { version = "0.13", default-features = false, features = ["json"] }
 http = "1"
 # `fs` only: ServeDir/ServeFile for the built dashboard assets.
 tower-http = { version = "0.7", features = ["fs"] }
+# Already in the tree under axum; a direct dev-dependency so serve's tests can drive its router.
+tower = "0.5"
 # Phase 3 execution: MicroVM sandbox + ACP client for driving a coding CLI.
 microsandbox = "0.6.8"
+# Hosted-instance identity. Argon2id is the current default recommendation for passwords, and the
+# PHC string it emits carries its own parameters — so raising the cost later applies on next login
+# rather than needing a migration. `sha2` because a session token is stored as a digest, so a
+# leaked auth database cannot be replayed against a live server.
+argon2 = "0.5"
+sha2 = "0.10"
+# Pinned to 0.6 because that is the rand_core `password-hash` speaks, and `SaltString::generate`
+# takes its RNG trait — a 0.9 RNG will not satisfy it. `getrandom` is what makes `OsRng` exist at
+# all: argon2's own `rand` feature only enables the rand_core *dependency*, not its OS entropy
+# source, and it exposes no way to turn this on from there.
+rand_core = { version = "0.6", features = ["getrandom"] }

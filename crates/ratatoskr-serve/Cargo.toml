@@ -21,6 +21,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `ServiceExt::oneshot`, to drive the real router in tests. Authorization that is only unit-tested
+# proves the predicate, not that any route calls it.
+tower = { workspace = true, features = ["util"] }
 # Only so `every_run_status_is_classified` can enumerate the real variants: `is_terminal` matches
 # on strings, so without this a new status silently reads as still-executing.
 ratatoskr-core.workspace = true

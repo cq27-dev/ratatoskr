@@ -1335,3 +1335,86 @@ a:focus-visible {
     opacity: 1;
   }
 }
+
+/*
+ * ── Identity ────────────────────────────────────────────────────────────────
+ *
+ * In the masthead, because who is about to start a run is context you want visible rather than
+ * behind a dialog you dismissed. Quiet by default: on a loopback instance with no accounts this is
+ * a single word nobody needs to read.
+ */
+.who,
+.signin {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.who-name {
+  color: var(--fg);
+}
+
+.who-role {
+  color: var(--muted);
+}
+
+.who-in,
+.who-out {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.who-in:hover,
+.who-out:hover {
+  color: var(--fg);
+}
+
+.signin input {
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  padding: 4px 6px;
+  font: inherit;
+  letter-spacing: inherit;
+  color: var(--fg);
+  /* A fixed width so the masthead does not resize as you type into it. */
+  width: 14ch;
+}
+
+.signin input::placeholder {
+  color: var(--muted);
+}
+
+.signin input:focus-visible {
+  outline: 1px solid var(--fg);
+  outline-offset: -2px;
+}
+
+.signin button {
+  background: transparent;
+  border: 1px solid var(--rule);
+  padding: 4px 8px;
+  font: inherit;
+  letter-spacing: inherit;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.signin button:hover:not(:disabled) {
+  background: var(--hazard);
+  border-color: var(--hazard);
+  color: var(--bg);
+}
+
+.signin button:disabled {
+  color: var(--muted);
+  cursor: default;
+}

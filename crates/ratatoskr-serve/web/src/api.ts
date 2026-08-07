@@ -61,7 +61,26 @@ export interface NodeTelemetry {
 /** A watched project. Each has its own store, worktrees and logs; nothing is shared. */
 export interface ProjectView {
   slug: string;
-  dir: string;
+  /** Absent for a caller who is not signed in — the server does not tell strangers its paths. */
+  dir?: string;
+}
+
+/** What a role may do. Ordered weakest-first, mirroring the server's `Role`. */
+export type Role = "viewer" | "operator" | "admin";
+
+/**
+ * Who the viewer is. Every field is absent when nobody is signed in, which is a valid state and
+ * not an error: an anonymous caller can read a public project.
+ */
+export interface Me {
+  principal_id?: string;
+  display_name?: string;
+  role?: Role;
+}
+
+/** Whether this role may start runs and answer clarifications. */
+export function mayAct(role: Role | undefined): boolean {
+  return role === "operator" || role === "admin";
 }
 
 export interface RunSummary {
@@ -109,10 +128,49 @@ export const LIVE: ReadonlySet<string> = new Set([
   "pending",
 ]);
 
+/**
+ * Thrown when the server says who you are is the problem.
+ *
+ * Carried as a type rather than a message so the dashboard can tell the two apart: 401 means a
+ * sign-in would help and the form is worth showing, 403 means it would not.
+ */
+export class AuthRequired extends Error {
+  constructor(public readonly status: number) {
+    super(status === 403 ? "not allowed" : "sign in");
+  }
+}
+
 async function getJSON<T>(url: string): Promise<T> {
   const res = await fetch(url);
+  if (res.status === 401 || res.status === 403) throw new AuthRequired(res.status);
   if (!res.ok) throw new Error(`${res.status} ${url}`);
   return (await res.json()) as T;
+}
+
+/** Who the viewer is. Never fails on "nobody" — that is an answer. */
+export const whoami = () => getJSON<Me>("/api/auth/me");
+
+/** Exchange a username and password for a session cookie. */
+export async function login(username: string, password: string): Promise<Me> {
+  const res = await fetch("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  const body: unknown = await res.json().catch(() => null);
+  if (!res.ok) {
+    const message =
+      body && typeof body === "object" && "error" in body
+        ? String((body as { error: unknown }).error)
+        : `sign-in failed (${res.status})`;
+    throw new Error(message);
+  }
+  return body as Me;
+}
+
+/** End this session. Succeeds even if there was not one, so a stale tab can always get clean. */
+export async function logout(): Promise<void> {
+  await fetch("/api/auth/logout", { method: "POST" });
 }
 
 const scope = (project: string) =>

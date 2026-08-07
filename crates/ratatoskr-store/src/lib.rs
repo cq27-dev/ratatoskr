@@ -64,6 +64,7 @@ pub enum StoreError {
     Unsupported { found: u32 },
 }
 
+pub mod auth;
 pub mod bundle;
 
 /// A per-node checkpoint snapshot read back from the `checkpoints` table.
@@ -129,6 +130,22 @@ pub struct EventRow {
     pub payload_json: String,
 }
 
+/// Open a SQLite file the way every database in this crate wants it, creating its directory.
+///
+/// WAL so readers (`status`, `serve`) never block on the writer. `busy_timeout` covers the brief
+/// moments a WAL checkpoint does take the write lock — without it a concurrent reader gets a
+/// sporadic `SQLITE_BUSY` instead of waiting.
+pub(crate) fn open_sqlite(path: &Path) -> Result<Connection, StoreError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")?;
+    Ok(conn)
+}
+
 /// A handle to the checkpoint database. Cheap to clone (shares the guarded connection).
 #[derive(Clone)]
 pub struct Store {
@@ -139,18 +156,7 @@ impl Store {
     /// Open (creating if needed) the checkpoint database at `path`, in WAL mode, with the schema
     /// applied. WAL means Phase 5's read-only `status` command won't block on the writer.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let conn = Connection::open(path)?;
-        // WAL so readers (`status`, `serve`) never block on the writer. `busy_timeout` covers the
-        // brief moments a WAL checkpoint does take the write lock — without it a concurrent reader
-        // gets a sporadic `SQLITE_BUSY` instead of waiting.
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")?;
-        Self::from_connection(conn)
+        Self::from_connection(open_sqlite(path.as_ref())?)
     }
 
     /// An in-memory store, for tests and for Phase 1's `ratatoskr ask` (no durable state needed).
