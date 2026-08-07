@@ -34,6 +34,13 @@ pub struct ImplementerOutput {
     pub diff_summary: String,
     #[serde(default)]
     pub touched_files: Vec<String>,
+    /// Of those, the ones where a line that was already there was removed or replaced.
+    ///
+    /// What the referee gate reads. Adding a test is work worth having from an implementer;
+    /// rewriting one is the shortcut the gate refuses, and a path on its own cannot tell them
+    /// apart.
+    #[serde(default)]
+    pub rewritten_files: Vec<String>,
     pub failing_tests: Vec<String>,
     pub passing_tests: Vec<String>,
     pub exit_code: i32,
@@ -184,11 +191,15 @@ impl ImplementerNode {
         // Diff/touched reads are best-effort — don't fail the attempt if they hiccup.
         let diff_summary = worktree::diff_stat(worktree).await.unwrap_or_default();
         let touched_files = worktree::touched_files(worktree).await.unwrap_or_default();
+        let rewritten_files = worktree::rewritten_files(worktree)
+            .await
+            .unwrap_or_default();
 
         Ok(ImplementerOutput {
             worktree_path: worktree.as_path().display().to_string(),
             diff_summary,
             touched_files,
+            rewritten_files,
             failing_tests: tests.failing,
             passing_tests: tests.passing,
             exit_code: tests.exit_code,
@@ -300,20 +311,32 @@ mod tests {
 
     #[test]
     fn the_native_preamble_states_the_rules_a_run_actually_enforces() {
-        // The prompt lives in a separate file, so nothing in the type system ties it to the gates
-        // it describes. These are the four an iteration is actually rejected or re-driven on: a
-        // prompt that stopped mentioning one would leave the model to discover it by failing.
-        let p = NATIVE_PREAMBLE;
-        assert!(p.contains("REFEREE GATE"), "the hard-rejection rule");
+        // The prompt lives in a separate file, so nothing in the type system ties it to what the
+        // run actually does. Asserted on the facts rather than the wording: the prompt is meant to
+        // read like a briefing and gets rewritten, and a test keyed to its phrasing would either
+        // fail on every edit or quietly stop checking anything.
+        // Whitespace-collapsed, so a reflowed paragraph is not a failing test.
+        let p = NATIVE_PREAMBLE
+            .to_ascii_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Rewriting a test comes back; adding one does not. Both halves matter — a prompt that
+        // says only the first leaves an implementer writing untested code to stay safe.
+        assert!(p.contains("rewrote") || p.contains("rewrite"), "the gate");
         assert!(
-            p.contains("conftest.py") && p.contains("Cargo.toml"),
-            "the referee files"
+            p.contains("adding one is never held against you"),
+            "and its limit"
         );
-        assert!(p.contains("DEFINITION OF DONE"), "when to stop");
+        assert!(
+            p.contains("maymodifytests"),
+            "how a real exemption is declared"
+        );
+        assert!(p.contains("stopping is a claim"), "when to stop");
         assert!(p.contains("exactly once"), "Edit's uniqueness contract");
-        assert!(p.contains("DIAGNOSTIC"), "the re-driven path");
+        assert!(p.contains("diagnostic"), "the re-driven path");
         // It is told there is nobody to ask, which is the fact every interactive prompt assumes
         // the opposite of.
-        assert!(p.contains("no human") || p.contains("There is no human"));
+        assert!(p.contains("nobody to ask"));
     }
 }

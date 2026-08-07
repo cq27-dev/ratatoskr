@@ -1187,6 +1187,7 @@ fn node_agent_config(
             max_tokens: None,
             temperature: None,
             params: None,
+            session: Default::default(),
         },
         None => route(config, node)?,
     };
@@ -2291,7 +2292,8 @@ async fn fork_and_converge(
         // Did the change edit the referee? Checked BEFORE `tests_clean` is trusted: a conftest.py
         // that rewrites every outcome, or an edited test, makes the passing/failing sets describe a
         // bar the change wrote for itself.
-        let referee = converge::referee_touches(&impl_out.touched_files, engine.may_modify_tests());
+        let referee =
+            converge::referee_touches(&impl_out.rewritten_files, engine.may_modify_tests());
 
         // What to do next. The referee check comes first, then the test gate, then the review: a
         // moved referee makes the test result meaningless, and a test result is stronger evidence
@@ -2634,6 +2636,7 @@ mod agent_config_tests {
                 max_tokens: None,
                 temperature: None,
                 params: None,
+                session: Default::default(),
             },
         );
 
@@ -2716,6 +2719,7 @@ mod agent_config_tests {
                 max_tokens: None,
                 temperature: None,
                 params: None,
+                session: Default::default(),
             },
         );
         assert!(classifier_enabled(&engine, &config));

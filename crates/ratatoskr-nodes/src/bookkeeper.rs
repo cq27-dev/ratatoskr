@@ -681,6 +681,7 @@ mod tests {
                 worktree_path: "/tmp/wt".into(),
                 diff_summary: diff.into(),
                 touched_files: touched.iter().map(|s| (*s).to_string()).collect(),
+                rewritten_files: Vec::new(),
                 failing_tests: Vec::new(),
                 passing_tests: Vec::new(),
                 exit_code: 0,

@@ -10,7 +10,7 @@ pub use worktree::{
     ManagedWorktree, WorktreePath, WorktreeSurvey, create as create_worktree,
     delete_branch as delete_worktree_branch, diff_text, head_sha,
     managed_branches as managed_worktree_branches, prune as prune_worktrees,
-    remove as remove_worktree, survey as survey_worktrees,
+    remove as remove_worktree, rewritten_files, survey as survey_worktrees,
 };
 
 /// Errors from the worktree module (git subprocess failures).

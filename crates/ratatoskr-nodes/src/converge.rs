@@ -87,16 +87,22 @@ pub fn referee_touches(touched: &[String], exempt: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// What to send back when the iteration moved the referee. Names the offending files *and* the
-/// exemption, so a task that legitimately writes tests but never declared it learns how to instead
-/// of churning silently to the iteration wall.
+/// What to send back when the iteration rewrote the referee. Names the offending files *and* the
+/// exemption, so a task that legitimately rewrites tests but never declared it learns how to
+/// instead of churning silently to the iteration wall.
+///
+/// It also says what is *not* refused. The gate reads rewritten files, not touched ones, so a new
+/// test is always allowed — and an implementer that believes otherwise writes untested code and
+/// contorts its design to avoid a fixture it was never forbidden to extend.
 pub fn referee_correction(referee: &[String]) -> String {
     format!(
-        "You changed files that decide whether this task is done: {}. Revert them and make the \
-         change satisfy the tests as they stand — editing the tests, their runner config, or \
-         anything the runner auto-loads is not a way to pass. If this task really is supposed to \
-         change them, that has to be declared up front, before the work, in \
-         .ratatoskr/rules/*.ts with `defineDefaults({{ mayModifyTests: [\"<path>\"] }})`.",
+        "You rewrote files that decide whether this task is done: {}. Revert those edits and make \
+         the change satisfy the tests as they stand — rewriting a test, its runner config, or \
+         anything the runner auto-loads is not a way to pass. Note what this is not: *adding* a \
+         test is allowed and expected, and does not bring you here. Only removing or replacing \
+         lines that were already there does. If this task really is supposed to change existing \
+         tests, that has to be declared up front, before the work, in .ratatoskr/rules/*.ts with \
+         `defineDefaults({{ mayModifyTests: [\"<path>\"] }})`.",
         referee.join(", ")
     )
 }

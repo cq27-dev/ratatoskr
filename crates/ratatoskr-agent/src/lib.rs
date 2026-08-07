@@ -1555,6 +1555,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             params: None,
+            session: Default::default(),
         };
         let answer = run_structured(NodeRun {
             node: "livetest",
@@ -1622,6 +1623,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             params: None,
+            session: Default::default(),
         };
         let answer = run_structured(NodeRun {
             node: "usagetest",

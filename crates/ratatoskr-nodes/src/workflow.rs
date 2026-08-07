@@ -163,7 +163,7 @@ fn infer_status(
     review: Option<&verifier::VerifierOutput>,
     threshold: verifier::Severity,
 ) -> RunStatus {
-    let referee = converge::referee_touches(&implementer.touched_files, may_modify_tests);
+    let referee = converge::referee_touches(&implementer.rewritten_files, may_modify_tests);
     if !referee.is_empty() {
         tracing::warn!(files = ?referee, "run touched the referee; not converged");
         return RunStatus::MaxIterationsReached;
@@ -532,7 +532,7 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String,
         .map_err(|e| e.to_string())?;
     let post_ran =
         converge::test_command_ran(&prev.failing_tests, &prev.passing_tests, prev.exit_code);
-    let referee = converge::referee_touches(&prev.touched_files, ctx.engine.may_modify_tests());
+    let referee = converge::referee_touches(&prev.rewritten_files, ctx.engine.may_modify_tests());
     // Referee first, same as the built-in loop: a moved referee makes the test sets meaningless,
     // so reverting it is what this iteration has to be told to do.
     let diagnostic = if !referee.is_empty() {
@@ -1015,6 +1015,7 @@ mod tests {
             worktree_path: "/wt".to_string(),
             diff_summary: String::new(),
             touched_files: vec![],
+            rewritten_files: Vec::new(),
             failing_tests: failing.iter().map(|s| s.to_string()).collect(),
             passing_tests: passing.iter().map(|s| s.to_string()).collect(),
             exit_code: exit,
@@ -1062,11 +1063,13 @@ mod tests {
     }
 
     #[test]
-    fn a_clean_test_run_does_not_convert_a_touched_referee_into_success() {
-        // The BenchJack shape: every test passes, because a new conftest.py says so.
+    fn a_clean_test_run_does_not_convert_a_rewritten_referee_into_success() {
+        // The BenchJack shape: every test passes, because conftest.py was rewritten to say so.
         let baseline = red(&["a"], &["b"], 1);
         let mut cheated = imp(&[], &["a", "b"], 0);
         cheated.touched_files = vec!["conftest.py".to_string()];
+        cheated.rewritten_files = vec!["conftest.py".to_string()];
+        cheated.rewritten_files = vec!["conftest.py".to_string()];
         assert_eq!(
             infer_status(&baseline, &cheated, &[], None, verifier::Severity::P2),
             RunStatus::MaxIterationsReached
@@ -1080,6 +1083,22 @@ mod tests {
                 None,
                 verifier::Severity::P2
             ),
+            RunStatus::Converged
+        );
+    }
+
+    #[test]
+    fn adding_a_test_is_not_a_referee_touch() {
+        // The gate refuses rewriting a test to make failures stop; it must not refuse writing one.
+        // An implementer that believes otherwise ships untested code and contorts its design to
+        // avoid a fixture it was never forbidden to extend.
+        let baseline = red(&["a"], &["b"], 1);
+        let mut honest = imp(&[], &["a", "b"], 0);
+        honest.touched_files = vec!["src/lib.rs".to_string(), "tests/api.rs".to_string()];
+        // Only added lines, so nothing was rewritten.
+        honest.rewritten_files = vec!["src/lib.rs".to_string()];
+        assert_eq!(
+            infer_status(&baseline, &honest, &[], None, verifier::Severity::P2),
             RunStatus::Converged
         );
     }

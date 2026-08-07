@@ -166,6 +166,7 @@ mod tests {
             worktree_path: "/w/ratatoskr/abc".into(),
             diff_summary: " store.rs | 12 ++".into(),
             touched_files: vec!["store.rs".into()],
+            rewritten_files: Vec::new(),
             failing_tests: failing.iter().map(|f| (*f).to_string()).collect(),
             passing_tests: vec!["a".into(), "b".into()],
             exit_code: if failing.is_empty() { 0 } else { 101 },

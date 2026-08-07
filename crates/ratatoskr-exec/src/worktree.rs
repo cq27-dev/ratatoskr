@@ -301,9 +301,67 @@ pub async fn touched_files(worktree: &WorktreePath) -> Result<Vec<String>, ExecE
         .collect())
 }
 
+/// Files whose diff removed or replaced a line that was already there.
+///
+/// The distinction the referee gate needs. Adding a test is work anyone would want from an
+/// implementer; rewriting one is the shortcut the gate exists to refuse, and a path on its own
+/// cannot tell the two apart. `--numstat` reports added and deleted counts per file, and a purely
+/// additive change has a deleted count of zero.
+///
+/// A rename reports as a delete plus an add, so a renamed test file counts as rewritten. That is
+/// the right answer: the test that used to run under that name no longer does.
+pub async fn rewritten_files(worktree: &WorktreePath) -> Result<Vec<String>, ExecError> {
+    let cwd = worktree.as_path();
+    // As in `diff_stat`: `-N` makes a new file visible to `diff` without staging its content.
+    git(cwd, "add -N", &["add", "-N", "."]).await?;
+    let out = git(
+        cwd,
+        "diff --numstat",
+        &["--no-pager", "diff", "--numstat", "HEAD"],
+    )
+    .await?;
+    Ok(out.lines().filter_map(rewritten_in).collect())
+}
+
+/// One `--numstat` line, when it reports a deletion. Format is `added\tdeleted\tpath`, with `-`
+/// for a binary file — which is counted as rewritten, since nothing about it can be called additive.
+fn rewritten_in(line: &str) -> Option<String> {
+    let mut fields = line.split('\t');
+    let added = fields.next()?;
+    let deleted = fields.next()?;
+    let path = fields.next()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let binary = added == "-" || deleted == "-";
+    let removed_lines = deleted.parse::<u64>().unwrap_or(0) > 0;
+    (binary || removed_lines).then(|| path.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_change_that_removes_an_existing_line_counts_as_rewritten() {
+        // Adding a test is work worth having; rewriting one is the shortcut the referee refuses,
+        // and the path alone cannot tell them apart.
+        assert_eq!(rewritten_in("12\t0\tcrates/foo/tests/api.rs"), None);
+        assert_eq!(
+            rewritten_in("3\t4\tcrates/foo/tests/api.rs").as_deref(),
+            Some("crates/foo/tests/api.rs")
+        );
+        assert_eq!(
+            rewritten_in("0\t9\ttests/gone.rs").as_deref(),
+            Some("tests/gone.rs")
+        );
+        // A binary file has no additive reading.
+        assert_eq!(
+            rewritten_in("-\t-\ttests/fixture.bin").as_deref(),
+            Some("tests/fixture.bin")
+        );
+        assert_eq!(rewritten_in("garbage"), None);
+    }
 
     #[test]
     fn a_worktree_root_inside_the_repository_is_nested() {

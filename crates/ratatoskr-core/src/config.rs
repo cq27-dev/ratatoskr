@@ -322,6 +322,31 @@ pub struct ModelRoute {
     /// alongside the budget or the call is rejected for a cap it cannot meet.
     #[serde(default)]
     pub params: Option<toml::Value>,
+    /// Whether this node's conversation continues across attempts, or starts over each time.
+    ///
+    /// A node that is re-driven — the implementer on a converge iteration, the analyst on a
+    /// revision — is given a diagnostic rather than the original task, and its message history
+    /// starts empty either way. What `Reuse` keeps is the *endpoint's* session: a gateway that
+    /// tracks one can carry what the previous attempt established, so the second attempt does not
+    /// re-read the tree it just edited.
+    ///
+    /// Default is `Fresh`, because reuse is only sound where a later attempt genuinely continues
+    /// the earlier one. A node re-run on an unrelated task under a reused session would inherit
+    /// context that has nothing to do with it.
+    #[serde(default)]
+    pub session: SessionScope,
+}
+
+/// Whether a node's endpoint session continues across attempts within a run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionScope {
+    /// A new session per attempt. The safe default.
+    #[default]
+    Fresh,
+    /// One session for this node across the whole run, so a re-driven attempt continues where the
+    /// last one stopped.
+    Reuse,
 }
 
 /// The per-call output cap when a route does not set one.
@@ -398,6 +423,7 @@ impl Default for RatatoskrConfig {
             max_tokens: None,
             temperature: None,
             params: None,
+            session: SessionScope::default(),
             provider: provider.to_string(),
             model: model.to_string(),
         };
