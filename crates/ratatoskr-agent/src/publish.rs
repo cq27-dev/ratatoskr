@@ -1,4 +1,4 @@
-//! The one tool that writes somewhere other than this machine.
+//! The two tools that write somewhere other than this machine.
 //!
 //! A run's output has to leave the store to be worth anything, and the tracker already knows how to
 //! receive it. Rather than reimplement a maintained CLI — its auth handling, its API versioning,
@@ -18,6 +18,9 @@ use serde_json::json;
 
 /// The name this is offered under.
 pub const GH: &str = "gh";
+
+/// The name the push tool is offered under.
+pub const PUSH: &str = "git_push";
 
 /// How long one `gh` call may take. A tracker that is slow or unreachable must not hold a run open
 /// indefinitely — the work is already done and checkpointed by the time this runs.
@@ -207,8 +210,204 @@ fn truncate(s: &str) -> String {
     }
 }
 
+/// The branch a run may push, and the repository it lives in.
+///
+/// Bound when the publisher is built, from the run that created the branch. This is the whole
+/// safety argument: the tool takes NO arguments, so there is no branch name, remote, refspec or
+/// flag for a model to supply. An allowlist would have to decide whether a supplied string is
+/// acceptable; there is no supplied string to decide about.
+#[derive(Debug, Clone)]
+pub struct PushAccess {
+    /// Where `git` runs. Worktrees share the main checkout's refs, so the repository root can push
+    /// a branch that is checked out in a linked worktree.
+    pub repo_root: PathBuf,
+    /// The branch this run authored. Must be one this repository manages.
+    pub branch: String,
+}
+
+/// Whether `branch` is one a run authored and may therefore push.
+///
+/// The prefix is how this repository marks the branches it creates and reclaims, so it is also the
+/// right boundary for what a run may publish. Everything else is someone's work: `main`, a
+/// colleague's feature branch, a release branch.
+///
+/// The rest of the checks are about the name being a name. A refspec is `src:dst`, a leading `-`
+/// is a flag, and `..`/`~`/`^`/`?`/`*`/`[`/whitespace are revision syntax — none of which can
+/// appear in a branch this repository created, so a name carrying one is not one of ours however
+/// it came to be constructed.
+pub fn pushable(branch: &str) -> bool {
+    branch.starts_with("ratatoskr/")
+        && !branch.starts_with('-')
+        && !branch.contains("..")
+        && !branch.contains([':', '~', '^', '?', '*', '[', '\\', ' ', '\t', '\n', '\r'])
+}
+
+/// Exactly what gets exec'd. Split out so the argument list is a thing a test can assert on.
+///
+/// Fully-qualified on both sides of the refspec: `push origin <branch>` consults `push.default`
+/// and the remote's configured refspecs to decide what it means, and this must mean one thing.
+/// No `--force`, no `--tags`, no `--delete` — a run publishes its own work and never rewrites
+/// anyone's history.
+fn push_argv(branch: &str) -> Vec<String> {
+    vec![
+        "push".to_string(),
+        "--set-upstream".to_string(),
+        "origin".to_string(),
+        format!("refs/heads/{branch}:refs/heads/{branch}"),
+    ]
+}
+
+/// The push tool's declaration: no parameters, deliberately.
+pub fn push_declaration() -> Tool {
+    let mut tool = Tool::default();
+    tool.name = PUSH.into();
+    tool.description = Some(
+        "Push this run's own branch to `origin`, so a pull request can be opened against it. \
+         Takes no arguments: the branch is the one this run created, and no other branch can be \
+         pushed. Call it before `gh pr create` — a pull request cannot be opened for a branch the \
+         remote has never seen."
+            .to_string()
+            .into(),
+    );
+    tool.input_schema = Arc::new(
+        json!({ "type": "object", "properties": {} })
+            .as_object()
+            .cloned()
+            .expect("schema literal"),
+    );
+    tool
+}
+
+/// The implementation, bound to one run's branch.
+pub fn push_implementation(name: &str, access: &PushAccess) -> Option<DynamicTool> {
+    if name != PUSH {
+        return None;
+    }
+    let access = access.clone();
+    Some(crate::answered_by(
+        push_declaration(),
+        move |_ctx, _args| {
+            let access = access.clone();
+            Box::pin(async move { push(&access).await.map(ToolOutput::text) })
+        },
+    ))
+}
+
+async fn push(access: &PushAccess) -> Result<String, ToolExecutionError> {
+    // Checked here rather than only at construction: this is the last point before the process
+    // runs, and it is the check that has to hold no matter how the access came to be built.
+    if !pushable(&access.branch) {
+        return Err(ToolExecutionError::other(format!(
+            "refusing to push `{}`: a run may push only the branch it authored",
+            access.branch
+        )));
+    }
+    let out = tokio::time::timeout(
+        CALL_TIMEOUT,
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&access.repo_root)
+            .args(push_argv(&access.branch))
+            .output(),
+    )
+    .await
+    .map_err(|_| ToolExecutionError::other("git push timed out"))?
+    .map_err(|e| ToolExecutionError::other(format!("git push failed to start: {e}")))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if out.status.success() {
+        // git reports a push on stderr, so both streams carry the answer.
+        Ok(truncate(&format!(
+            "pushed {}\n{stdout}{stderr}",
+            access.branch
+        )))
+    } else {
+        // Returned as output, not as an error: the publisher can still comment on the issue, and
+        // an error would read to it as the tool being broken rather than the push being refused.
+        Ok(truncate(&format!(
+            "push failed (exit {}). The branch is not on the remote, so a pull request cannot be \
+             opened for it.\n{stdout}{stderr}",
+            out.status.code().unwrap_or(-1)
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_a_branch_this_run_authored_may_be_pushed() {
+        assert!(pushable("ratatoskr/abc12345"));
+
+        // Someone else's work, which is the whole point of the guard.
+        assert!(!pushable("main"));
+        assert!(!pushable("master"));
+        assert!(!pushable("release/2.0"));
+        assert!(!pushable("feature/colleagues-work"));
+
+        // Prefix games: the marker has to start the name, not appear in it.
+        assert!(!pushable("not-ratatoskr/abc"));
+        assert!(!pushable("../ratatoskr/abc"));
+
+        // A branch name that is trying to be something else. None of these can occur in a name
+        // this repository created, so any of them means the name did not come from us.
+        assert!(!pushable("ratatoskr/a:refs/heads/main"));
+        assert!(!pushable("ratatoskr/a b"));
+        assert!(!pushable("ratatoskr/a~1"));
+        assert!(!pushable("ratatoskr/a^"));
+        assert!(!pushable("ratatoskr/a..b"));
+        assert!(!pushable("ratatoskr/*"));
+    }
+
+    #[tokio::test]
+    async fn a_push_of_someone_elses_branch_is_refused_at_the_last_moment() {
+        // The construction site filters too, but this is the check that has to hold however the
+        // access was built — it is the last point before a process runs.
+        let access = PushAccess {
+            repo_root: ".".into(),
+            branch: "main".to_string(),
+        };
+        let err = push(&access).await.expect_err("must refuse");
+        assert!(
+            format!("{err}").contains("only the branch it authored"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_push_command_is_fully_qualified_and_never_forced() {
+        let argv = push_argv("ratatoskr/abc12345");
+        assert_eq!(
+            argv,
+            [
+                "push",
+                "--set-upstream",
+                "origin",
+                "refs/heads/ratatoskr/abc12345:refs/heads/ratatoskr/abc12345",
+            ]
+        );
+        // The properties that matter, stated so a future edit has to break them deliberately.
+        assert!(!argv.iter().any(|a| a.contains("force")), "{argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "--tags" || a == "--delete"),
+            "{argv:?}"
+        );
+    }
+
+    #[test]
+    fn the_push_tool_takes_no_arguments_at_all() {
+        // The safety argument in one assertion: there is no branch, remote, refspec or flag for a
+        // model to supply, so there is no supplied string to validate.
+        let d = push_declaration();
+        assert_eq!(d.name, PUSH);
+        let props = d
+            .input_schema
+            .get("properties")
+            .expect("schema has properties");
+        assert!(props.as_object().is_some_and(|p| p.is_empty()), "{props:?}");
+        assert!(d.input_schema.get("required").is_none());
+    }
     use super::*;
 
     fn argv(args: &[&str]) -> Vec<String> {

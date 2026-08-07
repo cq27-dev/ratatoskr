@@ -60,6 +60,8 @@ pub struct PublisherNode {
     pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
     /// The repository `gh` runs in. Also what roots the file tools it reads the diff with.
     pub files: Option<std::path::PathBuf>,
+    /// The one branch this run may push, when it has one. `None` leaves the node without the tool.
+    pub push: Option<ratatoskr_agent::publish::PushAccess>,
 }
 
 impl PublisherNode {
@@ -84,6 +86,7 @@ impl PublisherNode {
             files: self.files.clone(),
             // Reads and edits, but runs nothing.
             shell: None,
+            push: self.push.clone(),
             conversation: None,
             ledger: self.ledger.clone(),
             produces: Some("what was published, where, and why"),
@@ -124,7 +127,10 @@ fn render_prompt(input: &PublisherInput) -> String {
             );
         }
         Some(im) => {
-            let _ = write!(s, "BRANCH: {}\n\n", im.worktree_path);
+            // The branch by name, and the tree separately. These are different strings and the
+            // publisher acts on both: it pushes and opens a pull request against the branch.
+            let _ = writeln!(s, "BRANCH: {}", im.branch);
+            let _ = write!(s, "WORKTREE: {}\n\n", im.worktree_path);
             if !im.touched_files.is_empty() {
                 let _ = writeln!(s, "FILES CHANGED: {}", im.touched_files.join(", "));
             }
@@ -166,6 +172,7 @@ mod tests {
     fn implementer(failing: &[&str]) -> ImplementerOutput {
         ImplementerOutput {
             worktree_path: "/w/ratatoskr/abc".into(),
+            branch: "ratatoskr/abc".into(),
             diff_summary: " store.rs | 12 ++".into(),
             touched_files: vec!["store.rs".into()],
             rewritten_files: Vec::new(),
@@ -216,7 +223,8 @@ mod tests {
             status: "converged".into(),
             iterations: 1,
         });
-        assert!(prompt.contains("BRANCH: /w/ratatoskr/abc"));
+        assert!(prompt.contains("BRANCH: ratatoskr/abc"), "{prompt}");
+        assert!(prompt.contains("WORKTREE: /w/ratatoskr/abc"), "{prompt}");
         assert!(prompt.contains("store.rs"));
         assert!(prompt.contains("0 failing, 2 passing"));
         // The requirements travel too: they are what a description has to be checked against.

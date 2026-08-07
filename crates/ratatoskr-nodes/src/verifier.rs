@@ -167,6 +167,7 @@ impl VerifierNode {
             files: self.files.clone(),
             // Reads the diff; runs nothing — the acceptance run already happened.
             shell: None,
+            push: None,
             conversation: None,
             ledger: self.ledger.clone(),
             produces: Some(

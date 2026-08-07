@@ -123,6 +123,7 @@ impl ContextNode {
             files: self.files.clone(),
             // Reads and edits, but runs nothing.
             shell: None,
+            push: None,
             conversation: None,
             ledger: self.ledger.clone(),
             produces: Some(

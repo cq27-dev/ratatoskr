@@ -227,6 +227,7 @@ impl Node for AnalystNode {
             files: self.files.clone(),
             // Reads and edits, but runs nothing.
             shell: None,
+            push: None,
             conversation: self.conversation.as_deref(),
             ledger: self.ledger.clone(),
             produces: Some(

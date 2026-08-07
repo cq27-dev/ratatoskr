@@ -77,6 +77,7 @@ impl OverseerNode {
             files: self.files.clone(),
             // Reads and edits, but runs nothing.
             shell: None,
+            push: None,
             conversation: None,
             ledger: self.ledger.clone(),
             produces: Some("the name of the workflow to run, and why this task fits it"),

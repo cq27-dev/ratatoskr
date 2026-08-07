@@ -108,6 +108,7 @@ impl RedTeamClassifier {
             files: self.files.clone(),
             // Reads and edits, but runs nothing.
             shell: None,
+            push: None,
             conversation: None,
             ledger: self.ledger.clone(),
             produces: Some(
@@ -185,6 +186,7 @@ impl TestAuthor {
             // No shell. Writing a test is not running one, and the baseline run is what says
             // whether these fail — which at this point they should.
             shell: None,
+            push: None,
             conversation: None,
             ledger: self.ledger.clone(),
             produces: Some("tests covering the contracted interface, written before the code"),

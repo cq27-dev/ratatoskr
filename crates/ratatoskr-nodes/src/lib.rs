@@ -1598,14 +1598,34 @@ async fn publish_and_checkpoint(
         &plugins,
     )?;
     let mut tools = cfg.tools;
-    // The one tool that writes outside this machine. Added here rather than in the default list so
-    // no other node can be handed it by widening a shared constant.
+    // The tools that write outside this machine. Added here rather than in the default list so no
+    // other node can be handed one by widening a shared constant.
     tools
         .local()
         .tools
         .push(ratatoskr_agent::publish::declaration());
 
+    // Push is offered only when there is a branch to push, and only ever THAT branch: the access
+    // carries it, and the tool takes no arguments. A run with no fork has nothing to publish and
+    // is not given the tool at all.
+    let push = input
+        .implementer
+        .as_ref()
+        .map(|im| im.branch.clone())
+        .filter(|b| ratatoskr_agent::publish::pushable(b))
+        .map(|branch| ratatoskr_agent::publish::PushAccess {
+            repo_root: cfg.files.clone().unwrap_or_else(|| ".".into()),
+            branch,
+        });
+    if push.is_some() {
+        tools
+            .local()
+            .tools
+            .push(ratatoskr_agent::publish::push_declaration());
+    }
+
     let node = PublisherNode {
+        push,
         route: cfg.route,
         tools,
         policy: cfg.policy,

@@ -30,6 +30,14 @@ use crate::testrun::{Characterizer, GUEST_WORKSPACE, by_exit_code, run_acceptanc
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ImplementerOutput {
     pub worktree_path: String,
+    /// The branch this run authored, by name.
+    ///
+    /// Carried explicitly because the worktree path is not it: the path ends in the id, while the
+    /// branch is `ratatoskr/<id>`. The publisher was once shown the path under a `BRANCH:` label
+    /// and opened a pull request against the last path segment, which the remote had never heard
+    /// of.
+    #[serde(default)]
+    pub branch: String,
     #[serde(default)]
     pub diff_summary: String,
     #[serde(default)]
@@ -195,6 +203,7 @@ impl ImplementerNode {
             // the copy it owns, or one attempt edits the tree another node is reading.
             files: Some(worktree.as_path().to_path_buf()),
             shell: Some(self.shell_access(worktree)),
+            push: None,
             conversation: Some(&conversation),
             ledger: self.ledger.clone(),
             produces: Some("a change that satisfies the plan and passes the acceptance checks"),
@@ -225,6 +234,7 @@ impl ImplementerNode {
 
         Ok(ImplementerOutput {
             worktree_path: worktree.as_path().display().to_string(),
+            branch: self.branch(),
             diff_summary,
             touched_files,
             rewritten_files,
@@ -260,6 +270,12 @@ impl ImplementerNode {
 
     fn short_id(&self) -> String {
         self.run_id.chars().take(8).collect()
+    }
+
+    /// The branch this run works on. One definition, because the name is used to create the
+    /// worktree, to push, and to open a pull request, and three spellings of it is two bugs.
+    pub fn branch(&self) -> String {
+        format!("ratatoskr/{}", self.short_id())
     }
 
     /// The initial prompt: the issue plus the analyst's requirements and risks.

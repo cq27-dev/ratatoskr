@@ -203,7 +203,7 @@ where
     M: CompletionModel + 'static,
 {
     let (builder, meter) = metered(model, preamble, max_turns, Request::of(route));
-    let agent = bind_tools(builder, &tools, None, None);
+    let agent = bind_tools(builder, &tools, None, None, None);
 
     let answer = agent.prompt(question).await;
     // No store to checkpoint to here, so it goes to the log. A one-shot question whose cost is
@@ -753,6 +753,7 @@ fn bind_tools<M: CompletionModel + 'static>(
     tools: &ToolSet,
     files: Option<&std::path::Path>,
     shell: Option<&shell::ShellAccess>,
+    push: Option<&publish::PushAccess>,
 ) -> Agent<M> {
     // An empty dynamic set moves the builder out of `NoToolConfig` without binding anything, which
     // is what lets the groups below be a plain loop over two different binding calls.
@@ -777,7 +778,7 @@ fn bind_tools<M: CompletionModel + 'static>(
                 group
                     .tools
                     .iter()
-                    .map(|tool| local_tool(tool, files, shell))
+                    .map(|tool| local_tool(tool, files, shell, push))
                     .collect(),
             ),
         };
@@ -799,8 +800,12 @@ fn local_tool(
     tool: &Tool,
     files: Option<&std::path::Path>,
     shell: Option<&shell::ShellAccess>,
+    push: Option<&publish::PushAccess>,
 ) -> DynamicTool {
     if let Some(implemented) = shell.and_then(|s| shell::implementation(&tool.name, s)) {
+        return implemented;
+    }
+    if let Some(implemented) = push.and_then(|p| publish::push_implementation(&tool.name, p)) {
         return implemented;
     }
     if let Some(root) = files {
@@ -1254,6 +1259,8 @@ pub struct NodeRun<'a> {
     /// running code in it, and only the node that has to build and test its own work is given the
     /// second.
     pub shell: Option<shell::ShellAccess>,
+    /// The branch this node may push, if any. Only the publisher is given one.
+    pub push: Option<publish::PushAccess>,
     /// Where this turn reports what it cost; `None` outside a run that records checkpoints.
     pub ledger: Option<Arc<RunLedger>>,
     /// What this node has to end up producing, in one line, for the compactor.
@@ -1312,6 +1319,7 @@ where
         skills,
         files,
         shell,
+        push,
         conversation,
         ledger,
         produces,
@@ -1374,7 +1382,13 @@ where
     // Before the set is handed to the agent: what the model could call is part of what this turn
     // was, and a reader of the run cannot reconstruct it from a config that has since changed.
     let tool_names = tools.names();
-    let agent = bind_tools(builder, &tools, files.as_deref(), shell.as_ref());
+    let agent = bind_tools(
+        builder,
+        &tools,
+        files.as_deref(),
+        shell.as_ref(),
+        push.as_ref(),
+    );
 
     // Tag every log line for this run — the hook's tool-call/text lines and rig-agent's own turn
     // logs — with the node name, so a run's agents are distinguishable in the logs. `prompt()` is
@@ -1710,6 +1724,7 @@ mod tests {
             skills: Vec::new(),
             files: Some(root.clone()),
             shell: None,
+            push: None,
             conversation: None,
             ledger: None,
             produces: Some("a summary of the change"),
@@ -1776,6 +1791,7 @@ mod tests {
             skills: Vec::new(),
             files: None,
             shell: None,
+            push: None,
             conversation: None,
             ledger: Some(Arc::clone(&ledger)),
             produces: None,
@@ -1834,6 +1850,7 @@ mod tests {
                 skills: Vec::new(),
                 files: None,
                 shell: None,
+                push: None,
                 conversation,
                 ledger: None,
                 produces: None,
