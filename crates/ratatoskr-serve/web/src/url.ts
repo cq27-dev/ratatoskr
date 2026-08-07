@@ -15,6 +15,74 @@
  * is what nuqs is here for.
  */
 import { createParser } from "nuqs";
+import { short } from "./ui/text";
+
+/**
+ * What the path names: which project, and which run.
+ *
+ * In the path rather than the query string because these two are *what you are looking at*, and a
+ * path is how a location is written down — `/ratatoskr/358e8441…` reads as a place, where
+ * `?project=…&run=…` reads as a form submission.
+ *
+ * The selected node and the scrub position stay query parameters, because they are views into that
+ * run rather than a different thing to look at. The run is written short — the same eight
+ * characters the interface shows everywhere else, the way a git short hash works; the server
+ * resolves the prefix and refuses an ambiguous one rather than picking — and because either can be absent while the run
+ * still is what you are on. Nesting them would make `//implementer` a URL that has to mean
+ * something.
+ */
+export interface Where {
+  project: string | null;
+  run: string | null;
+}
+
+/**
+ * First path segments the server has already claimed.
+ *
+ * `/api` is the JSON API and `/assets` is the built bundle; both are matched before the fallback
+ * that serves the dashboard, so a project of either name would be unreachable here. `open_all`
+ * refuses those names when opening projects, which is what keeps this from having to be enforced
+ * at read time too.
+ */
+const RESERVED = new Set(["api", "assets", "internal"]);
+
+/**
+ * Whether two run ids name the same run, allowing for one being a short form of the other.
+ *
+ * A link carries eight characters and the run list carries thirty-six, so the same run is written
+ * two ways within one page load — and code that compares them with `===` sees a *different* run at
+ * the moment the short one is expanded.
+ */
+export function sameRun(a: string | null, b: string | null): boolean {
+  if (!a || !b) return a === b;
+  return a.startsWith(b) || b.startsWith(a);
+}
+
+/** What the address bar currently names. */
+export function readPath(): Where {
+  const [project, run] = window.location.pathname
+    .split("/")
+    .filter(Boolean)
+    .map(decodeURIComponent);
+  if (!project || RESERVED.has(project)) return { project: null, run: null };
+  return { project, run: run ?? null };
+}
+
+/**
+ * Write the path, keeping whatever query string is there.
+ *
+ * The two halves of the URL have different owners — this one and nuqs — and each preserves the
+ * other's, so neither has to know when the other runs. Silent when nothing would change, so this
+ * can sit in an effect that fires on every render.
+ */
+export function writePath({ project, run }: Where): void {
+  // A run without a project is not a place: the run id alone would parse back as a project name.
+  const named = project ? (run ? [project, short(run)] : [project]) : [];
+  const path = named.length ? `/${named.map(encodeURIComponent).join("/")}` : "/";
+  if (path !== window.location.pathname) {
+    window.history.replaceState(null, "", `${path}${window.location.search}`);
+  }
+}
 
 /** An event, as far as the URL cares: something with a time. */
 interface Moment {

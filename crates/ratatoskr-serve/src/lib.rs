@@ -79,6 +79,30 @@ impl FromRef<AppState> for AuthStore {
 }
 
 impl AppState {
+    /// The project a request names and the full id of the run it names, resolving a short one.
+    ///
+    /// The dashboard puts an eight-character run id in its URLs, the way a git short hash works,
+    /// so a request can arrive naming a prefix. Resolved here — one place — rather than in each of
+    /// the four handlers that take a run id.
+    async fn project_and_run(
+        &self,
+        slug: &str,
+        run_id: &str,
+        caller: &Caller,
+        access: Access,
+    ) -> Result<(&Project, String), ApiError> {
+        let project = self.project(slug, caller, access)?;
+        let resolved = project
+            .store
+            .resolve_run(run_id)
+            .await?
+            // A prefix nothing starts with is kept as-is rather than refused here: the handlers
+            // below already answer an unknown run, and this way they answer it the same way for a
+            // short id as for a long one.
+            .unwrap_or_else(|| run_id.to_string());
+        Ok((project, resolved))
+    }
+
     /// The project a request names, if this caller may do `access` to it.
     ///
     /// Authorization lives here rather than in each handler because every project-scoped handler
@@ -481,7 +505,9 @@ async fn run_detail(
     caller: Caller,
     AxumPath((project, run_id)): AxumPath<(String, String)>,
 ) -> Result<Json<RunDetail>, ApiError> {
-    let found = state.project(&project, &caller, Access::Read)?;
+    let (found, run_id) = state
+        .project_and_run(&project, &run_id, &caller, Access::Read)
+        .await?;
     let store = &found.store;
     let config_path = found.config_path.clone();
     let run = store.run(&run_id).await?;
@@ -528,11 +554,10 @@ async fn node_checkpoints(
     caller: Caller,
     AxumPath((project, run_id, node)): AxumPath<(String, String, String)>,
 ) -> Result<Json<Vec<CheckpointView>>, ApiError> {
-    let all = state
-        .project(&project, &caller, Access::Read)?
-        .store
-        .checkpoints_for_run(&run_id)
+    let (found, run_id) = state
+        .project_and_run(&project, &run_id, &caller, Access::Read)
         .await?;
+    let all = found.store.checkpoints_for_run(&run_id).await?;
     // Every checkpoint, not just the latest: the implementer writes one per converge iteration and
     // the diagnostic progression between them is the interesting part.
     let views: Vec<CheckpointView> = all
@@ -665,7 +690,9 @@ async fn run_history(
     caller: Caller,
     AxumPath((project, run_id)): AxumPath<(String, String)>,
 ) -> Result<Json<Vec<events::LiveEvent>>, ApiError> {
-    let project = state.project(&project, &caller, Access::Read)?;
+    let (project, run_id) = state
+        .project_and_run(&project, &run_id, &caller, Access::Read)
+        .await?;
     Ok(Json(
         events::history(&project.store, &project.log_dir, &run_id).await,
     ))
@@ -677,10 +704,10 @@ async fn run_events(
     AxumPath((project, run_id)): AxumPath<(String, String)>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError>
 {
-    let dir = state
-        .project(&project, &caller, Access::Read)?
-        .log_dir
-        .clone();
+    let (found, run_id) = state
+        .project_and_run(&project, &run_id, &caller, Access::Read)
+        .await?;
+    let dir = found.log_dir.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     // Watching this run *is* holding an event stream open, so attendance is exactly this task's
     // lifetime — no disconnect handling to get wrong.
@@ -1133,6 +1160,51 @@ mod access_tests {
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
             assert!(response.headers().get("set-cookie").is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn a_short_run_id_reaches_the_same_run_as_the_long_one() {
+        // What the dashboard's URLs carry. Every run-scoped route has to resolve it, and "one
+        // handler forgot" is invisible until someone opens a link to that pane.
+        let state = state().await;
+        let project = state.projects.get("open").expect("the public project");
+        project
+            .store
+            .upsert_run("358e8441-fa9a-4ab4-bbbe-46a826455b20", None, "converged")
+            .await
+            .expect("a run");
+
+        // Compared against the full id rather than asserted to be 200: whether a route answers
+        // depends on what the run contains — `/nodes/scout` is a 404 for a run with no scout
+        // checkpoint — and the claim being made is that the short form reaches the *same run*, not
+        // that every route has something to say about it.
+        for suffix in ["", "/nodes/scout", "/history"] {
+            let short = send(
+                state.clone(),
+                get(&format!("/api/projects/open/runs/358e8441{suffix}"), None),
+            )
+            .await;
+            let full = send(
+                state.clone(),
+                get(
+                    &format!(
+                        "/api/projects/open/runs/358e8441-fa9a-4ab4-bbbe-46a826455b20{suffix}"
+                    ),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(
+                short, full,
+                "the short id took a different path at {suffix:?}"
+            );
+        }
+
+        // And a prefix nothing starts with still reads as a missing run.
+        assert_eq!(
+            send(state, get("/api/projects/open/runs/deadbeef", None)).await,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]

@@ -57,6 +57,8 @@ pub enum StoreError {
     Join(#[from] tokio::task::JoinError),
     #[error("run bundle: {0}")]
     Bundle(String),
+    #[error("`{0}` names more than one run — use more of the id")]
+    AmbiguousRun(String),
     #[error(
         "this bundle is format version {found}; this build reads up to {}. Update ratatoskr to read it",
         crate::bundle::FORMAT_VERSION
@@ -146,6 +148,9 @@ pub(crate) fn open_sqlite(path: &Path) -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
+/// The length of a run id in full: a hyphenated uuid. Anything shorter is treated as a prefix.
+const UUID_LEN: usize = 36;
+
 /// A handle to the checkpoint database. Cheap to clone (shares the guarded connection).
 #[derive(Clone)]
 pub struct Store {
@@ -226,6 +231,43 @@ impl Store {
                 )
                 .optional()?;
             Ok::<_, StoreError>(run)
+        })
+        .await?
+    }
+
+    /// The full run id a prefix names, the way git resolves a short hash.
+    ///
+    /// `Ok(None)` for a prefix nothing starts with; [`StoreError::AmbiguousRun`] when more than one
+    /// does — never a silent pick, because the two runs a prefix could mean are usually the two
+    /// you are trying to tell apart.
+    ///
+    /// A prefix scan on the primary key, so this is a range scan of an index rather than a table
+    /// scan. `LIMIT 2` because one more than one is all the answer needs.
+    pub async fn resolve_run(&self, prefix: &str) -> Result<Option<String>, StoreError> {
+        // An exact id needs no resolving, and a full uuid is the common case — the dashboard
+        // shortens for display but every internal caller has the whole thing.
+        if prefix.len() >= UUID_LEN {
+            return Ok(Some(prefix.to_string()));
+        }
+        // `LIKE` treats these as wildcards, so a prefix carrying one would match far too much.
+        // Refused rather than escaped: no real run id contains either.
+        if prefix.is_empty() || prefix.contains('%') || prefix.contains('_') {
+            return Ok(None);
+        }
+        let conn = Arc::clone(&self.conn);
+        let prefix = prefix.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("store mutex poisoned");
+            let mut stmt =
+                conn.prepare("SELECT run_id FROM runs WHERE run_id LIKE ?1 || '%' LIMIT 2")?;
+            let found = stmt
+                .query_map(params![prefix], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            match found.len() {
+                0 => Ok(None),
+                1 => Ok(Some(found.into_iter().next().expect("one row"))),
+                _ => Err(StoreError::AmbiguousRun(prefix)),
+            }
         })
         .await?
     }
@@ -647,6 +689,70 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_prefix_resolves_to_one_run_the_way_a_short_hash_does() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("358e8441-fa9a-4ab4-bbbe-46a826455b20", None, "running")
+            .await
+            .unwrap();
+        store
+            .upsert_run("6402ccea-650f-4472-bff5-24e34466fe6d", None, "running")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.resolve_run("358e8441").await.unwrap().as_deref(),
+            Some("358e8441-fa9a-4ab4-bbbe-46a826455b20")
+        );
+        // A full id resolves to itself without touching the database.
+        assert_eq!(
+            store
+                .resolve_run("6402ccea-650f-4472-bff5-24e34466fe6d")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("6402ccea-650f-4472-bff5-24e34466fe6d")
+        );
+        assert_eq!(store.resolve_run("deadbeef").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_prefix_is_an_error_rather_than_a_guess() {
+        // The two runs a prefix could mean are usually the two you are trying to tell apart, so
+        // picking one is the worst available answer.
+        let store = Store::open_in_memory().unwrap();
+        for id in [
+            "abc11111-0000-0000-0000-000000000000",
+            "abc22222-0000-0000-0000-000000000000",
+        ] {
+            store.upsert_run(id, None, "running").await.unwrap();
+        }
+        assert!(matches!(
+            store.resolve_run("abc").await,
+            Err(StoreError::AmbiguousRun(p)) if p == "abc"
+        ));
+        // One more character tells them apart.
+        assert_eq!(
+            store.resolve_run("abc1").await.unwrap().as_deref(),
+            Some("abc11111-0000-0000-0000-000000000000")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prefix_carrying_a_like_wildcard_matches_nothing() {
+        // `%` and `_` are wildcards to LIKE. Unescaped, `%` would match every run and resolve to
+        // whichever two rows came back first — an ambiguity error at best, the wrong run at worst.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("358e8441-fa9a-4ab4-bbbe-46a826455b20", None, "running")
+            .await
+            .unwrap();
+        assert_eq!(store.resolve_run("%").await.unwrap(), None);
+        assert_eq!(store.resolve_run("358e____").await.unwrap(), None);
+        assert_eq!(store.resolve_run("").await.unwrap(), None);
+    }
 
     #[tokio::test]
     async fn a_runs_history_survives_being_ingested_twice() {
