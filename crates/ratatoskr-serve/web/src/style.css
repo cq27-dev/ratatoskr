@@ -456,16 +456,17 @@ body {
   min-width: 0;
 }
 
-/* The argument that distinguishes one call from the next. Takes the free space and truncates from
-   the left: the tail of a path is what identifies it, the leading directories are shared. */
+/* The argument that distinguishes one call from the next, in plain LTR. The server trims a long
+   one from the front and marks it, so the end — the file name, the tail of a command — is what
+   survives. `direction: rtl` used to do that job here and cost more than it gave: it reverses how
+   the text selects, and it reorders a neutral character at either end of the string — so an
+   absolute path rendered with its leading `/` at the far end, reading as a directory it is not. */
 .ev-a {
   flex: 1;
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  direction: rtl;
-  text-align: left;
   color: var(--fg);
 }
 
