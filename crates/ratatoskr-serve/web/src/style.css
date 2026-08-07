@@ -10,7 +10,9 @@
   --bg: #0a0a0a;
   --panel: #121212;
   --rule: #2a2a2a;
-  --fg: #eaeaea;
+  /* 15% off white phosphor: full-strength #eaeaea on near-black glares over a long session,
+     and the accents above have to sit against it without shouting. */
+  --fg: #c7c7c7;
   --muted: #6e6e6e;
   --hazard: #e61919;
   --live: #4af626;
@@ -847,4 +849,67 @@ body {
 }
 .react-flow__panel {
   margin: 8px;
+}
+
+/* ── Structured output and model prose ──────────────────────────────────── */
+
+/* A JSON palette drawn from the existing scheme rather than a new one: strings and numbers are the
+   values you read, keys are structure, and punctuation should recede to nearly nothing. Nothing
+   here is red or the live green — those already mean failure and running, and a `false` in a
+   checkpoint is not a failure. */
+.json {
+  --j-dim: #4a4a4a;
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.j-key {
+  color: #9fb4c7;
+}
+.j-str {
+  color: #b9c99a;
+}
+.j-num {
+  color: #d9b98c;
+}
+.j-bool,
+.j-null {
+  color: #a89bc4;
+}
+.j-punc {
+  color: var(--j-dim);
+}
+
+/* Inline markers in model prose. Deliberately quiet: a feed row is one line among hundreds, and
+   emphasis that shouts costs more than the emphasis is worth. */
+.ev-d code,
+.ev-a code {
+  background: #1c1c1c;
+  border: 1px solid var(--rule);
+  padding: 0 3px;
+  color: #cfd8c4;
+}
+
+.ev-d strong {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.ev-d em {
+  color: var(--fg);
+  font-style: italic;
+}
+
+/* A fenced block inside a feed row: its own box, so a multi-line snippet does not read as more
+   feed rows. Scrolls rather than wraps — a wrapped shell command is a different command. */
+.ev-d .fence {
+  display: block;
+  margin: 4px 0 2px;
+  padding: 6px 8px;
+  background: #101010;
+  border-left: 2px solid var(--rule);
+  overflow-x: auto;
+  white-space: pre;
+  color: #cfd8c4;
 }

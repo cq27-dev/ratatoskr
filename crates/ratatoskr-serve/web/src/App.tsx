@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { InlineJson, Json, Prose } from "./format";
 import { accent, band } from "./tint";
 import { applyDerived, nodesFromEvents } from "./derive";
 import PipelineGraph from "./PipelineGraph";
@@ -422,6 +423,19 @@ const TELEMETRY = new Set(["usage"]);
  */
 const HARNESS_FILLER = "No response requested.";
 
+/**
+ * Kinds whose text was *written* by something, rather than captured from somewhere.
+ *
+ * A model's prose and this pipeline's own notices are both composed for a reader, backticks and
+ * all — the output-token warning quotes `output_tokens` and a `RUST_LOG=` invocation, and reading
+ * them as literal text wastes the markers their author put there on purpose.
+ *
+ * Everything else is captured: an acceptance step's output, a tool result, a path. Those contain
+ * asterisks and underscores because build output does, not because anyone meant emphasis, and
+ * formatting them would invent structure the producer never asked for.
+ */
+const PROSE = new Set(["model_text", "event"]);
+
 function rows(events: LiveEvent[]): Row[] {
   const out: Row[] = [];
   for (const e of events) {
@@ -524,8 +538,14 @@ function Feed({ events, node }: { events: LiveEvent[]; node: string | null }) {
                 </span>
               )}
             </span>
-            {r.arg && <span className="ev-a">{r.arg}</span>}
-            {r.detail && <span className="ev-d">{r.detail}</span>}
+            {r.arg && (
+              <span className="ev-a">
+                <InlineJson text={r.arg} />
+              </span>
+            )}
+            {r.detail && (
+              <span className="ev-d">{PROSE.has(r.kind) ? <Prose text={r.detail} /> : r.detail}</span>
+            )}
             {r.durationMs !== undefined && r.durationMs >= 1000 && (
               <span className="ev-ms">{(r.durationMs / 1000).toFixed(1)}s</span>
             )}
@@ -626,7 +646,7 @@ function Detail({
               <span>{clock(c.created_at)}</span>
             </div>
           )}
-          <pre>{JSON.stringify(c.output, null, 2)}</pre>
+          <Json value={c.output} />
         </section>
       ))}
     </div>
