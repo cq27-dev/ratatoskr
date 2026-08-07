@@ -693,6 +693,38 @@ export default function App() {
     void load();
   }, [load]);
 
+  /**
+   * Re-read the run's whole history.
+   *
+   * Both sides of the timeline are windows: the client keeps the last `FEED_LIMIT` live events, and
+   * the server replays a bounded tail to each new connection. History is the only complete account,
+   * so anything that can leave a hole between those windows — a long run, a dropped stream, a
+   * server restart — has to re-read it or the gap is permanent. A node whose checkpoint falls in
+   * such a hole is shown working forever, because the fold never sees it finish.
+   */
+  const historyReadAt = useRef(0);
+  const loadHistory = useCallback(async () => {
+    if (!runId || !project) return;
+    // Attaching replays a tail that contains every checkpoint the run has written, and each one
+    // asks for the history again — a dozen reads of the same few hundred KB in one second. One
+    // read covers all of them, so the rest are skipped rather than fetched and discarded.
+    const now = Date.now();
+    if (now - historyReadAt.current < 5_000) return;
+    historyReadAt.current = now;
+    try {
+      const h = await getHistory(project, runId);
+      if (shown.current === `${project}/${runId}`) setHistory(h);
+    } catch {
+      // A run whose log has rotated away and was never ingested has no timeline. The live feed
+      // still works, and the boxes fall back to what the store knows.
+      if (shown.current === `${project}/${runId}`) setHistory([]);
+    }
+  }, [runId, project]);
+
+  useEffect(() => {
+    void loadHistory();
+  }, [loadHistory]);
+
   // Follow the run's activity rather than polling for it. Checkpoints only say a node *finished*;
   // the stream is what shows a node working through a long turn. Node state still comes from the
   // store, so a checkpoint event is the cue to re-read it.
@@ -702,18 +734,26 @@ export default function App() {
     setLastEventAt(null);
     setAnswered(new Set());
     const stop = followRun(project, runId, {
-      onReset: () => setEvents([]),
+      onReset: () => {
+        setEvents([]);
+        // The stream restarted, so the live window starts over from wherever it replays. Whatever
+        // it does not replay is only in history, which has to be re-read to cover it.
+        void loadHistory();
+      },
       onEvent: (event) => {
         setEvents((prev) => [...prev.slice(-(FEED_LIMIT - 1)), event]);
         setLastEventAt(Date.now());
         if (event.kind === "checkpoint" || event.kind.startsWith("run_")) {
           void load();
           void refresh();
+          // A long run outgrows the live window while it runs; re-reading here keeps the timeline
+          // whole without polling for it.
+          void loadHistory();
         }
       },
     });
     return stop;
-  }, [runId, project, load, refresh]);
+  }, [runId, project, load, refresh, loadHistory]);
 
   /**
    * The run's whole timeline: its history, plus anything the stream has delivered since.
@@ -743,8 +783,12 @@ export default function App() {
    */
   const graphNodes = useMemo(() => {
     if (!detail) return [];
-    const derived = nodesFromEvents(shownEvents);
-    return derived.size ? applyDerived(detail.nodes, derived) : detail.nodes;
+    // Having a timeline is what makes the stream authoritative — not whether this position has
+    // reached a node yet. At the very start of a run the only event is the issue checkpoint, which
+    // is not a pipeline node, so the derivation is legitimately empty; falling back to the store
+    // there showed every node finished, with its final counts, at step one of the run.
+    if (!shownEvents.length) return detail.nodes;
+    return applyDerived(detail.nodes, nodesFromEvents(shownEvents));
   }, [detail, shownEvents]);
 
   // What a node announced when it started, plus its tool calls so far. A checkpoint carries the
@@ -802,23 +846,6 @@ export default function App() {
     setCursor(null);
   }, [runId]);
 
-  // The live stream keeps only a window (`FEED_LIMIT`) and starts wherever the viewer attached.
-  // Scrubbing needs the whole run, which is a different question and a different endpoint.
-  useEffect(() => {
-    if (!runId || !project) return;
-    let cancelled = false;
-    getHistory(project, runId)
-      .then((h) => {
-        if (!cancelled) setHistory(h);
-      })
-      .catch(() => {
-        // A run whose log has rotated away has no timeline. The live feed still works.
-        if (!cancelled) setHistory([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [runId, project]);
 
   useEffect(() => {
     if (!runId || !node || !project) return;
