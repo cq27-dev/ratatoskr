@@ -42,22 +42,6 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* Electron-beam sweep. Fixed and inert so it never intercepts a click. */
-body::after {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 9999;
-  background: repeating-linear-gradient(
-    0deg,
-    transparent,
-    transparent 2px,
-    rgba(0, 0, 0, 0.22) 2px,
-    rgba(0, 0, 0, 0.22) 4px
-  );
-}
-
 /* ── Shell ───────────────────────────────────────────────────────────────── */
 /* gap:1px over a --rule backdrop draws the dividing lines: no border bookkeeping. */
 .shell {
@@ -528,8 +512,19 @@ body::after {
   margin: 0 0 4px;
 }
 
+/* Electron-beam sweep, behind the node map only. Lines are LIGHT: the map sits on #0a0a0a, so a
+   darkening sweep — which is what reads as scanlines over a full viewport of text and panels —
+   is invisible here. Layered into the background so it never dims anything above it. */
 .graph {
-  background: var(--bg);
+  background:
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(255, 255, 255, 0.045) 2px,
+      rgba(255, 255, 255, 0.045) 4px
+    ),
+    var(--bg);
   position: relative;
   min-height: 0;
 }

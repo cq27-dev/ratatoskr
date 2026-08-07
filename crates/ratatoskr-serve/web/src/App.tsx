@@ -619,7 +619,7 @@ export default function App() {
     <div className="shell">
       <div className="masthead">
         <h1>
-          Ratatoskr<span className="hazard">®</span> Run Telemetry
+          Ratatoskr Run Telemetry
         </h1>
         <span className="rev">
           {error ? (
