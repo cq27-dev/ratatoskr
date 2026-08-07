@@ -148,6 +148,34 @@ fn permitted(args: &[String]) -> bool {
     }
 }
 
+/// The label this call should carry, if any.
+///
+/// Only a `pr create` is labelled: a comment is not a pull request, and labelling one would be
+/// telling a reviewer something about the wrong object.
+fn label_for(argv: &[String]) -> Option<&'static str> {
+    let creating =
+        argv.first().is_some_and(|a| a == "pr") && argv.get(1).is_some_and(|a| a == "create");
+    creating.then(run_label).flatten()
+}
+
+/// `argv` with the run's label appended, when it is a pull request being created.
+///
+/// Added here rather than asked of the caller: a reviewer needs to know what wrote the change in
+/// front of them, and a label a node has to remember is one it will eventually forget. Appended
+/// after the allowlist check, so the check still sees exactly what the caller asked for.
+///
+/// Split from `run` so the argument list is a thing a test can assert on directly. Asserting it
+/// through a failed `gh` invocation instead made the test depend on `gh` being installed *and*
+/// failing: where it is absent the error is "could not run `gh`" and carries no argv at all, so
+/// the test passed on a developer's machine and failed in a container.
+fn labelled(mut argv: Vec<String>) -> Vec<String> {
+    if let Some(label) = label_for(&argv) {
+        argv.push("--label".to_string());
+        argv.push(label.to_string());
+    }
+    argv
+}
+
 async fn run(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionError> {
     let command: Vec<String> = args
         .get("command")
@@ -178,19 +206,13 @@ async fn run(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecut
         ));
     }
 
-    let mut argv = command;
-    // Every pull request a run opens is labelled as one, added here rather than asked for: a
-    // reviewer needs to know what wrote the thing in front of them, and a label a node has to
-    // remember is one it will eventually forget. Adding it after the allowlist check means the
-    // check still sees exactly what the caller asked for.
-    if argv.first().is_some_and(|a| a == "pr")
-        && argv.get(1).is_some_and(|a| a == "create")
-        && let Some(label) = run_label()
-    {
+    let argv = command;
+    // Every pull request a run opens is labelled as one. The label has to exist before `gh` is
+    // asked to apply it, which is the only part of this that needs the tracker.
+    if let Some(label) = label_for(&argv) {
         ensure_label(root, label).await;
-        argv.push("--label".to_string());
-        argv.push(label.to_string());
     }
+    let mut argv = labelled(argv);
     // Written by this code rather than by the caller: a body is prose with newlines and backticks
     // in it, and argv is where quoting bugs and injected arguments both live.
     let body_file = match args.get("body").and_then(|v| v.as_str()) {
@@ -633,41 +655,31 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn every_pull_request_a_run_opens_is_labelled_as_one() {
+    #[test]
+    fn every_pull_request_a_run_opens_is_labelled_as_one() {
         // The label is added by this code, not asked of the caller: a reviewer has to be able to
         // tell what wrote the change in front of them, and a label a node must remember is one it
         // will eventually forget.
         //
-        // Driven through `run` with a `gh` that is not installed here, so what is asserted is the
-        // argument list it built — the call itself failing is fine and expected.
-        let root = std::env::temp_dir();
-        let out = run(
-            &root,
-            &json!({ "command": ["pr", "create", "--title", "x"] }),
-        )
-        .await;
-        let text = match out {
-            Ok(t) => t,
-            Err(e) => format!("{e}"),
-        };
-        assert!(
-            text.contains("--label ratatoskr"),
-            "the label reaches the command: {text}"
+        // Asserted on the argument list directly. Driving it through `run` instead made the test
+        // depend on `gh` being installed *and* failing — where `gh` is absent the error is
+        // "could not run `gh`" and carries no argv, so the test passed on a developer's machine
+        // and failed in a container, which is where a run's checks now execute.
+        assert_eq!(
+            labelled(argv(&["pr", "create", "--title", "x"])),
+            argv(&["pr", "create", "--title", "x", "--label", "ratatoskr"])
         );
 
-        // The opt-out is real: with no label configured, nothing is added and `gh` is not asked
-        // to create one. Checked through `run_label` rather than by setting the OnceLock, which
-        // one test cannot un-set for the others.
-        assert_eq!(run_label(), Some("ratatoskr"), "the default, unconfigured");
+        // A comment is not a pull request, and labelling one tells a reviewer something about the
+        // wrong object.
+        let comment = argv(&["issue", "comment", "1"]);
+        assert_eq!(labelled(comment.clone()), comment);
+        let view = argv(&["pr", "view", "7"]);
+        assert_eq!(labelled(view.clone()), view);
 
-        // A comment is not a pull request and is not labelled.
-        let out = run(&root, &json!({ "command": ["issue", "comment", "1"] })).await;
-        let text = match out {
-            Ok(t) => t,
-            Err(e) => format!("{e}"),
-        };
-        assert!(!text.contains("--label"), "{text}");
+        // The opt-out is real. Checked through `run_label` rather than by setting the OnceLock,
+        // which one test cannot un-set for the others.
+        assert_eq!(run_label(), Some("ratatoskr"), "the default, unconfigured");
     }
 
     #[test]
