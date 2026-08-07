@@ -1922,6 +1922,10 @@ fn build_implementer_agent(
         .local()
         .tools
         .push(ratatoskr_agent::shell::declaration());
+    // The implementer can ask. It has the most turns to spend and is the only node that changes
+    // code, so it is the one most likely to meet a question worth asking — and the run-wide
+    // `ASK_BUDGET` is what keeps that a relief valve rather than a way to spend a run.
+    tools.local().tools.push(clarify::ask_tool());
     let cfg = node_agent_config(
         engine,
         config,
@@ -2372,6 +2376,7 @@ async fn fork_and_converge(
     let (impl_cfg, impl_plugins) =
         build_implementer_agent(engine, config, context, client.offer())?;
     let implementer = ImplementerNode {
+        clarifier: Some(clarifier.as_dyn()),
         repo_path: repo_path.clone(),
         worktree_root: config.worktree.root.clone(),
         sandbox: config.sandbox.clone(),

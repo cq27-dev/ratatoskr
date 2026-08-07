@@ -476,6 +476,9 @@ fn build_implementer(
         ctx.rag_rat.clone(),
     )?;
     Ok(ImplementerNode {
+        // As every node on the scripted path: clarification is wired by the built-in flow, which
+        // owns the run's `NodeClarifier`.
+        clarifier: None,
         acceptance: ctx.acceptance(&analyst.acceptance),
         characterizer: crate::build_characterizer(
             &ctx.engine,

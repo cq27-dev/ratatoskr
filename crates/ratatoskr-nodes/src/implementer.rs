@@ -133,6 +133,14 @@ pub struct ImplementerNode {
     pub system_prompt: Option<String>,
     pub plugins: crate::NodePlugins,
     pub ledger: Option<Arc<RunLedger>>,
+    /// Who answers when the implementer cannot resolve something itself.
+    ///
+    /// It is the node with the most turns to spend and the only one that changes code, so it is
+    /// also the one most likely to hit a question worth asking — a plan that contradicts the tree,
+    /// or its own tool results looking wrong. Without this its only options were to proceed on a
+    /// belief nobody checked or to stop. Bounded by the run-wide `ASK_BUDGET`, which it shares with
+    /// every other asker, so a stuck node cannot spend the run asking.
+    pub clarifier: Option<Arc<dyn ratatoskr_agent::Clarifier>>,
     pub run_id: String,
     pub issue: String,
     pub analyst: AnalystOutput,
@@ -218,7 +226,7 @@ impl ImplementerNode {
             policy: self.policy.clone(),
             max_turns: self.max_turns,
             // Nobody to ask. The prompt says so, and offering the tool would contradict it.
-            clarifier: None,
+            clarifier: self.clarifier.clone(),
             observer: self.plugins.observer.clone(),
             skills: crate::skills::loaded(&self.plugins.skills),
             // Rooted at the worktree, not the checkout: every path it reads or writes has to be
@@ -415,8 +423,19 @@ mod tests {
         assert!(p.contains("stopping is a claim"), "when to stop");
         assert!(p.contains("exactly once"), "Edit's uniqueness contract");
         assert!(p.contains("diagnostic"), "the re-driven path");
-        // It is told there is nobody to ask, which is the fact every interactive prompt assumes
-        // the opposite of.
-        assert!(p.contains("nobody to ask"));
+        // It can ask, and is told what is worth asking about. The failure this guards against is a
+        // prompt that says a question produces nothing while the node holds an `ask` tool — a node
+        // told not to ask will not ask, however wired it is, and the one case where asking clearly
+        // beats guessing is when its own tool results look fabricated.
+        assert!(p.contains("you do have `ask`"), "that it can");
+        assert!(p.contains("budget"), "and that asking is not free");
+        assert!(
+            p.contains("fabricated tool result"),
+            "the case where it plainly beats re-deriving the tree"
+        );
+        assert!(
+            p.contains("not for permission"),
+            "and what does not earn one"
+        );
     }
 }
