@@ -703,7 +703,10 @@ fn grep(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionEr
 
     let mut lines: Vec<String> = Vec::new();
     let mut counts: Vec<String> = Vec::new();
-    for file in walk(&within(root, args.get("path").and_then(|v| v.as_str()))?) {
+    for file in walk(
+        root,
+        &within(root, args.get("path").and_then(|v| v.as_str()))?,
+    ) {
         if let Some(filter) = &filter
             && !filter.matches_path(file.strip_prefix(root).unwrap_or(&file))
         {
@@ -758,7 +761,7 @@ fn glob_files(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecu
         .map_err(|e| ToolExecutionError::invalid_args(format!("invalid glob: {e}")))?;
     let base = within(root, args.get("path").and_then(|v| v.as_str()))?;
 
-    let found: Vec<String> = walk(&base)
+    let found: Vec<String> = walk(root, &base)
         .filter(|p| pattern.matches_path(p.strip_prefix(root).unwrap_or(p)))
         .take(MAX_RESULTS)
         .map(|p| p.strip_prefix(root).unwrap_or(&p).display().to_string())
@@ -771,10 +774,30 @@ fn glob_files(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecu
 }
 
 /// Every file under `base`, skipping the directories nothing wants searched.
-fn walk(base: &Path) -> impl Iterator<Item = PathBuf> + use<> {
+///
+/// `filter_entry` never rejects the walk root (depth 0), so a `base` that already sits inside a
+/// SKIP directory would otherwise be searched in full — the skip is only escaped by rooting the
+/// walk there. Judged against `root`, not by absolute component, so a repo checked out under a
+/// directory literally named `target` stays searchable while a `path` pointing into the repo's
+/// own `target` returns nothing.
+fn walk(root: &Path, base: &Path) -> impl Iterator<Item = PathBuf> + use<> {
+    // Judge the base's path relative to the canonical root — the same canonicalisation `within`
+    // used to produce `base`, so the prefix actually strips.
+    let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let escaped = base
+        .strip_prefix(&canon)
+        .unwrap_or(base)
+        .components()
+        .any(|c| {
+            let name = c.as_os_str().to_string_lossy();
+            SKIP.contains(&name.as_ref()) || name.starts_with('.')
+        });
     walkdir::WalkDir::new(base)
         .into_iter()
-        .filter_entry(|e| {
+        .filter_entry(move |e| {
+            if escaped {
+                return false;
+            }
             let name = e.file_name().to_string_lossy();
             !SKIP.contains(&name.as_ref()) && !name.starts_with('.') || e.depth() == 0
         })
@@ -1238,5 +1261,46 @@ mod tests {
         // Token order and content still have to match exactly — this is not fuzzy matching.
         assert_ne!(normalized("a b"), normalized("b a"));
         assert_ne!(normalized("a();"), normalized("a ();"));
+    }
+
+    #[test]
+    fn grep_with_no_path_still_skips_node_modules() {
+        // The existing behaviour to preserve: walking from the repo root, a SKIP directory is not
+        // searched at all.
+        let root = repo("grep-skips-nm");
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "fn main() {}\n").unwrap();
+        let out = grep(&root, &json!({ "pattern": "fn main" })).unwrap();
+        assert!(out.contains("src/main.rs"), "{out}");
+        assert!(!out.contains("node_modules"), "{out}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grep_rooted_in_a_skipped_dir_searches_nothing() {
+        // The skip is escapable: the walk root always passes filter_entry at depth 0, so a `path`
+        // pointing inside a SKIP directory searches it fully. Rooting a grep at node_modules must
+        // still find nothing there.
+        let root = repo("grep-in-nm");
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("node_modules/evil.js"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/deep.js"), "fn main() {}\n").unwrap();
+        let out = grep(
+            &root,
+            &json!({ "pattern": "fn main", "path": "node_modules" }),
+        )
+        .unwrap();
+        assert_eq!(out, "no matches", "{out}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn glob_rooted_in_a_skipped_dir_matches_nothing() {
+        // Same escape through Glob: `repo` already placed target/huge.rs, and rooting the glob at
+        // the skipped `target` must not surface it.
+        let root = repo("glob-in-target");
+        let out = glob_files(&root, &json!({ "pattern": "**/*.rs", "path": "target" })).unwrap();
+        assert_eq!(out, "no files matched", "{out}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
