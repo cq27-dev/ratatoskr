@@ -3,6 +3,7 @@
 //! This crate is the stable base every other crate depends on and deliberately has **no** async
 //! runtime dependency — if a type here ever needs `tokio`, it belongs in a different crate.
 
+pub mod auth;
 pub mod config;
 pub mod policy;
 pub mod shape;

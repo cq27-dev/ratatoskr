@@ -107,7 +107,9 @@ Rust workspace (2024 edition), crates in a layered DAG under `crates/`:
   and the `run_plan` / `run_full` orchestration.
 - `ratatoskr-exec` — execution primitives for the fork: isolated git worktrees, sandboxed command
   runs (microsandbox / bwrap+Landlock), and the ACP client that drives a coding CLI.
-- `ratatoskr-store` — the checkpoint store: a single SQLite file, one writer by construction.
+- `ratatoskr-store` — the checkpoint store: a single SQLite file, one writer by construction. Also
+  the instance's identity database (`auth.rs`), a *separate* file: `serve` writes sessions to that
+  one and still never writes to a project's store.
 - `ratatoskr-cli` — the `ratatoskr` binary (`init`, `ask`, `plan`, `run`, `bookkeep`, `status`).
 
 `ratatoskr.toml` (repo root, gitignored) configures models, rag-rat launch, sandbox, and store;

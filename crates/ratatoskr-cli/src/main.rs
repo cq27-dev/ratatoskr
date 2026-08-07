@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ratatoskr_core::RatatoskrConfig;
+use ratatoskr_core::auth::{Role, Visibility};
 use ratatoskr_nodes::PlanOutcome;
 use tracing::Instrument as _;
 use tracing_subscriber::EnvFilter;
@@ -95,11 +96,32 @@ enum Command {
     },
     /// Serve the observability dashboard over the checkpoint store.
     Serve {
-        /// Address to bind. Defaults to loopback, and should stay there: the dashboard can
-        /// START RUNS, and there is no auth — anyone who can reach this port can drive a coding
-        /// CLI against the repo and spend API credits.
+        /// Address to bind.
+        ///
+        /// Safe to expose, unlike earlier versions: starting a run and answering a clarification
+        /// both need an operator session, and a project is readable without one only if it was
+        /// named with `--public`. Put TLS in front of it and pass `--secure-cookies`.
         #[arg(long, default_value = "127.0.0.1:7878")]
         addr: SocketAddr,
+        /// Where the clarification rendezvous binds — the endpoint a run process calls to ask a
+        /// human a question. Loopback only: reaching it is what stands in for a credential.
+        #[arg(long, default_value = "127.0.0.1:7879")]
+        internal_addr: SocketAddr,
+        /// Serve this project's runs to anyone, with no sign-in. Repeatable, by directory name.
+        ///
+        /// Everything a run recorded becomes public: the issue text, the model's output, and the
+        /// contents of every file its tools read. Starting runs still needs an operator.
+        #[arg(long = "public")]
+        public: Vec<String>,
+        /// Where this instance keeps its accounts and sessions. Not a project's store — one
+        /// instance can watch several projects, and identity belongs to none of them.
+        #[arg(long, default_value = ".ratatoskr/auth.sqlite3")]
+        auth_db: PathBuf,
+        /// Mark the session cookie `Secure`. Set this whenever the instance is reached over
+        /// https, and leave it off for loopback — a browser discards a `Secure` cookie sent over
+        /// plain http, which looks exactly like sign-in silently failing.
+        #[arg(long)]
+        secure_cookies: bool,
         /// Path to the config file, for the current directory. Ignored when `--project` is used:
         /// each of those reads its own `ratatoskr.toml`.
         #[arg(long, default_value = "ratatoskr.toml")]
@@ -146,6 +168,54 @@ enum Command {
         #[arg(long, default_value = "ratatoskr.toml")]
         config: PathBuf,
     },
+    /// Manage who may use a hosted instance.
+    ///
+    /// Only needed for an instance other people can reach. A loopback dashboard needs no accounts:
+    /// whoever can reach the port already owns the checkout.
+    Users {
+        #[command(subcommand)]
+        command: UsersCommand,
+        /// The identity database `serve` was pointed at.
+        #[arg(long, default_value = ".ratatoskr/auth.sqlite3")]
+        auth_db: PathBuf,
+    },
+}
+
+/// Managing who may use a hosted instance.
+#[derive(Subcommand)]
+enum UsersCommand {
+    /// Create an account.
+    ///
+    /// The password is read from the `RATATOSKR_PASSWORD` environment variable, never from an
+    /// argument: an argument is visible to every other process on the machine through `ps` and is
+    /// written to the shell's history file.
+    Add {
+        /// The username to sign in with.
+        username: String,
+        /// What to call them in the dashboard. Defaults to the username.
+        #[arg(long)]
+        name: Option<String>,
+        /// `viewer` reads, `operator` also starts runs and answers clarifications, `admin` also
+        /// manages accounts.
+        #[arg(long, default_value = "viewer")]
+        role: String,
+    },
+    /// List accounts, their roles, and which are disabled.
+    List,
+    /// Change an account's password, ending every session it had open.
+    ///
+    /// Read from `RATATOSKR_PASSWORD`, as for `add`.
+    Passwd { username: String },
+    /// Change what an account may do. Takes effect on that account's next request.
+    Role {
+        username: String,
+        /// `viewer`, `operator`, or `admin`.
+        role: String,
+    },
+    /// Stop an account signing in, and close the sessions it already has.
+    Disable { username: String },
+    /// Let a disabled account sign in again.
+    Enable { username: String },
 }
 
 #[derive(Subcommand)]
@@ -241,14 +311,31 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Status { run_id, config }) => status(&run_id, &config).await,
         Some(Command::Serve {
             addr,
+            internal_addr,
+            public,
+            auth_db,
+            secure_cookies,
             config,
             projects,
             max_runs,
-        }) => serve(addr, &config, projects, max_runs).await,
+        }) => {
+            serve(ServeArgs {
+                addr,
+                internal_addr,
+                config_path: config,
+                projects,
+                public,
+                max_runs,
+                auth_db,
+                secure_cookies,
+            })
+            .await
+        }
         Some(Command::Workflows) => workflows().await,
         Some(Command::Prepare { config }) => prepare(&config).await,
         Some(Command::Clean { force }) => clean(force).await,
         Some(Command::Runs { command, config }) => runs(command, &config).await,
+        Some(Command::Users { command, auth_db }) => users(command, &auth_db).await,
         None => {
             Cli::command().print_help()?;
             println!();
@@ -638,13 +725,32 @@ async fn status(run_id: &str, config_path: &Path) -> anyhow::Result<()> {
 
 /// Serve the dashboard over one or more projects' stores. Reads them directly; runs started from
 /// the dashboard are spawned as child processes, so this one never writes to them.
-async fn serve(
+/// What `serve` was asked for, as one value rather than an argument train.
+struct ServeArgs {
     addr: SocketAddr,
-    config_path: &Path,
+    internal_addr: SocketAddr,
+    config_path: PathBuf,
     projects: Vec<PathBuf>,
+    /// Slugs to make readable without logging in.
+    public: Vec<String>,
     max_runs: usize,
-) -> anyhow::Result<()> {
-    let specs = if projects.is_empty() {
+    auth_db: PathBuf,
+    secure_cookies: bool,
+}
+
+async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    let ServeArgs {
+        addr,
+        internal_addr,
+        config_path,
+        projects,
+        public,
+        max_runs,
+        auth_db,
+        secure_cookies,
+    } = args;
+    let config_path = config_path.as_path();
+    let mut specs = if projects.is_empty() {
         // No `--project`: watch the current directory, exactly as before.
         let dir = std::env::current_dir().context("resolving the project directory")?;
         vec![project_spec(&dir, config_path)?]
@@ -655,13 +761,147 @@ async fn serve(
             .collect::<anyhow::Result<Vec<_>>>()?
     };
 
+    // Visibility is decided here, from this instance's flags — never from the project's own
+    // config, which lives in the repository and would let a checkout publish itself.
+    let public: std::collections::BTreeSet<&str> = public.iter().map(String::as_str).collect();
+    for spec in &mut specs {
+        let slug = spec
+            .dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if public.contains(slug) {
+            spec.visibility = Visibility::Public;
+        }
+    }
+    // A name that matches nothing is a typo, and the failure it produces — a project that stays
+    // private — is invisible. Better to say so than to serve the opposite of what was asked.
+    let known: std::collections::BTreeSet<&str> = specs
+        .iter()
+        .filter_map(|s| s.dir.file_name().and_then(|n| n.to_str()))
+        .collect();
+    let unknown: Vec<&&str> = public.difference(&known).collect();
+    if !unknown.is_empty() {
+        bail!(
+            "--public names no project being served: {}",
+            unknown
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     ratatoskr_serve::serve(ratatoskr_serve::ServeOptions {
         addr,
+        internal_addr,
         projects: specs,
         max_runs,
+        auth_db,
+        secure_cookies,
     })
     .await?;
     Ok(())
+}
+
+/// Account management for a hosted instance.
+async fn users(command: UsersCommand, auth_db: &Path) -> anyhow::Result<()> {
+    let auth = ratatoskr_store::auth::AuthStore::open(auth_db)
+        .with_context(|| format!("opening the identity database at {}", auth_db.display()))?;
+
+    match command {
+        UsersCommand::Add {
+            username,
+            name,
+            role,
+        } => {
+            let role = parse_role(&role)?;
+            let password = password_from_env()?;
+            let display = name.unwrap_or_else(|| username.clone());
+            auth.create_local(&username, &password, &display, role)
+                .await?;
+            println!("added {username} ({role})");
+            if role >= Role::Operator {
+                // Worth saying out loud: this account can now spend money and change a checkout.
+                println!("  {username} can start runs and answer clarifications");
+            }
+        }
+        UsersCommand::List => {
+            let listed = auth.list_principals().await?;
+            if listed.is_empty() {
+                println!("no accounts — `ratatoskr users add <username> --role operator`");
+            }
+            for (principal, disabled) in listed {
+                let state = if disabled { "  (disabled)" } else { "" };
+                println!(
+                    "{:<10} {:<20} {}{state}",
+                    principal.role.as_str(),
+                    principal.display_name,
+                    principal.principal_id
+                );
+            }
+        }
+        UsersCommand::Passwd { username } => {
+            let password = password_from_env()?;
+            if !auth.set_password(&username, &password).await? {
+                bail!("no account called `{username}`");
+            }
+            println!("changed the password for {username}; its open sessions are closed");
+        }
+        UsersCommand::Role { username, role } => {
+            let role = parse_role(&role)?;
+            let principal_id = principal_id_for(&auth, &username).await?;
+            auth.set_role(&principal_id, role).await?;
+            println!("{username} is now {role}");
+        }
+        UsersCommand::Disable { username } => {
+            let principal_id = principal_id_for(&auth, &username).await?;
+            auth.set_disabled(&principal_id, true).await?;
+            println!("disabled {username}; its open sessions are closed");
+        }
+        UsersCommand::Enable { username } => {
+            let principal_id = principal_id_for(&auth, &username).await?;
+            auth.set_disabled(&principal_id, false).await?;
+            println!("enabled {username}");
+        }
+    }
+    Ok(())
+}
+
+/// The password, from the environment rather than an argument.
+///
+/// An argument is readable by every process on the machine for as long as the command runs, and
+/// ends up in the shell's history file afterwards. Neither is acceptable for the credential that
+/// guards starting runs.
+fn password_from_env() -> anyhow::Result<String> {
+    let password = std::env::var("RATATOSKR_PASSWORD").map_err(|_| {
+        anyhow::anyhow!(
+            "set RATATOSKR_PASSWORD to the password for this account \
+             (an argument would be visible in `ps` and in shell history)"
+        )
+    })?;
+    if password.chars().count() < 12 {
+        // A length floor rather than a character-class rule: length is what actually resists
+        // guessing, and composition rules mostly produce predictable substitutions.
+        bail!("that password is shorter than 12 characters");
+    }
+    Ok(password)
+}
+
+fn parse_role(role: &str) -> anyhow::Result<Role> {
+    role.parse::<Role>()
+        .map_err(|_| anyhow::anyhow!("`{role}` is not a role — use viewer, operator, or admin"))
+}
+
+/// The principal behind a local username, for the commands that address one by name.
+async fn principal_id_for(
+    auth: &ratatoskr_store::auth::AuthStore,
+    username: &str,
+) -> anyhow::Result<String> {
+    auth.principal_for_local(username)
+        .await?
+        .map(|p| p.principal_id)
+        .ok_or_else(|| anyhow::anyhow!("no account called `{username}`"))
 }
 
 /// Resolve one project for `serve`: its config, and where that config's store actually is.
@@ -682,6 +922,8 @@ fn project_spec(dir: &Path, config_path: &Path) -> anyhow::Result<ratatoskr_serv
         dir,
         config_path: config_path.to_path_buf(),
         store_path,
+        // Overridden by `--public` in `serve`; private is the direction a mistake should fail in.
+        visibility: Visibility::default(),
     })
 }
 

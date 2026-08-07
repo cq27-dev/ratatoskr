@@ -8,6 +8,7 @@ import { Detail } from "./panels/Detail";
 import { Feed } from "./panels/Feed";
 import { Question } from "./panels/Question";
 import { Rail } from "./panels/Rail";
+import { SignIn } from "./panels/SignIn";
 import { RunMeta } from "./panels/RunMeta";
 import { Scrubber } from "./panels/Scrubber";
 import {
@@ -17,9 +18,12 @@ import {
   followRun,
   listProjects,
   listRuns,
+  mayAct,
+  whoami,
   type CheckpointView,
   type LiveEvent,
   type NodeFacts,
+  type Me,
   type ProjectView,
   type RunDetail,
   type RunSummary,
@@ -44,6 +48,14 @@ const RUN_LIST_POLL_MS = 10_000;
 const SYNC_COALESCE_MS = 250;
 export default function App() {
   const [projects, setProjects] = useState<ProjectView[]>([]);
+  /**
+   * Who the viewer is, or `{}` for nobody.
+   *
+   * `null` until the first answer, which is distinct from "signed out": drawing the sign-in
+   * control before the server has said would flash SIGN IN at someone who is already signed in,
+   * on every load.
+   */
+  const [me, setMe] = useState<Me | null>(null);
   /*
    * Project, run, node and position live in the address bar rather than in React.
    *
@@ -76,6 +88,22 @@ export default function App() {
   const [answered, setAnswered] = useState<ReadonlySet<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
 
+  // Who is looking. Read before anything else, because it decides what the rest of these calls
+  // are even allowed to return.
+  useEffect(() => {
+    void whoami()
+      .then(setMe)
+      .catch(() => setMe({}));
+  }, []);
+
+  /** Re-read everything after signing in or out: what may be seen has just changed. */
+  const onIdentity = useCallback((next: Me) => {
+    setMe(next);
+    void listProjects()
+      .then(setProjects)
+      .catch(() => setProjects([]));
+  }, []);
+
   // Which projects this dashboard watches. Fixed at startup, so fetched once.
   useEffect(() => {
     void (async () => {
@@ -91,7 +119,7 @@ export default function App() {
         setError(e instanceof Error ? e.message : String(e));
       }
     })();
-  }, []);
+  }, [me]);
 
   const refresh = useCallback(async () => {
     if (!project) return;
@@ -471,6 +499,7 @@ export default function App() {
         <h1>
           Ratatoskr
         </h1>
+        <SignIn me={me} onChange={onIdentity} />
         <span className="rev">
           {error ? (
             <span className="hazard">/// LINK DOWN — {error}</span>
@@ -488,6 +517,7 @@ export default function App() {
         selected={runId}
         onSelect={setRunId}
         onStarted={onStarted}
+        mayAct={mayAct(me?.role)}
       />
 
       <main className="stage stage--split">

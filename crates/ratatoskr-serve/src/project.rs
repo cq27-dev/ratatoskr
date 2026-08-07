@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ratatoskr_core::auth::Visibility;
 use ratatoskr_store::Store;
 use serde::Serialize;
 
@@ -23,12 +24,20 @@ pub struct ProjectSpec {
     pub dir: PathBuf,
     pub config_path: PathBuf,
     pub store_path: PathBuf,
+    /// Whether anyone may read this project without logging in.
+    ///
+    /// Resolved by the caller, from the instance's own configuration, and deliberately never from
+    /// the project's `ratatoskr.toml`: a repository must not be able to declare itself public.
+    /// That is the host operator's decision, so it is made where the projects are listed.
+    pub visibility: Visibility,
 }
 
 /// One watched project, opened and ready to serve.
 pub struct Project {
     pub slug: String,
     pub dir: PathBuf,
+    /// See [`ProjectSpec::visibility`].
+    pub visibility: Visibility,
     /// Where this project's config lives, so per-node routes can be read when a client asks. Read
     /// per request rather than cached: a dashboard left open across a config edit should show the
     /// routes a run would use now, not the ones it started with.
@@ -42,7 +51,13 @@ pub struct Project {
 #[derive(Debug, Serialize)]
 pub struct ProjectView {
     pub slug: String,
-    pub dir: String,
+    /// Where it lives on the host — absent for a caller who is not logged in.
+    ///
+    /// An absolute filesystem path says more about the machine than a stranger reading a public
+    /// run needs to know: the operating system, the layout, often a username. It is useful to
+    /// whoever runs the instance, so it is shown to them and to nobody else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
 }
 
 /// Errors opening the set of projects.
@@ -141,6 +156,7 @@ pub fn open_all(
                 log_dir: spec.dir.join(".ratatoskr/logs"),
                 config_path: spec.config_path.clone(),
                 dir: spec.dir,
+                visibility: spec.visibility,
                 store: Store::open(&spec.store_path)?,
                 launcher,
             },
@@ -176,6 +192,7 @@ mod tests {
             dir: d.to_path_buf(),
             config_path: d.join("ratatoskr.toml"),
             store_path: d.join("state.sqlite3"),
+            visibility: Visibility::default(),
         };
 
         let opened = open_all(vec![spec(&a), spec(&b)], 1, "http://127.0.0.1:1");
@@ -201,6 +218,7 @@ mod tests {
             dir: d.to_path_buf(),
             config_path: d.join("ratatoskr.toml"),
             store_path: shared.clone(),
+            visibility: Visibility::default(),
         };
 
         let opened = open_all(vec![spec(&a), spec(&b)], 1, "http://127.0.0.1:1");
@@ -220,6 +238,7 @@ mod tests {
                 dir: PathBuf::from("/nonexistent"),
                 config_path: PathBuf::from("/nonexistent/ratatoskr.toml"),
                 store_path: missing.clone(),
+                visibility: Visibility::default(),
             }],
             1,
             "http://127.0.0.1:1",

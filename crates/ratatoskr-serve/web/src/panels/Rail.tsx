@@ -96,6 +96,7 @@ export function Rail({
   selected,
   onSelect,
   onStarted,
+  mayAct,
 }: {
   projects: ProjectView[];
   project: string;
@@ -104,11 +105,16 @@ export function Rail({
   selected: string | null;
   onSelect: (id: string) => void;
   onStarted: (runId: string) => void;
+  /** Whether this viewer may start runs. The server enforces it; this only stops offering. */
+  mayAct: boolean;
 }) {
   return (
     <nav className="rail">
       <Projects projects={projects} selected={project} onSelect={onProject} />
-      <NewRun project={project} onStarted={onStarted} />
+      {/* Hidden rather than disabled: a greyed-out box invites a viewer to wonder what they did
+          wrong, where its absence simply reflects what this account is for. The route refuses it
+          either way — a control that is not drawn is not a permission. */}
+      {mayAct && <NewRun project={project} onStarted={onStarted} />}
       <div className="sec">
         <span>[ RUNS ]</span>
         <output>{runs.length}</output>
