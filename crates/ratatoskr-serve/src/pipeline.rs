@@ -142,6 +142,10 @@ pub struct NodeTelemetryView {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    /// Tokens written to cache rather than read from it. Billed at a premium and the number that
+    /// separates a run that reused its context from one that rebuilt it, so it is reported rather
+    /// than folded into the input total.
+    pub cache_creation_input_tokens: u64,
     /// Non-zero when the model reasoned before answering. Zero from endpoints that do not report
     /// it, which is why `thinking` exists alongside.
     pub reasoning_tokens: u64,
@@ -167,6 +171,7 @@ impl NodeTelemetryView {
             input_tokens: t.usage.input_tokens,
             output_tokens: t.usage.output_tokens,
             cached_input_tokens: t.usage.cached_input_tokens,
+            cache_creation_input_tokens: t.usage.cache_creation_input_tokens,
             reasoning_tokens: t.usage.reasoning_tokens,
             thinking: t.thinking,
             duration_ms: t.duration_ms,

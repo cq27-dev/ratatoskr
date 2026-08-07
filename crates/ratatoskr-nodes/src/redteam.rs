@@ -285,9 +285,15 @@ impl RedTeamNode {
     }
 
     pub async fn run(&self) -> Result<RedTeamOutput, NodeError> {
-        let outcomes = run_acceptance(&self.sandbox, &self.name, &self.repo_path, &self.acceptance)
-            .await
-            .map_err(NodeError::Failed)?;
+        let outcomes = run_acceptance(
+            &self.sandbox,
+            "red_team",
+            &self.name,
+            &self.repo_path,
+            &self.acceptance,
+        )
+        .await
+        .map_err(NodeError::Failed)?;
         let results = match &self.characterizer {
             Some(c) => c.read(&outcomes).await,
             None => by_exit_code(&outcomes),

@@ -365,6 +365,11 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
             );
         }
     }
+    // The event carries the same measurements as the row, because a viewer reconstructing where a
+    // run WAS reads the log, not the store: the store holds only the latest state of each node, so
+    // deriving a past moment from it shows final numbers against a historical position. Everything
+    // the row records, the event has to be able to prove.
+    let logged = telemetry.clone();
     r.store
         .insert_checkpoint(ratatoskr_store::CheckpointWrite {
             run_id: r.run_id,
@@ -381,6 +386,20 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
         kind = "checkpoint",
         node = r.node,
         bytes = json.len(),
+        iteration = r.iteration,
+        model = logged.model.as_deref().unwrap_or_default(),
+        tools = logged.tools.join(","),
+        tools_used = logged.tools_used.join(","),
+        thinking = logged.thinking,
+        reuses_session = logged.reuses_session,
+        turns = logged.turns.unwrap_or_default(),
+        error = logged.error.as_deref().unwrap_or_default(),
+        duration_ms = logged.duration_ms.unwrap_or_default(),
+        "gen_ai.usage.input_tokens" = logged.usage.input_tokens,
+        "gen_ai.usage.output_tokens" = logged.usage.output_tokens,
+        "gen_ai.usage.cached_input_tokens" = logged.usage.cached_input_tokens,
+        "gen_ai.usage.cache_creation_input_tokens" = logged.usage.cache_creation_input_tokens,
+        "gen_ai.usage.reasoning_tokens" = logged.usage.reasoning_tokens,
         "checkpoint"
     );
     Ok(())

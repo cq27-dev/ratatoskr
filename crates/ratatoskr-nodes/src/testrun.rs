@@ -63,6 +63,7 @@ pub struct TestResults {
 /// why. The exit code carries the failure regardless of where it happened.
 pub async fn run_acceptance(
     cfg: &SandboxConfig,
+    node: &str,
     name: &str,
     host_path: &Path,
     steps: &[AcceptanceStep],
@@ -92,8 +93,11 @@ pub async fn run_acceptance(
         // misreads a read-only-filesystem error as "cargo is not installed" sends whoever reads
         // the run after a problem that does not exist.
         let combined = format!("{}\n{}", out.stdout, out.stderr);
+        // Attributed to the node running it. A suite takes minutes, and unattributed the node
+        // that is plainly working looks idle for the whole of it to anything reading the stream.
         tracing::info!(
             kind = "acceptance_step",
+            node,
             step = %step.name,
             command = %step.command.join(" "),
             exit_code = out.exit_code,

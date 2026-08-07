@@ -214,6 +214,7 @@ impl ImplementerNode {
 
         let outcomes = run_acceptance(
             &self.sandbox,
+            "implementer",
             &format!("ratatoskr-impl-{}", self.short_id()),
             worktree.as_path(),
             &self.acceptance,
