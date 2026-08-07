@@ -280,7 +280,8 @@ body {
 /* ── Stage: graph, plus a detail pane only once a node is selected ───────── */
 .stage {
   display: grid;
-  grid-template-rows: auto 1fr;
+  /* meta, scrubber, graph — the scrubber sits directly above the map it drives. */
+  grid-template-rows: auto auto 1fr;
   gap: 1px;
   background: var(--rule);
   overflow: hidden;
@@ -510,6 +511,46 @@ body {
 
 .runmeta dd {
   margin: 0 0 4px;
+}
+
+/* ── Scrubber ────────────────────────────────────────────────────────────── */
+.scrub {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 12px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--rule);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.scrub-live {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--rule);
+  padding: 3px 8px;
+  font: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+  flex: none;
+}
+.scrub-live.is-live {
+  color: var(--live);
+  border-color: var(--live);
+}
+
+.scrub input[type="range"] {
+  flex: 1;
+  accent-color: var(--hazard);
+  min-width: 0;
+}
+
+.scrub-at {
+  color: var(--muted);
+  flex: none;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Electron-beam sweep, behind the node map only. Lines are LIGHT: the map sits on #0a0a0a, so a

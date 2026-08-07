@@ -41,6 +41,9 @@ export interface NodeTelemetry {
   input_tokens: number;
   output_tokens: number;
   cached_input_tokens: number;
+  /** Written to cache rather than read from it. Billed at a premium, and what separates a run that
+   *  reused its context from one that rebuilt it. */
+  cache_creation_input_tokens: number;
   /** Non-zero when the model reasoned before answering. Zero from endpoints that never report it. */
   reasoning_tokens: number;
   /** Whether the node was left free to reason. Configured, not observed. */
@@ -157,8 +160,26 @@ export interface LiveEvent {
   arg?: string;
   /** How long a tool took, on its `tool_result`. */
   duration_ms?: number;
-  /** Present on a `node_start` event: what the node is about to run on. */
+  /** Present on `node_start` and `checkpoint`: what the node ran on. */
   facts?: NodeFacts;
+  /** Present on `usage` and `checkpoint`: what the attempt cost. */
+  usage?: EventUsage;
+  /** Model calls the attempt took, on a `checkpoint`. */
+  turns?: number;
+  /** Why the node failed, on a `checkpoint`. Its presence is what makes a node read as failed. */
+  error?: string;
+  /** Which attempt this was, on a `checkpoint`. */
+  iteration?: number;
+}
+
+/** What one attempt cost, off the event stream. */
+export interface EventUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens: number;
+  cache_creation_input_tokens: number;
+  reasoning_tokens: number;
+  duration_ms: number;
 }
 
 /**
@@ -193,6 +214,10 @@ export async function answerQuestion(
  * The server replays recent history on connect and then streams, so a dashboard opened mid-run
  * shows what already happened instead of an empty pane.
  */
+/** Every event a run produced, oldest first — the record a historical view is rebuilt from. */
+export const getHistory = (project: string, runId: string) =>
+  getJSON<LiveEvent[]>(`${scope(project)}/runs/${encodeURIComponent(runId)}/history`);
+
 export function followRun(
   project: string,
   runId: string,

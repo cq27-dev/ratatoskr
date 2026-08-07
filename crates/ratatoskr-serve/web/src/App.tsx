@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { applyDerived, nodesFromEvents } from "./derive";
 import PipelineGraph from "./PipelineGraph";
 import {
   LIVE,
+  getHistory,
   getNodeCheckpoints,
   getRun,
   answerQuestion,
@@ -306,14 +308,102 @@ interface Row {
  * events worth reading: a call and its result become one row, a run of the same call collapses to
  * a count, and the argument that distinguishes one call from the next is kept.
  */
+/**
+ * Move through a run's timeline.
+ *
+ * Scrubbing is a prefix of the event stream: everything the view shows — the boxes, the
+ * highlighting, the feed — is a fold over the events, so cutting the list short IS the historical
+ * view. There is no replay engine and no second code path to keep in step with the live one.
+ */
+function Scrubber({
+  total,
+  cursor,
+  at,
+  onScrub,
+}: {
+  total: number;
+  cursor: number | null;
+  at: string | null;
+  onScrub: (cursor: number | null) => void;
+}) {
+  // Nothing to move through until the history has loaded.
+  if (total < 2) return null;
+  const position = cursor ?? total - 1;
+  const following = cursor === null;
+  return (
+    <div className="scrub">
+      <button
+        type="button"
+        className={following ? "scrub-live is-live" : "scrub-live"}
+        onClick={() => onScrub(following ? position : null)}
+        title={following ? "Following the end of the run" : "Return to the end of the run"}
+      >
+        {/* Both words are six characters, so the button is the same size in either state and the
+            slider beside it does not change length when the mode flips. */}
+        {following ? "FOLLOW" : "REPLAY"}
+      </button>
+      <input
+        type="range"
+        min={0}
+        max={total - 1}
+        value={position}
+        onChange={(e) => {
+          const next = Number(e.target.value);
+          // Landing on the last event means following again, so the view resumes on its own
+          // rather than freezing one event short of the present.
+          onScrub(next >= total - 1 ? null : next);
+        }}
+        aria-label="Position in the run"
+      />
+      <span className="scrub-at" title={at ?? undefined}>
+        {/* Padded to the total's width: unpadded, the label is narrower at 1/654 than at 654/654
+            and the slider changes length as you drag it. */}
+        {String(position + 1).padStart(String(total).length, "0")}/{total}
+        {at ? ` · ${at.slice(11, 19)}` : ""}
+      </span>
+    </div>
+  );
+}
+
+/** Kinds that are measurements rather than actions: they fill the node boxes, not the feed. */
+const TELEMETRY = new Set(["usage"]);
+
+/**
+ * Filler the endpoint's harness emits, not the model.
+ *
+ * Requests go through a proxy that runs each one inside a Claude Code subprocess, and that CLI
+ * writes this when a turn ends having only called tools — the string is in its binary, not in
+ * anything here. It is still recorded in the log, which is the provenance record; the feed is a
+ * reading aid, and a line that says nothing costs a row and breaks the run of identical calls
+ * around it, so two reads of the same file stop collapsing into one.
+ */
+const HARNESS_FILLER = "No response requested.";
+
 function rows(events: LiveEvent[]): Row[] {
   const out: Row[] = [];
   for (const e of events) {
+    // A `usage` event is the node's cost, which the box reports. As a feed line it reads as
+    // "bookkeeper / usage / node usage" — three words for a number that is already on screen.
+    if (TELEMETRY.has(e.kind)) continue;
+    // The filler is sometimes the whole message and sometimes a prefix on real output, so strip
+    // it rather than dropping the line — discarding the row would lose what the model actually
+    // said in the second case.
+    let detail = e.detail;
+    if (e.kind === "model_text" && detail.startsWith(HARNESS_FILLER)) {
+      detail = detail.slice(HARNESS_FILLER.length).trimStart();
+      if (!detail) continue;
+    }
     // A result is not its own line — it finishes the call above it. Tools run one at a time, so
     // the most recent matching call is the right one.
     if (e.kind === "tool_result") {
       const call = [...out].reverse().find((r) => r.kind === "tool_call" && r.node === e.node && r.action === e.detail);
-      if (call && e.duration_ms !== undefined) call.durationMs = (call.durationMs ?? 0) + e.duration_ms;
+      if (call && e.duration_ms !== undefined) {
+        call.durationMs = (call.durationMs ?? 0) + e.duration_ms;
+        // The row's total is the sum; the part's is its own, so an expanded group shows which of
+        // the calls was the slow one.
+        const part = call.parts[call.parts.length - 1];
+        if (part) part.durationMs = e.duration_ms;
+      }
       continue;
     }
     const last = out[out.length - 1];
@@ -387,15 +477,32 @@ function Detail({
   runId,
   node,
   checkpoints,
+  until,
 }: {
   runId: string | null;
   node: string | null;
   checkpoints: CheckpointView[] | null;
+  /** While scrubbing, the moment being looked at: later checkpoints have not happened yet. */
+  until: string | null;
 }) {
   if (!node) return <p className="empty">select a node to inspect its output</p>;
   if (checkpoints === null) return <p className="empty">loading {node}…</p>;
-  if (checkpoints.length === 0)
-    return <p className="empty">{node} has recorded no output</p>;
+
+  // The store returns every checkpoint a node ever wrote, which is its state at the END of the
+  // run. Showing that against a scrubbed position would put output on screen that the run had not
+  // produced yet — and for the implementer, whose iterations are the interesting part, it would
+  // show the final answer while the map says it is still working.
+  const shown = until
+    ? checkpoints.filter((c) => Date.parse(c.created_at) <= Date.parse(until))
+    : checkpoints;
+
+  if (shown.length === 0) {
+    return (
+      <p className="empty">
+        {node} {until ? "had recorded no output by this point" : "has recorded no output"}
+      </p>
+    );
+  }
 
   return (
     <div>
@@ -404,15 +511,15 @@ function Detail({
           [ {node.replace("_", " ")} ] <samp>{short(runId)}</samp>
         </span>
         <output>
-          {checkpoints.length}{" "}
-          {checkpoints.length === 1 ? "checkpoint" : "checkpoints"}
+          {shown.length} {shown.length === 1 ? "checkpoint" : "checkpoints"}
+          {until && shown.length < checkpoints.length ? ` of ${checkpoints.length}` : ""}
         </output>
       </div>
-      {checkpoints.map((c, i) => (
+      {shown.map((c, i) => (
         <section className="iter" key={`${c.created_at}-${i}`}>
           {/* Every checkpoint, not just the last: for the implementer these are the converge
               iterations, and the progression between them is the interesting part. */}
-          {checkpoints.length > 1 && (
+          {shown.length > 1 && (
             <div className="sec">
               <span>ITERATION {String(i + 1).padStart(2, "0")}</span>
               <span>{clock(c.created_at)}</span>
@@ -431,6 +538,10 @@ export default function App() {
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [runId, setRunId] = useState<string | null>(null);
   const [detail, setDetail] = useState<RunDetail | null>(null);
+  /** The run's whole event history, loaded once so a finished run can be moved through. */
+  const [history, setHistory] = useState<LiveEvent[] | null>(null);
+  /** How far through `shown` the viewer has scrubbed; `null` means "follow the end". */
+  const [cursor, setCursor] = useState<number | null>(null);
   const [node, setNode] = useState<string | null>(null);
   const [checkpoints, setCheckpoints] = useState<CheckpointView[] | null>(null);
   const [events, setEvents] = useState<LiveEvent[]>([]);
@@ -537,11 +648,43 @@ export default function App() {
     return stop;
   }, [runId, project, load, refresh]);
 
+  /**
+   * The run's whole timeline: its history, plus anything the stream has delivered since.
+   *
+   * The history is read once and the stream keeps arriving, so the two overlap; timestamps are
+   * ISO-8601 and sort lexicographically, which is enough to take only the genuinely newer ones.
+   */
+  const timeline = useMemo(() => {
+    if (!history?.length) return events;
+    const last = history[history.length - 1]!.at;
+    return [...history, ...events.filter((e) => e.at > last)];
+  }, [history, events]);
+
+  /** The instant being looked at while scrubbing; `null` when following the run's end. */
+  const shownEvents = useMemo(
+    () => (cursor === null ? timeline : timeline.slice(0, cursor + 1)),
+    [timeline, cursor],
+  );
+  const shownAt = cursor === null ? null : (shownEvents[shownEvents.length - 1]?.at ?? null);
+
+  /**
+   * Every node's box, rebuilt from the stream rather than read from the store.
+   *
+   * The store holds each node's LATEST row, so at any point but the end it answers a different
+   * question than the one being asked. Only the pipeline's shape — which nodes exist and where —
+   * still comes from the server, because that is a property of the graph, not of a moment.
+   */
+  const graphNodes = useMemo(() => {
+    if (!detail) return [];
+    const derived = nodesFromEvents(shownEvents);
+    return derived.size ? applyDerived(detail.nodes, derived) : detail.nodes;
+  }, [detail, shownEvents]);
+
   // What a node announced when it started, plus its tool calls so far. A checkpoint carries the
   // same facts, but only once the node has stopped — this is what fills the box while it works.
   const live = useMemo(() => {
     const out = new Map<string, { facts?: NodeFacts; cycles: number; used: Set<string> }>();
-    for (const e of events) {
+    for (const e of shownEvents) {
       if (!e.node) continue;
       const at = out.get(e.node) ?? { cycles: 0, used: new Set<string>() };
       // A node_start means a fresh attempt: its counts start again.
@@ -557,29 +700,58 @@ export default function App() {
       out.set(e.node, at);
     }
     return out;
-  }, [events]);
+  }, [shownEvents]);
 
   /**
-   * The node that last did something, from the stream.
+   * Every node currently working, from the stream.
    *
    * The store cannot answer this. It sees checkpoints, and mid-converge the implementer has one
    * while still being re-run — so it reads as working — while the verifier, which is an optional
    * stage and has not checkpointed, reads as not started. Both are the wrong way round exactly
    * when a viewer is watching the verifier work.
+   *
+   * A SET, not the latest speaker: the bookkeeper and the publisher run concurrently at the end of
+   * a run, and taking whoever spoke last made the highlight alternate between them as their events
+   * interleaved. A node is working once it acts and stops when it checkpoints — which is the run's
+   * own meaning of the word, and holds however many are in flight.
    */
   const active = useMemo(() => {
     const WORKING = new Set(["tool_call", "model_text", "node_start", "tool_result"]);
-    for (let i = events.length - 1; i >= 0; i--) {
-      const e = events[i];
-      if (e?.node && WORKING.has(e.kind)) return e.node;
+    const working = new Set<string>();
+    for (const e of shownEvents) {
+      if (!e?.node) continue;
+      if (WORKING.has(e.kind)) working.add(e.node);
+      // Its checkpoint is the node saying it is finished. The implementer checkpoints once per
+      // converge iteration and is then re-driven, which re-adds it on its next event.
+      else if (e.kind === "checkpoint") working.delete(e.node);
     }
-    return null;
-  }, [events]);
+    return working;
+  }, [shownEvents]);
 
   useEffect(() => {
     setNode(null);
     setCheckpoints(null);
+    setHistory(null);
+    setCursor(null);
   }, [runId]);
+
+  // The live stream keeps only a window (`FEED_LIMIT`) and starts wherever the viewer attached.
+  // Scrubbing needs the whole run, which is a different question and a different endpoint.
+  useEffect(() => {
+    if (!runId || !project) return;
+    let cancelled = false;
+    getHistory(project, runId)
+      .then((h) => {
+        if (!cancelled) setHistory(h);
+      })
+      .catch(() => {
+        // A run whose log has rotated away has no timeline. The live feed still works.
+        if (!cancelled) setHistory([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [runId, project]);
 
   useEffect(() => {
     if (!runId || !node || !project) return;
@@ -644,9 +816,15 @@ export default function App() {
         {detail ? (
           <>
             <RunMeta detail={detail} lastEventAt={lastEventAt} />
+            <Scrubber
+              total={timeline.length}
+              cursor={cursor}
+              at={shownEvents.length ? shownEvents[shownEvents.length - 1]!.at : null}
+              onScrub={setCursor}
+            />
             <div className="graph">
               <PipelineGraph
-                nodes={detail.nodes}
+                nodes={graphNodes}
                 live={live}
                 active={active}
                 selected={node}
@@ -664,11 +842,16 @@ export default function App() {
                     }
                   />
                 ))}
-                <Feed events={events} node={node} />
+                <Feed events={shownEvents} node={node} />
               </div>
               {node && (
                 <div className="detail">
-                  <Detail runId={runId} node={node} checkpoints={checkpoints} />
+                  <Detail
+                    runId={runId}
+                    node={node}
+                    checkpoints={checkpoints}
+                    until={shownAt}
+                  />
                 </div>
               )}
             </div>
