@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 /// Top-level config loaded from `ratatoskr.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RatatoskrConfig {
+    #[serde(default)]
     pub rag_rat: RagRatConfig,
     pub store: StoreConfig,
     pub worktree: WorktreeConfig,
@@ -516,11 +517,28 @@ impl SandboxConfig {
 }
 
 /// How to launch rag-rat's MCP server over stdio.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Optional. A repository that wants the harness alone — the nodes, the fork, the sandbox — and
+/// not a code index is a supported setup, so an absent `[rag_rat]` section means "no rag-rat"
+/// rather than a misconfiguration. What that costs is in the README: no semantic search, no graph
+/// traversal, no papertrail, and no memory, because there is nowhere to keep it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RagRatConfig {
+    #[serde(default)]
     pub command: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<PathBuf>,
+}
+
+impl RagRatConfig {
+    /// Whether this config asks for rag-rat at all.
+    ///
+    /// The empty command is the "off" state rather than a separate flag: there is exactly one way
+    /// to express it, so a config cannot say `enabled = true` and then fail to say how to launch
+    /// it.
+    pub fn configured(&self) -> bool {
+        !self.command.is_empty()
+    }
 }
 
 /// Ratatoskr's own checkpoint database — deliberately a separate file from rag-rat's index.
@@ -644,12 +662,6 @@ impl RatatoskrConfig {
         // this rejects is a backend nobody can select, and the reverse fails deep in a run.
         const BACKENDS: [&str; 3] = ["container", "landlock", "microsandbox"];
 
-        if self.rag_rat.command.is_empty() {
-            return Err(ConfigError::Invalid(
-                "rag_rat.command is empty — set the command that launches rag-rat's MCP server"
-                    .to_string(),
-            ));
-        }
         if self.sandbox.test_command.is_empty() {
             return Err(ConfigError::Invalid(
                 "sandbox.test_command is empty — set the repo's test command".to_string(),
@@ -1088,10 +1100,46 @@ mod tests {
             }
         };
 
-        invalid(|c| c.rag_rat.command.clear());
         invalid(|c| c.sandbox.test_command.clear());
         invalid(|c| c.sandbox.backend = "docker".to_string());
         invalid(|c| c.implementer.max_iterations = 0);
+    }
+
+    #[test]
+    fn the_shipped_no_rag_rat_example_is_a_config_this_build_accepts() {
+        // A committed example that does not parse is worse than no example: it is followed, and
+        // then blamed on the tool. This fails the moment the config shape moves under it.
+        let example = include_str!("../../../examples/without-rag-rat.toml");
+        let cfg: RatatoskrConfig = toml::from_str(example).expect("the example parses");
+        cfg.validate().expect("the example is valid");
+        assert!(
+            !cfg.rag_rat.configured(),
+            "the point of this example is the absence of rag-rat"
+        );
+    }
+
+    #[test]
+    fn a_config_without_rag_rat_is_valid_and_says_so() {
+        // The harness alone is a supported setup. An empty command is the single expression of
+        // "no rag-rat" — there is no separate flag that could disagree with it.
+        let toml = r#"
+            [store]
+            path = ".ratatoskr/state.sqlite3"
+            [worktree]
+            root = "../wt"
+            [sandbox]
+            backend = "landlock"
+            image = "checks"
+            test_command = ["cargo", "test"]
+        "#;
+        let cfg: RatatoskrConfig = toml::from_str(toml).expect("no [rag_rat] section is allowed");
+        assert!(!cfg.rag_rat.configured());
+        cfg.validate().expect("a config without rag-rat is valid");
+
+        // And a section that names a command is on.
+        let with = format!("{toml}\n[rag_rat]\ncommand = [\"rag-rat\", \"mcp\"]\n");
+        let cfg: RatatoskrConfig = toml::from_str(&with).expect("parses");
+        assert!(cfg.rag_rat.configured());
     }
 
     #[test]

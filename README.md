@@ -261,6 +261,24 @@ cd crates/ratatoskr-serve/web && bun install && bun run build
 
 See the [web README](crates/ratatoskr-serve/web/README.md) for the dev-server workflow.
 
+### Without rag-rat
+
+rag-rat is optional. Delete the `[rag_rat]` section and ratatoskr runs the harness alone —
+`examples/without-rag-rat.toml` is a working config, and the absence of the section is the whole of
+it. An empty command means "no code index", not a misconfiguration.
+
+Every node keeps `Read`, `Grep` and `Glob`, so it can still find things the way a person does. What
+goes is what rag-rat knows that a file read cannot tell you: semantic search, the call graph and
+impact surface, the papertrail explaining why a line is the way it is, and memory.
+
+Memory is the one worth thinking about. The `context` node runs with an empty baseline and distils
+the task from what it can read; the `bookkeeper` returns immediately rather than spending a model
+turn composing memories it cannot store. So a run learns nothing from the runs before it and
+teaches the runs after it nothing — a real cost over a long series, and none at all for a one-off.
+
+Everything else is unchanged: the pipeline, fork and converge, the sandbox, acceptance checks,
+worktrees, the dashboard, clarification, plugins, skills, publishing.
+
 ## Configuration
 
 `ratatoskr.toml` covers model routing per node, how rag-rat's MCP server is launched, the sandbox

@@ -1,0 +1,61 @@
+# Ratatoskr without rag-rat: the harness alone.
+#
+# Copy to `ratatoskr.toml`. The only difference from the standard example is what is NOT here —
+# there is no `[rag_rat]` section, and that absence is the whole configuration. An empty or missing
+# section means "no code index", not a misconfiguration, so nothing else needs to say so.
+#
+# ── What you lose ───────────────────────────────────────────────────────────────────────────────
+#
+# Every node keeps `Read`, `Grep` and `Glob`, so it can still find things — the way a person does,
+# by looking. What goes is everything rag-rat knows that a file read cannot tell you:
+#
+#   semantic search      "where is this concept implemented" becomes grep for a word you guessed
+#   the call graph       callers/callees, impact surface — the blast radius before an edit
+#   the papertrail       which issue or PR explains why a line is the way it is
+#   memory               nothing is recorded, and nothing is recalled
+#
+# The last one is the one to think about. The `context` node runs with an empty baseline and
+# distils the task from what it can read; the `bookkeeper` returns immediately without spending a
+# model turn, because it has nowhere to write. A run therefore learns nothing from the runs before
+# it, and teaches the runs after it nothing. That is a real cost over a long series of runs, and no
+# cost at all for a one-off.
+#
+# ── What still works ────────────────────────────────────────────────────────────────────────────
+#
+# Everything else: the full pipeline, the fork and converge loop, the sandbox, acceptance checks,
+# worktrees, the dashboard, clarification, plugins, skills, and publishing. Nothing here is a
+# reduced mode — it is the same harness with one source of context removed.
+
+[store]
+path = ".ratatoskr/state.sqlite3"
+
+[worktree]
+# Outside the checkout: build tools walk up to find a project root, so a worktree nested inside
+# resolves to the outer project instead of itself.
+root = "../.ratatoskr-worktrees"
+
+[sandbox]
+backend = "landlock"
+image = "ratatoskr-checks"
+# The repository's own test command. Runs offline, in the sandbox, against the run's worktree.
+test_command = ["cargo", "test"]
+
+[models.ask]
+provider = "anthropic"
+model = "claude-sonnet-5"
+
+[models.context]
+provider = "anthropic"
+model = "claude-sonnet-5"
+
+[models.analyst]
+provider = "anthropic"
+model = "claude-opus-5"
+
+[models.implementer]
+provider = "anthropic"
+model = "claude-opus-5"
+
+[models.verifier]
+provider = "anthropic"
+model = "claude-opus-5"

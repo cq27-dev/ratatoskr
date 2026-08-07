@@ -38,14 +38,15 @@ pub struct MemoryRecord {
 }
 
 /// Memory node output: the ranked memories.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MemoryOutput {
     pub memories: Vec<MemoryRecord>,
 }
 
 /// The memory node: a direct rag-rat `memory_search`, no agent.
 pub struct MemoryNode {
-    pub sink: ServerSink,
+    /// `None` without rag-rat, where there is no index to search and the answer is simply empty.
+    pub sink: Option<ServerSink>,
 }
 
 impl Node for MemoryNode {
@@ -61,7 +62,12 @@ impl Node for MemoryNode {
         input: MemoryInput,
         _run_state: &RunState,
     ) -> Result<MemoryOutput, NodeError> {
-        search(&self.sink, &input.issue, &input.context).await
+        match &self.sink {
+            Some(sink) => search(sink, &input.issue, &input.context).await,
+            // Not an error: a repository with no memory index has no memories, which is a fact
+            // about it rather than a failure to retrieve them.
+            None => Ok(MemoryOutput::default()),
+        }
     }
 }
 
