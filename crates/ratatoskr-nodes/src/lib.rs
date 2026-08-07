@@ -1163,12 +1163,19 @@ fn node_agent_config(
     // and reading a file it found is the ordinary case rather than the dangerous one. These are
     // also the names a plugin's hooks are written against — `Read`, `Grep`, `Glob` — which is what
     // makes an unmodified plugin's `PreToolUse` fire for a planning node at all.
-    // An empty `default_tools` means the node declares no reach, and that has to include the file
-    // tools — otherwise "no tools" quietly means "Read, Grep and Glob", which is how a node meant
-    // to transcribe output it was handed came to be reading directories on the host instead.
-    let declares_reach = !default_tools.is_empty();
-    let files = std::env::current_dir().ok().filter(|_| declares_reach);
-    if files.is_some() {
+    // Two different things, and conflating them cost the publisher its `gh`.
+    //
+    // Whether a node is *offered* the file tools follows from whether it declares any reach: an
+    // empty list has to mean none, or "no tools" quietly means "Read, Grep and Glob" and a node
+    // meant to transcribe output it was handed goes reading directories on the host.
+    //
+    // The root is separate, and always set. It is not a capability — it is where a tool resolves
+    // paths, and a node with no file tools can do nothing with one. The publisher declares no
+    // default tools on purpose, so `gh` cannot be handed to anyone by widening a shared constant,
+    // and it is the root that lets `gh` resolve at all. Gating the root on the list left it
+    // holding a stand-in that errors, which it dutifully reported as a reason not to publish.
+    let files = std::env::current_dir().ok();
+    if !default_tools.is_empty() {
         tools
             .local()
             .tools
@@ -2721,7 +2728,11 @@ mod agent_config_tests {
         )
         .unwrap();
         assert!(none.tools.names().is_empty(), "{:?}", none.tools.names());
-        assert!(none.files.is_none(), "and nothing to root them at");
+        // The root is still set, and that is not a capability: with no file tools offered there is
+        // nothing to resolve against it. Gating the root on this list instead is what left the
+        // publisher holding a `gh` stand-in that errors — it declares no default tools on purpose,
+        // and the root is what lets the tool it *is* given resolve.
+        assert!(none.files.is_some(), "the root is not the capability");
 
         // A node that does declare reach still gets them — this is the reading half of the
         // pipeline, not an exception for one node.
@@ -2736,6 +2747,32 @@ mod agent_config_tests {
         .unwrap();
         assert!(some.files.is_some());
         assert!(some.tools.names().iter().any(|n| n == "Read"));
+    }
+
+    #[test]
+    fn the_publishers_gh_resolves_to_something_that_can_actually_run() {
+        // The failure this guards, seen on a live run: `gh` fell through to the stand-in whose
+        // message says the tool "is answered inside the run and should never have been
+        // dispatched". The publisher read that as an instruction and reported publishing nothing,
+        // with reasoning that sounded entirely deliberate.
+        let root = std::env::current_dir().expect("a working directory");
+        assert!(
+            ratatoskr_agent::publish::implementation(ratatoskr_agent::publish::GH, &root).is_some(),
+            "with a root, `gh` is a real tool"
+        );
+        // Without one there is nothing to run it in, which is exactly the state the publisher was
+        // left in.
+        let mut tools = ToolSet::default();
+        tools
+            .local()
+            .tools
+            .push(ratatoskr_agent::publish::declaration());
+        assert!(
+            tools
+                .names()
+                .iter()
+                .any(|n| n == ratatoskr_agent::publish::GH)
+        );
     }
 
     #[tokio::test]
