@@ -559,6 +559,23 @@ export default function App() {
     return out;
   }, [events]);
 
+  /**
+   * The node that last did something, from the stream.
+   *
+   * The store cannot answer this. It sees checkpoints, and mid-converge the implementer has one
+   * while still being re-run — so it reads as working — while the verifier, which is an optional
+   * stage and has not checkpointed, reads as not started. Both are the wrong way round exactly
+   * when a viewer is watching the verifier work.
+   */
+  const active = useMemo(() => {
+    const WORKING = new Set(["tool_call", "model_text", "node_start", "tool_result"]);
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e?.node && WORKING.has(e.kind)) return e.node;
+    }
+    return null;
+  }, [events]);
+
   useEffect(() => {
     setNode(null);
     setCheckpoints(null);
@@ -631,6 +648,7 @@ export default function App() {
               <PipelineGraph
                 nodes={detail.nodes}
                 live={live}
+                active={active}
                 selected={node}
                 onSelect={setNode}
               />

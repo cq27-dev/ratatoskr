@@ -289,17 +289,42 @@ interface Props {
   nodes: NodeView[];
   /** Keyed by node name. Fills the box while a node is still working. */
   live: Map<string, LiveNode>;
+  /** The node that last did something, from the event stream. Overrides the derived state. */
+  active: string | null;
   selected: string | null;
   onSelect: (name: string) => void;
 }
 
-export default function PipelineGraph({ nodes, live, selected, onSelect }: Props) {
-  const byName = useMemo(
-    () => new Map(nodes.map((n) => [n.name, n])),
-    [nodes],
-  );
+export default function PipelineGraph({ nodes, live, active, selected, onSelect }: Props) {
 
-  const columns = useMemo(() => stages(nodes), [nodes]);
+  /*
+   * The pipeline as it actually stands, from two sources each authoritative for a different half.
+   *
+   * The store proves what has *completed*: checkpoints are durable and survive a reload. The event
+   * stream is the only thing that knows what is happening *now* — and the store's guess at that is
+   * inverted precisely when it matters. Mid-converge the implementer holds a checkpoint and is
+   * still being re-run, so it reads as working; the verifier is an optional stage that has not
+   * checkpointed, so it reads as not started. Someone watching the verifier sees the implementer
+   * lit up instead.
+   *
+   * Everything below reads from this one list — boxes, edges, and the converge loop. Deriving any
+   * of them from the raw list is how the loop came to glow green while a different node worked.
+   */
+  const view = useMemo(() => {
+    if (!active) return nodes;
+    return nodes.map((n) => {
+      if (n.name === active) return { ...n, state: "working" as const };
+      // Something else is talking, so this is not working: fall back to what its checkpoints
+      // support. A node with one is done; a node with none never started.
+      if (n.state === "working") {
+        return { ...n, state: (n.checkpoints > 0 ? "done" : "idle") as NodeView["state"] };
+      }
+      return n;
+    });
+  }, [nodes, active]);
+
+  const columns = useMemo(() => stages(view), [view]);
+  const byName = useMemo(() => new Map(view.map((n) => [n.name, n])), [view]);
 
   const rfNodes = useMemo<PipelineNodeType[]>(() => {
     const maxLanes = Math.max(1, ...columns.map((c) => c.length));
@@ -313,7 +338,7 @@ export default function PipelineGraph({ nodes, live, selected, onSelect }: Props
         ...NODE_SIZE,
       })),
     );
-  }, [columns, selected]);
+  }, [columns, live, selected]);
 
   const rfEdges = useMemo<Edge[]>(() => {
     // Every node in a stage feeds every node in the next one — which is what a fork joining back

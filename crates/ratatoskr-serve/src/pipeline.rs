@@ -56,6 +56,13 @@ const CANNOT_FAIL_THE_RUN: &[&str] = &["bookkeeper", "publisher"];
 pub const ISSUE_NODE: &str = "issue";
 
 /// What a node is doing, as far as the store can honestly say.
+///
+/// The qualifier is load-bearing. This is inferred from checkpoints, which are durable and prove
+/// what *completed* — and cannot answer what is happening now. Two cases it gets backwards, both
+/// mid-converge: the implementer holds a checkpoint while still being re-run, so it reads as
+/// `Working`; the verifier is an optional stage that has not checkpointed, so it reads as `Idle`.
+/// A client with the event stream knows better and is expected to prefer it; one without gets the
+/// best answer the store can give.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeState {
