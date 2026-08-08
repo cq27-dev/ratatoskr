@@ -70,9 +70,11 @@ impl PublisherNode {
             node: "publisher",
             route: &self.route,
             preamble: &crate::effective_preamble(
+                "publisher",
                 PREAMBLE,
                 self.system_prompt.as_deref(),
                 self.plugins.context.as_deref(),
+                &self.plugins.skills,
             ),
             question: &render_prompt(&input),
             tools: self.tools.clone(),

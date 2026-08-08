@@ -1211,16 +1211,34 @@ fn servers_to_start(
 }
 
 /// The preamble a node actually runs with: its built-in text, or a ruleset's replacement for it,
-/// prefixed by whatever context plugins contributed for this run.
+/// prefixed by whatever context plugins contributed for this run and suffixed by the listing of the
+/// skills its plugins bind.
+///
+/// The skill listing lives here rather than in the `Skill` tool's schema so it does not grow the
+/// schema the node carries on every model call: it is prose in the cached prefix, and the tool
+/// resolves the chosen name against the same set at call time. It is appended to whichever base
+/// applies — a ruleset `systemPrompt` override replaces the node's text, not the skills its plugins
+/// ship — so overriding the preamble cannot disenfranchise a bound skill. No skills bound leaves the
+/// preamble byte-identical to the context-and-base composition.
 pub(crate) fn effective_preamble(
+    node: &str,
     built_in: &str,
     system_prompt: Option<&str>,
     context: Option<&str>,
+    skills: &[ratatoskr_plugin::Skill],
 ) -> String {
     let base = system_prompt.unwrap_or(built_in);
-    match context {
+    let composed = match context {
         Some(context) => format!("{context}\n\n{base}"),
         None => base.to_string(),
+    };
+    // `node` attributes a duplicate-name warning to the node whose plugins bound the skills.
+    match skills::listing(skills, node) {
+        Some(listing) => format!(
+            "{composed}\n\nAvailable skills: call the Skill tool with one of these names, and only \
+             these, when its description matches what you are doing.\n{listing}"
+        ),
+        None => composed,
     }
 }
 
@@ -3338,18 +3356,120 @@ mod agent_config_tests {
     fn plugin_context_prefixes_whichever_preamble_applies() {
         // A ruleset replaces the node's own text; plugin context is prepended to whatever wins,
         // so a repository digest never costs a node its instructions.
-        assert_eq!(effective_preamble("built-in", None, None), "built-in");
         assert_eq!(
-            effective_preamble("built-in", Some("override"), None),
+            effective_preamble("n", "built-in", None, None, &[]),
+            "built-in"
+        );
+        assert_eq!(
+            effective_preamble("n", "built-in", Some("override"), None, &[]),
             "override"
         );
         assert_eq!(
-            effective_preamble("built-in", None, Some("digest")),
+            effective_preamble("n", "built-in", None, Some("digest"), &[]),
             "digest\n\nbuilt-in"
         );
         assert_eq!(
-            effective_preamble("built-in", Some("override"), Some("digest")),
+            effective_preamble("n", "built-in", Some("override"), Some("digest"), &[]),
             "digest\n\noverride"
+        );
+    }
+
+    // --- the skill listing lives in the preamble (issue #143) ---
+    //
+    // `effective_preamble` gained a `skills` parameter: it appends an 'Available skills:'
+    // listing of every deduped bound skill's name and description to whichever base preamble
+    // applies, so the tool schema can stay constant. These exercise that contracted signature.
+
+    /// A skill ready to bind, as the plugin loader hands them out.
+    fn bound_skill(name: &str, description: &str) -> ratatoskr_plugin::Skill {
+        ratatoskr_plugin::Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            body: format!("do {name} in ${{CLAUDE_SKILL_DIR}}"),
+            dir: std::path::PathBuf::from(format!("/plugins/{name}")),
+        }
+    }
+
+    #[test]
+    fn the_preamble_lists_every_bound_skill_whichever_base_applies() {
+        let skills = [
+            bound_skill("dream-review", "when triaging findings"),
+            bound_skill("using-rag-rat", "when navigating the repository"),
+        ];
+        let preamble = effective_preamble("n", "base", None, None, &skills);
+        assert!(preamble.contains("base"), "{preamble}");
+        assert!(
+            preamble.contains("Available skills:"),
+            "the listing lives in the preamble now: {preamble}"
+        );
+        for s in &skills {
+            assert!(preamble.contains(&s.name), "missing {}: {preamble}", s.name);
+            assert!(
+                preamble.contains(&s.description),
+                "missing the description of {}: {preamble}",
+                s.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_ruleset_preamble_override_cannot_disenfranchise_a_bound_skill() {
+        // `systemPrompt` replaces the node's built-in text, not the skills its plugins ship: the
+        // listing is appended to whichever preamble applies.
+        let skills = [
+            bound_skill("dream-review", "when triaging findings"),
+            bound_skill("using-rag-rat", "when navigating the repository"),
+        ];
+        let preamble =
+            effective_preamble("n", "built-in", Some("override"), Some("digest"), &skills);
+        assert!(preamble.contains("digest"), "{preamble}");
+        assert!(preamble.contains("override"), "{preamble}");
+        for s in &skills {
+            assert!(
+                preamble.contains(&s.name),
+                "overriding the preamble dropped {}: {preamble}",
+                s.name
+            );
+            assert!(
+                preamble.contains(&s.description),
+                "overriding the preamble dropped the description of {}: {preamble}",
+                s.name
+            );
+        }
+    }
+
+    #[test]
+    fn no_skills_bound_leaves_the_preamble_byte_identical() {
+        // The empty slice is the ordinary case — most nodes bind no plugin — and it must not
+        // grow an empty 'Available skills' section.
+        assert_eq!(
+            effective_preamble("n", "built-in", None, None, &[]),
+            "built-in"
+        );
+        assert_eq!(
+            effective_preamble("n", "built-in", Some("override"), None, &[]),
+            "override"
+        );
+        assert_eq!(
+            effective_preamble("n", "built-in", None, Some("digest"), &[]),
+            "digest\n\nbuilt-in"
+        );
+        assert_eq!(
+            effective_preamble("n", "built-in", Some("override"), Some("digest"), &[]),
+            "digest\n\noverride"
+        );
+    }
+
+    #[test]
+    fn a_long_skill_description_is_listed_in_full_in_the_preamble() {
+        // The budget that used to drop this skill existed because the listing was a tool schema;
+        // as preamble prose there is nothing to be full of.
+        let description = format!("when the {} case applies", "very long ".repeat(500));
+        let skills = [bound_skill("verbose", &description)];
+        let preamble = effective_preamble("n", "base", None, None, &skills);
+        assert!(
+            preamble.contains(&description),
+            "the whole description is listed, not dropped to fit a budget"
         );
     }
 

@@ -74,9 +74,11 @@ impl Node for ScoutNode {
             node: "scout",
             route: &self.route,
             preamble: &crate::effective_preamble(
+                "scout",
                 PREAMBLE,
                 self.system_prompt.as_deref(),
                 self.plugins.context.as_deref(),
+                &self.plugins.skills,
             ),
             question: &issue,
             tools: self.tools.clone(),
