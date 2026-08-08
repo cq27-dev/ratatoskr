@@ -83,6 +83,7 @@ const ALLOWED: &[(&str, &str)] = &[
     ("pr", "list"),
     ("issue", "comment"),
     ("issue", "view"),
+    ("issue", "close"),
 ];
 
 /// The tool declaration.
@@ -95,7 +96,7 @@ pub fn declaration() -> Tool {
                 "items": { "type": "string" },
                 "description": "Arguments to `gh`, without the program name. Permitted: \
                     `pr create`, `pr comment`, `pr view`, `pr list`, `issue comment`, \
-                    `issue view`. Anything else is refused."
+                    `issue view`, `issue close`. Anything else is refused."
             },
             "body": {
                 "type": "string",
@@ -736,6 +737,13 @@ mod tests {
     fn only_the_enumerated_subcommands_run() {
         assert!(permitted(&argv(&["pr", "create", "--title", "x"])));
         assert!(permitted(&argv(&["issue", "comment", "79"])));
+        assert!(permitted(&argv(&[
+            "issue",
+            "close",
+            "79",
+            "--reason",
+            "completed"
+        ])));
         // Flags go after the subcommand, which is the ordinary form.
         assert!(permitted(&argv(&["pr", "view", "--repo", "o/r"])));
         // And a leading flag is refused rather than searched past: deciding which token is a flag's
@@ -747,6 +755,11 @@ mod tests {
         assert!(!permitted(&argv(&["api", "-X", "DELETE", "/repos/o/r"])));
         assert!(!permitted(&argv(&["auth", "token"])));
         assert!(!permitted(&argv(&["pr", "merge", "1"])));
+        // Closing an issue is permitted; reopening, editing and transferring one are not — each
+        // would let a run undo or rewrite a person's decision rather than record its own.
+        assert!(!permitted(&argv(&["issue", "reopen", "79"])));
+        assert!(!permitted(&argv(&["issue", "edit", "79"])));
+        assert!(!permitted(&argv(&["issue", "transfer", "79", "o/r"])));
         assert!(!permitted(&argv(&["repo", "delete", "o/r"])));
         assert!(!permitted(&argv(&["release", "create", "v1"])));
         // A subcommand nobody thought about is refused by the list being exhaustive rather than
