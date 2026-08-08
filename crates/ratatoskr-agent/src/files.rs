@@ -245,7 +245,9 @@ fn within(root: &Path, path: Option<&str>) -> Result<PathBuf, ToolExecutionError
     if !real.starts_with(&base) {
         return Err(ToolExecutionError::invalid_args(format!(
             "{} is outside this repository",
-            real.display()
+            // What was asked for, not where it resolved to: a path outside the repository has no
+            // relative form, and printing the resolved one hands over the root.
+            path.unwrap_or_default()
         )));
     }
     Ok(real)
@@ -293,25 +295,25 @@ fn write(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionE
         return Err(ToolExecutionError::invalid_args(format!(
             "refusing to write {} bytes to {}; the cap is {MAX_WRITE_BYTES}",
             content.len(),
-            path.display()
+            display(root, &path)
         )));
     }
     if path.is_dir() {
         return Err(ToolExecutionError::invalid_args(format!(
             "{} is a directory",
-            path.display()
+            display(root, &path)
         )));
     }
     // Created here rather than failing: a change that adds a module adds its directory too, and
     // making the model call a separate tool for that is a turn spent on nothing.
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            ToolExecutionError::other(format!("could not create {}: {e}", parent.display()))
+            ToolExecutionError::other(format!("could not create {}: {e}", display(root, parent)))
         })?;
     }
     let existed = path.exists();
     std::fs::write(&path, content).map_err(|e| {
-        ToolExecutionError::other(format!("could not write {}: {e}", path.display()))
+        ToolExecutionError::other(format!("could not write {}: {e}", display(root, &path)))
     })?;
     let what = if existed { "Replaced" } else { "Created" };
     Ok(format!(
@@ -351,7 +353,7 @@ fn edit(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionEr
     }
 
     let before = std::fs::read_to_string(&path).map_err(|e| {
-        ToolExecutionError::other(format!("could not read {}: {e}", path.display()))
+        ToolExecutionError::other(format!("could not read {}: {e}", display(root, &path)))
     })?;
 
     let count = before.matches(old).count();
@@ -383,7 +385,7 @@ fn edit(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionEr
                 after.push_str(eol);
             }
             std::fs::write(&path, &after).map_err(|e| {
-                ToolExecutionError::other(format!("could not write {}: {e}", path.display()))
+                ToolExecutionError::other(format!("could not write {}: {e}", display(root, &path)))
             })?;
             // Said plainly: the edit landed somewhere the arguments did not name exactly, and the
             // caller should know that rather than assume a literal match.
@@ -414,7 +416,7 @@ fn edit(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionEr
         before.replacen(old, new, 1)
     };
     std::fs::write(&path, &after).map_err(|e| {
-        ToolExecutionError::other(format!("could not write {}: {e}", path.display()))
+        ToolExecutionError::other(format!("could not write {}: {e}", display(root, &path)))
     })?;
     Ok(format!(
         "Edited {} ({} replacement{}).",
@@ -591,7 +593,7 @@ fn read(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionEr
             display(root, &path)
         )));
     }
-    if is_binary(&path)? {
+    if is_binary(root, &path)? {
         // Said plainly rather than left to fail as a UTF-8 error deeper in, which reads as a
         // broken tool rather than as a file nobody should be asking for by line.
         return Err(ToolExecutionError::invalid_args(format!(
@@ -614,9 +616,13 @@ fn read(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionEr
     let mut out = String::new();
     let mut last = 0;
     let mut cut = false;
-    for (number, line) in lines_of(&path)?.enumerate().skip(offset - 1).take(limit) {
+    for (number, line) in lines_of(root, &path)?
+        .enumerate()
+        .skip(offset - 1)
+        .take(limit)
+    {
         let line = line.map_err(|e| {
-            ToolExecutionError::other(format!("cannot read {}: {e}", path.display()))
+            ToolExecutionError::other(format!("cannot read {}: {e}", display(root, &path)))
         })?;
         last = number + 1;
         // Numbered because that is how a node cites what it read, and how it asks for more.
@@ -655,24 +661,27 @@ fn clip(line: &str) -> String {
 }
 
 /// Whether the file looks binary, by the same rule git uses: a NUL byte near the start.
-fn is_binary(path: &Path) -> Result<bool, ToolExecutionError> {
+fn is_binary(root: &Path, path: &Path) -> Result<bool, ToolExecutionError> {
     use std::io::Read as _;
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| ToolExecutionError::other(format!("cannot read {}: {e}", path.display())))?;
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        ToolExecutionError::other(format!("cannot read {}: {e}", display(root, path)))
+    })?;
     let mut head = [0u8; 8192];
-    let n = file
-        .read(&mut head)
-        .map_err(|e| ToolExecutionError::other(format!("cannot read {}: {e}", path.display())))?;
+    let n = file.read(&mut head).map_err(|e| {
+        ToolExecutionError::other(format!("cannot read {}: {e}", display(root, path)))
+    })?;
     Ok(head[..n].contains(&0))
 }
 
 /// One file's lines, read as they are needed.
 fn lines_of(
+    root: &Path,
     path: &Path,
 ) -> Result<std::io::Lines<std::io::BufReader<std::fs::File>>, ToolExecutionError> {
     use std::io::BufRead as _;
-    let file = std::fs::File::open(path)
-        .map_err(|e| ToolExecutionError::other(format!("cannot read {}: {e}", path.display())))?;
+    let file = std::fs::File::open(path).map_err(|e| {
+        ToolExecutionError::other(format!("cannot read {}: {e}", display(root, path)))
+    })?;
     Ok(std::io::BufReader::new(file).lines())
 }
 
@@ -713,7 +722,7 @@ fn grep(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecutionEr
             continue;
         }
         // Streamed, so a file large enough to matter is never held whole in memory.
-        let Ok(reading) = lines_of(&file) else {
+        let Ok(reading) = lines_of(root, &file) else {
             continue; // Unreadable. Not an error; just not a match.
         };
         let shown = file
@@ -809,6 +818,54 @@ fn walk(root: &Path, base: &Path) -> impl Iterator<Item = PathBuf> + use<> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_message_hands_the_model_the_root_it_is_working_under() {
+        // A node's file tools are rooted at a run's worktree on this machine; its `Bash` runs in a
+        // sandbox where that tree is mounted somewhere else entirely. So a path from one is wrong
+        // in the other, and a node that learns the host path starts using it — observed as
+        // `cd /home/…/.ratatoskr-worktrees/ratatoskr/<id> && cargo test`, which the sandbox cannot
+        // resolve. Errors are where it learnt it: the successful answers were already relative.
+        let root = repo("no-absolute-paths");
+        let absolute = root.display().to_string();
+        let said = |v: serde_json::Value| -> String {
+            let name = v["tool"].as_str().unwrap().to_string();
+            let args = v["args"].clone();
+            let out = match name.as_str() {
+                "Write" => write(&root, &args),
+                "Edit" => edit(&root, &args),
+                "Read" => read(&root, &args),
+                _ => unreachable!(),
+            };
+            // Display, not Debug: `Debug` prints the message as `<redacted>`, so a test reading it
+            // would pass no matter what the model is actually shown.
+            out.expect_err("these are the failing cases").to_string()
+        };
+
+        let messages = [
+            // A file that is not there — the most common failure a node meets.
+            said(serde_json::json!({"tool":"Read","args":{"file_path":"src/nope.rs"}})),
+            // A directory where a file was meant.
+            said(serde_json::json!({"tool":"Read","args":{"file_path":"src"}})),
+            // An edit whose anchor does not match.
+            said(serde_json::json!({
+                "tool":"Edit",
+                "args":{"file_path":"src/lib.rs","old_string":"not in the file","new_string":"x"}
+            })),
+            // And a write to a path that leaves the repository.
+            said(serde_json::json!({
+                "tool":"Write",
+                "args":{"file_path":"/etc/passwd","content":"x"}
+            })),
+        ];
+        for message in &messages {
+            assert!(
+                !message.contains(&absolute),
+                "leaked the root {absolute}: {message}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A repository with a couple of files in it.
     fn repo(case: &str) -> PathBuf {
