@@ -107,6 +107,24 @@ impl PublisherNode {
     }
 }
 
+/// Whether the run ended having done what it set out to do.
+///
+/// Three statuses mean yes, and only one of them is `converged`. A run that judged the task needed
+/// no code change did exactly what was asked and its plan is the deliverable; a `plan` run that
+/// finished is not half of anything. Warning about either produces a pull request or comment that
+/// apologises for a success — which was the first thing this said, on a research run that ended
+/// `no_code_change`: "this run did not finish clean".
+///
+/// A status this build cannot parse is treated as unclean. The cost of that is a sentence of
+/// unnecessary caution; the cost of the other direction is a run overclaiming.
+fn finished_clean(status: &str) -> bool {
+    use ratatoskr_core::RunStatus::{Converged, NoCodeChange, Planned};
+    matches!(
+        status.parse::<ratatoskr_core::RunStatus>(),
+        Ok(Converged | NoCodeChange | Planned)
+    )
+}
+
 fn render_prompt(input: &PublisherInput) -> String {
     let mut s = String::new();
     let _ = write!(s, "THE TASK:\n{}\n\n", input.issue);
@@ -120,7 +138,7 @@ fn render_prompt(input: &PublisherInput) -> String {
     // more concrete claim and the one a reader believes. A live run published exactly that: a
     // status of `max_iterations_reached`, a pull request describing a clean landing, and no
     // mention of the review it had failed four times.
-    if input.status != ratatoskr_core::RunStatus::Converged.as_str() {
+    if !finished_clean(&input.status) {
         s.push_str(
             "THIS RUN DID NOT FINISH CLEAN. Whatever you write must say so in its own words, \
              near the top, before anything it did well. The tests passing is not the same as the \
@@ -289,6 +307,42 @@ mod tests {
         );
         // And the scenario, because a summary without one is a claim the writer cannot check.
         assert!(prompt.contains("a reader is told the opposite"), "{prompt}");
+    }
+
+    #[test]
+    fn a_run_that_needed_no_change_is_not_told_it_fell_short() {
+        // Observed: a research run ended `no_code_change`, which is the analyst judging the task
+        // needs no code — a success whose deliverable is the plan. It was told it had not finished
+        // clean, and duly wrote that into what it published.
+        for clean in ["no_code_change", "planned", "converged"] {
+            let prompt = render_prompt(&PublisherInput {
+                issue: "Is the codebase accruing debt?".into(),
+                analyst: analyst(),
+                implementer: None,
+                status: clean.into(),
+                iterations: 0,
+                unresolved: Vec::new(),
+            });
+            assert!(
+                !prompt.contains("DID NOT FINISH CLEAN"),
+                "{clean}: {prompt}"
+            );
+        }
+        // And the ones that did fall short still say so.
+        for unclean in ["max_iterations_reached", "failed", "unreviewed"] {
+            let prompt = render_prompt(&PublisherInput {
+                issue: "Fix it".into(),
+                analyst: analyst(),
+                implementer: Some(implementer(&[])),
+                status: unclean.into(),
+                iterations: 3,
+                unresolved: Vec::new(),
+            });
+            assert!(
+                prompt.contains("DID NOT FINISH CLEAN"),
+                "{unclean}: {prompt}"
+            );
+        }
     }
 
     #[test]
