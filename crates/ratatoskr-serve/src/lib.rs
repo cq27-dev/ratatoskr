@@ -18,10 +18,10 @@ pub mod launch;
 pub mod pipeline;
 pub mod project;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{FromRef, Path as AxumPath, State};
 use axum::http::StatusCode;
@@ -30,6 +30,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ratatoskr_core::auth::{Access, Role};
+use ratatoskr_core::{Command, Control, ControlView, RunControl};
 use ratatoskr_store::Checkpoint;
 use ratatoskr_store::auth::AuthStore;
 use serde::Serialize;
@@ -60,6 +61,13 @@ struct AppState {
     /// Questions from runs waiting on a human, and who is watching. Shared across projects: run
     /// ids are unique, so a question needs no further scoping.
     desk: Arc<Desk>,
+    /// What operators have asked of the runs in flight, keyed by run id.
+    ///
+    /// In memory, and deliberately: a command is advice to a process that is running right now, so
+    /// it is worth exactly as long as that process. Persisting it would resurrect a pause for a run
+    /// that is long finished. It also cannot go in a project's store, which only a run process
+    /// writes.
+    control: Arc<Mutex<HashMap<String, RunControl>>>,
     /// Who may use this instance. Instance-wide, not per project — see `ratatoskr_store::auth`.
     auth: AuthStore,
     /// Failed sign-ins, so a password cannot be guessed at network speed.
@@ -211,6 +219,7 @@ pub async fn serve(opts: ServeOptions) -> Result<(), ServeError> {
     let state = AppState {
         projects: Arc::clone(&projects),
         desk,
+        control: Arc::default(),
         auth,
         throttle: Arc::new(auth::LoginThrottle::default()),
         secure_cookies,
@@ -293,6 +302,10 @@ fn router(state: AppState, web: Option<PathBuf>) -> Router {
         )
         .route("/api/projects/{project}/runs/{run_id}", get(run_detail))
         .route(
+            "/api/projects/{project}/runs/{run_id}/control",
+            post(control_run),
+        )
+        .route(
             "/api/projects/{project}/runs/{run_id}/nodes/{node}",
             get(node_checkpoints),
         )
@@ -329,7 +342,57 @@ fn router(state: AppState, web: Option<PathBuf>) -> Router {
 fn internal_router(state: AppState) -> Router {
     Router::new()
         .route("/internal/clarifications", post(await_answer))
+        .route("/internal/control", post(node_control))
         .with_state(state)
+}
+
+/// What a run process asks for: which node, of which run.
+#[derive(serde::Deserialize)]
+struct ControlAsk {
+    run_id: String,
+    node: String,
+}
+
+/// Answer one node's "what should I do now?".
+///
+/// Loopback only, like the clarification rendezvous beside it, and unauthenticated for the same
+/// reason: reaching this port is the credential. It takes the operator's text with it, so a reply
+/// is delivered exactly once — a message re-read on every poll would be the operator saying it
+/// again on every turn.
+async fn node_control(State(state): State<AppState>, Json(ask): Json<ControlAsk>) -> Json<Control> {
+    let mut control = state.control.lock().expect("control mutex poisoned");
+    let Some(run) = control.get_mut(&ask.run_id) else {
+        return Json(Control::carry_on());
+    };
+    Json(run.poll(&ask.node))
+}
+
+/// Pause, resume, stop, start or steer a run in flight.
+///
+/// Needs `Act`, the same as starting a run: these change what a run does, and a reader of a public
+/// project must not be able to stop it. Recorded here and nowhere else — the run picks it up at its
+/// next turn boundary, which is why the answer is what the *operator asked for* rather than what
+/// the run has since done about it.
+async fn control_run(
+    State(state): State<AppState>,
+    caller: Caller,
+    AxumPath((project, run_id)): AxumPath<(String, String)>,
+    Json(command): Json<Command>,
+) -> Result<Json<ControlView>, ApiError> {
+    let (_, run_id) = state
+        .project_and_run(&project, &run_id, &caller, Access::Act)
+        .await?;
+    let mut control = state.control.lock().expect("control mutex poisoned");
+    let run = control.entry(run_id.clone()).or_default();
+    tracing::info!(run_id, ?command, "operator control");
+    run.apply(command);
+    let view = run.view();
+    // Nothing asked for and nothing outstanding: drop the entry rather than accumulate one per run
+    // this instance has ever watched.
+    if run.is_empty() {
+        control.remove(&run_id);
+    }
+    Ok(Json(view))
 }
 
 /// Start a run because someone mentioned the bot in an issue.
@@ -568,6 +631,12 @@ struct RunDetail {
     /// The pull request the run opened, if it opened one. Absent for comment-only or
     /// nothing-published runs, and for older runs whose `publisher` checkpoint predates this.
     pull_request: Option<PullRequestView>,
+    /// What the operator has asked of this run — what the controls should show.
+    ///
+    /// What was asked for, not what the run has done about it: a node acts at its next turn
+    /// boundary, which can be a minute away, and a button that sprang back until the run noticed
+    /// would read as the click having been lost.
+    control: ControlView,
 }
 
 /// The implementer's worktree — the reviewable deliverable, kept on `converged` and
@@ -653,7 +722,16 @@ async fn run_detail(
         .max()
         .map(str::to_string);
 
+    let control = state
+        .control
+        .lock()
+        .expect("control mutex poisoned")
+        .get(&run_id)
+        .map(RunControl::view)
+        .unwrap_or_default();
+
     Ok(Json(RunDetail {
+        control,
         run_id,
         status,
         issue_id: run.as_ref().and_then(|r| r.issue_id.clone()),
@@ -978,6 +1056,7 @@ mod access_tests {
         AppState {
             projects: Arc::new(projects),
             desk: Arc::new(Desk::default()),
+            control: Arc::default(),
             auth: AuthStore::open_in_memory().expect("in-memory identity database"),
             throttle: Arc::new(auth::LoginThrottle::default()),
             secure_cookies: false,
@@ -1029,6 +1108,143 @@ mod access_tests {
         builder
             .body(Body::from(json.to_string()))
             .expect("a valid request")
+    }
+
+    /// The controls, end to end: an operator issues a command on the public API and a run process
+    /// picks it up on the internal one.
+    mod control {
+        use super::*;
+
+        /// Ask the internal rendezvous what a node should do, the way a run process does.
+        async fn ask(state: AppState, run_id: &str, node: &str) -> Control {
+            let body = serde_json::json!({ "run_id": run_id, "node": node }).to_string();
+            let response = internal_router(state)
+                .oneshot(post("/internal/control", &body, None))
+                .await
+                .expect("the rendezvous to answer");
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("a body");
+            serde_json::from_slice(&bytes).expect("a control")
+        }
+
+        /// Issue a command as an operator.
+        async fn command(state: AppState, cookie: &str, json: &str) -> StatusCode {
+            send(
+                state,
+                post("/api/projects/open/runs/r1/control", json, Some(cookie)),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_pause_reaches_the_run_that_asks_for_it() {
+            let state = state().await;
+            let cookie = signed_in(&state, Role::Operator).await;
+            assert_eq!(
+                command(state.clone(), &cookie, r#"{"command":"pause"}"#).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                ask(state.clone(), "r1", "analyst").await.directive,
+                ratatoskr_core::Directive::Hold
+            );
+
+            command(state.clone(), &cookie, r#"{"command":"resume"}"#).await;
+            assert_eq!(
+                ask(state, "r1", "analyst").await.directive,
+                ratatoskr_core::Directive::Continue
+            );
+        }
+
+        #[tokio::test]
+        async fn text_reaches_the_node_it_names_exactly_once() {
+            let state = state().await;
+            let cookie = signed_in(&state, Role::Operator).await;
+            command(
+                state.clone(),
+                &cookie,
+                r#"{"command":"steer","node":"implementer","text":"use the existing helper"}"#,
+            )
+            .await;
+
+            assert_eq!(
+                ask(state.clone(), "r1", "implementer").await.steer,
+                ["use the existing helper"]
+            );
+            // Twice would be the operator appearing to repeat themselves on every turn.
+            assert!(
+                ask(state.clone(), "r1", "implementer")
+                    .await
+                    .steer
+                    .is_empty()
+            );
+            // And it was never for the other node in the fork.
+            assert!(ask(state, "r1", "red_team").await.steer.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_run_nobody_has_touched_is_told_to_carry_on() {
+            // The common case by far: every node of every uncontrolled run asks this at every turn
+            // boundary, and must not be held up by the answer.
+            let state = state().await;
+            assert_eq!(
+                ask(state, "never-heard-of-it", "analyst").await,
+                Control::carry_on()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_viewer_cannot_touch_a_run() {
+            // Reading a public project is open to anyone; stopping its run is not.
+            let state = state().await;
+            let viewer = signed_in(&state, Role::Viewer).await;
+            assert_eq!(
+                command(state.clone(), &viewer, r#"{"command":"pause"}"#).await,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                send(
+                    state.clone(),
+                    post(
+                        "/api/projects/open/runs/r1/control",
+                        r#"{"command":"pause"}"#,
+                        None
+                    ),
+                )
+                .await,
+                StatusCode::UNAUTHORIZED
+            );
+            // Neither of them changed anything.
+            assert_eq!(ask(state, "r1", "analyst").await, Control::carry_on());
+        }
+
+        #[tokio::test]
+        async fn stopping_and_starting_a_node_is_one_round_trip_each() {
+            let state = state().await;
+            let cookie = signed_in(&state, Role::Operator).await;
+            command(
+                state.clone(),
+                &cookie,
+                r#"{"command":"stop","node":"implementer"}"#,
+            )
+            .await;
+            assert_eq!(
+                ask(state.clone(), "r1", "implementer").await.directive,
+                ratatoskr_core::Directive::Stop
+            );
+
+            command(
+                state.clone(),
+                &cookie,
+                r#"{"command":"start","node":"implementer"}"#,
+            )
+            .await;
+            assert_eq!(
+                ask(state, "r1", "implementer").await.directive,
+                ratatoskr_core::Directive::Continue
+            );
+        }
     }
 
     #[tokio::test]

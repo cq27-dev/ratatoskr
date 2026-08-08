@@ -18,16 +18,19 @@ import { Rail } from "./panels/Rail";
 import { SignIn } from "./panels/SignIn";
 import { RunMeta } from "./panels/RunMeta";
 import { Scrubber } from "./panels/Scrubber";
+import { Controls } from "./panels/Controls";
 import {
   getHistory,
   getNodeCheckpoints,
   getRun,
   followRun,
   listProjects,
+  isTerminal,
   listRuns,
   mayAct,
   whoami,
   type CheckpointView,
+  type ControlView,
   type LiveEvent,
   type NodeFacts,
   type Me,
@@ -35,6 +38,10 @@ import {
   type RunDetail,
   type RunSummary,
 } from "./api";
+
+/** A run nobody has touched. A constant so the identity is stable — as a literal it would be a new
+ * object on every render, and the effect that seeds it would never stop firing. */
+const EMPTY_CONTROL: ControlView = { paused: false, stopped: [], steering: [] };
 
 /** How many live events to keep on screen. Old ones scroll away; the log file keeps everything. */
 const FEED_LIMIT = 250;
@@ -381,6 +388,29 @@ export default function App() {
   }, [detail, shownEvents]);
 
   /**
+   * Which nodes are working right now — what stop and steer can be aimed at.
+   *
+   * From the live pipeline rather than the scrubbed view: scrubbing back through a run does not
+   * change what it is doing this second, and a control aimed at where the slider happens to sit
+   * would stop a node that finished ten minutes ago.
+   */
+  const workingNodes = useMemo(
+    () => (detail?.nodes ?? []).filter((n) => n.state === "working").map((n) => n.name),
+    [detail],
+  );
+
+  /**
+   * What the operator has asked of this run.
+   *
+   * Seeded from the server and updated by each command's reply, so a click shows at once instead
+   * of waiting for the next poll — and a reload, or a second tab, still sees the same pause.
+   */
+  const [controlState, setControlState] = useState<ControlView>(EMPTY_CONTROL);
+  useEffect(() => {
+    setControlState(detail?.control ?? EMPTY_CONTROL);
+  }, [detail]);
+
+  /**
    * Characters the node column reserves, from the longest name this run can ever show.
    *
    * Both sources matter and neither alone is enough. The graph's nodes are fixed when the run
@@ -564,6 +594,21 @@ export default function App() {
               nodes={timelineNodes}
               startedAt={timeline[0]?.at ?? null}
               onScrub={onScrub}
+              controls={
+                // Only for a run still executing. A finished run has nothing to pause, and
+                // controls that could never do anything are worse than none: they invite a click
+                // and then explain themselves.
+                project && runId && !isTerminal(detail.status) ? (
+                  <Controls
+                    project={project}
+                    runId={runId}
+                    state={controlState}
+                    working={workingNodes}
+                    mayAct={mayAct(me?.role)}
+                    onChange={setControlState}
+                  />
+                ) : undefined
+              }
             />
             <div className="graph">
               <PipelineGraph

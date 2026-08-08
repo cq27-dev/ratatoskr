@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod control;
 pub mod policy;
 pub mod shape;
 pub mod state;
@@ -15,6 +16,7 @@ pub use config::{
     HookLimits, ImplementerConfig, MAX_SUBJECT_CHARS, ModelRoute, PluginConfig, PublishConfig,
     RagRatConfig, RatatoskrConfig, SandboxConfig, SessionScope, StoreConfig, WorktreeConfig,
 };
+pub use control::{Command, Control, ControlView, Directive, RunControl};
 pub use policy::{ToolDecision, ToolPolicy};
 pub use state::{RunState, RunStatus};
 pub use telemetry::{NodeTelemetry, TokenUsage};

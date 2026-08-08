@@ -14,13 +14,15 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ratatoskr_core::{ModelRoute, NodeTelemetry, TokenUsage, ToolDecision, ToolPolicy};
+use ratatoskr_core::{
+    Control, Directive, ModelRoute, NodeTelemetry, TokenUsage, ToolDecision, ToolPolicy,
+};
 use ratatoskr_mcp::ToolSet;
 use rig_agent::AgentBuilder;
 use rig_agent::agent::{
     Agent, AgentHook, CompletionResponseEvent, HookContext, ModelTurnAction, ModelTurnFinished,
-    NoToolConfig, ObservationAction, OutputMode, ToolCall, ToolCallAction, ToolResultAction,
-    ToolResultEvent, WithBuilderTools,
+    NoToolConfig, ObservationAction, OutputMode, RetryRequest, ToolCall, ToolCallAction,
+    ToolResultAction, ToolResultEvent, WithBuilderTools,
 };
 use rig_agent::completion::Prompt;
 use rig_agent::tool::{DynamicTool, ToolExecutionError};
@@ -83,6 +85,16 @@ pub trait Clarifier: Send + Sync {
         to: &'a str,
         question: &'a str,
     ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>;
+}
+
+/// Where a node asks what the operator watching it wants (implemented in `ratatoskr-nodes`, which
+/// knows how to reach the dashboard).
+///
+/// Asked at turn boundaries only. A pause that landed mid-tool-call would leave a command half
+/// run and a conversation holding an unanswered call, so the question is only ever put where the
+/// answer can be acted on.
+pub trait Controller: Send + Sync {
+    fn poll<'a>(&'a self, node: &'a str) -> Pin<Box<dyn Future<Output = Control> + Send + 'a>>;
 }
 
 /// What a node's run reports to the plugins bound to it (implemented in `ratatoskr-nodes`, which
@@ -1244,6 +1256,144 @@ impl AgentHook for PluginHook {
     }
 }
 
+/// Where every node in this process asks what the operator wants.
+///
+/// Process-wide for the same reason as [`ENDPOINT`], and more strongly: a process runs exactly one
+/// run, so "this process" and "this run" are the same thing, and every node in it answers to the
+/// same dashboard. Unset is the ordinary case — a run started from the command line has nobody
+/// watching it, and nothing to ask.
+static CONTROL: std::sync::OnceLock<Arc<dyn Controller>> = std::sync::OnceLock::new();
+
+/// Give this run's nodes somewhere to ask. Called once, before any node runs.
+pub fn configure_control(controller: Arc<dyn Controller>) {
+    let _ = CONTROL.set(controller);
+}
+
+/// How long a held node waits before asking again.
+///
+/// The dashboard is on loopback and a turn takes seconds, so this is cheap. It is also the worst
+/// case for how long "resume" takes to be noticed, which is why it is a second rather than ten.
+const CONTROL_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What a node is told when the operator stops it. Ends the turn loop; the run then parks.
+const STOPPED_BY_OPERATOR: &str = "the operator stopped this node";
+
+/// How the operator's text is labelled where the model reads it.
+///
+/// Named as a person, and deliberately not as a tool's answer or a repository fact: this is the
+/// one channel where imperative text is legitimate, because a human watching the run wrote it on
+/// purpose. Everything arriving through a tool is the opposite case — see `PLUGIN_NOTE`.
+const OPERATOR_NOTE: &str = "Message from the operator watching this run:";
+
+/// What one node's control state carries between the hook and the run that owns it.
+#[derive(Default)]
+struct Pending {
+    /// Operator text taken from the dashboard but not yet put in front of the model.
+    steer: Mutex<Vec<String>>,
+    /// Set when the operator stopped this node, so the caller can tell a stop from a failure.
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+impl Pending {
+    /// Take everything waiting, as one labelled block, or `None` if there is nothing to say.
+    fn take(&self) -> Option<String> {
+        let taken: Vec<String> = std::mem::take(&mut *self.steer.lock().expect("steer poisoned"));
+        if taken.is_empty() {
+            return None;
+        }
+        Some(format!("{OPERATOR_NOTE}\n{}", taken.join("\n\n")))
+    }
+}
+
+/// Applies the operator's pause, stop and steer to one node's turn loop.
+///
+/// All three act at a turn boundary. Pause holds the loop there, which keeps the conversation and
+/// its prompt cache intact so resuming costs only the wait. Stop ends the loop. Steering rides to
+/// the model on the next tool result — the same channel a plugin's context uses — because rig
+/// refuses to retry a turn that made tool calls, and nearly every turn here makes one.
+struct ControlHook {
+    node: String,
+    controller: Arc<dyn Controller>,
+    pending: Arc<Pending>,
+}
+
+impl AgentHook for ControlHook {
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &HookContext,
+        event: ModelTurnFinished<'_>,
+    ) -> ModelTurnAction {
+        loop {
+            let control = self.controller.poll(&self.node).await;
+            if !control.steer.is_empty() {
+                self.pending
+                    .steer
+                    .lock()
+                    .expect("steer poisoned")
+                    .extend(control.steer);
+            }
+            match control.directive {
+                Directive::Stop => {
+                    self.pending
+                        .stopped
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    tracing::info!(kind = "control", node = %self.node, "stopped by the operator");
+                    return ModelTurnAction::Stop(STOPPED_BY_OPERATOR.to_string());
+                }
+                Directive::Hold => tokio::time::sleep(CONTROL_POLL).await,
+                Directive::Continue => break,
+            }
+        }
+
+        // A turn that called no tool has no tool result to ride, and it is also the only kind rig
+        // will let us retry. Feeding it back here is what stops a message sitting unread while the
+        // node writes its answer.
+        let called_tools = event
+            .content
+            .iter()
+            .any(|c| matches!(c, AssistantContent::ToolCall(_)));
+        if !called_tools && let Some(text) = self.pending.take() {
+            return ModelTurnAction::Retry(RetryRequest::Feedback(text));
+        }
+        ModelTurnAction::Continue
+    }
+
+    async fn on_tool_result(
+        &self,
+        _ctx: &HookContext,
+        event: ToolResultEvent<'_>,
+    ) -> ToolResultAction {
+        // Never on the output tool: that result is the node's own answer being accepted, and
+        // there is no turn after it in which the model could act on what it was told.
+        if event.tool_name == OUTPUT_TOOL_NAME {
+            return ToolResultAction::Keep;
+        }
+        let Some(text) = self.pending.take() else {
+            return ToolResultAction::Keep;
+        };
+        tracing::info!(kind = "control", node = %self.node, "steering the node");
+        let mut content = event.presentation.as_content().clone();
+        content.push(rig_core::message::ToolResultContent::text(text));
+        ToolResultAction::rewrite_output(ToolOutput::content(content))
+    }
+}
+
+/// Wait for the operator to start `node` again, keeping anything they say meanwhile.
+///
+/// Returns the text that arrived while parked, so a message sent to a stopped node reaches the
+/// attempt that replaces it rather than being answered by nobody.
+async fn park(controller: &Arc<dyn Controller>, node: &str) -> Vec<String> {
+    let mut said = Vec::new();
+    loop {
+        let control = controller.poll(node).await;
+        said.extend(control.steer);
+        if control.directive != Directive::Stop {
+            return said;
+        }
+        tokio::time::sleep(CONTROL_POLL).await;
+    }
+}
+
 /// Where a run's node turns report what they cost.
 ///
 /// A node's `run` returns its typed output and nothing else — the graph vocabulary is about what a
@@ -1393,6 +1543,7 @@ where
         ledger,
         produces,
     } = run;
+    let control = CONTROL.get();
     let model_name = format!("{}/{}", route.provider, route.model);
     // `SubagentStart` opens the node's conversation, `UserPromptSubmit` rides with the prompt —
     // where each lands in the format, and a cleaner place for a plugin to speak than a tool result.
@@ -1414,6 +1565,16 @@ where
         // Anthropic rejects when combined with tools ("output_config.format: Cannot be combined
         // with tools"). Tool mode sends no native format and composes with the rag-rat tools.
         .output_mode(OutputMode::Tool);
+    // First of the gates: what the operator asked for outranks anything the conversation is in the
+    // middle of, and a node being stopped should not spend a turn on the hooks below it.
+    let pending = Arc::new(Pending::default());
+    if let Some(controller) = control {
+        builder = builder.add_hook(ControlHook {
+            node: node.to_string(),
+            controller: Arc::clone(controller),
+            pending: Arc::clone(&pending),
+        });
+    }
     // Answer `ask` calls in-conversation. Added before the ruleset hook so an `ask` is handled here
     // (and short-circuits) rather than reaching the ruleset gate.
     if let Some(clarifier) = clarifier {
@@ -1486,10 +1647,40 @@ where
         "node started"
     );
     let started = std::time::Instant::now();
-    let mut answer = async { agent.prompt(&question).await }
-        .instrument(span.clone())
-        .await
-        .map_err(|e| AgentError::Prompt(e.to_string()));
+    // A node the operator stopped has not failed, and its work is not thrown away: the run parks
+    // here until they start it again, then runs the node afresh on the same question — which is
+    // the one its checkpoints hold, so "start from checkpoint" is exactly what a new attempt is.
+    // The wait is inside the node's own duration, because from the run's side that is what
+    // happened: the node was still the thing in progress.
+    let mut answer = loop {
+        let attempt = async { agent.prompt(&question).await }
+            .instrument(span.clone())
+            .await
+            .map_err(|e| AgentError::Prompt(e.to_string()));
+        let stopped = pending
+            .stopped
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        match (control, stopped) {
+            (Some(controller), true) => {
+                tracing::info!(
+                    kind = "control",
+                    node,
+                    "parked; waiting to be started again"
+                );
+                let said = park(controller, node).await;
+                // Anything the operator said to the stopped node belongs to the attempt that
+                // replaces it — they were talking about this work, not the abandoned transcript.
+                pending.steer.lock().expect("steer poisoned").extend(
+                    said.into_iter().chain([
+                        "This node was stopped and started again. Its previous conversation is \
+                         gone; you are running from the beginning."
+                            .to_string(),
+                    ]),
+                );
+            }
+            _ => break attempt,
+        }
+    };
 
     // One retry when the call never reached a verdict. A dropped connection is not an answer, and
     // it cost a live run twenty minutes of implementer work at the last node before the diff: the
@@ -1592,6 +1783,88 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// The operator controls, at the two points where this crate makes a decision of its own:
+    /// waiting for a stopped node to be started, and holding what was said until the model can be
+    /// told. The rules about what a command *means* are `ratatoskr_core::control`'s, and tested
+    /// there.
+    mod control {
+        use std::sync::Mutex;
+
+        use ratatoskr_core::{Control, Directive};
+
+        use super::super::*;
+
+        /// Answers with a scripted sequence, then `Continue` forever.
+        struct Scripted(Mutex<std::vec::IntoIter<Control>>);
+
+        impl Scripted {
+            fn answering(answers: Vec<Control>) -> Arc<dyn Controller> {
+                Arc::new(Scripted(Mutex::new(answers.into_iter())))
+            }
+        }
+
+        impl Controller for Scripted {
+            fn poll<'a>(
+                &'a self,
+                _node: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Control> + Send + 'a>> {
+                let next = self.0.lock().expect("script poisoned").next();
+                Box::pin(async move { next.unwrap_or_default() })
+            }
+        }
+
+        fn stop() -> Control {
+            Control {
+                directive: Directive::Stop,
+                steer: Vec::new(),
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn parking_ends_when_the_node_is_started_again() {
+            // Two more polls saying "still stopped" before the operator presses play. Time is
+            // paused, so the waits between them cost the test nothing.
+            let controller = Scripted::answering(vec![stop(), stop(), Control::carry_on()]);
+            assert!(park(&controller, "implementer").await.is_empty());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn what_was_said_to_a_stopped_node_survives_the_wait() {
+            // The operator stops a node, says something to it, then starts it. The message is
+            // about the work, not about the abandoned conversation, so the attempt that replaces
+            // it must be the one that hears it.
+            let controller = Scripted::answering(vec![
+                stop(),
+                Control {
+                    directive: Directive::Stop,
+                    steer: vec!["use the existing helper".to_string()],
+                },
+                Control::carry_on(),
+            ]);
+            assert_eq!(
+                park(&controller, "implementer").await,
+                ["use the existing helper"]
+            );
+        }
+
+        #[test]
+        fn text_is_labelled_as_a_person_and_handed_over_once() {
+            let pending = Pending::default();
+            pending.steer.lock().expect("steer poisoned").extend([
+                "look at the ruleset".to_string(),
+                "and the gate".to_string(),
+            ]);
+
+            let taken = pending.take().expect("something to say");
+            assert!(taken.starts_with(OPERATOR_NOTE));
+            assert!(taken.contains("look at the ruleset"));
+            assert!(taken.contains("and the gate"));
+            // Twice would put the operator's words in front of the model on every later tool
+            // result, reading as them saying it again and again.
+            assert!(pending.take().is_none());
+        }
+    }
+
     #[test]
     fn sanitize_strips_tag_and_zero_width_but_keeps_ordinary_text() {
         // Unchanged when there is nothing to strip.
