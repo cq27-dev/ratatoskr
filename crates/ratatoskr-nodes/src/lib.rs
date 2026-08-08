@@ -2944,6 +2944,18 @@ fn wrapped(text: &str) -> String {
 mod agent_config_tests {
     use super::*;
 
+    #[test]
+    fn the_implementer_can_correct_a_memory_its_change_falsifies() {
+        // The defect this closes: a review that found a memory contradicted by the diff routed the
+        // finding here, and this node could read memories and write none — so converge asked for a
+        // fix nobody in the run could make, every iteration, until the budget ran out.
+        let tools = implementer_default_tools();
+        assert!(tools.contains(&"memory_update"), "{tools:?}");
+        assert!(tools.contains(&"memory_mark_obsolete"), "{tools:?}");
+        // And composing new ones stays the bookkeeper's, done once with the whole run in view.
+        assert!(!tools.contains(&"memory_create"), "{tools:?}");
+    }
+
     /// scout: full ruleset (model + prompt), no `[models.scout]`. bookkeeper: partial ruleset
     /// (no model) → TOML route + built-in preamble. memory: no ruleset at all.
     ///

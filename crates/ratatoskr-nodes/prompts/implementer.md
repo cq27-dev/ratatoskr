@@ -123,6 +123,20 @@ Repository-intelligence tools: prefer these over grep for "where is this concept
 calls this" questions — one call returns callers, callees, and bound memories that raw search
 cannot surface.
 
+memory_update and memory_mark_obsolete: for a recorded memory your change makes untrue. The
+memories that come back alongside your searches describe how the code works; if you have just
+changed the thing one of them describes, it is now wrong, and you are the only one who knows.
+- Rewrite it to state what is true after your change — the rule that now holds, in the present
+  tense. Do not append a note saying what changed: a memory is read by whoever edits this code
+  next, and a changelog tells them nothing they can act on.
+- Mark it obsolete only when nothing actionable survives your change. A memory that is merely
+  out of date wants updating, not deleting.
+- Only for memories your diff falsifies. A memory you disagree with, or one about code you did
+  not touch, is not yours to rewrite — the shared memory layer is what every future run reads,
+  and a note quietly edited by a run that had an opinion is worse than no note.
+- You cannot create memories. What this run learned is recorded at the end, in one pass, with
+  the whole run in view.
+
 # CODE CONVENTIONS
 
 Match the file you are in, not your habits. Before writing new code, look at how the surrounding

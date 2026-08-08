@@ -104,6 +104,19 @@ pub const IMPLEMENTER_TOOLS: &[&str] = &[
     "find_callers",
     "memory_search",
     "read_chunk",
+    // The two writes. A change can make a recorded memory false — it is the only thing that can —
+    // and until now nothing in a run could correct one: reading was the whole of a node's access,
+    // and the bookkeeper's writes happen outside the agent, after the run is over. A review that
+    // found a memory contradicted by the diff therefore routed to this node and asked it for
+    // something it had no tool to do, every iteration, until the budget ran out.
+    //
+    // `memory_create` is deliberately absent. Composing a new memory from what a run learned is the
+    // bookkeeper's job, done once at the end with the whole run in view and rag-rat's dedup behind
+    // it; a node writing them mid-change would produce several immature notes about work still in
+    // progress. Correcting a memory the change falsifies is the opposite case — it is part of the
+    // change, and nobody else is in a position to know.
+    "memory_update",
+    "memory_mark_obsolete",
 ];
 
 /// What the model reports when it stops. Everything that decides the run — the diff, the checks —
