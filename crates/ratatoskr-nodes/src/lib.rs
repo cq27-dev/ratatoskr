@@ -9,6 +9,7 @@ pub mod analyst;
 pub mod bookkeeper;
 pub mod clarify;
 pub mod context;
+pub mod control;
 pub mod converge;
 pub mod implementer;
 pub mod memory;
@@ -89,6 +90,8 @@ impl PlanError {
 /// Run scout → memory → analyst in sequence, checkpointing after each, and record the run's final
 /// status. On any node failure the run is marked `Failed` and the error names the node.
 pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError> {
+    // Before any node runs, so the first one can already be paused.
+    control::install(request.run_id);
     // Decided before the request is taken apart: choosing needs the whole of it.
     let chosen = choose(&request).await?;
     let RunRequest {
@@ -1486,6 +1489,8 @@ async fn no_code_change(
 /// The full Phase 3 run: plan (scout → memory → analyst), then fork red-team ∥ implementer, then
 /// converge. Reuses [`run_plan`] for the planning half.
 pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> {
+    // Before any node runs, so the first one can already be paused.
+    control::install(request.run_id);
     // Decided before the request is taken apart: choosing needs the whole of it.
     let chosen = choose(&request).await?;
     let RunRequest {

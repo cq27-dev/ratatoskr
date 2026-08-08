@@ -79,6 +79,20 @@ export interface Me {
 }
 
 /** Whether this role may start runs and answer clarifications. */
+/**
+ * Whether a run has stopped executing. Mirrors `RunStatus::is_terminal` on the server, and the
+ * same two-sided rule applies: a status this build has never heard of reads as still executing,
+ * which shows a stale run rather than declaring a live one finished.
+ */
+export function isTerminal(status: RunStatus | null): boolean {
+  return (
+    status !== null &&
+    status !== "pending" &&
+    status !== "running" &&
+    status !== "awaiting_clarification"
+  );
+}
+
 export function mayAct(role: Role | undefined): boolean {
   return role === "operator" || role === "admin";
 }
@@ -113,6 +127,57 @@ export interface RunDetail {
   /** The pull request the run opened, if any. Null for comment-only, nothing-published, or
    * older runs whose publisher checkpoint predates this field. */
   pull_request: PullRequestView | null;
+  control: ControlView;
+}
+
+/**
+ * What the operator has asked of a run — what the controls should show.
+ *
+ * What was *asked for*, not what the run has done about it: a node acts at its next turn
+ * boundary, so a button that sprang back until the run noticed would read as a lost click.
+ */
+export interface ControlView {
+  paused: boolean;
+  /** Nodes stopped and waiting to be started again. */
+  stopped: string[];
+  /** Nodes with text delivered to the server but not yet picked up by the run. */
+  steering: string[];
+}
+
+/** One thing an operator does to a run in flight. */
+export type Command =
+  | { command: "pause" }
+  | { command: "resume" }
+  | { command: "stop"; node: string }
+  | { command: "start"; node: string }
+  | { command: "steer"; node: string; text: string };
+
+/**
+ * Issue a command to a run. Resolves with what the server now holds, which is what the buttons
+ * render — so a click shows immediately rather than waiting for the next poll.
+ */
+export async function control(
+  project: string,
+  runId: string,
+  command: Command,
+): Promise<ControlView> {
+  const res = await fetch(
+    `${scope(project)}/runs/${encodeURIComponent(runId)}/control`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(command),
+    },
+  );
+  const body: unknown = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(
+      body && typeof body === "object" && "error" in body
+        ? String((body as { error: unknown }).error)
+        : `${res.status}`,
+    );
+  }
+  return body as ControlView;
 }
 
 export interface CheckpointView {

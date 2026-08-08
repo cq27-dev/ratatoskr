@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { band } from "../ui/tint";
 import { since } from "../ui/text";
 
@@ -22,6 +23,7 @@ export function Scrubber({
   startedAt,
   nodes,
   onScrub,
+  controls,
 }: {
   total: number;
   cursor: number | null;
@@ -31,6 +33,10 @@ export function Scrubber({
   /** The node each event belongs to, in timeline order. Colours the track. */
   nodes: (string | null)[];
   onScrub: (cursor: number | null) => void;
+  /** The run's controls, if this run can be controlled at all. A slot rather than props of its
+   * own: moving through a finished run and steering a live one are different jobs that happen to
+   * share a row, and this one has no business knowing how the other works. */
+  controls?: ReactNode;
 }) {
   // Rendered even with nothing to scrub through, disabled. Returning null instead removed the
   // control's 38 pixels from the layout until the history arrived, and everything below — the
@@ -51,6 +57,7 @@ export function Scrubber({
             slider beside it does not change length when the mode flips. */}
         {following ? "FOLLOW" : "REPLAY"}
       </button>
+      {controls}
       <input
         type="range"
         min={0}

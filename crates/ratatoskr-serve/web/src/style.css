@@ -1424,3 +1424,106 @@ a:focus-visible {
   color: var(--muted);
   cursor: default;
 }
+
+/* ── run controls ───────────────────────────────────────────────────────────────────────────── */
+
+/* Three glyph buttons in the scrubber's row. `relative` because the picker hangs off them, and
+   `flex: none` so they keep their width while the slider beside them takes the rest. */
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  position: relative;
+}
+
+/* Square, so the three read as one instrument rather than three words of different lengths.
+   `line-height: 1` and a fixed size keep ❚❚, ▶ and ■ — which have different metrics — from moving
+   the row's height as the buttons change state. */
+.control {
+  width: 22px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--rule);
+  font: inherit;
+  font-size: 9px;
+  line-height: 1;
+  cursor: pointer;
+}
+.control:hover:not(:disabled) {
+  color: var(--fg);
+  border-color: var(--fg);
+}
+/* Asked for and in force. The same colour the FOLLOW button uses for "this is live", because it
+   is the same claim: the run is being acted on right now. */
+.control.is-on {
+  color: var(--live);
+  border-color: var(--live);
+}
+.control:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* The picker and the message box. Above the row rather than below it: the scrubber sits at the top
+   of the stage, and a menu opening downward would cover the graph it is about. */
+.control-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 20;
+  min-width: 220px;
+  padding: 8px;
+  background: var(--bg);
+  border: 1px solid var(--rule);
+  box-shadow: 0 6px 18px rgb(0 0 0 / 0.4);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  text-transform: none;
+  letter-spacing: normal;
+}
+.control-ask {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.control-pick {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--rule);
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  text-align: left;
+}
+.control-pick:hover:not(:disabled) {
+  border-color: var(--fg);
+}
+.control-error {
+  margin: 0;
+  color: var(--hazard, #e61919);
+  font-size: 11px;
+}
+
+/* Which node is being spoken to, when the fork means there is a choice. Inside the `/// …` heading
+   of the message box, so it inherits that line's type and only marks itself with an underline —
+   a bordered select there would look like a second, unrelated widget. */
+.ask-to {
+  background: transparent;
+  color: inherit;
+  border: none;
+  border-bottom: 1px solid currentColor;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  padding: 0 2px;
+  cursor: pointer;
+}
