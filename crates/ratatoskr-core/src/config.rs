@@ -60,6 +60,16 @@ pub struct PluginConfig {
     pub paths: Vec<PathBuf>,
     #[serde(default)]
     pub hooks: HookLimits,
+    /// Skills, by name, that no node is offered however many plugins ship them.
+    ///
+    /// A plugin is installed whole, and some of what it ships is written for a person at a
+    /// keyboard rather than for a run — a setup procedure that expects to ask questions and be
+    /// answered is the clear case. Such a skill costs every node that binds the plugin the space
+    /// its description takes, on every call, to offer something none of them can carry out.
+    ///
+    /// By name rather than by plugin, because the rest of the plugin is usually worth having.
+    #[serde(default)]
+    pub skills_deny: Vec<String>,
 }
 
 /// What a plugin's hooks may spend of a run.
