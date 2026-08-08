@@ -231,9 +231,11 @@ impl ImplementerNode {
                 format!(
                     "{}{}",
                     crate::effective_preamble(
+                        "implementer",
                         NATIVE_PREAMBLE,
                         self.system_prompt.as_deref(),
                         self.plugins.context.as_deref(),
+                        &self.plugins.skills,
                     ),
                     where_you_are(worktree),
                 ),
@@ -466,7 +468,7 @@ mod tests {
         // No conventions file: the loader is None and a writing node's preamble is byte-identical
         // to the plain composition — no header, no separator.
         assert_eq!(crate::repo_conventions(&dir), None);
-        let plain = crate::effective_preamble(NATIVE_PREAMBLE, None, None);
+        let plain = crate::effective_preamble("implementer", NATIVE_PREAMBLE, None, None, &[]);
         assert_eq!(
             crate::with_conventions("implementer", None, plain.clone()),
             plain,

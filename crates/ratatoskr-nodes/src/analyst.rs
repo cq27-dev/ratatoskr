@@ -211,9 +211,11 @@ impl Node for AnalystNode {
             node: "analyst",
             route: &self.route,
             preamble: &crate::effective_preamble(
+                "analyst",
                 PREAMBLE,
                 self.system_prompt.as_deref(),
                 self.plugins.context.as_deref(),
+                &self.plugins.skills,
             ),
             question: &prompt,
             tools: self.tools.clone(),

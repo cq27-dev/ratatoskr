@@ -150,9 +150,11 @@ impl VerifierNode {
             node: "verifier",
             route: &self.route,
             preamble: &crate::effective_preamble(
+                "verifier",
                 PREAMBLE,
                 self.system_prompt.as_deref(),
                 self.plugins.context.as_deref(),
+                &self.plugins.skills,
             ),
             question: &render_prompt(&input),
             tools: self.tools.clone(),

@@ -296,9 +296,11 @@ impl BookkeeperNode {
             node: "bookkeeper",
             route: &self.route,
             preamble: &crate::effective_preamble(
+                "bookkeeper",
                 PREAMBLE,
                 self.system_prompt.as_deref(),
                 self.plugins.context.as_deref(),
+                &self.plugins.skills,
             ),
             question: &prompt,
             tools: self.tools.clone(),

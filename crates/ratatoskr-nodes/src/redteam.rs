@@ -94,9 +94,11 @@ impl RedTeamClassifier {
             node: "redteam",
             route: &self.route,
             preamble: &crate::effective_preamble(
+                "redteam",
                 CLASSIFY_PREAMBLE,
                 self.system_prompt.as_deref(),
                 self.plugins.context.as_deref(),
+                &self.plugins.skills,
             ),
             question: &prompt,
             tools: self.tools.clone(),
@@ -177,9 +179,11 @@ impl TestAuthor {
                 "redteam",
                 self.conventions.as_deref(),
                 crate::effective_preamble(
+                    "redteam",
                     AUTHOR_PREAMBLE,
                     self.system_prompt.as_deref(),
                     self.plugins.context.as_deref(),
+                    &self.plugins.skills,
                 ),
             ),
             question: &author_prompt(issue, interface),

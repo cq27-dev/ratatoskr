@@ -66,8 +66,9 @@ pub const SKILL_TOOL_NAME: &str = "Skill";
 /// A skill a node may load, as the agent needs it: the name it is asked for by, and the
 /// instructions handed back.
 ///
-/// The *description* is deliberately not here. It belongs to the tool's schema, because it is what
-/// the model reads to choose; this is what it reads once it has chosen.
+/// The *description* is deliberately not here. It is listed in the node's preamble, because it is
+/// what the model reads to choose; this is what it reads once it has chosen. The `Skill` tool
+/// resolves the requested name against these at call time (see [`SkillHook`]).
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
@@ -1143,16 +1144,18 @@ struct SkillArgs {
 ///
 /// The body is delivered as the tool's result rather than prepended to the preamble, which is the
 /// whole point of a skill over a longer system prompt: a node carries every bound skill's
-/// description, and pays for the instructions of the one it actually picks.
+/// description in its preamble, and pays for the instructions of the one it actually picks. The
+/// name is free-form and resolved here against the bound set — an unknown one is answered with a
+/// `Skip` naming what is available, never a silent failure.
 struct SkillHook {
     skills: Vec<Skill>,
 }
 
-impl AgentHook for SkillHook {
-    async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
-        if event.tool_name != SKILL_TOOL_NAME {
-            return ToolCallAction::Run;
-        }
+impl SkillHook {
+    /// Resolve a `Skill` call's arguments to the `Skip` feedback the model sees. Split out from
+    /// `on_tool_call` so the miss/malformed contract is exercised by a unit test — the hook's
+    /// `HookContext` is built inside rig-agent's loop and cannot be constructed here.
+    fn resolve(&self, args: &str) -> ToolCallAction {
         let known = || {
             self.skills
                 .iter()
@@ -1160,7 +1163,7 @@ impl AgentHook for SkillHook {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let wanted = match serde_json::from_str::<SkillArgs>(event.args) {
+        let wanted = match serde_json::from_str::<SkillArgs>(args) {
             Ok(a) => a.skill,
             Err(e) => {
                 return ToolCallAction::Skip(format!(
@@ -1180,6 +1183,15 @@ impl AgentHook for SkillHook {
                 ToolCallAction::Skip(format!("No skill named `{wanted}`. Available: {}", known()))
             }
         }
+    }
+}
+
+impl AgentHook for SkillHook {
+    async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
+        if event.tool_name != SKILL_TOOL_NAME {
+            return ToolCallAction::Run;
+        }
+        self.resolve(event.args)
     }
 }
 
@@ -2396,6 +2408,60 @@ mod tests {
             built, 2,
             "an agent is constructed somewhere other than `metered`, so its calls are unmetered"
         );
+    }
+
+    #[test]
+    fn a_skill_call_that_misses_is_answered_with_what_is_available() {
+        // Behaviourally exercises the unknown-name error branch: it calls the real resolution
+        // logic and asserts on the `ToolCallAction::Skip` it returns, so it fails the moment that
+        // branch stops producing the available-names message — it is not a search for source
+        // literals. The entry point `on_tool_call` delegates straight to `resolve` after the
+        // tool-name guard; `resolve` is the anchor because `on_tool_call` cannot be called here:
+        // rig-agent's `HookContext::new` is `pub(crate)`, so no `HookContext` is constructible
+        // outside that crate, and the end-to-end tool path needs a live model (no network in the
+        // test sandbox). Do not "upgrade" this to `on_tool_call` or an end-to-end call — it will
+        // not compile / not run offline. Asking for a missing skill, or a malformed argument,
+        // answers with a Skip naming what *is* bound: never silent, never a bare error, and (now
+        // that the schema is a free-form string) the only place a wrong name is answered.
+        let hook = SkillHook {
+            skills: vec![
+                Skill {
+                    name: "alpha".into(),
+                    body: "do alpha".into(),
+                },
+                Skill {
+                    name: "beta".into(),
+                    body: "do beta".into(),
+                },
+            ],
+        };
+
+        // A known name loads that skill's body.
+        match hook.resolve(r#"{"skill":"alpha"}"#) {
+            ToolCallAction::Skip(msg) => assert_eq!(msg, "do alpha"),
+            other => panic!("a known skill loads its body: {other:?}"),
+        }
+
+        // An unknown name is answered, not silent, and names what is available.
+        match hook.resolve(r#"{"skill":"missing"}"#) {
+            ToolCallAction::Skip(msg) => {
+                assert!(msg.contains("No skill named"), "{msg}");
+                assert!(msg.contains("missing"), "{msg}");
+                assert!(msg.contains("Available"), "{msg}");
+                assert!(msg.contains("alpha") && msg.contains("beta"), "{msg}");
+            }
+            other => panic!("an unknown skill is answered with a Skip: {other:?}"),
+        }
+
+        // Malformed arguments are answered with the expected shape and the available names.
+        match hook.resolve("not json") {
+            ToolCallAction::Skip(msg) => {
+                assert!(msg.contains("invalid arguments"), "{msg}");
+                assert!(msg.contains("<name>"), "{msg}");
+                assert!(msg.contains("Available"), "{msg}");
+            }
+            other => panic!("a malformed call is answered with a Skip: {other:?}"),
+        }
     }
 
     // Recognising a `model_text` that is the model writing the *other side* of the conversation
