@@ -304,15 +304,16 @@ fn default_committer_email() -> String {
     "ratatoskr@localhost".to_string()
 }
 
-/// Most of a commit subject. The git convention, and what every log viewer truncates at.
-pub const MAX_SUBJECT_CHARS: usize = 72;
-
 impl PublishConfig {
     /// The subject line for a change the implementer described as `kind`/`scope`/`summary`.
     ///
-    /// Over-long subjects are cut at a word boundary rather than mid-token: a subject that ends
-    /// "a fabricated tool res" reads as a truncated *sentence*, which is what a reader will assume
-    /// the change was too.
+    /// The summary is used exactly as written. Cutting it to a length was worse than leaving it
+    /// long however carefully it was done: cut mid-word it read as a truncated string, and cut at
+    /// a word boundary it read as a truncated *thought* — "treat a default-named plugin as a
+    /// preference, not a" is grammatical enough to look like the whole of what the run believed
+    /// it had done. A subject nobody trimmed is at worst untidy in `git log --oneline`; one this
+    /// trimmed was misleading in the history forever. Length is asked for where it can actually be
+    /// controlled: the schema tells the implementer what to aim at.
     pub fn commit_subject(&self, kind: &str, scope: &str, summary: &str) -> String {
         let kind = kind.trim();
         let scope = scope.trim();
@@ -320,25 +321,12 @@ impl PublishConfig {
             true => self.commit_subject.replace("({scope})", ""),
             false => self.commit_subject.clone(),
         };
-        let rendered = template
+        template
             .replace("{type}", kind)
             .replace("{scope}", scope)
             .replace("{summary}", summary.trim())
             .trim()
-            .to_string();
-        if rendered.chars().count() <= MAX_SUBJECT_CHARS {
-            return rendered;
-        }
-        let cut: String = rendered.chars().take(MAX_SUBJECT_CHARS).collect();
-        match cut.rsplit_once(' ') {
-            // Only if trimming to the word boundary leaves something worth reading; a first
-            // "word" longer than the limit is a path or an identifier, and half of one is worse
-            // than none.
-            Some((head, _)) if head.chars().count() >= MAX_SUBJECT_CHARS / 2 => {
-                head.trim_end_matches([' ', ',', ';', '-']).to_string()
-            }
-            _ => cut,
-        }
+            .to_string()
     }
 }
 
@@ -829,26 +817,15 @@ mod commit_subject_tests {
     }
 
     #[test]
-    fn an_over_long_subject_is_cut_at_a_word_not_through_one() {
-        // The observed failure: an 81-character issue title cut at 72 produced a subject ending
-        // "a fabricated tool res", which reads as a truncated change rather than a truncated
-        // string — a reader concludes the commit did half of something.
+    fn a_long_subject_is_kept_whole() {
+        // Two runs' worth of evidence say a shortened subject is worse than a long one. Cut
+        // mid-word it read as a truncated string; cut at a word boundary it read as a truncated
+        // thought — "…as a preference, not a" is grammatical, so nothing tells the reader that
+        // what the run believed it had done continued past the end of the line.
         let d = PublishConfig::default();
-        let words = "a node's model text sometimes contains a fabricated tool result and it is bad";
-        let long = d.commit_subject("fix", "agent", words);
-        assert!(long.chars().count() <= MAX_SUBJECT_CHARS, "{long}");
-        assert!(!long.ends_with(' '), "{long}");
-        // Whatever it ends on is a whole word.
-        let last = long.rsplit(' ').next().unwrap();
-        assert!(
-            words.split(' ').any(|w| w == last),
-            "cut through {last:?}: {long}"
-        );
-
-        // A single token longer than the limit has no word boundary to cut at, and half an
-        // identifier still beats nothing.
-        let one_word = d.commit_subject("fix", "", &"x".repeat(200));
-        assert_eq!(one_word.chars().count(), MAX_SUBJECT_CHARS);
+        let words = "treat a default-named plugin as a preference, not a requirement of the run";
+        let long = d.commit_subject("fix", "nodes", words);
+        assert_eq!(long, format!("fix(nodes): {words}"));
     }
 }
 
