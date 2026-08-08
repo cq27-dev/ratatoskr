@@ -859,6 +859,8 @@ pub struct PluginContext {
     hook_time: Arc<std::sync::atomic::AtomicU64>,
     /// What this repo lets its plugins' hooks spend.
     limits: ratatoskr_core::HookLimits,
+    /// Skills this repository does not want offered, by name.
+    skills_deny: Vec<String>,
 }
 
 /// What the plugins a node binds contribute to that node.
@@ -1058,6 +1060,7 @@ impl PluginContext {
             plugins: Arc::new(plugins),
             hook_time: Arc::default(),
             limits: config.plugins.hooks.clone(),
+            skills_deny: config.plugins.skills_deny.clone(),
         })
     }
 
@@ -1084,6 +1087,18 @@ impl PluginContext {
         }
     }
 
+    /// Whether this repository has asked that `skill` never be offered.
+    ///
+    /// Matched on the name as the plugin spells it, ignoring case and surrounding space, so a
+    /// config entry does not have to reproduce a name's exact typography to take effect. Names are
+    /// kebab-case by the format's convention, and a repository denying `init-rag-rat` means the
+    /// one it can see in its own logs.
+    fn denied(&self, skill: &str) -> bool {
+        self.skills_deny
+            .iter()
+            .any(|d| d.trim().eq_ignore_ascii_case(skill.trim()))
+    }
+
     /// What the plugins `node` binds give it: their session context, and a hook runner when any of
     /// them registers one for a tool call.
     pub fn for_node(&self, node: &str) -> NodePlugins {
@@ -1105,6 +1120,7 @@ impl PluginContext {
                 .iter()
                 .filter(|p| bound.contains(&p.name))
                 .flat_map(|p| p.skills.iter().cloned())
+                .filter(|s| !self.denied(&s.name))
                 .collect(),
             context: ratatoskr_plugin::compose(&self.contexts, &bound, &self.limits),
             // `None` rather than an empty runner: it is what keeps the hook off the agent
@@ -3772,6 +3788,26 @@ mod agent_config_tests {
             ..plugins
         };
         assert!(crate::skills::skill_tool(&stripped.skills, "context").is_none());
+    }
+
+    #[test]
+    fn a_denied_skill_is_offered_to_no_node() {
+        // A plugin is installed whole, and some of what it ships is written for a person at a
+        // keyboard. `init-rag-rat` sets up an unindexed repository by asking questions and being
+        // answered — a procedure no node can carry out, costing every node that binds the plugin
+        // the space its description takes on every call.
+        let context = PluginContext {
+            skills_deny: vec!["init-rag-rat".to_string()],
+            ..Default::default()
+        };
+        assert!(context.denied("init-rag-rat"));
+        // Spelling is forgiven; the rest of the plugin is untouched.
+        assert!(context.denied(" INIT-RAG-RAT "));
+        assert!(!context.denied("using-rag-rat"));
+        assert!(!context.denied("dream-review"));
+
+        // And a repository that denied nothing keeps everything.
+        assert!(!PluginContext::default().denied("init-rag-rat"));
     }
 
     #[test]

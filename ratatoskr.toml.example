@@ -281,6 +281,12 @@ committer_email = "ratatoskr@localhost"
 
 [plugins]
 paths = []
+# Skills no node should be offered, by name. A plugin is installed whole, and some of what it
+# ships is written for a person at a keyboard — a setup procedure that expects to ask questions
+# and be answered is the clear case. Such a skill costs every node that binds the plugin the space
+# its description takes, on every call, to offer something no node can carry out. By name rather
+# than by plugin, because the rest of the plugin is usually worth having.
+# skills_deny = ["init-rag-rat"]
 
 # What a plugin's hooks may spend. The defaults are the plugin format's own, so a plugin behaves
 # here the way its author tested it in a coding CLI. They are generous because that host has a
