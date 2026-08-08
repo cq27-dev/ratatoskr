@@ -29,7 +29,7 @@ use rig_core::client::completion::CompletionClient;
 use rig_core::client::{ProviderClient, ProviderClientError};
 use rig_core::completion::CompletionModel;
 use rig_core::message::{AssistantContent, ImageMediaType, MimeType, ToolResultContent};
-use rig_core::providers::{anthropic, moonshot};
+use rig_core::providers::{anthropic, moonshot, openai};
 use rig_core::tool::ToolOutput;
 use rmcp::ServiceError;
 use rmcp::model::{
@@ -119,7 +119,7 @@ pub type Answer<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
 /// Errors running an agent turn.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
-    #[error("unknown provider {0:?}; supported in Phase 1: anthropic, moonshot")]
+    #[error("unknown provider {0:?}; supported: anthropic, openai, moonshot")]
     UnknownProvider(String),
     #[error("initializing the {provider} client failed: {source} (is the API key env var set?)")]
     Provider {
@@ -130,9 +130,10 @@ pub enum AgentError {
     Prompt(String),
 }
 
-/// The providers Phase 1 can route to.
+/// The providers a route can name.
 enum Provider {
     Anthropic,
+    OpenAi,
     Moonshot,
 }
 
@@ -140,9 +141,25 @@ enum Provider {
 fn parse_provider(name: &str) -> Result<Provider, AgentError> {
     match name {
         "anthropic" => Ok(Provider::Anthropic),
+        "openai" => Ok(Provider::OpenAi),
         "moonshot" => Ok(Provider::Moonshot),
         other => Err(AgentError::UnknownProvider(other.to_string())),
     }
+}
+
+/// An OpenAI client, on the Responses API rather than chat completions.
+///
+/// `from_env` reads `OPENAI_API_KEY` and `OPENAI_BASE_URL`, which is all this needs — the endpoint
+/// headers are Anthropic's meridian arrangement and mean nothing here.
+///
+/// Responses is rig's default surface for this provider and the right one for a reasoning model: a
+/// reasoning item round-trips across the agent's tool-calling turns, where chat completions drops
+/// it and the model re-derives its thinking on every turn.
+fn openai_client() -> Result<openai::Client, AgentError> {
+    openai::Client::from_env().map_err(|source| AgentError::Provider {
+        provider: "openai".to_string(),
+        source,
+    })
 }
 
 /// Ask one question, letting the agent call `tools` to answer.
@@ -161,6 +178,17 @@ pub async fn ask(
             let client = anthropic_client(&uuid::Uuid::new_v4().to_string())?;
             run(
                 caching(client.completion_model(&route.model)),
+                preamble,
+                question,
+                tools,
+                max_turns,
+                route,
+            )
+            .await
+        }
+        Provider::OpenAi => {
+            run(
+                openai_client()?.completion_model(&route.model),
                 preamble,
                 question,
                 tools,
@@ -1353,6 +1381,10 @@ pub async fn run_structured(run: NodeRun<'_>) -> Result<String, AgentError> {
             let model = caching(client.completion_model(&run.route.model));
             run_typed(model, run).await
         }
+        Provider::OpenAi => {
+            let model = openai_client()?.completion_model(&run.route.model);
+            run_typed(model, run).await
+        }
         Provider::Moonshot => {
             let client = moonshot::Client::from_env().map_err(|source| AgentError::Provider {
                 provider: "moonshot".to_string(),
@@ -1775,6 +1807,7 @@ mod tests {
             Err(AgentError::UnknownProvider(_))
         ));
         assert!(parse_provider("anthropic").is_ok());
+        assert!(parse_provider("openai").is_ok());
         assert!(parse_provider("moonshot").is_ok());
     }
 

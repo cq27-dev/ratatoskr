@@ -22,8 +22,17 @@ path = ".ratatoskr/state.sqlite3"
 root = "../.ratatoskr-worktrees"
 
 # Per-node model routing. `ask` is the only route used in Phase 1; provider is one of
-# "anthropic" or "moonshot", read from ANTHROPIC_API_KEY / MOONSHOT_API_KEY. The rest are
+# "anthropic", "openai" or "moonshot", read from ANTHROPIC_API_KEY / OPENAI_API_KEY /
+# MOONSHOT_API_KEY. Each also takes a *_BASE_URL (OPENAI_BASE_URL, ANTHROPIC_BASE_URL), so a
+# route can be pointed at a local gateway rather than the provider itself. The rest are
 # illustrative, forward-looking node routes (Phase 2+).
+#
+# "openai" runs on the Responses API, not chat completions: a reasoning model's thinking then
+# carries across the agent's tool-calling turns instead of being re-derived every turn. Ask it
+# for a level with `params`, the same way the other providers are asked:
+#
+#   [models.verifier.params.reasoning]
+#   effort = "medium"
 [models.ask]
 provider = "anthropic"
 model = "claude-sonnet-4-6"

@@ -113,7 +113,7 @@ Requires a repository already indexed by rag-rat, and `bwrap` for the default sa
 ```sh
 cargo build --workspace
 cargo run -p ratatoskr-cli -- init          # writes ratatoskr.toml
-export ANTHROPIC_API_KEY=...                # or MOONSHOT_API_KEY, per [models.*]
+export ANTHROPIC_API_KEY=...                # or OPENAI_API_KEY / MOONSHOT_API_KEY, per [models.*]
 cargo run -p ratatoskr-cli -- run "Fix the flaky retry in the store"
 ```
 
