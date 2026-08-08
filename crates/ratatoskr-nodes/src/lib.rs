@@ -979,11 +979,15 @@ impl PluginServer {
 
 impl PluginContext {
     /// Discover plugins, run their `SessionStart` hooks, and check that every plugin a ruleset
-    /// names actually exists.
+    /// *requires* actually exists.
     ///
-    /// A plugin that is missing, broken, or slow contributes nothing and is logged. A ruleset that
-    /// *names* a plugin nobody installed is a different thing — a typo in configuration — and
-    /// fails the run rather than silently binding less than its author asked for.
+    /// A plugin that is missing, broken, or slow contributes nothing and is logged. A plugin a
+    /// ruleset *names* splits by how it was named. An explicit `defineAgent` binding (an `Only`
+    /// list, an `add`, or a `remove`) is a requirement: naming one nobody installed is a typo, and
+    /// the run fails rather than binding less than its author asked for. A `defineDefaults` name is
+    /// a preference — it applies to every node, so a missing one warns and narrows the tool pool to
+    /// what was discovered rather than refusing the run (a rag-rat-less checkout falls back to file
+    /// tools). A name in both categories is a requirement: the explicit binding wins.
     pub async fn resolve(
         config: &RatatoskrConfig,
         engine: &Arc<ScriptEngine>,
@@ -994,25 +998,44 @@ impl PluginContext {
             tracing::info!(plugin = plugin.name, "loaded plugin");
         }
 
-        let missing: Vec<String> = engine
-            .declared_plugins()
-            .into_iter()
-            .filter(|name| !plugins.iter().any(|p| &p.name == name))
-            .collect();
-        if !missing.is_empty() {
-            let known: Vec<&str> = plugins.iter().map(|p| p.name.as_str()).collect();
+        let installed = |name: &String| plugins.iter().any(|p| &p.name == name);
+        let known = || {
+            let names: Vec<&str> = plugins.iter().map(|p| p.name.as_str()).collect();
+            if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(", ")
+            }
+        };
+
+        // An explicit `defineAgent` binding is a requirement: a missing one fails the run.
+        let required = engine.required_plugins();
+        let missing_required: Vec<String> =
+            required.iter().filter(|n| !installed(n)).cloned().collect();
+        if !missing_required.is_empty() {
             return Err(PlanError::node(
                 "plugins",
                 NodeError::Failed(format!(
                     "ruleset names plugin(s) that were not found: {}; discovered: {}",
-                    missing.join(", "),
-                    if known.is_empty() {
-                        "none".to_string()
-                    } else {
-                        known.join(", ")
-                    }
+                    missing_required.join(", "),
+                    known()
                 )),
             ));
+        }
+
+        // A `defineDefaults` name is a preference: a missing one warns and narrows the pool. Names
+        // promoted to required by an agent rule are handled above, so exclude them here.
+        let missing_preferred: Vec<String> = engine
+            .declared_plugins()
+            .into_iter()
+            .filter(|n| !required.contains(n) && !installed(n))
+            .collect();
+        if !missing_preferred.is_empty() {
+            tracing::warn!(
+                missing = missing_preferred.join(", "),
+                discovered = known(),
+                "ruleset default names plugin(s) that were not found; running without them"
+            );
         }
 
         let discovered: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
@@ -1091,9 +1114,17 @@ impl PluginContext {
     }
 
     /// Which plugins `node` binds — its ruleset's declaration, or every plugin found.
+    ///
+    /// Restricted to what was discovered: a `defineDefaults` name nobody installed is a preference
+    /// (#185), so it drops out of the bound set rather than binding a plugin that does not exist.
+    /// An undiscovered *explicit* binding never reaches here — `resolve` fails first.
     fn bound(&self, node: &str) -> Vec<String> {
         match &self.engine {
-            Some(engine) => engine.plugins_for(node, &self.discovered),
+            Some(engine) => engine
+                .plugins_for(node, &self.discovered)
+                .into_iter()
+                .filter(|name| self.discovered.contains(name))
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -3003,6 +3034,196 @@ mod agent_config_tests {
 
         let _ = std::fs::remove_dir_all(&hookful);
         let _ = std::fs::remove_dir_all(&quiet);
+    }
+
+    /// A config and cwd that discover exactly `names` — bare plugins, manifest only, so `resolve`
+    /// runs no hooks and connects no servers. The cwd holds no `.ratatoskr/plugins` of its own:
+    /// what the test discovers must not depend on the real checkout it happens to run in.
+    fn resolve_fixture(case: &str, names: &[&str]) -> (RatatoskrConfig, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "ratatoskr-nodes-resolve-{}-{case}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let plugins = root.join("plugins");
+        for name in names {
+            let manifest = plugins.join(name).join(".claude-plugin");
+            std::fs::create_dir_all(&manifest).unwrap();
+            std::fs::write(
+                manifest.join("plugin.json"),
+                format!(r#"{{"name": "{name}"}}"#),
+            )
+            .unwrap();
+        }
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.plugins.paths = vec![plugins];
+        (config, cwd)
+    }
+
+    #[tokio::test]
+    async fn a_default_plugin_nobody_installed_narrows_instead_of_failing() {
+        // #185: `[rag_rat]` is optional, but the shipped ruleset still declares
+        // `defineDefaults({ plugins: ["rag-rat"] })` — and a default applies to every node, so it
+        // is a preference. Treating it like an explicit binding failed a rag-rat-less run on the
+        // `plugins` node before any work started. (The tracing::warn! the contract asks for is
+        // not asserted: capturing the global subscriber races the rest of the test suite.)
+        let engine = binding_engine(
+            "default-missing",
+            r#"defineDefaults({ plugins: ["rag-rat"] });"#,
+        )
+        .await;
+        let (config, cwd) = resolve_fixture("default-missing", &["ponytail"]);
+
+        let context = PluginContext::resolve(&config, &engine, &cwd)
+            .await
+            .expect("a missing default narrows the tool pool; it does not fail the run");
+
+        // The missing plugin is absent from every node's bound set, and nothing a node binds was
+        // not actually discovered. Whether the narrowed set keeps `ponytail` or is empty is the
+        // implementer's choice — the contract is only "only discovered plugins".
+        for node in ["scout", "memory", "analyst", "implementer", "bookkeeper"] {
+            let bound = context.bound(node);
+            assert!(
+                !bound.iter().any(|name| name == "rag-rat"),
+                "{node} still binds a plugin nobody installed: {bound:?}"
+            );
+            assert!(
+                bound.iter().all(|name| name == "ponytail"),
+                "{node} binds something that was not discovered: {bound:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_default_beside_a_discovered_agent_add_resolves_as_before() {
+        // The narrowing must not disturb the satisfied path: both names discovered, both bound,
+        // defaults first then the add.
+        let engine = binding_engine(
+            "default-and-add",
+            r#"
+            defineDefaults({ plugins: ["rag-rat"] });
+            defineAgent("analyst", { plugins: { add: ["ponytail"] } });
+            "#,
+        )
+        .await;
+        let (config, cwd) = resolve_fixture("default-and-add", &["rag-rat", "ponytail"]);
+
+        let context = PluginContext::resolve(&config, &engine, &cwd)
+            .await
+            .expect("everything named was discovered");
+        assert_eq!(context.bound("analyst"), ["rag-rat", "ponytail"]);
+        // A node that says nothing still gets exactly the defaults — discovering `ponytail` does
+        // not bind it, the ruleset named the pool.
+        assert_eq!(context.bound("scout"), ["rag-rat"]);
+    }
+
+    #[tokio::test]
+    async fn when_everything_declared_is_discovered_resolve_is_unchanged() {
+        // The strict path must not regress for a fully satisfied ruleset: no warning, no
+        // narrowing, the defaults reach a node that says nothing.
+        let engine =
+            binding_engine("all-found", r#"defineDefaults({ plugins: ["rag-rat"] });"#).await;
+        let (config, cwd) = resolve_fixture("all-found", &["rag-rat", "ponytail"]);
+
+        let context = PluginContext::resolve(&config, &engine, &cwd)
+            .await
+            .expect("everything named was discovered");
+        assert_eq!(context.bound("scout"), ["rag-rat"]);
+    }
+
+    #[tokio::test]
+    async fn an_agent_plugin_nobody_installed_still_fails_the_run() {
+        // The gate stays for an explicit binding: a defineAgent name that matches nothing
+        // installed is a typo in all three spellings, and fails on the `plugins` node with the
+        // message naming both the missing plugin(s) and the discovered list.
+        for (case, rule) in [
+            ("only", r#"defineAgent("analyst", { plugins: ["ghost"] });"#),
+            (
+                "add",
+                r#"defineAgent("scout", { plugins: { add: ["ghost"] } });"#,
+            ),
+            (
+                "remove",
+                r#"defineAgent("scout", { plugins: { remove: ["ghost"] } });"#,
+            ),
+        ] {
+            let engine = binding_engine(&format!("agent-missing-{case}"), rule).await;
+            let (config, cwd) = resolve_fixture(&format!("agent-missing-{case}"), &["ponytail"]);
+
+            let error = match PluginContext::resolve(&config, &engine, &cwd).await {
+                Err(error) => error,
+                Ok(_) => {
+                    panic!("an explicit binding naming an uninstalled plugin must fail ({case})")
+                }
+            };
+            let message = match error {
+                PlanError::Node {
+                    node: "plugins",
+                    source,
+                } => source.to_string(),
+                other => panic!("the failure belongs to the `plugins` node, got {other}"),
+            };
+            assert!(
+                message.contains("ruleset names plugin(s) that were not found"),
+                "{case}: the existing message shape: {message}"
+            );
+            assert!(
+                message.contains("ghost"),
+                "{case}: the missing name is reported: {message}"
+            );
+            assert!(
+                message.contains("ponytail"),
+                "{case}: the discovered list is reported: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plugin_named_by_both_defaults_and_an_agent_still_fails_when_undiscovered() {
+        // The explicit binding wins over the default preference: once a defineAgent names the
+        // plugin, a miss is a requirement again — warn-and-narrow is for defaults-only names.
+        let engine = binding_engine(
+            "both-missing",
+            r#"
+            defineDefaults({ plugins: ["rag-rat"] });
+            defineAgent("analyst", { plugins: { add: ["rag-rat"] } });
+            "#,
+        )
+        .await;
+        let (config, cwd) = resolve_fixture("both-missing", &["ponytail"]);
+
+        let error = match PluginContext::resolve(&config, &engine, &cwd).await {
+            Err(error) => error,
+            Ok(_) => panic!("an agent-level binding makes the missing plugin required"),
+        };
+        let message = error.to_string();
+        assert!(message.contains("rag-rat"), "{message}");
+        assert!(message.contains("ponytail"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn no_plugins_discovered_at_all_still_runs_when_only_defaults_name_one() {
+        // The rag-rat-less setup taken to its end: nothing installed, a default naming rag-rat,
+        // and the run proceeds on file tools. A default is a preference.
+        let engine = binding_engine(
+            "none-discovered",
+            r#"defineDefaults({ plugins: ["rag-rat"] });"#,
+        )
+        .await;
+        let (config, cwd) = resolve_fixture("none-discovered", &[]);
+
+        let context = PluginContext::resolve(&config, &engine, &cwd)
+            .await
+            .expect("nothing discovered and only a default declared: there is nothing to require");
+        assert!(context.discovered.is_empty());
+        for node in ["scout", "analyst", "implementer"] {
+            assert!(
+                !context.bound(node).iter().any(|name| name == "rag-rat"),
+                "nothing was discovered, so nothing undiscovered may be bound"
+            );
+        }
     }
 
     #[tokio::test]

@@ -295,6 +295,17 @@ impl ScriptEngine {
     /// Every plugin name any ruleset mentions, for validating them against what was discovered.
     pub fn declared_plugins(&self) -> Vec<String> {
         let mut names = self.defaults.plugins.clone().unwrap_or_default();
+        names.extend(self.required_plugins());
+        dedup(names)
+    }
+
+    /// Plugin names bound by an explicit `defineAgent` rule — an `Only` list, an `add`, or a
+    /// `remove`. These are *requirements*: naming one nobody installed is a typo, and the run
+    /// fails rather than binding less than the author asked for. Names bound only by
+    /// `defineDefaults` are preferences (see [`ScriptEngine::declared_plugins`] for the full set),
+    /// so they are excluded here.
+    pub fn required_plugins(&self) -> Vec<String> {
+        let mut names = Vec::new();
         for agent in self.agents.values() {
             match &agent.plugins {
                 Some(PluginRule::Only(only)) => names.extend(only.iter().cloned()),
@@ -581,6 +592,65 @@ mod tests {
         let mut declared = engine.declared_plugins();
         declared.sort();
         assert_eq!(declared, ["a", "b", "c", "rag-rat"]);
+    }
+
+    #[tokio::test]
+    async fn defaults_only_plugins_are_preferences_not_requirements() {
+        // #185: `defineDefaults` applies to every node, so a plugin named only there is a
+        // preference — resolve warns and narrows rather than refusing the run. It must not land
+        // in the required set, or a rag-rat-less checkout fails on the `plugins` node before any
+        // work starts. The contract leaves the accessor's exact name and shape to the
+        // implementer; this uses the suggested `required_plugins() -> Vec<String>`.
+        let engine = engine_with(
+            "defaults-preferred",
+            r#"defineDefaults({ plugins: ["rag-rat"] });"#,
+        )
+        .await;
+
+        assert!(
+            engine.required_plugins().is_empty(),
+            "a default is a preference, not a requirement"
+        );
+        // The defaults stay reachable — resolve needs them to compute the narrowed pool. If the
+        // implementer replaces `declared_plugins` with a dedicated defaults accessor, this
+        // assertion moves there; what matters is the names are not lost.
+        assert_eq!(engine.declared_plugins(), ["rag-rat"]);
+    }
+
+    #[tokio::test]
+    async fn agent_level_plugin_names_are_requirements() {
+        // An explicit binding is a requirement in all three spellings — an Only list, an `add`,
+        // and a `remove` (a `remove` naming nothing real is the same typo as an `add`).
+        let engine = engine_with(
+            "agent-required",
+            r#"
+            defineDefaults({ plugins: ["rag-rat"] });
+            defineAgent("scout", { plugins: { add: ["a"], remove: ["b"] } });
+            defineAgent("analyst", { plugins: ["c"] });
+            "#,
+        )
+        .await;
+
+        let mut required = engine.required_plugins();
+        required.sort();
+        assert_eq!(required, ["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn a_name_in_both_defaults_and_an_agent_rule_is_required_once() {
+        // The explicit binding wins over the default preference: naming a plugin in defineAgent
+        // promotes it to required, deduped, so resolve fails rather than warns when nobody
+        // installed it.
+        let engine = engine_with(
+            "both-required",
+            r#"
+            defineDefaults({ plugins: ["rag-rat", "shared"] });
+            defineAgent("scout", { plugins: { add: ["shared"] } });
+            "#,
+        )
+        .await;
+
+        assert_eq!(engine.required_plugins(), ["shared"]);
     }
 
     #[tokio::test]
