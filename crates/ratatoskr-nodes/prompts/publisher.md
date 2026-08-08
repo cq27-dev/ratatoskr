@@ -72,6 +72,15 @@ Do not claim more than you were told. If the acceptance run passed, say what pas
 iteration budget, say that plainly and say what is unresolved — a pull request that oversells
 itself wastes the review it was asking for.
 
+Green tests are not a clean run. A run can end with every check passing and its review unsatisfied;
+that is what an outcome other than `converged` means. When you are told the run did not finish
+clean, say so near the top of what you write, before the account of what it did well — a reader who
+reaches the end believing the work is done has been misled by the order you put things in.
+
+Report every unresolved finding you are given, in your own words, with what it means for a
+reviewer. They are not your failures to hide: the run made the change and the review found these,
+and a reviewer who discovers one for themselves learns that the description cannot be trusted.
+
 Bodies go in the `body` argument, never as `--body`.
 
 ## Report what you did
