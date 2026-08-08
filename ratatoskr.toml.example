@@ -23,9 +23,10 @@ root = "../.ratatoskr-worktrees"
 
 # Per-node model routing. `ask` is the only route used in Phase 1; provider is one of
 # "anthropic", "openai" or "moonshot", read from ANTHROPIC_API_KEY / OPENAI_API_KEY /
-# MOONSHOT_API_KEY. Each also takes a *_BASE_URL (OPENAI_BASE_URL, ANTHROPIC_BASE_URL), so a
-# route can be pointed at a local gateway rather than the provider itself. The rest are
-# illustrative, forward-looking node routes (Phase 2+).
+# MOONSHOT_API_KEY. Each also takes a base-URL override — ANTHROPIC_BASE_URL, OPENAI_BASE_URL,
+# MOONSHOT_API_BASE — so a route can be pointed at a local gateway, or at whichever of a
+# provider's platforms issued the key. The rest are illustrative, forward-looking node routes
+# (Phase 2+).
 #
 # "openai" runs on the Responses API, not chat completions: a reasoning model's thinking then
 # carries across the agent's tool-calling turns instead of being re-derived every turn. Ask it
