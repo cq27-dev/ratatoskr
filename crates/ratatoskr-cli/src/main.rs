@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use clap::{CommandFactory, Parser, Subcommand};
-use ratatoskr_core::RatatoskrConfig;
 use ratatoskr_core::auth::{Role, Visibility};
+use ratatoskr_core::{RatatoskrConfig, RunStatus};
 use ratatoskr_nodes::PlanOutcome;
 use tracing::Instrument as _;
 use tracing_subscriber::EnvFilter;
@@ -274,6 +274,19 @@ enum RunsCommand {
         run_id: String,
         #[arg(required = true)]
         tags: Vec<String>,
+    },
+    /// Mark runs abandoned, for ones whose process is gone.
+    ///
+    /// A run's status is written by the process running it, so one that was killed, crashed, or
+    /// outlived its machine stays `running` in the store and on the dashboard forever. This is how
+    /// a human says it is not coming back. Nothing else is touched: the checkpoints, the events
+    /// and the worktree are all still there to read.
+    ///
+    /// Refuses a run that already reached a terminal status, so a finished run cannot be relabelled
+    /// by a mistyped id.
+    Abandon {
+        #[arg(required = true)]
+        run_ids: Vec<String>,
     },
     /// Delete runs and everything recorded about them.
     ///
@@ -1203,6 +1216,35 @@ async fn runs(command: RunsCommand, config_path: &Path) -> anyhow::Result<()> {
             let run_id = resolve(&store, &run_id).await?;
             store.untag_run(&run_id, tags.clone()).await?;
             println!("untagged {} {}", short(Some(&run_id)), tags.join(","));
+            Ok(())
+        }
+
+        RunsCommand::Abandon { run_ids } => {
+            for id in &run_ids {
+                let run_id = resolve(&store, id).await?;
+                let status = store.run_status(&run_id).await?;
+                // An unparseable status is left alone rather than overwritten: it was written by a
+                // build that knows something this one does not, and abandoning it would discard
+                // that.
+                match status.as_deref().map(str::parse::<RunStatus>) {
+                    Some(Ok(s)) if s.is_terminal() => {
+                        println!("{} already finished ({s})", short(Some(&run_id)));
+                    }
+                    Some(Err(_)) => {
+                        println!(
+                            "{} has an unrecognised status ({}); left alone",
+                            short(Some(&run_id)),
+                            status.as_deref().unwrap_or_default()
+                        );
+                    }
+                    _ => {
+                        store
+                            .upsert_run(&run_id, None, RunStatus::Abandoned.as_str())
+                            .await?;
+                        println!("abandoned {}", short(Some(&run_id)));
+                    }
+                }
+            }
             Ok(())
         }
 
