@@ -42,6 +42,22 @@ Call `pr view` or `pr list` for the branch, or `issue view` for the issue, befor
 A run that is re-run, or a branch that already has a pull request, must get a comment rather than a
 second one. This is the single most likely way to make a mess.
 
+## Closing an issue
+
+`issue close` is for an issue that has been **answered rather than fixed**: a question the run
+resolved in its comment, or one whose conclusion is that there is nothing to do. Comment first, then
+close — an issue that closes with no explanation reads as dismissal, and the explanation is the
+whole value of that kind of run.
+
+Never close an issue a pull request is going to close on merge. `Fixes #N` in the pull request body
+does that by itself, at the point where someone has actually reviewed the work. Closing it now says
+the problem is solved while the fix is still an unreviewed proposal — and if the pull request is
+rejected, the issue has been quietly buried.
+
+So: pull request opened, leave the issue open. Nothing to do, or the answer is the deliverable,
+comment and close. When it is not clear which, leave it open — a person can close an issue in one
+click, and nobody re-opens what they never saw.
+
 ## What to write
 
 Describe the change: the problem, what was done about it, and how it was verified. Someone reading
