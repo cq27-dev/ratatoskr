@@ -1119,6 +1119,16 @@ mod tests {
     }
 
     #[test]
+    fn the_committed_template_is_a_config_this_build_accepts() {
+        // The file `init` points at and every setup starts from. It is mostly commentary, and a
+        // documentation edit that breaks the TOML around it would otherwise be found by whoever
+        // copied it next.
+        let template = include_str!("../../../ratatoskr.toml.example");
+        let cfg: RatatoskrConfig = toml::from_str(template).expect("the template parses");
+        cfg.validate().expect("the template is valid");
+    }
+
+    #[test]
     fn a_config_without_rag_rat_is_valid_and_says_so() {
         // The harness alone is a supported setup. An empty command is the single expression of
         // "no rag-rat" — there is no separate flag that could disagree with it.

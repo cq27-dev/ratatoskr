@@ -113,7 +113,7 @@ Requires a repository already indexed by rag-rat, and `bwrap` for the default sa
 ```sh
 cargo build --workspace
 cargo run -p ratatoskr-cli -- init          # writes ratatoskr.toml
-export ANTHROPIC_API_KEY=...                # or MOONSHOT_API_KEY, per [models.*]
+export ANTHROPIC_API_KEY=...                # or OPENAI_API_KEY / MOONSHOT_API_KEY, per [models.*]
 cargo run -p ratatoskr-cli -- run "Fix the flaky retry in the store"
 ```
 
@@ -289,6 +289,39 @@ The sandbox backend is `landlock` (bubblewrap + Landlock — the default; no ima
 or `microsandbox` (a MicroVM, needs KVM). microsandbox sits behind a Cargo feature because its
 build script downloads a helper binary, which fails in the network-less test sandbox; enable it
 with `cargo build --features ratatoskr-exec/microsandbox`.
+
+### Model providers
+
+Every node names its own `provider` and `model`, so a run can span providers. Three are supported:
+
+| `provider` | Key | Base-URL override | Surface |
+| --- | --- | --- | --- |
+| `anthropic` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` | Messages, with prompt caching |
+| `openai` | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | Responses |
+| `moonshot` | `MOONSHOT_API_KEY` | `MOONSHOT_API_BASE` | Chat completions |
+
+The base-URL override is what points a route at a local gateway instead of the provider — or at
+whichever of a provider's platforms issued the key, which is not always the one its client
+defaults to. A Moonshot key beginning `sk-kimi` belongs to Kimi For Coding
+(`https://api.kimi.com/coding/v1`, serving `k3`), and the general platform rejects it as a bad key
+rather than a wrong host. Note that Moonshot spells its variable `MOONSHOT_API_BASE`, not
+`_BASE_URL`.
+
+`openai` runs on the Responses API rather than chat completions. That is the surface where a
+reasoning model's thinking carries across the agent's tool-calling turns; on chat completions it is
+dropped between turns and re-derived on each one, so a node that takes ten turns pays for its
+reasoning ten times.
+
+A route's `params` are merged into the request verbatim, which means the spelling is the
+provider's — `thinking` on Anthropic and Moonshot, `reasoning` on OpenAI — and a field one
+provider knows is one another ignores in silence. `ratatoskr.toml.example` gives the three side by
+side. Two things do not travel: `[endpoint]`'s headers and session id are sent by the Anthropic
+client only, so `session = "reuse"` on another provider's route is accepted and does nothing, and
+Anthropic prompt caching is likewise not applied elsewhere.
+
+Mixing providers within a run is worth doing deliberately in one place: review. A verifier on a
+different family from the model that wrote the change is a second opinion rather than a second
+look.
 
 ### Agent rulesets
 

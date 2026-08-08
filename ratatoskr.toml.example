@@ -22,8 +22,18 @@ path = ".ratatoskr/state.sqlite3"
 root = "../.ratatoskr-worktrees"
 
 # Per-node model routing. `ask` is the only route used in Phase 1; provider is one of
-# "anthropic" or "moonshot", read from ANTHROPIC_API_KEY / MOONSHOT_API_KEY. The rest are
-# illustrative, forward-looking node routes (Phase 2+).
+# "anthropic", "openai" or "moonshot", read from ANTHROPIC_API_KEY / OPENAI_API_KEY /
+# MOONSHOT_API_KEY. Each also takes a base-URL override — ANTHROPIC_BASE_URL, OPENAI_BASE_URL,
+# MOONSHOT_API_BASE — so a route can be pointed at a local gateway, or at whichever of a
+# provider's platforms issued the key. The rest are illustrative, forward-looking node routes
+# (Phase 2+).
+#
+# "openai" runs on the Responses API, not chat completions: a reasoning model's thinking then
+# carries across the agent's tool-calling turns instead of being re-derived every turn.
+#
+# Nothing stops a run from spanning providers, and there is one place it is worth doing on
+# purpose: review. A verifier on a different family from the model that wrote the change is a
+# second opinion rather than a second look.
 [models.ask]
 provider = "anthropic"
 model = "claude-sonnet-4-6"
@@ -32,15 +42,32 @@ model = "claude-sonnet-4-6"
 provider = "moonshot"
 model = "kimi-k2.5"
 # A route may also set `temperature`, and `params` for anything the provider takes that this
-# config has no word for. `params` is merged into the request verbatim.
+# config has no word for. `params` is merged into the request verbatim — which means the spelling
+# is the provider's, not this file's, and a field one provider knows is one another silently
+# ignores. Copying a `params` block between routes of different providers is the way to get a
+# node that quietly reasons at whatever the endpoint defaults to.
 #
-# Extended thinking is the one worth knowing about: some endpoints turn it on as soon as a
-# request carries tools, and every node here carries tools. A node that thinks before each of
-# forty file reads spends most of its wall-clock reasoning about which file to open next, so it
-# is worth turning off for the nodes that explore and leaving on for the ones that judge.
+# Thinking is the one worth knowing about: some endpoints turn it on as soon as a request carries
+# tools, and every node here carries tools. A node that thinks before each of forty file reads
+# spends most of its wall-clock deciding which file to open next, so it is worth turning down for
+# the nodes that explore and leaving up for the ones that judge. Each provider spells that
+# differently:
 #
+#   # anthropic
 #   [models.context.params.thinking]
-#   type = "disabled"
+#   type = "disabled"                 # or type = "enabled" with budget_tokens = 4000
+#
+#   # openai, on the Responses API
+#   [models.verifier.params.reasoning]
+#   effort = "medium"
+#
+#   # moonshot
+#   [models.context.params.thinking]
+#   type = "enabled"
+#   effort = "low"                    # Kimi For Coding's K3: low | high | max, default high
+#
+# Not every model can be told to stop thinking. Kimi's coding models report
+# `supports_thinking_type: "only"`, so there the knob is how much, never whether.
 #
 # Thinking tokens are billed as output and count against `max_tokens`; raise it alongside any
 # budget you set.
@@ -55,11 +82,15 @@ model = "kimi-k2.5"
 #   [models.implementer]
 #   session = "reuse"
 #
-# On thinking levels: leaving it unset is not the cheap option. Measured against one endpoint on a
-# reasoning-heavy prompt with tools present, the unset default ran 26-39s and was the least
-# predictable setting available; `output_config.effort` at low, medium and high all landed between
-# 23s and 30s with reasoning still on, and disabling thinking entirely at 24-25s. A node that
-# should think is better told how much:
+# `[endpoint]` — its headers and that session id — rides on the anthropic client only. On an
+# openai or moonshot route `session = "reuse"` is accepted and does nothing, so setting it there
+# describes an arrangement the route has not got.
+#
+# On thinking levels: leaving it unset is not the cheap option. Measured on a reasoning-heavy
+# prompt with tools present, against an Anthropic route through a gateway that takes
+# `output_config`, the unset default ran 26-39s and was the least predictable setting available;
+# `effort` at low, medium and high all landed between 23s and 30s with reasoning still on, and
+# disabling thinking entirely at 24-25s. A node that should think is better told how much:
 #
 #   [models.verifier.params.output_config]
 #   effort = "medium"
