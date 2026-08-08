@@ -334,7 +334,7 @@ const MAX_ISSUE_DIGITS: usize = 6;
 /// Collecting every digit in the text instead produced a fifty-character branch name on a live run
 /// — `126` followed by every line number and date in the body — because a test fixture was a
 /// one-line issue string and a real issue is not.
-fn issue_number(issue: &str) -> Option<String> {
+pub fn issue_number(issue: &str) -> Option<String> {
     let digits = |s: &str| -> Option<String> {
         let n: String = s
             .chars()
