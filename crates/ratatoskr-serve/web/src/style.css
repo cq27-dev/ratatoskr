@@ -348,6 +348,14 @@ body {
   font-size: 11px;
   line-height: 1.5;
   overflow-wrap: anywhere;
+  /* A node's question is as long as it needs to be — one ran to a page and a half of reasoning,
+     which pushed the answer box off the bottom of the panel with no way to reach either. Cap it
+     and let it scroll: the box you answer in stays on screen whatever the question's length. */
+  max-height: 40vh;
+  overflow-y: auto;
+  /* Paragraphs are how a long question is structured, and HTML would collapse every one of them
+     into a single block. */
+  white-space: pre-wrap;
 }
 
 .ask textarea {

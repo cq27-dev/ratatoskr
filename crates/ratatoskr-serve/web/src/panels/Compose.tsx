@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Prose } from "../ui/format";
 
 /**
  * Typing something to a node.
@@ -85,7 +86,15 @@ export function Compose({
         <span>{heading}</span>
         <span>{aside}</span>
       </div>
-      {prompt && <p className="ask-q">{prompt}</p>}
+      {/* The same renderer the feed uses: a node asking a question writes the way it writes
+          everywhere else — backticks around a symbol, a fenced block of the code it is asking
+          about. Shown raw, those are noise exactly where the reader is being asked to decide
+          something. */}
+      {prompt && (
+        <div className="ask-q">
+          <Prose text={prompt} />
+        </div>
+      )}
       <textarea
         ref={box}
         value={text}
