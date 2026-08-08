@@ -25,6 +25,10 @@
 # Everything else: the full pipeline, the fork and converge loop, the sandbox, acceptance checks,
 # worktrees, the dashboard, clarification, plugins, skills, and publishing. Nothing here is a
 # reduced mode — it is the same harness with one source of context removed.
+#
+# The shipped ruleset declares `defineDefaults({ plugins: ["rag-rat"] })`, but a default is a
+# preference: with no rag-rat plugin installed the run warns and proceeds on file tools rather than
+# failing. No ruleset edit is needed here.
 
 [store]
 path = ".ratatoskr/state.sqlite3"
