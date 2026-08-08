@@ -143,26 +143,17 @@ impl NodeTelemetryView {
     }
 }
 
-/// Statuses that mean the run is no longer executing. Note `planned` belongs here only because
-/// `run_full` now records `running` for its fork+converge phase — otherwise a full run in flight
-/// would be indistinguishable from a finished `plan`.
+/// Whether the run is no longer executing, from the status string the store holds.
 ///
-/// This matches `RunStatus`'s persisted strings, so the compiler cannot flag a new variant that
-/// belongs here — and one missing from the list leaves a finished run showing as still executing,
-/// forever. `every_run_status_is_classified` is what actually catches that.
+/// The classification itself is `RunStatus::is_terminal`, where an exhaustive match makes the
+/// compiler flag a new variant nobody classified. This only turns the stored string back into the
+/// enum: a status that is absent, or one written by a newer build than this one, reads as still
+/// executing — the safe direction, since it shows a stale run rather than declaring a live one
+/// finished.
 fn is_terminal(status: Option<&str>) -> bool {
-    matches!(
-        status,
-        Some(
-            "planned"
-                | "converged"
-                | "max_iterations_reached"
-                | "no_code_change"
-                | "unreviewed"
-                | "failed"
-                | "abandoned"
-        )
-    )
+    status
+        .and_then(|s| s.parse::<ratatoskr_core::RunStatus>().ok())
+        .is_some_and(|s| s.is_terminal())
 }
 
 /// Derive each node's state from the run status and its checkpoints.

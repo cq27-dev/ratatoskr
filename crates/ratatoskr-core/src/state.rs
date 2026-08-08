@@ -63,6 +63,28 @@ impl RunStatus {
     pub fn as_str(&self) -> &'static str {
         (*self).into()
     }
+
+    /// Whether the run is no longer executing.
+    ///
+    /// An exhaustive match rather than a list of strings, so a new variant cannot be added without
+    /// classifying it. The failure it prevents is silent and permanent in both directions: an
+    /// unclassified terminal status leaves a finished run reading as still executing forever, and
+    /// a live one classified as terminal invites a second process onto the same worktree.
+    ///
+    /// `Planned` is terminal because a full run records `Running` for its fork and converge phase;
+    /// without that, a finished `plan` would be indistinguishable from a run still in flight.
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            RunStatus::Pending | RunStatus::Running | RunStatus::AwaitingClarification => false,
+            RunStatus::Planned
+            | RunStatus::Converged
+            | RunStatus::MaxIterationsReached
+            | RunStatus::Unreviewed
+            | RunStatus::NoCodeChange
+            | RunStatus::Failed
+            | RunStatus::Abandoned => true,
+        }
+    }
 }
 
 /// The minimal state shape a run carries between nodes. Node-produced slots stay untyped
@@ -127,6 +149,24 @@ mod tests {
         assert_eq!(back.status, RunStatus::AwaitingClarification);
         assert_eq!(back.scout_report, state.scout_report);
         assert_eq!(back.memories.len(), 1);
+    }
+
+    #[test]
+    fn a_run_is_either_executing_or_finished() {
+        use strum::IntoEnumIterator as _;
+
+        // The exhaustive match means a new variant cannot be added without classifying it, but it
+        // cannot say which side is right. This names the executing three, so a variant quietly
+        // moved into that arm — where a killed run would never be reported finished, and a live
+        // one could be started twice — fails here.
+        let executing = ["pending", "running", "awaiting_clarification"];
+        for status in RunStatus::iter() {
+            assert_ne!(
+                status.is_terminal(),
+                executing.contains(&status.as_str()),
+                "`{status}` must be terminal or executing, and only one"
+            );
+        }
     }
 
     #[test]
