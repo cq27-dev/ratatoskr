@@ -12,6 +12,7 @@ pub mod context;
 pub mod control;
 pub mod converge;
 pub mod implementer;
+pub mod issue;
 pub mod memory;
 pub mod overseer;
 pub mod publisher;
@@ -92,6 +93,12 @@ impl PlanError {
 pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError> {
     // Before any node runs, so the first one can already be paused.
     control::install(request.run_id);
+    // Before the issue checkpoint is written, so what is recorded is what every node was given.
+    let filled = issue::enriched(request.issue, &std::env::current_dir().unwrap_or_default()).await;
+    let request = RunRequest {
+        issue: &filled,
+        ..request
+    };
     // Decided before the request is taken apart: choosing needs the whole of it.
     let chosen = choose(&request).await?;
     let RunRequest {
@@ -1522,6 +1529,12 @@ async fn no_code_change(
 pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> {
     // Before any node runs, so the first one can already be paused.
     control::install(request.run_id);
+    // Before the issue checkpoint is written, so what is recorded is what every node was given.
+    let filled = issue::enriched(request.issue, &std::env::current_dir().unwrap_or_default()).await;
+    let request = RunRequest {
+        issue: &filled,
+        ..request
+    };
     // Decided before the request is taken apart: choosing needs the whole of it.
     let chosen = choose(&request).await?;
     let RunRequest {
