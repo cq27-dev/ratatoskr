@@ -1649,7 +1649,7 @@ where
             for_compaction,
             node,
             produces,
-            compaction::default_budget(),
+            compaction::budget_for(route.context_window),
             ledger.clone(),
         ));
     }
@@ -2177,6 +2177,7 @@ mod tests {
             provider: "anthropic".into(),
             model: "claude-haiku-4-5-20251001".into(),
             max_tokens: None,
+            context_window: None,
             temperature: None,
             params: None,
             session: Default::default(),
@@ -2247,6 +2248,7 @@ mod tests {
             provider: "anthropic".into(),
             model: "claude-haiku-4-5-20251001".into(),
             max_tokens: None,
+            context_window: None,
             temperature: None,
             params: None,
             session: Default::default(),
@@ -2305,6 +2307,7 @@ mod tests {
             provider: "anthropic".into(),
             model: "claude-opus-4-8".into(),
             max_tokens: None,
+            context_window: None,
             temperature: None,
             params: None,
             session,

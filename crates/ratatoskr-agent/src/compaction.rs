@@ -18,12 +18,36 @@ use rig_core::memory::{Compactor, MemoryError};
 use rig_core::wasm_compat::WasmBoxedFuture;
 use rig_memory::{InMemoryConversationMemory, TokenWindowMemory};
 
-/// Roughly how many tokens of history a node keeps before the oldest turns are summarised.
+/// The history budget for a route that does not say how large its window is.
 ///
-/// Deliberately well under any model's window: compaction has to happen with enough room left for
-/// the summary call itself, the tool declarations, and the turn that triggered it. A budget set at
-/// the window's edge produces a context-length error instead of a compaction.
+/// Conservative on purpose: it has to be safe on the smallest model anyone routes here, because
+/// the cost of being wrong in the other direction is a context-length error mid-run rather than a
+/// compaction. A route that says its window gets a budget scaled to it instead — see
+/// [`budget_for`].
 const HISTORY_TOKEN_BUDGET: usize = 120_000;
+
+/// What share of a model's window a node's *history* may occupy.
+///
+/// The rest is not slack. A compaction happens by making a model call, so the window has to hold,
+/// at that moment: everything kept, the summary prompt, every tool declaration, and the turn that
+/// tripped the budget — which is routinely the largest of them, being a whole file read back or a
+/// failing suite's output. Two thirds leaves that room at every window size, where a fixed reserve
+/// would be most of a small window and a rounding error in a large one.
+const HISTORY_SHARE: (usize, usize) = (2, 3);
+
+/// Tokens of history a node on this route keeps before its oldest turns are summarised.
+pub fn budget_for(window: Option<u64>) -> usize {
+    let Some(window) = window else {
+        return HISTORY_TOKEN_BUDGET;
+    };
+    let (num, den) = HISTORY_SHARE;
+    // Saturating rather than wrapping: a window declared absurdly large is a config mistake, and
+    // the budget it produces should stay a number rather than becoming a small one.
+    usize::try_from(window)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(num)
+        / den
+}
 
 /// Characters per token, for the estimate that decides when to compact.
 ///
@@ -211,7 +235,7 @@ where
     )
 }
 
-/// The default budget, for a caller with no reason to pick another.
+/// The default budget, for a caller with no route to ask.
 pub fn default_budget() -> usize {
     HISTORY_TOKEN_BUDGET
 }
@@ -238,6 +262,39 @@ mod tests {
         assert!(tokens_in(&Message::user("")) >= 1);
         let long = Message::user("x".repeat(3_000));
         assert!(tokens_in(&long) >= 900, "{}", tokens_in(&long));
+    }
+
+    #[test]
+    fn a_route_that_states_its_window_gets_a_budget_scaled_to_it() {
+        // The defect this closes: every node compacted at a fixed 120k whatever it was running on,
+        // so a large-window model summarised its history away long before it had to — paying for a
+        // summary, and losing detail, to solve a problem it did not have.
+        assert!(budget_for(Some(200_000)) > budget_for(None));
+        assert!(budget_for(Some(1_000_000)) > budget_for(Some(200_000)));
+        // And a window smaller than the fallback is respected rather than overrun.
+        assert!(budget_for(Some(32_000)) < budget_for(None));
+    }
+
+    #[test]
+    fn a_budget_always_leaves_the_window_room_to_compact_in() {
+        // Compaction is itself a model call: what is kept, the summary prompt, every tool
+        // declaration and the turn that tripped the budget all have to fit at that moment. A
+        // budget at the window's edge produces a context-length error instead of a compaction,
+        // which is the failure this whole module exists to avoid.
+        for window in [8_000u64, 32_000, 128_000, 200_000, 1_000_000] {
+            let budget = budget_for(Some(window));
+            let spare = window as usize - budget;
+            assert!(budget < window as usize, "{window}: {budget}");
+            // Room for a large tool result on top of everything else, at every size.
+            assert!(spare >= window as usize / 4, "{window}: only {spare} spare");
+        }
+    }
+
+    #[test]
+    fn an_unstated_window_keeps_the_budget_that_was_there_before() {
+        // Most routes will never state one, and their behaviour must not move because this exists.
+        assert_eq!(budget_for(None), 120_000);
+        assert_eq!(budget_for(None), default_budget());
     }
 
     #[test]

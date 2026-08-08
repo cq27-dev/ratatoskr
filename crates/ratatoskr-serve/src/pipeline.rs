@@ -502,6 +502,7 @@ mod tests {
                 provider: "anthropic".into(),
                 model: "claude-sonnet-5".into(),
                 max_tokens: None,
+                context_window: None,
                 temperature: None,
                 params: None,
                 session: ratatoskr_core::SessionScope::Reuse,

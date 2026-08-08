@@ -41,6 +41,22 @@ model = "claude-sonnet-4-6"
 [models.context]
 provider = "moonshot"
 model = "kimi-k2.5"
+# `context_window` is how many tokens the model holds. It decides when a node's history is
+# summarised rather than carried: the budget is two thirds of it, leaving room for the summary
+# call, the tool declarations and the turn that tripped it — a budget at the window's edge
+# produces a context-length error instead of a compaction.
+#
+#   [models.analyst]
+#   context_window = 1048576
+#
+# Stated rather than looked up, for the same reason as `max_tokens`: a table of model names
+# compiled into the binary cannot know a model released after it. Unset, every node keeps a
+# conservative 120k of history, which is safe on anything but summarises early on a large model.
+# Ask the endpoint rather than guessing — most report it (`/v1/models` carries `context_window` or
+# `context_length`), and a window declared larger than the model's turns a compaction into a
+# context-length error. Declaring one *smaller* is fine and sometimes right: the budget bounds
+# correctness, not spend, and history is paid for on every turn.
+#
 # A route may also set `temperature`, and `params` for anything the provider takes that this
 # config has no word for. `params` is merged into the request verbatim — which means the spelling
 # is the provider's, not this file's, and a field one provider knows is one another silently
