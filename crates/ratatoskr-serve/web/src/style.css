@@ -1494,8 +1494,7 @@ a:focus-visible {
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
-.control-pick,
-.control-send {
+.control-pick {
   background: transparent;
   color: var(--fg);
   border: 1px solid var(--rule);
@@ -1505,37 +1504,26 @@ a:focus-visible {
   cursor: pointer;
   text-align: left;
 }
-.control-pick:hover:not(:disabled),
-.control-send:hover:not(:disabled) {
+.control-pick:hover:not(:disabled) {
   border-color: var(--fg);
-}
-.control-menu form {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.control-node,
-.control-text {
-  background: var(--bg);
-  color: var(--fg);
-  border: 1px solid var(--rule);
-  font: inherit;
-  font-size: 11px;
-  padding: 4px 6px;
-}
-.control-text {
-  resize: vertical;
-  min-height: 44px;
-}
-.control-send {
-  text-align: center;
-}
-.control-send:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
 }
 .control-error {
   margin: 0;
   color: var(--hazard, #e61919);
   font-size: 11px;
+}
+
+/* Which node is being spoken to, when the fork means there is a choice. Inside the `/// …` heading
+   of the message box, so it inherits that line's type and only marks itself with an underline —
+   a bordered select there would look like a second, unrelated widget. */
+.ask-to {
+  background: transparent;
+  color: inherit;
+  border: none;
+  border-bottom: 1px solid currentColor;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  padding: 0 2px;
+  cursor: pointer;
 }

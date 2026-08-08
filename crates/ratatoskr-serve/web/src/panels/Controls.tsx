@@ -9,9 +9,10 @@ import { control, type Command, type ControlView } from "../api";
  * about it: a control that sprang back until the run noticed would read as a lost click. The state
  * comes from the server for the same reason — another tab, or a reload, must see the same pause.
  *
- * Stop and steer name a node, because a run's fork has two working at once and "stop the run"
- * would be ambiguous exactly when it matters. With one node working there is nothing to choose and
- * the click acts directly; with several, it asks which.
+ * Stop names a node, because a run's fork has two working at once and "stop the run" would be
+ * ambiguous exactly when it matters. With one node working there is nothing to choose and the
+ * click acts directly; with several, it asks which. Steering opens the same box a node's question
+ * opens, down in the activity area — see `Steer`.
  */
 export function Controls({
   project,
@@ -20,6 +21,7 @@ export function Controls({
   working,
   mayAct,
   onChange,
+  onCompose,
 }: {
   project: string;
   runId: string;
@@ -30,9 +32,10 @@ export function Controls({
    * by them, and a control that vanishes reads as a feature that does not exist. */
   mayAct: boolean;
   onChange: (view: ControlView) => void;
+  /** Open the message box. Not a popover of its own — it is the clarification box. */
+  onCompose: () => void;
 }) {
-  const [menu, setMenu] = useState<"stop" | "steer" | null>(null);
-  const [text, setText] = useState("");
+  const [picking, setPicking] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const box = useRef<HTMLDivElement>(null);
@@ -40,12 +43,12 @@ export function Controls({
   // Close on anything that means "I am doing something else now". Escape and an outside click are
   // the two ways out of a popover people already know.
   useEffect(() => {
-    if (!menu) return;
+    if (!picking) return;
     const away = (e: PointerEvent) => {
-      if (!box.current?.contains(e.target as Node)) setMenu(null);
+      if (!box.current?.contains(e.target as Node)) setPicking(false);
     };
     const key = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setMenu(null);
+      if (e.key === "Escape") setPicking(false);
     };
     document.addEventListener("pointerdown", away);
     document.addEventListener("keydown", key);
@@ -53,15 +56,14 @@ export function Controls({
       document.removeEventListener("pointerdown", away);
       document.removeEventListener("keydown", key);
     };
-  }, [menu]);
+  }, [picking]);
 
   async function send(command: Command) {
     setBusy(true);
     setError(null);
     try {
       onChange(await control(project, runId, command));
-      setMenu(null);
-      setText("");
+      setPicking(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -70,14 +72,9 @@ export function Controls({
   }
 
   const stopped = state.stopped;
-  // One target and no choice to make: the common case, and the one where a picker would be a
-  // second click for a decision with one option.
-  const only = working.length === 1 ? working[0]! : null;
-
-  function aim(kind: "stop" | "steer") {
-    if (kind === "stop" && only) return void send({ command: "stop", node: only });
-    setMenu(kind);
-  }
+  /** What the stop button acts on, when there is no choice to make. */
+  const target = stopped.length ? stopped : working;
+  const only = target.length === 1 ? target[0]! : null;
 
   return (
     <div className="controls" ref={box}>
@@ -85,7 +82,7 @@ export function Controls({
         type="button"
         className={state.paused ? "control is-on" : "control"}
         disabled={!mayAct || busy}
-        onClick={() => send({ command: state.paused ? "resume" : "pause" })}
+        onClick={() => void send({ command: state.paused ? "resume" : "pause" })}
         data-tip={
           state.paused
             ? "Resume: every node carries on from where it held"
@@ -101,13 +98,11 @@ export function Controls({
       <button
         type="button"
         className={stopped.length ? "control is-on" : "control"}
-        disabled={!mayAct || busy || (!stopped.length && !working.length)}
+        disabled={!mayAct || busy || !target.length}
         onClick={() =>
-          stopped.length === 1
-            ? send({ command: "start", node: stopped[0]! })
-            : stopped.length
-              ? setMenu("stop")
-              : aim("stop")
+          only
+            ? void send({ command: stopped.length ? "start" : "stop", node: only })
+            : setPicking(true)
         }
         data-tip={
           stopped.length
@@ -123,7 +118,8 @@ export function Controls({
         type="button"
         className={state.steering.length ? "control is-on" : "control"}
         disabled={!mayAct || busy || !working.length}
-        onClick={() => aim("steer")}
+        onClick={onCompose}
+        data-compose-toggle=""
         data-tip={
           working.length
             ? "Say something to a working node. It arrives on its next turn"
@@ -134,82 +130,25 @@ export function Controls({
         {BUBBLE}
       </button>
 
-      {menu && (
+      {picking && (
         <div className="control-menu">
-          {menu === "stop" ? (
-            <>
-              <p className="control-ask">
-                {stopped.length ? "Start which node?" : "Stop which node?"}
-              </p>
-              {(stopped.length ? stopped : working).map((node) => (
-                <button
-                  key={node}
-                  type="button"
-                  className="control-pick"
-                  disabled={busy}
-                  onClick={() =>
-                    send({
-                      command: stopped.length ? "start" : "stop",
-                      node,
-                    })
-                  }
-                >
-                  {node}
-                </button>
-              ))}
-            </>
-          ) : (
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                const node = only ?? pickedRef(box);
-                if (!node || !text.trim()) return;
-                void send({ command: "steer", node, text: text.trim() });
-              }}
+          <p className="control-ask">{stopped.length ? "Start which node?" : "Stop which node?"}</p>
+          {target.map((node) => (
+            <button
+              key={node}
+              type="button"
+              className="control-pick"
+              disabled={busy}
+              onClick={() => void send({ command: stopped.length ? "start" : "stop", node })}
             >
-              {/* Only when there is a choice: a select with one option is a question with one
-                  answer, which is not a question. */}
-              {!only && (
-                <select className="control-node" name="node" defaultValue={working[0]}>
-                  {working.map((node) => (
-                    <option key={node} value={node}>
-                      {node}
-                    </option>
-                  ))}
-                </select>
-              )}
-              <textarea
-                className="control-text"
-                value={text}
-                onChange={(e) => setText(e.target.value)}
-                placeholder={`Message ${only ?? "the node"}…`}
-                rows={3}
-                autoFocus
-                // Enter sends, because this is a message rather than a document — the same as the
-                // clarification box next to it. Shift+Enter still breaks a line.
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    e.currentTarget.form?.requestSubmit();
-                  }
-                }}
-              />
-              <button type="submit" className="control-send" disabled={busy || !text.trim()}>
-                SEND
-              </button>
-            </form>
-          )}
+              {node}
+            </button>
+          ))}
           {error && <p className="control-error">{error}</p>}
         </div>
       )}
     </div>
   );
-}
-
-/** The node chosen in the steer form's select, when there was a choice to make. */
-function pickedRef(box: React.RefObject<HTMLDivElement | null>): string | null {
-  const select = box.current?.querySelector<HTMLSelectElement>("select.control-node");
-  return select?.value ?? null;
 }
 
 // Glyphs rather than words: three controls in the space the scrubber can spare, and every one of

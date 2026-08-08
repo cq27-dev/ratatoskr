@@ -19,6 +19,7 @@ import { SignIn } from "./panels/SignIn";
 import { RunMeta } from "./panels/RunMeta";
 import { Scrubber } from "./panels/Scrubber";
 import { Controls } from "./panels/Controls";
+import { Steer } from "./panels/Steer";
 import {
   getHistory,
   getNodeCheckpoints,
@@ -406,9 +407,14 @@ export default function App() {
    * of waiting for the next poll — and a reload, or a second tab, still sees the same pause.
    */
   const [controlState, setControlState] = useState<ControlView>(EMPTY_CONTROL);
+  /** Whether the message box is open. Down with the questions, not up by the button that opens it. */
+  const [composing, setComposing] = useState(false);
   useEffect(() => {
     setControlState(detail?.control ?? EMPTY_CONTROL);
   }, [detail]);
+  useEffect(() => {
+    if (!workingNodes.length) setComposing(false);
+  }, [workingNodes]);
 
   /**
    * Characters the node column reserves, from the longest name this run can ever show.
@@ -606,6 +612,7 @@ export default function App() {
                     working={workingNodes}
                     mayAct={mayAct(me?.role)}
                     onChange={setControlState}
+                    onCompose={() => setComposing((open) => !open)}
                   />
                 ) : undefined
               }
@@ -621,6 +628,15 @@ export default function App() {
             </div>
             <div className="lower">
               <div className="activity">
+                {composing && project && runId && (
+                  <Steer
+                    project={project}
+                    runId={runId}
+                    working={workingNodes}
+                    onSent={() => setComposing(false)}
+                    onDismiss={() => setComposing(false)}
+                  />
+                )}
                 {pending.map((question) => (
                   <Question
                     key={question.question_id}
