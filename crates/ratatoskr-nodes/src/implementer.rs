@@ -70,6 +70,11 @@ pub struct ImplementerOutput {
     pub commit_kind: String,
     #[serde(default)]
     pub commit_scope: String,
+    /// The subject alone, without the `type(scope): ` prefix — that is added for you.
+    ///
+    /// Aim for 55 characters or fewer, so the whole line stays within git's customary 72. Nothing
+    /// shortens it for you: what you write is what the history keeps, so a subject that runs long
+    /// is merely untidy, and one that trails off mid-thought is wrong.
     #[serde(default)]
     pub commit_subject: String,
 }
