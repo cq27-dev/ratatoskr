@@ -46,6 +46,13 @@ pub struct PublisherInput {
     /// The run's terminal status, so the write does not overclaim what the acceptance run showed.
     pub status: String,
     pub iterations: u32,
+    /// What the last review still objected to, if there was a review.
+    ///
+    /// The publisher is told to say what is unresolved, and until this existed it had no way to
+    /// know. A run can end with its tests green and its review unsatisfied — that is exactly what
+    /// `max_iterations_reached` means — and a pull request written from the test result alone
+    /// reads as a clean landing.
+    pub unresolved: Vec<crate::verifier::Finding>,
 }
 
 /// The publisher node.
@@ -101,11 +108,38 @@ impl PublisherNode {
 fn render_prompt(input: &PublisherInput) -> String {
     let mut s = String::new();
     let _ = write!(s, "THE TASK:\n{}\n\n", input.issue);
-    let _ = write!(
+    let _ = writeln!(
         s,
-        "OUTCOME: {} after {} implementer iteration(s).\n\n",
+        "OUTCOME: {} after {} implementer iteration(s).",
         input.status, input.iterations
     );
+    // Spelled out rather than left as a status word among many. The line below this one reports
+    // the acceptance run, and on a run that ends unclean it says every test passes — which is the
+    // more concrete claim and the one a reader believes. A live run published exactly that: a
+    // status of `max_iterations_reached`, a pull request describing a clean landing, and no
+    // mention of the review it had failed four times.
+    if input.status != ratatoskr_core::RunStatus::Converged.as_str() {
+        s.push_str(
+            "THIS RUN DID NOT FINISH CLEAN. Whatever you write must say so in its own words, \
+             near the top, before anything it did well. The tests passing is not the same as the \
+             work being done.\n",
+        );
+    }
+    s.push('\n');
+
+    if !input.unresolved.is_empty() {
+        s.push_str(
+            "THE REVIEW STILL OBJECTED TO THIS. Report each one — a reviewer who finds it \
+             themselves has been misled by what you wrote:\n",
+        );
+        for f in &input.unresolved {
+            let _ = writeln!(s, "- [{:?}] {}", f.severity, f.summary);
+            if !f.failure_scenario.is_empty() {
+                let _ = writeln!(s, "    {}", f.failure_scenario);
+            }
+        }
+        s.push('\n');
+    }
 
     let a = &input.analyst;
     if !a.impact_summary.is_empty() {
@@ -169,6 +203,17 @@ mod tests {
         }
     }
 
+    fn finding(summary: &str) -> crate::verifier::Finding {
+        crate::verifier::Finding {
+            severity: crate::verifier::Severity::P2,
+            kind: crate::verifier::FindingKind::Execution,
+            file: String::new(),
+            line: None,
+            summary: summary.to_string(),
+            failure_scenario: "a reader is told the opposite of what the code does".to_string(),
+        }
+    }
+
     fn implementer(failing: &[&str]) -> ImplementerOutput {
         ImplementerOutput {
             worktree_path: "/w/ratatoskr/abc".into(),
@@ -196,6 +241,7 @@ mod tests {
             implementer: None,
             status: "no_code_change".into(),
             iterations: 0,
+            unresolved: Vec::new(),
         });
         assert!(prompt.contains("NO CODE WAS CHANGED"));
         assert!(prompt.contains("nothing to open a pull request for"));
@@ -211,10 +257,52 @@ mod tests {
             implementer: Some(implementer(&["store::migrates"])),
             status: "max_iterations_reached".into(),
             iterations: 3,
+            unresolved: Vec::new(),
         });
         assert!(prompt.contains("max_iterations_reached"));
         assert!(prompt.contains("3 implementer iteration"));
         assert!(prompt.contains("Still failing: store::migrates"));
+    }
+
+    #[test]
+    fn an_unclean_run_is_told_so_in_words_it_cannot_read_past() {
+        // The failure this closes, from run `aab02a3d`: the status word said
+        // `max_iterations_reached` and the line under it said every test passed. The pull request
+        // was written from the second one and read as a clean landing.
+        let prompt = render_prompt(&PublisherInput {
+            issue: "Fix it".into(),
+            analyst: analyst(),
+            implementer: Some(implementer(&[])),
+            status: "max_iterations_reached".into(),
+            iterations: 4,
+            unresolved: vec![finding(
+                "the memory still describes the design this replaced",
+            )],
+        });
+        assert!(prompt.contains("THIS RUN DID NOT FINISH CLEAN"), "{prompt}");
+        assert!(prompt.contains("THE REVIEW STILL OBJECTED"), "{prompt}");
+        assert!(
+            prompt.contains("the memory still describes the design this replaced"),
+            "{prompt}"
+        );
+        // And the scenario, because a summary without one is a claim the writer cannot check.
+        assert!(prompt.contains("a reader is told the opposite"), "{prompt}");
+    }
+
+    #[test]
+    fn a_clean_run_is_not_warned_about_a_review_that_passed() {
+        // The warning has to mean something. A run that converged with nothing outstanding must
+        // not carry text telling it to confess, or the next one that does will read the same.
+        let prompt = render_prompt(&PublisherInput {
+            issue: "Add a column".into(),
+            analyst: analyst(),
+            implementer: Some(implementer(&[])),
+            status: "converged".into(),
+            iterations: 1,
+            unresolved: Vec::new(),
+        });
+        assert!(!prompt.contains("DID NOT FINISH CLEAN"), "{prompt}");
+        assert!(!prompt.contains("THE REVIEW STILL OBJECTED"), "{prompt}");
     }
 
     #[test]
@@ -225,6 +313,7 @@ mod tests {
             implementer: Some(implementer(&[])),
             status: "converged".into(),
             iterations: 1,
+            unresolved: Vec::new(),
         });
         assert!(prompt.contains("BRANCH: ratatoskr/abc"), "{prompt}");
         assert!(prompt.contains("WORKTREE: /w/ratatoskr/abc"), "{prompt}");

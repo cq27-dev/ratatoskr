@@ -1444,6 +1444,30 @@ pub struct RunOutcome {
     pub bookkeeper: Option<BookkeeperOutput>,
 }
 
+/// What the run's last review still objected to, read back from its checkpoints.
+///
+/// Best-effort, and empty is the ordinary answer: a repository with no verifier route never
+/// reviews at all. The publisher is told to say what is unresolved, so this is where it finds out;
+/// a store read that fails costs a sentence in a pull request and must not cost the run.
+async fn unresolved_of(store: &Store, run_id: &str) -> Vec<verifier::Finding> {
+    let checkpoints = match store.checkpoints_for_run(run_id).await {
+        Ok(checkpoints) => checkpoints,
+        Err(e) => {
+            tracing::warn!("could not read the run's checkpoints for publishing: {e}");
+            return Vec::new();
+        }
+    };
+    // The last review is the one that still stands: an earlier pass's findings were either fixed
+    // or raised again, and reporting a fixed one would be as misleading as reporting none.
+    checkpoints
+        .iter()
+        .rev()
+        .find(|c| c.node_name == "verifier")
+        .and_then(|c| serde_json::from_str::<verifier::VerifierOutput>(&c.output_json).ok())
+        .map(|v| v.findings)
+        .unwrap_or_default()
+}
+
 /// The run's friction, read back from its checkpoints.
 ///
 /// Best-effort: a store read that fails costs the bookkeeper its richest input, and failing the
@@ -1501,6 +1525,8 @@ async fn no_code_change(
             implementer: None,
             status: status.as_str().to_string(),
             iterations: 0,
+            // No fork ran, so there was nothing to review.
+            unresolved: Vec::new(),
         },
         true,
     )
@@ -1682,6 +1708,7 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
                 implementer: Some(implementer.clone()),
                 status: status.as_str().to_string(),
                 iterations,
+                unresolved: unresolved_of(store, run_id).await,
             },
             terminal,
         )
