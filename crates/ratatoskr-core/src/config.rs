@@ -2,8 +2,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+
+use crate::Capability;
 
 /// Top-level config loaded from `ratatoskr.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,9 +15,12 @@ pub struct RatatoskrConfig {
     pub rag_rat: RagRatConfig,
     pub store: StoreConfig,
     pub worktree: WorktreeConfig,
-    /// Per-node model routing, keyed by node name (`"scout"`, `"analyst"`, ...).
+    /// Per-node model routing, keyed by stage name (`"scout"`, `"analyst"`, ...).
     #[serde(default)]
     pub models: HashMap<String, ModelRoute>,
+    /// Reusable execution profiles. Stage names remain the model/ruleset compatibility key.
+    #[serde(default)]
+    pub agents: HashMap<String, AgentProfileConfig>,
     #[serde(default)]
     pub implementer: ImplementerConfig,
     #[serde(default)]
@@ -25,6 +31,39 @@ pub struct RatatoskrConfig {
     pub publish: PublishConfig,
     #[serde(default)]
     pub endpoint: EndpointConfig,
+}
+
+/// Configurable defaults for a reusable agent profile. A missing model keeps the existing
+/// `[models.<stage>]` fallback, preserving stage-keyed configuration compatibility.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProfileConfig {
+    #[serde(default)]
+    pub model: Option<ModelRoute>,
+    #[serde(default)]
+    pub base_prompt: String,
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+    /// Rust-supplied policy shared by every stage using this profile; TOML cannot express code.
+    #[serde(skip)]
+    pub tool_policy: Option<Arc<dyn crate::ToolPolicy>>,
+    #[serde(default)]
+    pub max_turns: Option<usize>,
+}
+
+impl std::fmt::Debug for AgentProfileConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentProfileConfig")
+            .field("model", &self.model)
+            .field("base_prompt", &self.base_prompt)
+            .field("capabilities", &self.capabilities)
+            .field(
+                "tool_policy",
+                &self.tool_policy.as_ref().map(|_| "configured"),
+            )
+            .field("max_turns", &self.max_turns)
+            .finish()
+    }
 }
 
 /// How to address the model endpoint, beyond its URL and key.
@@ -740,6 +779,7 @@ impl Default for RatatoskrConfig {
             worktree: WorktreeConfig {
                 root: PathBuf::from(".ratatoskr/worktrees"),
             },
+            agents: HashMap::new(),
             models: HashMap::from([
                 // `ask` is the only route consumed in Phase 1; the rest are illustrative,
                 // forward-looking node routes (Phase 2+).

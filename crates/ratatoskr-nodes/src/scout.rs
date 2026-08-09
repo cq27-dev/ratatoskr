@@ -73,9 +73,10 @@ impl Node for ScoutNode {
         let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
             node: "scout",
             route: &self.route,
-            preamble: &crate::effective_preamble(
+            preamble: &crate::effective_preamble_with_profile(
                 "scout",
                 PREAMBLE,
+                self.plugins.profile_prompt.as_str(),
                 self.system_prompt.as_deref(),
                 self.plugins.context.as_deref(),
                 &self.plugins.skills,

@@ -8,12 +8,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ratatoskr_core::{RatatoskrConfig, ToolPolicy};
+use ratatoskr_core::{Capability, RatatoskrConfig, ToolDecision, ToolPolicy};
 use ratatoskr_graph::NodeError;
 use ratatoskr_mcp::{Connection, ServerTools, ToolSet};
 use ratatoskr_script::ScriptEngine;
 
-use crate::{NodeAgentConfig, PlanError, route, skills};
+use crate::stage::stage_profile;
+use crate::{
+    AgentProfile, NodeAgentConfig, PlanError, Stage, agent_profiles, built_in_stages, route, skills,
+};
 
 /// What each plugin contributed for this run.
 ///
@@ -40,15 +43,17 @@ pub struct PluginContext {
     skills_deny: Vec<String>,
 }
 
-/// What the plugins a node binds contribute to that node.
+/// Shared node execution context: plugin contributions plus reusable profile guidance.
 ///
-/// One value rather than a field per contribution: a node's plugins are resolved in one place and
-/// travel together, and every new thing plugins can give a node would otherwise mean another
-/// parameter threaded through every node struct and every construction site.
+/// One value rather than a field per contribution: settings are resolved in one place and travel
+/// together, and every new one would otherwise mean another parameter threaded through every node
+/// struct and every construction site.
 #[derive(Clone, Default)]
 pub struct NodePlugins {
     /// Session context, prefixed to whichever preamble the node runs with.
     pub context: Option<String>,
+    /// Reusable agent guidance, composed ahead of the stage's own instructions.
+    pub profile_prompt: String,
     /// Runs the node's tool calls past its plugins' `PreToolUse`/`PostToolUse` hooks. `None` when
     /// nothing it binds registers one, so a node that gains nothing pays nothing.
     pub observer: Option<Arc<dyn ratatoskr_agent::PluginHooks>>,
@@ -300,6 +305,7 @@ impl PluginContext {
                 .filter(|s| !self.denied(&s.name))
                 .collect(),
             context: ratatoskr_plugin::compose(&self.contexts, &bound, &self.limits),
+            profile_prompt: String::new(),
             // `None` rather than an empty runner: it is what keeps the hook off the agent
             // entirely for a node whose plugins have nothing to say about its tool calls.
             observer: (!hooked.is_empty()).then(|| {
@@ -403,18 +409,48 @@ pub(crate) fn servers_to_start(
     start
 }
 
-/// Resolve a node's agent settings. The ruleset is authoritative where it speaks: its `model` is
-/// the route (so a fully-declared node needs no `[models.<node>]` entry — that's only the
-/// fallback), `allow` (if given) REPLACES `default_tools`, `deny` is always removed, `systemPrompt`
-/// replaces the node's built-in preamble, and `onToolCall` (if defined) becomes the per-call
-/// [`ToolPolicy`].
-pub(crate) fn node_agent_config(
+struct AgentSettings<'a> {
+    capabilities: &'a [Capability],
+    profile: Option<AgentProfile>,
+}
+
+/// Apply a stage ruleset first, then the reusable profile policy to the resulting arguments. The
+/// profile is the authority boundary, so its decision is always last.
+struct ProfilePolicy {
+    stage: Arc<dyn ToolPolicy>,
+    profile: Arc<dyn ToolPolicy>,
+}
+
+impl ToolPolicy for ProfilePolicy {
+    fn decide<'a>(
+        &'a self,
+        tool_name: &'a str,
+        args_json: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolDecision> + Send + 'a>> {
+        Box::pin(async move {
+            match self.stage.decide(tool_name, args_json).await {
+                ToolDecision::Allow => self.profile.decide(tool_name, args_json).await,
+                ToolDecision::Deny(reason) => ToolDecision::Deny(reason),
+                ToolDecision::Rewrite(args) => {
+                    self.profile.decide(tool_name, &args.to_string()).await
+                }
+            }
+        })
+    }
+}
+
+/// Resolve a node's agent settings. Ruleset values override the selected profile, which overrides
+/// the historic stage-keyed TOML route; `allow` (if given) REPLACES `default_tools`, `deny` is
+/// always removed, and `onToolCall` (if defined) becomes the per-call [`ToolPolicy`].
+/// Offered tools are narrowed to the stage's effective capability ceiling.
+fn node_agent_config(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     mut tools: ToolSet,
     node: &str,
     default_tools: &[&str],
     plugins: &NodePlugins,
+    settings: AgentSettings<'_>,
 ) -> Result<NodeAgentConfig, PlanError> {
     // Offered before narrowing, so `deny` can take them away: a node reasons about a repository,
     // and reading a file it found is the ordinary case rather than the dangerous one. These are
@@ -432,7 +468,11 @@ pub(crate) fn node_agent_config(
     // and it is the root that lets `gh` resolve at all. Gating the root on the list left it
     // holding a stand-in that errors, which it dutifully reported as a reason not to publish.
     let files = std::env::current_dir().ok();
-    if !default_tools.is_empty() {
+    let ceiling = Capability::ceiling(settings.capabilities);
+    let profile = settings.profile.as_ref();
+    if !default_tools.is_empty()
+        && ceiling.is_some_and(|capability| capability.permits(Capability::Read))
+    {
         tools
             .local()
             .tools
@@ -441,8 +481,8 @@ pub(crate) fn node_agent_config(
     let ruleset = engine.ruleset(node);
     let rc = ruleset.as_ref().map(|r| r.config());
 
-    // Ruleset model FIRST: a node whose ruleset declares one needs no `[models.<node>]` entry.
-    // `route()` — and its "add a [models.<node>]" error — is only the fallback.
+    // Ruleset model FIRST; the selected profile is the reusable fallback before the historic
+    // stage-keyed route.
     let route = match rc.and_then(|c| c.model.as_ref()) {
         Some(m) => ratatoskr_core::ModelRoute {
             provider: m.provider.clone(),
@@ -456,7 +496,10 @@ pub(crate) fn node_agent_config(
             params: None,
             session: Default::default(),
         },
-        None => route(config, node)?,
+        None => match profile.and_then(|profile| profile.model.clone()) {
+            Some(model) => model,
+            None => route(config, node)?,
+        },
     };
 
     // A ruleset's `allow` is exhaustive. The default is not just the node's built-in list: those
@@ -470,6 +513,23 @@ pub(crate) fn node_agent_config(
         Some(a) => a.to_vec(),
         None => default_allow(default_tools, from_plugins.clone()),
     };
+    let allowed: Vec<String> = allow
+        .iter()
+        .filter(|tool| ceiling.is_some_and(|ceiling| ceiling.permits(tools.capability(tool))))
+        .cloned()
+        .collect();
+    let excluded_by_ceiling: Vec<&String> = allow
+        .iter()
+        .filter(|tool| !ceiling.is_some_and(|ceiling| ceiling.permits(tools.capability(tool))))
+        .collect();
+    if !excluded_by_ceiling.is_empty() {
+        tracing::warn!(
+            node,
+            excluded = ?excluded_by_ceiling,
+            "stage capability ceiling excluded declared tools"
+        );
+    }
+    let allow = allowed;
     let deny: Vec<String> = rc
         .and_then(|c| c.tools.as_ref())
         .map(|t| t.deny.clone())
@@ -512,28 +572,114 @@ pub(crate) fn node_agent_config(
     }
     tools.narrow(&allow, &deny);
 
-    let max_turns = rc.and_then(|c| c.max_turns);
+    let max_turns = rc
+        .and_then(|c| c.max_turns)
+        .or_else(|| profile.and_then(|profile| profile.max_turns));
     let system_prompt = rc.and_then(|c| c.system_prompt.clone());
-    let policy: Option<Arc<dyn ToolPolicy>> = match ruleset {
+    let stage_policy = match ruleset {
         Some(r) if r.config().has_on_tool_call => Some(Arc::new(r) as Arc<dyn ToolPolicy>),
         _ => None,
+    };
+    let policy = match (
+        stage_policy,
+        profile.and_then(|profile| profile.tool_policy.clone()),
+    ) {
+        (Some(stage), Some(profile)) => {
+            Some(Arc::new(ProfilePolicy { stage, profile }) as Arc<dyn ToolPolicy>)
+        }
+        (Some(stage), None) => Some(stage),
+        (None, Some(profile)) => Some(profile),
+        (None, None) => None,
     };
 
     // Every node reaches this function, which is why the skill tool is added here rather than at
     // each construction site: a node that binds a skill and is never offered it is the failure
     // this seam exists to prevent.
-    if let Some(tool) = skills::skill_tool(&plugins.skills, node) {
+    if ceiling.is_some_and(|capability| capability.permits(Capability::Read))
+        && let Some(tool) = skills::skill_tool(&plugins.skills, node)
+    {
         tools.add_local(tool);
     }
 
     Ok(NodeAgentConfig {
         route,
         tools,
+        capability_ceiling: ceiling,
         files,
         policy,
         max_turns,
         system_prompt,
     })
+}
+
+/// Resolve a built-in stage through its selected reusable profile.
+pub(crate) fn stage_agent_config(
+    engine: &Arc<ScriptEngine>,
+    config: &RatatoskrConfig,
+    tools: ToolSet,
+    node: &str,
+    default_tools: &[&str],
+    plugins: &mut NodePlugins,
+) -> Result<NodeAgentConfig, PlanError> {
+    let stages = built_in_stages();
+    let stage_id = if node == "redteam" { "red_team" } else { node };
+    let stage = stages.iter().find(|stage| stage.id == stage_id);
+    let profile = stage_profile(config, node);
+    plugins.profile_prompt = profile
+        .as_ref()
+        .map_or_else(String::new, |profile| profile.base_prompt.clone());
+    let ceiling = match (stage, profile.as_ref()) {
+        (Some(stage), Some(profile)) => stage.effective_ceiling(profile),
+        _ => Some(Capability::Read),
+    };
+    let capabilities = ceiling.into_iter().collect::<Vec<_>>();
+    node_agent_config(
+        engine,
+        config,
+        tools,
+        node,
+        default_tools,
+        plugins,
+        AgentSettings {
+            capabilities: &capabilities,
+            profile,
+        },
+    )
+}
+
+/// Resolve a declared workflow stage through the profile it names.
+pub(crate) fn declared_stage_agent_config(
+    engine: &Arc<ScriptEngine>,
+    config: &RatatoskrConfig,
+    tools: ToolSet,
+    stage: &Stage,
+    default_tools: &[&str],
+    plugins: &NodePlugins,
+) -> Result<(NodeAgentConfig, AgentProfile), PlanError> {
+    let profile = agent_profiles(config)
+        .into_iter()
+        .find(|profile| profile.id == stage.agent)
+        .ok_or_else(|| {
+            PlanError::Configuration(format!(
+                "stage `{}` references unknown agent `{}`",
+                stage.id, stage.agent
+            ))
+        })?;
+    let ceiling = stage.effective_ceiling(&profile);
+    let capabilities = ceiling.into_iter().collect::<Vec<_>>();
+    let cfg = node_agent_config(
+        engine,
+        config,
+        tools,
+        &stage.id,
+        default_tools,
+        plugins,
+        AgentSettings {
+            capabilities: &capabilities,
+            profile: Some(profile.clone()),
+        },
+    )?;
+    Ok((cfg, profile))
 }
 
 /// What a node may call when its ruleset names no tools: its built-in list, plus everything the
@@ -564,6 +710,54 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("agents.ts"), source).unwrap();
         ScriptEngine::load(&dir).await.unwrap()
+    }
+
+    struct DenyTool(&'static str);
+
+    impl ToolPolicy for DenyTool {
+        fn decide<'a>(
+            &'a self,
+            tool_name: &'a str,
+            _args_json: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolDecision> + Send + 'a>>
+        {
+            Box::pin(async move {
+                if tool_name == self.0 {
+                    ToolDecision::Deny("profile policy".to_string())
+                } else {
+                    ToolDecision::Allow
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_profile_policy_applies_to_every_stage_using_the_profile() {
+        let engine = binding_engine("profile-policy", "").await;
+        let mut config = RatatoskrConfig::default();
+        config.agents.insert(
+            "reason".to_string(),
+            ratatoskr_core::AgentProfileConfig {
+                tool_policy: Some(Arc::new(DenyTool("Write"))),
+                ..Default::default()
+            },
+        );
+
+        for node in ["analyst", "bookkeeper"] {
+            let cfg = stage_agent_config(
+                &engine,
+                &config,
+                ToolSet::default(),
+                node,
+                &[],
+                &mut NodePlugins::default(),
+            )
+            .unwrap();
+            assert!(matches!(
+                cfg.policy.unwrap().decide("Write", "{}").await,
+                ToolDecision::Deny(reason) if reason == "profile policy"
+            ));
+        }
     }
 
     /// A config and cwd that discover exactly `names` — bare plugins, manifest only, so `resolve`

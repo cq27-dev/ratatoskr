@@ -4,6 +4,7 @@
 //! runtime dependency — if a type here ever needs `tokio`, it belongs in a different crate.
 
 pub mod auth;
+pub mod capability;
 pub mod config;
 pub mod control;
 pub mod policy;
@@ -11,10 +12,11 @@ pub mod shape;
 pub mod state;
 pub mod telemetry;
 
+pub use capability::Capability;
 pub use config::{
-    AcceptanceStep, CACHE_ROOT, CacheMount, ConfigError, DEFAULT_MAX_TOKENS, EndpointConfig,
-    HookLimits, ImplementerConfig, ModelRoute, PluginConfig, PublishConfig, RagRatConfig,
-    RatatoskrConfig, SandboxConfig, SessionScope, StoreConfig, WorktreeConfig,
+    AcceptanceStep, AgentProfileConfig, CACHE_ROOT, CacheMount, ConfigError, DEFAULT_MAX_TOKENS,
+    EndpointConfig, HookLimits, ImplementerConfig, ModelRoute, PluginConfig, PublishConfig,
+    RagRatConfig, RatatoskrConfig, SandboxConfig, SessionScope, StoreConfig, WorktreeConfig,
 };
 pub use control::{Command, Control, ControlView, Directive, RunControl};
 pub use policy::{ToolDecision, ToolPolicy};

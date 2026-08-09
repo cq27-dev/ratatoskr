@@ -93,9 +93,10 @@ impl RedTeamClassifier {
         let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
             node: "redteam",
             route: &self.route,
-            preamble: &crate::effective_preamble(
+            preamble: &crate::effective_preamble_with_profile(
                 "redteam",
                 CLASSIFY_PREAMBLE,
+                self.plugins.profile_prompt.as_str(),
                 self.system_prompt.as_deref(),
                 self.plugins.context.as_deref(),
                 &self.plugins.skills,
@@ -178,9 +179,10 @@ impl TestAuthor {
             preamble: &crate::with_conventions(
                 "redteam",
                 self.conventions.as_deref(),
-                crate::effective_preamble(
+                crate::effective_preamble_with_profile(
                     "redteam",
                     AUTHOR_PREAMBLE,
+                    self.plugins.profile_prompt.as_str(),
                     self.system_prompt.as_deref(),
                     self.plugins.context.as_deref(),
                     &self.plugins.skills,

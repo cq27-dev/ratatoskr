@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use ratatoskr_core::RagRatConfig;
+use ratatoskr_core::{Capability, RagRatConfig};
 use rmcp::ServiceExt;
 use rmcp::model::Tool;
 use rmcp::service::{RoleClient, RunningService, ServerSink};
@@ -345,6 +345,22 @@ impl ToolSet {
         self.groups.iter().flat_map(|g| g.display_names()).collect()
     }
 
+    /// The minimum authority each offered tool requires. A server-owned tool without an explicit
+    /// declaration is `Publish`: an unknown remote operation must never slip through a narrower
+    /// stage merely because its name sounds harmless.
+    pub fn capability(&self, name: &str) -> Capability {
+        self.groups
+            .iter()
+            .find_map(|group| {
+                group
+                    .display_names()
+                    .into_iter()
+                    .any(|offered| offered == name)
+                    .then(|| declared_capability(&group.origin, name))
+            })
+            .unwrap_or(Capability::Publish)
+    }
+
     /// Every tool name offered by a server other than `origin`, in precedence order.
     ///
     /// What a node's default tool list can't name: the built-in lists were written against
@@ -353,6 +369,16 @@ impl ToolSet {
         self.groups
             .iter()
             .filter(|g| g.origin != origin)
+            .flat_map(|g| g.display_names())
+            .collect()
+    }
+
+    /// Every tool contributed by a non-host, non-rag-rat server. Plugin MCP servers have no
+    /// capability declaration, so callers must treat these as untrusted authority.
+    pub fn external_names(&self) -> Vec<String> {
+        self.groups
+            .iter()
+            .filter(|g| g.origin != RAG_RAT && g.origin != LOCAL)
             .flat_map(|g| g.display_names())
             .collect()
     }
@@ -378,6 +404,38 @@ impl ToolSet {
 
     pub fn is_empty(&self) -> bool {
         self.groups.iter().all(|g| g.tools.is_empty())
+    }
+}
+
+fn declared_capability(origin: &str, name: &str) -> Capability {
+    match origin {
+        LOCAL => match name {
+            "Read" | "Grep" | "Glob" | "ask" | "Skill" => Capability::Read,
+            "Write" | "Edit" | "Bash" => Capability::Write,
+            _ => Capability::Publish,
+        },
+        RAG_RAT => match name {
+            "semantic_search"
+            | "symbol_lookup"
+            | "find_callers"
+            | "trace_callees"
+            | "impact_surface"
+            | "read_chunk"
+            | "repo_brief"
+            | "repo_clusters"
+            | "important_symbols"
+            | "memory_search"
+            | "memory_show"
+            | "memory_for_symbol"
+            | "memory_for_path"
+            | "memory_for_call_path"
+            | "papertrail_issue_search" => Capability::Read,
+            "memory_create" | "memory_update" | "memory_mark_obsolete" => Capability::Write,
+            _ => Capability::Publish,
+        },
+        // Plugin and user-provided MCP servers do not currently declare authority in their
+        // manifests. Publish is the safe declaration until they do.
+        _ => Capability::Publish,
     }
 }
 

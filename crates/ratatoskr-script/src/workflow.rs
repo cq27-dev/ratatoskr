@@ -16,6 +16,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use ratatoskr_core::Capability;
 use rquickjs::promise::{Promise, Promised};
 use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Function};
 
@@ -48,7 +49,7 @@ globalThis.defineWorkflow = function (meta) {
         throw new Error("defineWorkflow: `name` is required");
     }
     for (var k in meta) {
-        if (k !== "name" && k !== "purpose" && k !== "whenToUse" && k !== "nodes") {
+        if (k !== "name" && k !== "purpose" && k !== "whenToUse" && k !== "nodes" && k !== "stages") {
             throw new Error("defineWorkflow: unknown key '" + k + "'");
         }
     }
@@ -56,7 +57,8 @@ globalThis.defineWorkflow = function (meta) {
         name: meta.name,
         purpose: meta.purpose || "",
         whenToUse: meta.whenToUse || [],
-        nodes: meta.nodes || []
+        nodes: meta.nodes || [],
+        stages: meta.stages || []
     };
 };
 globalThis.__workflowMeta = function () {
@@ -89,6 +91,50 @@ pub struct WorkflowMeta {
     /// rather than read as a typo.
     #[serde(default)]
     pub nodes: Vec<String>,
+    /// Ordered user-defined stages. Their contracts are checked at startup before a run starts.
+    #[serde(default)]
+    pub stages: Vec<WorkflowStage>,
+}
+
+/// A serializable stage declaration kept in the script crate so workflow metadata remains independent
+/// of concrete node implementations.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowStage {
+    #[serde(alias = "name")]
+    pub id: String,
+    pub agent: String,
+    #[serde(default, alias = "input")]
+    pub input_contract: String,
+    #[serde(default, alias = "output")]
+    pub output_contract: String,
+    /// JSON Schema that enforces the declared output contract at the model and checkpoint gates.
+    #[serde(default)]
+    pub output_schema: Option<serde_json::Value>,
+    #[serde(default)]
+    pub instructions: String,
+    #[serde(default)]
+    pub context: String,
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+    #[serde(default)]
+    pub delegation: Option<WorkflowDelegation>,
+    #[serde(default = "default_append_repository_guidance")]
+    pub append_repository_guidance: bool,
+}
+
+fn default_append_repository_guidance() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowDelegation {
+    pub target: String,
+    #[serde(default)]
+    pub evidence_contract: String,
+    #[serde(default)]
+    pub input_limit: usize,
 }
 
 /// A loaded workflow script: the resident JS context plus the transpiled source.
@@ -130,6 +176,7 @@ impl WorkflowRuntime {
             purpose: String::new(),
             when_to_use: Vec::new(),
             nodes: Vec::new(),
+            stages: Vec::new(),
         });
 
         Ok(Some(WorkflowRuntime {

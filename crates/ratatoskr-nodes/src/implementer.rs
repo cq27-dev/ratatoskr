@@ -243,9 +243,10 @@ impl ImplementerNode {
                 self.conventions.as_deref(),
                 format!(
                     "{}{}",
-                    crate::effective_preamble(
+                    crate::effective_preamble_with_profile(
                         "implementer",
                         NATIVE_PREAMBLE,
+                        self.plugins.profile_prompt.as_str(),
                         self.system_prompt.as_deref(),
                         self.plugins.context.as_deref(),
                         &self.plugins.skills,
