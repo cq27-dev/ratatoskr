@@ -42,7 +42,7 @@ pub use referee::{RefereeNode, RefereeOutput, Violation};
 pub use scout::{RelatedItem, ScoutNode, ScoutOutput};
 pub use verifier::{Finding, FindingKind, Severity, VerifierNode, VerifierOutput};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ratatoskr_core::{RatatoskrConfig, RunState, RunStatus, ToolPolicy};
@@ -834,7 +834,7 @@ struct NodeAgentConfig {
 ///
 /// A parameter struct because these travel together through every stage; passing them
 /// individually made each helper's signature grow with the run rather than with its job.
-struct Run<'a> {
+pub(crate) struct Run<'a> {
     client: Option<&'a RagRatClient>,
     config: &'a RatatoskrConfig,
     store: &'a Store,
@@ -1602,7 +1602,7 @@ impl Referee {
 /// Built once per run and reused across converge iterations, so a second review costs a model call
 /// rather than a rebuild. `None` when the verifier has no route — like the red team's classifier,
 /// it is opt-in by being given a model rather than by a separate switch.
-struct Review {
+pub(crate) struct Review {
     verifier: verifier::VerifierNode,
     threshold: verifier::Severity,
     /// The analyst, kept alive for revisions. It is the principal: it owns the plan, so it is the
@@ -1620,7 +1620,7 @@ struct Review {
 /// approved anything, but it has not found anything either. Its error is evidence about our
 /// infrastructure, not about the change, so it must neither block the run nor pass as a clean
 /// review.
-enum Reviewed {
+pub(crate) enum Reviewed {
     /// Nothing above the threshold. The change is accepted.
     Clean,
     /// Send this back.
@@ -1630,7 +1630,7 @@ enum Reviewed {
 }
 
 /// What a review concluded the run should do next.
-struct Correction {
+pub(crate) struct Correction {
     /// What the review found, carried so the next pass can see what the last one said — and notice
     /// when a new finding exists only because of the fix for an old one.
     found: Vec<verifier::Finding>,
@@ -2113,41 +2113,77 @@ async fn fork_and_converge(
     ),
     PlanError,
 > {
+    let repo_path: PathBuf = std::env::current_dir()
+        .map_err(|e| PlanError::node("fork", NodeError::Failed(format!("cwd: {e}"))))?;
+    let acceptance = run.config.sandbox.acceptance(&plan.analyst.acceptance);
+    tracing::info!(
+        steps = ?acceptance.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        "acceptance for this run"
+    );
+
+    // --- build agents ---
+    let (red_team, implementer) = build_converge_agents(run, plan, &repo_path, acceptance)?;
+    let (mut review, mut referee) = build_reviewers(run, plan)?;
+
+    // --- fork worktree ---
+    let worktree = fork_worktree(&implementer).await?;
+
+    // --- root review/referee ---
+    root_reviewers(&mut review, &mut referee, &worktree);
+
+    // --- red-team baseline ---
+    let red_team_out = red_team_baseline(&red_team, &worktree, run.issue, plan).await?;
+
+    // --- first implementer attempt ---
+    let impl_out = first_implementer_attempt(&implementer, &worktree).await?;
+    record_initial_attempt(run, plan, &red_team_out, &impl_out).await?;
+    validate_baseline(&red_team_out)?;
+
+    // --- converge ---
+    let (impl_out, status, iterations) = converge(ConvergeInput {
+        run,
+        plan,
+        repo_path: &repo_path,
+        implementer: &implementer,
+        worktree: &worktree,
+        red_team_out: &red_team_out,
+        impl_out,
+        review: review.as_ref(),
+        referee: referee.as_ref(),
+    })
+    .await?;
+
+    // --- final commit ---
+    commit_run(run, &implementer, &worktree, &impl_out).await;
+    Ok((red_team_out, impl_out, worktree, status, iterations))
+}
+
+/// Build the red-team and implementer agents used by the fork.
+pub(crate) fn build_converge_agents(
+    run: &Run<'_>,
+    plan: &PlanOutcome,
+    repo_path: &Path,
+    acceptance: Vec<ratatoskr_core::AcceptanceStep>,
+) -> Result<(RedTeamNode, ImplementerNode), PlanError> {
     let &Run {
         client,
         config,
-        store,
         run_id,
         issue,
         engine,
         clarifier,
         ledger,
         context,
+        ..
     } = run;
-    let repo_path: PathBuf = std::env::current_dir()
-        .map_err(|e| PlanError::node("fork", NodeError::Failed(format!("cwd: {e}"))))?;
     let short: String = run_id.chars().take(8).collect();
-    // The repository's own conventions (`AGENTS.md`), loaded once from the checkout — not from an
-    // implementer worktree, which is a copy — so every converge iteration and the test author see
-    // the same text. Only the two nodes that write code carry it.
-    let conventions = repo_conventions(&repo_path);
-    // Resolved once and shared by both branches: the baseline and the post-change run must execute
-    // the same steps, or the two sets converge compares are not comparable. Frozen here for the
-    // whole run — a later analyst revision amends requirements, never the bar.
-    let acceptance = config.sandbox.acceptance(&plan.analyst.acceptance);
-    tracing::info!(
-        steps = ?acceptance.iter().map(|s| &s.name).collect::<Vec<_>>(),
-        "acceptance for this run"
-    );
-
+    let conventions = repo_conventions(repo_path);
     let red_team = RedTeamNode {
-        repo_path: repo_path.clone(),
+        repo_path: repo_path.to_path_buf(),
         worktree_root: config.worktree.root.clone(),
         baseline_branch: format!("ratatoskr/{short}-baseline"),
         sandbox: config.sandbox.clone(),
         name: format!("ratatoskr-redteam-{short}"),
-        // Opt-in: classify baseline failures only when redteam has a route — from
-        // `[models.redteam]` or from its `.ratatoskr/rules/redteam.ts` ruleset.
         acceptance: acceptance.clone(),
         characterizer: build_characterizer(
             engine,
@@ -2183,8 +2219,6 @@ async fn fork_and_converge(
             }
             false => None,
         },
-        // Writing the change's tests needs the write tools the classifier has no use for, so the
-        // set is built separately even though both hang off the same route.
         author: match classifier_enabled(engine, config) {
             true => {
                 let plugins = context.for_node("redteam");
@@ -2220,7 +2254,7 @@ async fn fork_and_converge(
         build_implementer_agent(engine, config, context, client.map(|c| c.offer()))?;
     let implementer = ImplementerNode {
         clarifier: Some(clarifier.as_dyn()),
-        repo_path: repo_path.clone(),
+        repo_path: repo_path.to_path_buf(),
         worktree_root: config.worktree.root.clone(),
         sandbox: config.sandbox.clone(),
         route: impl_cfg.route,
@@ -2243,294 +2277,418 @@ async fn fork_and_converge(
             Some(Arc::clone(ledger)),
         )?,
     };
+    Ok((red_team, implementer))
+}
 
-    // Built before the fork so a misconfigured verifier fails the run here rather than after an
-    // implementer session and a sandboxed test run have already been spent on it.
-    let mut review = Review::build(run, plan)?;
-    let mut referee = Referee::build(run)?;
+/// Build the optional reviewer and referee before work is spent in the fork.
+pub(crate) fn build_reviewers(
+    run: &Run<'_>,
+    plan: &PlanOutcome,
+) -> Result<(Option<Review>, Option<Referee>), PlanError> {
+    Ok((Review::build(run, plan)?, Referee::build(run)?))
+}
 
-    // The worktree first, because the red team writes the change's tests into it and cannot do
-    // that until it exists.
-    let worktree = implementer
+/// Create the worktree that the red team and implementer share.
+pub(crate) async fn fork_worktree(
+    implementer: &ImplementerNode,
+) -> Result<WorktreePath, PlanError> {
+    implementer
         .prepare()
         .await
-        .map_err(|e| PlanError::node("implementer", e))?;
+        .map_err(|e| PlanError::node("implementer", e))
+}
 
-    // And now the verifier can be told where the change lives. It is built above, before there is
-    // a worktree to name, so this is the earliest point it can be rooted — see `rooted_at`.
+/// Point the diff readers at the newly-created worktree.
+pub(crate) fn root_reviewers(
+    review: &mut Option<Review>,
+    referee: &mut Option<Referee>,
+    worktree: &WorktreePath,
+) {
     if let Some(review) = review.as_mut() {
         review.rooted_at(worktree.as_path());
     }
     if let Some(referee) = referee.as_mut() {
         referee.rooted_at(worktree.as_path());
     }
+}
 
-    // Red team next, not alongside: it characterises the baseline and writes the tests the change
-    // will be judged against, and both have to be done before the implementer opens the tree. The
-    // concurrency this gives up is small — the baseline is a minute against the implementer's ten
-    // — and what it buys is that the tests are not written by the author of the code.
-    let red_team_out = red_team
+/// Characterize the baseline and author any tests before the implementer opens the tree.
+pub(crate) async fn red_team_baseline(
+    red_team: &RedTeamNode,
+    worktree: &WorktreePath,
+    issue: &str,
+    plan: &PlanOutcome,
+) -> Result<RedTeamOutput, PlanError> {
+    red_team
         .run_and_author(worktree.as_path(), issue, &plan.analyst.interface)
         .await
-        .map_err(|e| PlanError::node("red_team", e))?;
+        .map_err(|e| PlanError::node("red_team", e))
+}
 
-    let mut impl_out = match implementer.work(&worktree).await {
-        Ok(out) => out,
+/// Run the first implementation attempt, discarding its worktree on failure.
+pub(crate) async fn first_implementer_attempt(
+    implementer: &ImplementerNode,
+    worktree: &WorktreePath,
+) -> Result<ImplementerOutput, PlanError> {
+    match implementer.work(worktree).await {
+        Ok(out) => Ok(out),
         Err(e) => {
-            // A failed first attempt leaves nothing behind, as before.
-            implementer.discard(&worktree).await;
-            return Err(PlanError::node("implementer", e));
+            implementer.discard(worktree).await;
+            Err(PlanError::node("implementer", e))
         }
-    };
+    }
+}
 
+/// Record the baseline and first implementation at their original ledger iteration.
+pub(crate) async fn record_initial_attempt(
+    run: &Run<'_>,
+    plan: &PlanOutcome,
+    red_team_out: &RedTeamOutput,
+    impl_out: &ImplementerOutput,
+) -> Result<(), PlanError> {
     record(Record {
-        store,
-        run_id,
+        store: run.store,
+        run_id: run.run_id,
         node: "red_team",
-        output: &red_team_out,
+        output: red_team_out,
         input: None,
         iteration: Some(1),
-        ledger: Some(ledger),
+        ledger: Some(run.ledger),
     })
     .await?;
     record(Record {
-        store,
-        run_id,
+        store: run.store,
+        run_id: run.run_id,
         node: "implementer",
-        output: &impl_out,
-        // The implementer's own model turn is on the ledger under this name, and the row also
-        // carries the iteration and the outcome.
+        output: impl_out,
         input: Some(serde_json::to_string(&plan.analyst)?),
         iteration: Some(1),
-        ledger: Some(ledger),
+        ledger: Some(run.ledger),
     })
-    .await?;
+    .await
+}
 
-    // Hard guard: red-team must have actually characterized the baseline. If the test command
-    // produced no tests, converge would compare against empty data and falsely "converge".
-    if !converge::test_command_ran(
+/// Reject a baseline that did not produce any acceptance result.
+pub(crate) fn validate_baseline(red_team_out: &RedTeamOutput) -> Result<(), PlanError> {
+    if converge::test_command_ran(
         &red_team_out.failing_tests,
         red_team_out.passed_tests,
         red_team_out.exit_code,
     ) {
-        return Err(PlanError::node(
-            "red_team",
-            NodeError::Failed(format!(
-                "the baseline acceptance run produced no checks (exit {}); \
-                 check the analyst's acceptance, [sandbox] test_command and the sandbox backend",
-                red_team_out.exit_code
-            )),
-        ));
+        return Ok(());
+    }
+    Err(PlanError::node(
+        "red_team",
+        NodeError::Failed(format!(
+            "the baseline acceptance run produced no checks (exit {}); \
+             check the analyst's acceptance, [sandbox] test_command and the sandbox backend",
+            red_team_out.exit_code
+        )),
+    ))
+}
+
+/// The live context needed only when a clean test result reaches review.
+pub(crate) struct ReviewRequest<'a, 'run> {
+    review: &'a Review,
+    run: &'a Run<'run>,
+    plan: &'a AnalystOutput,
+    worktree: &'a WorktreePath,
+    iteration: u32,
+    findings: &'a [verifier::Finding],
+}
+
+/// Apply the referee, test, and verifier gates in that order.
+pub(crate) async fn decide_correction(
+    referee_violations: &[referee::Violation],
+    red_team_out: &RedTeamOutput,
+    impl_out: &ImplementerOutput,
+    authored: &[String],
+    review: Option<ReviewRequest<'_, '_>>,
+) -> Result<Reviewed, PlanError> {
+    if !referee_violations.is_empty() {
+        tracing::warn!(violations = ?referee_violations, "iteration weakened the referee; not accepting it");
+        return Ok(Reviewed::Fix(Box::new(Correction {
+            prompt: referee::correction(referee_violations),
+            revised: None,
+            found: Vec::new(),
+        })));
     }
 
-    // Converge: iterate the implementer (not red-team — the baseline doesn't change) until the
-    // change both passes the tests and survives review, or the budget runs out.
-    // The plan in force. A revision replaces it, so a later review judges the change against what
-    // was actually asked for by the end rather than against the requirement that was wrong.
+    let post_ran = converge::test_command_ran(
+        &impl_out.failing_tests,
+        impl_out.passed_tests,
+        impl_out.exit_code,
+    );
+    let unsatisfied = converge::unsatisfied(authored, &impl_out.failing_tests);
+    let tests_clean = post_ran
+        && unsatisfied.is_empty()
+        && converge::is_converged(&red_team_out.failing_tests, &impl_out.failing_tests);
+    if !tests_clean {
+        let prompt = if !post_ran {
+            format!(
+                "The test command did not run to completion (exit {}) — your change likely \
+                 does not compile. Fix it so the tests run and pass.",
+                impl_out.exit_code
+            )
+        } else if !unsatisfied.is_empty() {
+            format!(
+                "These tests were written for this change, from the interface, before any code \
+                 existed to satisfy them — making them pass is what the change is for, and \
+                 they are still failing: {}. They are not yours to edit; implement what they \
+                 describe. If one of them is wrong about the contract rather than about your \
+                 code, say so in your summary and implement the rest.",
+                unsatisfied.join(", ")
+            )
+        } else {
+            let new_failures = converge::newly_introduced_failures(
+                &red_team_out.failing_tests,
+                &impl_out.failing_tests,
+            );
+            format!(
+                "Your change introduced NEW failing tests not present in the baseline: {}. \
+                 Fix them without breaking other tests.",
+                new_failures.join(", ")
+            )
+        };
+        return Ok(Reviewed::Fix(Box::new(Correction {
+            prompt,
+            revised: None,
+            found: Vec::new(),
+        })));
+    }
+
+    match review {
+        Some(review) => {
+            review
+                .review
+                .review(
+                    review.run,
+                    review.plan,
+                    impl_out,
+                    review.worktree,
+                    review.iteration,
+                    review.findings,
+                )
+                .await
+        }
+        None => Ok(Reviewed::Clean),
+    }
+}
+
+/// The decision reached when the iteration budget has been spent.
+pub(crate) enum CeilingDecision {
+    Stop(RunStatus),
+    Replan(Box<Correction>),
+}
+
+/// Optionally escalate the accumulated findings once, after the budget is spent.
+pub(crate) async fn at_ceiling(
+    iterations: u32,
+    max_iterations: u32,
+    replanned: bool,
+    findings: &[verifier::Finding],
+    review: Option<ReviewRequest<'_, '_>>,
+) -> Result<CeilingDecision, PlanError> {
+    debug_assert!(iterations >= max_iterations);
+    if replanned || findings.is_empty() {
+        return Ok(CeilingDecision::Stop(RunStatus::MaxIterationsReached));
+    }
+    let Some(review) = review else {
+        return Ok(CeilingDecision::Stop(RunStatus::MaxIterationsReached));
+    };
+    tracing::warn!(
+        iterations,
+        findings = findings.len(),
+        "the iteration budget is spent; asking the analyst to look at the plan rather than recording another failed attempt"
+    );
+    match review
+        .review
+        .replan_at_ceiling(review.run, review.plan, findings, iterations)
+        .await?
+    {
+        Some((revised, prompt)) => Ok(CeilingDecision::Replan(Box::new(Correction {
+            prompt,
+            revised: Some(revised),
+            found: Vec::new(),
+        }))),
+        None => Ok(CeilingDecision::Stop(RunStatus::MaxIterationsReached)),
+    }
+}
+
+/// Record one corrective implementer attempt.
+pub(crate) async fn record_iteration(
+    run: &Run<'_>,
+    impl_out: &ImplementerOutput,
+    input: String,
+    iteration: u32,
+) -> Result<(), PlanError> {
+    record(Record {
+        store: run.store,
+        run_id: run.run_id,
+        node: "implementer",
+        output: impl_out,
+        input: Some(input),
+        iteration: Some(iteration),
+        ledger: Some(run.ledger),
+    })
+    .await
+}
+
+/// Everything the convergence loop carries between its named decision stages.
+pub(crate) struct ConvergeInput<'a, 'run> {
+    run: &'a Run<'run>,
+    plan: &'a PlanOutcome,
+    repo_path: &'a Path,
+    implementer: &'a ImplementerNode,
+    worktree: &'a WorktreePath,
+    red_team_out: &'a RedTeamOutput,
+    impl_out: ImplementerOutput,
+    review: Option<&'a Review>,
+    referee: Option<&'a Referee>,
+}
+
+/// Iterate until the referee, tests, and review accept the current work.
+pub(crate) async fn converge(
+    input: ConvergeInput<'_, '_>,
+) -> Result<(ImplementerOutput, RunStatus, u32), PlanError> {
+    let ConvergeInput {
+        run,
+        plan,
+        repo_path,
+        implementer,
+        worktree,
+        red_team_out,
+        mut impl_out,
+        review,
+        referee,
+    } = input;
     let mut in_force = plan.analyst.clone();
     let mut iterations = 1u32;
-    // Everything the review has said this run. Carried so a later pass can see the earlier ones,
-    // and so the ceiling has the evidence to hand the analyst.
     let mut found_so_far: Vec<verifier::Finding> = Vec::new();
-    // At most one re-plan per run: a second would be the same escalation on the same evidence.
     let mut replanned = false;
+
     let status = loop {
-        let post_ran = converge::test_command_ran(
-            &impl_out.failing_tests,
-            impl_out.passed_tests,
-            impl_out.exit_code,
-        );
-        // Tests written for this change before it existed. They fail in the baseline as a matter
-        // of course, so "nothing newly failing" is not enough to call them satisfied.
+        let referee_violations = match referee {
+            Some(referee) => {
+                referee
+                    .judge(run, &in_force, &impl_out, worktree, iterations)
+                    .await?
+            }
+            None => Vec::new(),
+        };
         let authored = red_team_out
             .authored
             .as_ref()
             .map(|a| a.tests.as_slice())
             .unwrap_or_default();
-        let unsatisfied = converge::unsatisfied(authored, &impl_out.failing_tests);
-        let tests_clean = post_ran
-            && unsatisfied.is_empty()
-            && converge::is_converged(&red_team_out.failing_tests, &impl_out.failing_tests);
-
-        // The referee runs before the test result is believed: an edited check makes the
-        // passing/failing sets describe a bar the change wrote for itself. A failed referee is
-        // recorded and degrades to trusting tests, like the verifier.
-        let referee_violations = match referee.as_ref() {
-            Some(referee) => {
-                referee
-                    .judge(run, &in_force, &impl_out, &worktree, iterations)
-                    .await?
-            }
-            None => Vec::new(),
-        };
-
-        // What to do next. The referee check comes first, then the test gate, then the review: a
-        // moved referee makes the test result meaningless, and a test result is stronger evidence
-        // than a model's judgement, so reviewing a change that does not build wastes the call.
-        let correction: Reviewed = if !referee_violations.is_empty() {
-            tracing::warn!(violations = ?referee_violations, "iteration weakened the referee; not accepting it");
-            Reviewed::Fix(Box::new(Correction {
-                prompt: referee::correction(&referee_violations),
-                revised: None,
-                found: Vec::new(),
-            }))
-        } else if !tests_clean {
-            // A post-change run that didn't complete usually means the edit broke the build — say
-            // that specifically instead of reporting "no new failures".
-            let prompt = if !post_ran {
-                format!(
-                    "The test command did not run to completion (exit {}) — your change likely \
-                     does not compile. Fix it so the tests run and pass.",
-                    impl_out.exit_code
-                )
-            } else if !unsatisfied.is_empty() {
-                // Said apart from the regression case, because it is the opposite situation: these
-                // were failing before you started, and making them pass is the task.
-                format!(
-                    "These tests were written for this change, from the interface, before any code \
-                     existed to satisfy them — making them pass is what the change is for, and \
-                     they are still failing: {}. They are not yours to edit; implement what they \
-                     describe. If one of them is wrong about the contract rather than about your \
-                     code, say so in your summary and implement the rest.",
-                    unsatisfied.join(", ")
-                )
-            } else {
-                let new_failures = converge::newly_introduced_failures(
-                    &red_team_out.failing_tests,
-                    &impl_out.failing_tests,
-                );
-                format!(
-                    "Your change introduced NEW failing tests not present in the baseline: {}. \
-                     Fix them without breaking other tests.",
-                    new_failures.join(", ")
-                )
-            };
-            Reviewed::Fix(Box::new(Correction {
-                prompt,
-                revised: None,
-                found: Vec::new(),
-            }))
-        } else if let Some(review) = &review {
-            review
-                .review(
-                    run,
-                    &in_force,
-                    &impl_out,
-                    &worktree,
-                    iterations,
-                    &found_so_far,
-                )
-                .await?
-        } else {
-            Reviewed::Clean
-        };
-
-        let correction = match correction {
+        let review_request = review.map(|review| ReviewRequest {
+            review,
+            run,
+            plan: &in_force,
+            worktree,
+            iteration: iterations,
+            findings: &found_so_far,
+        });
+        let correction = match decide_correction(
+            &referee_violations,
+            red_team_out,
+            &impl_out,
+            authored,
+            review_request,
+        )
+        .await?
+        {
             Reviewed::Clean => break RunStatus::Converged,
-            // The change passed its tests and nobody was able to review it. Saying `Converged`
-            // would claim a review that did not happen; failing would discard work that did.
             Reviewed::Unavailable => break RunStatus::Unreviewed,
             Reviewed::Fix(correction) => *correction,
         };
-        // Everything the review has said this run, so the next pass can recognise a finding that
-        // exists only because of the fix for an earlier one.
         found_so_far.extend(correction.found.iter().cloned());
-        if let Some(revised) = correction.revised {
-            in_force = revised;
+        if let Some(revised) = correction.revised.as_ref() {
+            in_force = revised.clone();
             replanned = true;
         }
-        if iterations >= config.implementer.max_iterations {
-            // The budget is spent. Stopping here records "ran out of attempts", which is the one
-            // reading the evidence usually does not support: a run that spends three iterations
-            // trading each defect for its successor did not need a fourth attempt at the same
-            // plan, it needed the plan looked at. So escalate once, then stop for real.
-            if replanned || found_so_far.is_empty() {
-                break RunStatus::MaxIterationsReached;
-            }
-            match review.as_ref() {
-                None => break RunStatus::MaxIterationsReached,
-                Some(review) => {
-                    tracing::warn!(
-                        iterations,
-                        findings = found_so_far.len(),
-                        "the iteration budget is spent; asking the analyst to look at the plan \
-                         rather than recording another failed attempt"
-                    );
-                    let revised = review
-                        .replan_at_ceiling(run, &in_force, &found_so_far, iterations)
-                        .await?;
-                    match revised {
-                        None => break RunStatus::MaxIterationsReached,
-                        Some((revised, prompt)) => {
-                            in_force = revised;
-                            replanned = true;
-                            iterations += 1;
-                            impl_out = match implementer.iterate(&worktree, &prompt).await {
-                                Ok(out) => out,
-                                Err(e) => {
-                                    if let Err(rm) = remove_worktree(&repo_path, &worktree).await {
-                                        tracing::warn!("failed to clean up worktree: {rm}");
-                                    }
-                                    return Err(PlanError::node("implementer", e));
-                                }
-                            };
-                            record(Record {
-                                store,
-                                run_id,
-                                node: "implementer",
-                                output: &impl_out,
-                                input: Some(serde_json::to_string(&in_force)?),
-                                iteration: Some(iterations),
-                                ledger: Some(ledger),
-                            })
-                            .await?;
-                            continue;
+        if iterations >= run.config.implementer.max_iterations {
+            let ceiling_review = review.map(|review| ReviewRequest {
+                review,
+                run,
+                plan: &in_force,
+                worktree,
+                iteration: iterations,
+                findings: &found_so_far,
+            });
+            match at_ceiling(
+                iterations,
+                run.config.implementer.max_iterations,
+                replanned,
+                &found_so_far,
+                ceiling_review,
+            )
+            .await?
+            {
+                CeilingDecision::Stop(status) => break status,
+                CeilingDecision::Replan(correction) => {
+                    let revised = correction
+                        .revised
+                        .expect("ceiling replans carry a revision");
+                    in_force = revised;
+                    replanned = true;
+                    iterations += 1;
+                    impl_out = match implementer.iterate(worktree, &correction.prompt).await {
+                        Ok(out) => out,
+                        Err(e) => {
+                            if let Err(rm) = remove_worktree(repo_path, worktree).await {
+                                tracing::warn!("failed to clean up worktree: {rm}");
+                            }
+                            return Err(PlanError::node("implementer", e));
                         }
-                    }
+                    };
+                    record_iteration(
+                        run,
+                        &impl_out,
+                        serde_json::to_string(&in_force)?,
+                        iterations,
+                    )
+                    .await?;
+                    continue;
                 }
             }
         }
-        impl_out = match implementer.iterate(&worktree, &correction.prompt).await {
+        impl_out = match implementer.iterate(worktree, &correction.prompt).await {
             Ok(out) => out,
             Err(e) => {
-                // Hard error mid-converge: don't leave the worktree behind.
-                if let Err(rm) = remove_worktree(&repo_path, &worktree).await {
+                if let Err(rm) = remove_worktree(repo_path, worktree).await {
                     tracing::warn!("failed to clean up worktree after converge error: {rm}");
                 }
                 return Err(PlanError::node("implementer", e));
             }
         };
-        record(Record {
-            store,
-            run_id,
-            node: "implementer",
-            output: &impl_out,
-            // The correction is what this iteration was actually given — the thing that explains
-            // why it did what it did, and the one input a replay would need.
-            input: Some(serde_json::to_string(&correction.prompt)?),
-            iteration: Some(iterations + 1),
-            ledger: Some(ledger),
-        })
+        record_iteration(
+            run,
+            &impl_out,
+            serde_json::to_string(&correction.prompt)?,
+            iterations + 1,
+        )
         .await?;
         iterations += 1;
     };
+    Ok((impl_out, status, iterations))
+}
 
-    // The run's work becomes a commit on the run's own branch, whatever the outcome. A worktree
-    // left with uncommitted changes is work that exists nowhere a reviewer can reach: the branch
-    // still points where it forked from, so pushing it delivers nothing and a pull request against
-    // it is refused for having no commits — which is what happened before this existed.
-    //
-    // Whatever the outcome, because the commit is a record rather than an endorsement. A run that
-    // hit its iteration ceiling still produced something worth looking at, and publishing decides
-    // separately whether anyone should be asked to.
+/// Commit the run branch regardless of the settled outcome.
+pub(crate) async fn commit_run(
+    run: &Run<'_>,
+    implementer: &ImplementerNode,
+    worktree: &WorktreePath,
+    impl_out: &ImplementerOutput,
+) {
     let branch = implementer.branch();
     match ratatoskr_exec::commit_all(
-        &worktree,
+        worktree,
         &branch,
-        &commit_message(&config.publish, issue, &impl_out),
+        &commit_message(&run.config.publish, run.issue, impl_out),
         ratatoskr_exec::Committer {
-            name: &config.publish.committer_name,
-            email: &config.publish.committer_email,
+            name: &run.config.publish.committer_name,
+            email: &run.config.publish.committer_email,
         },
     )
     .await
@@ -2539,12 +2697,8 @@ async fn fork_and_converge(
             tracing::info!(kind = "committed", branch = %branch, sha = %sha, "committed")
         }
         Ok(None) => tracing::info!(branch = %branch, "nothing to commit"),
-        // Best-effort: the work and its checkpoints are already recorded, and failing the run here
-        // would discard them over a step that only makes them reachable.
         Err(e) => tracing::warn!("could not commit the run's work to {branch}: {e}"),
     }
-
-    Ok((red_team_out, impl_out, worktree, status, iterations))
 }
 
 /// The message a run's commit carries.
@@ -3700,5 +3854,279 @@ mod repo_conventions_tests {
         std::fs::write(&file, "conventions").unwrap();
         assert_eq!(repo_conventions(&file), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod converge_stage_tests {
+    use super::*;
+
+    // Contract reading (#198): `fork_and_converge` is split into the named stages its comments
+    // already describe, two of which are the decisions the loop used to keep inline. The issue
+    // names them "per the existing comments, e.g." — pinned here at the crate root, next to
+    // `fork_and_converge`, as:
+    //
+    //   pub(crate) async fn decide_correction(
+    //       violations: &[referee::Violation],
+    //       red_team_out: &RedTeamOutput,
+    //       impl_out: &ImplementerOutput,
+    //       authored: &[String],
+    //       review: Option<&Review>,
+    //   ) -> Result<Reviewed, PlanError>
+    //
+    // — the contract's input list in its order (referee violations, the two outputs, the
+    // authored test list, the review handle). Async and fallible because the tests-clean +
+    // review-configured branch must await the review; with `review: None` it is pure data, which
+    // is the half these tests exercise.
+    //
+    //   pub(crate) enum CeilingDecision { Stop(RunStatus), Replan(Correction) }
+    //
+    //   pub(crate) async fn at_ceiling(
+    //       iterations: u32,
+    //       max_iterations: u32,
+    //       replanned: bool,
+    //       findings: &[verifier::Finding],
+    //       review: Option<&Review>,
+    //   ) -> Result<CeilingDecision, PlanError>
+    //
+    // — the contract's "enum of the form { Stop(RunStatus) | Replan(Correction) }", with the
+    // once-per-run escalation decidable without a loop. Same async/Result reading: the Replan
+    // branch awaits the analyst, the Stop branches never do.
+    //
+    // What these tests deliberately do not pin: the loop's translation of a stage output into a
+    // terminal status (Clean → Converged, Unavailable → Unreviewed), the replanned/in-force
+    // bookkeeping, and the worktree cleanup on an implementer error. Those live in the loop body
+    // `fork_and_converge` still owns, are not separately callable under the contract, and are
+    // covered by the requirement that the existing converge tests pass unedited.
+
+    fn red(failing: &[&str], passed: usize, exit: i32) -> RedTeamOutput {
+        RedTeamOutput {
+            authored: None,
+            failing_tests: failing.iter().map(|s| s.to_string()).collect(),
+            passed_tests: passed,
+            exit_code: exit,
+            classifications: vec![],
+        }
+    }
+
+    fn imp(failing: &[&str], passed: usize, exit: i32) -> ImplementerOutput {
+        ImplementerOutput {
+            worktree_path: "/wt".to_string(),
+            branch: "ratatoskr/test".into(),
+            diff_summary: String::new(),
+            touched_files: vec![],
+            rewritten_files: Vec::new(),
+            failing_tests: failing.iter().map(|s| s.to_string()).collect(),
+            passed_tests: passed,
+            exit_code: exit,
+            narrative: None,
+            commit_kind: String::new(),
+            commit_scope: String::new(),
+            commit_subject: String::new(),
+        }
+    }
+
+    fn violation(file: &str, reason: &str) -> referee::Violation {
+        referee::Violation {
+            file: file.into(),
+            reason: reason.into(),
+        }
+    }
+
+    fn finding() -> verifier::Finding {
+        verifier::Finding {
+            severity: verifier::Severity::P2,
+            kind: verifier::FindingKind::Execution,
+            file: "a.rs".into(),
+            line: None,
+            summary: "s".into(),
+            failure_scenario: "f".into(),
+        }
+    }
+
+    /// Unwrap a `Reviewed::Fix` into its correction, failing loudly on any other verdict.
+    fn correction_of(reviewed: Reviewed) -> Correction {
+        match reviewed {
+            Reviewed::Fix(correction) => *correction,
+            Reviewed::Clean => panic!("expected a correction, got Reviewed::Clean"),
+            Reviewed::Unavailable => panic!("expected a correction, got Reviewed::Unavailable"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_referee_correction_wins_and_the_tests_are_never_consulted() {
+        // The two gates in order, referee first: violations are non-empty AND the test outcome
+        // is as bad as it gets — the post-change run never completed (exit 101, nothing parsed)
+        // and an authored test still fails. The prompt must come back byte-equal to
+        // `referee::correction(&violations)`: no test-derived prompt can be that string, so
+        // equality is what proves the test result was never consulted.
+        let violations = vec![violation(
+            "crates/foo/src/lib.rs",
+            "deleted the module's #[cfg(test)] characterisation",
+        )];
+        let baseline = red(&["crate::authored_test"], 3, 1);
+        let post = imp(&["crate::authored_test"], 0, 101);
+        let authored = vec!["crate::authored_test".to_string()];
+
+        let reviewed = decide_correction(&violations, &baseline, &post, &authored, None)
+            .await
+            .expect("the referee branch spends no model call");
+        let correction = correction_of(reviewed);
+        assert_eq!(correction.prompt, referee::correction(&violations));
+        // A deterministic correction carries no review state: nothing found, no revised plan.
+        assert!(correction.found.is_empty());
+        assert!(correction.revised.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_test_run_that_did_not_complete_says_so_and_names_the_exit_code() {
+        // Zero tests parsed and a non-zero exit: the change likely does not compile. Reporting
+        // "no new failures" here would be the false-convergence reading this branch exists to
+        // refuse — the prompt states the command did not run to completion, with the exit code.
+        let baseline = red(&["a::pre_existing"], 10, 1);
+        let post = imp(&[], 0, 101);
+
+        let reviewed = decide_correction(&[], &baseline, &post, &[], None)
+            .await
+            .expect("pure data with no review configured");
+        let prompt = correction_of(reviewed).prompt;
+        assert!(
+            prompt.contains("did not run to completion"),
+            "the run's failure to complete is said, not hidden: {prompt}"
+        );
+        assert!(
+            prompt.contains("101"),
+            "the exit code is named so the implementer can see how it died: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authored_tests_still_failing_are_named_in_the_correction() {
+        // Written for this change before any code existed, they fail in the baseline as a matter
+        // of course — so *nothing is newly failing* here, and `is_converged` alone would wave
+        // the change through. The unsatisfied gate is what refuses, and the prompt names exactly
+        // the authored tests that still fail.
+        let baseline = red(
+            &["tests::writes_a_row", "tests::rejects_an_empty_name"],
+            4,
+            1,
+        );
+        // The run completed (tests parsed, so exit 1 is a real test result), one authored test
+        // now passes, the other still fails.
+        let post = imp(&["tests::rejects_an_empty_name"], 8, 1);
+        let authored = vec![
+            "tests::writes_a_row".to_string(),
+            "tests::rejects_an_empty_name".to_string(),
+        ];
+
+        let reviewed = decide_correction(&[], &baseline, &post, &authored, None)
+            .await
+            .expect("pure data with no review configured");
+        let prompt = correction_of(reviewed).prompt;
+        assert!(
+            prompt.contains("tests::rejects_an_empty_name"),
+            "the unsatisfied test is named: {prompt}"
+        );
+        assert!(
+            !prompt.contains("tests::writes_a_row"),
+            "the authored test that now passes is not named: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn newly_introduced_failures_are_named_and_pre_existing_ones_are_not() {
+        // The regression branch: the run completed, no authored tests are outstanding, but the
+        // change broke tests the baseline had green. The prompt names those and only those —
+        // naming a pre-existing failure would send the implementer chasing a failure it did not
+        // cause.
+        let baseline = red(&["a::pre_existing"], 10, 1);
+        let post = imp(&["a::pre_existing", "b::broke", "c::also_broke"], 9, 1);
+
+        let reviewed = decide_correction(&[], &baseline, &post, &[], None)
+            .await
+            .expect("pure data with no review configured");
+        let prompt = correction_of(reviewed).prompt;
+        assert!(prompt.contains("b::broke"), "{prompt}");
+        assert!(prompt.contains("c::also_broke"), "{prompt}");
+        assert!(
+            !prompt.contains("a::pre_existing"),
+            "the pre-existing failure is not the implementer's problem: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_tests_and_no_review_is_clean() {
+        // Every deterministic gate passes — the run completed, no authored test is outstanding,
+        // nothing newly failing — and there is no verifier configured: the stage's verdict is
+        // Reviewed::Clean, which the loop then translates to RunStatus::Converged. (The
+        // translation is the loop's, not the stage's; the stage's half is returning Clean.)
+        let baseline = red(&["a::pre_existing"], 10, 1);
+        let post = imp(&["a::pre_existing"], 12, 0);
+        let reviewed = decide_correction(&[], &baseline, &post, &[], None)
+            .await
+            .expect("pure data with no review configured");
+        assert!(
+            matches!(reviewed, Reviewed::Clean),
+            "clean tests with nobody to ask converge as Clean"
+        );
+
+        // The all-green spelling of the same thing: empty baseline, everything passing.
+        let reviewed = decide_correction(&[], &red(&[], 285, 0), &imp(&[], 300, 0), &[], None)
+            .await
+            .expect("pure data with no review configured");
+        assert!(matches!(reviewed, Reviewed::Clean));
+    }
+
+    #[tokio::test]
+    async fn a_spent_budget_with_nothing_found_stops_without_asking_the_analyst() {
+        // Budget spent, no prior replan, but `found_so_far` is empty: there is no evidence to
+        // hand the analyst, so the run stops at the wall rather than spending a replan on
+        // nothing. No review handle is passed — with no findings the analyst must not be
+        // reached even when there is one.
+        let decision = at_ceiling(3, 3, false, &[], None)
+            .await
+            .expect("stopping spends no model call");
+        assert!(
+            matches!(
+                decision,
+                CeilingDecision::Stop(RunStatus::MaxIterationsReached)
+            ),
+            "an empty evidence base records the wall, not a replan"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spent_budget_after_a_replan_stops_for_real() {
+        // The escalation is once per run: `replanned` stops the run even with findings standing,
+        // because a second replan would be the same escalation on the same evidence.
+        let findings = vec![finding()];
+        let decision = at_ceiling(4, 3, true, &findings, None)
+            .await
+            .expect("stopping spends no model call");
+        assert!(
+            matches!(
+                decision,
+                CeilingDecision::Stop(RunStatus::MaxIterationsReached)
+            ),
+            "the second time at the ceiling is the wall, not another escalation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spent_budget_without_a_review_stops_at_the_wall() {
+        // Findings stand and the budget is spent, but with no review configured there is no
+        // analyst re-entry either: the escalation goes through the review handle. Its absence is
+        // MaxIterationsReached — never an error, and never a silently extended budget.
+        let findings = vec![finding()];
+        let decision = at_ceiling(3, 3, false, &findings, None)
+            .await
+            .expect("no review configured stops cleanly");
+        assert!(
+            matches!(
+                decision,
+                CeilingDecision::Stop(RunStatus::MaxIterationsReached)
+            ),
+            "with nobody to escalate to, the ceiling is the wall"
+        );
     }
 }
