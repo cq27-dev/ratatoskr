@@ -75,6 +75,15 @@ pub fn validate(stages: &[Stage], profiles: &[AgentProfile]) -> Result<(), PlanE
                 stage_names.iter().copied().collect::<Vec<_>>().join(", ")
             )));
         };
+        // A delegated child is invoked directly by the Rust executor, not through the JavaScript
+        // host wrapper where `renderQuestion` runs. Refuse the unsupported shape up front instead
+        // of silently handing the child raw JSON under a declaration that promised another prompt.
+        if target.question_renderer.is_some() {
+            return Err(PlanError::Configuration(format!(
+                "stage `{}` delegates to `{}`, whose renderQuestion requires an explicit workflow host call",
+                parent.id, target.id
+            )));
+        }
         if !target.output_contract.is_empty() && target.output_schema.is_none() {
             return Err(PlanError::Configuration(format!(
                 "stage `{}` delegates to `{}`, whose output contract `{}` has no outputSchema",
@@ -202,5 +211,34 @@ mod tests {
                 "{alias} must be reserved: {error}"
             );
         }
+    }
+
+    #[test]
+    fn a_delegated_renderer_is_refused_before_execution() {
+        let template = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        let mut parent = template.clone();
+        parent.id = "parent".to_string();
+        parent.delegation = Some(crate::Delegation {
+            target: "child".to_string(),
+            evidence_contract: "Evidence".to_string(),
+            input_limit: 1_000,
+        });
+        let mut child = template;
+        child.id = "child".to_string();
+        child.output_contract = "Evidence".to_string();
+        child.output_schema = Some(serde_json::json!({ "type": "object" }));
+        child.question_renderer = Some("input => JSON.stringify(input)".to_string());
+
+        let error = validate(&[parent, child], &crate::built_in_agents())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("requires an explicit workflow host call"),
+            "{error}"
+        );
     }
 }

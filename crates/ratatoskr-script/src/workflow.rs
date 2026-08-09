@@ -37,13 +37,47 @@ pub type HostFn =
 const BOOTSTRAP: &str = r#"
 globalThis.__wrap = function (name) {
     return async function (x) {
-        var raw = await globalThis["__" + name](JSON.stringify(x === undefined ? null : x));
+        var input = x === undefined ? null : x;
+        var renderer = globalThis.__stageQuestionRenderers[name];
+        var hostInput = input;
+        if (renderer !== undefined) {
+            var question = renderer(input);
+            if (typeof question !== "string") {
+                throw new Error("stage '" + name + "' renderQuestion must return a string");
+            }
+            hostInput = {
+                __ratatoskrRenderedQuestion: {
+                    input: input,
+                    question: question
+                }
+            };
+        }
+        var raw = await globalThis["__" + name](JSON.stringify(hostInput));
         var r = JSON.parse(raw);
         if (r && Object.prototype.hasOwnProperty.call(r, "__error")) throw new Error(r.__error);
         return r.value;
     };
 };
 globalThis.__workflow = null;
+globalThis.__stageQuestionRenderers = {};
+globalThis.__compileStageQuestionRenderer = function (name, source) {
+    var renderer;
+    try {
+        renderer = (0, eval)("(" + source + ")");
+    } catch (firstError) {
+        // Function.prototype.toString preserves object-method shorthand. It needs `function` when
+        // installed into another workflow runtime, while arrows and function expressions do not.
+        try {
+            renderer = (0, eval)("(function " + source + ")");
+        } catch (error) {
+            throw new Error("stage '" + name + "' renderQuestion could not be loaded: " + error);
+        }
+    }
+    if (typeof renderer !== "function") {
+        throw new Error("stage '" + name + "' renderQuestion must be a function");
+    }
+    return renderer;
+};
 globalThis.defineWorkflow = function (meta) {
     if (!meta || typeof meta.name !== "string" || meta.name === "") {
         throw new Error("defineWorkflow: `name` is required");
@@ -53,12 +87,34 @@ globalThis.defineWorkflow = function (meta) {
             throw new Error("defineWorkflow: unknown key '" + k + "'");
         }
     }
+    var stages = (meta.stages || []).map(function (stage) {
+        if (!stage || typeof stage !== "object") return stage;
+        if (stage.questionRenderer !== undefined) {
+            throw new Error("stage '" + stage.id + "' declares reserved key 'questionRenderer'; use renderQuestion");
+        }
+        var declared = {};
+        for (var key in stage) {
+            if (key !== "renderQuestion") declared[key] = stage[key];
+        }
+        if (stage.renderQuestion !== undefined) {
+            if (typeof stage.renderQuestion !== "function") {
+                throw new Error("stage '" + stage.id + "' renderQuestion must be a function");
+            }
+            var source = Function.prototype.toString.call(stage.renderQuestion);
+            // Object-method shorthand stringifies as `renderQuestion(input) { ... }`, which is not
+            // an expression until it is given the `function` prefix.
+            if (source.indexOf("renderQuestion(") === 0) source = "function " + source;
+            declared.questionRenderer = source;
+            globalThis.__stageQuestionRenderers[stage.id] = stage.renderQuestion;
+        }
+        return declared;
+    });
     globalThis.__workflow = {
         name: meta.name,
         purpose: meta.purpose || "",
         whenToUse: meta.whenToUse || [],
         nodes: meta.nodes || [],
-        stages: meta.stages || []
+        stages: stages
     };
 };
 globalThis.__workflowMeta = function () {
@@ -123,6 +179,12 @@ pub struct WorkflowStage {
     /// Override the selected agent route's attempt-continuation policy for this stage.
     #[serde(default)]
     pub session: Option<SessionScope>,
+    /// Source of a pure TypeScript function that renders the runtime input into the model question.
+    ///
+    /// Repository authors declare this as `renderQuestion(input) => string`; `defineWorkflow`
+    /// serializes its source so bundled declarations can be installed in another workflow runtime.
+    #[serde(default)]
+    pub question_renderer: Option<String>,
     /// Generic, declarative cleanup applied after schema validation and before checkpointing.
     #[serde(default)]
     pub array_normalization: Vec<WorkflowArrayNormalization>,
@@ -299,6 +361,22 @@ impl WorkflowRuntime {
         input_json: String,
         hosts: HashMap<String, HostFn>,
     ) -> Result<String, ScriptError> {
+        self.run_with_question_renderers(entry, input_json, hosts, HashMap::new())
+            .await
+    }
+
+    /// Invoke one entry with declared stage question renderers installed before host wrappers.
+    ///
+    /// A renderer runs synchronously in JavaScript before its Rust host. It receives the original
+    /// structured input and may return only a string; the host still owns the model call, output
+    /// validation, checkpointing, telemetry and every workflow gate.
+    pub async fn run_with_question_renderers(
+        &self,
+        entry: &str,
+        input_json: String,
+        hosts: HashMap<String, HostFn>,
+        question_renderers: HashMap<String, String>,
+    ) -> Result<String, ScriptError> {
         let program = format!("{BOOTSTRAP}\n{}", self.source);
         let entry = entry.to_string();
 
@@ -307,6 +385,18 @@ impl WorkflowRuntime {
                 ctx.eval::<(), _>(program)
                     .catch(&ctx)
                     .map_err(|e| ScriptError::Eval(format!("{e}")))?;
+
+                for (name, source) in question_renderers {
+                    let install = format!(
+                        "globalThis.__stageQuestionRenderers[{name:?}] = \
+                         globalThis.__compileStageQuestionRenderer({name:?}, {});",
+                        serde_json::to_string(&source)
+                            .expect("a renderer source string always serializes")
+                    );
+                    ctx.eval::<(), _>(install)
+                        .catch(&ctx)
+                        .map_err(|e| ScriptError::Eval(format!("{e}")))?;
+                }
 
                 for (name, hostfn) in hosts {
                     let hf = hostfn.clone();
@@ -508,6 +598,7 @@ mod tests {
         assert_eq!(requirements.agent, "requirements");
         assert_eq!(requirements.capabilities, [Capability::Read]);
         assert!(requirements.output_schema.is_some());
+        assert!(requirements.question_renderer.is_some());
     }
 
     #[tokio::test]
@@ -532,6 +623,119 @@ mod tests {
             found[0].meta().stages[0].session,
             Some(SessionScope::Compacted)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stage_renderer_conditionally_formats_input_before_the_host() {
+        let dir = scratch("stage-question-renderer");
+        let runtime = load(
+            &dir,
+            r#"defineWorkflow({
+                 name: "review",
+                 stages: [{
+                   id: "reviewer",
+                   agent: "reason",
+                   renderQuestion(input) {
+                     return input.previous
+                       ? `REVISION OF ${input.previous}: ${input.issue}`
+                       : `FRESH: ${input.issue}`;
+                   },
+                 }],
+               });
+               async function plan(input) {
+                 await reviewer(input);
+                 return await reviewer({ ...input, previous: "plan-v1" });
+               }"#,
+        )
+        .await;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        let mut hosts = HashMap::new();
+        hosts.insert(
+            "reviewer".to_string(),
+            host(move |arg| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.lock()
+                        .expect("renderer calls mutex poisoned")
+                        .push(serde_json::from_str::<serde_json::Value>(&arg).unwrap());
+                    Ok("{}".to_string())
+                }
+            }),
+        );
+
+        let renderer = runtime.meta().stages[0].question_renderer.clone().unwrap();
+        runtime
+            .run_with_question_renderers(
+                "plan",
+                serde_json::json!({ "issue": "keep the contract" }).to_string(),
+                hosts,
+                HashMap::from([("reviewer".to_string(), renderer)]),
+            )
+            .await
+            .unwrap();
+
+        let calls = calls.lock().expect("renderer calls mutex poisoned");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0]["__ratatoskrRenderedQuestion"]["question"],
+            "FRESH: keep the contract"
+        );
+        assert_eq!(
+            calls[1]["__ratatoskrRenderedQuestion"]["question"],
+            "REVISION OF plan-v1: keep the contract"
+        );
+        assert_eq!(
+            calls[1]["__ratatoskrRenderedQuestion"]["input"]["previous"],
+            "plan-v1"
+        );
+        assert!(runtime.meta().stages[0].question_renderer.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stage_renderer_must_return_text_before_the_host_runs() {
+        let dir = scratch("invalid-stage-question-renderer");
+        let runtime = load(
+            &dir,
+            r#"defineWorkflow({
+                 name: "review",
+                 stages: [{
+                   id: "reviewer",
+                   agent: "reason",
+                   renderQuestion(input) { return { issue: input.issue }; },
+                 }],
+               });
+               async function plan(input) { return await reviewer(input); }"#,
+        )
+        .await;
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let host_called = Arc::clone(&called);
+        let mut hosts = HashMap::new();
+        hosts.insert(
+            "reviewer".to_string(),
+            host(move |_| {
+                host_called.store(true, std::sync::atomic::Ordering::Relaxed);
+                async { Ok("{}".to_string()) }
+            }),
+        );
+
+        let error = runtime
+            .run(
+                "plan",
+                serde_json::json!({ "issue": "x" }).to_string(),
+                hosts,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("renderQuestion must return a string"),
+            "{error}"
+        );
+        assert!(!called.load(std::sync::atomic::Ordering::Relaxed));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

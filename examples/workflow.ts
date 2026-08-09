@@ -56,6 +56,11 @@ defineWorkflow({
       instructions:
         "Extract the requirements and delivery risks that must shape the implementation plan. " +
         "Do not propose code. Return only the declared JSON object.",
+      // Optional and synchronous: format structured input for the model without changing what the
+      // Rust host checkpoints. The function must be self-contained and return a string.
+      renderQuestion(input: { issue: string }) {
+        return `ISSUE TO DISTIL:\n${input.issue}`;
+      },
       capabilities: ["read"],
     },
   ],

@@ -49,6 +49,8 @@ pub struct Stage {
     pub tools: Vec<String>,
     /// Overrides the selected route's attempt-continuation policy when present.
     pub session: Option<SessionScope>,
+    /// Pure TypeScript source that renders structured runtime input into this stage's question.
+    pub question_renderer: Option<String>,
     /// Generic output cleanup performed after schema validation.
     pub array_normalization: Vec<ArrayNormalization>,
     pub delegation: Option<Delegation>,
@@ -197,6 +199,7 @@ pub fn stages_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> 
             capabilities: stage.capabilities.clone(),
             tools: stage.tools.clone(),
             session: stage.session,
+            question_renderer: stage.question_renderer.clone(),
             array_normalization: stage
                 .array_normalization
                 .iter()
@@ -252,6 +255,7 @@ pub fn built_in_stages() -> Vec<Stage> {
         capabilities: Vec::new(),
         tools: Vec::new(),
         session: None,
+        question_renderer: None,
         array_normalization: Vec::new(),
         delegation: None,
         append_repository_guidance: true,
@@ -281,6 +285,7 @@ mod tests {
                 capabilities: vec![Capability::Read],
                 tools: Vec::new(),
                 session: Some(SessionScope::Compacted),
+                question_renderer: None,
                 array_normalization: Vec::new(),
                 delegation: None,
                 append_repository_guidance: true,

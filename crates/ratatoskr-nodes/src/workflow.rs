@@ -896,9 +896,9 @@ fn declared_stage_preamble(
     crate::effective_preamble(&stage.id, &base, None, None, skills)
 }
 
-fn declared_stage_question(stage: &Stage, runtime_input_json: &str) -> String {
+fn declared_stage_question(stage: &Stage, runtime_question: &str) -> String {
     format!(
-        "Input contract: {}\nOutput contract: {}\n\n{runtime_input_json}",
+        "Input contract: {}\nOutput contract: {}\n\n{runtime_question}",
         stage.input_contract, stage.output_contract
     )
 }
@@ -931,7 +931,42 @@ enum StageOutput {
 struct StageInvocation {
     stage: Stage,
     input_json: String,
+    rendered_question: Option<String>,
     output: StageOutput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RenderedStageQuestion {
+    input: serde_json::Value,
+    question: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenderedStageEnvelope {
+    #[serde(rename = "__ratatoskrRenderedQuestion")]
+    rendered: RenderedStageQuestion,
+}
+
+fn stage_invocation(stage: Stage, host_input_json: String) -> Result<StageInvocation, String> {
+    let Some(_) = stage.question_renderer.as_ref() else {
+        return Ok(StageInvocation {
+            stage,
+            input_json: host_input_json,
+            rendered_question: None,
+            output: StageOutput::Checkpoint,
+        });
+    };
+    let envelope: RenderedStageEnvelope = serde_json::from_str(&host_input_json)
+        .map_err(|error| format!("stage `{}` rendered-question envelope: {error}", stage.id))?;
+    Ok(StageInvocation {
+        stage,
+        input_json: serde_json::to_string(&envelope.rendered.input)
+            .map_err(|error| error.to_string())?,
+        rendered_question: Some(envelope.rendered.question),
+        output: StageOutput::Checkpoint,
+    })
 }
 
 /// Generic execution boundary for every declarative stage.
@@ -960,13 +995,8 @@ impl StageExecutor {
             let executor = Arc::clone(&executor);
             let stage = stage.clone();
             Box::pin(async move {
-                executor
-                    .execute(StageInvocation {
-                        stage,
-                        input_json,
-                        output: StageOutput::Checkpoint,
-                    })
-                    .await
+                let invocation = stage_invocation(stage, input_json)?;
+                executor.execute(invocation).await
             })
         })
     }
@@ -976,6 +1006,7 @@ impl StageExecutor {
         let StageInvocation {
             stage,
             input_json,
+            rendered_question,
             output: disposition,
         } = invocation;
         let input: serde_json::Value =
@@ -1021,6 +1052,7 @@ impl StageExecutor {
             let child = Box::pin(self.execute(StageInvocation {
                 stage: target,
                 input_json: serde_json::to_string(&task.input).map_err(|e| e.to_string())?,
+                rendered_question: None,
                 output: StageOutput::Evidence,
             }))
             .await?;
@@ -1043,7 +1075,16 @@ impl StageExecutor {
             plugins.context.as_deref(),
             &plugins.skills,
         );
-        let question = declared_stage_question(&stage, &runtime_input_json);
+        if stage.question_renderer.is_some() && rendered_question.is_none() {
+            return Err(format!(
+                "stage `{}` has renderQuestion but was invoked without its workflow host",
+                stage.id
+            ));
+        }
+        let question = declared_stage_question(
+            &stage,
+            rendered_question.as_deref().unwrap_or(&runtime_input_json),
+        );
         let output_schema = stage
             .output_schema
             .clone()
@@ -1185,6 +1226,18 @@ fn build_hosts(
     build_hosts_with_turn(ctx, stages, Arc::new(LiveStageTurn))
 }
 
+fn stage_question_renderers(stages: &[Stage]) -> HashMap<String, String> {
+    stages
+        .iter()
+        .filter_map(|stage| {
+            stage
+                .question_renderer
+                .as_ref()
+                .map(|source| (stage.id.clone(), source.clone()))
+        })
+        .collect()
+}
+
 pub(crate) async fn standard_stages() -> Result<Vec<Stage>, PlanError> {
     let meta = WorkflowRuntime::bundled_meta("ratatoskr-standard-v1", STANDARD_WORKFLOW_V1)
         .await
@@ -1225,7 +1278,9 @@ pub async fn run_plan_scripted(
     let stages = execution_stages(&runtime).await?;
     let hosts = build_hosts(&ctx, &stages)?;
     let input = json!({ "issue": ctx.issue }).to_string();
-    let result = runtime.run("plan", input, hosts).await;
+    let result = runtime
+        .run_with_question_renderers("plan", input, hosts, stage_question_renderers(&stages))
+        .await;
 
     let outcome = match result {
         Ok(_) => reconstruct_plan(&ctx.store, &ctx.run_id).await,
@@ -1280,7 +1335,10 @@ pub async fn run_full_scripted(
     // Run the script, then reconstruct the outcome. EITHER failing is a run failure: on any error
     // (a script/binding error, or a reconstruction error like a missing checkpoint) the worktree is
     // cleaned up and the run is marked `Failed` — never left orphaned or stuck at `Running`.
-    let result = match runtime.run("run", input, hosts).await {
+    let result = match runtime
+        .run_with_question_renderers("run", input, hosts, stage_question_renderers(&stages))
+        .await
+    {
         Ok(_) => finish_full(&ctx).await,
         Err(e) => Err(PlanError::node(
             "workflow",
@@ -1637,6 +1695,7 @@ mod tests {
             .execute(StageInvocation {
                 stage,
                 input_json: "{}".to_string(),
+                rendered_question: None,
                 output: StageOutput::Evidence,
             })
             .await
@@ -1723,6 +1782,94 @@ mod tests {
             .unwrap();
         assert_eq!(checkpoints.len(), 1);
         assert_eq!(checkpoints[0].node_name, "arbitrary_probe");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn generic_executor_consumes_a_rendered_question_and_checkpoints_original_input() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-rendered-stage-question-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-rendered-question", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "rendered_probe".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-rendered-question",
+            "render this",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let mut stage = crate::built_in_stages().pop().unwrap();
+        stage.id = "rendered_probe".to_string();
+        stage.agent = "reason".to_string();
+        stage.input_contract = "ProbeInput".to_string();
+        stage.output_contract = "ProbeOutput".to_string();
+        stage.output_schema = Some(json!({ "type": "object" }));
+        stage.instructions = "stage guidance".to_string();
+        stage.question_renderer = Some("function (input) { return input.issue; }".to_string());
+        let turn = Arc::new(RecordingStageTurn::default());
+        let mut hosts =
+            build_hosts_with_turn(&ctx, &[stage], Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        let envelope = json!({
+            "__ratatoskrRenderedQuestion": {
+                "input": { "issue": "original checkpoint input" },
+                "question": "CONDITIONALLY RENDERED QUESTION"
+            }
+        })
+        .to_string();
+
+        hosts.remove("rendered_probe").unwrap()(envelope)
+            .await
+            .unwrap();
+
+        {
+            let preambles = turn
+                .preambles
+                .lock()
+                .expect("recording runner mutex poisoned");
+            let questions = turn
+                .questions
+                .lock()
+                .expect("recording runner mutex poisoned");
+            let full_prompt = format!("{}\n\n{}", preambles[0], questions[0]);
+            assert!(
+                full_prompt.find("stage guidance") < full_prompt.find("CONDITIONALLY RENDERED")
+            );
+            assert!(questions[0].contains("Input contract: ProbeInput"));
+            assert!(questions[0].ends_with("CONDITIONALLY RENDERED QUESTION"));
+            assert!(!questions[0].contains("original checkpoint input"));
+        }
+        let checkpoints = store
+            .checkpoints_for_run("run-rendered-question")
+            .await
+            .unwrap();
+        assert_eq!(
+            checkpoints[0].input_json.as_deref(),
+            Some(r#"{"issue":"original checkpoint input"}"#)
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
