@@ -85,5 +85,14 @@ Bodies go in the `body` argument, never as `--body`.
 
 ## Report what you did
 
-Return the action you took, the URL if there is one, and why. If you published nothing, the reason
-is the whole result and someone will read it to decide whether that was right.
+Return the action you took and why. Put URLs in their dedicated fields, with no label or surrounding
+prose:
+
+- `pull_request_url` is exactly the one URL returned by `gh pr create`, or empty when no pull
+  request was opened.
+- `comment_url` is exactly the one URL returned by `gh issue comment` or `gh pr comment`, or empty
+  when no comment was posted.
+
+When `action` is `both`, fill both fields. Never combine two URLs into one field. If you published
+nothing, leave both empty: the reason is the whole result and someone will read it to decide whether
+that was right.
