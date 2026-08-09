@@ -98,6 +98,7 @@ impl Node for ScoutNode {
             produces: Some(
                 "a papertrail summary of what the tracker and history say about this task, plus the related items found",
             ),
+            compacted_session: None,
         })
         .await
         .map_err(|e| NodeError::Failed(format!("scout agent failed: {e}")))?;

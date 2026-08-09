@@ -110,6 +110,7 @@ impl PublisherNode {
             conversation: None,
             ledger: self.ledger.clone(),
             produces: Some("what was published, where, and why"),
+            compacted_session: None,
         })
         .await
         .map_err(|e| NodeError::Failed(format!("publisher agent failed: {e}")))?;

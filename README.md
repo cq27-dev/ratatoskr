@@ -315,9 +315,11 @@ reasoning ten times.
 A route's `params` are merged into the request verbatim, which means the spelling is the
 provider's — `thinking` on Anthropic and Moonshot, `reasoning` on OpenAI — and a field one
 provider knows is one another ignores in silence. `ratatoskr.toml.example` gives the three side by
-side. Two things do not travel: `[endpoint]`'s headers and session id are sent by the Anthropic
-client only, so `session = "reuse"` on another provider's route is accepted and does nothing, and
-Anthropic prompt caching is likewise not applied elsewhere.
+side. Two things do not travel: `[endpoint]`'s headers and `session = "reuse"` id are sent by the
+Anthropic client only, so reuse on another provider's route is accepted and does nothing.
+`session = "compacted"` instead keeps a local hand-off between attempts and therefore works on
+every provider without an endpoint session header. Anthropic prompt caching is likewise not applied
+elsewhere.
 
 Mixing providers within a run is worth doing deliberately in one place: review. A verifier on a
 different family from the model that wrote the change is a second opinion rather than a second

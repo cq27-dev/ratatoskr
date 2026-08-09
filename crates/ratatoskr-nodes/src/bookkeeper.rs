@@ -320,6 +320,7 @@ impl BookkeeperNode {
             produces: Some(
                 "a decision per durable learning: create, revise or none, with the memory body and its anchor",
             ),
+            compacted_session: None,
         })
         .await
         .map_err(|e| NodeError::Failed(format!("bookkeeper compose failed: {e}")))?;

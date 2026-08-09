@@ -659,9 +659,10 @@ pub struct ModelRoute {
     ///
     /// A node that is re-driven — the implementer on a converge iteration, the analyst on a
     /// revision — is given a diagnostic rather than the original task, and its message history
-    /// starts empty either way. What `Reuse` keeps is the *endpoint's* session: a gateway that
-    /// tracks one can carry what the previous attempt established, so the second attempt does not
-    /// re-read the tree it just edited.
+    /// starts empty either way. `Reuse` keeps the *endpoint's* session: a gateway that tracks one
+    /// can carry what the previous attempt established. `Compacted` instead keeps a local compact
+    /// summary of the prior attempt and supplies it to the next one, so it works without endpoint
+    /// session support.
     ///
     /// Default is `Fresh`, because reuse is only sound where a later attempt genuinely continues
     /// the earlier one. A node re-run on an unrelated task under a reused session would inherit
@@ -680,6 +681,8 @@ pub enum SessionScope {
     /// One session for this node across the whole run, so a re-driven attempt continues where the
     /// last one stopped.
     Reuse,
+    /// A local, compacted summary continues this node across attempts without endpoint support.
+    Compacted,
 }
 
 /// The per-call output cap when a route does not set one.
@@ -1140,6 +1143,25 @@ mod tests {
         assert_eq!(cfg.rag_rat.command, ["rag-rat", "mcp", "serve"]);
         assert_eq!(cfg.store.path, PathBuf::from(".ratatoskr/state.sqlite3"));
         assert_eq!(cfg.models["scout"].provider, "kimi");
+    }
+
+    #[test]
+    fn parses_compacted_session_scope() {
+        let cfg = RatatoskrConfig::from_toml_str(
+            r#"
+            [store]
+            path = ".ratatoskr/state.sqlite3"
+            [worktree]
+            root = ".ratatoskr/worktrees"
+            [models.implementer]
+            provider = "openai"
+            model = "gpt-5.6"
+            session = "compacted"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.models["implementer"].session, SessionScope::Compacted);
     }
 
     #[test]

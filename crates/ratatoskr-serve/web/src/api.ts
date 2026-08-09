@@ -384,6 +384,7 @@ export interface PlannedNode {
   model: string;
   thinking: boolean;
   reuses_session: boolean;
+  session: "fresh" | "reuse" | "compacted";
 }
 
 /** Mirrors `events::LiveNodeFacts` — what a node announced when it started. */

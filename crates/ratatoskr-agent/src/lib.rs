@@ -9,6 +9,8 @@ pub mod files;
 pub mod publish;
 pub mod shell;
 
+pub use compaction::CompactedSession;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -188,7 +190,8 @@ pub async fn ask(
 ) -> Result<String, AgentError> {
     match parse_provider(&route.provider)? {
         Provider::Anthropic => {
-            let client = anthropic_client(&uuid::Uuid::new_v4().to_string())?;
+            let session = uuid::Uuid::new_v4().to_string();
+            let client = anthropic_client(Some(&session))?;
             run(
                 caching(client.completion_model(&route.model)),
                 preamble,
@@ -455,10 +458,23 @@ fn thinking_left_on(route: &ModelRoute) -> bool {
 /// analyst on a revision — continues where the last one stopped rather than meeting the repository
 /// for the first time again. Reuse needs a `conversation` key to be stable across those attempts;
 /// without one there is nothing to be stable about, and it falls back to fresh.
-fn session_id(run: &NodeRun<'_>) -> String {
+fn session_id(run: &NodeRun<'_>) -> Option<String> {
     match (run.route.session, run.conversation) {
-        (ratatoskr_core::SessionScope::Reuse, Some(key)) => key.to_string(),
-        _ => uuid::Uuid::new_v4().to_string(),
+        (ratatoskr_core::SessionScope::Compacted, _) => None,
+        (ratatoskr_core::SessionScope::Reuse, Some(key)) => Some(key.to_string()),
+        _ => Some(uuid::Uuid::new_v4().to_string()),
+    }
+}
+
+fn continuing_session(
+    scope: ratatoskr_core::SessionScope,
+    conversation: Option<&str>,
+    has_compacted_session: bool,
+) -> bool {
+    match scope {
+        ratatoskr_core::SessionScope::Fresh => false,
+        ratatoskr_core::SessionScope::Reuse => conversation.is_some(),
+        ratatoskr_core::SessionScope::Compacted => conversation.is_some() && has_compacted_session,
     }
 }
 
@@ -469,7 +485,7 @@ fn session_id(run: &NodeRun<'_>) -> String {
 /// failure worth catching is a header that never reaches the wire, and that is decided here.
 fn endpoint_headers(
     endpoint: Option<&ratatoskr_core::EndpointConfig>,
-    session: &str,
+    session: Option<&str>,
 ) -> http::HeaderMap {
     let mut headers = http::HeaderMap::new();
     for (name, value) in endpoint.map(|e| &e.headers).into_iter().flatten() {
@@ -489,6 +505,7 @@ fn endpoint_headers(
         }
     }
     if let Some(name) = endpoint.and_then(|e| e.session_header.as_deref())
+        && let Some(session) = session
         && let (Ok(n), Ok(v)) = (
             http::HeaderName::try_from(name),
             http::HeaderValue::try_from(session),
@@ -517,7 +534,7 @@ pub fn configure_endpoint(endpoint: ratatoskr_core::EndpointConfig) {
 /// is spelled out here to add them. `session` is fresh per node attempt and constant across that
 /// attempt's turns — an endpoint that keys a session off it then continues one conversation rather
 /// than rebuilding it every turn.
-fn anthropic_client(session: &str) -> Result<anthropic::Client, AgentError> {
+fn anthropic_client(session: Option<&str>) -> Result<anthropic::Client, AgentError> {
     let key = std::env::var("ANTHROPIC_API_KEY").map_err(|source| AgentError::Provider {
         provider: "anthropic".to_string(),
         source: ProviderClientError::EnvironmentVariable {
@@ -1506,12 +1523,14 @@ pub struct NodeRun<'a> {
     pub skills: Vec<Skill>,
     /// The repository the node's built-in file tools read within; `None` when it has none.
     pub files: Option<std::path::PathBuf>,
-    /// A key naming this node's conversation within the run, when the route asks for the endpoint
-    /// session to be reused across attempts.
+    /// A key naming this node's conversation within the run, when the route continues it across
+    /// attempts.
     ///
-    /// Only consulted for `SessionScope::Reuse`; ignored otherwise, so a node that supplies one is
-    /// not thereby opting into reuse — the route decides that.
+    /// Only consulted for a continuing session scope; the route decides whether endpoint or local
+    /// memory state is reused.
     pub conversation: Option<&'a str>,
+    /// Shared local memory for `SessionScope::Compacted`.
+    pub compacted_session: Option<CompactedSession>,
     /// The sandbox the node's `Bash` calls run in; `None` for a node that runs no commands.
     ///
     /// Separate from `files` because they are different powers: reading and editing a tree is not
@@ -1539,7 +1558,8 @@ pub struct NodeRun<'a> {
 pub async fn run_structured(run: NodeRun<'_>) -> Result<String, AgentError> {
     match parse_provider(&run.route.provider)? {
         Provider::Anthropic => {
-            let client = anthropic_client(&session_id(&run))?;
+            let session = session_id(&run);
+            let client = anthropic_client(session.as_deref())?;
             let model = caching(client.completion_model(&run.route.model));
             run_typed(model, run).await
         }
@@ -1584,6 +1604,7 @@ where
         shell,
         push,
         conversation,
+        compacted_session,
         ledger,
         produces,
     } = run;
@@ -1644,7 +1665,21 @@ where
     // Summarise the oldest turns rather than dropping them, once history outgrows the budget. A
     // plain window would evict exactly the turn that discovered a constraint — it is the oldest —
     // and the node would rediscover it, or retry the approach it ruled out.
-    if let Some(produces) = produces {
+    if let (
+        ratatoskr_core::SessionScope::Compacted,
+        Some(conversation),
+        Some(session),
+        Some(produces),
+    ) = (
+        route.session,
+        conversation,
+        compacted_session.as_ref(),
+        produces,
+    ) {
+        builder = builder
+            .memory(session.memory(for_compaction, node, produces, ledger.clone()))
+            .conversation(conversation);
+    } else if let Some(produces) = produces {
         builder = builder.memory(compaction::compacting_memory(
             for_compaction,
             node,
@@ -1686,8 +1721,7 @@ where
         model = %model_name,
         tools = %tool_names.join(","),
         thinking = thinking_left_on(route),
-        reuses_session = matches!(route.session, ratatoskr_core::SessionScope::Reuse)
-            && conversation.is_some(),
+        reuses_session = continuing_session(route.session, conversation, compacted_session.is_some()),
         "node started"
     );
     let started = std::time::Instant::now();
@@ -1786,8 +1820,11 @@ where
             error: answer.as_ref().err().map(ToString::to_string),
             tools: tool_names,
             tools_used: meter.used(),
-            reuses_session: matches!(route.session, ratatoskr_core::SessionScope::Reuse)
-                && conversation.is_some(),
+            reuses_session: continuing_session(
+                route.session,
+                conversation,
+                compacted_session.is_some(),
+            ),
             thinking: thinking_left_on(route),
         };
         tracing::info!(
@@ -2203,6 +2240,7 @@ mod tests {
             conversation: None,
             ledger: None,
             produces: Some("a summary of the change"),
+            compacted_session: None,
         })
         .await
         .expect("the live run should complete");
@@ -2271,6 +2309,7 @@ mod tests {
             conversation: None,
             ledger: Some(Arc::clone(&ledger)),
             produces: None,
+            compacted_session: None,
         })
         .await
         .expect("the live run should complete");
@@ -2331,6 +2370,7 @@ mod tests {
                 conversation,
                 ledger: None,
                 produces: None,
+                compacted_session: None,
             }
         }
 
@@ -2347,6 +2387,14 @@ mod tests {
             session_id(&run(&reuse, None)),
             session_id(&run(&reuse, None))
         );
+
+        // A compacted continuation belongs to this process, not to the endpoint. It therefore
+        // sends no reusable id, and only claims a continuation once the node supplied the local
+        // memory that holds the prior attempt.
+        let compacted = route(ratatoskr_core::SessionScope::Compacted);
+        assert_eq!(session_id(&run(&compacted, key)), None);
+        assert!(continuing_session(compacted.session, key, true));
+        assert!(!continuing_session(compacted.session, key, false));
     }
 
     #[test]
@@ -2362,14 +2410,20 @@ mod tests {
             session_header: Some("x-litellm-session-id".to_string()),
         };
 
-        let sent = endpoint_headers(Some(&cfg), "session-abc");
+        let sent = endpoint_headers(Some(&cfg), Some("session-abc"));
         assert_eq!(sent.get("x-meridian-agent").unwrap(), "passthrough");
         assert_eq!(sent.get("x-litellm-session-id").unwrap(), "session-abc");
         // A typo costs its own header and nothing else — not the run.
         assert_eq!(sent.len(), 2);
 
         // Unconfigured is the default, and sends nothing of its own.
-        assert!(endpoint_headers(None, "session-abc").is_empty());
+        assert!(endpoint_headers(None, Some("session-abc")).is_empty());
+
+        // Local compacted continuation must not require, nor accidentally send, the endpoint's
+        // session header. Static deployment headers still apply.
+        let sent = endpoint_headers(Some(&cfg), None);
+        assert_eq!(sent.get("x-meridian-agent").unwrap(), "passthrough");
+        assert!(!sent.contains_key("x-litellm-session-id"));
     }
 
     #[test]

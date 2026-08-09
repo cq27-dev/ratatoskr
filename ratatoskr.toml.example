@@ -93,19 +93,19 @@ model = "kimi-k2.5"
 # Thinking tokens are billed as output and count against `max_tokens`; raise it alongside any
 # budget you set.
 #
-# `session` decides whether a node's endpoint session continues across attempts within a run.
-# "fresh" (the default) starts a new one each time; "reuse" keeps one for the node, so a node that
-# gets re-driven — the implementer on a converge iteration, the analyst on a revision — continues
-# where it stopped instead of meeting the repository again from nothing. Only worth it where a
-# later attempt genuinely continues the earlier one, and it needs `[endpoint] session_header` set
-# for anything to key off.
+# `session` decides whether a node continues across attempts within a run. "fresh" (the default)
+# starts a new one each time. "reuse" keeps an endpoint session for the node, so it needs
+# `[endpoint] session_header` set for anything to key off. "compacted" instead carries a local,
+# compacted hand-off between attempts and works with every provider without endpoint session support.
 #
 #   [models.implementer]
 #   session = "reuse"
+#   # Or, for an endpoint without session support:
+#   # session = "compacted"
 #
-# `[endpoint]` — its headers and that session id — rides on the anthropic client only. On an
-# openai or moonshot route `session = "reuse"` is accepted and does nothing, so setting it there
-# describes an arrangement the route has not got.
+# `[endpoint]` — its headers and a `reuse` session id — rides on the anthropic client only. On an
+# openai or moonshot route `session = "reuse"` is accepted and does nothing. `session =
+# "compacted"` is local and works on every provider.
 #
 # On thinking levels: leaving it unset is not the cheap option. Measured on a reasoning-heavy
 # prompt with tools present, against an Anthropic route through a gateway that takes

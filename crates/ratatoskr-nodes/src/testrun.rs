@@ -257,6 +257,7 @@ impl Characterizer {
             // One turn over output it was handed: there is no history to outgrow, so a compaction
             // policy would only cost a summariser it never calls.
             produces: None,
+            compacted_session: None,
         })
         .await
         {

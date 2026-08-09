@@ -2181,6 +2181,11 @@ pub(crate) fn build_converge_agents(
     };
     let (impl_cfg, impl_plugins) =
         build_implementer_agent(engine, config, context, client.map(|c| c.offer()))?;
+    let compacted_session = matches!(
+        impl_cfg.route.session,
+        ratatoskr_core::SessionScope::Compacted
+    )
+    .then(ratatoskr_agent::CompactedSession::default);
     let implementer = ImplementerNode {
         clarifier: Some(clarifier.as_dyn()),
         repo_path: repo_path.to_path_buf(),
@@ -2194,6 +2199,7 @@ pub(crate) fn build_converge_agents(
         conventions,
         plugins: impl_plugins,
         ledger: Some(Arc::clone(ledger)),
+        compacted_session,
         run_id: run_id.to_string(),
         issue: issue.to_string(),
         analyst: plan.analyst.clone(),

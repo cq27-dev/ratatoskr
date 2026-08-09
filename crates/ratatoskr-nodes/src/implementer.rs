@@ -160,6 +160,8 @@ pub struct ImplementerNode {
     pub conventions: Option<String>,
     pub plugins: crate::NodePlugins,
     pub ledger: Option<Arc<RunLedger>>,
+    /// Local continuation state for routes that compact one attempt before the next begins.
+    pub compacted_session: Option<ratatoskr_agent::CompactedSession>,
     /// Who answers when the implementer cannot resolve something itself.
     ///
     /// It is the node with the most turns to spend and the only one that changes code, so it is
@@ -271,6 +273,7 @@ impl ImplementerNode {
             conversation: Some(&conversation),
             ledger: self.ledger.clone(),
             produces: Some("a change that satisfies the plan and passes the acceptance checks"),
+            compacted_session: self.compacted_session.clone(),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("implementer agent failed: {e}")))?;

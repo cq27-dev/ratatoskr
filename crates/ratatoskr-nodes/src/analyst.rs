@@ -236,6 +236,7 @@ impl Node for AnalystNode {
             produces: Some(
                 "an impact summary, the symbols and paths touched, risks, the concrete requirements the implementation must satisfy, and the acceptance steps that prove it done",
             ),
+            compacted_session: None,
         })
         .await
         .map_err(|e| NodeError::Failed(format!("analyst agent failed: {e}")))?;

@@ -474,6 +474,8 @@ fn build_implementer(
         &ctx.plugin_context,
         ctx.rag_rat.clone(),
     )?;
+    let compacted_session = matches!(cfg.route.session, ratatoskr_core::SessionScope::Compacted)
+        .then(ratatoskr_agent::CompactedSession::default);
     Ok(ImplementerNode {
         // As every node on the scripted path: clarification is wired by the built-in flow, which
         // owns the run's `NodeClarifier`.
@@ -499,6 +501,7 @@ fn build_implementer(
         conventions: crate::repo_conventions(&ctx.repo_path),
         plugins,
         ledger: Some(Arc::clone(&ctx.ledger)),
+        compacted_session,
         run_id: ctx.run_id.clone(),
         issue: ctx.issue.clone(),
         analyst,
@@ -984,6 +987,7 @@ async fn declared_stage_host(
         conversation: None,
         ledger: Some(Arc::clone(&ctx.ledger)),
         produces: Some(&stage.output_contract),
+        compacted_session: None,
     })
     .await
     .map_err(|e| format!("stage `{}` agent failed: {e}", stage.id))?;

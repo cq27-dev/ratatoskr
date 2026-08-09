@@ -71,6 +71,7 @@ pub struct PlannedNode {
     pub model: String,
     pub thinking: bool,
     pub reuses_session: bool,
+    pub session: ratatoskr_core::SessionScope,
 }
 
 impl PlannedNode {
@@ -89,6 +90,7 @@ impl PlannedNode {
                 .and_then(|t| t.as_str())
                 != Some("disabled"),
             reuses_session: matches!(route.session, ratatoskr_core::SessionScope::Reuse),
+            session: route.session,
         })
     }
 }
@@ -518,6 +520,7 @@ mod tests {
             .expect("a routed node says what it will run on");
         assert_eq!(planned.model, "anthropic/claude-sonnet-5");
         assert!(planned.reuses_session);
+        assert_eq!(planned.session, ratatoskr_core::SessionScope::Reuse);
         assert!(planned.thinking, "nothing disabled it");
 
         // A node with no route never runs, and claims nothing.

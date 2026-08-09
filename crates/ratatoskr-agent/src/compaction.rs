@@ -10,11 +10,11 @@
 //! exact identifier, the exact command. So the template asks for those verbatim and says why,
 //! rather than asking for "a summary".
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rig_agent::completion::Prompt;
 use rig_core::completion::{CompletionModel, Message};
-use rig_core::memory::{Compactor, MemoryError};
+use rig_core::memory::{Compactor, ConversationMemory, MemoryError};
 use rig_core::wasm_compat::WasmBoxedFuture;
 use rig_memory::{InMemoryConversationMemory, TokenWindowMemory};
 
@@ -63,6 +63,49 @@ const CHARS_PER_TOKEN: usize = 3;
 /// every node here ends by filling a JSON schema, so the test for "did this summary keep enough" is
 /// whether the node can still fill its schema from it — not whether it reads well.
 const PREAMBLE: &str = include_str!("../prompts/compaction.md");
+
+/// A run-local conversation that is reduced to one summary before its next attempt.
+///
+/// `rig` retains every tool call and result in its conversation memory. The normal compaction
+/// budget is deliberately generous for a single long-running attempt, but a re-driven node needs
+/// a small hand-off rather than the entire previous attempt. A zero-token window demotes the whole
+/// completed attempt when the next one loads this memory, and the compactor replaces it with one
+/// summary. This state deliberately lives in the node instance: it is scoped to one run and cannot
+/// leak into a later run that happens to use the same route.
+#[derive(Clone, Default)]
+pub struct CompactedSession {
+    memory: Arc<Mutex<Option<Arc<dyn ConversationMemory>>>>,
+}
+
+impl CompactedSession {
+    /// Return the one memory backend shared by every attempt of this node.
+    pub fn memory<M>(
+        &self,
+        model: M,
+        node: &str,
+        produces: &str,
+        ledger: Option<Arc<crate::RunLedger>>,
+    ) -> Arc<dyn ConversationMemory>
+    where
+        M: CompletionModel + 'static,
+    {
+        let mut slot = self
+            .memory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(memory) = &*slot {
+            return Arc::clone(memory);
+        }
+
+        // Each stored message costs at least one token, so this window carries no raw history into
+        // a re-entry. CompactingMemory retains its rolling summary separately and includes it in
+        // the following compaction, preserving facts from every earlier attempt.
+        let memory: Arc<dyn ConversationMemory> =
+            Arc::new(compacting_memory(model, node, produces, 0, ledger));
+        *slot = Some(Arc::clone(&memory));
+        memory
+    }
+}
 
 /// Summarises evicted turns with a model call.
 pub struct SummaryCompactor<M> {

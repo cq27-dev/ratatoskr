@@ -175,9 +175,10 @@ impl VerifierNode {
                 push: None,
                 conversation: None,
                 ledger: self.ledger.clone(),
-                produces: Some(
-                    "findings on the diff — each with a severity, a plan/execution kind, and a concrete failure scenario — or none",
-                ),
+            produces: Some(
+                "findings on the diff — each with a severity, a plan/execution kind, and a concrete failure scenario — or none",
+            ),
+            compacted_session: None,
             },
             "verifier",
         )
