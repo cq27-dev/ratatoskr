@@ -65,7 +65,6 @@ impl Stage {
         platform_invariants: &str,
         profile: &AgentProfile,
         repository_guidance: &str,
-        runtime_input: &str,
     ) -> String {
         [
             platform_invariants,
@@ -77,7 +76,6 @@ impl Stage {
             } else {
                 ""
             },
-            runtime_input,
         ]
         .into_iter()
         .filter(|part| !part.is_empty())

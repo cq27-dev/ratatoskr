@@ -60,7 +60,9 @@ impl ChildTask {
         })
     }
 
-    /// Deserialize the child's evidence at its parent boundary.
+    /// Deserialize the child's schema-validated output at its parent boundary without narrowing
+    /// its JSON shape. A declared contract can validly produce an array or scalar as well as an
+    /// object, and the parent must preserve that evidence exactly.
     pub fn evidence<T: DeserializeOwned>(&self, output: Value) -> Result<T, PlanError> {
         serde_json::from_value(output).map_err(|error| {
             PlanError::Configuration(format!(
@@ -68,5 +70,30 @@ impl ChildTask {
                 self.target, self.evidence_contract, self.parent
             ))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn task() -> ChildTask {
+        ChildTask {
+            parent: "parent".to_string(),
+            target: "child".to_string(),
+            input: json!(null),
+            evidence_contract: "Evidence".to_string(),
+            capabilities: None,
+        }
+    }
+
+    #[test]
+    fn evidence_preserves_contract_valid_non_object_json() {
+        for evidence in [json!(["one", "two"]), json!("a scalar"), json!(42)] {
+            let preserved: Value = task().evidence(evidence.clone()).unwrap();
+            assert_eq!(preserved, evidence);
+        }
     }
 }

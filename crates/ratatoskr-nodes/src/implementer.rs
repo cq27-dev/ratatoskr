@@ -458,6 +458,12 @@ mod tests {
         assert!(p.contains("stopping is a claim"), "when to stop");
         assert!(p.contains("exactly once"), "Edit's uniqueness contract");
         assert!(p.contains("diagnostic"), "the re-driven path");
+        assert!(p.contains("git status --short"), "recovering prior edits");
+        assert!(p.contains("git diff --cached"), "recovering staged edits");
+        assert!(
+            p.contains("git mv") && p.contains("git rm"),
+            "tracked file moves and removals"
+        );
         // It can ask, and is told what is worth asking about. The failure this guards against is a
         // prompt that says a question produces nothing while the node holds an `ask` tool — a node
         // told not to ask will not ask, however wired it is, and the one case where asking clearly

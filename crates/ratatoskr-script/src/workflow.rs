@@ -459,6 +459,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reference_workflow_declares_a_schema_checked_stage() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/workflow.ts");
+        let runtime = WorkflowRuntime::load(&path).await.unwrap().unwrap();
+        let meta = runtime.meta();
+
+        assert_eq!(meta.name, "standard");
+        assert_eq!(meta.stages.len(), 1);
+        let requirements = &meta.stages[0];
+        assert_eq!(requirements.id, "requirements");
+        assert_eq!(requirements.agent, "requirements");
+        assert_eq!(requirements.capabilities, [Capability::Read]);
+        assert!(requirements.output_schema.is_some());
+    }
+
+    #[tokio::test]
     async fn a_script_that_declares_nothing_is_named_after_its_file() {
         // What keeps a repo's existing `workflow.ts` working with no edit.
         let dir = scratch("undeclared");

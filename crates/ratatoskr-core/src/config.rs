@@ -1420,4 +1420,25 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn reference_agent_profiles_are_valid_and_isolate_the_declared_stage_route() {
+        let config = RatatoskrConfig::from_toml_str(&format!(
+            "[store]\npath = \"state.sqlite3\"\n[worktree]\nroot = \"worktrees\"\n\n{}",
+            include_str!("../../../examples/agent-profiles.toml")
+        ))
+        .unwrap();
+
+        assert_eq!(config.agents["explore"].capabilities, [Capability::Read]);
+        assert_eq!(config.agents["build"].capabilities, [Capability::Write]);
+        assert_eq!(config.agents["publish"].capabilities, [Capability::Publish]);
+        assert!(config.agents["reason"].model.is_none());
+        assert_eq!(
+            config.agents["requirements"]
+                .model
+                .as_ref()
+                .map(|route| route.model.as_str()),
+            Some("claude-sonnet-4-6")
+        );
+    }
 }

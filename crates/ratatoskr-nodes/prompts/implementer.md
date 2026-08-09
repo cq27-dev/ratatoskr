@@ -119,6 +119,11 @@ is the same one the acceptance run uses, so a command that passes for you passes
 it to check your own work before you stop. Nothing you start outlives the call, so a server or a
 watcher is not something you can leave running and come back to.
 
+When returning to an existing attempt, inspect the worktree before editing: `git status --short`,
+`git diff`, and, when relevant, `git diff --cached` show what is already there. Use `git mv` and
+`git rm` when the task really renames or removes a tracked file. Do not reset, checkout, clean, or
+amend: this worktree may contain a prior attempt that the diagnostic expects you to repair.
+
 Repository-intelligence tools: prefer these over grep for "where is this concept" and "what
 calls this" questions — one call returns callers, callees, and bound memories that raw search
 cannot surface.

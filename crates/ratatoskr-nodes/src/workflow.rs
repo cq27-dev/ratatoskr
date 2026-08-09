@@ -850,6 +850,54 @@ fn validate_declared_output(stage: &Stage, output: &serde_json::Value) -> Result
     })
 }
 
+/// Build a declared stage's cached guidance in the order that governs its runtime input.
+///
+/// Runtime data deliberately stays out of this preamble: [`declared_stage_question`] puts it in
+/// the user message after platform, agent, stage, repository, plugin, and skill guidance.
+fn declared_stage_preamble(
+    stage: &Stage,
+    profile: &crate::AgentProfile,
+    system_prompt: Option<&str>,
+    repository_guidance: &str,
+    plugin_context: Option<&str>,
+    skills: &[ratatoskr_plugin::Skill],
+) -> String {
+    let stage_guidance = match system_prompt {
+        Some(instructions) => [
+            "Return JSON matching the declared output contract.",
+            profile.base_prompt.as_str(),
+            instructions,
+            if stage.append_repository_guidance {
+                repository_guidance
+            } else {
+                ""
+            },
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n"),
+        None => stage.prompt(
+            "Return JSON matching the declared output contract.",
+            profile,
+            repository_guidance,
+        ),
+    };
+    let base = [stage_guidance.as_str(), plugin_context.unwrap_or_default()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    crate::effective_preamble(&stage.id, &base, None, None, skills)
+}
+
+fn declared_stage_question(stage: &Stage, runtime_input_json: &str) -> String {
+    format!(
+        "Input contract: {}\nOutput contract: {}\n\n{runtime_input_json}",
+        stage.input_contract, stage.output_contract
+    )
+}
+
 async fn declared_stage_host(
     ctx: Arc<WorkflowContext>,
     stage: Stage,
@@ -872,81 +920,51 @@ async fn declared_stage_host(
     .map_err(|e| e.to_string())?;
 
     // A child is evidence within its parent's call, never a second checkpointed graph stage.
-    let runtime_input =
-        if let Some(delegation) = stage.delegation.as_ref().filter(|_| checkpoint_output) {
-            let target = stages
-                .iter()
-                .find(|candidate| candidate.id == delegation.target)
-                .ok_or_else(|| {
-                    format!(
-                        "stage `{}` delegates to missing `{}`",
-                        stage.id, delegation.target
-                    )
-                })?
-                .clone();
-            let target_profile = crate::agent_profiles(&ctx.config)
-                .into_iter()
-                .find(|candidate| candidate.id == target.agent)
-                .ok_or_else(|| format!("stage `{}` has no agent `{}`", target.id, target.agent))?;
-            let task = ChildTask::spawn(&stage, &profile, &target, &target_profile, input.clone())
-                .map_err(|e| e.to_string())?;
-            let child = Box::pin(declared_stage_host(
-                Arc::clone(&ctx),
-                target,
-                Arc::clone(&stages),
-                serde_json::to_string(&task.input).map_err(|e| e.to_string())?,
-                false,
-            ))
-            .await?;
-            let child_output: serde_json::Value =
-                serde_json::from_str(&child).map_err(|e| e.to_string())?;
-            let evidence = if task.evidence_contract.is_empty() {
-                child_output
-            } else {
-                let evidence: serde_json::Map<String, serde_json::Value> =
-                    task.evidence(child_output).map_err(|e| e.to_string())?;
-                serde_json::Value::Object(evidence)
-            };
-            json!({ "input": input, "child_evidence": evidence })
-        } else {
-            input
-        };
+    let runtime_input = if let Some(delegation) =
+        stage.delegation.as_ref().filter(|_| checkpoint_output)
+    {
+        let target = stages
+            .iter()
+            .find(|candidate| candidate.id == delegation.target)
+            .ok_or_else(|| {
+                format!(
+                    "stage `{}` delegates to missing `{}`",
+                    stage.id, delegation.target
+                )
+            })?
+            .clone();
+        let target_profile = crate::agent_profiles(&ctx.config)
+            .into_iter()
+            .find(|candidate| candidate.id == target.agent)
+            .ok_or_else(|| format!("stage `{}` has no agent `{}`", target.id, target.agent))?;
+        let task = ChildTask::spawn(&stage, &profile, &target, &target_profile, input.clone())
+            .map_err(|e| e.to_string())?;
+        let child = Box::pin(declared_stage_host(
+            Arc::clone(&ctx),
+            target,
+            Arc::clone(&stages),
+            serde_json::to_string(&task.input).map_err(|e| e.to_string())?,
+            false,
+        ))
+        .await?;
+        let child_output: serde_json::Value =
+            serde_json::from_str(&child).map_err(|e| e.to_string())?;
+        let evidence: serde_json::Value = task.evidence(child_output).map_err(|e| e.to_string())?;
+        json!({ "input": input, "child_evidence": evidence })
+    } else {
+        input
+    };
     let runtime_input_json = serde_json::to_string(&runtime_input).map_err(|e| e.to_string())?;
     let repository_guidance = crate::repo_conventions(&ctx.repo_path).unwrap_or_default();
-    let prompt = match cfg.system_prompt.as_deref() {
-        Some(instructions) => [
-            "Return JSON matching the declared output contract.",
-            profile.base_prompt.as_str(),
-            instructions,
-            if stage.append_repository_guidance {
-                &repository_guidance
-            } else {
-                ""
-            },
-            runtime_input_json.as_str(),
-        ]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n"),
-        None => stage.prompt(
-            "Return JSON matching the declared output contract.",
-            &profile,
-            &repository_guidance,
-            &runtime_input_json,
-        ),
-    };
-    let question = format!(
-        "Input contract: {}\nOutput contract: {}\n\n{runtime_input_json}",
-        stage.input_contract, stage.output_contract
-    );
-    let preamble = crate::effective_preamble(
-        &stage.id,
-        &prompt,
-        None,
+    let preamble = declared_stage_preamble(
+        &stage,
+        &profile,
+        cfg.system_prompt.as_deref(),
+        &repository_guidance,
         plugins.context.as_deref(),
         &plugins.skills,
     );
+    let question = declared_stage_question(&stage, &runtime_input_json);
     let output_schema = stage
         .output_schema
         .clone()
@@ -1313,6 +1331,53 @@ mod tests {
         assert!(validate_declared_output(&stage, &json!("evidence")).is_err());
         assert!(validate_declared_output(&stage, &json!({ "unrelated": true })).is_err());
         assert!(validate_declared_output(&stage, &json!({ "finding": "validated" })).is_ok());
+    }
+
+    #[test]
+    fn declared_stage_guidance_precedes_runtime_input() {
+        let mut stage = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        stage.instructions = "stage instructions".to_string();
+        stage.context = "stage context".to_string();
+        let mut profile = crate::built_in_agents()
+            .into_iter()
+            .find(|profile| profile.id == "reason")
+            .unwrap();
+        profile.base_prompt = "agent prompt".to_string();
+        let skills = [ratatoskr_plugin::Skill {
+            name: "review-skill".to_string(),
+            description: "review declared outputs".to_string(),
+            body: String::new(),
+            dir: PathBuf::new(),
+        }];
+        let preamble = declared_stage_preamble(
+            &stage,
+            &profile,
+            None,
+            "repository guidance",
+            Some("plugin context"),
+            &skills,
+        );
+        let question = declared_stage_question(&stage, r#"{"runtime":"input"}"#);
+        let full_prompt = format!("{preamble}\n\n{question}");
+
+        for (earlier, later) in [
+            ("Return JSON", "agent prompt"),
+            ("agent prompt", "stage instructions"),
+            ("stage instructions", "stage context"),
+            ("stage context", "repository guidance"),
+            ("repository guidance", "plugin context"),
+            ("plugin context", "Available skills:"),
+            ("Available skills:", r#"{"runtime":"input"}"#),
+        ] {
+            assert!(
+                full_prompt.find(earlier) < full_prompt.find(later),
+                "expected `{earlier}` before `{later}` in {full_prompt}"
+            );
+        }
+        assert!(!preamble.contains(r#"{"runtime":"input"}"#));
     }
 
     #[test]

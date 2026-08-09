@@ -647,6 +647,35 @@ pub(crate) fn stage_agent_config(
     )
 }
 
+/// Resolve the red-team test author. It shares the `redteam` route and ruleset with the optional
+/// classifier, but its fixed job is to write tests into the pre-implementation worktree. The
+/// classifier stage's read ceiling must therefore not remove `Write` or `Edit` from the author.
+pub(crate) fn redteam_author_agent_config(
+    engine: &Arc<ScriptEngine>,
+    config: &RatatoskrConfig,
+    tools: ToolSet,
+    default_tools: &[&str],
+    plugins: &mut NodePlugins,
+) -> Result<NodeAgentConfig, PlanError> {
+    let profile = stage_profile(config, "redteam");
+    plugins.profile_prompt = profile
+        .as_ref()
+        .map_or_else(String::new, |profile| profile.base_prompt.clone());
+    let capabilities = [Capability::Write];
+    node_agent_config(
+        engine,
+        config,
+        tools,
+        "redteam",
+        default_tools,
+        plugins,
+        AgentSettings {
+            capabilities: &capabilities,
+            profile,
+        },
+    )
+}
+
 /// Resolve a declared workflow stage through the profile it names.
 pub(crate) fn declared_stage_agent_config(
     engine: &Arc<ScriptEngine>,
@@ -757,6 +786,36 @@ mod tests {
                 cfg.policy.unwrap().decide("Write", "{}").await,
                 ToolDecision::Deny(reason) if reason == "profile policy"
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn redteam_test_author_retains_its_write_tools() {
+        let engine = binding_engine("redteam-author-writes", "").await;
+        let mut config = RatatoskrConfig::default();
+        let route = config.models["analyst"].clone();
+        config.models.insert("redteam".to_string(), route);
+        let mut tools = ToolSet::default();
+        tools
+            .local()
+            .tools
+            .extend(ratatoskr_agent::files::edit_declarations());
+
+        let cfg = redteam_author_agent_config(
+            &engine,
+            &config,
+            tools,
+            crate::redteam::AUTHOR_TOOLS,
+            &mut NodePlugins::default(),
+        )
+        .unwrap();
+
+        for required in [ratatoskr_agent::files::WRITE, ratatoskr_agent::files::EDIT] {
+            assert!(
+                cfg.tools.names().iter().any(|name| name == required),
+                "the red-team test author needs {required}: {:?}",
+                cfg.tools.names()
+            );
         }
     }
 

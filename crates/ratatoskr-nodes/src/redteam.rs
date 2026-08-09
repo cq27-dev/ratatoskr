@@ -21,6 +21,17 @@ use crate::testrun::{Acceptance, Characterizer, by_exit_code, run_acceptance};
 /// rag-rat tools the classifier may use to inspect the failing tests' code.
 pub const CLASSIFIER_TOOLS: &[&str] = &["symbol_lookup", "semantic_search"];
 
+/// Tools required by the test author, which writes its contracted tests before implementation.
+pub const AUTHOR_TOOLS: &[&str] = &[
+    "symbol_lookup",
+    "semantic_search",
+    ratatoskr_agent::files::READ,
+    ratatoskr_agent::files::GREP,
+    ratatoskr_agent::files::GLOB,
+    ratatoskr_agent::files::WRITE,
+    ratatoskr_agent::files::EDIT,
+];
+
 const CLASSIFY_PREAMBLE: &str = include_str!("../prompts/redteam-classifier.md");
 
 /// One baseline failure's classification. Additive context, not part of the strict pass/fail.

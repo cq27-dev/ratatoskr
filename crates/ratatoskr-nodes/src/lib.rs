@@ -2159,16 +2159,13 @@ pub(crate) fn build_converge_agents(
                     .local()
                     .tools
                     .extend(ratatoskr_agent::files::edit_declarations());
-                let mut names: Vec<&str> = redteam::CLASSIFIER_TOOLS.to_vec();
-                names.extend([
-                    ratatoskr_agent::files::READ,
-                    ratatoskr_agent::files::GREP,
-                    ratatoskr_agent::files::GLOB,
-                    ratatoskr_agent::files::WRITE,
-                    ratatoskr_agent::files::EDIT,
-                ]);
-                let cfg =
-                    stage_agent_config(engine, config, tools, "redteam", &names, &mut plugins)?;
+                let cfg = plugins::redteam_author_agent_config(
+                    engine,
+                    config,
+                    tools,
+                    redteam::AUTHOR_TOOLS,
+                    &mut plugins,
+                )?;
                 Some(redteam::TestAuthor {
                     route: cfg.route,
                     tools: cfg.tools,
