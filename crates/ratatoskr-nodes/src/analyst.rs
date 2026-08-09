@@ -210,9 +210,10 @@ impl Node for AnalystNode {
         let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
             node: "analyst",
             route: &self.route,
-            preamble: &crate::effective_preamble(
+            preamble: &crate::effective_preamble_with_profile(
                 "analyst",
                 PREAMBLE,
+                self.plugins.profile_prompt.as_str(),
                 self.system_prompt.as_deref(),
                 self.plugins.context.as_deref(),
                 &self.plugins.skills,

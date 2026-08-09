@@ -542,7 +542,7 @@ async fn plan(
         .with_context(|| format!("opening store at {}", config.store.path.display()))?;
     let client = connect_rag_rat(&config.rag_rat).await?;
 
-    let engine = load_rules().await?;
+    let engine = load_rules(&config).await?;
     let run_id = uuid::Uuid::new_v4().to_string();
     let result = ratatoskr_nodes::run_plan(ratatoskr_nodes::RunRequest {
         client: client.as_ref(),
@@ -627,7 +627,7 @@ async fn run_cmd(
         .with_context(|| format!("opening store at {}", config.store.path.display()))?;
     let client = connect_rag_rat(&config.rag_rat).await?;
 
-    let engine = load_rules().await?;
+    let engine = load_rules(&config).await?;
     let run_id = match run_id {
         // Reusing an id would interleave this run's checkpoints with the existing run's, since
         // the run row is an upsert and checkpoints are an unconstrained append.
@@ -678,7 +678,7 @@ async fn bookkeep(run_id: &str, config_path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("opening store at {}", config.store.path.display()))?;
     let client = connect_rag_rat(&config.rag_rat).await?;
 
-    let engine = load_rules().await?;
+    let engine = load_rules(&config).await?;
     let result = ratatoskr_nodes::run_bookkeeper(client.as_ref(), &config, &store, run_id, &engine)
         .instrument(tracing::info_span!("run", run_id = %run_id))
         .await;
@@ -1589,7 +1589,10 @@ async fn workflows() -> anyhow::Result<()> {
 /// The allowed set is the built-in nodes plus what every defined workflow declares — the union,
 /// because rulesets load before a workflow is selected. Validating here rather than at first use
 /// keeps a typo an error at startup instead of a node that silently ignores its ruleset.
-async fn load_rules() -> anyhow::Result<std::sync::Arc<ratatoskr_script::ScriptEngine>> {
+async fn load_rules(
+    config: &RatatoskrConfig,
+) -> anyhow::Result<std::sync::Arc<ratatoskr_script::ScriptEngine>> {
+    ratatoskr_nodes::validate_configured_stages(config).await?;
     let engine = ratatoskr_script::ScriptEngine::load(Path::new(".ratatoskr/rules"))
         .await
         .context("loading .ratatoskr/rules")?;

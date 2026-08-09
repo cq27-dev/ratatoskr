@@ -16,6 +16,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use ratatoskr_core::Capability;
 use rquickjs::promise::{Promise, Promised};
 use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Function};
 
@@ -48,7 +49,7 @@ globalThis.defineWorkflow = function (meta) {
         throw new Error("defineWorkflow: `name` is required");
     }
     for (var k in meta) {
-        if (k !== "name" && k !== "purpose" && k !== "whenToUse" && k !== "nodes") {
+        if (k !== "name" && k !== "purpose" && k !== "whenToUse" && k !== "nodes" && k !== "stages") {
             throw new Error("defineWorkflow: unknown key '" + k + "'");
         }
     }
@@ -56,7 +57,8 @@ globalThis.defineWorkflow = function (meta) {
         name: meta.name,
         purpose: meta.purpose || "",
         whenToUse: meta.whenToUse || [],
-        nodes: meta.nodes || []
+        nodes: meta.nodes || [],
+        stages: meta.stages || []
     };
 };
 globalThis.__workflowMeta = function () {
@@ -89,6 +91,50 @@ pub struct WorkflowMeta {
     /// rather than read as a typo.
     #[serde(default)]
     pub nodes: Vec<String>,
+    /// Ordered user-defined stages. Their contracts are checked at startup before a run starts.
+    #[serde(default)]
+    pub stages: Vec<WorkflowStage>,
+}
+
+/// A serializable stage declaration kept in the script crate so workflow metadata remains independent
+/// of concrete node implementations.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowStage {
+    #[serde(alias = "name")]
+    pub id: String,
+    pub agent: String,
+    #[serde(default, alias = "input")]
+    pub input_contract: String,
+    #[serde(default, alias = "output")]
+    pub output_contract: String,
+    /// JSON Schema that enforces the declared output contract at the model and checkpoint gates.
+    #[serde(default)]
+    pub output_schema: Option<serde_json::Value>,
+    #[serde(default)]
+    pub instructions: String,
+    #[serde(default)]
+    pub context: String,
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+    #[serde(default)]
+    pub delegation: Option<WorkflowDelegation>,
+    #[serde(default = "default_append_repository_guidance")]
+    pub append_repository_guidance: bool,
+}
+
+fn default_append_repository_guidance() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowDelegation {
+    pub target: String,
+    #[serde(default)]
+    pub evidence_contract: String,
+    #[serde(default)]
+    pub input_limit: usize,
 }
 
 /// A loaded workflow script: the resident JS context plus the transpiled source.
@@ -130,6 +176,7 @@ impl WorkflowRuntime {
             purpose: String::new(),
             when_to_use: Vec::new(),
             nodes: Vec::new(),
+            stages: Vec::new(),
         });
 
         Ok(Some(WorkflowRuntime {
@@ -409,6 +456,22 @@ mod tests {
         // Selection is a matching problem, so the concrete cases are the part that carries.
         assert_eq!(meta.when_to_use.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reference_workflow_declares_a_schema_checked_stage() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/workflow.ts");
+        let runtime = WorkflowRuntime::load(&path).await.unwrap().unwrap();
+        let meta = runtime.meta();
+
+        assert_eq!(meta.name, "standard");
+        assert_eq!(meta.stages.len(), 1);
+        let requirements = &meta.stages[0];
+        assert_eq!(requirements.id, "requirements");
+        assert_eq!(requirements.agent, "requirements");
+        assert_eq!(requirements.capabilities, [Capability::Read]);
+        assert!(requirements.output_schema.is_some());
     }
 
     #[tokio::test]

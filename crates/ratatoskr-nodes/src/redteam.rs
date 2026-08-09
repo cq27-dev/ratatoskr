@@ -21,6 +21,17 @@ use crate::testrun::{Acceptance, Characterizer, by_exit_code, run_acceptance};
 /// rag-rat tools the classifier may use to inspect the failing tests' code.
 pub const CLASSIFIER_TOOLS: &[&str] = &["symbol_lookup", "semantic_search"];
 
+/// Tools required by the test author, which writes its contracted tests before implementation.
+pub const AUTHOR_TOOLS: &[&str] = &[
+    "symbol_lookup",
+    "semantic_search",
+    ratatoskr_agent::files::READ,
+    ratatoskr_agent::files::GREP,
+    ratatoskr_agent::files::GLOB,
+    ratatoskr_agent::files::WRITE,
+    ratatoskr_agent::files::EDIT,
+];
+
 const CLASSIFY_PREAMBLE: &str = include_str!("../prompts/redteam-classifier.md");
 
 /// One baseline failure's classification. Additive context, not part of the strict pass/fail.
@@ -93,9 +104,10 @@ impl RedTeamClassifier {
         let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
             node: "redteam",
             route: &self.route,
-            preamble: &crate::effective_preamble(
+            preamble: &crate::effective_preamble_with_profile(
                 "redteam",
                 CLASSIFY_PREAMBLE,
+                self.plugins.profile_prompt.as_str(),
                 self.system_prompt.as_deref(),
                 self.plugins.context.as_deref(),
                 &self.plugins.skills,
@@ -178,9 +190,10 @@ impl TestAuthor {
             preamble: &crate::with_conventions(
                 "redteam",
                 self.conventions.as_deref(),
-                crate::effective_preamble(
+                crate::effective_preamble_with_profile(
                     "redteam",
                     AUTHOR_PREAMBLE,
+                    self.plugins.profile_prompt.as_str(),
                     self.system_prompt.as_deref(),
                     self.plugins.context.as_deref(),
                     &self.plugins.skills,

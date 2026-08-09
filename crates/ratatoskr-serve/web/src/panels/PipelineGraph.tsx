@@ -40,6 +40,13 @@ const LANE_GAP = 62;
 const COLUMN_PITCH = NODE_SIZE.width + COLUMN_GAP;
 const LANE_PITCH = NODE_SIZE.height + LANE_GAP;
 
+function stageLabel(id: string): string {
+  return id
+    .split("_")
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
 function position(node: NodeView, lanesInStage: number, maxLanes: number) {
   const offset = (maxLanes - lanesInStage) / 2;
   return {
@@ -216,7 +223,7 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
           Unnamed, the stage edges vanished intermittently on re-render. */}
       <Handle type="target" id="in" position={Position.Left} isConnectable={false} />
       <div className="node-name">
-        <span>{node.name.replace("_", " ")}</span>
+        <span>{stageLabel(node.name)}</span>
         <span className="dot" aria-hidden="true" />
       </div>
       <div className="node-meta">

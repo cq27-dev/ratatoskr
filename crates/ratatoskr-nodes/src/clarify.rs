@@ -26,7 +26,7 @@ use rmcp::model::Tool;
 use serde_json::{Value, json};
 use tracing::Instrument;
 
-use crate::{checkpoint, node_agent_config};
+use crate::{checkpoint, stage_agent_config};
 
 /// Total `ask` calls allowed per run — a runaway backstop. Answerers get no `ask` tool, so this is a
 /// flat per-run budget, not a recursion depth.
@@ -218,14 +218,15 @@ impl NodeClarifier {
 
         // Only the route matters here; answer mode runs with no tools. Label with the RESOLVED
         // answerer (not the raw `to`), so a fallback to analyst isn't misattributed.
-        let (route, system_prompt) = match node_agent_config(
+        let mut plugins = crate::NodePlugins::default();
+        let (route, system_prompt) = match stage_agent_config(
             &self.engine,
             &self.config,
             ToolSet::default(),
             answerer,
             &[],
             // Answer mode runs with no tools at all, so no skills either.
-            &crate::NodePlugins::default(),
+            &mut plugins,
         ) {
             Ok(cfg) => (cfg.route, cfg.system_prompt),
             Err(_) => {
@@ -239,8 +240,14 @@ impl NodeClarifier {
         // A ruleset `systemPrompt` replaces the node's *persona*, but the answer-mode contract is
         // this call site's own and always applies — otherwise a scout-shaped prompt would make the
         // answerer go scout instead of answering.
-        let persona = system_prompt
-            .unwrap_or_else(|| format!("You are the {answerer} in a code-planning pipeline."));
+        let persona = match (plugins.profile_prompt.as_str(), system_prompt) {
+            ("", Some(prompt)) => prompt,
+            ("", None) => format!("You are the {answerer} in a code-planning pipeline."),
+            (profile, Some(prompt)) => format!("{profile}\n\n{prompt}"),
+            (profile, None) => {
+                format!("{profile}\n\nYou are the {answerer} in a code-planning pipeline.")
+            }
+        };
         let preamble = format!(
             "{persona}\n\nA peer node is asking you a question mid-run. Answer it concisely and \
              concretely from the context you are given; if you cannot answer from what you have, \

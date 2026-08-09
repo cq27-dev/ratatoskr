@@ -31,10 +31,10 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use crate::{
-    AnalystNode, AnalystOutput, BookkeeperInput, BookkeeperNode, BookkeeperOutput, ImplementerNode,
-    ImplementerOutput, MemoryNode, MemoryOutput, PlanError, PlanOutcome, RedTeamNode,
-    RedTeamOutput, RunOutcome, ScoutNode, ScoutOutput, analyst, bookkeeper, checkpoint, converge,
-    memory, node_agent_config, redteam, referee, scout, verifier,
+    AnalystNode, AnalystOutput, BookkeeperInput, BookkeeperNode, BookkeeperOutput, ChildTask,
+    ImplementerNode, ImplementerOutput, MemoryNode, MemoryOutput, PlanError, PlanOutcome,
+    RedTeamNode, RedTeamOutput, RunOutcome, ScoutNode, ScoutOutput, Stage, analyst, bookkeeper,
+    checkpoint, converge, memory, redteam, referee, scout, stage_agent_config, verifier,
 };
 
 /// Backstop on total node-running binding calls per run — a runaway-loop guard, far above any real
@@ -282,14 +282,14 @@ where
 async fn scout_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
     ctx.guard()?;
     let issue: String = serde_json::from_str(&arg).map_err(|e| format!("scout arg: {e}"))?;
-    let plugins = ctx.plugin_context.for_node("scout");
-    let cfg = node_agent_config(
+    let mut plugins = ctx.plugin_context.for_node("scout");
+    let cfg = stage_agent_config(
         &ctx.engine,
         &ctx.config,
         ctx.plugin_context.pool_for("scout", ctx.rag_rat.clone()),
         "scout",
         scout::SCOUT_TOOLS,
-        &plugins,
+        &mut plugins,
     )
     .map_err(|e| e.to_string())?;
     let node = ScoutNode {
@@ -331,14 +331,14 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
     ctx.guard()?;
     let input: analyst::AnalystInput =
         serde_json::from_str(&arg).map_err(|e| format!("analyze arg: {e}"))?;
-    let plugins = ctx.plugin_context.for_node("analyst");
-    let cfg = node_agent_config(
+    let mut plugins = ctx.plugin_context.for_node("analyst");
+    let cfg = stage_agent_config(
         &ctx.engine,
         &ctx.config,
         ctx.plugin_context.pool_for("analyst", ctx.rag_rat.clone()),
         "analyst",
         analyst::ANALYST_TOOLS,
-        &plugins,
+        &mut plugins,
     )
     .map_err(|e| e.to_string())?;
     let node = AnalystNode {
@@ -371,14 +371,14 @@ fn build_red_team(
     let short: String = ctx.run_id.chars().take(8).collect();
     let classifier = match crate::classifier_enabled(&ctx.engine, &ctx.config) {
         true => {
-            let plugins = ctx.plugin_context.for_node("redteam");
-            let cfg = node_agent_config(
+            let mut plugins = ctx.plugin_context.for_node("redteam");
+            let cfg = stage_agent_config(
                 &ctx.engine,
                 &ctx.config,
                 ctx.plugin_context.pool_for("redteam", ctx.rag_rat.clone()),
                 "redteam",
                 redteam::CLASSIFIER_TOOLS,
-                &plugins,
+                &mut plugins,
             )?;
             Some(redteam::RedTeamClassifier {
                 route: cfg.route,
@@ -724,14 +724,14 @@ async fn verify_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, S
         .await
         .map_err(|e| e.to_string())?;
 
-    let plugins = ctx.plugin_context.for_node("verifier");
-    let cfg = node_agent_config(
+    let mut plugins = ctx.plugin_context.for_node("verifier");
+    let cfg = stage_agent_config(
         &ctx.engine,
         &ctx.config,
         ctx.plugin_context.pool_for("verifier", ctx.rag_rat.clone()),
         "verifier",
         verifier::VERIFIER_TOOLS,
-        &plugins,
+        &mut plugins,
     )
     .map_err(|e| e.to_string())?;
     let node = verifier::VerifierNode {
@@ -800,14 +800,14 @@ async fn verify_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, S
 async fn context_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
     ctx.guard()?;
     let issue: String = serde_json::from_str(&arg).map_err(|e| format!("context arg: {e}"))?;
-    let plugins = ctx.plugin_context.for_node("context");
-    let cfg = node_agent_config(
+    let mut plugins = ctx.plugin_context.for_node("context");
+    let cfg = stage_agent_config(
         &ctx.engine,
         &ctx.config,
         ctx.plugin_context.pool_for("context", ctx.rag_rat.clone()),
         "context",
         crate::context::CONTEXT_TOOLS,
-        &plugins,
+        &mut plugins,
     )
     .map_err(|e| e.to_string())?;
     let node = crate::ContextNode {
@@ -827,10 +827,205 @@ async fn context_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
-fn build_hosts(ctx: &Arc<WorkflowContext>) -> HashMap<String, HostFn> {
+fn validate_declared_output(stage: &Stage, output: &serde_json::Value) -> Result<(), String> {
+    let Some(schema) = stage.output_schema.as_ref() else {
+        if stage.output_contract.is_empty() {
+            return Ok(());
+        }
+        return Err(format!(
+            "stage `{}` declares output contract `{}` without outputSchema",
+            stage.id, stage.output_contract
+        ));
+    };
+    ratatoskr_graph::validate_value(output, schema).map_err(|e| {
+        format!(
+            "stage `{}` returned invalid `{}` output: {e}",
+            stage.id, stage.output_contract
+        )
+    })
+}
+
+/// Build a declared stage's cached guidance in the order that governs its runtime input.
+///
+/// Runtime data deliberately stays out of this preamble: [`declared_stage_question`] puts it in
+/// the user message after platform, agent, stage, repository, plugin, and skill guidance.
+fn declared_stage_preamble(
+    stage: &Stage,
+    profile: &crate::AgentProfile,
+    system_prompt: Option<&str>,
+    repository_guidance: &str,
+    plugin_context: Option<&str>,
+    skills: &[ratatoskr_plugin::Skill],
+) -> String {
+    let stage_guidance = match system_prompt {
+        Some(instructions) => [
+            "Return JSON matching the declared output contract.",
+            profile.base_prompt.as_str(),
+            instructions,
+            if stage.append_repository_guidance {
+                repository_guidance
+            } else {
+                ""
+            },
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n"),
+        None => stage.prompt(
+            "Return JSON matching the declared output contract.",
+            profile,
+            repository_guidance,
+        ),
+    };
+    let base = [stage_guidance.as_str(), plugin_context.unwrap_or_default()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    crate::effective_preamble(&stage.id, &base, None, None, skills)
+}
+
+fn declared_stage_question(stage: &Stage, runtime_input_json: &str) -> String {
+    format!(
+        "Input contract: {}\nOutput contract: {}\n\n{runtime_input_json}",
+        stage.input_contract, stage.output_contract
+    )
+}
+
+async fn declared_stage_host(
+    ctx: Arc<WorkflowContext>,
+    stage: Stage,
+    stages: Arc<Vec<Stage>>,
+    arg: String,
+    checkpoint_output: bool,
+) -> Result<String, String> {
+    ctx.guard()?;
+    let input: serde_json::Value =
+        serde_json::from_str(&arg).map_err(|e| format!("{} arg: {e}", stage.id))?;
+    let plugins = ctx.plugin_context.for_node(&stage.id);
+    let (cfg, profile) = crate::plugins::declared_stage_agent_config(
+        &ctx.engine,
+        &ctx.config,
+        ctx.plugin_context.pool_for(&stage.id, ctx.rag_rat.clone()),
+        &stage,
+        &[],
+        &plugins,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // A child is evidence within its parent's call, never a second checkpointed graph stage.
+    let runtime_input = if let Some(delegation) =
+        stage.delegation.as_ref().filter(|_| checkpoint_output)
+    {
+        let target = stages
+            .iter()
+            .find(|candidate| candidate.id == delegation.target)
+            .ok_or_else(|| {
+                format!(
+                    "stage `{}` delegates to missing `{}`",
+                    stage.id, delegation.target
+                )
+            })?
+            .clone();
+        let target_profile = crate::agent_profiles(&ctx.config)
+            .into_iter()
+            .find(|candidate| candidate.id == target.agent)
+            .ok_or_else(|| format!("stage `{}` has no agent `{}`", target.id, target.agent))?;
+        let task = ChildTask::spawn(&stage, &profile, &target, &target_profile, input.clone())
+            .map_err(|e| e.to_string())?;
+        let child = Box::pin(declared_stage_host(
+            Arc::clone(&ctx),
+            target,
+            Arc::clone(&stages),
+            serde_json::to_string(&task.input).map_err(|e| e.to_string())?,
+            false,
+        ))
+        .await?;
+        let child_output: serde_json::Value =
+            serde_json::from_str(&child).map_err(|e| e.to_string())?;
+        let evidence: serde_json::Value = task.evidence(child_output).map_err(|e| e.to_string())?;
+        json!({ "input": input, "child_evidence": evidence })
+    } else {
+        input
+    };
+    let runtime_input_json = serde_json::to_string(&runtime_input).map_err(|e| e.to_string())?;
+    let repository_guidance = crate::repo_conventions(&ctx.repo_path).unwrap_or_default();
+    let preamble = declared_stage_preamble(
+        &stage,
+        &profile,
+        cfg.system_prompt.as_deref(),
+        &repository_guidance,
+        plugins.context.as_deref(),
+        &plugins.skills,
+    );
+    let question = declared_stage_question(&stage, &runtime_input_json);
+    let output_schema = stage
+        .output_schema
+        .clone()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| format!("stage `{}` has invalid outputSchema: {e}", stage.id))?;
+    let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
+        node: &stage.id,
+        route: &cfg.route,
+        preamble: &preamble,
+        question: &question,
+        tools: cfg.tools,
+        output_schema: output_schema.unwrap_or_else(|| schemars::schema_for!(serde_json::Value)),
+        policy: cfg.policy,
+        max_turns: cfg.max_turns,
+        clarifier: None,
+        observer: plugins.observer.clone(),
+        skills: crate::skills::loaded(&plugins.skills, &stage.id),
+        files: cfg.files,
+        shell: None,
+        push: None,
+        conversation: None,
+        ledger: Some(Arc::clone(&ctx.ledger)),
+        produces: Some(&stage.output_contract),
+    })
+    .await
+    .map_err(|e| format!("stage `{}` agent failed: {e}", stage.id))?;
+    let output: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("stage `{}` returned invalid JSON: {e}", stage.id))?;
+    validate_declared_output(&stage, &output)?;
+    if checkpoint_output {
+        note(&ctx, &stage.id, &output, Some(arg)).await?;
+    }
+    serde_json::to_string(&output).map_err(|e| e.to_string())
+}
+
+fn declared_host(ctx: &Arc<WorkflowContext>, stage: Stage, stages: Arc<Vec<Stage>>) -> HostFn {
+    binding(Arc::clone(ctx), move |ctx, arg| {
+        let stage = stage.clone();
+        let stages = Arc::clone(&stages);
+        async move { declared_stage_host(ctx, stage, stages, arg, true).await }
+    })
+}
+
+fn stage_host(ctx: &Arc<WorkflowContext>, stage: Stage, stages: Arc<Vec<Stage>>) -> HostFn {
+    match stage.id.as_str() {
+        "context" => binding(Arc::clone(ctx), context_host),
+        "scout" => binding(Arc::clone(ctx), scout_host),
+        "analyst" => binding(Arc::clone(ctx), analyze_host),
+        "red_team" => binding(Arc::clone(ctx), red_team_host),
+        "implementer" => binding(Arc::clone(ctx), implement_host),
+        "verifier" => binding(Arc::clone(ctx), verify_host),
+        _ => declared_host(ctx, stage, stages),
+    }
+}
+
+fn build_hosts(ctx: &Arc<WorkflowContext>, stages: &[Stage]) -> HashMap<String, HostFn> {
     let mut h = HashMap::new();
-    h.insert("context".into(), binding(Arc::clone(ctx), context_host));
-    h.insert("scout".into(), binding(Arc::clone(ctx), scout_host));
+    let stages = Arc::new(stages.to_vec());
+    for stage in stages.iter() {
+        h.insert(
+            stage.id.clone(),
+            stage_host(ctx, stage.clone(), Arc::clone(&stages)),
+        );
+    }
+    // Legacy workflow.ts names remain aliases for the declared built-in stages.
     h.insert("memory".into(), binding(Arc::clone(ctx), memory_host));
     h.insert("analyze".into(), binding(Arc::clone(ctx), analyze_host));
     h.insert("redTeam".into(), binding(Arc::clone(ctx), red_team_host));
@@ -850,6 +1045,12 @@ fn build_hosts(ctx: &Arc<WorkflowContext>) -> HashMap<String, HostFn> {
         binding(Arc::clone(ctx), newly_introduced_host),
     );
     h
+}
+
+fn execution_stages(runtime: &WorkflowRuntime) -> Vec<Stage> {
+    let mut stages = crate::built_in_stages();
+    stages.extend(crate::stage::stages_from_workflow(runtime.meta()));
+    stages
 }
 
 // --- wrappers (own every status write, gate, and cleanup) -------------------
@@ -874,7 +1075,8 @@ pub async fn run_plan_scripted(
     )
     .await?;
 
-    let hosts = build_hosts(&ctx);
+    let stages = execution_stages(&runtime);
+    let hosts = build_hosts(&ctx, &stages);
     let input = json!({ "issue": ctx.issue }).to_string();
     let result = runtime.run("plan", input, hosts).await;
 
@@ -922,7 +1124,8 @@ pub async fn run_full_scripted(
     )
     .await?;
 
-    let hosts = build_hosts(&ctx);
+    let stages = execution_stages(&runtime);
+    let hosts = build_hosts(&ctx, &stages);
     let input =
         json!({ "issue": ctx.issue, "maxIterations": ctx.config.implementer.max_iterations })
             .to_string();
@@ -1045,15 +1248,15 @@ async fn bookkeep_scripted(
     ctx: &WorkflowContext,
     input: BookkeeperInput,
 ) -> Result<BookkeeperOutput, PlanError> {
-    let plugins = ctx.plugin_context.for_node("bookkeeper");
-    let cfg = node_agent_config(
+    let mut plugins = ctx.plugin_context.for_node("bookkeeper");
+    let cfg = stage_agent_config(
         &ctx.engine,
         &ctx.config,
         ctx.plugin_context
             .pool_for("bookkeeper", ctx.rag_rat.clone()),
         "bookkeeper",
         bookkeeper::BOOKKEEPER_TOOLS,
-        &plugins,
+        &mut plugins,
     )?;
     let node = BookkeeperNode {
         route: cfg.route,
@@ -1106,6 +1309,81 @@ mod tests {
             exit_code: exit,
             narrative: None,
         }
+    }
+
+    #[test]
+    fn declared_contracts_validate_all_json_root_values() {
+        let mut stage = crate::built_in_stages().pop().unwrap();
+        stage.id = "security_evidence".into();
+        stage.output_contract = "SecurityEvidence".into();
+        stage.output_schema = Some(json!({
+            "type": "object",
+            "required": ["finding"],
+            "properties": { "finding": { "type": "string" } }
+        }));
+
+        assert!(validate_declared_output(&stage, &json!({})).is_err());
+        assert!(validate_declared_output(&stage, &json!("evidence")).is_err());
+        assert!(validate_declared_output(&stage, &json!({ "unrelated": true })).is_err());
+        assert!(validate_declared_output(&stage, &json!({ "finding": "validated" })).is_ok());
+
+        stage.output_schema = Some(json!({
+            "type": "array",
+            "items": { "type": "string" }
+        }));
+        assert!(validate_declared_output(&stage, &json!(["validated"])).is_ok());
+        assert!(validate_declared_output(&stage, &json!("not an array")).is_err());
+
+        stage.output_schema = Some(json!({ "type": "integer" }));
+        assert!(validate_declared_output(&stage, &json!(42)).is_ok());
+        assert!(validate_declared_output(&stage, &json!([42])).is_err());
+    }
+
+    #[test]
+    fn declared_stage_guidance_precedes_runtime_input() {
+        let mut stage = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        stage.instructions = "stage instructions".to_string();
+        stage.context = "stage context".to_string();
+        let mut profile = crate::built_in_agents()
+            .into_iter()
+            .find(|profile| profile.id == "reason")
+            .unwrap();
+        profile.base_prompt = "agent prompt".to_string();
+        let skills = [ratatoskr_plugin::Skill {
+            name: "review-skill".to_string(),
+            description: "review declared outputs".to_string(),
+            body: String::new(),
+            dir: PathBuf::new(),
+        }];
+        let preamble = declared_stage_preamble(
+            &stage,
+            &profile,
+            None,
+            "repository guidance",
+            Some("plugin context"),
+            &skills,
+        );
+        let question = declared_stage_question(&stage, r#"{"runtime":"input"}"#);
+        let full_prompt = format!("{preamble}\n\n{question}");
+
+        for (earlier, later) in [
+            ("Return JSON", "agent prompt"),
+            ("agent prompt", "stage instructions"),
+            ("stage instructions", "stage context"),
+            ("stage context", "repository guidance"),
+            ("repository guidance", "plugin context"),
+            ("plugin context", "Available skills:"),
+            ("Available skills:", r#"{"runtime":"input"}"#),
+        ] {
+            assert!(
+                full_prompt.find(earlier) < full_prompt.find(later),
+                "expected `{earlier}` before `{later}` in {full_prompt}"
+            );
+        }
+        assert!(!preamble.contains(r#"{"runtime":"input"}"#));
     }
 
     #[test]

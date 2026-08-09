@@ -7,6 +7,7 @@
 
 pub mod analyst;
 pub mod bookkeeper;
+pub mod child;
 pub mod clarify;
 pub mod context;
 pub mod control;
@@ -21,17 +22,20 @@ pub mod redteam;
 pub mod referee;
 pub mod scout;
 pub mod skills;
+pub mod stage;
 pub mod testrun;
+pub mod validate;
 pub mod verifier;
 pub mod workflow;
 
-pub(crate) use plugins::node_agent_config;
+pub(crate) use plugins::stage_agent_config;
 pub use plugins::{NodePlugins, PluginContext};
 #[cfg(test)]
 use plugins::{default_allow, servers_to_start};
 
 pub use analyst::{AnalystNode, AnalystOutput};
 pub use bookkeeper::{BookkeeperInput, BookkeeperNode, BookkeeperOutput, MemoryWritten};
+pub use child::ChildTask;
 pub use context::{Constraint, ContextNode, ContextOutput};
 pub use implementer::{ImplementerNode, ImplementerOutput};
 pub use memory::{MemoryNode, MemoryOutput, MemoryRecord};
@@ -40,6 +44,10 @@ pub use publisher::{PublisherNode, PublisherOutput};
 pub use redteam::{RedTeamNode, RedTeamOutput};
 pub use referee::{RefereeNode, RefereeOutput, Violation};
 pub use scout::{RelatedItem, ScoutNode, ScoutOutput};
+pub use stage::{
+    AgentProfile, Delegation, Stage, agent_profiles, built_in_agents, built_in_stages,
+};
+pub use validate::validate;
 pub use verifier::{Finding, FindingKind, Severity, VerifierNode, VerifierOutput};
 
 use std::path::{Path, PathBuf};
@@ -84,6 +92,8 @@ pub enum PlanError {
     Store(#[from] StoreError),
     #[error("serialization error: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error("configuration error: {0}")]
+    Configuration(String),
     #[error("no model route `{0}` in config — add a [models.{0}] entry")]
     MissingRoute(String),
     #[error("run {0} has no `{1}` checkpoint — not a converged run?")]
@@ -99,6 +109,7 @@ impl PlanError {
 /// Run scout → memory → analyst in sequence, checkpointing after each, and record the run's final
 /// status. On any node failure the run is marked `Failed` and the error names the node.
 pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError> {
+    validate_configured_stages(request.config).await?;
     // Before any node runs, so the first one can already be paused.
     control::install(request.run_id);
     // Before the issue checkpoint is written, so what is recorded is what every node was given.
@@ -234,14 +245,14 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
     .await?;
 
     // --- context ---
-    let plugins_context = context.for_node("context");
-    let ctx_cfg = node_agent_config(
+    let mut plugins_context = context.for_node("context");
+    let ctx_cfg = stage_agent_config(
         engine,
         config,
         context.pool_for("context", client.map(|c| c.offer())),
         "context",
         context::CONTEXT_TOOLS,
-        &plugins_context,
+        &mut plugins_context,
     )?;
     let mut ctx_tools = ctx_cfg.tools;
     ctx_tools.add_local(clarify::ask_tool());
@@ -276,14 +287,14 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
     state.scout_report = Some(serde_json::to_value(&scout_out)?);
 
     // --- analyst ---
-    let plugins_analyst = context.for_node("analyst");
-    let analyst_cfg = node_agent_config(
+    let mut plugins_analyst = context.for_node("analyst");
+    let analyst_cfg = stage_agent_config(
         engine,
         config,
         context.pool_for("analyst", client.map(|c| c.offer())),
         "analyst",
         analyst::ANALYST_TOOLS,
-        &plugins_analyst,
+        &mut plugins_analyst,
     )?;
     let analyst = AnalystNode {
         conversation: Some(format!("{run_id}-analyst")),
@@ -605,6 +616,9 @@ impl Workflow {
 /// The single-script path, still honoured so a repo that has one keeps working untouched.
 const LEGACY_WORKFLOW: &str = ".ratatoskr/workflow.ts";
 
+/// Checkpointed internal gates that never become configurable workflow stages.
+const INTERNAL_GATES: &[&str] = &["referee"];
+
 /// Every node any workflow in this repo may govern: the built-in set plus what each declares.
 ///
 /// The union across all of them, not just the one a run selects, because rulesets are loaded
@@ -615,8 +629,9 @@ fn governable_from(workflows: impl IntoIterator<Item = WorkflowRuntime>) -> Vec<
     let mut names: Vec<String> = BUILT_IN_NODES.iter().map(|s| s.to_string()).collect();
     for workflow in workflows {
         names.extend(workflow.meta().nodes.iter().cloned());
+        names.extend(workflow.meta().stages.iter().map(|stage| stage.id.clone()));
     }
-    names.retain(|name| name != "referee");
+    names.retain(|name| !INTERNAL_GATES.contains(&name.as_str()));
     names.sort();
     names.dedup();
     names
@@ -656,6 +671,18 @@ pub async fn defined() -> Result<Vec<WorkflowRuntime>, PlanError> {
         }
     }
     Ok(found)
+}
+
+/// Validate the stage registry every configured workflow contributes before any run starts.
+pub async fn validate_configured_stages(config: &RatatoskrConfig) -> Result<(), PlanError> {
+    let profiles = agent_profiles(config);
+    let mut stages = built_in_stages();
+    for workflow in defined().await? {
+        let workflow_stages = stage::stages_from_workflow(workflow.meta());
+        validate::validate_declared_contracts(&workflow_stages)?;
+        stages.extend(workflow_stages);
+    }
+    validate::validate(&stages, &profiles)
 }
 
 /// Pick the workflow a run should use.
@@ -700,10 +727,7 @@ pub fn select(found: Vec<Workflow>, wanted: Option<&str>) -> Result<Workflow, Pl
 
 /// The overseer is opt-in on having somewhere to run, like the verifier and the characterizer.
 fn overseer_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> bool {
-    config.models.contains_key("overseer")
-        || engine
-            .ruleset("overseer")
-            .is_some_and(|r| r.config().model.is_some())
+    node_route(engine, config, "overseer").is_some()
 }
 
 /// Pick the workflow for this run, asking the overseer when there is a real choice to make.
@@ -735,14 +759,14 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
 
     let cwd = std::env::current_dir().unwrap_or_default();
     let context = PluginContext::resolve(request.config, request.engine, &cwd).await?;
-    let plugins = context.for_node("overseer");
-    let cfg = node_agent_config(
+    let mut plugins = context.for_node("overseer");
+    let cfg = stage_agent_config(
         request.engine,
         request.config,
         context.pool_for("overseer", request.client.map(|c| c.offer())),
         "overseer",
         overseer::OVERSEER_TOOLS,
-        &plugins,
+        &mut plugins,
     )?;
     // Its own ledger: the overseer runs before the run's, and its cost is still a cost. Drained
     // straight onto the checkpoint below rather than carried, because nothing after this point
@@ -815,23 +839,20 @@ fn route(config: &RatatoskrConfig, name: &str) -> Result<ratatoskr_core::ModelRo
 /// The red-team classifier is opt-in: it runs only when redteam has a model route to run on,
 /// whether that comes from `[models.redteam]` or from its ruleset.
 fn classifier_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> bool {
-    config.models.contains_key("redteam")
-        || engine
-            .ruleset("redteam")
-            .is_some_and(|r| r.config().model.is_some())
+    node_route(engine, config, "redteam").is_some()
 }
 
-/// The resolved agent settings for one node: base config plus any `.ratatoskr/rules/<node>.ts`
-/// overrides (model, tool set, per-call policy, max turns).
-struct NodeAgentConfig {
-    route: ratatoskr_core::ModelRoute,
-    tools: ToolSet,
-    /// The repository the node's built-in file tools read within.
-    files: Option<PathBuf>,
-    policy: Option<Arc<dyn ToolPolicy>>,
-    max_turns: Option<usize>,
-    /// Replaces the node's built-in preamble when the ruleset declares one.
-    system_prompt: Option<String>,
+/// The resolved agent settings for one stage: profile defaults plus stage ruleset overrides.
+pub struct NodeAgentConfig {
+    pub route: ratatoskr_core::ModelRoute,
+    pub tools: ToolSet,
+    pub capability_ceiling: Option<ratatoskr_core::Capability>,
+    /// The repository the stage's built-in file tools read within.
+    pub files: Option<PathBuf>,
+    pub policy: Option<Arc<dyn ToolPolicy>>,
+    pub max_turns: Option<usize>,
+    /// Replaces the stage's built-in preamble when its ruleset declares one.
+    pub system_prompt: Option<String>,
 }
 
 /// Everything a run's helpers need in common: the rag-rat connection, the run's identity and
@@ -852,9 +873,9 @@ pub(crate) struct Run<'a> {
     ledger: &'a Arc<RunLedger>,
 }
 
-/// The preamble a node actually runs with: its built-in text, or a ruleset's replacement for it,
-/// prefixed by whatever context plugins contributed for this run and suffixed by the listing of the
-/// skills its plugins bind.
+/// The preamble a node actually runs with: reusable agent guidance, then its built-in text or a
+/// ruleset replacement, prefixed by whatever context plugins contributed for this run and suffixed
+/// by the listing of the skills its plugins bind.
 ///
 /// The skill listing lives here rather than in the `Skill` tool's schema so it does not grow the
 /// schema the node carries on every model call: it is prose in the cached prefix, and the tool
@@ -869,7 +890,25 @@ pub(crate) fn effective_preamble(
     context: Option<&str>,
     skills: &[ratatoskr_plugin::Skill],
 ) -> String {
-    let base = system_prompt.unwrap_or(built_in);
+    effective_preamble_with_profile(node, built_in, "", system_prompt, context, skills)
+}
+
+/// Compose reusable agent guidance before a stage's own preamble. A ruleset replaces only the
+/// stage portion, so a shared profile cannot erase the stage contract or platform instructions.
+pub(crate) fn effective_preamble_with_profile(
+    node: &str,
+    built_in: &str,
+    profile_prompt: &str,
+    system_prompt: Option<&str>,
+    context: Option<&str>,
+    skills: &[ratatoskr_plugin::Skill],
+) -> String {
+    let stage = system_prompt.unwrap_or(built_in);
+    let base = [profile_prompt, stage]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
     let composed = match context {
         Some(context) => format!("{context}\n\n{base}"),
         None => base.to_string(),
@@ -1068,6 +1107,7 @@ async fn no_code_change(
 /// The full Phase 3 run: plan (scout → memory → analyst), then fork red-team ∥ implementer, then
 /// converge. Reuses [`run_plan`] for the planning half.
 pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> {
+    validate_configured_stages(request.config).await?;
     // Before any node runs, so the first one can already be paused.
     control::install(request.run_id);
     // Before the issue checkpoint is written, so what is recorded is what every node was given.
@@ -1286,44 +1326,50 @@ async fn publish_and_checkpoint(
         ledger,
         ..
     } = run;
-    let plugins = context.for_node("publisher");
-    let cfg = node_agent_config(
+    let mut plugins = context.for_node("publisher");
+    let cfg = stage_agent_config(
         engine,
         config,
         context.pool_for("publisher", client.map(|c| c.offer())),
         "publisher",
         &[],
-        &plugins,
+        &mut plugins,
     )?;
+    let may_publish = cfg.capability_ceiling == Some(ratatoskr_core::Capability::Publish);
     let mut tools = cfg.tools;
-    // The tools that write outside this machine. Added here rather than in the default list so no
-    // other node can be handed one by widening a shared constant.
-    tools
-        .local()
-        .tools
-        .push(ratatoskr_agent::publish::declaration());
-
-    // Push is offered only when there is a branch to push, and only ever THAT branch: the access
-    // carries it, and what the tool takes is a name's parts, never a ref. A run with no fork has
-    // nothing to publish and is not given the tool at all.
-    let push = input
-        .implementer
-        .as_ref()
-        .map(|im| im.branch.clone())
-        .filter(|b| ratatoskr_agent::publish::pushable(b))
-        .map(|branch| ratatoskr_agent::publish::PushAccess {
-            repo_root: cfg.files.clone().unwrap_or_else(|| ".".into()),
-            branch,
-            // From the run, not from the publisher: the number is what the branch is *for*, and
-            // it is not the naming step's to choose.
-            issue: Some(input.issue.clone()),
-        });
-    if push.is_some() {
+    let push = if may_publish {
+        // The tools that write outside this machine. Added here rather than in the default list so no
+        // other node can be handed one by widening a shared constant.
         tools
             .local()
             .tools
-            .push(ratatoskr_agent::publish::push_declaration());
-    }
+            .push(ratatoskr_agent::publish::declaration());
+
+        // Push is offered only when there is a branch to push, and only ever THAT branch: the access
+        // carries it, and what the tool takes is a name's parts, never a ref. A run with no fork has
+        // nothing to publish and is not given the tool at all.
+        let push = input
+            .implementer
+            .as_ref()
+            .map(|im| im.branch.clone())
+            .filter(|b| ratatoskr_agent::publish::pushable(b))
+            .map(|branch| ratatoskr_agent::publish::PushAccess {
+                repo_root: cfg.files.clone().unwrap_or_else(|| ".".into()),
+                branch,
+                // From the run, not from the publisher: the number is what the branch is *for*, and
+                // it is not the naming step's to choose.
+                issue: Some(input.issue.clone()),
+            });
+        if push.is_some() {
+            tools
+                .local()
+                .tools
+                .push(ratatoskr_agent::publish::push_declaration());
+        }
+        push
+    } else {
+        None
+    };
 
     let node = PublisherNode {
         push,
@@ -1372,14 +1418,14 @@ async fn bookkeep_and_checkpoint(
         context,
         ..
     } = run;
-    let plugins_bookkeeper = context.for_node("bookkeeper");
-    let cfg = node_agent_config(
+    let mut plugins_bookkeeper = context.for_node("bookkeeper");
+    let cfg = stage_agent_config(
         engine,
         config,
         context.pool_for("bookkeeper", client.map(|c| c.offer())),
         "bookkeeper",
         bookkeeper::BOOKKEEPER_TOOLS,
-        &plugins_bookkeeper,
+        &mut plugins_bookkeeper,
     )?;
     let mut tools = cfg.tools;
     tools.add_local(clarify::ask_tool());
@@ -1533,11 +1579,7 @@ pub(crate) fn build_characterizer(
     offer: Option<ServerTools>,
     ledger: Option<Arc<RunLedger>>,
 ) -> Result<Option<testrun::Characterizer>, PlanError> {
-    if !config.models.contains_key("characterizer")
-        && !engine
-            .ruleset("characterizer")
-            .is_some_and(|r| r.config().model.is_some())
-    {
+    if node_route(engine, config, "characterizer").is_none() {
         return Ok(None);
     }
     // No skills either, and this is the seam that enforces it: `node_agent_config` grants the
@@ -1545,19 +1587,19 @@ pub(crate) fn build_characterizer(
     // from what the caller passes to `run_structured`. `Characterizer` passes none — so leaving
     // skills bound here would offer it a tool whose result nothing can produce, and a node that
     // reads a tool error as an instruction is a failure this repo has already paid for once.
-    let plugins = NodePlugins {
+    let mut plugins = NodePlugins {
         skills: Vec::new(),
         ..context.for_node("characterizer")
     };
     // No default tools: it transcribes output it was handed. Reading the repo would invite it to
     // decide whether a failure matters, which is the one thing it must not do.
-    let cfg = node_agent_config(
+    let cfg = stage_agent_config(
         engine,
         config,
         context.pool_for("characterizer", offer),
         "characterizer",
         &[],
-        &plugins,
+        &mut plugins,
     )?;
     Ok(Some(testrun::Characterizer {
         route: cfg.route,
@@ -1579,7 +1621,7 @@ fn build_implementer_agent(
     context: &PluginContext,
     offer: Option<ServerTools>,
 ) -> Result<(NodeAgentConfig, NodePlugins), PlanError> {
-    let plugins = context.for_node("implementer");
+    let mut plugins = context.for_node("implementer");
     let mut tools = context.pool_for("implementer", offer);
     tools
         .local()
@@ -1593,13 +1635,13 @@ fn build_implementer_agent(
     // code, so it is the one most likely to meet a question worth asking — and the run-wide
     // `ASK_BUDGET` is what keeps that a relief valve rather than a way to spend a run.
     tools.local().tools.push(clarify::ask_tool());
-    let mut cfg = node_agent_config(
+    let mut cfg = stage_agent_config(
         engine,
         config,
         tools,
         "implementer",
         &implementer_default_tools(),
-        &plugins,
+        &mut plugins,
     )?;
     // TOML governs the built-in implementer. A ruleset can still make a deliberate, more-specific
     // per-node override with `maxTurns`.
@@ -1643,6 +1685,7 @@ fn node_route(
             params: None,
             session: Default::default(),
         })
+        .or_else(|| stage::stage_profile(config, node).and_then(|profile| profile.model))
         .or_else(|| config.models.get(node).cloned())
 }
 
@@ -1711,14 +1754,14 @@ impl Review {
             return Ok(None);
         }
 
-        let plugins_verifier = context.for_node("verifier");
-        let cfg = node_agent_config(
+        let mut plugins_verifier = context.for_node("verifier");
+        let cfg = stage_agent_config(
             engine,
             config,
             context.pool_for("verifier", client.map(|c| c.offer())),
             "verifier",
             verifier::VERIFIER_TOOLS,
-            &plugins_verifier,
+            &mut plugins_verifier,
         )?;
         let verifier = verifier::VerifierNode {
             route: cfg.route,
@@ -1736,14 +1779,14 @@ impl Review {
             ledger: Some(Arc::clone(ledger)),
         };
 
-        let plugins_analyst = context.for_node("analyst");
-        let acfg = node_agent_config(
+        let mut plugins_analyst = context.for_node("analyst");
+        let acfg = stage_agent_config(
             engine,
             config,
             context.pool_for("analyst", client.map(|c| c.offer())),
             "analyst",
             analyst::ANALYST_TOOLS,
-            &plugins_analyst,
+            &mut plugins_analyst,
         )?;
         Ok(Some(Review {
             verifier,
@@ -2082,14 +2125,14 @@ pub(crate) fn build_converge_agents(
         )?,
         classifier: match classifier_enabled(engine, config) {
             true => {
-                let plugins_redteam = context.for_node("redteam");
-                let cfg = node_agent_config(
+                let mut plugins_redteam = context.for_node("redteam");
+                let cfg = stage_agent_config(
                     engine,
                     config,
                     context.pool_for("redteam", client.map(|c| c.offer())),
                     "redteam",
                     redteam::CLASSIFIER_TOOLS,
-                    &plugins_redteam,
+                    &mut plugins_redteam,
                 )?;
                 let mut tools = cfg.tools;
                 tools.add_local(clarify::ask_tool());
@@ -2109,21 +2152,19 @@ pub(crate) fn build_converge_agents(
         },
         author: match classifier_enabled(engine, config) {
             true => {
-                let plugins = context.for_node("redteam");
+                let mut plugins = context.for_node("redteam");
                 let mut tools = context.pool_for("redteam", client.map(|c| c.offer()));
                 tools
                     .local()
                     .tools
                     .extend(ratatoskr_agent::files::edit_declarations());
-                let mut names: Vec<&str> = redteam::CLASSIFIER_TOOLS.to_vec();
-                names.extend([
-                    ratatoskr_agent::files::READ,
-                    ratatoskr_agent::files::GREP,
-                    ratatoskr_agent::files::GLOB,
-                    ratatoskr_agent::files::WRITE,
-                    ratatoskr_agent::files::EDIT,
-                ]);
-                let cfg = node_agent_config(engine, config, tools, "redteam", &names, &plugins)?;
+                let cfg = plugins::redteam_author_agent_config(
+                    engine,
+                    config,
+                    tools,
+                    redteam::AUTHOR_TOOLS,
+                    &mut plugins,
+                )?;
                 Some(redteam::TestAuthor {
                     route: cfg.route,
                     tools: cfg.tools,
@@ -2919,6 +2960,18 @@ mod agent_config_tests {
     }
 
     #[test]
+    fn agent_profile_guidance_precedes_the_stage_preamble() {
+        assert_eq!(
+            effective_preamble_with_profile("n", "stage", "profile", None, None, &[]),
+            "profile\n\nstage"
+        );
+        assert_eq!(
+            effective_preamble_with_profile("n", "stage", "profile", Some("override"), None, &[]),
+            "profile\n\noverride"
+        );
+    }
+
+    #[test]
     fn plugin_context_prefixes_whichever_preamble_applies() {
         // A ruleset replaces the node's own text; plugin context is prepended to whatever wins,
         // so a repository digest never costs a node its instructions.
@@ -3046,13 +3099,13 @@ mod agent_config_tests {
         // The whole point: no `[models.scout]` entry at all.
         config.models.remove("scout");
 
-        let cfg = node_agent_config(
+        let cfg = stage_agent_config(
             &engine,
             &config,
             ToolSet::default(),
             "scout",
             &[],
-            &NodePlugins::default(),
+            &mut NodePlugins::default(),
         )
         .unwrap();
         assert_eq!(cfg.route.provider, "openai");
@@ -3080,13 +3133,13 @@ mod agent_config_tests {
             },
         );
 
-        let none = node_agent_config(
+        let none = stage_agent_config(
             &engine,
             &config,
             ToolSet::default(),
             "characterizer",
             &[],
-            &NodePlugins::default(),
+            &mut NodePlugins::default(),
         )
         .unwrap();
         assert!(none.tools.names().is_empty(), "{:?}", none.tools.names());
@@ -3098,13 +3151,13 @@ mod agent_config_tests {
 
         // A node that does declare reach still gets them — this is the reading half of the
         // pipeline, not an exception for one node.
-        let some = node_agent_config(
+        let some = stage_agent_config(
             &engine,
             &config,
             ToolSet::default(),
             "analyst",
             analyst::ANALYST_TOOLS,
-            &NodePlugins::default(),
+            &mut NodePlugins::default(),
         )
         .unwrap();
         assert!(some.files.is_some());
@@ -3142,13 +3195,13 @@ mod agent_config_tests {
         let engine = engine("toml-fallback").await;
         let config = RatatoskrConfig::default();
 
-        let cfg = node_agent_config(
+        let cfg = stage_agent_config(
             &engine,
             &config,
             ToolSet::default(),
             "bookkeeper",
             &[],
-            &NodePlugins::default(),
+            &mut NodePlugins::default(),
         )
         .unwrap();
         assert_eq!(cfg.route.provider, config.models["bookkeeper"].provider);
@@ -3183,16 +3236,75 @@ mod agent_config_tests {
         config.models.remove("analyst");
 
         assert!(matches!(
-            node_agent_config(
+            stage_agent_config(
                 &engine,
                 &config,
                 ToolSet::default(),
                 "analyst",
                 &[],
-                &NodePlugins::default(),
+                &mut NodePlugins::default(),
             ),
             Err(PlanError::MissingRoute(n)) if n == "analyst"
         ));
+    }
+
+    #[tokio::test]
+    async fn a_built_in_stage_uses_its_selected_profile() {
+        let engine = binding_engine("build-profile", "").await;
+        let mut config = RatatoskrConfig::default();
+        config.agents.insert(
+            "build".to_string(),
+            ratatoskr_core::AgentProfileConfig {
+                model: Some(ratatoskr_core::ModelRoute {
+                    provider: "test".to_string(),
+                    model: "profile-model".to_string(),
+                    max_tokens: None,
+                    context_window: None,
+                    temperature: None,
+                    params: None,
+                    session: Default::default(),
+                }),
+                base_prompt: "profile prompt".to_string(),
+                capabilities: vec![ratatoskr_core::Capability::Read],
+                tool_policy: None,
+                max_turns: Some(7),
+            },
+        );
+
+        let mut plugins = NodePlugins::default();
+        let cfg = stage_agent_config(
+            &engine,
+            &config,
+            ToolSet::default(),
+            "implementer",
+            &implementer_default_tools(),
+            &mut plugins,
+        )
+        .unwrap();
+        assert_eq!(cfg.route.model, "profile-model");
+        assert_eq!(cfg.system_prompt, None);
+        assert_eq!(plugins.profile_prompt, "profile prompt");
+        assert_eq!(cfg.max_turns, Some(7));
+        assert_eq!(cfg.tools.names(), ["Read", "Grep", "Glob"]);
+    }
+
+    #[tokio::test]
+    async fn a_read_stage_does_not_widen_an_explicit_write_allow_list() {
+        let engine = binding_engine(
+            "read-ceiling-allow-list",
+            r#"defineAgent("analyst", { tools: { allow: ["Write"] } });"#,
+        )
+        .await;
+        let cfg = stage_agent_config(
+            &engine,
+            &RatatoskrConfig::default(),
+            ToolSet::default(),
+            "analyst",
+            analyst::ANALYST_TOOLS,
+            &mut NodePlugins::default(),
+        )
+        .unwrap();
+        assert!(cfg.tools.is_empty());
     }
 
     #[tokio::test]

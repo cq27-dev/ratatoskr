@@ -1,5 +1,6 @@
-// Reference `.ratatoskr/workflow.ts` — reproduces Ratatoskr's built-in run flow. Copy it to
-// `.ratatoskr/workflow.ts` and edit to customize how a run is sequenced.
+// Reference `.ratatoskr/workflow.ts` — reproduces Ratatoskr's built-in run flow and adds a
+// declared requirements stage. Copy it to `.ratatoskr/workflow.ts` and edit to customize how a
+// run is sequenced. It expects the `requirements` profile from `examples/agent-profiles.toml`.
 //
 // The script only *composes* the node bindings. Every gate stays Rust-enforced no matter what the
 // script does: each binding validates and checkpoints its own output; `redTeam()` runs the
@@ -33,18 +34,53 @@
 //   testCommandRan(output) -> boolean
 //   newlyIntroducedFailures({baseline, post}) -> string[]
 
-// `plan`: scout -> memory -> analyst. Backs `ratatoskr plan`.
+defineWorkflow({
+  name: "standard",
+  purpose: "Plan and implement a repository change with an explicit requirements digest.",
+  whenToUse: ["the task requests a code change"],
+  stages: [
+    {
+      id: "requirements",
+      agent: "requirements",
+      inputContract: "{ issue: string }",
+      outputContract: "RequirementsDigest",
+      outputSchema: {
+        type: "object",
+        properties: {
+          summary: { type: "string" },
+          risks: { type: "array", items: { type: "string" } },
+        },
+        required: ["summary", "risks"],
+        additionalProperties: false,
+      },
+      instructions:
+        "Extract the requirements and delivery risks that must shape the implementation plan. " +
+        "Do not propose code. Return only the declared JSON object.",
+      capabilities: ["read"],
+    },
+  ],
+});
+
+// `plan`: requirements -> scout -> memory -> analyst. Backs `ratatoskr plan`.
 async function plan(input: { issue: string }) {
+  const requirementsOut = await requirements({ issue: input.issue });
   const scoutOut = await scout(input.issue);
-  const memoryOut = await memory({ issue: input.issue, context: scoutOut.papertrail_summary });
+  const memoryOut = await memory({
+    issue: input.issue,
+    context: `${scoutOut.papertrail_summary}\n\nRequirements:\n${requirementsOut.summary}`,
+  });
   const analystOut = await analyze({ issue: input.issue, scout: scoutOut, memory: memoryOut });
-  return { scout: scoutOut, memory: memoryOut, analyst: analystOut };
+  return { requirements: requirementsOut, scout: scoutOut, memory: memoryOut, analyst: analystOut };
 }
 
-// `run`: plan, then fork red-team ∥ implementer, then converge. Backs `ratatoskr run`.
+// `run`: requirements, plan, then fork red-team ∥ implementer, then converge. Backs `ratatoskr run`.
 async function run(input: { issue: string; maxIterations: number }) {
+  const requirementsOut = await requirements({ issue: input.issue });
   const scoutOut = await scout(input.issue);
-  const memoryOut = await memory({ issue: input.issue, context: scoutOut.papertrail_summary });
+  const memoryOut = await memory({
+    issue: input.issue,
+    context: `${scoutOut.papertrail_summary}\n\nRequirements:\n${requirementsOut.summary}`,
+  });
   const analystOut = await analyze({ issue: input.issue, scout: scoutOut, memory: memoryOut });
 
   // Fork: both run concurrently off the frozen post-analyst state.
