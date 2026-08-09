@@ -55,7 +55,7 @@ use std::sync::Arc;
 
 use ratatoskr_core::{RatatoskrConfig, RunState, RunStatus, ToolPolicy};
 use ratatoskr_exec::{WorktreePath, remove_worktree};
-use ratatoskr_graph::{Node, NodeError};
+use ratatoskr_graph::{NodeError, parse_validated};
 use ratatoskr_mcp::{RagRatClient, ServerTools, ToolSet};
 use ratatoskr_script::{ScriptEngine, WorkflowRuntime};
 use ratatoskr_store::{Store, StoreError};
@@ -150,7 +150,18 @@ pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError>
     let context =
         PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
             .await?;
-    let outcome = plan_half(client, config, store, run_id, issue, engine, &context).await;
+    let ledger = Arc::new(RunLedger::default());
+    let outcome = plan_half(PlanHalfRequest {
+        client,
+        config,
+        store,
+        run_id,
+        issue,
+        engine,
+        context: &context,
+        ledger: &ledger,
+    })
+    .await;
     // Closed by whoever owns the run's lifetime: a `plan` ends here, a `run` carries on.
     context.session_end(status_of(&outcome)).await;
     outcome
@@ -164,17 +175,30 @@ fn status_of(outcome: &Result<PlanOutcome, PlanError>) -> &'static str {
     }
 }
 
+struct PlanHalfRequest<'a> {
+    client: Option<&'a RagRatClient>,
+    config: &'a RatatoskrConfig,
+    store: &'a Store,
+    run_id: &'a str,
+    issue: &'a str,
+    engine: &'a Arc<ScriptEngine>,
+    context: &'a PluginContext,
+    ledger: &'a Arc<RunLedger>,
+}
+
 /// The planning half, against an already-resolved plugin context. `run_full` resolves it once and
 /// reuses it for both halves, so a full run doesn't pay for every plugin's `SessionStart` twice.
-async fn plan_half(
-    client: Option<&RagRatClient>,
-    config: &RatatoskrConfig,
-    store: &Store,
-    run_id: &str,
-    issue: &str,
-    engine: &Arc<ScriptEngine>,
-    context: &PluginContext,
-) -> Result<PlanOutcome, PlanError> {
+async fn plan_half(request: PlanHalfRequest<'_>) -> Result<PlanOutcome, PlanError> {
+    let PlanHalfRequest {
+        client,
+        config,
+        store,
+        run_id,
+        issue,
+        engine,
+        context,
+        ledger,
+    } = request;
     // First, and here rather than in a caller: every checkpoint references this row, and the
     // schema enforces it. `run_full` reaches this function directly, so a caller-side write would
     // leave that path creating checkpoints for a run that doesn't exist yet.
@@ -185,7 +209,6 @@ async fn plan_half(
     record_provenance(store, run_id, config).await;
 
     let clarifier = NodeClarifier::new(config, store, engine, run_id, issue);
-    let ledger = Arc::new(RunLedger::default());
     let run = Run {
         client,
         config,
@@ -194,7 +217,7 @@ async fn plan_half(
         issue,
         engine,
         clarifier: &clarifier,
-        ledger: &ledger,
+        ledger,
         context,
     };
     let outcome = run_nodes(&run)
@@ -278,7 +301,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         plugins: plugins_context,
         files: ctx_cfg.files,
         ledger: Some(Arc::clone(ledger)),
-        declared_context,
+        declared_context: Arc::clone(&declared_context),
     };
     let context_out = context_node
         .run(issue)
@@ -299,33 +322,10 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
     state.scout_report = Some(serde_json::to_value(&scout_out)?);
 
     // --- analyst ---
-    let mut plugins_analyst = context.for_node("analyst");
-    let analyst_cfg = stage_agent_config(
-        engine,
-        config,
-        context.pool_for("analyst", client.map(|c| c.offer())),
-        "analyst",
-        analyst::ANALYST_TOOLS,
-        &mut plugins_analyst,
-    )?;
-    let analyst = AnalystNode {
-        conversation: Some(format!("{run_id}-analyst")),
-        route: analyst_cfg.route,
-        tools: analyst_cfg.tools,
-        policy: analyst_cfg.policy,
-        max_turns: analyst_cfg.max_turns,
-        system_prompt: analyst_cfg.system_prompt,
-        plugins: plugins_analyst,
-        files: analyst_cfg.files,
-        ledger: Some(Arc::clone(ledger)),
-    };
     let analyst_in =
         analyst::AnalystInput::fresh(issue.to_string(), scout_out.clone(), memory_out.clone());
     let analyst_input_json = serde_json::to_string(&analyst_in)?;
-    let analyst_out = analyst
-        .run(analyst_in, &state)
-        .await
-        .map_err(|e| PlanError::node("analyst", e))?;
+    let analyst_out = run_declared_analyst(&declared_context, &analyst_in).await?;
     record(Record {
         store,
         run_id,
@@ -347,6 +347,108 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         brief: context_out.brief,
         constraints: context_out.constraints,
     })
+}
+
+async fn run_declared_analyst(
+    context: &Arc<workflow::WorkflowContext>,
+    input: &analyst::AnalystInput,
+) -> Result<AnalystOutput, PlanError> {
+    run_declared_analyst_with_turn(context, input, None).await
+}
+
+async fn run_declared_analyst_with_turn(
+    context: &Arc<workflow::WorkflowContext>,
+    input: &analyst::AnalystInput,
+    turn: Option<Arc<dyn workflow::StageTurn>>,
+) -> Result<AnalystOutput, PlanError> {
+    let input_json = serde_json::to_string(input)?;
+    let question = analyst::render_prompt(input);
+    let result = match turn {
+        Some(turn) => {
+            workflow::evaluate_standard_stage_with_turn(
+                Arc::clone(context),
+                "analyst",
+                input_json,
+                question,
+                turn,
+            )
+            .await
+        }
+        None => {
+            workflow::evaluate_standard_stage(Arc::clone(context), "analyst", input_json, question)
+                .await
+        }
+    };
+    let raw = result.map_err(|error| {
+        PlanError::node(
+            "analyst",
+            NodeError::Failed(format!("analyst agent failed: {error}")),
+        )
+    })?;
+    parse_validated::<AnalystOutput>(&raw).map_err(|error| PlanError::node("analyst", error))
+}
+
+async fn run_declared_verifier(
+    context: &Arc<workflow::WorkflowContext>,
+    input: &verifier::VerifierInput,
+    worktree: &WorktreePath,
+) -> Result<VerifierOutput, PlanError> {
+    run_declared_verifier_with_turn(context, input, worktree, None).await
+}
+
+async fn run_declared_verifier_with_turn(
+    context: &Arc<workflow::WorkflowContext>,
+    input: &verifier::VerifierInput,
+    worktree: &WorktreePath,
+    turn: Option<Arc<dyn workflow::StageTurn>>,
+) -> Result<VerifierOutput, PlanError> {
+    // Nothing to review is not a clean review. Preserve the no-turn result rather than asking a
+    // declared stage to approve an empty patch.
+    if input.diff.trim().is_empty() {
+        return Ok(VerifierOutput {
+            findings: Vec::new(),
+            assessment: "there was no diff to review".to_string(),
+        });
+    }
+    let input_json = serde_json::to_string(input)?;
+    let question = verifier::render_prompt(input);
+    let resources = workflow::StandardStageResources {
+        resource_root: worktree.as_path().to_path_buf(),
+        shell: None,
+        publish: None,
+        clarifier: None,
+        guidance: None,
+    };
+    let result = match turn {
+        Some(turn) => {
+            workflow::evaluate_standard_stage_with_resources_and_turn(
+                Arc::clone(context),
+                "verifier",
+                input_json,
+                question,
+                resources,
+                turn,
+            )
+            .await
+        }
+        None => {
+            workflow::evaluate_standard_stage_with_resources(
+                Arc::clone(context),
+                "verifier",
+                input_json,
+                question,
+                resources,
+            )
+            .await
+        }
+    };
+    let raw = result.map_err(|error| {
+        PlanError::node(
+            "verifier",
+            NodeError::Failed(format!("verifier agent failed: {error}")),
+        )
+    })?;
+    parse_validated::<VerifierOutput>(&raw).map_err(|error| PlanError::node("verifier", error))
 }
 
 /// One checkpoint to write: which node, what it produced, and — for a node that ran a model — what
@@ -1068,6 +1170,344 @@ mod migrated_stage_path_tests {
                 "{component} must require a declared workflow context"
             );
         }
+
+        let built_in = include_str!("lib.rs");
+        assert!(
+            !built_in.contains(concat!("Analyst", "Node {")),
+            "the built-in plan and review must not construct the compatibility analyst wrapper"
+        );
+        assert!(
+            !built_in.contains(concat!("verifier::Verifier", "Node {")),
+            "the built-in review must not construct the compatibility verifier wrapper"
+        );
+    }
+}
+
+#[cfg(test)]
+mod built_in_declared_review_tests {
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct SeenTurn {
+        node: String,
+        session: ratatoskr_core::SessionScope,
+        conversation: Option<String>,
+        ledger: Option<usize>,
+        files: Option<PathBuf>,
+        question: String,
+    }
+
+    struct SequenceTurn {
+        seen: Mutex<Vec<SeenTurn>>,
+        outputs: Mutex<VecDeque<Result<String, String>>>,
+    }
+
+    impl SequenceTurn {
+        fn new(outputs: impl IntoIterator<Item = Result<serde_json::Value, &'static str>>) -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+                outputs: Mutex::new(
+                    outputs
+                        .into_iter()
+                        .map(|output| {
+                            output
+                                .map(|value| value.to_string())
+                                .map_err(str::to_string)
+                        })
+                        .collect(),
+                ),
+            }
+        }
+    }
+
+    impl workflow::StageTurn for SequenceTurn {
+        fn run<'a>(
+            &'a self,
+            run: ratatoskr_agent::NodeRun<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, ratatoskr_agent::AgentError>> + Send + 'a>>
+        {
+            self.seen
+                .lock()
+                .expect("seen-turn mutex poisoned")
+                .push(SeenTurn {
+                    node: run.node.to_string(),
+                    session: run.route.session,
+                    conversation: run.conversation.map(str::to_string),
+                    ledger: run
+                        .ledger
+                        .as_ref()
+                        .map(|ledger| Arc::as_ptr(ledger) as usize),
+                    files: run.files.clone(),
+                    question: run.question.to_string(),
+                });
+            let output = self
+                .outputs
+                .lock()
+                .expect("sequence-output mutex poisoned")
+                .pop_front()
+                .expect("a canned output exists for every turn");
+            Box::pin(async move { output.map_err(ratatoskr_agent::AgentError::Prompt) })
+        }
+    }
+
+    async fn declared_contexts(
+        case: &str,
+    ) -> (
+        Store,
+        Arc<RunLedger>,
+        Arc<workflow::WorkflowContext>,
+        Arc<workflow::WorkflowContext>,
+        std::path::PathBuf,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-built-in-declared-{}-{case}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("built-in-declared", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "verifier".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "openai".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Compacted,
+            },
+        );
+        let ledger = Arc::new(RunLedger::default());
+        let context = |plugin_context| {
+            workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
+                client: None,
+                config: &config,
+                store: &store,
+                run_id: "built-in-declared",
+                issue: "keep the hand-off",
+                engine: &engine,
+                plugin_context,
+                ledger: Arc::clone(&ledger),
+            })
+            .unwrap()
+        };
+        let planning = context(PluginContext::default());
+        let review = context(PluginContext::default());
+        (store, ledger, planning, review, dir)
+    }
+
+    fn initial_analyst_input() -> analyst::AnalystInput {
+        analyst::AnalystInput::fresh(
+            "keep the hand-off".to_string(),
+            ScoutOutput {
+                related_items: Vec::new(),
+                papertrail_summary: "the original plan chose SessionKey".to_string(),
+            },
+            MemoryOutput {
+                memories: Vec::new(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn built_in_analyst_reentry_keeps_one_ledger_and_typed_checkpoint_handoff() {
+        let (store, ledger, planning, review, dir) = declared_contexts("analyst").await;
+        let turn = Arc::new(SequenceTurn::new([
+            Ok(serde_json::json!({
+                "impact_summary": "introduce SessionKey",
+                "requirements": ["scope keys by run"],
+                "interface": [{
+                    "name": "SessionKey",
+                    "shape": "struct SessionKey { run: String, stage: String }"
+                }]
+            })),
+            Ok(serde_json::json!({
+                "impact_summary": "retain SessionKey and reject empty run ids",
+                "requirements": ["scope keys by run", "reject empty run ids"]
+            })),
+        ]));
+        let fresh = initial_analyst_input();
+        let initial = run_declared_analyst_with_turn(
+            &planning,
+            &fresh,
+            Some(Arc::clone(&turn) as Arc<dyn workflow::StageTurn>),
+        )
+        .await
+        .unwrap();
+        record(Record {
+            store: &store,
+            run_id: "built-in-declared",
+            node: "analyst",
+            output: &initial,
+            input: Some(serde_json::to_string(&fresh).unwrap()),
+            iteration: None,
+            ledger: Some(&ledger),
+        })
+        .await
+        .unwrap();
+
+        let revision = analyst::AnalystInput {
+            issue: fresh.issue.clone(),
+            scout: fresh.scout.clone(),
+            memory: fresh.memory.clone(),
+            brief: fresh.brief.clone(),
+            constraints: fresh.constraints.clone(),
+            previous: Some(Box::new(initial)),
+            findings: vec![verifier::Finding {
+                severity: verifier::Severity::P1,
+                kind: verifier::FindingKind::Plan,
+                file: "session.rs".to_string(),
+                line: Some(17),
+                summary: "empty run ids collide".to_string(),
+                failure_scenario: "two empty run ids share a stage key".to_string(),
+            }],
+        };
+        let revised = run_declared_analyst_with_turn(
+            &review,
+            &revision,
+            Some(Arc::clone(&turn) as Arc<dyn workflow::StageTurn>),
+        )
+        .await
+        .unwrap();
+        record(Record {
+            store: &store,
+            run_id: "built-in-declared",
+            node: "analyst",
+            output: &revised,
+            input: Some(serde_json::to_string(&revision).unwrap()),
+            iteration: Some(2),
+            ledger: Some(&ledger),
+        })
+        .await
+        .unwrap();
+
+        {
+            let seen = turn.seen.lock().expect("seen-turn mutex poisoned");
+            assert_eq!(seen.len(), 2);
+            assert!(seen.iter().all(|turn| turn.node == "analyst"));
+            assert!(seen.iter().all(|turn| {
+                turn.session == ratatoskr_core::SessionScope::Compacted
+                    && turn.conversation.as_deref() == Some("built-in-declared-analyst")
+            }));
+            assert_eq!(seen[0].ledger, seen[1].ledger);
+            assert_eq!(seen[0].ledger, Some(Arc::as_ptr(&ledger) as usize));
+            assert!(!seen[0].question.contains("THIS IS A REVISION"));
+            assert!(seen[1].question.contains("THIS IS A REVISION"));
+            assert!(seen[1].question.contains("SessionKey"));
+            assert!(seen[1].question.contains("empty run ids collide"));
+        }
+
+        let checkpoints = store
+            .checkpoints_for_run("built-in-declared")
+            .await
+            .unwrap();
+        assert_eq!(checkpoints.len(), 2);
+        let first: analyst::AnalystInput =
+            serde_json::from_str(checkpoints[0].input_json.as_deref().unwrap()).unwrap();
+        let second: analyst::AnalystInput =
+            serde_json::from_str(checkpoints[1].input_json.as_deref().unwrap()).unwrap();
+        assert!(first.previous.is_none());
+        assert_eq!(second.previous.unwrap().interface[0].name, "SessionKey");
+        assert_eq!(second.findings[0].summary, "empty run ids collide");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn built_in_verifier_keeps_empty_diff_local_and_roots_the_declared_turn() {
+        let (_store, _ledger, _planning, review, dir) = declared_contexts("verifier").await;
+        let turn = Arc::new(SequenceTurn::new([
+            Ok(serde_json::json!({
+                "findings": [{
+                    "severity": "P1",
+                    "kind": "plan",
+                    "summary": "the plan cannot isolate runs",
+                    "failure_scenario": "two runs collide"
+                }],
+                "assessment": "the diff follows an unsafe plan"
+            })),
+            Err("provider unavailable"),
+        ]));
+        let worktree = WorktreePath(dir.join("worktree"));
+        std::fs::create_dir_all(worktree.as_path()).unwrap();
+        let analyst = AnalystOutput {
+            impact_summary: "scope the session key".to_string(),
+            touched: Vec::new(),
+            risks: Vec::new(),
+            requirements: vec!["isolate runs".to_string()],
+            residual_risk: String::new(),
+            changes_code: true,
+            acceptance: Vec::new(),
+            interface: Vec::new(),
+        };
+        let mut input = verifier::VerifierInput {
+            issue: "keep the hand-off".to_string(),
+            analyst,
+            diff: String::new(),
+            touched_files: vec!["session.rs".to_string()],
+            previous_findings: Vec::new(),
+        };
+        let empty = run_declared_verifier_with_turn(
+            &review,
+            &input,
+            &worktree,
+            Some(Arc::clone(&turn) as Arc<dyn workflow::StageTurn>),
+        )
+        .await
+        .unwrap();
+        assert!(empty.findings.is_empty());
+        assert_eq!(empty.assessment, "there was no diff to review");
+        assert!(
+            turn.seen
+                .lock()
+                .expect("seen-turn mutex poisoned")
+                .is_empty()
+        );
+
+        input.diff = "+pub struct SessionKey;".to_string();
+        let reviewed = run_declared_verifier_with_turn(
+            &review,
+            &input,
+            &worktree,
+            Some(Arc::clone(&turn) as Arc<dyn workflow::StageTurn>),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reviewed.blocking(verifier::Severity::P2).len(), 1);
+        assert_eq!(reviewed.findings[0].kind, verifier::FindingKind::Plan);
+        {
+            let seen = turn.seen.lock().expect("seen-turn mutex poisoned");
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].session, ratatoskr_core::SessionScope::Fresh);
+            assert_eq!(seen[0].files.as_deref(), Some(worktree.as_path()));
+            assert!(
+                seen[0]
+                    .question
+                    .contains("THE CHANGE:\n+pub struct SessionKey;")
+            );
+        }
+
+        let error = run_declared_verifier_with_turn(
+            &review,
+            &input,
+            &worktree,
+            Some(Arc::clone(&turn) as Arc<dyn workflow::StageTurn>),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("provider unavailable"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -1246,7 +1686,19 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
     let plan_context =
         PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
             .await?;
-    let plan = match plan_half(client, config, store, run_id, issue, engine, &plan_context).await {
+    let ledger = Arc::new(RunLedger::default());
+    let plan = match plan_half(PlanHalfRequest {
+        client,
+        config,
+        store,
+        run_id,
+        issue,
+        engine,
+        context: &plan_context,
+        ledger: &ledger,
+    })
+    .await
+    {
         Ok(plan) => plan,
         Err(e) => {
             plan_context.session_end(RunStatus::Failed.as_str()).await;
@@ -1257,7 +1709,6 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
     // Built before the fork decision, because the no-code-change path publishes too and a
     // publisher needs the same run handle every other node gets.
     let clarifier = NodeClarifier::new(config, store, engine, run_id, issue);
-    let ledger = Arc::new(RunLedger::default());
     let run = Run {
         client,
         config,
@@ -1641,11 +2092,8 @@ pub async fn run_bookkeeper(
 /// rather than a rebuild. `None` when the verifier has no route — like the red team's classifier,
 /// it is opt-in by being given a model rather than by a separate switch.
 pub(crate) struct Review {
-    verifier: verifier::VerifierNode,
+    declared_context: Arc<workflow::WorkflowContext>,
     threshold: verifier::Severity,
-    /// The analyst, kept alive for revisions. It is the principal: it owns the plan, so it is the
-    /// only node that can tell "the plan was wrong" from "the code did not follow the plan".
-    analyst: AnalystNode,
     scout: ScoutOutput,
     memory: MemoryOutput,
     brief: String,
@@ -1836,29 +2284,13 @@ fn parse_threshold(raw: &str) -> verifier::Severity {
 }
 
 impl Review {
-    /// Point the verifier's file tools at the tree the change is actually in.
-    ///
-    /// The verifier is handed the diff as text and then reads the repository to check it against.
-    /// Without this it reads the process's working directory — the main checkout — which does not
-    /// contain the change, so every `Read` and `Grep` it makes describes the code as it was before.
-    /// On a live run that produced three consecutive blocking findings saying the diff's changes
-    /// "are not actually present in the repository": true of the tree it could see, and the wrong
-    /// conclusion, which sent the implementer back to fix work that was never broken.
-    ///
-    /// Set here rather than at construction because [`Review::build`] runs before the worktree
-    /// exists — deliberately, so a misconfigured verifier fails the run before an implementer
-    /// session has been spent on it. This is the earliest moment the path is known.
-    ///
-    /// The analyst kept alive for revisions is left rooted at the checkout: it owns the plan and
-    /// reasons about the repository, not about the diff.
-    fn rooted_at(&mut self, worktree: &std::path::Path) {
-        self.verifier.files = Some(worktree.to_path_buf());
-    }
-
     fn build(run: &Run<'_>, plan: &PlanOutcome) -> Result<Option<Self>, PlanError> {
         let &Run {
             client,
             config,
+            store,
+            run_id,
+            issue,
             engine,
             context,
             ledger,
@@ -1868,54 +2300,20 @@ impl Review {
             return Ok(None);
         }
 
-        let mut plugins_verifier = context.for_node("verifier");
-        let cfg = stage_agent_config(
-            engine,
-            config,
-            context.pool_for("verifier", client.map(|c| c.offer())),
-            "verifier",
-            verifier::VERIFIER_TOOLS,
-            &mut plugins_verifier,
-        )?;
-        let verifier = verifier::VerifierNode {
-            route: cfg.route,
-            tools: cfg.tools,
-            policy: cfg.policy,
-            max_turns: cfg.max_turns,
-            system_prompt: cfg.system_prompt,
-            plugins: plugins_verifier,
-            // Left unset here, and set by `rooted_at` once the worktree exists. `cfg.files` is the
-            // process's working directory — the main checkout — which does not contain the change
-            // this node reviews. Leaving it None means a review that was never rooted loses its file
-            // tools and says so, rather than quietly reading the wrong tree and reporting the change
-            // as missing.
-            files: None,
-            ledger: Some(Arc::clone(ledger)),
-        };
-
-        let mut plugins_analyst = context.for_node("analyst");
-        let acfg = stage_agent_config(
-            engine,
-            config,
-            context.pool_for("analyst", client.map(|c| c.offer())),
-            "analyst",
-            analyst::ANALYST_TOOLS,
-            &mut plugins_analyst,
-        )?;
+        let declared_context =
+            workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
+                client,
+                config,
+                store,
+                run_id,
+                issue,
+                engine,
+                plugin_context: context.clone(),
+                ledger: Arc::clone(ledger),
+            })?;
         Ok(Some(Review {
-            verifier,
+            declared_context,
             threshold: parse_threshold(&config.implementer.verify_threshold),
-            analyst: AnalystNode {
-                conversation: Some(format!("{}-analyst", run.run_id)),
-                route: acfg.route,
-                tools: acfg.tools,
-                policy: acfg.policy,
-                max_turns: acfg.max_turns,
-                system_prompt: acfg.system_prompt,
-                plugins: plugins_analyst,
-                files: acfg.files,
-                ledger: Some(Arc::clone(ledger)),
-            },
             scout: plan.scout.clone(),
             memory: plan.memory.clone(),
             brief: plan.brief.clone(),
@@ -1961,7 +2359,7 @@ impl Review {
         // A verifier that cannot run must not discard a change that was made and passed. Every
         // other fallible node here is best-effort for the same reason; this one propagating its
         // error was an oversight, and the run it cost had already implemented the task correctly.
-        let out = match self.verifier.run(input).await {
+        let out = match run_declared_verifier(&self.declared_context, &input, worktree).await {
             Ok(out) => out,
             Err(e) => {
                 tracing::warn!("the verifier could not review this change: {e}");
@@ -2032,11 +2430,7 @@ impl Review {
             findings: plan_faults,
         };
         let revision_json = serde_json::to_string(&revision)?;
-        let revised = self
-            .analyst
-            .run(revision, &RunState::new(run_id, None))
-            .await
-            .map_err(|e| PlanError::node("analyst", e))?;
+        let revised = run_declared_analyst(&self.declared_context, &revision).await?;
         record(Record {
             store,
             run_id,
@@ -2090,11 +2484,7 @@ impl Review {
             findings: findings.to_vec(),
         };
         let revision_json = serde_json::to_string(&revision)?;
-        let revised = match self
-            .analyst
-            .run(revision, &RunState::new(run_id, None))
-            .await
-        {
+        let revised = match run_declared_analyst(&self.declared_context, &revision).await {
             Ok(revised) => revised,
             // Best-effort, like every other recovery here: a failed re-plan leaves the run
             // recording what it already knew rather than losing the work as well.
@@ -2169,13 +2559,10 @@ async fn fork_and_converge(
 
     // --- build agents ---
     let (red_team, implementer) = build_converge_agents(run, plan, &repo_path, acceptance)?;
-    let mut review = build_reviewers(run, plan)?;
+    let review = build_reviewers(run, plan)?;
 
     // --- fork worktree ---
     let worktree = fork_worktree(&implementer).await?;
-
-    // --- root review ---
-    root_reviewers(&mut review, &worktree);
 
     // --- red-team baseline ---
     let red_team_out = red_team_baseline(&red_team, &worktree, run.issue, plan).await?;
@@ -2393,13 +2780,6 @@ pub(crate) async fn fork_worktree(
         .prepare()
         .await
         .map_err(|e| PlanError::node("implementer", e))
-}
-
-/// Point the diff reader at the newly-created worktree.
-pub(crate) fn root_reviewers(review: &mut Option<Review>, worktree: &WorktreePath) {
-    if let Some(review) = review.as_mut() {
-        review.rooted_at(worktree.as_path());
-    }
 }
 
 /// Characterize the baseline and author any tests before the implementer opens the tree.

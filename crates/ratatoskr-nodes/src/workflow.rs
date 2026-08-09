@@ -1015,7 +1015,7 @@ fn declared_stage_question(stage: &Stage, runtime_question: &str) -> String {
     )
 }
 
-trait StageTurn: Send + Sync {
+pub(crate) trait StageTurn: Send + Sync {
     fn run<'a>(
         &'a self,
         run: ratatoskr_agent::NodeRun<'a>,
@@ -1555,7 +1555,7 @@ pub(crate) async fn evaluate_standard_stage_with_resources(
     .await
 }
 
-async fn evaluate_standard_stage_with_turn(
+pub(crate) async fn evaluate_standard_stage_with_turn(
     ctx: Arc<WorkflowContext>,
     stage_id: &str,
     input_json: String,
@@ -1573,7 +1573,7 @@ async fn evaluate_standard_stage_with_turn(
     .await
 }
 
-async fn evaluate_standard_stage_with_resources_and_turn(
+pub(crate) async fn evaluate_standard_stage_with_resources_and_turn(
     ctx: Arc<WorkflowContext>,
     stage_id: &str,
     input_json: String,

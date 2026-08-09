@@ -245,7 +245,7 @@ impl Node for AnalystNode {
 }
 
 /// Fold the issue + upstream outputs into the analyst's prompt.
-fn render_prompt(input: &AnalystInput) -> String {
+pub(crate) fn render_prompt(input: &AnalystInput) -> String {
     let mut s = String::new();
     if input.is_revision() {
         s.push_str(
