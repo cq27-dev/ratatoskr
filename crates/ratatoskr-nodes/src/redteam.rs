@@ -47,9 +47,15 @@ pub struct FailureClassification {
 
 /// The compose model's output.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct Classification {
+pub(crate) struct Classification {
     #[serde(default)]
-    classifications: Vec<FailureClassification>,
+    pub(crate) classifications: Vec<FailureClassification>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct ClassifierInput {
+    pub failing: Vec<String>,
+    pub raw_output: String,
 }
 
 /// Deterministic baseline characterization (strict schema — built from a real test run, not an LLM).
@@ -87,6 +93,9 @@ pub struct RedTeamClassifier {
     pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
     /// The repository its built-in file tools read within.
     pub files: Option<std::path::PathBuf>,
+    /// Present on production paths. Direct construction retains the native runner as a
+    /// compatibility path.
+    pub(crate) declared_context: Option<std::sync::Arc<crate::workflow::WorkflowContext>>,
 }
 
 impl RedTeamClassifier {
@@ -95,45 +104,65 @@ impl RedTeamClassifier {
         failing: &[String],
         raw_output: &str,
     ) -> Result<Vec<FailureClassification>, NodeError> {
-        let prompt = format!(
-            "These tests fail in the current baseline (before any change):\n{}\n\nTest output:\n{}\n\n\
-             Classify each as \"flaky\" or \"real\" with a one-line reason.",
-            failing.join("\n"),
-            truncate(raw_output, 6000)
-        );
-        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-            node: "redteam",
-            route: &self.route,
-            preamble: &crate::effective_preamble_with_profile(
-                "redteam",
-                CLASSIFY_PREAMBLE,
-                self.plugins.profile_prompt.as_str(),
-                self.system_prompt.as_deref(),
-                self.plugins.context.as_deref(),
-                &self.plugins.skills,
-            ),
-            question: &prompt,
-            tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(Classification),
-            policy: self.policy.clone(),
-            max_turns: self.max_turns,
-            clarifier: self.clarifier.clone(),
-            observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills, "redteam"),
-            files: self.files.clone(),
-            // Reads and edits, but runs nothing.
-            shell: None,
-            push: None,
-            conversation: None,
-            ledger: self.ledger.clone(),
-            produces: Some(
-                "a classification of each baseline test failure as flaky or real, with the reason",
-            ),
-        })
-        .await
-        .map_err(|e| NodeError::Failed(format!("red-team classifier failed: {e}")))?;
+        let input = ClassifierInput {
+            failing: failing.to_vec(),
+            raw_output: raw_output.to_string(),
+        };
+        let input_json = serde_json::to_string(&input)
+            .map_err(|error| NodeError::Failed(format!("red-team classifier input: {error}")))?;
+        let prompt = classifier_prompt(&input.failing, &input.raw_output);
+        let raw = match &self.declared_context {
+            Some(ctx) => crate::workflow::evaluate_standard_stage(
+                std::sync::Arc::clone(ctx),
+                "redteam_classifier",
+                input_json,
+                prompt,
+            )
+            .await
+            .map_err(|error| NodeError::Failed(format!("red-team classifier failed: {error}")))?,
+            None => ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
+                node: "redteam",
+                route: &self.route,
+                preamble: &crate::effective_preamble_with_profile(
+                    "redteam",
+                    CLASSIFY_PREAMBLE,
+                    self.plugins.profile_prompt.as_str(),
+                    self.system_prompt.as_deref(),
+                    self.plugins.context.as_deref(),
+                    &self.plugins.skills,
+                ),
+                question: &prompt,
+                tools: self.tools.clone(),
+                output_schema: schemars::schema_for!(Classification),
+                policy: self.policy.clone(),
+                max_turns: self.max_turns,
+                clarifier: self.clarifier.clone(),
+                observer: self.plugins.observer.clone(),
+                skills: crate::skills::loaded(&self.plugins.skills, "redteam"),
+                files: self.files.clone(),
+                // Reads, but runs nothing.
+                shell: None,
+                push: None,
+                conversation: None,
+                ledger: self.ledger.clone(),
+                produces: Some(
+                    "a classification of each baseline test failure as flaky or real, with the reason",
+                ),
+            })
+            .await
+            .map_err(|error| NodeError::Failed(format!("red-team classifier failed: {error}")))?,
+        };
         Ok(parse_validated::<Classification>(&raw)?.classifications)
     }
+}
+
+pub(crate) fn classifier_prompt(failing: &[String], raw_output: &str) -> String {
+    format!(
+        "These tests fail in the current baseline (before any change):\n{}\n\nTest output:\n{}\n\n\
+         Classify each as \"flaky\" or \"real\" with a one-line reason.",
+        failing.join("\n"),
+        truncate(raw_output, 6000)
+    )
 }
 
 /// The red-team node: run the baseline checkout's tests in a sandbox, optionally classify failures.
@@ -174,6 +203,15 @@ pub struct TestAuthor {
     pub conventions: Option<String>,
     pub plugins: crate::NodePlugins,
     pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
+    /// Present on production paths. Direct construction retains the native runner as a
+    /// compatibility path.
+    pub(crate) declared_context: Option<std::sync::Arc<crate::workflow::WorkflowContext>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct TestAuthorInput {
+    pub issue: String,
+    pub interface: Vec<crate::analyst::InterfaceItem>,
 }
 
 impl TestAuthor {
@@ -184,47 +222,65 @@ impl TestAuthor {
         issue: &str,
         interface: &[crate::analyst::InterfaceItem],
     ) -> Result<AuthoredTests, NodeError> {
-        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-            node: "redteam",
-            route: &self.route,
-            preamble: &crate::with_conventions(
-                "redteam",
-                self.conventions.as_deref(),
-                crate::effective_preamble_with_profile(
+        let input = TestAuthorInput {
+            issue: issue.to_string(),
+            interface: interface.to_vec(),
+        };
+        let input_json = serde_json::to_string(&input)
+            .map_err(|error| NodeError::Failed(format!("test author input: {error}")))?;
+        let prompt = author_prompt(&input.issue, &input.interface);
+        let raw = match &self.declared_context {
+            Some(ctx) => crate::workflow::evaluate_standard_stage_at(
+                std::sync::Arc::clone(ctx),
+                "redteam_author",
+                input_json,
+                prompt,
+                worktree.to_path_buf(),
+            )
+            .await
+            .map_err(|error| NodeError::Failed(format!("test author failed: {error}")))?,
+            None => ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
+                node: "redteam",
+                route: &self.route,
+                preamble: &crate::with_conventions(
                     "redteam",
-                    AUTHOR_PREAMBLE,
-                    self.plugins.profile_prompt.as_str(),
-                    self.system_prompt.as_deref(),
-                    self.plugins.context.as_deref(),
-                    &self.plugins.skills,
+                    self.conventions.as_deref(),
+                    crate::effective_preamble_with_profile(
+                        "redteam",
+                        AUTHOR_PREAMBLE,
+                        self.plugins.profile_prompt.as_str(),
+                        self.system_prompt.as_deref(),
+                        self.plugins.context.as_deref(),
+                        &self.plugins.skills,
+                    ),
                 ),
-            ),
-            question: &author_prompt(issue, interface),
-            tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(AuthoredTests),
-            policy: self.policy.clone(),
-            max_turns: self.max_turns,
-            clarifier: None,
-            observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills, "redteam"),
-            // Rooted at the worktree: the tests have to land where the implementer will meet them.
-            files: Some(worktree.to_path_buf()),
-            // No shell. Writing a test is not running one, and the baseline run is what says
-            // whether these fail — which at this point they should.
-            shell: None,
-            push: None,
-            conversation: None,
-            ledger: self.ledger.clone(),
-            produces: Some("tests covering the contracted interface, written before the code"),
-        })
-        .await
-        .map_err(|e| NodeError::Failed(format!("test author failed: {e}")))?;
+                question: &prompt,
+                tools: self.tools.clone(),
+                output_schema: schemars::schema_for!(AuthoredTests),
+                policy: self.policy.clone(),
+                max_turns: self.max_turns,
+                clarifier: None,
+                observer: self.plugins.observer.clone(),
+                skills: crate::skills::loaded(&self.plugins.skills, "redteam"),
+                // Rooted at the worktree: the tests have to land where the implementer will meet them.
+                files: Some(worktree.to_path_buf()),
+                // No shell. Writing a test is not running one, and the baseline run is what says
+                // whether these fail — which at this point they should.
+                shell: None,
+                push: None,
+                conversation: None,
+                ledger: self.ledger.clone(),
+                produces: Some("tests covering the contracted interface, written before the code"),
+            })
+            .await
+            .map_err(|error| NodeError::Failed(format!("test author failed: {error}")))?,
+        };
         parse_validated::<AuthoredTests>(&raw)
     }
 }
 
 /// What the author is given: the task for context, and the contract it writes against.
-fn author_prompt(issue: &str, interface: &[crate::analyst::InterfaceItem]) -> String {
+pub(crate) fn author_prompt(issue: &str, interface: &[crate::analyst::InterfaceItem]) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     let _ = write!(s, "THE TASK, for context only:\n{issue}\n\n");

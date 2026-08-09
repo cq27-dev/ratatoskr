@@ -2166,6 +2166,23 @@ pub(crate) fn build_converge_agents(
     } = run;
     let short: String = run_id.chars().take(8).collect();
     let conventions = repo_conventions(repo_path);
+    let redteam_enabled = classifier_enabled(engine, config);
+    let redteam_context = if redteam_enabled {
+        Some(workflow::WorkflowContext::new_with_ledger(
+            workflow::WorkflowContextParams {
+                client,
+                config,
+                store: run.store,
+                run_id,
+                issue,
+                engine,
+                plugin_context: context.clone(),
+                ledger: Arc::clone(ledger),
+            },
+        )?)
+    } else {
+        None
+    };
     let characterizer_context = if node_route(engine, config, "characterizer").is_some() {
         Some(workflow::WorkflowContext::new_with_ledger(
             workflow::WorkflowContextParams {
@@ -2197,7 +2214,7 @@ pub(crate) fn build_converge_agents(
             Some(Arc::clone(ledger)),
             characterizer_context.as_ref().map(Arc::clone),
         )?,
-        classifier: match classifier_enabled(engine, config) {
+        classifier: match redteam_enabled {
             true => {
                 let mut plugins_redteam = context.for_node("redteam");
                 let cfg = stage_agent_config(
@@ -2220,11 +2237,12 @@ pub(crate) fn build_converge_agents(
                     plugins: plugins_redteam,
                     files: cfg.files,
                     ledger: Some(Arc::clone(ledger)),
+                    declared_context: redteam_context.as_ref().map(Arc::clone),
                 })
             }
             false => None,
         },
-        author: match classifier_enabled(engine, config) {
+        author: match redteam_enabled {
             true => {
                 let mut plugins = context.for_node("redteam");
                 let mut tools = context.pool_for("redteam", client.map(|c| c.offer()));
@@ -2248,6 +2266,7 @@ pub(crate) fn build_converge_agents(
                     conventions: conventions.clone(),
                     plugins,
                     ledger: Some(Arc::clone(ledger)),
+                    declared_context: redteam_context,
                 })
             }
             false => None,

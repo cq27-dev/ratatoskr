@@ -182,6 +182,158 @@ step in \`failing\`.`,
       appendRepositoryGuidance: false,
     },
     {
+      id: "redteam_classifier",
+      agent: "reason",
+      governedBy: "redteam",
+      inputContract: "ClassifierInput",
+      outputContract: "Classification",
+      outputSchema: {
+        type: "object",
+        properties: {
+          classifications: {
+            type: "array",
+            default: [],
+            items: { "$ref": "#/$defs/FailureClassification" },
+          },
+        },
+        "$defs": {
+          FailureClassification: {
+            type: "object",
+            properties: {
+              category: { type: "string", default: "" },
+              reason: { type: "string", default: "" },
+              test: { type: "string" },
+            },
+            required: ["test"],
+          },
+        },
+      },
+      instructions: `You classify failing tests. For each test, decide whether it is "flaky" (fails non-
+deterministically — timing, ordering, environment, network — and would likely pass on a retry)
+or "real" (a genuine, reproducible failure in the code under test). Base the call on the test
+output and, if useful, the test's code. Be conservative: only call something flaky when the
+evidence points to non-determinism.`,
+      renderQuestion(input: any) {
+        const characters = Array.from(input.raw_output);
+        let bytes = 0;
+        let kept = "";
+        let truncated = false;
+        for (const character of characters) {
+          const code = character.codePointAt(0)!;
+          const width = code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
+          if (bytes + width > 6000) {
+            truncated = true;
+            break;
+          }
+          kept += character;
+          bytes += width;
+        }
+        const output = truncated ? `${kept}…` : kept;
+        return "These tests fail in the current baseline (before any change):\n" +
+          input.failing.join("\n") +
+          `\n\nTest output:\n${output}\n\n` +
+          "Classify each as \"flaky\" or \"real\" with a one-line reason.";
+      },
+      capabilities: ["read"],
+      tools: ["symbol_lookup", "semantic_search"],
+      session: "fresh",
+      appendRepositoryGuidance: false,
+    },
+    {
+      id: "redteam_author",
+      agent: "build",
+      governedBy: "redteam",
+      inputContract: "TestAuthorInput",
+      outputContract: "AuthoredTests",
+      outputSchema: {
+        type: "object",
+        properties: {
+          covers: { type: "string", default: "" },
+          files: {
+            type: "array",
+            default: [],
+            items: { type: "string" },
+          },
+          tests: {
+            type: "array",
+            default: [],
+            items: { type: "string" },
+          },
+        },
+      },
+      instructions: `You write the tests for a change that has not been written yet.
+
+You are given an interface: the surface the change is contracted to have, and what it owes its
+caller on the happy path and the sad one. You have the repository as it is now, before the change.
+Your job is to turn that contract into tests that will pass when the change is right and fail when
+it is wrong.
+
+The reason you exist as a separate step is worth knowing, because it shapes what a good test looks
+like here. An author writing their own tests writes them against the code that appeared — the
+branches it happens to have, the errors it happens to return. Those tests pass, and they check that
+the implementation is itself. You are working from the contract instead, so your tests can be wrong
+about the implementation and still right about the requirement, which is the whole point.
+
+## What to write
+
+Cover both lists. The \`sad\` entries matter most: they are the cases an author omits without
+noticing, and the ones a reviewer cannot reconstruct from a diff.
+
+Write them so they fail now, for the right reason. The code does not exist yet, so a test that
+cannot compile or cannot find the symbol is expected at this stage — what matters is that when the
+symbol arrives with the contracted shape, the test exercises it rather than needing a rewrite. Do
+not write a test that passes today by asserting nothing.
+
+Match the interface exactly: the names, the parameter order, the types. If the contract is
+ambiguous about something you need, pick the reading that makes the requirement checkable and note
+the choice in a comment on the test — do not invent a second, more convenient interface.
+
+## Where to write
+
+Follow the repository's own convention. Look at how the tests near the code you are testing are
+laid out — same directory, same file naming, same framework, same helpers — and add to that. A new
+file is fine when the convention is a file per unit; extending an existing module is fine when it
+is not. Read a neighbouring test before you write, so yours does not stand out as foreign.
+
+Do not modify tests that are already there. Do not touch production code, or the test runner's
+configuration: you are adding what the change will be judged against, not adjusting the judge.
+
+## Report
+
+Return the paths you wrote or extended, the tests you added named exactly as the test runner will
+report them (\`crate::module::test_name\`, \`path/to/file.rs::test_name\`, whatever this runner
+prints — the run compares these against its output, so a name that does not match is a test nobody
+can tell passed), and a line on what they cover. If the interface
+was too thin to write a real test against, say so plainly and write nothing rather than producing a
+test that asserts whatever is easy — the run is better off knowing the contract was not specific
+enough than believing it is covered.`,
+      renderQuestion(input: any) {
+        let question = `THE TASK, for context only:\n${input.issue}\n\n`;
+        question +=
+          "THE INTERFACE. This is the contract, and it is all you get — the code does not exist yet, and the person writing it is working from this same description:\n\n";
+        for (const item of input.interface) {
+          question += `- ${item.name}\n  ${item.shape}\n`;
+          for (const happy of item.happy || []) question += `  happy: ${happy}\n`;
+          for (const sad of item.sad || []) question += `  sad: ${sad}\n`;
+        }
+        question +=
+          "\nWrite tests for these. Follow the repository's own layout and conventions, cover the sad cases as carefully as the happy ones, and change nothing that already exists.";
+        return question;
+      },
+      capabilities: ["write"],
+      tools: [
+        "symbol_lookup",
+        "semantic_search",
+        "Read",
+        "Grep",
+        "Glob",
+        "Write",
+        "Edit",
+      ],
+      session: "fresh",
+      appendRepositoryGuidance: true,
+    },
+    {
       id: "context_distillation",
       agent: "explore",
       governedBy: "context",

@@ -401,6 +401,7 @@ fn build_red_team(
                 clarifier: None,
                 system_prompt: cfg.system_prompt,
                 plugins,
+                declared_context: Some(Arc::clone(ctx)),
             })
         }
         false => None,
@@ -1090,12 +1091,22 @@ impl StageExecutor {
         let governance_id = stage.governance_id().to_string();
         let plugins = self.ctx.plugin_context.for_node(&governance_id);
         let default_tools = stage.tools.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut offered = self
+            .ctx
+            .plugin_context
+            .pool_for(&governance_id, self.ctx.rag_rat.clone());
+        if ratatoskr_core::Capability::ceiling(&stage.capabilities)
+            .is_some_and(|ceiling| ceiling.permits(ratatoskr_core::Capability::Write))
+        {
+            offered
+                .local()
+                .tools
+                .extend(ratatoskr_agent::files::edit_declarations());
+        }
         let (mut cfg, profile) = crate::plugins::declared_stage_agent_config(
             &self.ctx.engine,
             &self.ctx.config,
-            self.ctx
-                .plugin_context
-                .pool_for(&governance_id, self.ctx.rag_rat.clone()),
+            offered,
             &stage,
             &default_tools,
             &plugins,
@@ -1361,11 +1372,72 @@ pub(crate) async fn evaluate_standard_stage(
     .await
 }
 
+/// Evaluate a bundled standard stage with its file tools rooted at a Rust-owned resource.
+///
+/// The caller retains ownership of that resource's lifecycle. In particular, the red-team author
+/// may write into the implementer's pre-change worktree without giving a declared stage authority
+/// to create, select, retain, or remove worktrees.
+pub(crate) async fn evaluate_standard_stage_at(
+    ctx: Arc<WorkflowContext>,
+    stage_id: &str,
+    input_json: String,
+    rendered_question: String,
+    resource_root: std::path::PathBuf,
+) -> Result<String, String> {
+    evaluate_standard_stage_at_with_turn(
+        ctx,
+        stage_id,
+        input_json,
+        rendered_question,
+        resource_root,
+        Arc::new(LiveStageTurn),
+    )
+    .await
+}
+
 async fn evaluate_standard_stage_with_turn(
     ctx: Arc<WorkflowContext>,
     stage_id: &str,
     input_json: String,
     rendered_question: String,
+    turn: Arc<dyn StageTurn>,
+) -> Result<String, String> {
+    evaluate_standard_stage_with_turn_and_root(
+        ctx,
+        stage_id,
+        input_json,
+        rendered_question,
+        None,
+        turn,
+    )
+    .await
+}
+
+async fn evaluate_standard_stage_at_with_turn(
+    ctx: Arc<WorkflowContext>,
+    stage_id: &str,
+    input_json: String,
+    rendered_question: String,
+    resource_root: std::path::PathBuf,
+    turn: Arc<dyn StageTurn>,
+) -> Result<String, String> {
+    evaluate_standard_stage_with_turn_and_root(
+        ctx,
+        stage_id,
+        input_json,
+        rendered_question,
+        Some(resource_root),
+        turn,
+    )
+    .await
+}
+
+async fn evaluate_standard_stage_with_turn_and_root(
+    ctx: Arc<WorkflowContext>,
+    stage_id: &str,
+    input_json: String,
+    rendered_question: String,
+    resource_root: Option<std::path::PathBuf>,
     turn: Arc<dyn StageTurn>,
 ) -> Result<String, String> {
     let stages = Arc::new(standard_stages().await.map_err(|error| error.to_string())?);
@@ -1379,7 +1451,7 @@ async fn evaluate_standard_stage_with_turn(
             stage,
             input_json,
             rendered_question: Some(rendered_question),
-            resource_root: None,
+            resource_root,
             output: StageOutput::Evidence,
         })
         .await
@@ -1736,6 +1808,7 @@ mod tests {
         conversations: Mutex<Vec<Option<String>>>,
         ledger_ids: Mutex<Vec<Option<usize>>>,
         tools: Mutex<Vec<Vec<String>>>,
+        files: Mutex<Vec<Option<std::path::PathBuf>>>,
         preambles: Mutex<Vec<String>>,
         questions: Mutex<Vec<String>>,
         has_ledger: Mutex<Vec<bool>>,
@@ -1750,6 +1823,7 @@ mod tests {
                 conversations: Mutex::new(Vec::new()),
                 ledger_ids: Mutex::new(Vec::new()),
                 tools: Mutex::new(Vec::new()),
+                files: Mutex::new(Vec::new()),
                 preambles: Mutex::new(Vec::new()),
                 questions: Mutex::new(Vec::new()),
                 has_ledger: Mutex::new(Vec::new()),
@@ -1788,6 +1862,10 @@ mod tests {
                 .lock()
                 .expect("recording runner mutex poisoned")
                 .push(run.tools.names());
+            self.files
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(run.files.clone());
             self.preambles
                 .lock()
                 .expect("recording runner mutex poisoned")
@@ -2816,6 +2894,289 @@ mod tests {
         assert!(output.memory.memories.is_empty());
         assert!(output.scout.related_items.is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn standard_redteam_stages_use_generic_dispatch_with_faithful_prompts_and_ceilings() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-redteam-stages-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"async function plan(input) {
+                await redteam_author(input.author);
+                return await redteam_classifier(input.classifier);
+            }"#,
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::load(&workflow_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-standard-redteam", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "redteam".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Compacted,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-standard-redteam",
+            "add Store::prune",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = standard_stages().await.unwrap();
+        let author_stage = stages
+            .iter()
+            .find(|stage| stage.id == "redteam_author")
+            .unwrap();
+        let classifier_stage = stages
+            .iter()
+            .find(|stage| stage.id == "redteam_classifier")
+            .unwrap();
+        assert_eq!(author_stage.governance_id(), "redteam");
+        assert_eq!(classifier_stage.governance_id(), "redteam");
+        assert_eq!(
+            author_stage.instructions,
+            include_str!("../prompts/redteam-author.md").trim()
+        );
+        assert_eq!(
+            classifier_stage.instructions,
+            include_str!("../prompts/redteam-classifier.md").trim()
+        );
+
+        let author = crate::redteam::TestAuthorInput {
+            issue: "add Store::prune".to_string(),
+            interface: vec![crate::analyst::InterfaceItem {
+                name: "Store::prune".to_string(),
+                shape: "async fn prune(Duration) -> Result<u64>".to_string(),
+                happy: vec!["returns the deleted row count".to_string()],
+                sad: vec!["a zero duration deletes nothing".to_string()],
+            }],
+        };
+        let classifier = crate::redteam::ClassifierInput {
+            failing: vec!["store::tests::prune_zero".to_string()],
+            raw_output: "assertion failed: deleted > 0".to_string(),
+        };
+        let turn = Arc::new(RecordingStageTurn::default());
+        let hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        runtime
+            .run_with_question_renderers(
+                "plan",
+                json!({ "author": author, "classifier": classifier }).to_string(),
+                hosts,
+                stage_question_renderers(&stages),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *turn.nodes.lock().expect("recording runner mutex poisoned"),
+            ["redteam", "redteam"]
+        );
+        assert_eq!(
+            *turn
+                .sessions
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            [
+                ratatoskr_core::SessionScope::Fresh,
+                ratatoskr_core::SessionScope::Fresh
+            ]
+        );
+        let tools = turn
+            .tools
+            .lock()
+            .expect("recording runner mutex poisoned")
+            .clone();
+        for tool in ["Read", "Grep", "Glob", "Write", "Edit"] {
+            assert!(
+                tools[0].iter().any(|offered| offered == tool),
+                "missing {tool}"
+            );
+        }
+        assert!(
+            !tools[1]
+                .iter()
+                .any(|tool| tool == "Write" || tool == "Edit")
+        );
+        for tool in ["Read", "Grep", "Glob"] {
+            assert!(
+                tools[1].iter().any(|offered| offered == tool),
+                "missing {tool}"
+            );
+        }
+        let questions = turn
+            .questions
+            .lock()
+            .expect("recording runner mutex poisoned")
+            .clone();
+        assert_eq!(
+            questions[0],
+            format!(
+                "Input contract: TestAuthorInput\nOutput contract: AuthoredTests\n\n{}",
+                crate::redteam::author_prompt(&author.issue, &author.interface)
+            )
+        );
+        assert_eq!(
+            questions[1],
+            format!(
+                "Input contract: ClassifierInput\nOutput contract: Classification\n\n{}",
+                crate::redteam::classifier_prompt(&classifier.failing, &classifier.raw_output)
+            )
+        );
+        let checkpoints = store
+            .checkpoints_for_run("run-standard-redteam")
+            .await
+            .unwrap();
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(checkpoints[0].node_name, "redteam_author");
+        assert_eq!(checkpoints[1].node_name, "redteam_classifier");
+        let checkpoint_author: crate::redteam::TestAuthorInput =
+            serde_json::from_str(checkpoints[0].input_json.as_deref().unwrap()).unwrap();
+        assert_eq!(checkpoint_author.interface[0].name, "Store::prune");
+        let checkpoint_classifier: crate::redteam::ClassifierInput =
+            serde_json::from_str(checkpoints[1].input_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            checkpoint_classifier.raw_output,
+            "assertion failed: deleted > 0"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn redteam_evidence_keeps_the_author_root_and_rejects_invalid_classification() {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-redteam-evidence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let author_root = dir.join("implementer-tree");
+        std::fs::create_dir_all(&author_root).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-redteam-evidence", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "redteam".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-redteam-evidence",
+            "add Store::prune",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let author = crate::redteam::TestAuthorInput {
+            issue: "add Store::prune".to_string(),
+            interface: Vec::new(),
+        };
+        let author_turn = Arc::new(RecordingStageTurn {
+            output: json!({ "files": [], "tests": [], "covers": "no interface" }).to_string(),
+            ..Default::default()
+        });
+        evaluate_standard_stage_at_with_turn(
+            Arc::clone(&ctx),
+            "redteam_author",
+            serde_json::to_string(&author).unwrap(),
+            crate::redteam::author_prompt(&author.issue, &author.interface),
+            author_root.clone(),
+            Arc::clone(&author_turn) as Arc<dyn StageTurn>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            author_turn
+                .files
+                .lock()
+                .expect("recording runner mutex poisoned")[0],
+            Some(author_root)
+        );
+
+        let classifier = crate::redteam::ClassifierInput {
+            failing: vec!["store::tests::prune_zero".to_string()],
+            raw_output: "failed".to_string(),
+        };
+        let invalid_turn = Arc::new(RecordingStageTurn {
+            output: json!({ "classifications": [{ "category": "real" }] }).to_string(),
+            ..Default::default()
+        });
+        let error = evaluate_standard_stage_with_turn(
+            ctx,
+            "redteam_classifier",
+            serde_json::to_string(&classifier).unwrap(),
+            crate::redteam::classifier_prompt(&classifier.failing, &classifier.raw_output),
+            invalid_turn,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("invalid `Classification` output"), "{error}");
+        assert!(error.contains("test"), "{error}");
+        assert!(
+            store
+                .checkpoints_for_run("run-redteam-evidence")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn standard_redteam_contracts_match_the_typed_output_gates() {
+        let stages = standard_stages().await.unwrap();
+        for (stage_id, mut generated) in [
+            (
+                "redteam_author",
+                serde_json::to_value(schemars::schema_for!(crate::redteam::AuthoredTests)).unwrap(),
+            ),
+            (
+                "redteam_classifier",
+                serde_json::to_value(schemars::schema_for!(crate::redteam::Classification))
+                    .unwrap(),
+            ),
+        ] {
+            let stage = stages.iter().find(|stage| stage.id == stage_id).unwrap();
+            let mut declared = stage.output_schema.clone().unwrap();
+            without_schema_annotations(&mut generated);
+            without_schema_annotations(&mut declared);
+            assert_eq!(declared, generated, "schema drift for {stage_id}");
+        }
     }
 
     #[tokio::test]
