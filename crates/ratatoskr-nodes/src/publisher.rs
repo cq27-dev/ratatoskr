@@ -26,13 +26,23 @@ const PREAMBLE: &str = include_str!("../prompts/publisher.md");
 /// What the publisher did.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PublisherOutput {
-    /// `pull_request`, `comment`, `both`, or `none`. Free text rather than an enum: nothing
-    /// branches on it, and a model writing an unexpected word should not fail a run whose work is
-    /// already done and whose `reasoning` says what happened.
+    /// `pull_request`, `comment`, `both`, or `none`.
+    ///
+    /// The dashboard uses this to decide whether the checkpoint contains a pull request. Keep the
+    /// value low-cardinality even though an unexpected word must not turn an already-complete run
+    /// into a failure.
     pub action: String,
-    /// Where it landed, when it landed anywhere.
+    /// The one pull request URL, if a pull request was opened.
+    ///
+    /// Never combine this with an issue-comment URL or a label such as `PR:`. Its absence is an
+    /// empty string so old checkpoints remain readable.
     #[serde(default)]
-    pub url: String,
+    pub pull_request_url: String,
+    /// The one issue-comment URL, if a comment was posted.
+    ///
+    /// This stays separate from [`Self::pull_request_url`] when `action` is `both`.
+    #[serde(default)]
+    pub comment_url: String,
     /// Why this was the right form — and, when nothing was published, the whole result.
     pub reasoning: String,
 }
@@ -386,8 +396,26 @@ mod tests {
         let raw = r#"{"action":"none","reasoning":"the run changed nothing and answered nothing"}"#;
         let out = parse_validated::<PublisherOutput>(raw).unwrap();
         assert_eq!(out.action, "none");
-        assert!(out.url.is_empty());
+        assert!(out.pull_request_url.is_empty());
+        assert!(out.comment_url.is_empty());
 
         assert!(parse_validated::<PublisherOutput>(r#"{"action":"none"}"#).is_err());
+    }
+
+    #[test]
+    fn publishing_both_keeps_the_two_urls_in_their_own_fields() {
+        let raw = r#"{
+            "action":"both",
+            "pull_request_url":"https://github.com/o/r/pull/214",
+            "comment_url":"https://github.com/o/r/issues/210#issuecomment-1",
+            "reasoning":"the change and its issue update are both published"
+        }"#;
+        let out = parse_validated::<PublisherOutput>(raw).unwrap();
+
+        assert_eq!(out.pull_request_url, "https://github.com/o/r/pull/214");
+        assert_eq!(
+            out.comment_url,
+            "https://github.com/o/r/issues/210#issuecomment-1"
+        );
     }
 }

@@ -802,11 +802,12 @@ fn worktree_view(checkpoints: &[Checkpoint]) -> Option<WorktreeView> {
     Some(WorktreeView { path, exists })
 }
 
-/// The pull request the latest `publisher` checkpoint opened, if any. `url` is only a PR when
-/// `action` is `pull_request` or `both` — a `comment`/`none` url points at an issue comment and
-/// must not be shown as a PR. `both` collapses to the PR (the single `url` field). The number is
-/// the URL's last path segment; anything that doesn't yield a number (older run without the field,
-/// comment url, malformed JSON) is absence, not an error.
+/// The pull request the latest `publisher` checkpoint opened, if any.
+///
+/// A checkpoint records `pull_request_url` separately from `comment_url`; the old `url` field is
+/// read only for compatibility. The action keeps comment-only checkpoints out of the dashboard.
+/// The parser accepts a URL only when it has GitHub's pull-request path shape, so a malformed or
+/// mixed legacy field is never used as an anchor verbatim.
 fn pull_request_view(checkpoints: &[Checkpoint]) -> Option<PullRequestView> {
     let raw = checkpoints
         .iter()
@@ -819,15 +820,46 @@ fn pull_request_view(checkpoints: &[Checkpoint]) -> Option<PullRequestView> {
         Some("pull_request") | Some("both") => {}
         _ => return None,
     }
-    let url = value.get("url")?.as_str()?;
-    let number: u64 = url
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()?
-        .split(['?', '#'])
-        .next()?
-        .parse()
-        .ok()?;
+    ["pull_request_url", "url"]
+        .into_iter()
+        .filter_map(|field| value.get(field).and_then(serde_json::Value::as_str))
+        .find_map(pull_request_url)
+}
+
+/// Extract one GitHub pull-request URL from a checkpoint field.
+///
+/// New publisher checkpoints contain the URL alone. Splitting legacy text on whitespace recovers
+/// an old `PR: <url>\\nIssue comment: <url>` record without letting the dashboard use the mixed
+/// text as its `href`.
+fn pull_request_url(value: &str) -> Option<PullRequestView> {
+    value
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | ',' | '.'))
+        })
+        .find_map(parse_github_pull_request_url)
+}
+
+fn parse_github_pull_request_url(url: &str) -> Option<PullRequestView> {
+    let mut segments = url.strip_prefix("https://github.com/")?.split('/');
+    let owner = segments.next()?;
+    let repository = segments.next()?;
+    if owner.is_empty() || repository.is_empty() || segments.next()? != "pull" {
+        return None;
+    }
+    let number_and_suffix = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+
+    let number_end = number_and_suffix
+        .find(['?', '#'])
+        .unwrap_or(number_and_suffix.len());
+    let (digits, suffix) = number_and_suffix.split_at(number_end);
+    if digits.is_empty() || (!suffix.is_empty() && !suffix.starts_with(['?', '#'])) {
+        return None;
+    }
+    let number = digits.parse().ok()?;
     Some(PullRequestView {
         number,
         url: url.to_string(),
@@ -1763,7 +1795,7 @@ mod tests {
     fn action_both_still_yields_the_pull_request() {
         let cps = vec![cp(
             "publisher",
-            r#"{"action":"both","url":"https://github.com/o/r/pull/42","reasoning":"x"}"#,
+            r#"{"action":"both","pull_request_url":"https://github.com/o/r/pull/42","comment_url":"https://github.com/o/r/issues/1#issuecomment-2","reasoning":"x"}"#,
         )];
         let pr = pull_request_view(&cps).unwrap();
         assert_eq!(pr.number, 42);
@@ -1824,6 +1856,27 @@ mod tests {
         assert!(pull_request_view(&cps).is_none());
         let empty_url = vec![cp("publisher", r#"{"action":"pull_request","url":""}"#)];
         assert!(pull_request_view(&empty_url).is_none());
+    }
+
+    #[test]
+    fn a_legacy_both_checkpoint_extracts_only_its_pull_request_url() {
+        let cps = vec![cp(
+            "publisher",
+            r#"{"action":"both","url":"PR: https://github.com/cq27-dev/ratatoskr/pull/214\nIssue comment: https://github.com/cq27-dev/ratatoskr/issues/210#issuecomment-5231512849"}"#,
+        )];
+
+        let pr = pull_request_view(&cps).unwrap();
+        assert_eq!(pr.number, 214);
+        assert_eq!(pr.url, "https://github.com/cq27-dev/ratatoskr/pull/214");
+    }
+
+    #[test]
+    fn a_non_github_pull_request_url_is_absent() {
+        let cps = vec![cp(
+            "publisher",
+            r#"{"action":"pull_request","pull_request_url":"https://example.com/o/r/pull/214"}"#,
+        )];
+        assert!(pull_request_view(&cps).is_none());
     }
 
     #[test]
