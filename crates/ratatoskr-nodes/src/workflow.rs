@@ -837,12 +837,7 @@ fn validate_declared_output(stage: &Stage, output: &serde_json::Value) -> Result
             stage.id, stage.output_contract
         ));
     };
-    ratatoskr_graph::validate_raw(
-        &serde_json::to_string(output).map_err(|e| e.to_string())?,
-        schema,
-    )
-    .map(|_| ())
-    .map_err(|e| {
+    ratatoskr_graph::validate_value(output, schema).map_err(|e| {
         format!(
             "stage `{}` returned invalid `{}` output: {e}",
             stage.id, stage.output_contract
@@ -1317,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn declared_contracts_reject_empty_or_scalar_output() {
+    fn declared_contracts_validate_all_json_root_values() {
         let mut stage = crate::built_in_stages().pop().unwrap();
         stage.id = "security_evidence".into();
         stage.output_contract = "SecurityEvidence".into();
@@ -1331,6 +1326,17 @@ mod tests {
         assert!(validate_declared_output(&stage, &json!("evidence")).is_err());
         assert!(validate_declared_output(&stage, &json!({ "unrelated": true })).is_err());
         assert!(validate_declared_output(&stage, &json!({ "finding": "validated" })).is_ok());
+
+        stage.output_schema = Some(json!({
+            "type": "array",
+            "items": { "type": "string" }
+        }));
+        assert!(validate_declared_output(&stage, &json!(["validated"])).is_ok());
+        assert!(validate_declared_output(&stage, &json!("not an array")).is_err());
+
+        stage.output_schema = Some(json!({ "type": "integer" }));
+        assert!(validate_declared_output(&stage, &json!(42)).is_ok());
+        assert!(validate_declared_output(&stage, &json!([42])).is_err());
     }
 
     #[test]

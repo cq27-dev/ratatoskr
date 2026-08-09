@@ -28,8 +28,8 @@ pub enum NodeError {
 /// `RunState`.
 ///
 /// `raw` may be wrapped in prose or ```json fences (agents in `OutputMode::Tool` are *instructed*
-/// but not *forced* to emit clean JSON), so the object between the outermost braces is extracted
-/// first.
+/// but not *forced* to emit clean JSON). A complete JSON document is preferred, which preserves
+/// array and scalar roots; object extraction remains the fallback for legacy prose-wrapped output.
 pub fn parse_validated<T>(raw: &str) -> Result<T, NodeError>
 where
     T: DeserializeOwned + JsonSchema,
@@ -56,12 +56,24 @@ where
 /// `parse_validated` does not: the agent that produced the output, still able to correct it. A
 /// caller that has the type should use [`parse_validated`].
 pub fn validate_raw(raw: &str, schema: &serde_json::Value) -> Result<serde_json::Value, NodeError> {
-    let json = extract_json_object(raw).ok_or_else(|| {
-        NodeError::InvalidOutput(format!("no JSON object found in output: {}", elide(raw)))
+    let json = extract_json_value(raw).ok_or_else(|| {
+        NodeError::InvalidOutput(format!("no JSON value found in output: {}", elide(raw)))
     })?;
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| NodeError::InvalidOutput(format!("output is not valid JSON: {e}")))?;
 
+    validate_value(&value, schema)?;
+    Ok(value)
+}
+
+/// Validate an already-parsed JSON value against a schema.
+///
+/// Unlike [`validate_raw`], this has no output-text recovery step and therefore preserves every
+/// valid JSON root, including arrays and scalars.
+pub fn validate_value(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> Result<(), NodeError> {
     let validator = jsonschema::validator_for(schema)
         .map_err(|e| NodeError::InvalidOutput(format!("could not compile schema: {e}")))?;
     // Every error, each with the field it is about. The validator's own message says only what was
@@ -69,7 +81,7 @@ pub fn validate_raw(raw: &str, schema: &serde_json::Value) -> Result<serde_json:
     // of a failed run and for the model being asked to correct it. Reporting all of them means a
     // correction fixes the answer rather than the first of several faults in it.
     let problems: Vec<String> = validator
-        .iter_errors(&value)
+        .iter_errors(value)
         .map(|err| match err.instance_path().to_string() {
             path if path.is_empty() => err.to_string(),
             path => format!("at `{path}`: {err}"),
@@ -81,7 +93,16 @@ pub fn validate_raw(raw: &str, schema: &serde_json::Value) -> Result<serde_json:
             problems.join("; ")
         )));
     }
-    Ok(value)
+    Ok(())
+}
+
+/// Return a complete JSON document, or recover an object from prose-wrapped legacy output.
+fn extract_json_value(raw: &str) -> Option<&str> {
+    let raw = raw.trim();
+    serde_json::from_str::<serde_json::Value>(raw)
+        .is_ok()
+        .then_some(raw)
+        .or_else(|| extract_json_object(raw))
 }
 
 /// Return the substring from the first `{` to the last `}`, or `None` if there isn't a brace pair.
@@ -223,6 +244,21 @@ mod tests {
         // And the corrected shape both validates and deserializes into the field it belongs to.
         let fixed: Plan = parse_validated(r#"{"acceptance":["cargo test"]}"#).unwrap();
         assert_eq!(fixed.acceptance, ["cargo test"]);
+    }
+
+    #[test]
+    fn validate_raw_preserves_array_and_scalar_roots() {
+        let array_schema = serde_json::json!({ "type": "array", "items": { "type": "string" } });
+        assert_eq!(
+            validate_raw(r#"["first", "second"]"#, &array_schema).unwrap(),
+            serde_json::json!(["first", "second"])
+        );
+
+        let scalar_schema = serde_json::json!({ "type": "integer" });
+        assert_eq!(
+            validate_raw("42", &scalar_schema).unwrap(),
+            serde_json::json!(42)
+        );
     }
 
     #[test]
