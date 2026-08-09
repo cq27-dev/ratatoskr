@@ -903,16 +903,16 @@ fn declared_stage_question(stage: &Stage, runtime_input_json: &str) -> String {
     )
 }
 
-trait DeclaredStageRunner: Send + Sync {
+trait StageTurn: Send + Sync {
     fn run<'a>(
         &'a self,
         run: ratatoskr_agent::NodeRun<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<String, ratatoskr_agent::AgentError>> + Send + 'a>>;
 }
 
-struct LiveDeclaredStageRunner;
+struct LiveStageTurn;
 
-impl DeclaredStageRunner for LiveDeclaredStageRunner {
+impl StageTurn for LiveStageTurn {
     fn run<'a>(
         &'a self,
         run: ratatoskr_agent::NodeRun<'a>,
@@ -922,182 +922,267 @@ impl DeclaredStageRunner for LiveDeclaredStageRunner {
     }
 }
 
-async fn declared_stage_host(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StageOutput {
+    Checkpoint,
+    Evidence,
+}
+
+struct StageInvocation {
+    stage: Stage,
+    input_json: String,
+    output: StageOutput,
+}
+
+/// Generic execution boundary for every declarative stage.
+///
+/// It owns model/profile resolution, authority narrowing, delegation, schema validation,
+/// normalization, telemetry and checkpointing. Workflow operation adapters stay outside it so a
+/// stage never acquires worktree, iteration or terminal-status powers by sharing an identifier.
+struct StageExecutor {
     ctx: Arc<WorkflowContext>,
-    stage: Stage,
     stages: Arc<Vec<Stage>>,
-    arg: String,
-    checkpoint_output: bool,
-    runner: &dyn DeclaredStageRunner,
-) -> Result<String, String> {
-    ctx.guard()?;
-    let input: serde_json::Value =
-        serde_json::from_str(&arg).map_err(|e| format!("{} arg: {e}", stage.id))?;
-    let plugins = ctx.plugin_context.for_node(&stage.id);
-    let default_tools = stage.tools.iter().map(String::as_str).collect::<Vec<_>>();
-    let (mut cfg, profile) = crate::plugins::declared_stage_agent_config(
-        &ctx.engine,
-        &ctx.config,
-        ctx.plugin_context.pool_for(&stage.id, ctx.rag_rat.clone()),
-        &stage,
-        &default_tools,
-        &plugins,
-    )
-    .map_err(|e| e.to_string())?;
-    cfg.route.session = stage.session_scope(cfg.route.session);
+    turn: Arc<dyn StageTurn>,
+}
 
-    // A child is evidence within its parent's call, never a second checkpointed graph stage.
-    let runtime_input = if let Some(delegation) =
-        stage.delegation.as_ref().filter(|_| checkpoint_output)
-    {
-        let target = stages
-            .iter()
-            .find(|candidate| candidate.id == delegation.target)
-            .ok_or_else(|| {
-                format!(
-                    "stage `{}` delegates to missing `{}`",
-                    stage.id, delegation.target
-                )
-            })?
-            .clone();
-        let target_profile = crate::agent_profiles(&ctx.config)
-            .into_iter()
-            .find(|candidate| candidate.id == target.agent)
-            .ok_or_else(|| format!("stage `{}` has no agent `{}`", target.id, target.agent))?;
-        let task = ChildTask::spawn(&stage, &profile, &target, &target_profile, input.clone())
-            .map_err(|e| e.to_string())?;
-        let child = Box::pin(declared_stage_host(
-            Arc::clone(&ctx),
-            target,
-            Arc::clone(&stages),
-            serde_json::to_string(&task.input).map_err(|e| e.to_string())?,
-            false,
-            runner,
-        ))
-        .await?;
-        let child_output: serde_json::Value =
-            serde_json::from_str(&child).map_err(|e| e.to_string())?;
-        let evidence: serde_json::Value = task.evidence(child_output).map_err(|e| e.to_string())?;
-        json!({ "input": input, "child_evidence": evidence })
-    } else {
-        input
-    };
-    let runtime_input_json = serde_json::to_string(&runtime_input).map_err(|e| e.to_string())?;
-    let repository_guidance = crate::repo_conventions(&ctx.repo_path).unwrap_or_default();
-    let preamble = declared_stage_preamble(
-        &stage,
-        &profile,
-        cfg.system_prompt.as_deref(),
-        &repository_guidance,
-        plugins.context.as_deref(),
-        &plugins.skills,
-    );
-    let question = declared_stage_question(&stage, &runtime_input_json);
-    let output_schema = stage
-        .output_schema
-        .clone()
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|e| format!("stage `{}` has invalid outputSchema: {e}", stage.id))?;
-    // Stable within this run and stage, unique across runs. Endpoint reuse needs the uniqueness;
-    // local compaction uses the same key so both continuation modes agree on stage identity.
-    let conversation = format!("{}-{}", ctx.run_id, stage.id);
-    let raw = runner
-        .run(ratatoskr_agent::NodeRun {
-            node: &stage.id,
-            route: &cfg.route,
-            preamble: &preamble,
-            question: &question,
-            tools: cfg.tools,
-            output_schema: output_schema
-                .unwrap_or_else(|| schemars::schema_for!(serde_json::Value)),
-            policy: cfg.policy,
-            max_turns: cfg.max_turns,
-            clarifier: None,
-            observer: plugins.observer.clone(),
-            skills: crate::skills::loaded(&plugins.skills, &stage.id),
-            files: cfg.files,
-            shell: None,
-            push: None,
-            conversation: Some(&conversation),
-            ledger: Some(Arc::clone(&ctx.ledger)),
-            produces: Some(&stage.output_contract),
+impl StageExecutor {
+    fn new(
+        ctx: Arc<WorkflowContext>,
+        stages: Arc<Vec<Stage>>,
+        turn: Arc<dyn StageTurn>,
+    ) -> Arc<Self> {
+        Arc::new(Self { ctx, stages, turn })
+    }
+
+    fn host(self: &Arc<Self>, stage: Stage) -> HostFn {
+        let executor = Arc::clone(self);
+        Arc::new(move |input_json| {
+            let executor = Arc::clone(&executor);
+            let stage = stage.clone();
+            Box::pin(async move {
+                executor
+                    .execute(StageInvocation {
+                        stage,
+                        input_json,
+                        output: StageOutput::Checkpoint,
+                    })
+                    .await
+            })
         })
-        .await
-        .map_err(|e| format!("stage `{}` agent failed: {e}", stage.id))?;
-    let mut output: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("stage `{}` returned invalid JSON: {e}", stage.id))?;
-    validate_declared_output(&stage, &output)?;
-    normalize_declared_output(&stage, &mut output)?;
-    if checkpoint_output {
-        note(&ctx, &stage.id, &output, Some(arg)).await?;
     }
-    serde_json::to_string(&output).map_err(|e| e.to_string())
-}
 
-fn declared_host_with_runner(
-    ctx: &Arc<WorkflowContext>,
-    stage: Stage,
-    stages: Arc<Vec<Stage>>,
-    runner: Arc<dyn DeclaredStageRunner>,
-) -> HostFn {
-    binding(Arc::clone(ctx), move |ctx, arg| {
-        let stage = stage.clone();
-        let stages = Arc::clone(&stages);
-        let runner = Arc::clone(&runner);
-        async move { declared_stage_host(ctx, stage, stages, arg, true, runner.as_ref()).await }
-    })
-}
+    async fn execute(self: &Arc<Self>, invocation: StageInvocation) -> Result<String, String> {
+        self.ctx.guard()?;
+        let StageInvocation {
+            stage,
+            input_json,
+            output: disposition,
+        } = invocation;
+        let input: serde_json::Value =
+            serde_json::from_str(&input_json).map_err(|e| format!("{} arg: {e}", stage.id))?;
+        let plugins = self.ctx.plugin_context.for_node(&stage.id);
+        let default_tools = stage.tools.iter().map(String::as_str).collect::<Vec<_>>();
+        let (mut cfg, profile) = crate::plugins::declared_stage_agent_config(
+            &self.ctx.engine,
+            &self.ctx.config,
+            self.ctx
+                .plugin_context
+                .pool_for(&stage.id, self.ctx.rag_rat.clone()),
+            &stage,
+            &default_tools,
+            &plugins,
+        )
+        .map_err(|e| e.to_string())?;
+        cfg.route.session = stage.session_scope(cfg.route.session);
 
-fn stage_host(ctx: &Arc<WorkflowContext>, stage: Stage, stages: Arc<Vec<Stage>>) -> HostFn {
-    stage_host_with_runner(ctx, stage, stages, Arc::new(LiveDeclaredStageRunner))
-}
-
-fn stage_host_with_runner(
-    ctx: &Arc<WorkflowContext>,
-    stage: Stage,
-    stages: Arc<Vec<Stage>>,
-    runner: Arc<dyn DeclaredStageRunner>,
-) -> HostFn {
-    match stage.id.as_str() {
-        "context" => binding(Arc::clone(ctx), context_host),
-        "analyst" => binding(Arc::clone(ctx), analyze_host),
-        "red_team" => binding(Arc::clone(ctx), red_team_host),
-        "implementer" => binding(Arc::clone(ctx), implement_host),
-        "verifier" => binding(Arc::clone(ctx), verify_host),
-        _ => declared_host_with_runner(ctx, stage, stages, runner),
-    }
-}
-
-fn build_hosts(ctx: &Arc<WorkflowContext>, stages: &[Stage]) -> HashMap<String, HostFn> {
-    let mut h = HashMap::new();
-    let stages = Arc::new(stages.to_vec());
-    for stage in stages.iter() {
-        h.insert(
-            stage.id.clone(),
-            stage_host(ctx, stage.clone(), Arc::clone(&stages)),
+        // A child is evidence within its parent's call, never a second checkpointed graph stage.
+        let runtime_input = if let Some(delegation) = stage
+            .delegation
+            .as_ref()
+            .filter(|_| disposition == StageOutput::Checkpoint)
+        {
+            let target = self
+                .stages
+                .iter()
+                .find(|candidate| candidate.id == delegation.target)
+                .ok_or_else(|| {
+                    format!(
+                        "stage `{}` delegates to missing `{}`",
+                        stage.id, delegation.target
+                    )
+                })?
+                .clone();
+            let target_profile = crate::agent_profiles(&self.ctx.config)
+                .into_iter()
+                .find(|candidate| candidate.id == target.agent)
+                .ok_or_else(|| format!("stage `{}` has no agent `{}`", target.id, target.agent))?;
+            let task = ChildTask::spawn(&stage, &profile, &target, &target_profile, input.clone())
+                .map_err(|e| e.to_string())?;
+            let child = Box::pin(self.execute(StageInvocation {
+                stage: target,
+                input_json: serde_json::to_string(&task.input).map_err(|e| e.to_string())?,
+                output: StageOutput::Evidence,
+            }))
+            .await?;
+            let child_output: serde_json::Value =
+                serde_json::from_str(&child).map_err(|e| e.to_string())?;
+            let evidence: serde_json::Value =
+                task.evidence(child_output).map_err(|e| e.to_string())?;
+            json!({ "input": input, "child_evidence": evidence })
+        } else {
+            input
+        };
+        let runtime_input_json =
+            serde_json::to_string(&runtime_input).map_err(|e| e.to_string())?;
+        let repository_guidance = crate::repo_conventions(&self.ctx.repo_path).unwrap_or_default();
+        let preamble = declared_stage_preamble(
+            &stage,
+            &profile,
+            cfg.system_prompt.as_deref(),
+            &repository_guidance,
+            plugins.context.as_deref(),
+            &plugins.skills,
         );
+        let question = declared_stage_question(&stage, &runtime_input_json);
+        let output_schema = stage
+            .output_schema
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| format!("stage `{}` has invalid outputSchema: {e}", stage.id))?;
+        // Stable within this run and stage, unique across runs. Endpoint reuse needs the uniqueness;
+        // local compaction uses the same key so both continuation modes agree on stage identity.
+        let conversation = format!("{}-{}", self.ctx.run_id, stage.id);
+        let raw = self
+            .turn
+            .run(ratatoskr_agent::NodeRun {
+                node: &stage.id,
+                route: &cfg.route,
+                preamble: &preamble,
+                question: &question,
+                tools: cfg.tools,
+                output_schema: output_schema
+                    .unwrap_or_else(|| schemars::schema_for!(serde_json::Value)),
+                policy: cfg.policy,
+                max_turns: cfg.max_turns,
+                clarifier: None,
+                observer: plugins.observer.clone(),
+                skills: crate::skills::loaded(&plugins.skills, &stage.id),
+                files: cfg.files,
+                shell: None,
+                push: None,
+                conversation: Some(&conversation),
+                ledger: Some(Arc::clone(&self.ctx.ledger)),
+                produces: Some(&stage.output_contract),
+            })
+            .await
+            .map_err(|e| format!("stage `{}` agent failed: {e}", stage.id))?;
+        let mut output: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("stage `{}` returned invalid JSON: {e}", stage.id))?;
+        validate_declared_output(&stage, &output)?;
+        normalize_declared_output(&stage, &mut output)?;
+        if disposition == StageOutput::Checkpoint {
+            note(&self.ctx, &stage.id, &output, Some(input_json)).await?;
+        }
+        serde_json::to_string(&output).map_err(|e| e.to_string())
     }
-    // Legacy workflow.ts names remain aliases for the declared built-in stages.
-    h.insert("memory".into(), binding(Arc::clone(ctx), memory_host));
-    h.insert("analyze".into(), binding(Arc::clone(ctx), analyze_host));
-    h.insert("redTeam".into(), binding(Arc::clone(ctx), red_team_host));
-    h.insert("implement".into(), binding(Arc::clone(ctx), implement_host));
-    h.insert("iterate".into(), binding(Arc::clone(ctx), iterate_host));
-    h.insert("verify".into(), binding(Arc::clone(ctx), verify_host));
-    h.insert(
-        "isConverged".into(),
-        binding(Arc::clone(ctx), is_converged_host),
-    );
-    h.insert(
-        "testCommandRan".into(),
-        binding(Arc::clone(ctx), test_command_ran_host),
-    );
-    h.insert(
-        "newlyIntroducedFailures".into(),
-        binding(Arc::clone(ctx), newly_introduced_host),
-    );
-    h
+}
+
+/// Compatibility adapter for scripted operations that still own Rust-only workflow state or
+/// gates. Migrating one means replacing this entry with a standard declarative stage.
+#[derive(Clone, Copy)]
+enum TemporaryOperation {
+    Context,
+    Memory,
+    Analyst,
+    RedTeam,
+    Implement,
+    Iterate,
+    Verify,
+    IsConverged,
+    TestCommandRan,
+    NewlyIntroducedFailures,
+}
+
+impl TemporaryOperation {
+    fn host(self, ctx: &Arc<WorkflowContext>) -> HostFn {
+        match self {
+            Self::Context => binding(Arc::clone(ctx), context_host),
+            Self::Memory => binding(Arc::clone(ctx), memory_host),
+            Self::Analyst => binding(Arc::clone(ctx), analyze_host),
+            Self::RedTeam => binding(Arc::clone(ctx), red_team_host),
+            Self::Implement => binding(Arc::clone(ctx), implement_host),
+            Self::Iterate => binding(Arc::clone(ctx), iterate_host),
+            Self::Verify => binding(Arc::clone(ctx), verify_host),
+            Self::IsConverged => binding(Arc::clone(ctx), is_converged_host),
+            Self::TestCommandRan => binding(Arc::clone(ctx), test_command_ran_host),
+            Self::NewlyIntroducedFailures => binding(Arc::clone(ctx), newly_introduced_host),
+        }
+    }
+}
+
+const TEMPORARY_OPERATIONS: &[(&str, TemporaryOperation)] = &[
+    ("context", TemporaryOperation::Context),
+    ("memory", TemporaryOperation::Memory),
+    ("analyst", TemporaryOperation::Analyst),
+    ("analyze", TemporaryOperation::Analyst),
+    ("red_team", TemporaryOperation::RedTeam),
+    ("redTeam", TemporaryOperation::RedTeam),
+    ("implementer", TemporaryOperation::Implement),
+    ("implement", TemporaryOperation::Implement),
+    ("iterate", TemporaryOperation::Iterate),
+    ("verifier", TemporaryOperation::Verify),
+    ("verify", TemporaryOperation::Verify),
+    ("isConverged", TemporaryOperation::IsConverged),
+    ("testCommandRan", TemporaryOperation::TestCommandRan),
+    (
+        "newlyIntroducedFailures",
+        TemporaryOperation::NewlyIntroducedFailures,
+    ),
+];
+
+fn build_legacy_operation_hosts(ctx: &Arc<WorkflowContext>) -> HashMap<String, HostFn> {
+    TEMPORARY_OPERATIONS
+        .iter()
+        .map(|(name, operation)| ((*name).to_string(), operation.host(ctx)))
+        .collect()
+}
+
+fn build_declared_stage_hosts(
+    ctx: &Arc<WorkflowContext>,
+    stages: &[Stage],
+    turn: Arc<dyn StageTurn>,
+) -> HashMap<String, HostFn> {
+    let stages = Arc::new(stages.to_vec());
+    let executor = StageExecutor::new(Arc::clone(ctx), Arc::clone(&stages), turn);
+    stages
+        .iter()
+        .map(|stage| (stage.id.clone(), executor.host(stage.clone())))
+        .collect()
+}
+
+fn build_hosts_with_turn(
+    ctx: &Arc<WorkflowContext>,
+    stages: &[Stage],
+    turn: Arc<dyn StageTurn>,
+) -> Result<HashMap<String, HostFn>, PlanError> {
+    let declared = build_declared_stage_hosts(ctx, stages, turn);
+    let mut hosts = build_legacy_operation_hosts(ctx);
+    if let Some(stage) = stages.iter().find(|stage| hosts.contains_key(&stage.id)) {
+        return Err(PlanError::Configuration(format!(
+            "stage `{}` conflicts with a legacy workflow operation",
+            stage.id
+        )));
+    }
+    hosts.extend(declared);
+    Ok(hosts)
+}
+
+fn build_hosts(
+    ctx: &Arc<WorkflowContext>,
+    stages: &[Stage],
+) -> Result<HashMap<String, HostFn>, PlanError> {
+    build_hosts_with_turn(ctx, stages, Arc::new(LiveStageTurn))
 }
 
 pub(crate) async fn standard_stages() -> Result<Vec<Stage>, PlanError> {
@@ -1110,9 +1195,7 @@ pub(crate) async fn standard_stages() -> Result<Vec<Stage>, PlanError> {
 }
 
 async fn execution_stages(runtime: &WorkflowRuntime) -> Result<Vec<Stage>, PlanError> {
-    let mut stages = crate::built_in_stages();
-    stages.retain(|stage| stage.id != "scout");
-    stages.extend(standard_stages().await?);
+    let mut stages = standard_stages().await?;
     stages.extend(crate::stage::stages_from_workflow(runtime.meta()));
     Ok(stages)
 }
@@ -1140,7 +1223,7 @@ pub async fn run_plan_scripted(
     .await?;
 
     let stages = execution_stages(&runtime).await?;
-    let hosts = build_hosts(&ctx, &stages);
+    let hosts = build_hosts(&ctx, &stages)?;
     let input = json!({ "issue": ctx.issue }).to_string();
     let result = runtime.run("plan", input, hosts).await;
 
@@ -1189,7 +1272,7 @@ pub async fn run_full_scripted(
     .await?;
 
     let stages = execution_stages(&runtime).await?;
-    let hosts = build_hosts(&ctx, &stages);
+    let hosts = build_hosts(&ctx, &stages)?;
     let input =
         json!({ "issue": ctx.issue, "maxIterations": ctx.config.implementer.max_iterations })
             .to_string();
@@ -1450,7 +1533,7 @@ mod tests {
         assert!(!preamble.contains(r#"{"runtime":"input"}"#));
     }
 
-    struct RecordingDeclaredStageRunner {
+    struct RecordingStageTurn {
         sessions: Mutex<Vec<ratatoskr_core::SessionScope>>,
         nodes: Mutex<Vec<String>>,
         tools: Mutex<Vec<Vec<String>>>,
@@ -1460,7 +1543,7 @@ mod tests {
         output: String,
     }
 
-    impl Default for RecordingDeclaredStageRunner {
+    impl Default for RecordingStageTurn {
         fn default() -> Self {
             Self {
                 sessions: Mutex::new(Vec::new()),
@@ -1474,7 +1557,7 @@ mod tests {
         }
     }
 
-    impl DeclaredStageRunner for RecordingDeclaredStageRunner {
+    impl StageTurn for RecordingStageTurn {
         fn run<'a>(
             &'a self,
             run: ratatoskr_agent::NodeRun<'a>,
@@ -1510,7 +1593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn declared_stage_host_applies_the_stage_session_override() {
+    async fn stage_executor_applies_the_declared_session_override() {
         let dir =
             std::env::temp_dir().join(format!("ratatoskr-declared-session-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1547,21 +1630,149 @@ mod tests {
         stage.output_schema = Some(json!({ "type": "object" }));
         stage.session = Some(ratatoskr_core::SessionScope::Compacted);
         let stages = Arc::new(vec![stage.clone()]);
-        let runner = RecordingDeclaredStageRunner::default();
+        let turn = Arc::new(RecordingStageTurn::default());
+        let executor = StageExecutor::new(ctx, stages, Arc::clone(&turn) as Arc<dyn StageTurn>);
 
-        let output = declared_stage_host(ctx, stage, stages, "{}".to_string(), false, &runner)
+        let output = executor
+            .execute(StageInvocation {
+                stage,
+                input_json: "{}".to_string(),
+                output: StageOutput::Evidence,
+            })
             .await
             .unwrap();
 
         assert_eq!(output, "{}");
         assert_eq!(
-            *runner
+            *turn
                 .sessions
                 .lock()
                 .expect("recording runner mutex poisoned"),
             vec![ratatoskr_core::SessionScope::Compacted],
             "the declared stage must override its route before NodeRun reaches the agent"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn arbitrary_declared_stage_id_uses_the_generic_executor() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-arbitrary-declared-stage-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-arbitrary-stage", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "arbitrary_probe".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-arbitrary-stage",
+            "probe this",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let mut stage = crate::built_in_stages().pop().unwrap();
+        stage.id = "arbitrary_probe".to_string();
+        stage.agent = "reason".to_string();
+        stage.input_contract = "ProbeInput".to_string();
+        stage.output_contract = "ProbeOutput".to_string();
+        stage.output_schema = Some(json!({
+            "type": "object",
+            "required": ["ok"],
+            "properties": { "ok": { "type": "boolean" } }
+        }));
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({ "ok": true }).to_string(),
+            ..Default::default()
+        });
+        let mut hosts =
+            build_hosts_with_turn(&ctx, &[stage], Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+
+        let output = hosts.remove("arbitrary_probe").unwrap()("{}".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(output, json!({ "ok": true }).to_string());
+        assert_eq!(
+            *turn.nodes.lock().expect("recording runner mutex poisoned"),
+            ["arbitrary_probe"]
+        );
+        let checkpoints = store
+            .checkpoints_for_run("run-arbitrary-stage")
+            .await
+            .unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].node_name, "arbitrary_probe");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn temporary_operation_adapters_remain_registered_and_guarded() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-temporary-operations-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let ctx = WorkflowContext::new(
+            None,
+            &RatatoskrConfig::default(),
+            &store,
+            "run-temporary-operations",
+            "test adapters",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let hosts =
+            build_hosts_with_turn(&ctx, &[], Arc::new(RecordingStageTurn::default())).unwrap();
+
+        for (name, _) in TEMPORARY_OPERATIONS {
+            assert!(
+                hosts.contains_key(*name),
+                "missing operation adapter `{name}`"
+            );
+        }
+
+        ctx.invocations.store(INVOCATION_CEILING, Ordering::Relaxed);
+        let error = hosts["memory"]("{}".to_string()).await.unwrap_err();
+        assert!(error.contains("runaway loop"));
+
+        let analyst = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        let error = match build_hosts_with_turn(
+            &ctx,
+            &[analyst],
+            Arc::new(RecordingStageTurn::default()),
+        ) {
+            Ok(_) => panic!("a declared stage replaced a temporary operation adapter"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("legacy workflow operation"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1601,7 +1812,7 @@ mod tests {
         assert!(scout.output_schema.is_some());
         assert_eq!(scout.session, None, "TOML retains the session decision");
 
-        let runner = Arc::new(RecordingDeclaredStageRunner {
+        let turn = Arc::new(RecordingStageTurn {
             output: json!({
                 "related_items": [
                     {
@@ -1624,12 +1835,9 @@ mod tests {
             .to_string(),
             ..Default::default()
         });
-        let host = stage_host_with_runner(
-            &ctx,
-            scout,
-            Arc::new(stages),
-            Arc::clone(&runner) as Arc<dyn DeclaredStageRunner>,
-        );
+        let mut hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        let host = hosts.remove(&scout.id).unwrap();
 
         let raw = host(serde_json::to_string("find prior work").unwrap())
             .await
@@ -1648,34 +1856,27 @@ mod tests {
         assert_eq!(checkpoint.related_items.len(), 1);
 
         assert_eq!(
-            *runner
-                .nodes
-                .lock()
-                .expect("recording runner mutex poisoned"),
+            *turn.nodes.lock().expect("recording runner mutex poisoned"),
             ["scout"]
         );
         assert_eq!(
-            *runner
+            *turn
                 .sessions
                 .lock()
                 .expect("recording runner mutex poisoned"),
             [ratatoskr_core::SessionScope::Compacted]
         );
         assert!(
-            runner
-                .has_ledger
+            turn.has_ledger
                 .lock()
                 .expect("recording runner mutex poisoned")[0],
             "generic dispatch must report telemetry to the run ledger"
         );
-        let offered = &runner
-            .tools
-            .lock()
-            .expect("recording runner mutex poisoned")[0];
+        let offered = &turn.tools.lock().expect("recording runner mutex poisoned")[0];
         assert!(offered.contains(&"Read".to_string()));
         assert!(offered.contains(&"Grep".to_string()));
         assert!(!offered.iter().any(|tool| tool == "Write" || tool == "Edit"));
-        let preamble = &runner
+        let preamble = &turn
             .preambles
             .lock()
             .expect("recording runner mutex poisoned")[0];
@@ -1683,7 +1884,7 @@ mod tests {
             preamble.find("Return JSON") < preamble.find("You are the scout"),
             "platform guidance must precede the bundled scout prompt"
         );
-        let question = &runner
+        let question = &turn
             .questions
             .lock()
             .expect("recording runner mutex poisoned")[0];
