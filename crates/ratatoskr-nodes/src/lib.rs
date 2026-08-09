@@ -18,6 +18,7 @@ pub mod overseer;
 pub mod plugins;
 pub mod publisher;
 pub mod redteam;
+pub mod referee;
 pub mod scout;
 pub mod skills;
 pub mod testrun;
@@ -37,6 +38,7 @@ pub use memory::{MemoryNode, MemoryOutput, MemoryRecord};
 pub use overseer::{OverseerNode, OverseerOutput};
 pub use publisher::{PublisherNode, PublisherOutput};
 pub use redteam::{RedTeamNode, RedTeamOutput};
+pub use referee::{RefereeNode, RefereeOutput, Violation};
 pub use scout::{RelatedItem, ScoutNode, ScoutOutput};
 pub use verifier::{Finding, FindingKind, Severity, VerifierNode, VerifierOutput};
 
@@ -542,6 +544,7 @@ pub const BUILT_IN_NODES: &[&str] = &[
     "bookkeeper",
     "redteam",
     "verifier",
+    "referee",
     "characterizer",
 ];
 
@@ -1469,8 +1472,131 @@ pub async fn run_bookkeeper(
     bookkeep_and_checkpoint(&run, input).await
 }
 
-/// The fork + converge half. Returns the terminal status; leaves the worktree in place on a
-/// terminal outcome and removes it on a hard error.
+/// The referee stage is independent of review: it runs before the test result is trusted, while
+/// review still runs only after clean tests.
+struct Referee {
+    node: referee::RefereeNode,
+}
+
+impl Referee {
+    fn rooted_at(&mut self, worktree: &std::path::Path) {
+        self.node.files = Some(worktree.to_path_buf());
+    }
+
+    fn build(run: &Run<'_>) -> Result<Option<Self>, PlanError> {
+        let &Run {
+            client,
+            config,
+            engine,
+            context,
+            ledger,
+            ..
+        } = run;
+        let Some(route) = referee_route(engine, config) else {
+            tracing::info!("no referee or verifier route configured; trusting test results alone");
+            return Ok(None);
+        };
+        // `node_agent_config` resolves the named node's ruleset (including its system prompt and
+        // policy). Supply the selected fallback route under that name when only verifier is set.
+        let mut referee_config = config.clone();
+        referee_config.models.insert("referee".to_string(), route);
+        let plugins = context.for_node("referee");
+        let cfg = match node_agent_config(
+            engine,
+            &referee_config,
+            context.pool_for("referee", client.map(|c| c.offer())),
+            "referee",
+            referee::REFEREE_TOOLS,
+            &plugins,
+        ) {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                tracing::warn!(
+                    "the referee could not be configured; trusting test results: {error}"
+                );
+                return Ok(None);
+            }
+        };
+        Ok(Some(Self {
+            node: referee::RefereeNode {
+                route: cfg.route,
+                tools: cfg.tools,
+                policy: cfg.policy,
+                max_turns: cfg.max_turns,
+                system_prompt: cfg.system_prompt,
+                plugins,
+                ledger: Some(Arc::clone(ledger)),
+                files: None,
+            },
+        }))
+    }
+
+    async fn judge(
+        &self,
+        run: &Run<'_>,
+        plan: &AnalystOutput,
+        implementer: &ImplementerOutput,
+        worktree: &WorktreePath,
+        iteration: u32,
+    ) -> Result<Vec<referee::Violation>, PlanError> {
+        let candidates = converge::referee_candidates(
+            &implementer.rewritten_files,
+            run.engine.may_modify_tests(),
+        );
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let diff = ratatoskr_exec::full_diff_text(worktree)
+            .await
+            .unwrap_or_default();
+        let input = referee::RefereeInput {
+            issue: run.issue.to_string(),
+            requirements: plan.requirements.clone(),
+            hunks: referee::hunks_for(&diff, &candidates),
+            candidates,
+        };
+        let input_json = serde_json::to_string(&serde_json::json!({
+            "requirements": input.requirements,
+            "candidates": input.candidates,
+            "hunk_bytes": input.hunks.len(),
+        }))?;
+        match self.node.run(input).await {
+            Ok(out) => {
+                record(Record {
+                    store: run.store,
+                    run_id: run.run_id,
+                    node: "referee",
+                    output: &out,
+                    input: Some(input_json),
+                    iteration: Some(iteration),
+                    ledger: Some(run.ledger),
+                })
+                .await?;
+                Ok(out.violations)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "the referee could not judge this change; trusting test results: {error}"
+                );
+                if let Err(record_error) = record(Record {
+                    store: run.store,
+                    run_id: run.run_id,
+                    node: "referee",
+                    output: &serde_json::json!({ "error": error.to_string() }),
+                    input: Some(input_json),
+                    iteration: Some(iteration),
+                    ledger: Some(run.ledger),
+                })
+                .await
+                {
+                    tracing::warn!("failed to record referee failure: {record_error}");
+                }
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
 /// The review stage: the verifier, plus the analyst re-entry it routes plan-level findings to.
 ///
 /// Built once per run and reused across converge iterations, so a second review costs a model call
@@ -1614,12 +1740,39 @@ fn implementer_default_tools() -> Vec<&'static str> {
     names
 }
 
+/// Resolve a node's model from its ruleset first, then its TOML route.
+fn node_route(
+    engine: &Arc<ScriptEngine>,
+    config: &RatatoskrConfig,
+    node: &str,
+) -> Option<ratatoskr_core::ModelRoute> {
+    engine
+        .ruleset(node)
+        .and_then(|ruleset| ruleset.config().model.clone())
+        .map(|model| ratatoskr_core::ModelRoute {
+            provider: model.provider,
+            model: model.model,
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        })
+        .or_else(|| config.models.get(node).cloned())
+}
+
+/// The referee uses its own route when configured, otherwise the verifier's route: either is a
+/// repository declaration that a model should judge diffs.
+pub fn referee_route(
+    engine: &Arc<ScriptEngine>,
+    config: &RatatoskrConfig,
+) -> Option<ratatoskr_core::ModelRoute> {
+    node_route(engine, config, "referee").or_else(|| node_route(engine, config, "verifier"))
+}
+
 /// The verifier is opt-in on having somewhere to run, the same way the red-team classifier is.
 fn verifier_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> bool {
-    config.models.contains_key("verifier")
-        || engine
-            .ruleset("verifier")
-            .is_some_and(|r| r.config().model.is_some())
+    node_route(engine, config, "verifier").is_some()
 }
 
 /// Read `[implementer] verify_threshold`. An unrecognised value is a typo, and a typo must not
@@ -2094,6 +2247,7 @@ async fn fork_and_converge(
     // Built before the fork so a misconfigured verifier fails the run here rather than after an
     // implementer session and a sandboxed test run have already been spent on it.
     let mut review = Review::build(run, plan)?;
+    let mut referee = Referee::build(run)?;
 
     // The worktree first, because the red team writes the change's tests into it and cannot do
     // that until it exists.
@@ -2106,6 +2260,9 @@ async fn fork_and_converge(
     // a worktree to name, so this is the earliest point it can be rooted — see `rooted_at`.
     if let Some(review) = review.as_mut() {
         review.rooted_at(worktree.as_path());
+    }
+    if let Some(referee) = referee.as_mut() {
+        referee.rooted_at(worktree.as_path());
     }
 
     // Red team next, not alongside: it characterises the baseline and writes the tests the change
@@ -2195,19 +2352,25 @@ async fn fork_and_converge(
             && unsatisfied.is_empty()
             && converge::is_converged(&red_team_out.failing_tests, &impl_out.failing_tests);
 
-        // Did the change edit the referee? Checked BEFORE `tests_clean` is trusted: a conftest.py
-        // that rewrites every outcome, or an edited test, makes the passing/failing sets describe a
-        // bar the change wrote for itself.
-        let referee =
-            converge::referee_touches(&impl_out.rewritten_files, engine.may_modify_tests());
+        // The referee runs before the test result is believed: an edited check makes the
+        // passing/failing sets describe a bar the change wrote for itself. A failed referee is
+        // recorded and degrades to trusting tests, like the verifier.
+        let referee_violations = match referee.as_ref() {
+            Some(referee) => {
+                referee
+                    .judge(run, &in_force, &impl_out, &worktree, iterations)
+                    .await?
+            }
+            None => Vec::new(),
+        };
 
         // What to do next. The referee check comes first, then the test gate, then the review: a
         // moved referee makes the test result meaningless, and a test result is stronger evidence
         // than a model's judgement, so reviewing a change that does not build wastes the call.
-        let correction: Reviewed = if !referee.is_empty() {
-            tracing::warn!(files = ?referee, "iteration touched the referee; not accepting it");
+        let correction: Reviewed = if !referee_violations.is_empty() {
+            tracing::warn!(violations = ?referee_violations, "iteration weakened the referee; not accepting it");
             Reviewed::Fix(Box::new(Correction {
-                prompt: converge::referee_correction(&referee),
+                prompt: referee::correction(&referee_violations),
                 revised: None,
                 found: Vec::new(),
             }))
@@ -2873,6 +3036,31 @@ mod agent_config_tests {
         assert!(some.tools.names().iter().any(|n| n == "Read"));
     }
 
+    #[tokio::test]
+    async fn referee_tools_exclude_extra_write_capabilities() {
+        let engine = engine("referee-read-only").await;
+        let mut config = RatatoskrConfig::default();
+        config
+            .models
+            .insert("referee".to_string(), config.models["analyst"].clone());
+        let mut write = rmcp::model::Tool::default();
+        write.name = "Write".into();
+        let mut tools = ToolSet::default();
+        tools.add_local(write);
+
+        let cfg = node_agent_config(
+            &engine,
+            &config,
+            tools,
+            "referee",
+            referee::REFEREE_TOOLS,
+            &NodePlugins::default(),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.tools.names(), referee::REFEREE_TOOLS);
+    }
+
     #[test]
     fn the_publishers_gh_resolves_to_something_that_can_actually_run() {
         // The failure this guards, seen on a live run: `gh` fell through to the stand-in whose
@@ -3244,6 +3432,7 @@ mod agent_config_tests {
         let built_in = Workflow::BuiltIn;
         // The built-in adds none: it governs exactly the standard set.
         assert!(built_in.nodes().is_empty());
+        assert!(BUILT_IN_NODES.contains(&"referee"));
 
         let dir = std::env::temp_dir().join(format!("ratatoskr-nodes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3327,6 +3516,84 @@ mod agent_config_tests {
         // A node that produced almost nothing has almost no floor to clear.
         assert_eq!(plausible_output_tokens(0), 0);
         assert_eq!(plausible_output_tokens(7), 0);
+    }
+
+    fn toml_route(provider: &str, model: &str) -> ratatoskr_core::ModelRoute {
+        ratatoskr_core::ModelRoute {
+            context_window: None,
+            provider: provider.into(),
+            model: model.into(),
+            max_tokens: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        }
+    }
+
+    // Contract reading (#206): the "referee_enabled/referee-route resolution next to
+    // verifier_enabled" is pinned here as `referee_route(engine, config) -> Option<ModelRoute>`,
+    // because the three outcomes the issue requires — the referee's own route, the verifier's
+    // route as fallback, or no judgement at all — are exactly an Option of the route to judge on.
+
+    #[tokio::test]
+    async fn the_referee_falls_back_to_the_verifier_route() {
+        let engine = engine("referee-via-verifier").await;
+        let mut config = RatatoskrConfig::default();
+        // Only [models.verifier] configured: a repo that already routes a model to judge the diff
+        // has said it wants that kind of check.
+        let verifier = toml_route("anthropic", "claude-sonnet-4-6");
+        config.models.insert("verifier".to_string(), verifier);
+        let route = referee_route(&engine, &config).expect("the verifier route is the fallback");
+        assert_eq!(route.provider, "anthropic");
+        assert_eq!(route.model, "claude-sonnet-4-6");
+
+        // The same fallback through the verifier route's other spelling: ruleset("verifier").model.
+        let ruleset = binding_engine(
+            "referee-via-verifier-ruleset",
+            r#"defineAgent("verifier", { model: { provider: "openai", model: "gpt-5" } });"#,
+        )
+        .await;
+        let config = RatatoskrConfig::default();
+        let route = referee_route(&ruleset, &config).expect("ruleset verifier is the fallback");
+        assert_eq!(route.provider, "openai");
+        assert_eq!(route.model, "gpt-5");
+    }
+
+    #[tokio::test]
+    async fn the_referees_own_route_wins_over_the_verifiers() {
+        let engine = engine("referee-own-route").await;
+        let mut config = RatatoskrConfig::default();
+        let verifier = toml_route("anthropic", "claude-sonnet-4-6");
+        config.models.insert("verifier".to_string(), verifier);
+        let own = toml_route("openai", "gpt-5");
+        config.models.insert("referee".to_string(), own);
+        let route = referee_route(&engine, &config).expect("a referee route is configured");
+        assert_eq!(
+            route.model, "gpt-5",
+            "[models.referee] beats [models.verifier]"
+        );
+
+        // A ruleset model is the same claim in the other spelling, and it wins too.
+        let ruleset = binding_engine(
+            "referee-ruleset-route",
+            r#"defineAgent("referee", { model: { provider: "moonshot", model: "kimi-k2.5" } });"#,
+        )
+        .await;
+        let route = referee_route(&ruleset, &config).expect("the ruleset is a referee route");
+        assert_eq!(route.provider, "moonshot");
+        assert_eq!(route.model, "kimi-k2.5");
+    }
+
+    #[tokio::test]
+    async fn no_referee_and_no_verifier_route_means_no_judgement() {
+        let engine = engine("referee-none").await;
+        // The default config has neither [models.referee] nor [models.verifier], and the fixture
+        // rulesets bind neither either.
+        let config = RatatoskrConfig::default();
+        assert!(
+            referee_route(&engine, &config).is_none(),
+            "with no route there is no judgement: converge trusts the test result alone, and says so"
+        );
     }
 }
 

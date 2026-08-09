@@ -262,16 +262,25 @@ const MAX_DIFF_BYTES: usize = 200_000;
 
 /// The worktree's changes as an actual patch — what a reviewer reads.
 ///
+/// Unlike [`diff_text`], this is never truncated. Content gates use it when every selected hunk
+/// must be present; callers that display a diff to a model should use [`diff_text`] instead.
+pub async fn full_diff_text(worktree: &WorktreePath) -> Result<String, ExecError> {
+    let cwd = worktree.as_path();
+    // `-N` (intent-to-add) so a newly-created file's content appears without staging it.
+    git(cwd, "add -N", &["add", "-N", "."]).await?;
+    git(cwd, "diff", &["--no-pager", "diff", "HEAD"]).await
+}
+
+/// The worktree's changes as an actual patch — what a reviewer reads.
+///
 /// Distinct from [`diff_stat`], which is filenames and line counts. A `--stat` cannot show a test
 /// weakened to pass, an error swallowed, or a condition inverted, so anything judging the *content*
 /// of a change needs this instead.
 pub async fn diff_text(worktree: &WorktreePath) -> Result<String, ExecError> {
-    let cwd = worktree.as_path();
-    // `-N` (intent-to-add) so a newly-created file's content appears without staging it. A change
-    // that only adds files would otherwise diff as empty and read as "nothing was done".
-    git(cwd, "add -N", &["add", "-N", "."]).await?;
-    let out = git(cwd, "diff", &["--no-pager", "diff", "HEAD"]).await?;
-    Ok(truncate_diff(out, MAX_DIFF_BYTES))
+    Ok(truncate_diff(
+        full_diff_text(worktree).await?,
+        MAX_DIFF_BYTES,
+    ))
 }
 
 /// Cut `diff` to `max` bytes at a line boundary, saying so where it cut.
@@ -406,6 +415,18 @@ pub async fn rewritten_files(worktree: &WorktreePath) -> Result<Vec<String>, Exe
     Ok(out.lines().filter_map(rewritten_in).collect())
 }
 
+/// A `--numstat` path after normalizing Git's rename notation to its destination.
+fn renamed_to(path: &str) -> String {
+    if let Some((before, rest)) = path.split_once('{')
+        && let Some((rename, after)) = rest.split_once('}')
+        && let Some((_, renamed)) = rename.split_once(" => ")
+    {
+        return format!("{before}{renamed}{after}");
+    }
+    path.split_once(" => ")
+        .map_or_else(|| path.to_string(), |(_, renamed)| renamed.to_string())
+}
+
 /// One `--numstat` line, when it reports a deletion. Format is `added\tdeleted\tpath`, with `-`
 /// for a binary file — which is counted as rewritten, since nothing about it can be called additive.
 fn rewritten_in(line: &str) -> Option<String> {
@@ -418,7 +439,7 @@ fn rewritten_in(line: &str) -> Option<String> {
     }
     let binary = added == "-" || deleted == "-";
     let removed_lines = deleted.parse::<u64>().unwrap_or(0) > 0;
-    (binary || removed_lines).then(|| path.to_string())
+    (binary || removed_lines).then(|| renamed_to(path))
 }
 
 #[cfg(test)]
@@ -442,6 +463,20 @@ mod tests {
         assert_eq!(
             rewritten_in("-\t-\ttests/fixture.bin").as_deref(),
             Some("tests/fixture.bin")
+        );
+        // Numstat abbreviates renames, but candidates must name the destination so their diff
+        // header can be found and judged.
+        assert_eq!(
+            rewritten_in("2\t3\t{old.rs => new.rs}").as_deref(),
+            Some("new.rs")
+        );
+        assert_eq!(
+            rewritten_in("2\t3\tsrc/old.rs => src/new.rs").as_deref(),
+            Some("src/new.rs")
+        );
+        assert_eq!(
+            rewritten_in("2\t3\tsrc/{old => new}.rs").as_deref(),
+            Some("src/new.rs")
         );
         assert_eq!(rewritten_in("garbage"), None);
     }
@@ -655,5 +690,31 @@ branch refs/heads/feature/x
         assert!(cut.starts_with("line one\n"));
         // Cut at a line boundary, so the last hunk shown is readable rather than split mid-token.
         assert!(!cut.contains("line t\n"));
+    }
+
+    #[tokio::test]
+    async fn the_full_diff_keeps_hunks_past_the_display_cap() {
+        let tmp = std::env::temp_dir().join(format!("ratatoskr-full-diff-{}", std::process::id()));
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo).await;
+        let wt = create(&repo, &tmp.join("wts"), "ratatoskr/full-diff")
+            .await
+            .unwrap();
+        std::fs::write(
+            wt.as_path().join("large.rs"),
+            "x".repeat(MAX_DIFF_BYTES + 1),
+        )
+        .unwrap();
+
+        let full = full_diff_text(&wt).await.unwrap();
+        assert!(full.len() > MAX_DIFF_BYTES, "full diff was capped");
+        assert!(
+            diff_text(&wt).await.unwrap().contains("[diff truncated"),
+            "display diff should still be capped"
+        );
+
+        let _ = remove(&repo, &wt).await;
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

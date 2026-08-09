@@ -405,9 +405,9 @@ pub(crate) fn servers_to_start(
 
 /// Resolve a node's agent settings. The ruleset is authoritative where it speaks: its `model` is
 /// the route (so a fully-declared node needs no `[models.<node>]` entry — that's only the
-/// fallback), `allow` (if given) REPLACES `default_tools`, `deny` is always removed,
-/// `systemPrompt` replaces the node's built-in preamble, and `onToolCall` (if defined) becomes the
-/// per-call [`ToolPolicy`].
+/// fallback), `allow` (if given) REPLACES `default_tools` except for the read-only referee,
+/// `deny` is always removed, `systemPrompt` replaces the node's built-in preamble, and `onToolCall`
+/// (if defined) becomes the per-call [`ToolPolicy`].
 pub(crate) fn node_agent_config(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
@@ -462,13 +462,27 @@ pub(crate) fn node_agent_config(
     // A ruleset's `allow` is exhaustive. The default is not just the node's built-in list: those
     // name rag-rat tools, written before any plugin was in the picture, so a plugin the node binds
     // would otherwise contribute a server whose every tool is filtered straight back out.
-    let from_plugins = tools.names_beyond(ratatoskr_mcp::RAG_RAT);
+    let read_only_referee = node == "referee";
+    let from_plugins = if read_only_referee {
+        Vec::new()
+    } else {
+        tools.names_beyond(ratatoskr_mcp::RAG_RAT)
+    };
     let spelled_out = rc
         .and_then(|c| c.tools.as_ref())
         .and_then(|t| t.allow.as_deref());
-    let allow: Vec<String> = match spelled_out {
-        Some(a) => a.to_vec(),
-        None => default_allow(default_tools, from_plugins.clone()),
+    // The referee judges the implementer's output after tests have run. No ruleset or bound plugin
+    // may turn that audit into a worktree mutation channel.
+    let allow: Vec<String> = if read_only_referee {
+        default_tools
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .collect()
+    } else {
+        match spelled_out {
+            Some(a) => a.to_vec(),
+            None => default_allow(default_tools, from_plugins.clone()),
+        }
     };
     let deny: Vec<String> = rc
         .and_then(|c| c.tools.as_ref())
@@ -522,7 +536,7 @@ pub(crate) fn node_agent_config(
     // Every node reaches this function, which is why the skill tool is added here rather than at
     // each construction site: a node that binds a skill and is never offered it is the failure
     // this seam exists to prevent.
-    if let Some(tool) = skills::skill_tool(&plugins.skills, node) {
+    if !read_only_referee && let Some(tool) = skills::skill_tool(&plugins.skills, node) {
         tools.add_local(tool);
     }
 
