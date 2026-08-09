@@ -24,11 +24,18 @@ pub const OVERSEER_TOOLS: &[&str] = &["papertrail_issue_search", "semantic_searc
 const PREAMBLE: &str = include_str!("../prompts/overseer.md");
 
 /// One workflow, as the overseer is shown it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Choice {
     pub name: String,
     pub purpose: String,
     pub when_to_use: Vec<String>,
+}
+
+/// The task and complete workflow registry presented for one routing decision.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OverseerInput {
+    pub issue: String,
+    pub choices: Vec<Choice>,
 }
 
 /// What the overseer decided.
@@ -92,7 +99,7 @@ impl OverseerNode {
     }
 }
 
-fn render_prompt(issue: &str, choices: &[Choice]) -> String {
+pub(crate) fn render_prompt(issue: &str, choices: &[Choice]) -> String {
     let mut s = String::new();
     s.push_str("AVAILABLE WORKFLOWS:\n\n");
     for c in choices {

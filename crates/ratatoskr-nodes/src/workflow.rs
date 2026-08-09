@@ -132,6 +132,10 @@ impl WorkflowContext {
         }
         Ok(())
     }
+
+    pub(crate) fn ledger(&self) -> &Arc<ratatoskr_agent::RunLedger> {
+        &self.ledger
+    }
 }
 
 // --- reconstruction helpers -------------------------------------------------
@@ -1278,6 +1282,34 @@ pub(crate) async fn standard_stages() -> Result<Vec<Stage>, PlanError> {
     Ok(stages)
 }
 
+/// Evaluate one bundled standard stage outside a repository workflow script.
+///
+/// Selection runs before a workflow exists, so the overseer cannot be invoked through a script
+/// host. It still uses the same executor boundary; the caller retains the semantic gate and owns
+/// checkpointing only after that gate accepts the stage output.
+pub(crate) async fn evaluate_standard_stage(
+    ctx: Arc<WorkflowContext>,
+    stage_id: &str,
+    input_json: String,
+    rendered_question: String,
+) -> Result<String, String> {
+    let stages = Arc::new(standard_stages().await.map_err(|error| error.to_string())?);
+    let stage = stages
+        .iter()
+        .find(|stage| stage.id == stage_id)
+        .cloned()
+        .ok_or_else(|| format!("standard stage `{stage_id}` is not registered"))?;
+    StageExecutor::new(ctx, stages, Arc::new(LiveStageTurn))
+        .execute(StageInvocation {
+            stage,
+            input_json,
+            rendered_question: Some(rendered_question),
+            resource_root: None,
+            output: StageOutput::Evidence,
+        })
+        .await
+}
+
 async fn execution_stages(runtime: &WorkflowRuntime) -> Result<Vec<Stage>, PlanError> {
     let mut stages = standard_stages().await?;
     stages.extend(crate::stage::stages_from_workflow(runtime.meta()));
@@ -2360,6 +2392,221 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "invalid output must not be checkpointed"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn standard_overseer_uses_generic_dispatch_and_preserves_its_input_and_prompt() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-overseer-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"async function plan(input) { return await overseer(input); }"#,
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::load(&workflow_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let rules_dir = dir.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        let engine = ScriptEngine::load(&rules_dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-standard-overseer", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "overseer".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Compacted,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-standard-overseer",
+            "explain the session registry",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = standard_stages().await.unwrap();
+        let overseer_stage = stages.iter().find(|stage| stage.id == "overseer").unwrap();
+        assert_eq!(overseer_stage.agent, "reason");
+        assert_eq!(
+            overseer_stage.session,
+            Some(ratatoskr_core::SessionScope::Fresh)
+        );
+        assert_eq!(
+            overseer_stage.tools,
+            ["papertrail_issue_search", "semantic_search"]
+        );
+
+        let input = crate::overseer::OverseerInput {
+            issue: "explain the session registry".to_string(),
+            choices: vec![
+                crate::overseer::Choice {
+                    name: "built-in".to_string(),
+                    purpose: "implement a repository change".to_string(),
+                    when_to_use: Vec::new(),
+                },
+                crate::overseer::Choice {
+                    name: "research".to_string(),
+                    purpose: "answer a repository question".to_string(),
+                    when_to_use: vec!["the task asks what or why".to_string()],
+                },
+            ],
+        };
+        let expected_prompt = crate::overseer::render_prompt(&input.issue, &input.choices);
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({
+                "workflow": "research",
+                "reasoning": "The task asks to explain the registry."
+            })
+            .to_string(),
+            ..Default::default()
+        });
+        let hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        runtime
+            .run_with_question_renderers(
+                "plan",
+                serde_json::to_string(&input).unwrap(),
+                hosts,
+                stage_question_renderers(&stages),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *turn.nodes.lock().expect("recording runner mutex poisoned"),
+            ["overseer"]
+        );
+        assert_eq!(
+            *turn
+                .sessions
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            [ratatoskr_core::SessionScope::Fresh]
+        );
+        let question = turn
+            .questions
+            .lock()
+            .expect("recording runner mutex poisoned")[0]
+            .clone();
+        assert_eq!(
+            question,
+            format!(
+                "Input contract: OverseerInput\nOutput contract: OverseerOutput\n\n{expected_prompt}"
+            )
+        );
+
+        let checkpoints = store
+            .checkpoints_for_run("run-standard-overseer")
+            .await
+            .unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].node_name, "overseer");
+        let checkpoint_input: crate::overseer::OverseerInput =
+            serde_json::from_str(checkpoints[0].input_json.as_deref().unwrap()).unwrap();
+        assert_eq!(checkpoint_input.choices[1].name, "research");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn standard_overseer_contract_matches_the_typed_gate_and_rejects_bare_choices() {
+        let stages = standard_stages().await.unwrap();
+        let overseer_stage = stages.iter().find(|stage| stage.id == "overseer").unwrap();
+        assert_eq!(
+            overseer_stage.instructions,
+            include_str!("../prompts/overseer.md").trim()
+        );
+        let mut generated =
+            serde_json::to_value(schemars::schema_for!(crate::overseer::OverseerOutput)).unwrap();
+        without_schema_annotations(&mut generated);
+        assert_eq!(overseer_stage.output_schema.as_ref().unwrap(), &generated);
+
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-overseer-schema-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-overseer-schema", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "overseer".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-overseer-schema",
+            "choose",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({ "workflow": "research" }).to_string(),
+            ..Default::default()
+        });
+        let mut hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        let envelope = json!({
+            "__ratatoskrRenderedQuestion": {
+                "input": {
+                    "issue": "choose",
+                    "choices": [{
+                        "name": "research",
+                        "purpose": "answer",
+                        "when_to_use": ["a question"]
+                    }]
+                },
+                "question": "AVAILABLE WORKFLOWS:\n\nname: research\n\nTHE TASK:\nchoose\n"
+            }
+        })
+        .to_string();
+        let error = hosts.remove("overseer").unwrap()(envelope)
+            .await
+            .unwrap_err();
+        assert!(error.contains("invalid `OverseerOutput` output"), "{error}");
+        assert!(error.contains("reasoning"), "{error}");
+        assert!(
+            store
+                .checkpoints_for_run("run-overseer-schema")
+                .await
+                .unwrap()
+                .is_empty()
         );
         let _ = std::fs::remove_dir_all(dir);
     }

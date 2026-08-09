@@ -677,7 +677,12 @@ pub async fn defined() -> Result<Vec<WorkflowRuntime>, PlanError> {
 pub async fn validate_configured_stages(config: &RatatoskrConfig) -> Result<(), PlanError> {
     let profiles = agent_profiles(config);
     let mut stages = built_in_stages();
-    stages.retain(|stage| !matches!(stage.id.as_str(), "scout" | "analyst" | "verifier"));
+    stages.retain(|stage| {
+        !matches!(
+            stage.id.as_str(),
+            "overseer" | "scout" | "analyst" | "verifier"
+        )
+    });
     stages.extend(workflow::standard_stages().await?);
     for workflow in defined().await? {
         let workflow_stages = stage::stages_from_workflow(workflow.meta());
@@ -732,6 +737,49 @@ fn overseer_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> boo
     node_route(engine, config, "overseer").is_some()
 }
 
+fn should_consult_overseer(
+    defined_workflows: usize,
+    workflow_named: bool,
+    configured: bool,
+) -> bool {
+    !workflow_named && defined_workflows > 1 && configured
+}
+
+struct OverseerDecision<'a> {
+    store: &'a Store,
+    run_id: &'a str,
+    found: Vec<Workflow>,
+    decided: OverseerOutput,
+    input_json: String,
+    ledger: &'a Arc<RunLedger>,
+}
+
+async fn select_and_record_overseer(decision: OverseerDecision<'_>) -> Result<Workflow, PlanError> {
+    let OverseerDecision {
+        store,
+        run_id,
+        found,
+        decided,
+        input_json,
+        ledger,
+    } = decision;
+    let selected = select(found, Some(&decided.workflow))?;
+    store
+        .upsert_run(run_id, None, RunStatus::Running.as_str())
+        .await?;
+    record(Record {
+        store,
+        run_id,
+        node: "overseer",
+        output: &decided,
+        input: Some(input_json),
+        iteration: None,
+        ledger: Some(ledger),
+    })
+    .await?;
+    Ok(selected)
+}
+
 /// Pick the workflow for this run, asking the overseer when there is a real choice to make.
 ///
 /// The order is deliberate. A named workflow wins outright — a caller that said which shape it
@@ -740,13 +788,15 @@ fn overseer_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> boo
 /// overseer, and without one configured the run still refuses to guess rather than picking.
 pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
     let found = registry().await?;
-    let real_choice = request.workflow.is_none()
-        && found
-            .iter()
-            .filter(|w| !matches!(w, Workflow::BuiltIn))
-            .count()
-            > 1;
-    if !real_choice || !overseer_enabled(request.engine, request.config) {
+    let defined_workflows = found
+        .iter()
+        .filter(|workflow| !matches!(workflow, Workflow::BuiltIn))
+        .count();
+    if !should_consult_overseer(
+        defined_workflows,
+        request.workflow.is_some(),
+        overseer_enabled(request.engine, request.config),
+    ) {
         return select(found, request.workflow);
     }
 
@@ -759,56 +809,47 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
         })
         .collect();
 
+    let input = overseer::OverseerInput {
+        issue: request.issue.to_string(),
+        choices,
+    };
+    let input_json = serde_json::to_string(&input)?;
+    let rendered_question = overseer::render_prompt(&input.issue, &input.choices);
     let cwd = std::env::current_dir().unwrap_or_default();
-    let context = PluginContext::resolve(request.config, request.engine, &cwd).await?;
-    let mut plugins = context.for_node("overseer");
-    let cfg = stage_agent_config(
-        request.engine,
+    let plugin_context = PluginContext::resolve(request.config, request.engine, &cwd).await?;
+    let ctx = workflow::WorkflowContext::new(
+        request.client,
         request.config,
-        context.pool_for("overseer", request.client.map(|c| c.offer())),
-        "overseer",
-        overseer::OVERSEER_TOOLS,
-        &mut plugins,
+        request.store,
+        request.run_id,
+        request.issue,
+        request.engine,
+        plugin_context,
     )?;
+    let raw = workflow::evaluate_standard_stage(
+        Arc::clone(&ctx),
+        "overseer",
+        input_json.clone(),
+        rendered_question,
+    )
+    .await
+    .map_err(|error| PlanError::node("overseer", NodeError::Failed(error)))?;
+    let decided: OverseerOutput = serde_json::from_str(&raw)?;
+
     // Its own ledger: the overseer runs before the run's, and its cost is still a cost. Drained
     // straight onto the checkpoint below rather than carried, because nothing after this point
     // would claim it.
-    let ledger = Arc::new(RunLedger::default());
-    let decided = OverseerNode {
-        route: cfg.route,
-        tools: cfg.tools,
-        policy: cfg.policy,
-        max_turns: cfg.max_turns,
-        system_prompt: cfg.system_prompt,
-        plugins,
-        ledger: Some(Arc::clone(&ledger)),
-        files: cfg.files,
-    }
-    .run(request.issue, &choices)
-    .await
-    .map_err(|e| PlanError::node("overseer", e))?;
-
-    // Recorded before it is acted on, and recorded even when the name turns out to be wrong: the
-    // reasoning is what a reader needs when a run went somewhere unexpected, and a rejected choice
-    // is exactly such a case.
-    request
-        .store
-        .upsert_run(request.run_id, None, RunStatus::Running.as_str())
-        .await?;
-    record(Record {
+    // A model naming something absent is rejected before this writes anything, so the store never
+    // presents a rejected routing decision as a completed stage.
+    select_and_record_overseer(OverseerDecision {
         store: request.store,
         run_id: request.run_id,
-        node: "overseer",
-        output: &decided,
-        input: Some(serde_json::to_string(request.issue)?),
-        iteration: None,
-        ledger: Some(&ledger),
+        found,
+        decided,
+        input_json,
+        ledger: ctx.ledger(),
     })
-    .await?;
-
-    // A model naming something that is not there does not get to select it. Falling through to the
-    // named lookup gives the error that lists what was available.
-    select(found, Some(&decided.workflow))
+    .await
 }
 
 /// What one run needs to start.
@@ -3640,24 +3681,19 @@ mod agent_config_tests {
         assert!(BUILT_IN_NODES.contains(&"implementer"));
     }
 
-    /// Whether `choose` would spend a model call, given what the repo defines and what was asked.
-    fn would_consult(defined: usize, named: bool, configured: bool) -> bool {
-        !named && defined > 1 && configured
-    }
-
     #[test]
     fn the_overseer_is_consulted_only_when_there_is_a_real_choice() {
         // A caller that named a workflow said which shape it wanted and is not asking to be
         // second-guessed.
-        assert!(!would_consult(3, true, true));
+        assert!(!should_consult_overseer(3, true, true));
         // One or none resolves without a model call: paying for a decision with one answer is
         // waste, and the built-in is what a repo defining nothing gets.
-        assert!(!would_consult(1, false, true));
-        assert!(!would_consult(0, false, true));
+        assert!(!should_consult_overseer(1, false, true));
+        assert!(!should_consult_overseer(0, false, true));
         // Unconfigured, the run refuses to guess rather than picking for itself.
-        assert!(!would_consult(3, false, false));
+        assert!(!should_consult_overseer(3, false, false));
         // The only case worth a call.
-        assert!(would_consult(2, false, true));
+        assert!(should_consult_overseer(2, false, true));
     }
 
     #[tokio::test]
@@ -3672,12 +3708,34 @@ mod agent_config_tests {
         let mut registry = vec![Workflow::BuiltIn];
         registry.extend(found.into_iter().map(Workflow::Scripted));
 
-        let err = match select(registry, Some("invented")) {
+        let store = Store::open_in_memory().unwrap();
+        let ledger = Arc::new(RunLedger::default());
+        let err = match select_and_record_overseer(OverseerDecision {
+            store: &store,
+            run_id: "run-invalid-overseer-choice",
+            found: registry,
+            decided: OverseerOutput {
+                workflow: "invented".to_string(),
+                reasoning: "the model invented a route".to_string(),
+            },
+            input_json: r#"{"issue":"choose","choices":[]}"#.to_string(),
+            ledger: &ledger,
+        })
+        .await
+        {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a name that is not in the registry must not select anything"),
         };
         assert!(err.contains("no workflow named `invented`"), "{err}");
         assert!(err.contains("research"), "{err}");
+        assert!(
+            store
+                .checkpoints_for_run("run-invalid-overseer-choice")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a rejected workflow name must not look like a valid overseer checkpoint"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
