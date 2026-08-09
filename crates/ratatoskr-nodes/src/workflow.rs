@@ -660,11 +660,32 @@ struct VerifyResult {
     needs_replan: bool,
 }
 
+fn verification_result(
+    out: verifier::VerifierOutput,
+    threshold: verifier::Severity,
+) -> VerifyResult {
+    let blocking: Vec<verifier::Finding> = out.blocking(threshold).into_iter().cloned().collect();
+    let needs_replan = blocking
+        .iter()
+        .any(|finding| finding.kind == verifier::FindingKind::Plan);
+    VerifyResult {
+        configured: true,
+        unavailable: false,
+        findings: out.findings,
+        blocking,
+        needs_replan,
+    }
+}
+
 /// `verify({ analyst })` — read the worktree's diff against the plan.
 ///
 /// Mirrors the built-in flow's second gate. The script decides when to call it; every judgement
 /// inside stays here.
-async fn verify_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
+async fn verify_host(
+    ctx: Arc<WorkflowContext>,
+    executor: Arc<StageExecutor>,
+    arg: String,
+) -> Result<String, String> {
     #[derive(Deserialize)]
     struct Arg {
         analyst: AnalystOutput,
@@ -695,73 +716,65 @@ async fn verify_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, S
         .await
         .map_err(|e| e.to_string())?;
 
-    let mut plugins = ctx.plugin_context.for_node("verifier");
-    let cfg = stage_agent_config(
-        &ctx.engine,
-        &ctx.config,
-        ctx.plugin_context.pool_for("verifier", ctx.rag_rat.clone()),
-        "verifier",
-        verifier::VERIFIER_TOOLS,
-        &mut plugins,
-    )
-    .map_err(|e| e.to_string())?;
-    let node = verifier::VerifierNode {
-        route: cfg.route,
-        tools: cfg.tools,
-        files: cfg.files,
-        ledger: Some(Arc::clone(&ctx.ledger)),
-        policy: cfg.policy,
-        max_turns: cfg.max_turns,
-        system_prompt: cfg.system_prompt,
-        plugins,
-    };
-
     // The patch, not the `--stat` the implementer records: a summary cannot show a weakened
     // assertion, which is one of the things this gate exists to catch.
     let diff = ratatoskr_exec::diff_text(&worktree)
         .await
         .unwrap_or_default();
-    let out = match node
-        .run(verifier::VerifierInput {
-            // The scripted path reviews once per call and keeps no history of its own.
-            previous_findings: Vec::new(),
-            issue: ctx.issue.clone(),
-            analyst: input.analyst,
-            diff,
-            touched_files: implementer.touched_files.clone(),
-        })
-        .await
-    {
-        Ok(out) => out,
-        Err(e) => {
-            // A verifier that cannot run must not fail a change that was made and passed. Recorded
-            // and reported as unavailable, exactly as the built-in flow treats it.
-            tracing::warn!("the verifier could not review this change: {e}");
-            note(
-                &ctx,
-                "verifier",
-                &serde_json::json!({ "error": e.to_string() }),
-                None,
-            )
-            .await?;
-            return none(true, true);
+    let verifier_input = verifier::VerifierInput {
+        // The scripted path reviews once per call and keeps no history of its own.
+        previous_findings: Vec::new(),
+        issue: ctx.issue.clone(),
+        analyst: input.analyst,
+        diff,
+        touched_files: implementer.touched_files.clone(),
+    };
+    let input_json = serde_json::to_string(&verifier_input).map_err(|e| e.to_string())?;
+    let raw = if verifier_input.diff.trim().is_empty() {
+        let out = verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: "there was no diff to review".to_string(),
+        };
+        note(&ctx, "verifier", &out, Some(input_json)).await?;
+        serde_json::to_string(&out).map_err(|e| e.to_string())?
+    } else {
+        let rendered_question = verifier::render_prompt(&verifier_input);
+        let stage = executor
+            .stages
+            .iter()
+            .find(|stage| stage.id == "verifier")
+            .cloned()
+            .ok_or_else(|| "standard verifier stage is not registered".to_string())?;
+        match executor
+            .execute_after_guard(StageInvocation {
+                stage,
+                input_json: input_json.clone(),
+                rendered_question: Some(rendered_question),
+                resource_root: Some(worktree.0.clone()),
+                output: StageOutput::Checkpoint,
+            })
+            .await
+        {
+            Ok(raw) => raw,
+            Err(error) => {
+                // A verifier that cannot run must not fail a change that was made and passed. Recorded
+                // and reported as unavailable, exactly as the built-in flow treats it.
+                tracing::warn!("the verifier could not review this change: {error}");
+                note(
+                    &ctx,
+                    "verifier",
+                    &serde_json::json!({ "error": error }),
+                    Some(input_json),
+                )
+                .await?;
+                return none(true, true);
+            }
         }
     };
-    note(&ctx, "verifier", &out, None).await?;
+    let out: verifier::VerifierOutput = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
 
     let threshold = crate::parse_threshold(&ctx.config.implementer.verify_threshold);
-    let blocking: Vec<verifier::Finding> = out.blocking(threshold).into_iter().cloned().collect();
-    let needs_replan = blocking
-        .iter()
-        .any(|f| f.kind == verifier::FindingKind::Plan);
-    serde_json::to_string(&VerifyResult {
-        configured: true,
-        unavailable: false,
-        findings: out.findings,
-        blocking,
-        needs_replan,
-    })
-    .map_err(|e| e.to_string())
+    serde_json::to_string(&verification_result(out, threshold)).map_err(|e| e.to_string())
 }
 
 /// `context(issue)` — the merged gather step: distilled findings plus the memories unmodified.
@@ -932,6 +945,7 @@ struct StageInvocation {
     stage: Stage,
     input_json: String,
     rendered_question: Option<String>,
+    resource_root: Option<PathBuf>,
     output: StageOutput,
 }
 
@@ -955,6 +969,7 @@ fn stage_invocation(stage: Stage, host_input_json: String) -> Result<StageInvoca
             stage,
             input_json: host_input_json,
             rendered_question: None,
+            resource_root: None,
             output: StageOutput::Checkpoint,
         });
     };
@@ -965,6 +980,7 @@ fn stage_invocation(stage: Stage, host_input_json: String) -> Result<StageInvoca
         input_json: serde_json::to_string(&envelope.rendered.input)
             .map_err(|error| error.to_string())?,
         rendered_question: Some(envelope.rendered.question),
+        resource_root: None,
         output: StageOutput::Checkpoint,
     })
 }
@@ -1003,10 +1019,18 @@ impl StageExecutor {
 
     async fn execute(self: &Arc<Self>, invocation: StageInvocation) -> Result<String, String> {
         self.ctx.guard()?;
+        self.execute_after_guard(invocation).await
+    }
+
+    async fn execute_after_guard(
+        self: &Arc<Self>,
+        invocation: StageInvocation,
+    ) -> Result<String, String> {
         let StageInvocation {
             stage,
             input_json,
             rendered_question,
+            resource_root,
             output: disposition,
         } = invocation;
         let input: serde_json::Value =
@@ -1053,6 +1077,7 @@ impl StageExecutor {
                 stage: target,
                 input_json: serde_json::to_string(&task.input).map_err(|e| e.to_string())?,
                 rendered_question: None,
+                resource_root: resource_root.clone(),
                 output: StageOutput::Evidence,
             }))
             .await?;
@@ -1109,7 +1134,7 @@ impl StageExecutor {
                 clarifier: None,
                 observer: plugins.observer.clone(),
                 skills: crate::skills::loaded(&plugins.skills, &stage.id),
-                files: cfg.files,
+                files: resource_root.or(cfg.files),
                 shell: None,
                 push: None,
                 conversation: Some(&conversation),
@@ -1146,7 +1171,7 @@ enum TemporaryOperation {
 }
 
 impl TemporaryOperation {
-    fn host(self, ctx: &Arc<WorkflowContext>) -> HostFn {
+    fn host(self, ctx: &Arc<WorkflowContext>, executor: &Arc<StageExecutor>) -> HostFn {
         match self {
             Self::Context => binding(Arc::clone(ctx), context_host),
             Self::Memory => binding(Arc::clone(ctx), memory_host),
@@ -1154,7 +1179,15 @@ impl TemporaryOperation {
             Self::RedTeam => binding(Arc::clone(ctx), red_team_host),
             Self::Implement => binding(Arc::clone(ctx), implement_host),
             Self::Iterate => binding(Arc::clone(ctx), iterate_host),
-            Self::Verify => binding(Arc::clone(ctx), verify_host),
+            Self::Verify => {
+                let ctx = Arc::clone(ctx);
+                let executor = Arc::clone(executor);
+                Arc::new(move |arg| {
+                    let ctx = Arc::clone(&ctx);
+                    let executor = Arc::clone(&executor);
+                    Box::pin(async move { verify_host(ctx, executor, arg).await })
+                })
+            }
             Self::IsConverged => binding(Arc::clone(ctx), is_converged_host),
             Self::TestCommandRan => binding(Arc::clone(ctx), test_command_ran_host),
             Self::NewlyIntroducedFailures => binding(Arc::clone(ctx), newly_introduced_host),
@@ -1171,7 +1204,6 @@ const TEMPORARY_OPERATIONS: &[(&str, TemporaryOperation)] = &[
     ("implementer", TemporaryOperation::Implement),
     ("implement", TemporaryOperation::Implement),
     ("iterate", TemporaryOperation::Iterate),
-    ("verifier", TemporaryOperation::Verify),
     ("verify", TemporaryOperation::Verify),
     ("isConverged", TemporaryOperation::IsConverged),
     ("testCommandRan", TemporaryOperation::TestCommandRan),
@@ -1181,21 +1213,19 @@ const TEMPORARY_OPERATIONS: &[(&str, TemporaryOperation)] = &[
     ),
 ];
 
-fn build_legacy_operation_hosts(ctx: &Arc<WorkflowContext>) -> HashMap<String, HostFn> {
+fn build_legacy_operation_hosts(
+    ctx: &Arc<WorkflowContext>,
+    executor: &Arc<StageExecutor>,
+) -> HashMap<String, HostFn> {
     TEMPORARY_OPERATIONS
         .iter()
-        .map(|(name, operation)| ((*name).to_string(), operation.host(ctx)))
+        .map(|(name, operation)| ((*name).to_string(), operation.host(ctx, executor)))
         .collect()
 }
 
-fn build_declared_stage_hosts(
-    ctx: &Arc<WorkflowContext>,
-    stages: &[Stage],
-    turn: Arc<dyn StageTurn>,
-) -> HashMap<String, HostFn> {
-    let stages = Arc::new(stages.to_vec());
-    let executor = StageExecutor::new(Arc::clone(ctx), Arc::clone(&stages), turn);
-    stages
+fn build_declared_stage_hosts(executor: &Arc<StageExecutor>) -> HashMap<String, HostFn> {
+    executor
+        .stages
         .iter()
         .map(|stage| (stage.id.clone(), executor.host(stage.clone())))
         .collect()
@@ -1206,8 +1236,10 @@ fn build_hosts_with_turn(
     stages: &[Stage],
     turn: Arc<dyn StageTurn>,
 ) -> Result<HashMap<String, HostFn>, PlanError> {
-    let declared = build_declared_stage_hosts(ctx, stages, turn);
-    let mut hosts = build_legacy_operation_hosts(ctx);
+    let stages = Arc::new(stages.to_vec());
+    let executor = StageExecutor::new(Arc::clone(ctx), Arc::clone(&stages), turn);
+    let declared = build_declared_stage_hosts(&executor);
+    let mut hosts = build_legacy_operation_hosts(ctx, &executor);
     if let Some(stage) = stages.iter().find(|stage| hosts.contains_key(&stage.id)) {
         return Err(PlanError::Configuration(format!(
             "stage `{}` conflicts with a legacy workflow operation",
@@ -1711,6 +1743,7 @@ mod tests {
                 stage,
                 input_json: "{}".to_string(),
                 rendered_question: None,
+                resource_root: None,
                 output: StageOutput::Evidence,
             })
             .await
@@ -1921,9 +1954,18 @@ mod tests {
             !hosts.contains_key("analyst"),
             "the canonical analyst id belongs to the declarative stage"
         );
+        assert!(
+            !hosts.contains_key("verifier"),
+            "the canonical verifier id belongs to the declarative stage"
+        );
         let error = hosts["analyze"]("{}".to_string()).await.unwrap_err();
         assert!(
             error.contains("analyze arg"),
+            "legacy alias changed: {error}"
+        );
+        let error = hosts["verify"]("{}".to_string()).await.unwrap_err();
+        assert!(
+            error.contains("verify arg"),
             "legacy alias changed: {error}"
         );
 
@@ -1931,16 +1973,18 @@ mod tests {
         let error = hosts["memory"]("{}".to_string()).await.unwrap_err();
         assert!(error.contains("runaway loop"));
 
-        let verifier = crate::built_in_stages()
+        let context = crate::built_in_stages()
             .into_iter()
-            .find(|stage| stage.id == "verifier")
+            .find(|stage| stage.id == "context")
             .unwrap();
-        let error =
-            match build_hosts_with_turn(&ctx, &[verifier], Arc::new(RecordingStageTurn::default()))
-            {
-                Ok(_) => panic!("a declared stage replaced a temporary operation adapter"),
-                Err(error) => error,
-            };
+        let error = match build_hosts_with_turn(
+            &ctx,
+            &[context],
+            Arc::new(RecordingStageTurn::default()),
+        ) {
+            Ok(_) => panic!("a declared stage replaced a temporary operation adapter"),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("legacy workflow operation"));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2318,6 +2362,291 @@ mod tests {
             "invalid output must not be checkpointed"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn standard_verifier_uses_generic_dispatch_and_preserves_its_input_and_prompt() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-verifier-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"async function plan(input) { return await verifier(input); }"#,
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::load(&workflow_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let rules_dir = dir.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        let engine = ScriptEngine::load(&rules_dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-standard-verifier", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "verifier".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Compacted,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-standard-verifier",
+            "review the change",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = standard_stages().await.unwrap();
+        let verifier_stage = stages.iter().find(|stage| stage.id == "verifier").unwrap();
+        assert_eq!(verifier_stage.agent, "explore");
+        assert_eq!(
+            verifier_stage.session,
+            Some(ratatoskr_core::SessionScope::Fresh)
+        );
+        assert_eq!(
+            verifier_stage.tools,
+            [
+                "semantic_search",
+                "symbol_lookup",
+                "impact_surface",
+                "memory_search"
+            ]
+        );
+
+        let input = verifier::VerifierInput {
+            issue: "review the change".to_string(),
+            analyst: AnalystOutput {
+                impact_summary: "changes the session registry".to_string(),
+                touched: Vec::new(),
+                risks: vec!["P1: a reused key could cross runs".to_string()],
+                requirements: vec!["isolate run-local sessions".to_string()],
+                residual_risk: String::new(),
+                changes_code: true,
+                acceptance: Vec::new(),
+                interface: Vec::new(),
+            },
+            diff: "diff --git a/session.rs b/session.rs\n+scope by run id".to_string(),
+            touched_files: vec!["session.rs".to_string(), "workflow.rs".to_string()],
+            previous_findings: vec![verifier::Finding {
+                severity: verifier::Severity::P2,
+                kind: verifier::FindingKind::Execution,
+                file: "session.rs".to_string(),
+                line: Some(8),
+                summary: "the key omitted the run".to_string(),
+                failure_scenario: "two runs use the same stage id".to_string(),
+            }],
+        };
+        let input_value = serde_json::to_value(&input).unwrap();
+        let expected_prompt = verifier::render_prompt(&input);
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({
+                "findings": [],
+                "assessment": "checked the session key and its callers"
+            })
+            .to_string(),
+            ..Default::default()
+        });
+        let hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        runtime
+            .run_with_question_renderers(
+                "plan",
+                input_value.to_string(),
+                hosts,
+                stage_question_renderers(&stages),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *turn.nodes.lock().expect("recording runner mutex poisoned"),
+            ["verifier"]
+        );
+        assert_eq!(
+            *turn
+                .sessions
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            [ratatoskr_core::SessionScope::Fresh],
+            "each review receives its explicit prior findings instead of hidden session history"
+        );
+        let question = turn
+            .questions
+            .lock()
+            .expect("recording runner mutex poisoned")[0]
+            .clone();
+        assert_eq!(
+            question,
+            format!(
+                "Input contract: VerifierInput\nOutput contract: VerifierOutput\n\n{expected_prompt}"
+            )
+        );
+        assert!(question.contains("[P2/Execution] session.rs: the key omitted the run"));
+        assert!(question.contains("THE CHANGE:\ndiff --git a/session.rs b/session.rs"));
+
+        let checkpoints = store
+            .checkpoints_for_run("run-standard-verifier")
+            .await
+            .unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].node_name, "verifier");
+        let checkpoint_input: verifier::VerifierInput =
+            serde_json::from_str(checkpoints[0].input_json.as_deref().unwrap()).unwrap();
+        assert_eq!(checkpoint_input.diff, input.diff);
+        assert_eq!(
+            checkpoint_input.previous_findings[0].summary,
+            "the key omitted the run"
+        );
+        let checkpoint_output: verifier::VerifierOutput =
+            serde_json::from_str(&checkpoints[0].output_json).unwrap();
+        assert_eq!(
+            checkpoint_output.assessment,
+            "checked the session key and its callers"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn standard_verifier_contract_matches_the_typed_gate_and_rejects_bad_findings() {
+        let stages = standard_stages().await.unwrap();
+        let verifier_stage = stages.iter().find(|stage| stage.id == "verifier").unwrap();
+        assert_eq!(
+            verifier_stage.instructions,
+            include_str!("../prompts/verifier.md").trim()
+        );
+        let mut generated =
+            serde_json::to_value(schemars::schema_for!(verifier::VerifierOutput)).unwrap();
+        without_schema_annotations(&mut generated);
+        assert_eq!(verifier_stage.output_schema.as_ref().unwrap(), &generated);
+
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-verifier-schema-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-verifier-schema", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "verifier".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-verifier-schema",
+            "validate this",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({
+                "findings": [{
+                    "severity": "P1",
+                    "kind": "plan",
+                    "summary": "missing the required failure scenario"
+                }],
+                "assessment": "reviewed"
+            })
+            .to_string(),
+            ..Default::default()
+        });
+        let mut hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        let envelope = json!({
+            "__ratatoskrRenderedQuestion": {
+                "input": {
+                    "issue": "validate this",
+                    "analyst": { "impact_summary": "check it" },
+                    "diff": "+change",
+                    "touched_files": [],
+                    "previous_findings": []
+                },
+                "question": "TASK:\nvalidate this\n\nTHE CHANGE:\n+change\n"
+            }
+        })
+        .to_string();
+        let error = hosts.remove("verifier").unwrap()(envelope)
+            .await
+            .unwrap_err();
+        assert!(error.contains("invalid `VerifierOutput` output"), "{error}");
+        assert!(error.contains("failure_scenario"), "{error}");
+        assert!(
+            store
+                .checkpoints_for_run("run-verifier-schema")
+                .await
+                .unwrap()
+                .is_empty(),
+            "invalid output must not be checkpointed"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn verifier_threshold_and_plan_routing_remain_rust_owned() {
+        let output = verifier::VerifierOutput {
+            findings: vec![
+                verifier::Finding {
+                    severity: verifier::Severity::P3,
+                    kind: verifier::FindingKind::Execution,
+                    file: String::new(),
+                    line: None,
+                    summary: "non-blocking nit".to_string(),
+                    failure_scenario: "a cosmetic label is awkward".to_string(),
+                },
+                verifier::Finding {
+                    severity: verifier::Severity::P1,
+                    kind: verifier::FindingKind::Plan,
+                    file: "session.rs".to_string(),
+                    line: None,
+                    summary: "the required key cannot isolate runs".to_string(),
+                    failure_scenario: "two runs collide".to_string(),
+                },
+            ],
+            assessment: "checked both findings".to_string(),
+        };
+
+        let result = verification_result(output, verifier::Severity::P2);
+
+        assert_eq!(result.findings.len(), 2, "all findings remain recorded");
+        assert_eq!(result.blocking.len(), 1, "P3 stays below the P2 gate");
+        assert_eq!(result.blocking[0].severity, verifier::Severity::P1);
+        assert!(
+            result.needs_replan,
+            "a blocking plan fault routes to the analyst"
+        );
     }
 
     #[test]

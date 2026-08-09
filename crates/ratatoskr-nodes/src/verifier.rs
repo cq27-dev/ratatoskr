@@ -108,6 +108,7 @@ impl VerifierOutput {
 }
 
 /// What the verifier is given: the change, and what it was for.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VerifierInput {
     pub issue: String,
     pub analyst: AnalystOutput,
@@ -196,7 +197,7 @@ pub(crate) async fn run_judgement<T: DeserializeOwned + JsonSchema>(
     parse_validated::<T>(&raw)
 }
 
-fn render_prompt(input: &VerifierInput) -> String {
+pub(crate) fn render_prompt(input: &VerifierInput) -> String {
     let mut s = String::new();
     let _ = write!(s, "TASK:\n{}\n\n", input.issue);
 
