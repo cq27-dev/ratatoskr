@@ -45,11 +45,22 @@ pub struct Stage {
     pub context: String,
     /// A stage may only narrow its profile's ceiling.
     pub capabilities: Vec<Capability>,
+    /// Default tools offered before repository rules narrow or replace the list.
+    pub tools: Vec<String>,
     /// Overrides the selected route's attempt-continuation policy when present.
     pub session: Option<SessionScope>,
+    /// Generic output cleanup performed after schema validation.
+    pub array_normalization: Vec<ArrayNormalization>,
     pub delegation: Option<Delegation>,
     /// Built-ins append repository guidance; user-defined stages may replace their prompt.
     pub append_repository_guidance: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrayNormalization {
+    pub field: String,
+    pub default_empty: bool,
+    pub retain_when_any_non_blank: Vec<String>,
 }
 
 impl Stage {
@@ -184,7 +195,17 @@ pub fn stages_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> 
             instructions: stage.instructions.clone(),
             context: stage.context.clone(),
             capabilities: stage.capabilities.clone(),
+            tools: stage.tools.clone(),
             session: stage.session,
+            array_normalization: stage
+                .array_normalization
+                .iter()
+                .map(|normalization| ArrayNormalization {
+                    field: normalization.field.clone(),
+                    default_empty: normalization.default_empty,
+                    retain_when_any_non_blank: normalization.retain_when_any_non_blank.clone(),
+                })
+                .collect(),
             delegation: stage.delegation.as_ref().map(|delegation| Delegation {
                 target: delegation.target.clone(),
                 evidence_contract: delegation.evidence_contract.clone(),
@@ -229,7 +250,9 @@ pub fn built_in_stages() -> Vec<Stage> {
         instructions: String::new(),
         context: String::new(),
         capabilities: Vec::new(),
+        tools: Vec::new(),
         session: None,
+        array_normalization: Vec::new(),
         delegation: None,
         append_repository_guidance: true,
     })
@@ -256,7 +279,9 @@ mod tests {
                 instructions: String::new(),
                 context: String::new(),
                 capabilities: vec![Capability::Read],
+                tools: Vec::new(),
                 session: Some(SessionScope::Compacted),
+                array_normalization: Vec::new(),
                 delegation: None,
                 append_repository_guidance: true,
             }],

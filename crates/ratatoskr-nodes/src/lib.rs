@@ -677,6 +677,8 @@ pub async fn defined() -> Result<Vec<WorkflowRuntime>, PlanError> {
 pub async fn validate_configured_stages(config: &RatatoskrConfig) -> Result<(), PlanError> {
     let profiles = agent_profiles(config);
     let mut stages = built_in_stages();
+    stages.retain(|stage| stage.id != "scout");
+    stages.extend(workflow::standard_stages().await?);
     for workflow in defined().await? {
         let workflow_stages = stage::stages_from_workflow(workflow.meta());
         validate::validate_declared_contracts(&workflow_stages)?;

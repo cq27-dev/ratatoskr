@@ -117,13 +117,32 @@ pub struct WorkflowStage {
     pub context: String,
     #[serde(default)]
     pub capabilities: Vec<Capability>,
+    /// Default tools offered to the stage before a ruleset narrows or replaces the list.
+    #[serde(default)]
+    pub tools: Vec<String>,
     /// Override the selected agent route's attempt-continuation policy for this stage.
     #[serde(default)]
     pub session: Option<SessionScope>,
+    /// Generic, declarative cleanup applied after schema validation and before checkpointing.
+    #[serde(default)]
+    pub array_normalization: Vec<WorkflowArrayNormalization>,
     #[serde(default)]
     pub delegation: Option<WorkflowDelegation>,
     #[serde(default = "default_append_repository_guidance")]
     pub append_repository_guidance: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowArrayNormalization {
+    /// Top-level array field to normalize.
+    pub field: String,
+    /// Materialize an absent field as an empty array.
+    #[serde(default)]
+    pub default_empty: bool,
+    /// Retain an object when any named string field is non-blank.
+    #[serde(default)]
+    pub retain_when_any_non_blank: Vec<String>,
 }
 
 fn default_append_repository_guidance() -> bool {
@@ -149,6 +168,20 @@ pub struct WorkflowRuntime {
 }
 
 impl WorkflowRuntime {
+    /// Parse a declaration bundled into the binary without registering it as a selectable
+    /// repository workflow. Standard stage metadata uses the same TypeScript boundary as a
+    /// repository declaration, while the repository script remains the thing that sequences it.
+    pub async fn bundled_meta(name: &str, src: &str) -> Result<WorkflowMeta, ScriptError> {
+        let source = transpile_ts(src)?;
+        let runtime = AsyncRuntime::new().map_err(|e| ScriptError::Eval(e.to_string()))?;
+        let context = AsyncContext::full(&runtime)
+            .await
+            .map_err(|e| ScriptError::Eval(e.to_string()))?;
+        Self::declared(&context, &source).await?.ok_or_else(|| {
+            ScriptError::Eval(format!("bundled workflow `{name}` has no declaration"))
+        })
+    }
+
     /// Load and transpile `path` (`.ratatoskr/workflow.ts`). `Ok(None)` if the file is absent —
     /// the caller then runs the built-in Rust flow, exactly as the ruleset engine treats a missing
     /// rules dir.

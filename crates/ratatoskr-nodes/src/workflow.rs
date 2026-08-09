@@ -35,14 +35,16 @@ use serde_json::json;
 use crate::{
     AnalystNode, AnalystOutput, BookkeeperInput, BookkeeperNode, BookkeeperOutput, ChildTask,
     ImplementerNode, ImplementerOutput, MemoryNode, MemoryOutput, PlanError, PlanOutcome,
-    RedTeamNode, RedTeamOutput, RunOutcome, ScoutNode, ScoutOutput, Stage, analyst, bookkeeper,
-    checkpoint, converge, memory, redteam, referee, scout, stage_agent_config, verifier,
+    RedTeamNode, RedTeamOutput, RunOutcome, ScoutOutput, Stage, analyst, bookkeeper, checkpoint,
+    converge, memory, redteam, referee, stage_agent_config, verifier,
 };
 
 /// Backstop on total node-running binding calls per run — a runaway-loop guard, far above any real
 /// workflow. `max_iterations` and the false-convergence guard are the precise limits; this only
 /// catches a script that ignores them and loops.
 const INVOCATION_CEILING: usize = 500;
+
+const STANDARD_WORKFLOW_V1: &str = include_str!("../workflows/standard-v1.ts");
 
 /// Everything the bindings need, cloned as an `Arc` into every host closure. Holds the run's shared
 /// mutable state (the worktree handle and the invocation/iteration counters) behind atomics/a mutex.
@@ -279,39 +281,6 @@ where
         Box::pin(async move { f(ctx, arg).await })
             as std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
     })
-}
-
-async fn scout_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
-    ctx.guard()?;
-    let issue: String = serde_json::from_str(&arg).map_err(|e| format!("scout arg: {e}"))?;
-    let mut plugins = ctx.plugin_context.for_node("scout");
-    let cfg = stage_agent_config(
-        &ctx.engine,
-        &ctx.config,
-        ctx.plugin_context.pool_for("scout", ctx.rag_rat.clone()),
-        "scout",
-        scout::SCOUT_TOOLS,
-        &mut plugins,
-    )
-    .map_err(|e| e.to_string())?;
-    let node = ScoutNode {
-        route: cfg.route,
-        tools: cfg.tools,
-        files: cfg.files,
-        ledger: Some(Arc::clone(&ctx.ledger)),
-        policy: cfg.policy,
-        max_turns: cfg.max_turns,
-        // Node-to-node clarification is built-in-flow only for now; the scripted path opts out.
-        clarifier: None,
-        system_prompt: cfg.system_prompt,
-        plugins,
-    };
-    let out = node
-        .run(issue, &RunState::new(&ctx.run_id, None))
-        .await
-        .map_err(|e| e.to_string())?;
-    note(&ctx, "scout", &out, Some(arg)).await?;
-    serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
 async fn memory_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
@@ -847,6 +816,45 @@ fn validate_declared_output(stage: &Stage, output: &serde_json::Value) -> Result
     })
 }
 
+fn normalize_declared_output(stage: &Stage, output: &mut serde_json::Value) -> Result<(), String> {
+    if stage.array_normalization.is_empty() {
+        return Ok(());
+    }
+    let object = output
+        .as_object_mut()
+        .ok_or_else(|| format!("stage `{}` normalization requires object output", stage.id))?;
+    for normalization in &stage.array_normalization {
+        if !object.contains_key(&normalization.field) && normalization.default_empty {
+            object.insert(
+                normalization.field.clone(),
+                serde_json::Value::Array(Vec::new()),
+            );
+        }
+        let Some(value) = object.get_mut(&normalization.field) else {
+            continue;
+        };
+        let array = value.as_array_mut().ok_or_else(|| {
+            format!(
+                "stage `{}` normalization field `{}` is not an array",
+                stage.id, normalization.field
+            )
+        })?;
+        if normalization.retain_when_any_non_blank.is_empty() {
+            continue;
+        }
+        array.retain(|item| {
+            item.as_object().is_some_and(|item| {
+                normalization.retain_when_any_non_blank.iter().any(|field| {
+                    item.get(field)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty())
+                })
+            })
+        });
+    }
+    Ok(())
+}
+
 /// Build a declared stage's cached guidance in the order that governs its runtime input.
 ///
 /// Runtime data deliberately stays out of this preamble: [`declared_stage_question`] puts it in
@@ -920,36 +928,19 @@ async fn declared_stage_host(
     stages: Arc<Vec<Stage>>,
     arg: String,
     checkpoint_output: bool,
-) -> Result<String, String> {
-    declared_stage_host_with(
-        ctx,
-        stage,
-        stages,
-        arg,
-        checkpoint_output,
-        &LiveDeclaredStageRunner,
-    )
-    .await
-}
-
-async fn declared_stage_host_with(
-    ctx: Arc<WorkflowContext>,
-    stage: Stage,
-    stages: Arc<Vec<Stage>>,
-    arg: String,
-    checkpoint_output: bool,
     runner: &dyn DeclaredStageRunner,
 ) -> Result<String, String> {
     ctx.guard()?;
     let input: serde_json::Value =
         serde_json::from_str(&arg).map_err(|e| format!("{} arg: {e}", stage.id))?;
     let plugins = ctx.plugin_context.for_node(&stage.id);
+    let default_tools = stage.tools.iter().map(String::as_str).collect::<Vec<_>>();
     let (mut cfg, profile) = crate::plugins::declared_stage_agent_config(
         &ctx.engine,
         &ctx.config,
         ctx.plugin_context.pool_for(&stage.id, ctx.rag_rat.clone()),
         &stage,
-        &[],
+        &default_tools,
         &plugins,
     )
     .map_err(|e| e.to_string())?;
@@ -975,7 +966,7 @@ async fn declared_stage_host_with(
             .ok_or_else(|| format!("stage `{}` has no agent `{}`", target.id, target.agent))?;
         let task = ChildTask::spawn(&stage, &profile, &target, &target_profile, input.clone())
             .map_err(|e| e.to_string())?;
-        let child = Box::pin(declared_stage_host_with(
+        let child = Box::pin(declared_stage_host(
             Arc::clone(&ctx),
             target,
             Arc::clone(&stages),
@@ -1034,32 +1025,47 @@ async fn declared_stage_host_with(
         })
         .await
         .map_err(|e| format!("stage `{}` agent failed: {e}", stage.id))?;
-    let output: serde_json::Value = serde_json::from_str(&raw)
+    let mut output: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| format!("stage `{}` returned invalid JSON: {e}", stage.id))?;
     validate_declared_output(&stage, &output)?;
+    normalize_declared_output(&stage, &mut output)?;
     if checkpoint_output {
         note(&ctx, &stage.id, &output, Some(arg)).await?;
     }
     serde_json::to_string(&output).map_err(|e| e.to_string())
 }
 
-fn declared_host(ctx: &Arc<WorkflowContext>, stage: Stage, stages: Arc<Vec<Stage>>) -> HostFn {
+fn declared_host_with_runner(
+    ctx: &Arc<WorkflowContext>,
+    stage: Stage,
+    stages: Arc<Vec<Stage>>,
+    runner: Arc<dyn DeclaredStageRunner>,
+) -> HostFn {
     binding(Arc::clone(ctx), move |ctx, arg| {
         let stage = stage.clone();
         let stages = Arc::clone(&stages);
-        async move { declared_stage_host(ctx, stage, stages, arg, true).await }
+        let runner = Arc::clone(&runner);
+        async move { declared_stage_host(ctx, stage, stages, arg, true, runner.as_ref()).await }
     })
 }
 
 fn stage_host(ctx: &Arc<WorkflowContext>, stage: Stage, stages: Arc<Vec<Stage>>) -> HostFn {
+    stage_host_with_runner(ctx, stage, stages, Arc::new(LiveDeclaredStageRunner))
+}
+
+fn stage_host_with_runner(
+    ctx: &Arc<WorkflowContext>,
+    stage: Stage,
+    stages: Arc<Vec<Stage>>,
+    runner: Arc<dyn DeclaredStageRunner>,
+) -> HostFn {
     match stage.id.as_str() {
         "context" => binding(Arc::clone(ctx), context_host),
-        "scout" => binding(Arc::clone(ctx), scout_host),
         "analyst" => binding(Arc::clone(ctx), analyze_host),
         "red_team" => binding(Arc::clone(ctx), red_team_host),
         "implementer" => binding(Arc::clone(ctx), implement_host),
         "verifier" => binding(Arc::clone(ctx), verify_host),
-        _ => declared_host(ctx, stage, stages),
+        _ => declared_host_with_runner(ctx, stage, stages, runner),
     }
 }
 
@@ -1094,10 +1100,21 @@ fn build_hosts(ctx: &Arc<WorkflowContext>, stages: &[Stage]) -> HashMap<String, 
     h
 }
 
-fn execution_stages(runtime: &WorkflowRuntime) -> Vec<Stage> {
+pub(crate) async fn standard_stages() -> Result<Vec<Stage>, PlanError> {
+    let meta = WorkflowRuntime::bundled_meta("ratatoskr-standard-v1", STANDARD_WORKFLOW_V1)
+        .await
+        .map_err(|error| PlanError::node("workflow", NodeError::Failed(error.to_string())))?;
+    let stages = crate::stage::stages_from_workflow(&meta);
+    crate::validate::validate_declared_contracts(&stages)?;
+    Ok(stages)
+}
+
+async fn execution_stages(runtime: &WorkflowRuntime) -> Result<Vec<Stage>, PlanError> {
     let mut stages = crate::built_in_stages();
+    stages.retain(|stage| stage.id != "scout");
+    stages.extend(standard_stages().await?);
     stages.extend(crate::stage::stages_from_workflow(runtime.meta()));
-    stages
+    Ok(stages)
 }
 
 // --- wrappers (own every status write, gate, and cleanup) -------------------
@@ -1122,7 +1139,7 @@ pub async fn run_plan_scripted(
     )
     .await?;
 
-    let stages = execution_stages(&runtime);
+    let stages = execution_stages(&runtime).await?;
     let hosts = build_hosts(&ctx, &stages);
     let input = json!({ "issue": ctx.issue }).to_string();
     let result = runtime.run("plan", input, hosts).await;
@@ -1171,7 +1188,7 @@ pub async fn run_full_scripted(
     )
     .await?;
 
-    let stages = execution_stages(&runtime);
+    let stages = execution_stages(&runtime).await?;
     let hosts = build_hosts(&ctx, &stages);
     let input =
         json!({ "issue": ctx.issue, "maxIterations": ctx.config.implementer.max_iterations })
@@ -1433,9 +1450,28 @@ mod tests {
         assert!(!preamble.contains(r#"{"runtime":"input"}"#));
     }
 
-    #[derive(Default)]
     struct RecordingDeclaredStageRunner {
         sessions: Mutex<Vec<ratatoskr_core::SessionScope>>,
+        nodes: Mutex<Vec<String>>,
+        tools: Mutex<Vec<Vec<String>>>,
+        preambles: Mutex<Vec<String>>,
+        questions: Mutex<Vec<String>>,
+        has_ledger: Mutex<Vec<bool>>,
+        output: String,
+    }
+
+    impl Default for RecordingDeclaredStageRunner {
+        fn default() -> Self {
+            Self {
+                sessions: Mutex::new(Vec::new()),
+                nodes: Mutex::new(Vec::new()),
+                tools: Mutex::new(Vec::new()),
+                preambles: Mutex::new(Vec::new()),
+                questions: Mutex::new(Vec::new()),
+                has_ledger: Mutex::new(Vec::new()),
+                output: "{}".to_string(),
+            }
+        }
     }
 
     impl DeclaredStageRunner for RecordingDeclaredStageRunner {
@@ -1448,7 +1484,28 @@ mod tests {
                 .lock()
                 .expect("recording runner mutex poisoned")
                 .push(run.route.session);
-            Box::pin(async { Ok("{}".to_string()) })
+            self.nodes
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(run.node.to_string());
+            self.tools
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(run.tools.names());
+            self.preambles
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(run.preamble.to_string());
+            self.questions
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(run.question.to_string());
+            self.has_ledger
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(run.ledger.is_some());
+            let output = self.output.clone();
+            Box::pin(async move { Ok(output) })
         }
     }
 
@@ -1492,7 +1549,7 @@ mod tests {
         let stages = Arc::new(vec![stage.clone()]);
         let runner = RecordingDeclaredStageRunner::default();
 
-        let output = declared_stage_host_with(ctx, stage, stages, "{}".to_string(), false, &runner)
+        let output = declared_stage_host(ctx, stage, stages, "{}".to_string(), false, &runner)
             .await
             .unwrap();
 
@@ -1505,6 +1562,133 @@ mod tests {
             vec![ratatoskr_core::SessionScope::Compacted],
             "the declared stage must override its route before NodeRun reaches the agent"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn standard_scout_uses_generic_dispatch_and_checkpoints_normalized_output() {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-standard-scout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-standard-scout", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.get_mut("scout").unwrap().session = ratatoskr_core::SessionScope::Compacted;
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-standard-scout",
+            "find prior work",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = standard_stages().await.unwrap();
+        let scout = stages
+            .iter()
+            .find(|stage| stage.id == "scout")
+            .unwrap()
+            .clone();
+        assert_eq!(scout.agent, "explore");
+        assert_eq!(scout.capabilities, [ratatoskr_core::Capability::Read]);
+        assert_eq!(scout.tools, ["papertrail_issue_search", "semantic_search"]);
+        assert!(scout.output_schema.is_some());
+        assert_eq!(scout.session, None, "TOML retains the session decision");
+
+        let runner = Arc::new(RecordingDeclaredStageRunner {
+            output: json!({
+                "related_items": [
+                    {
+                        "item_key": "  ",
+                        "title": "",
+                        "url": "",
+                        "relation": "",
+                        "summary": ""
+                    },
+                    {
+                        "item_key": "214",
+                        "title": "Reusable stages",
+                        "url": "https://example.test/214",
+                        "relation": "same execution seam",
+                        "summary": "introduced declared stages"
+                    }
+                ],
+                "papertrail_summary": "One related change."
+            })
+            .to_string(),
+            ..Default::default()
+        });
+        let host = stage_host_with_runner(
+            &ctx,
+            scout,
+            Arc::new(stages),
+            Arc::clone(&runner) as Arc<dyn DeclaredStageRunner>,
+        );
+
+        let raw = host(serde_json::to_string("find prior work").unwrap())
+            .await
+            .unwrap();
+        let output: ScoutOutput = serde_json::from_str(&raw).unwrap();
+        assert_eq!(output.related_items.len(), 1);
+        assert_eq!(output.related_items[0].item_key, "214");
+
+        let checkpoints = store
+            .checkpoints_for_run("run-standard-scout")
+            .await
+            .unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].node_name, "scout");
+        let checkpoint: ScoutOutput = serde_json::from_str(&checkpoints[0].output_json).unwrap();
+        assert_eq!(checkpoint.related_items.len(), 1);
+
+        assert_eq!(
+            *runner
+                .nodes
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            ["scout"]
+        );
+        assert_eq!(
+            *runner
+                .sessions
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            [ratatoskr_core::SessionScope::Compacted]
+        );
+        assert!(
+            runner
+                .has_ledger
+                .lock()
+                .expect("recording runner mutex poisoned")[0],
+            "generic dispatch must report telemetry to the run ledger"
+        );
+        let offered = &runner
+            .tools
+            .lock()
+            .expect("recording runner mutex poisoned")[0];
+        assert!(offered.contains(&"Read".to_string()));
+        assert!(offered.contains(&"Grep".to_string()));
+        assert!(!offered.iter().any(|tool| tool == "Write" || tool == "Edit"));
+        let preamble = &runner
+            .preambles
+            .lock()
+            .expect("recording runner mutex poisoned")[0];
+        assert!(
+            preamble.find("Return JSON") < preamble.find("You are the scout"),
+            "platform guidance must precede the bundled scout prompt"
+        );
+        let question = &runner
+            .questions
+            .lock()
+            .expect("recording runner mutex poisoned")[0];
+        assert!(question.ends_with(r#""find prior work""#));
+        assert!(!preamble.contains("find prior work"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
