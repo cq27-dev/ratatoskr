@@ -1593,7 +1593,7 @@ fn build_implementer_agent(
     // code, so it is the one most likely to meet a question worth asking — and the run-wide
     // `ASK_BUDGET` is what keeps that a relief valve rather than a way to spend a run.
     tools.local().tools.push(clarify::ask_tool());
-    let cfg = node_agent_config(
+    let mut cfg = node_agent_config(
         engine,
         config,
         tools,
@@ -1601,6 +1601,11 @@ fn build_implementer_agent(
         &implementer_default_tools(),
         &plugins,
     )?;
+    // TOML governs the built-in implementer. A ruleset can still make a deliberate, more-specific
+    // per-node override with `maxTurns`.
+    if cfg.max_turns.is_none() {
+        cfg.max_turns = Some(config.implementer.max_turns);
+    }
     Ok((cfg, plugins))
 }
 
@@ -3150,6 +3155,25 @@ mod agent_config_tests {
         assert_eq!(cfg.route.model, config.models["bookkeeper"].model);
         assert!(cfg.system_prompt.is_none());
         assert_eq!(cfg.max_turns, Some(3));
+    }
+
+    #[tokio::test]
+    async fn toml_configures_the_implementer_turn_cap_unless_its_ruleset_overrides_it() {
+        let mut config = RatatoskrConfig::default();
+        config.implementer.max_turns = 250;
+        let context = PluginContext::default();
+
+        let engine = engine("implementer-toml-turn-cap").await;
+        let (cfg, _) = build_implementer_agent(&engine, &config, &context, None).unwrap();
+        assert_eq!(cfg.max_turns, Some(250));
+
+        let engine = binding_engine(
+            "implementer-ruleset-turn-cap",
+            r#"defineAgent("implementer", { maxTurns: 7 });"#,
+        )
+        .await;
+        let (cfg, _) = build_implementer_agent(&engine, &config, &context, None).unwrap();
+        assert_eq!(cfg.max_turns, Some(7));
     }
 
     #[tokio::test]
