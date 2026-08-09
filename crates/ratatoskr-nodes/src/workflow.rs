@@ -531,61 +531,19 @@ async fn referee_judgement(
     analyst: &AnalystOutput,
     implementer: &ImplementerOutput,
 ) -> Vec<referee::Violation> {
-    let Some(route) = crate::referee_route(&ctx.engine, &ctx.config) else {
-        tracing::info!("no referee or verifier route configured; trusting test results alone");
-        return Vec::new();
-    };
-    let candidates =
-        converge::referee_candidates(&implementer.rewritten_files, ctx.engine.may_modify_tests());
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-
-    // Retain the referee ruleset's prompt, policy and tool override while supplying the verifier
-    // route when it is the configured fallback.
-    let mut config = ctx.config.clone();
-    config.models.insert("referee".to_string(), route);
-    let plugins = ctx.plugin_context.for_node("referee");
-    let cfg = match node_agent_config(
+    let violations = match referee::judge(
         &ctx.engine,
-        &config,
-        ctx.plugin_context.pool_for("referee", ctx.rag_rat.clone()),
-        "referee",
-        referee::REFEREE_TOOLS,
-        &plugins,
-    ) {
-        Ok(cfg) => cfg,
-        Err(error) => {
-            tracing::warn!("the referee could not be configured; trusting test results: {error}");
-            return Vec::new();
-        }
-    };
-    let node = referee::RefereeNode {
-        route: cfg.route,
-        tools: cfg.tools,
-        policy: cfg.policy,
-        max_turns: cfg.max_turns,
-        system_prompt: cfg.system_prompt,
-        plugins,
-        ledger: Some(Arc::clone(&ctx.ledger)),
-        files: Some(worktree.as_path().to_path_buf()),
-    };
-    let diff = ratatoskr_exec::full_diff_text(worktree)
-        .await
-        .unwrap_or_default();
-    let input = referee::RefereeInput {
-        issue: ctx.issue.clone(),
-        requirements: analyst.requirements.clone(),
-        hunks: referee::hunks_for(&diff, &candidates),
-        candidates,
-    };
-    match node.run(input).await {
-        Ok(out) => {
-            if let Err(error) = note(ctx, "referee", &out, None).await {
-                tracing::warn!("failed to record referee judgement: {error}");
-            }
-            out.violations
-        }
+        &ctx.config,
+        &ctx.ledger,
+        &ctx.issue,
+        &analyst.requirements,
+        implementer,
+        worktree,
+    )
+    .await
+    {
+        Ok(Some(violations)) => violations,
+        Ok(None) => return Vec::new(),
         Err(error) => {
             tracing::warn!(
                 "the referee could not judge this change; trusting test results: {error}"
@@ -600,9 +558,22 @@ async fn referee_judgement(
             {
                 tracing::warn!("failed to record referee failure: {record_error}");
             }
-            Vec::new()
+            return Vec::new();
         }
+    };
+    if let Err(error) = note(
+        ctx,
+        "referee",
+        &referee::RefereeOutput {
+            violations: violations.clone(),
+        },
+        None,
+    )
+    .await
+    {
+        tracing::warn!("failed to record referee judgement: {error}");
     }
+    violations
 }
 
 async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String, String> {

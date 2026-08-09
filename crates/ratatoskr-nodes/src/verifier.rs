@@ -15,6 +15,7 @@ use ratatoskr_core::ModelRoute;
 use ratatoskr_graph::{NodeError, parse_validated};
 use ratatoskr_mcp::ToolSet;
 use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::analyst::AnalystOutput;
@@ -146,41 +147,52 @@ impl VerifierNode {
             });
         }
 
-        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-            node: "verifier",
-            route: &self.route,
-            preamble: &crate::effective_preamble(
-                "verifier",
-                PREAMBLE,
-                self.system_prompt.as_deref(),
-                self.plugins.context.as_deref(),
-                &self.plugins.skills,
-            ),
-            question: &render_prompt(&input),
-            tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(VerifierOutput),
-            policy: self.policy.clone(),
-            max_turns: self.max_turns,
-            // The verifier judges; it does not negotiate. Asking the analyst what it meant would
-            // let the node being reviewed-for shape the review.
-            clarifier: None,
-            observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills, "verifier"),
-            files: self.files.clone(),
-            // Reads the diff; runs nothing — the acceptance run already happened.
-            shell: None,
-            push: None,
-            conversation: None,
-            ledger: self.ledger.clone(),
-            produces: Some(
-                "findings on the diff — each with a severity, a plan/execution kind, and a concrete failure scenario — or none",
-            ),
-        })
+        run_judgement(
+            ratatoskr_agent::NodeRun {
+                node: "verifier",
+                route: &self.route,
+                preamble: &crate::effective_preamble(
+                    "verifier",
+                    PREAMBLE,
+                    self.system_prompt.as_deref(),
+                    self.plugins.context.as_deref(),
+                    &self.plugins.skills,
+                ),
+                question: &render_prompt(&input),
+                tools: self.tools.clone(),
+                output_schema: schemars::schema_for!(VerifierOutput),
+                policy: self.policy.clone(),
+                max_turns: self.max_turns,
+                // The verifier judges; it does not negotiate. Asking the analyst what it meant would
+                // let the node being reviewed-for shape the review.
+                clarifier: None,
+                observer: self.plugins.observer.clone(),
+                skills: crate::skills::loaded(&self.plugins.skills, "verifier"),
+                files: self.files.clone(),
+                // Reads the diff; runs nothing — the acceptance run already happened.
+                shell: None,
+                push: None,
+                conversation: None,
+                ledger: self.ledger.clone(),
+                produces: Some(
+                    "findings on the diff — each with a severity, a plan/execution kind, and a concrete failure scenario — or none",
+                ),
+            },
+            "verifier",
+        )
         .await
-        .map_err(|e| NodeError::Failed(format!("verifier agent failed: {e}")))?;
-
-        parse_validated::<VerifierOutput>(&raw)
     }
+}
+
+/// Run and schema-validate a judgement node.
+pub(crate) async fn run_judgement<T: DeserializeOwned + JsonSchema>(
+    run: ratatoskr_agent::NodeRun<'_>,
+    name: &str,
+) -> Result<T, NodeError> {
+    let raw = ratatoskr_agent::run_structured(run)
+        .await
+        .map_err(|e| NodeError::Failed(format!("{name} agent failed: {e}")))?;
+    parse_validated::<T>(&raw)
 }
 
 fn render_prompt(input: &VerifierInput) -> String {

@@ -1,8 +1,13 @@
 use std::fmt::Write as _;
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use ratatoskr_core::ModelRoute;
-use ratatoskr_graph::{NodeError, parse_validated};
+use ratatoskr_agent::RunLedger;
+use ratatoskr_core::{ModelRoute, RatatoskrConfig};
+use ratatoskr_exec::WorktreePath;
+use ratatoskr_graph::NodeError;
 use ratatoskr_mcp::ToolSet;
+use ratatoskr_script::ScriptEngine;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -103,17 +108,41 @@ pub fn correction(violations: &[Violation]) -> String {
 
 /// A read-only model judgement over the hunks that removed or replaced existing lines.
 pub struct RefereeNode {
-    pub route: ModelRoute,
+    route: ModelRoute,
+    /// Observable so the fixed capability boundary can be asserted.
     pub tools: ToolSet,
-    pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
-    pub max_turns: Option<usize>,
-    pub system_prompt: Option<String>,
-    pub plugins: crate::NodePlugins,
-    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
-    pub files: Option<std::path::PathBuf>,
+    ledger: Option<Arc<RunLedger>>,
+    /// Set after the fork when the worktree becomes known.
+    pub files: Option<PathBuf>,
 }
 
 impl RefereeNode {
+    /// Construct the internal judge with its fixed, read-only capability boundary.
+    pub fn fixed(
+        route: ModelRoute,
+        ledger: Option<Arc<RunLedger>>,
+        files: Option<PathBuf>,
+    ) -> Self {
+        let mut tools = ToolSet::default();
+        tools
+            .local()
+            .tools
+            .extend(ratatoskr_agent::files::declarations());
+        tools.narrow(
+            &REFEREE_TOOLS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        Self {
+            route,
+            tools,
+            ledger,
+            files,
+        }
+    }
+
     pub async fn run(&self, input: RefereeInput) -> Result<RefereeOutput, NodeError> {
         if input.candidates.is_empty() {
             return Ok(RefereeOutput {
@@ -121,36 +150,77 @@ impl RefereeNode {
             });
         }
 
-        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-            node: "referee",
-            route: &self.route,
-            preamble: &crate::effective_preamble(
-                "referee",
-                PREAMBLE,
-                self.system_prompt.as_deref(),
-                self.plugins.context.as_deref(),
-                &self.plugins.skills,
-            ),
-            question: &render_prompt(&input),
-            tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(RefereeOutput),
-            policy: self.policy.clone(),
-            max_turns: self.max_turns,
-            clarifier: None,
-            observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills, "referee"),
-            files: self.files.clone(),
-            shell: None,
-            push: None,
-            conversation: None,
-            ledger: self.ledger.clone(),
-            produces: Some("files whose diff hunks weakened task-completion checks, each with a reason, or none"),
-        })
+        crate::verifier::run_judgement(
+            ratatoskr_agent::NodeRun {
+                node: "referee",
+                route: &self.route,
+                preamble: PREAMBLE,
+                question: &render_prompt(&input),
+                tools: self.tools.clone(),
+                output_schema: schemars::schema_for!(RefereeOutput),
+                policy: None,
+                max_turns: None,
+                clarifier: None,
+                observer: None,
+                skills: Vec::new(),
+                files: self.files.clone(),
+                shell: None,
+                push: None,
+                conversation: None,
+                ledger: self.ledger.clone(),
+                produces: Some("files whose diff hunks weakened task-completion checks, each with a reason, or none"),
+            },
+            "referee",
+        )
         .await
-        .map_err(|e| NodeError::Failed(format!("referee agent failed: {e}")))?;
-
-        parse_validated::<RefereeOutput>(&raw)
     }
+}
+
+/// Judge the current change before its acceptance result is trusted.
+///
+/// This is deliberately separate from the callers' checkpoint mechanics: both convergence paths
+/// use the same fixed route, candidates, diff extraction and model invocation, while retaining
+/// their own iteration metadata when they write the observable `referee` record. `Ok(None)` means
+/// no route was configured, so callers must not write a referee checkpoint.
+pub(crate) async fn judge(
+    engine: &Arc<ScriptEngine>,
+    config: &RatatoskrConfig,
+    ledger: &Arc<RunLedger>,
+    issue: &str,
+    requirements: &[String],
+    implementer: &crate::ImplementerOutput,
+    worktree: &WorktreePath,
+) -> Result<Option<Vec<Violation>>, crate::PlanError> {
+    let Some(route) = crate::referee_route(engine, config) else {
+        tracing::info!("no referee or verifier route configured; trusting test results alone");
+        return Ok(None);
+    };
+    let candidates = crate::converge::referee_candidates(
+        &implementer.rewritten_files,
+        engine.may_modify_tests(),
+    );
+    if candidates.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let diff = ratatoskr_exec::full_diff_text(worktree)
+        .await
+        .unwrap_or_default();
+    let input = RefereeInput {
+        issue: issue.to_string(),
+        requirements: requirements.to_vec(),
+        hunks: hunks_for(&diff, &candidates),
+        candidates,
+    };
+    let node = RefereeNode::fixed(
+        route,
+        Some(Arc::clone(ledger)),
+        Some(worktree.as_path().to_path_buf()),
+    );
+    node.run(input)
+        .await
+        .map(|out| Some(out.violations))
+        .map_err(|error| crate::PlanError::node("referee", error))
 }
 
 fn render_prompt(input: &RefereeInput) -> String {
@@ -176,7 +246,16 @@ fn render_prompt(input: &RefereeInput) -> String {
 mod tests {
     use super::*;
 
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use ratatoskr_agent::RunLedger;
+    use ratatoskr_core::RatatoskrConfig;
+    use ratatoskr_exec::WorktreePath;
     use ratatoskr_graph::parse_validated;
+    use ratatoskr_script::ScriptEngine;
+
+    use crate::implementer::ImplementerOutput;
 
     fn paths(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()
@@ -341,8 +420,8 @@ rename to src/new.rs
         // Field reading of the contract: `RefereeInput { issue, requirements, hunks, candidates }`
         // as String / Vec<String> / String / Vec<String>, and the node built with VerifierNode's
         // shape (all fields public, tools/ledger/files optional).
-        let node = RefereeNode {
-            route: ratatoskr_core::ModelRoute {
+        let node = RefereeNode::fixed(
+            ratatoskr_core::ModelRoute {
                 context_window: None,
                 provider: "no-such-provider".into(),
                 model: "no-such-model".into(),
@@ -351,14 +430,9 @@ rename to src/new.rs
                 params: None,
                 session: Default::default(),
             },
-            tools: ratatoskr_mcp::ToolSet::default(),
-            policy: None,
-            max_turns: None,
-            system_prompt: None,
-            plugins: crate::NodePlugins::default(),
-            ledger: None,
-            files: None,
-        };
+            None,
+            None,
+        );
         let out = node
             .run(RefereeInput {
                 issue: "the task".into(),
@@ -369,5 +443,260 @@ rename to src/new.rs
             .await
             .expect("an empty candidate set is a clean judgement, not an error");
         assert!(out.violations.is_empty());
+    }
+
+    // Contract reading (#209): the referee stops being a governable node and becomes an
+    // internal, fixed-capability judgement. Two symbols pin the change here:
+    //
+    //   RefereeNode::fixed(route: ModelRoute, ledger: Option<Arc<RunLedger>>, files: Option<PathBuf>) -> RefereeNode
+    //
+    // — the only construction path, building its ToolSet directly from REFEREE_TOOLS. The
+    // contract's sad case (a ruleset with tools.deny = ["Read", "Grep", "Glob"], a bound plugin
+    // offering Write/Bash) is enforced structurally: no engine, plugin pool, skill,
+    // system-prompt or policy parameter exists for that influence to arrive through, so the
+    // tests below assert the observable set and the absence of every influence socket rather
+    // than feeding a ruleset in.
+    //
+    // — the one entry point both convergence paths (the built-in loop and workflow.rs's
+    // iterate_host / finish_full) call. It returns `None` only when no route is configured, so
+    // callers skip the referee record; checkpointing itself stays with the callers so they can
+    // retain their own iteration metadata.
+
+    fn route(provider: &str, model: &str) -> ModelRoute {
+        ModelRoute {
+            context_window: None,
+            provider: provider.into(),
+            model: model.into(),
+            max_tokens: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        }
+    }
+
+    /// A ruleset directory containing exactly `source`, loaded minus the CLI's governable-name
+    /// gate: rejecting "referee" at startup is the gate's job (lib.rs's governance tests
+    /// compose its predicate); the engine itself still parses the file, which is what lets the
+    /// route tests below prove a referee ruleset is never consulted.
+    async fn rules_engine(case: &str, source: &str) -> Arc<ScriptEngine> {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-referee-fixed-{}-{case}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agents.ts"), source).unwrap();
+        ScriptEngine::load(&dir).await.unwrap()
+    }
+
+    fn implementer(rewritten: &[&str]) -> ImplementerOutput {
+        ImplementerOutput {
+            worktree_path: "/wt".into(),
+            branch: "ratatoskr/test".into(),
+            diff_summary: String::new(),
+            touched_files: Vec::new(),
+            rewritten_files: rewritten.iter().map(|s| s.to_string()).collect(),
+            failing_tests: Vec::new(),
+            passed_tests: 0,
+            exit_code: 0,
+            narrative: None,
+            commit_kind: String::new(),
+            commit_scope: String::new(),
+            commit_subject: String::new(),
+        }
+    }
+
+    /// A worktree path that is a plain temp directory, not a git checkout: diff extraction from
+    /// it fails and yields the empty diff the callers already treat as "nothing to judge".
+    fn worktree(case: &str) -> WorktreePath {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-referee-wt-{}-{case}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        WorktreePath(dir)
+    }
+
+    #[test]
+    fn fixed_construction_hands_the_judge_exactly_the_read_tools() {
+        let node = RefereeNode::fixed(route("anthropic", "claude-sonnet-4-6"), None, None);
+        // Exactly these three: enough to confirm a relocated check still exists, nothing that
+        // can change the worktree or run a command.
+        assert_eq!(node.tools.names(), REFEREE_TOOLS);
+        assert_eq!(
+            node.tools.names(),
+            ["Read", "Grep", "Glob"],
+            "the fixed set is the read tools and only the read tools"
+        );
+    }
+
+    #[test]
+    fn fixed_construction_admits_no_ruleset_or_plugin_influence() {
+        // The contract's sad case is not expressible against this constructor, and that is the
+        // point: the enforcement is structural. `fixed` has no engine, pool, skill, prompt or
+        // policy parameter, so there is no socket a tools.deny ruleset or a Write/Bash-offering
+        // plugin could plug into. What is observable is the constructed node carrying none of
+        // those influences and the full read set regardless.
+        let node = RefereeNode::fixed(
+            route("openai", "gpt-5"),
+            Some(Arc::new(RunLedger::default())),
+            Some(PathBuf::from("/wt")),
+        );
+        let names = node.tools.names();
+        for &read in REFEREE_TOOLS {
+            assert!(
+                names.iter().any(|n| n.as_str() == read),
+                "the judge lost {read}: {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|n| n == "Write" || n == "Bash"),
+            "the judge gained a write capability: {names:?}"
+        );
+        // The inputs the constructor takes are kept: the route to judge on, the run's ledger, and
+        // the worktree the file tools are rooted at.
+        assert_eq!(node.route.provider, "openai");
+        assert_eq!(node.route.model, "gpt-5");
+        assert!(node.ledger.is_some());
+        assert_eq!(node.files.as_deref(), Some(Path::new("/wt")));
+    }
+
+    #[tokio::test]
+    async fn a_fixed_node_with_nothing_to_judge_spends_no_model_call() {
+        // The route points nowhere, so any attempted model call would have to error — an Ok
+        // here can only come from short-circuiting on the empty candidate set first.
+        let node = RefereeNode::fixed(route("no-such-provider", "no-such-model"), None, None);
+        let out = node
+            .run(RefereeInput {
+                issue: "the task".into(),
+                requirements: vec!["keep the characterisation tests intact".into()],
+                hunks: String::new(),
+                candidates: Vec::new(),
+            })
+            .await
+            .expect("an empty candidate set is a clean judgement, not an error");
+        assert!(out.violations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fixed_node_with_candidates_really_calls_the_model() {
+        // The complement of the short-circuit: with candidates to judge, the node does attempt
+        // the call, so an unreachable route surfaces as an error at this level (fail-open lives
+        // in `judge`, one level up). This is what makes the empty-candidate Ok above — and the
+        // skip cases below — meaningful rather than a swallowed failure.
+        let node = RefereeNode::fixed(route("no-such-provider", "no-such-model"), None, None);
+        let result = node
+            .run(RefereeInput {
+                issue: "the task".into(),
+                requirements: Vec::new(),
+                hunks: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old();\n".into(),
+                candidates: vec!["src/lib.rs".to_string()],
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "candidates to judge and no reachable model must surface an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_configured_route_skips_the_judgement_without_an_error() {
+        // Neither [models.referee] nor any verifier route anywhere: the acceptance result is
+        // trusted, the log says why, and the skipped judgement is not a run failure — even with
+        // rewritten files that would otherwise be judged.
+        let engine = rules_engine("judge-no-route", "").await;
+        let config = RatatoskrConfig::default();
+        let ledger = Arc::new(RunLedger::default());
+        let violations = judge(
+            &engine,
+            &config,
+            &ledger,
+            "the issue",
+            &["keep the tests intact".to_string()],
+            &implementer(&["crates/foo/src/lib.rs"]),
+            &worktree("judge-no-route"),
+        )
+        .await
+        .expect("no route is a skipped judgement, not an error");
+        assert!(
+            violations.is_none(),
+            "no route has no judgement to checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn exempt_rewrites_and_empty_candidate_sets_skip_the_judgement() {
+        // A route IS configured but points nowhere: were the judgement to run, the model call
+        // would fail (see `a_fixed_node_with_candidates_really_calls_the_model`). The empty
+        // results here are therefore meaningful only as skips — candidates must be computed and
+        // found empty, with the mayModifyTests exemption applied, before any diff extraction or
+        // model call is paid for.
+        let engine = rules_engine(
+            "judge-exempt",
+            r#"defineDefaults({ mayModifyTests: ["crates/foo/tests"] });"#,
+        )
+        .await;
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "referee".to_string(),
+            route("no-such-provider", "no-such-model"),
+        );
+        let ledger = Arc::new(RunLedger::default());
+
+        // Every rewrite sits under the declared exemption: no candidates, no judgement.
+        let violations = judge(
+            &engine,
+            &config,
+            &ledger,
+            "the issue",
+            &[],
+            &implementer(&["crates/foo/tests/api.rs"]),
+            &worktree("judge-exempt"),
+        )
+        .await
+        .expect("nothing to judge is not an error");
+        assert!(matches!(violations, Some(ref violations) if violations.is_empty()));
+
+        // And the trivial spelling: the implementer rewrote nothing at all.
+        let violations = judge(
+            &engine,
+            &config,
+            &ledger,
+            "the issue",
+            &[],
+            &implementer(&[]),
+            &worktree("judge-exempt"),
+        )
+        .await
+        .expect("nothing rewritten is nothing to judge");
+        assert!(matches!(violations, Some(ref violations) if violations.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn a_failing_judgement_surfaces_an_error_for_checkpointing() {
+        // Candidates to judge, a route that resolves, and a model that cannot answer: `judge`
+        // returns the error so each convergence path can checkpoint it under "referee" before
+        // trusting the acceptance result.
+        let engine = rules_engine("judge-fails-open", "").await;
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "referee".to_string(),
+            route("no-such-provider", "no-such-model"),
+        );
+        let ledger = Arc::new(RunLedger::default());
+        let result = judge(
+            &engine,
+            &config,
+            &ledger,
+            "the issue",
+            &[],
+            &implementer(&["crates/foo/src/lib.rs"]),
+            &worktree("judge-fails-open"),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a failed judgement must reach the caller for failure checkpointing"
+        );
     }
 }
