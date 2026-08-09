@@ -40,20 +40,21 @@ defineWorkflow({
   purpose: "Plan and implement a repository change with an explicit requirements digest.",
   whenToUse: ["the task requests a code change"],
   stages: [
-    {
-      id: "requirements",
+    stage("requirements", {
       agent: "requirements",
       inputContract: "{ issue: string }",
       outputContract: "RequirementsDigest",
-      outputSchema: {
-        type: "object",
-        properties: {
-          summary: { type: "string" },
-          risks: { type: "array", items: { type: "string" } },
+      outputSchema: obj(
+        {
+          summary: str(),
+          risks: arr(str()),
         },
-        required: ["summary", "risks"],
-        additionalProperties: false,
-      },
+        ["summary", "risks"],
+        { additionalProperties: false },
+      ),
+      // A longer prompt can live beside the workflow and be compiled in with
+      // `LOAD("requirements.md").trim()`. LOAD accepts one literal relative path, never runs at
+      // runtime, and cannot leave the workflow directory.
       instructions:
         "Extract the requirements and delivery risks that must shape the implementation plan. " +
         "Do not propose code. Return only the declared JSON object.",
@@ -63,7 +64,8 @@ defineWorkflow({
         return `ISSUE TO DISTIL:\n${input.issue}`;
       },
       capabilities: ["read"],
-    },
+      appendRepositoryGuidance: true,
+    }),
   ],
 });
 

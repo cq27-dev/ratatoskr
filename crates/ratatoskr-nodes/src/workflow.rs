@@ -45,6 +45,16 @@ use crate::{
 const INVOCATION_CEILING: usize = 500;
 
 const STANDARD_WORKFLOW_V1: &str = include_str!("../workflows/standard-v1.ts");
+const STANDARD_WORKFLOW_INCLUDES: &[(&str, &str)] = &[
+    (
+        "prompts/overseer.md",
+        include_str!("../prompts/overseer.md"),
+    ),
+    (
+        "prompts/redteam-classifier.md",
+        include_str!("../prompts/redteam-classifier.md"),
+    ),
+];
 
 /// Everything the bindings need, cloned as an `Arc` into every host closure. Holds the run's shared
 /// mutable state (the worktree handle and the invocation/iteration counters) behind atomics/a mutex.
@@ -1386,9 +1396,13 @@ fn stage_question_renderers(stages: &[Stage]) -> HashMap<String, String> {
 }
 
 pub(crate) async fn standard_stages() -> Result<Vec<Stage>, PlanError> {
-    let meta = WorkflowRuntime::bundled_meta("ratatoskr-standard-v1", STANDARD_WORKFLOW_V1)
-        .await
-        .map_err(|error| PlanError::node("workflow", NodeError::Failed(error.to_string())))?;
+    let meta = WorkflowRuntime::bundled_meta_with_includes(
+        "ratatoskr-standard-v1",
+        STANDARD_WORKFLOW_V1,
+        STANDARD_WORKFLOW_INCLUDES,
+    )
+    .await
+    .map_err(|error| PlanError::node("workflow", NodeError::Failed(error.to_string())))?;
     let stages = crate::stage::stages_from_workflow(&meta);
     crate::validate::validate_declared_contracts(&stages)?;
     Ok(stages)

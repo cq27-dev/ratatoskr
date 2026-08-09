@@ -498,20 +498,28 @@ fn graph_fingerprint(repo: &std::path::Path) -> String {
     let mut sources = scripts_in(repo.join(".ratatoskr/rules"));
     // Every workflow, not just the one this run used: which workflows exist is part of what the
     // graph *is* now, and two runs cannot be compared across a registry that changed under them.
-    sources.extend(scripts_in(repo.join(WORKFLOW_DIR)));
+    let mut workflows = scripts_in(repo.join(WORKFLOW_DIR));
+    workflows.push(repo.join(LEGACY_WORKFLOW));
+    for workflow in &workflows {
+        if let Ok(dependencies) = ratatoskr_script::workflow::dependencies(workflow) {
+            sources.extend(dependencies);
+        }
+    }
+    sources.extend(workflows);
     // Sorted, because `read_dir` order is the filesystem's business and a fingerprint that depends
     // on it would differ between two checkouts of identical files.
     sources.sort();
-    sources.insert(0, repo.join(LEGACY_WORKFLOW));
+    sources.dedup();
 
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for path in sources {
         // A missing file still contributes its name, so adding a `workflow.ts` changes the
         // fingerprint even if it is empty.
         for byte in path
-            .file_name()
-            .map(|n| n.as_encoded_bytes().to_vec())
-            .unwrap_or_default()
+            .strip_prefix(repo)
+            .unwrap_or(&path)
+            .as_os_str()
+            .as_encoded_bytes()
             .iter()
             .chain(std::fs::read(&path).unwrap_or_default().iter())
         {
@@ -3468,6 +3476,21 @@ mod agent_config_tests {
         let with_rules = graph_fingerprint(&root);
         std::fs::write(root.join(".ratatoskr/workflow.ts"), "x").unwrap();
         assert_ne!(with_rules, graph_fingerprint(&root));
+
+        // A prompt compiled into a workflow is part of that graph too. Otherwise two runs with
+        // different model instructions would claim the same provenance merely because the small
+        // TypeScript wrapper was unchanged.
+        let workflows = root.join(WORKFLOW_DIR);
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(workflows.join("prompt.md"), "first prompt").unwrap();
+        std::fs::write(
+            workflows.join("review.ts"),
+            "defineWorkflow({ name: 'review', stages: [stage('reviewer', { agent: 'reason', instructions: LOAD('prompt.md') })] });",
+        )
+        .unwrap();
+        let with_loaded_prompt = graph_fingerprint(&root);
+        std::fs::write(workflows.join("prompt.md"), "second prompt").unwrap();
+        assert_ne!(with_loaded_prompt, graph_fingerprint(&root));
 
         let _ = std::fs::remove_dir_all(&root);
     }

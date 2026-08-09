@@ -21,7 +21,7 @@ use rquickjs::promise::{Promise, Promised};
 use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Function};
 
 use crate::ScriptError;
-use crate::transpile::transpile_ts;
+use crate::transpile::{self, transpile_ts};
 
 /// A host function's result: `Ok(json)` — a JSON-encoded return value — or `Err(message)`, which the
 /// script sees as a thrown `Error`.
@@ -32,9 +32,49 @@ pub type HostResult = Result<String, String>;
 pub type HostFn =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = HostResult> + Send>> + Send + Sync>;
 
+/// Canonical files compiled into a repository workflow through literal `LOAD` calls.
+pub fn dependencies(path: &Path) -> Result<Vec<std::path::PathBuf>, ScriptError> {
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let src = std::fs::read_to_string(path)
+        .map_err(|error| ScriptError::Io(path.display().to_string(), error))?;
+    Ok(transpile::transpile_workflow(path, &src)?.dependencies)
+}
+
 /// JS prelude: wrap each raw host (`__name`, taking/returning JSON strings) as an ergonomic
 /// `name(x)` that passes real JS values, and provide the entry invoker.
 const BOOTSTRAP: &str = r#"
+globalThis.str = Object.freeze(function (overrides) {
+    return Object.assign({ type: "string" }, overrides || {});
+});
+globalThis.num = Object.freeze(function (overrides) {
+    return Object.assign({ type: "number" }, overrides || {});
+});
+globalThis.bool = Object.freeze(function (overrides) {
+    return Object.assign({ type: "boolean" }, overrides || {});
+});
+globalThis.arr = Object.freeze(function (items, overrides) {
+    return Object.assign({ type: "array", items: items }, overrides || {});
+});
+globalThis.obj = Object.freeze(function (properties, required, overrides) {
+    var schema = {
+        type: "object",
+        properties: properties || {}
+    };
+    if (required && required.length > 0) schema.required = required;
+    return Object.assign(schema, overrides || {});
+});
+globalThis.schemaWithDefs = Object.freeze(function (root, definitions) {
+    return Object.assign({}, root, { "$defs": definitions || {} });
+});
+globalThis.stage = Object.freeze(function (id, overrides) {
+    return Object.assign({
+        capabilities: [],
+        session: "fresh",
+        appendRepositoryGuidance: false
+    }, overrides || {}, { id: id });
+});
 globalThis.__wrap = function (name) {
     return async function (x) {
         var input = x === undefined ? null : x;
@@ -229,8 +269,9 @@ pub struct WorkflowDelegation {
 pub struct WorkflowRuntime {
     _runtime: AsyncRuntime,
     context: AsyncContext,
-    source: String,
-    meta: WorkflowMeta,
+    source: Box<str>,
+    meta: Box<WorkflowMeta>,
+    dependencies: Box<[std::path::PathBuf]>,
 }
 
 impl WorkflowRuntime {
@@ -239,6 +280,25 @@ impl WorkflowRuntime {
     /// repository declaration, while the repository script remains the thing that sequences it.
     pub async fn bundled_meta(name: &str, src: &str) -> Result<WorkflowMeta, ScriptError> {
         let source = transpile_ts(src)?;
+        let runtime = AsyncRuntime::new().map_err(|e| ScriptError::Eval(e.to_string()))?;
+        let context = AsyncContext::full(&runtime)
+            .await
+            .map_err(|e| ScriptError::Eval(e.to_string()))?;
+        Self::declared(&context, &source).await?.ok_or_else(|| {
+            ScriptError::Eval(format!("bundled workflow `{name}` has no declaration"))
+        })
+    }
+
+    /// Parse a bundled declaration whose `LOAD` targets were embedded by the owning crate.
+    ///
+    /// An installed binary cannot assume its source checkout exists. The explicit map keeps
+    /// bundled prompts compile-time assets while repository workflows remain directory-confined.
+    pub async fn bundled_meta_with_includes(
+        name: &str,
+        src: &str,
+        includes: &[(&str, &str)],
+    ) -> Result<WorkflowMeta, ScriptError> {
+        let source = transpile::transpile_bundled_workflow(name, src, includes)?;
         let runtime = AsyncRuntime::new().map_err(|e| ScriptError::Eval(e.to_string()))?;
         let context = AsyncContext::full(&runtime)
             .await
@@ -257,7 +317,7 @@ impl WorkflowRuntime {
         }
         let src = std::fs::read_to_string(path)
             .map_err(|e| ScriptError::Io(path.display().to_string(), e))?;
-        let source = transpile_ts(&src)?;
+        let loaded = transpile::transpile_workflow(path, &src)?;
 
         let runtime = AsyncRuntime::new().map_err(|e| ScriptError::Eval(e.to_string()))?;
         let context = AsyncContext::full(&runtime)
@@ -267,7 +327,7 @@ impl WorkflowRuntime {
         // Evaluated once here to read what the script declares about itself. `run` evaluates it
         // again in the same context, which re-runs `defineWorkflow` — an idempotent assignment, and
         // the price of keeping the two paths independent.
-        let declared = Self::declared(&context, &source).await?;
+        let declared = Self::declared(&context, &loaded.javascript).await?;
         let meta = declared.unwrap_or_else(|| WorkflowMeta {
             // A script that declares nothing is still usable and is named after its file. This is
             // what keeps a repo's existing `workflow.ts` working with no edit.
@@ -284,14 +344,20 @@ impl WorkflowRuntime {
         Ok(Some(WorkflowRuntime {
             _runtime: runtime,
             context,
-            source,
-            meta,
+            source: loaded.javascript.into_boxed_str(),
+            meta: Box::new(meta),
+            dependencies: loaded.dependencies.into_boxed_slice(),
         }))
     }
 
     /// What this workflow says about itself.
     pub fn meta(&self) -> &WorkflowMeta {
         &self.meta
+    }
+
+    /// Canonical files whose text was compiled into this workflow through `LOAD`.
+    pub fn dependencies(&self) -> &[std::path::PathBuf] {
+        &self.dependencies
     }
 
     /// Read the script's `defineWorkflow` call, if it makes one.
@@ -746,6 +812,153 @@ mod tests {
         );
         assert!(!called.load(std::sync::atomic::Ordering::Relaxed));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workflow_helpers_build_schemas_without_granting_capabilities() {
+        let dir = scratch("workflow-helpers");
+        std::fs::write(dir.join("prompt.md"), "Review the declared result.\n").unwrap();
+        let runtime = load(
+            &dir,
+            r#"defineWorkflow({
+                 name: "review",
+                 stages: [stage("reviewer", {
+                   agent: "reason",
+                   outputContract: "Review",
+                   outputSchema: schemaWithDefs(
+                     obj({
+                       finding: str(),
+                       confidence: num({ minimum: 0, maximum: 1 }),
+                       blocking: bool(),
+                       evidence: arr(str()),
+                     }, ["finding", "confidence", "blocking", "evidence"]),
+                     { Note: obj({ text: str() }, ["text"]) },
+                   ),
+                   instructions: LOAD("prompt.md").trim(),
+                 })],
+               });
+               async function plan(input) { return input; }"#,
+        )
+        .await;
+
+        let stage = &runtime.meta().stages[0];
+        assert_eq!(stage.id, "reviewer");
+        assert!(stage.capabilities.is_empty());
+        assert_eq!(stage.session, Some(SessionScope::Fresh));
+        assert!(!stage.append_repository_guidance);
+        assert_eq!(stage.instructions, "Review the declared result.");
+        let schema = stage.output_schema.as_ref().unwrap();
+        assert_eq!(schema["properties"]["finding"]["type"], "string");
+        assert_eq!(schema["properties"]["confidence"]["type"], "number");
+        assert_eq!(schema["properties"]["blocking"]["type"], "boolean");
+        assert_eq!(schema["properties"]["evidence"]["type"], "array");
+        assert_eq!(schema["$defs"]["Note"]["required"][0], "text");
+        assert_eq!(
+            runtime.dependencies(),
+            [dir.join("prompt.md").canonicalize().unwrap()]
+        );
+
+        // The source is rewritten before runtime evaluation. Deleting the include afterwards does
+        // not create a hidden runtime filesystem capability or a global LOAD function.
+        std::fs::remove_file(dir.join("prompt.md")).unwrap();
+        let output = runtime
+            .run(
+                "plan",
+                serde_json::json!({ "ok": true }).to_string(),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap()["ok"],
+            true
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn load_requires_one_literal_and_reports_its_call_site() {
+        let dir = scratch("load-literal");
+        let path = dir.join("workflow.ts");
+        std::fs::write(
+            &path,
+            "const prompt = 'prompt.md';\ndefineWorkflow({ name: 'bad', stages: [stage('bad', { agent: 'reason', instructions: LOAD(prompt) })] });",
+        )
+        .unwrap();
+        let error = match WorkflowRuntime::load(&path).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a dynamic LOAD target must be rejected"),
+        };
+        assert!(error.contains("workflow.ts:2:"), "{error}");
+        assert!(error.contains("LOAD target `<non-literal>`"), "{error}");
+        assert!(error.contains("exactly one string literal"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn load_refuses_directory_escape_and_names_the_target() {
+        let root = scratch("load-escape");
+        let workflows = root.join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(root.join("secret.md"), "outside").unwrap();
+        let path = workflows.join("workflow.ts");
+        std::fs::write(
+            &path,
+            "defineWorkflow({ name: 'bad', stages: [stage('bad', { agent: 'reason', instructions: LOAD('../secret.md') })] });",
+        )
+        .unwrap();
+        let error = match WorkflowRuntime::load(&path).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a LOAD target outside the workflow directory must be rejected"),
+        };
+        assert!(error.contains("workflow.ts:1:"), "{error}");
+        assert!(error.contains("../secret.md"), "{error}");
+        assert!(error.contains("outside workflow directory"), "{error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_refuses_a_symlink_that_escapes_the_workflow_directory() {
+        let root = scratch("load-symlink-escape");
+        let workflows = root.join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let outside = root.join("outside.md");
+        std::fs::write(&outside, "outside").unwrap();
+        std::os::unix::fs::symlink(&outside, workflows.join("prompt.md")).unwrap();
+        let path = workflows.join("workflow.ts");
+        std::fs::write(
+            &path,
+            "defineWorkflow({ name: 'bad', stages: [stage('bad', { agent: 'reason', instructions: LOAD('prompt.md') })] });",
+        )
+        .unwrap();
+        let error = match WorkflowRuntime::load(&path).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a symlink outside the workflow directory must be rejected"),
+        };
+        assert!(error.contains("prompt.md"), "{error}");
+        assert!(error.contains("outside workflow directory"), "{error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn load_refuses_includes_larger_than_sixteen_kibibytes() {
+        let dir = scratch("load-size");
+        std::fs::write(dir.join("prompt.md"), vec![b'x'; 16 * 1024 + 1]).unwrap();
+        let path = dir.join("workflow.ts");
+        std::fs::write(
+            &path,
+            "defineWorkflow({ name: 'bad', stages: [stage('bad', { agent: 'reason', instructions: LOAD('prompt.md') })] });",
+        )
+        .unwrap();
+        let error = match WorkflowRuntime::load(&path).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("an oversized LOAD target must be rejected"),
+        };
+        assert!(error.contains("prompt.md"), "{error}");
+        assert!(error.contains("16385 bytes"), "{error}");
+        assert!(error.contains("16384 bytes"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
