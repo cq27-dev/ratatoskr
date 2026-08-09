@@ -680,7 +680,6 @@ pub async fn validate_configured_stages(config: &RatatoskrConfig) -> Result<(), 
     for workflow in defined().await? {
         let workflow_stages = stage::stages_from_workflow(workflow.meta());
         validate::validate_declared_contracts(&workflow_stages)?;
-        validate::validate_sequence(&workflow_stages)?;
         stages.extend(workflow_stages);
     }
     validate::validate(&stages, &profiles)

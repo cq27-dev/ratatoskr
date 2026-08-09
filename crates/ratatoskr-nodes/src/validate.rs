@@ -134,24 +134,6 @@ pub fn validate_declared_contracts(stages: &[Stage]) -> Result<(), PlanError> {
     Ok(())
 }
 
-/// Adjacent workflow stages exchange their declared contracts. Empty contracts are unspecified,
-/// preserving existing workflows that only declare names.
-pub fn validate_sequence(stages: &[Stage]) -> Result<(), PlanError> {
-    for pair in stages.windows(2) {
-        let (source, target) = (&pair[0], &pair[1]);
-        if !source.output_contract.is_empty()
-            && !target.input_contract.is_empty()
-            && source.output_contract != target.input_contract
-        {
-            return Err(PlanError::Configuration(format!(
-                "stage `{}` outputs `{}`, incompatible with successor `{}` input `{}`",
-                source.id, source.output_contract, target.id, target.input_contract
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn machine_name(value: &str) -> bool {
     !value.is_empty()
         && value
@@ -179,35 +161,28 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_declared_successors_are_rejected() {
-        let mut stages = crate::built_in_stages();
-        stages.extend([
-            Stage {
-                id: "first".to_string(),
-                agent: "reason".to_string(),
-                input_contract: String::new(),
-                output_contract: "plan".to_string(),
-                output_schema: None,
-                instructions: String::new(),
-                context: String::new(),
-                capabilities: Vec::new(),
-                delegation: None,
-                append_repository_guidance: true,
-            },
-            Stage {
-                id: "second".to_string(),
-                agent: "reason".to_string(),
-                input_contract: "review".to_string(),
-                output_contract: String::new(),
-                output_schema: None,
-                instructions: String::new(),
-                context: String::new(),
-                capabilities: Vec::new(),
-                delegation: None,
-                append_repository_guidance: true,
-            },
-        ]);
-        assert!(validate_sequence(&stages[10..]).is_err());
+    fn declared_stages_are_a_registry_not_an_execution_sequence() {
+        let template = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        let mut plan = template.clone();
+        plan.id = "plan".to_string();
+        plan.input_contract = "Issue".to_string();
+        plan.output_contract = "Plan".to_string();
+        plan.output_schema = Some(serde_json::json!({ "type": "object" }));
+
+        let mut review = template;
+        review.id = "review".to_string();
+        review.input_contract = "ReviewInput".to_string();
+        review.output_contract = "Review".to_string();
+        review.output_schema = Some(serde_json::json!({ "type": "array" }));
+
+        let stages = [plan, review];
+        // The workflow script calls hosts explicitly, so metadata order cannot create a dataflow
+        // edge or make two independently useful stages incompatible.
+        assert!(validate_declared_contracts(&stages).is_ok());
+        assert!(validate(&stages, &crate::built_in_agents()).is_ok());
     }
 
     #[test]
