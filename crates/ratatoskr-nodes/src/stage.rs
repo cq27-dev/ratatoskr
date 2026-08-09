@@ -135,6 +135,14 @@ pub fn built_in_agents() -> Vec<AgentProfile> {
             max_turns: None,
         },
         AgentProfile {
+            id: "transcribe".into(),
+            model: None,
+            base_prompt: String::new(),
+            capabilities: Vec::new(),
+            tool_policy: None,
+            max_turns: None,
+        },
+        AgentProfile {
             id: "build".into(),
             model: None,
             base_prompt: String::new(),
@@ -229,7 +237,7 @@ pub fn built_in_stages() -> Vec<Stage> {
         ("verifier", "explore", "VerifierInput", "VerifierOutput"),
         (
             "characterizer",
-            "reason",
+            "transcribe",
             "CharacterizerInput",
             "CharacterizerOutput",
         ),

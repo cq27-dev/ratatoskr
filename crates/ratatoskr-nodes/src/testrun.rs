@@ -30,7 +30,7 @@ pub const GUEST_WORKSPACE: &str = "/workspace";
 const MAX_TOTAL_OUTPUT_CHARS: usize = 120_000;
 
 /// What one acceptance step did. Entirely deterministic; no model involved.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StepOutcome {
     pub name: String,
     pub command: Vec<String>,
@@ -204,7 +204,7 @@ const PREAMBLE: &str = include_str!("../prompts/characterizer.md");
 
 /// What the model extracted from an acceptance run.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct Characterization {
+pub(crate) struct CharacterizerOutput {
     #[serde(default)]
     failing: Vec<String>,
     /// How many checks passed — a count, never the names.
@@ -214,6 +214,12 @@ struct Characterization {
     /// to answer that is the single largest output in the pipeline, and it grows with the suite.
     #[serde(default)]
     passed: usize,
+}
+
+/// The deterministic acceptance evidence presented to one characterizer turn.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct CharacterizerInput {
+    pub outcomes: Vec<StepOutcome>,
 }
 
 /// Reads an acceptance run's raw output and names the checks inside it.
@@ -227,6 +233,9 @@ pub struct Characterizer {
     /// Where its cost is charged. It runs on every acceptance run — twice per converge iteration —
     /// so leaving it unreported understated a run by one of its most frequent calls.
     pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
+    /// Present on production paths. The legacy fields remain usable by direct callers, while the
+    /// canonical turn resolves the bundled declaration through the generic stage executor.
+    pub(crate) declared_context: Option<std::sync::Arc<crate::workflow::WorkflowContext>>,
 }
 
 impl Characterizer {
@@ -235,38 +244,61 @@ impl Characterizer {
     /// is still there, and it is the one converge actually needs.
     pub async fn read(&self, outcomes: &[StepOutcome]) -> TestResults {
         let floor = by_exit_code(outcomes);
-        let raw = match ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-            node: "characterizer",
-            route: &self.route,
-            preamble: PREAMBLE,
-            question: &render_prompt(outcomes),
-            tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(Characterization),
-            policy: None,
-            max_turns: self.max_turns,
-            // It transcribes output. It has nothing to ask and nothing to be told.
-            clarifier: None,
-            observer: None,
-            skills: Vec::new(),
-            files: None,
-            // Reads output it was handed, and touches neither the tree nor a shell.
-            shell: None,
-            push: None,
-            conversation: None,
-            ledger: self.ledger.clone(),
-            // One turn over output it was handed: there is no history to outgrow, so a compaction
-            // policy would only cost a summariser it never calls.
-            produces: None,
-        })
-        .await
-        {
+        let input = CharacterizerInput {
+            outcomes: outcomes.to_vec(),
+        };
+        let input_json = match serde_json::to_string(&input) {
+            Ok(input) => input,
+            Err(error) => {
+                tracing::warn!("serializing the acceptance run failed: {error}; using exit codes");
+                return floor;
+            }
+        };
+        let question = render_prompt(outcomes);
+        let turn = match &self.declared_context {
+            Some(ctx) => {
+                crate::workflow::evaluate_standard_stage(
+                    std::sync::Arc::clone(ctx),
+                    "characterizer",
+                    input_json,
+                    question,
+                )
+                .await
+            }
+            None => ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
+                node: "characterizer",
+                route: &self.route,
+                preamble: PREAMBLE,
+                question: &question,
+                tools: self.tools.clone(),
+                output_schema: schemars::schema_for!(CharacterizerOutput),
+                policy: None,
+                max_turns: self.max_turns,
+                // It transcribes output. It has nothing to ask and nothing to be told.
+                clarifier: None,
+                observer: None,
+                skills: Vec::new(),
+                files: None,
+                // Reads output it was handed, and touches neither the tree nor a shell.
+                shell: None,
+                push: None,
+                conversation: None,
+                ledger: self.ledger.clone(),
+                // One turn over output it was handed: there is no history to outgrow, so a
+                // compaction policy would only cost a summariser it never calls.
+                produces: None,
+            })
+            .await
+            .map_err(|error| error.to_string()),
+        };
+        let raw = match turn {
             Ok(raw) => raw,
             Err(e) => {
                 tracing::warn!("characterizing the acceptance run failed: {e}; using exit codes");
                 return floor;
             }
         };
-        let Ok(read) = ratatoskr_graph::parse_validated::<Characterization>(&raw) else {
+        let Ok(read) = ratatoskr_graph::parse_validated::<CharacterizerOutput>(&raw) else {
             tracing::warn!("the characterization did not validate; using exit codes");
             return floor;
         };
@@ -280,7 +312,7 @@ impl Characterizer {
 /// That is the direction that loses a real regression — converge would compare an empty failing set
 /// against the baseline and call it converged — so it falls back rather than trusting the names.
 /// The opposite direction needs no guard: extra named failures are at worst noise the loop fixes.
-fn reconcile(read: Characterization, floor: TestResults) -> TestResults {
+fn reconcile(read: CharacterizerOutput, floor: TestResults) -> TestResults {
     if floor.exit_code != 0 && read.failing.is_empty() {
         tracing::warn!(
             "a step failed but the characterization named no failing check; using exit codes"
@@ -307,7 +339,7 @@ fn reconcile(read: Characterization, floor: TestResults) -> TestResults {
 /// The budget is a single total across all steps, spent from the last step backwards so the tail
 /// each runner summarises with survives; a step cut short says so, and a step dropped whole is
 /// named so a truncated suite does not read as a whole one.
-fn render_prompt(outcomes: &[StepOutcome]) -> String {
+pub(crate) fn render_prompt(outcomes: &[StepOutcome]) -> String {
     let mut budget = MAX_TOTAL_OUTPUT_CHARS;
     // Reverse: the last step's output is the most likely to carry the summary, so it is served
     // first from the shared budget.
@@ -438,7 +470,7 @@ mod tests {
         let floor = by_exit_code(&[outcome("browser tests", 1, "1 failed")]);
         // The dangerous direction: converge would compare an empty failing set against the
         // baseline and call a broken change converged.
-        let blind = Characterization {
+        let blind = CharacterizerOutput {
             failing: Vec::new(),
             passed: 12,
         };
@@ -451,7 +483,7 @@ mod tests {
 
         // Named failures are taken as given — finer than the step, and the exit code still rules
         // whether the run passed.
-        let named = Characterization {
+        let named = CharacterizerOutput {
             failing: vec!["spec/login.spec.ts:12".into()],
             passed: 3,
         };
@@ -461,9 +493,25 @@ mod tests {
     }
 
     #[test]
+    fn exit_codes_and_the_deterministic_pass_floor_override_model_claims() {
+        let floor = by_exit_code(&[
+            outcome("build", 0, "built"),
+            outcome("tests", 101, "one failed"),
+        ]);
+        let read = CharacterizerOutput {
+            failing: vec!["suite::one_case".into()],
+            passed: 0,
+        };
+        let out = reconcile(read, floor);
+        assert_eq!(out.failing, ["suite::one_case"]);
+        assert_eq!(out.passed, 1, "the model cannot erase a passing step");
+        assert_eq!(out.exit_code, 101, "the model cannot rewrite the exit code");
+    }
+
+    #[test]
     fn a_clean_run_may_legitimately_name_no_failures() {
         let floor = by_exit_code(&[outcome("tests", 0, "ok")]);
-        let read = Characterization {
+        let read = CharacterizerOutput {
             failing: Vec::new(),
             passed: 41,
         };

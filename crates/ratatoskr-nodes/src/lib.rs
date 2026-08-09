@@ -680,7 +680,7 @@ pub async fn validate_configured_stages(config: &RatatoskrConfig) -> Result<(), 
     stages.retain(|stage| {
         !matches!(
             stage.id.as_str(),
-            "overseer" | "scout" | "analyst" | "verifier"
+            "overseer" | "scout" | "analyst" | "verifier" | "characterizer"
         )
     });
     stages.extend(workflow::standard_stages().await?);
@@ -1621,6 +1621,7 @@ pub(crate) fn build_characterizer(
     context: &PluginContext,
     offer: Option<ServerTools>,
     ledger: Option<Arc<RunLedger>>,
+    declared_context: Option<Arc<workflow::WorkflowContext>>,
 ) -> Result<Option<testrun::Characterizer>, PlanError> {
     if node_route(engine, config, "characterizer").is_none() {
         return Ok(None);
@@ -1649,6 +1650,7 @@ pub(crate) fn build_characterizer(
         tools: cfg.tools,
         max_turns: cfg.max_turns,
         ledger,
+        declared_context,
     }))
 }
 
@@ -2152,6 +2154,22 @@ pub(crate) fn build_converge_agents(
     } = run;
     let short: String = run_id.chars().take(8).collect();
     let conventions = repo_conventions(repo_path);
+    let characterizer_context = if node_route(engine, config, "characterizer").is_some() {
+        Some(workflow::WorkflowContext::new_with_ledger(
+            workflow::WorkflowContextParams {
+                client,
+                config,
+                store: run.store,
+                run_id,
+                issue,
+                engine,
+                plugin_context: context.clone(),
+                ledger: Arc::clone(ledger),
+            },
+        )?)
+    } else {
+        None
+    };
     let red_team = RedTeamNode {
         repo_path: repo_path.to_path_buf(),
         worktree_root: config.worktree.root.clone(),
@@ -2165,6 +2183,7 @@ pub(crate) fn build_converge_agents(
             context,
             client.map(|c| c.offer()),
             Some(Arc::clone(ledger)),
+            characterizer_context.as_ref().map(Arc::clone),
         )?,
         classifier: match classifier_enabled(engine, config) {
             true => {
@@ -2247,6 +2266,7 @@ pub(crate) fn build_converge_agents(
             context,
             client.map(|c| c.offer()),
             Some(Arc::clone(ledger)),
+            characterizer_context,
         )?,
     };
     Ok((red_team, implementer))

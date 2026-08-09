@@ -81,6 +81,17 @@ pub struct WorkflowContext {
     acceptance: Mutex<Option<Vec<ratatoskr_core::AcceptanceStep>>>,
 }
 
+pub(crate) struct WorkflowContextParams<'a> {
+    pub client: Option<&'a RagRatClient>,
+    pub config: &'a RatatoskrConfig,
+    pub store: &'a Store,
+    pub run_id: &'a str,
+    pub issue: &'a str,
+    pub engine: &'a Arc<ScriptEngine>,
+    pub plugin_context: crate::PluginContext,
+    pub ledger: Arc<ratatoskr_agent::RunLedger>,
+}
+
 impl WorkflowContext {
     pub fn new(
         client: Option<&RagRatClient>,
@@ -91,10 +102,35 @@ impl WorkflowContext {
         engine: &Arc<ScriptEngine>,
         plugin_context: crate::PluginContext,
     ) -> Result<Arc<Self>, PlanError> {
+        Self::new_with_ledger(WorkflowContextParams {
+            client,
+            config,
+            store,
+            run_id,
+            issue,
+            engine,
+            plugin_context,
+            ledger: Arc::new(ratatoskr_agent::RunLedger::default()),
+        })
+    }
+
+    pub(crate) fn new_with_ledger(
+        params: WorkflowContextParams<'_>,
+    ) -> Result<Arc<Self>, PlanError> {
+        let WorkflowContextParams {
+            client,
+            config,
+            store,
+            run_id,
+            issue,
+            engine,
+            plugin_context,
+            ledger,
+        } = params;
         let repo_path = std::env::current_dir()
             .map_err(|e| PlanError::node("workflow", NodeError::Failed(format!("cwd: {e}"))))?;
         Ok(Arc::new(Self {
-            ledger: Arc::new(ratatoskr_agent::RunLedger::default()),
+            ledger,
             acceptance: Mutex::new(None),
             plugin_context,
             config: config.clone(),
@@ -340,7 +376,7 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
 /// must execute the same steps — a red team that resolved its own would drift from the implementer
 /// the moment a plan proposed anything.
 fn build_red_team(
-    ctx: &WorkflowContext,
+    ctx: &Arc<WorkflowContext>,
     acceptance: Vec<ratatoskr_core::AcceptanceStep>,
 ) -> Result<RedTeamNode, PlanError> {
     let short: String = ctx.run_id.chars().take(8).collect();
@@ -381,6 +417,7 @@ fn build_red_team(
             &ctx.plugin_context,
             ctx.rag_rat.clone(),
             Some(Arc::clone(&ctx.ledger)),
+            Some(Arc::clone(ctx)),
         )?,
         repo_path: ctx.repo_path.clone(),
         worktree_root: ctx.config.worktree.root.clone(),
@@ -440,7 +477,7 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
 }
 
 fn build_implementer(
-    ctx: &WorkflowContext,
+    ctx: &Arc<WorkflowContext>,
     analyst: AnalystOutput,
 ) -> Result<ImplementerNode, PlanError> {
     let (cfg, plugins) = crate::build_implementer_agent(
@@ -460,6 +497,7 @@ fn build_implementer(
             &ctx.plugin_context,
             ctx.rag_rat.clone(),
             Some(Arc::clone(&ctx.ledger)),
+            Some(Arc::clone(ctx)),
         )
         .ok()
         .flatten(),
@@ -1293,13 +1331,30 @@ pub(crate) async fn evaluate_standard_stage(
     input_json: String,
     rendered_question: String,
 ) -> Result<String, String> {
+    evaluate_standard_stage_with_turn(
+        ctx,
+        stage_id,
+        input_json,
+        rendered_question,
+        Arc::new(LiveStageTurn),
+    )
+    .await
+}
+
+async fn evaluate_standard_stage_with_turn(
+    ctx: Arc<WorkflowContext>,
+    stage_id: &str,
+    input_json: String,
+    rendered_question: String,
+    turn: Arc<dyn StageTurn>,
+) -> Result<String, String> {
     let stages = Arc::new(standard_stages().await.map_err(|error| error.to_string())?);
     let stage = stages
         .iter()
         .find(|stage| stage.id == stage_id)
         .cloned()
         .ok_or_else(|| format!("standard stage `{stage_id}` is not registered"))?;
-    StageExecutor::new(ctx, stages, Arc::new(LiveStageTurn))
+    StageExecutor::new(ctx, stages, turn)
         .execute(StageInvocation {
             stage,
             input_json,
@@ -2392,6 +2447,308 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "invalid output must not be checkpointed"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn standard_characterizer_uses_generic_dispatch_and_preserves_its_input_and_prompt() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-characterizer-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"async function plan(input) { return await characterizer(input); }"#,
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::load(&workflow_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run(
+                "run-standard-characterizer",
+                None,
+                RunStatus::Running.as_str(),
+            )
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "characterizer".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Compacted,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-standard-characterizer",
+            "characterize checks",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = standard_stages().await.unwrap();
+        let stage = stages
+            .iter()
+            .find(|stage| stage.id == "characterizer")
+            .unwrap();
+        assert_eq!(stage.agent, "transcribe");
+        assert_eq!(stage.session, Some(ratatoskr_core::SessionScope::Fresh));
+        assert!(stage.tools.is_empty());
+
+        let input = crate::testrun::CharacterizerInput {
+            outcomes: vec![crate::testrun::StepOutcome {
+                name: "workspace tests".to_string(),
+                command: vec!["cargo".to_string(), "test".to_string()],
+                exit_code: 101,
+                output: "test suite::fails ... FAILED\n1 failed; 8 passed".to_string(),
+            }],
+        };
+        let expected_prompt = crate::testrun::render_prompt(&input.outcomes);
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({
+                "failing": ["suite::fails"],
+                "passed": 8
+            })
+            .to_string(),
+            ..Default::default()
+        });
+        let hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        runtime
+            .run_with_question_renderers(
+                "plan",
+                serde_json::to_string(&input).unwrap(),
+                hosts,
+                stage_question_renderers(&stages),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *turn.nodes.lock().expect("recording runner mutex poisoned"),
+            ["characterizer"]
+        );
+        assert_eq!(
+            *turn
+                .sessions
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            [ratatoskr_core::SessionScope::Fresh]
+        );
+        assert!(
+            turn.tools.lock().expect("recording runner mutex poisoned")[0].is_empty(),
+            "a transcription stage must receive no tools"
+        );
+        assert_eq!(
+            turn.questions
+                .lock()
+                .expect("recording runner mutex poisoned")[0],
+            format!(
+                "Input contract: CharacterizerInput\nOutput contract: CharacterizerOutput\n\n{expected_prompt}"
+            )
+        );
+
+        let checkpoints = store
+            .checkpoints_for_run("run-standard-characterizer")
+            .await
+            .unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].node_name, "characterizer");
+        let checkpoint_input: crate::testrun::CharacterizerInput =
+            serde_json::from_str(checkpoints[0].input_json.as_deref().unwrap()).unwrap();
+        assert_eq!(checkpoint_input.outcomes[0].exit_code, 101);
+        assert_eq!(checkpoint_input.outcomes[0].command, ["cargo", "test"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn standard_characterizer_contract_rejects_bad_counts_without_a_checkpoint() {
+        let stages = standard_stages().await.unwrap();
+        let stage = stages
+            .iter()
+            .find(|stage| stage.id == "characterizer")
+            .unwrap();
+        assert_eq!(
+            stage.instructions,
+            include_str!("../prompts/characterizer.md").trim()
+        );
+        let mut generated =
+            serde_json::to_value(schemars::schema_for!(crate::testrun::CharacterizerOutput))
+                .unwrap();
+        without_schema_annotations(&mut generated);
+        assert_eq!(stage.output_schema.as_ref().unwrap(), &generated);
+
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-characterizer-schema-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run(
+                "run-characterizer-schema",
+                None,
+                RunStatus::Running.as_str(),
+            )
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "characterizer".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-characterizer-schema",
+            "characterize",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({ "failing": [], "passed": "many" }).to_string(),
+            ..Default::default()
+        });
+        let mut hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        let envelope = json!({
+            "__ratatoskrRenderedQuestion": {
+                "input": {
+                    "outcomes": [{
+                        "name": "tests",
+                        "command": ["cargo", "test"],
+                        "exit_code": 0,
+                        "output": "8 passed"
+                    }]
+                },
+                "question": "rendered acceptance output"
+            }
+        })
+        .to_string();
+        let error = hosts.remove("characterizer").unwrap()(envelope)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("invalid `CharacterizerOutput` output"),
+            "{error}"
+        );
+        assert!(error.contains("passed"), "{error}");
+        assert!(
+            store
+                .checkpoints_for_run("run-characterizer-schema")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn embedded_characterizer_evidence_waits_for_rust_reconciliation_before_checkpointing() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-embedded-characterizer-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run(
+                "run-embedded-characterizer",
+                None,
+                RunStatus::Running.as_str(),
+            )
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "characterizer".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Compacted,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-embedded-characterizer",
+            "characterize",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let input = crate::testrun::CharacterizerInput {
+            outcomes: vec![crate::testrun::StepOutcome {
+                name: "tests".to_string(),
+                command: vec!["cargo".to_string(), "test".to_string()],
+                exit_code: 101,
+                output: "one failed".to_string(),
+            }],
+        };
+        let question = crate::testrun::render_prompt(&input.outcomes);
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({ "failing": ["suite::one"], "passed": 3 }).to_string(),
+            ..Default::default()
+        });
+        let output = evaluate_standard_stage_with_turn(
+            ctx,
+            "characterizer",
+            serde_json::to_string(&input).unwrap(),
+            question,
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            json!({ "failing": ["suite::one"], "passed": 3 })
+        );
+        assert_eq!(
+            *turn.nodes.lock().expect("recording runner mutex poisoned"),
+            ["characterizer"]
+        );
+        assert!(
+            store
+                .checkpoints_for_run("run-embedded-characterizer")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the composite node checkpoints only after Rust accepts and reconciles this evidence"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
