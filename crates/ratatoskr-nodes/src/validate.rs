@@ -5,6 +5,9 @@ use std::collections::BTreeSet;
 use crate::{AgentProfile, PlanError, Stage};
 
 const INTERNAL_GATES: &[&str] = &["referee"];
+// These names are kept for existing workflow.ts scripts. They are hosts, not stages: accepting
+// one as a declared stage would replace its declared binding with the legacy host below it.
+const LEGACY_HOST_ALIASES: &[&str] = &["memory", "analyze", "implement", "iterate", "verify"];
 
 /// Reject invalid stage references before a workflow can start a model call.
 pub fn validate(stages: &[Stage], profiles: &[AgentProfile]) -> Result<(), PlanError> {
@@ -36,6 +39,12 @@ pub fn validate(stages: &[Stage], profiles: &[AgentProfile]) -> Result<(), PlanE
                     .copied()
                     .collect::<Vec<_>>()
                     .join(", ")
+            )));
+        }
+        if LEGACY_HOST_ALIASES.contains(&stage.id.as_str()) {
+            return Err(PlanError::Configuration(format!(
+                "stage `{}` conflicts with a legacy workflow host alias; choose a different stage identifier",
+                stage.id
             )));
         }
         if !agents.contains(stage.agent.as_str()) {
@@ -199,5 +208,24 @@ mod tests {
             },
         ]);
         assert!(validate_sequence(&stages[10..]).is_err());
+    }
+
+    #[test]
+    fn declared_stages_cannot_shadow_legacy_workflow_hosts() {
+        let template = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        let profiles = crate::built_in_agents();
+
+        for alias in LEGACY_HOST_ALIASES {
+            let mut stage = template.clone();
+            stage.id = (*alias).to_string();
+            let error = validate(&[stage], &profiles).unwrap_err().to_string();
+            assert!(
+                error.contains("legacy workflow host alias"),
+                "{alias} must be reserved: {error}"
+            );
+        }
     }
 }
