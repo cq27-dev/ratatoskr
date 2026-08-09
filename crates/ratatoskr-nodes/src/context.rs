@@ -32,8 +32,6 @@ pub const CONTEXT_TOOLS: &[&str] = &[
     "memory_search",
 ];
 
-const PREAMBLE: &str = include_str!("../prompts/context.md");
-
 /// One thing this task has to respect, and where that came from.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Constraint {
@@ -100,14 +98,13 @@ pub struct ContextNode {
     pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
     pub max_turns: Option<usize>,
     pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
-    /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
+    /// Legacy ruleset prompt slot; the declared stage resolves the effective prompt.
     pub system_prompt: Option<String>,
     pub plugins: crate::NodePlugins,
     pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
     pub files: Option<std::path::PathBuf>,
-    /// Present on production paths. Direct construction remains a compatibility path for callers
-    /// that still need the native model runner.
-    pub(crate) declared_context: Option<std::sync::Arc<crate::workflow::WorkflowContext>>,
+    /// The generic stage executor context used for the model distillation turn.
+    pub(crate) declared_context: std::sync::Arc<crate::workflow::WorkflowContext>,
 }
 
 impl ContextNode {
@@ -124,48 +121,14 @@ impl ContextNode {
         let input_json = serde_json::to_string(&input)
             .map_err(|error| NodeError::Failed(format!("context input: {error}")))?;
         let question = render_prompt(issue, &memory, input.searchable);
-        let raw = match &self.declared_context {
-            Some(ctx) => crate::workflow::evaluate_standard_stage(
-                std::sync::Arc::clone(ctx),
-                "context_distillation",
-                input_json,
-                question,
-            )
-            .await
-            .map_err(|error| NodeError::Failed(format!("context agent failed: {error}")))?,
-            None => ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-                node: "context",
-                route: &self.route,
-                preamble: &crate::effective_preamble_with_profile(
-                    "context",
-                    PREAMBLE,
-                    self.plugins.profile_prompt.as_str(),
-                    self.system_prompt.as_deref(),
-                    self.plugins.context.as_deref(),
-                    &self.plugins.skills,
-                ),
-                question: &question,
-                tools: self.tools.clone(),
-                output_schema: schemars::schema_for!(Distillation),
-                policy: self.policy.clone(),
-                max_turns: self.max_turns,
-                clarifier: self.clarifier.clone(),
-                observer: self.plugins.observer.clone(),
-                skills: crate::skills::loaded(&self.plugins.skills, "context"),
-                files: self.files.clone(),
-                // Reads and edits, but runs nothing.
-                shell: None,
-                push: None,
-                conversation: None,
-                ledger: self.ledger.clone(),
-                produces: Some(
-                    "a brief on what bears on this task, the constraints it must respect with \
-                     their sources, and the prior art found",
-                ),
-            })
-            .await
-            .map_err(|error| NodeError::Failed(format!("context agent failed: {error}")))?,
-        };
+        let raw = crate::workflow::evaluate_standard_stage(
+            std::sync::Arc::clone(&self.declared_context),
+            "context_distillation",
+            input_json,
+            question,
+        )
+        .await
+        .map_err(|error| NodeError::Failed(format!("context agent failed: {error}")))?;
 
         let distilled = parse_validated::<Distillation>(&raw)?;
         Ok(attach_evidence(distilled, memory))

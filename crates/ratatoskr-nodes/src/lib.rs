@@ -278,7 +278,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         plugins: plugins_context,
         files: ctx_cfg.files,
         ledger: Some(Arc::clone(ledger)),
-        declared_context: Some(declared_context),
+        declared_context,
     };
     let context_out = context_node
         .run(issue)
@@ -1031,6 +1031,7 @@ pub(crate) fn repo_conventions(repo_root: &std::path::Path) -> Option<String> {
 /// Prefix a writing node's preamble with the repository conventions, recording how much of the
 /// composed preamble came from them. `None` conventions (no `AGENTS.md`) leaves `base` byte-for-byte
 /// unchanged — no header, no separator — so a repo with no conventions file runs exactly as before.
+#[cfg(test)]
 pub(crate) fn with_conventions(node: &str, conventions: Option<&str>, base: String) -> String {
     let Some(conventions) = conventions else {
         return base;
@@ -1042,6 +1043,32 @@ pub(crate) fn with_conventions(node: &str, conventions: Option<&str>, base: Stri
         "repository conventions injected into node preamble"
     );
     format!("{conventions}\n\n{base}")
+}
+
+#[cfg(test)]
+mod migrated_stage_path_tests {
+    #[test]
+    fn migrated_native_components_have_one_stage_executor_model_path() {
+        for (component, source) in [
+            ("context", include_str!("context.rs")),
+            ("implementer", include_str!("implementer.rs")),
+            ("redteam", include_str!("redteam.rs")),
+            ("characterizer", include_str!("testrun.rs")),
+        ] {
+            assert!(
+                source.contains("evaluate_standard_stage"),
+                "{component} must invoke the generic stage executor"
+            );
+            assert!(
+                !source.contains("NodeRun"),
+                "{component} must not retain a direct model-loop fallback"
+            );
+            assert!(
+                !source.contains("declared_context: Option"),
+                "{component} must require a declared workflow context"
+            );
+        }
+    }
 }
 
 /// Everything a full fork+converge run produced. The worktree is the reviewable deliverable and is
@@ -1692,7 +1719,7 @@ pub(crate) fn build_characterizer(
         tools: cfg.tools,
         max_turns: cfg.max_turns,
         ledger,
-        declared_context,
+        declared_context: declared_context.expect("characterizer route requires its stage context"),
     }))
 }
 
@@ -2267,7 +2294,11 @@ pub(crate) fn build_converge_agents(
                     plugins: plugins_redteam,
                     files: cfg.files,
                     ledger: Some(Arc::clone(ledger)),
-                    declared_context: redteam_context.as_ref().map(Arc::clone),
+                    declared_context: Arc::clone(
+                        redteam_context
+                            .as_ref()
+                            .expect("red-team route requires its stage context"),
+                    ),
                 })
             }
             false => None,
@@ -2296,7 +2327,8 @@ pub(crate) fn build_converge_agents(
                     conventions: conventions.clone(),
                     plugins,
                     ledger: Some(Arc::clone(ledger)),
-                    declared_context: redteam_context,
+                    declared_context: redteam_context
+                        .expect("red-team route requires its stage context"),
                 })
             }
             false => None,
@@ -2340,7 +2372,7 @@ pub(crate) fn build_converge_agents(
             Some(Arc::clone(ledger)),
             characterizer_context,
         )?,
-        declared_context: Some(implementer_context),
+        declared_context: implementer_context,
     };
     Ok((red_team, implementer))
 }

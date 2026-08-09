@@ -438,7 +438,7 @@ fn build_red_team(
                 clarifier: None,
                 system_prompt: cfg.system_prompt,
                 plugins,
-                declared_context: Some(Arc::clone(ctx)),
+                declared_context: Arc::clone(ctx),
             })
         }
         false => None,
@@ -553,7 +553,7 @@ fn build_implementer(
         run_id: ctx.run_id.clone(),
         issue: ctx.issue.clone(),
         analyst,
-        declared_context: Some(Arc::clone(ctx)),
+        declared_context: Arc::clone(ctx),
     })
 }
 

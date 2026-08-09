@@ -200,6 +200,7 @@ fn tail(s: &str, max: usize) -> String {
     format!("[earlier output omitted]\n{kept}")
 }
 
+#[cfg(test)]
 const PREAMBLE: &str = include_str!("../prompts/characterizer.md");
 
 /// What the model extracted from an acceptance run.
@@ -233,9 +234,8 @@ pub struct Characterizer {
     /// Where its cost is charged. It runs on every acceptance run — twice per converge iteration —
     /// so leaving it unreported understated a run by one of its most frequent calls.
     pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
-    /// Present on production paths. The legacy fields remain usable by direct callers, while the
-    /// canonical turn resolves the bundled declaration through the generic stage executor.
-    pub(crate) declared_context: Option<std::sync::Arc<crate::workflow::WorkflowContext>>,
+    /// The generic stage executor context used for characterization.
+    pub(crate) declared_context: std::sync::Arc<crate::workflow::WorkflowContext>,
 }
 
 impl Characterizer {
@@ -255,42 +255,13 @@ impl Characterizer {
             }
         };
         let question = render_prompt(outcomes);
-        let turn = match &self.declared_context {
-            Some(ctx) => {
-                crate::workflow::evaluate_standard_stage(
-                    std::sync::Arc::clone(ctx),
-                    "characterizer",
-                    input_json,
-                    question,
-                )
-                .await
-            }
-            None => ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-                node: "characterizer",
-                route: &self.route,
-                preamble: PREAMBLE,
-                question: &question,
-                tools: self.tools.clone(),
-                output_schema: schemars::schema_for!(CharacterizerOutput),
-                policy: None,
-                max_turns: self.max_turns,
-                // It transcribes output. It has nothing to ask and nothing to be told.
-                clarifier: None,
-                observer: None,
-                skills: Vec::new(),
-                files: None,
-                // Reads output it was handed, and touches neither the tree nor a shell.
-                shell: None,
-                push: None,
-                conversation: None,
-                ledger: self.ledger.clone(),
-                // One turn over output it was handed: there is no history to outgrow, so a
-                // compaction policy would only cost a summariser it never calls.
-                produces: None,
-            })
-            .await
-            .map_err(|error| error.to_string()),
-        };
+        let turn = crate::workflow::evaluate_standard_stage(
+            std::sync::Arc::clone(&self.declared_context),
+            "characterizer",
+            input_json,
+            question,
+        )
+        .await;
         let raw = match turn {
             Ok(raw) => raw,
             Err(e) => {

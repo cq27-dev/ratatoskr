@@ -187,10 +187,8 @@ pub struct ImplementerNode {
     pub acceptance: Vec<ratatoskr_core::AcceptanceStep>,
     /// Names the checks inside each step. `None` compares at step granularity instead.
     pub characterizer: Option<Characterizer>,
-    /// Present on production paths. Direct construction retains the native
-    /// [`ratatoskr_agent::NodeRun`] path as a compatibility path; both paths use Ratatoskr's own
-    /// model/tool loop.
-    pub(crate) declared_context: Option<Arc<crate::workflow::WorkflowContext>>,
+    /// The generic stage executor context used for every implementation attempt.
+    pub(crate) declared_context: Arc<crate::workflow::WorkflowContext>,
 }
 
 impl ImplementerNode {
@@ -259,64 +257,21 @@ impl ImplementerNode {
         let input_json = serde_json::to_string(&input)
             .map_err(|error| NodeError::Failed(format!("implementer input: {error}")))?;
         let prompt = render_attempt_prompt(&input);
-        // One conversation for this node across the run, so a converge iteration continues the
-        // attempt it is fixing instead of meeting the worktree for the first time again.
-        let conversation = format!("{}-implementer", self.run_id);
-        let raw = match &self.declared_context {
-            Some(ctx) => crate::workflow::evaluate_standard_stage_with_resources(
-                Arc::clone(ctx),
-                "implementer_attempt",
-                input_json,
-                prompt,
-                crate::workflow::StandardStageResources {
-                    resource_root: worktree.as_path().to_path_buf(),
-                    shell: Some(self.shell_access(worktree)),
-                    publish: None,
-                    clarifier: self.clarifier.clone(),
-                    guidance: Some(where_you_are(worktree)),
-                },
-            )
-            .await
-            .map_err(|error| NodeError::Failed(format!("implementer agent failed: {error}")))?,
-            None => ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-                node: "implementer",
-                route: &self.route,
-                preamble: &crate::with_conventions(
-                    "implementer",
-                    self.conventions.as_deref(),
-                    format!(
-                        "{}{}",
-                        crate::effective_preamble_with_profile(
-                            "implementer",
-                            NATIVE_PREAMBLE,
-                            self.plugins.profile_prompt.as_str(),
-                            self.system_prompt.as_deref(),
-                            self.plugins.context.as_deref(),
-                            &self.plugins.skills,
-                        ),
-                        where_you_are(worktree),
-                    ),
-                ),
-                question: &prompt,
-                tools: self.tools.clone(),
-                output_schema: schemars::schema_for!(Report),
-                policy: self.policy.clone(),
-                max_turns: self.max_turns,
-                clarifier: self.clarifier.clone(),
-                observer: self.plugins.observer.clone(),
-                skills: crate::skills::loaded(&self.plugins.skills, "implementer"),
-                // Rooted at the worktree, not the checkout: every path it reads or writes has to be
-                // the copy it owns, or one attempt edits the tree another node is reading.
-                files: Some(worktree.as_path().to_path_buf()),
+        let raw = crate::workflow::evaluate_standard_stage_with_resources(
+            Arc::clone(&self.declared_context),
+            "implementer_attempt",
+            input_json,
+            prompt,
+            crate::workflow::StandardStageResources {
+                resource_root: worktree.as_path().to_path_buf(),
                 shell: Some(self.shell_access(worktree)),
-                push: None,
-                conversation: Some(&conversation),
-                ledger: self.ledger.clone(),
-                produces: Some("a change that satisfies the plan and passes the acceptance checks"),
-            })
-            .await
-            .map_err(|error| NodeError::Failed(format!("implementer agent failed: {error}")))?,
-        };
+                publish: None,
+                clarifier: self.clarifier.clone(),
+                guidance: Some(where_you_are(worktree)),
+            },
+        )
+        .await
+        .map_err(|error| NodeError::Failed(format!("implementer agent failed: {error}")))?;
         let report = parse_validated::<Report>(&raw)?;
 
         let outcomes = run_acceptance(Acceptance {
@@ -554,7 +509,7 @@ mod tests {
             },
             acceptance: Vec::new(),
             characterizer: None,
-            declared_context: Some(context),
+            declared_context: context,
         };
         let branch = node.branch();
 
