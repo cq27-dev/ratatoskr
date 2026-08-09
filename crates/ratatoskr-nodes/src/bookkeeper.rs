@@ -250,6 +250,29 @@ impl BookkeeperInput {
     }
 }
 
+/// Return the deterministic no-turn outcome when there is nowhere to write or nothing to learn.
+///
+/// Both the direct compatibility node and the declared-stage production path call this before a
+/// model turn, so neither spends tokens composing a memory that Rust will discard.
+pub(crate) fn skipped_before_compose(
+    input: &BookkeeperInput,
+    has_memory_index: bool,
+) -> Option<BookkeeperOutput> {
+    if !has_memory_index {
+        tracing::info!("no memory index in this repository; recording no memory");
+        return Some(input.nothing_recorded("this repository keeps no memory index"));
+    }
+    if input.converged
+        && input.implementer.touched_files.is_empty()
+        && input.implementer.diff_summary.trim().is_empty()
+        && input.friction.is_empty()
+    {
+        tracing::info!("nothing was changed and nothing went wrong; recording no memory");
+        return Some(input.nothing_recorded("the run changed nothing and hit nothing"));
+    }
+    None
+}
+
 /// The bookkeeper node. Holds a cheap model route, a small tool subset (for the compose agent), and
 /// rag-rat's sink (to call `memory_create` itself, outside the agent).
 pub struct BookkeeperNode {
@@ -273,22 +296,8 @@ pub struct BookkeeperNode {
 
 impl BookkeeperNode {
     pub async fn run(&self, input: BookkeeperInput) -> Result<BookkeeperOutput, NodeError> {
-        // Nowhere to put anything. Checked before the friction check and before the model, because
-        // asking one to compose memories that cannot be stored spends a turn to produce nothing.
-        if self.sink.is_none() {
-            tracing::info!("no memory index in this repository; recording no memory");
-            return Ok(input.nothing_recorded("this repository keeps no memory index"));
-        }
-        // A run that changed nothing AND hit nothing has nothing to teach. The friction check is
-        // what keeps this from throwing away the interesting case: a run that fought its way to an
-        // empty diff learned something expensive about why the change was not needed.
-        if input.converged
-            && input.implementer.touched_files.is_empty()
-            && input.implementer.diff_summary.trim().is_empty()
-            && input.friction.is_empty()
-        {
-            tracing::info!("nothing was changed and nothing went wrong; recording no memory");
-            return Ok(input.nothing_recorded("the run changed nothing and hit nothing"));
+        if let Some(output) = skipped_before_compose(&input, self.sink.is_some()) {
+            return Ok(output);
         }
 
         let prompt = render_prompt(&input);
@@ -325,9 +334,34 @@ impl BookkeeperNode {
         .map_err(|e| NodeError::Failed(format!("bookkeeper compose failed: {e}")))?;
 
         let decided = parse_validated::<MemoryDecisions>(&raw)?;
-        self.act_on(decided.decisions, &input).await
+        apply_decisions(
+            self.sink
+                .as_ref()
+                .expect("bookkeeper preflight requires a memory sink"),
+            decided.decisions,
+            &input,
+        )
+        .await
     }
+}
 
+/// Apply a schema-validated model decision through rag-rat's durable memory API.
+///
+/// The model stage has read authority only. This Rust boundary is the sole writer and is entered
+/// only after the decision schema gate succeeds.
+pub(crate) async fn apply_decisions(
+    sink: &ServerSink,
+    decisions: Vec<MemoryDecision>,
+    input: &BookkeeperInput,
+) -> Result<BookkeeperOutput, NodeError> {
+    MemoryApplication { sink }.act_on(decisions, input).await
+}
+
+struct MemoryApplication<'a> {
+    sink: &'a ServerSink,
+}
+
+impl MemoryApplication<'_> {
     /// Carry out what the model decided. The model chooses; this performs the writes, so the
     /// memory layer only ever changes through a call this code made deliberately.
     ///
@@ -462,8 +496,6 @@ impl BookkeeperNode {
 
         let result = self
             .sink
-            .as_ref()
-            .ok_or_else(|| NodeError::Failed("no memory index to update".to_string()))?
             .call_tool(param)
             .await
             .map_err(|e| NodeError::Failed(format!("memory_update call failed: {e}")))?;
@@ -511,8 +543,6 @@ impl BookkeeperNode {
 
         let result = self
             .sink
-            .as_ref()
-            .ok_or_else(|| NodeError::Failed("no memory index to write to".to_string()))?
             .call_tool(param)
             .await
             .map_err(|e| NodeError::Failed(format!("memory_create call failed: {e}")))?;
@@ -559,7 +589,7 @@ fn normalize_kind(kind: &str) -> String {
         .unwrap_or_else(|| "Decision".to_string())
 }
 
-fn render_prompt(input: &BookkeeperInput) -> String {
+pub(crate) fn render_prompt(input: &BookkeeperInput) -> String {
     let mut s = String::new();
     if input.converged {
         s.push_str("OUTCOME: the run CONVERGED — the change landed and the tests pass.\n\n");

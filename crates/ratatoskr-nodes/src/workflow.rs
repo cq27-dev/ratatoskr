@@ -33,10 +33,10 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use crate::{
-    AnalystNode, AnalystOutput, BookkeeperInput, BookkeeperNode, BookkeeperOutput, ChildTask,
-    ImplementerNode, ImplementerOutput, MemoryNode, MemoryOutput, PlanError, PlanOutcome,
-    RedTeamNode, RedTeamOutput, RunOutcome, ScoutOutput, Stage, analyst, bookkeeper, checkpoint,
-    converge, memory, redteam, referee, stage_agent_config, verifier,
+    AnalystNode, AnalystOutput, BookkeeperInput, BookkeeperOutput, ChildTask, ImplementerNode,
+    ImplementerOutput, MemoryNode, MemoryOutput, PlanError, PlanOutcome, RedTeamNode,
+    RedTeamOutput, RunOutcome, ScoutOutput, Stage, analyst, bookkeeper, checkpoint, converge,
+    memory, redteam, referee, stage_agent_config, verifier,
 };
 
 /// Backstop on total node-running binding calls per run — a runaway-loop guard, far above any real
@@ -47,6 +47,10 @@ const INVOCATION_CEILING: usize = 500;
 const STANDARD_WORKFLOW_V1: &str = include_str!("../workflows/standard-v1.ts");
 const STANDARD_WORKFLOW_INCLUDES: &[(&str, &str)] = &[
     ("prompts/analyst.md", include_str!("../prompts/analyst.md")),
+    (
+        "prompts/bookkeeper.md",
+        include_str!("../prompts/bookkeeper.md"),
+    ),
     (
         "prompts/characterizer.md",
         include_str!("../prompts/characterizer.md"),
@@ -1629,9 +1633,9 @@ async fn evaluate_standard_stage_with_turn_and_resources(
 
 async fn execution_stages(runtime: &WorkflowRuntime) -> Result<Vec<Stage>, PlanError> {
     let mut stages = standard_stages().await?;
-    // Publishing is terminal external I/O, not a workflow operation. The declaration is executed
-    // only by the Rust terminal adapter, which supplies the invocation-scoped host authority.
-    stages.retain(|stage| stage.id != "publisher");
+    // Delivery is terminal external I/O, not a workflow operation. These declarations are
+    // executed only by their Rust terminal adapters, after Rust has accepted the run outcome.
+    stages.retain(|stage| !matches!(stage.id.as_str(), "bookkeeper" | "publisher"));
     stages.extend(crate::stage::stages_from_workflow(runtime.meta()));
     Ok(stages)
 }
@@ -1833,35 +1837,52 @@ async fn finish_full(ctx: &Arc<WorkflowContext>) -> Result<RunOutcome, PlanError
 /// Compose + write the run-back memory (the `bookkeep_and_checkpoint` body, using the context's
 /// tools/sink instead of a `&RagRatClient`).
 async fn bookkeep_scripted(
-    ctx: &WorkflowContext,
+    ctx: &Arc<WorkflowContext>,
     input: BookkeeperInput,
 ) -> Result<BookkeeperOutput, PlanError> {
-    let mut plugins = ctx.plugin_context.for_node("bookkeeper");
-    let cfg = stage_agent_config(
-        &ctx.engine,
-        &ctx.config,
-        ctx.plugin_context
-            .pool_for("bookkeeper", ctx.rag_rat.clone()),
-        "bookkeeper",
-        bookkeeper::BOOKKEEPER_TOOLS,
-        &mut plugins,
-    )?;
-    let node = BookkeeperNode {
-        route: cfg.route,
-        tools: cfg.tools,
-        files: cfg.files,
-        ledger: Some(Arc::clone(&ctx.ledger)),
-        sink: ctx.sink.clone(),
-        policy: cfg.policy,
-        max_turns: cfg.max_turns,
-        clarifier: None,
-        system_prompt: cfg.system_prompt,
-        plugins,
-    };
-    let out = node
-        .run(input)
+    let input_json = serde_json::to_string(&input)?;
+    let out = if let Some(output) = bookkeeper::skipped_before_compose(&input, ctx.sink.is_some()) {
+        output
+    } else {
+        let raw = evaluate_standard_stage_with_resources(
+            Arc::clone(ctx),
+            "bookkeeper",
+            input_json,
+            bookkeeper::render_prompt(&input),
+            StandardStageResources {
+                resource_root: ctx.repo_path.clone(),
+                shell: None,
+                publish: None,
+                clarifier: None,
+                guidance: None,
+            },
+        )
         .await
-        .map_err(|e| PlanError::node("bookkeeper", e))?;
+        .map_err(|error| {
+            PlanError::node(
+                "bookkeeper",
+                NodeError::Failed(format!("bookkeeper compose failed: {error}")),
+            )
+        })?;
+        let decisions: bookkeeper::MemoryDecisions =
+            serde_json::from_str(&raw).map_err(|error| {
+                PlanError::node(
+                    "bookkeeper",
+                    NodeError::Failed(format!(
+                        "bookkeeper decisions could not be reconstructed: {error}"
+                    )),
+                )
+            })?;
+        bookkeeper::apply_decisions(
+            ctx.sink
+                .as_ref()
+                .expect("bookkeeper preflight requires a memory sink"),
+            decisions.decisions,
+            &input,
+        )
+        .await
+        .map_err(|error| PlanError::node("bookkeeper", error))?
+    };
     note(ctx, "bookkeeper", &out, None)
         .await
         .map_err(|e| PlanError::node("bookkeeper", NodeError::Failed(e)))?;
@@ -2703,6 +2724,7 @@ mod tests {
         let stages = standard_stages().await.unwrap();
         let expected_prompts = [
             ("analyst", include_str!("../prompts/analyst.md")),
+            ("bookkeeper", include_str!("../prompts/bookkeeper.md")),
             ("characterizer", include_str!("../prompts/characterizer.md")),
             (
                 "context_distillation",
@@ -2741,6 +2763,213 @@ mod tests {
                 "workflow schema materializes output defaults for {stage_id}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn bookkeeper_declaration_matches_its_typed_schema_and_rust_question() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-bookkeeper-renderer-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            "async function run(input) { return await bookkeeper(input); }",
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::load(&workflow_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let stages = standard_stages().await.unwrap();
+        assert!(
+            execution_stages(&runtime)
+                .await
+                .unwrap()
+                .iter()
+                .all(|stage| stage.id != "bookkeeper"),
+            "repository workflows must not manufacture terminal bookkeeping"
+        );
+        let bookkeeper = stages
+            .iter()
+            .find(|stage| stage.id == "bookkeeper")
+            .unwrap();
+        assert_eq!(bookkeeper.agent, "reason");
+        assert_eq!(bookkeeper.capabilities, [ratatoskr_core::Capability::Read]);
+        assert_eq!(
+            bookkeeper.tools,
+            ["semantic_search", "symbol_lookup", "memory_search", "ask"]
+        );
+        assert_eq!(bookkeeper.session, None);
+
+        let mut declared = bookkeeper.output_schema.clone().unwrap();
+        let mut generated =
+            serde_json::to_value(schemars::schema_for!(crate::bookkeeper::MemoryDecisions))
+                .unwrap();
+        without_schema_annotations(&mut declared);
+        without_schema_annotations(&mut generated);
+        assert_eq!(declared, generated, "schema drift for bookkeeper");
+
+        let input = crate::bookkeeper::BookkeeperInput {
+            issue: "Preserve the run's expensive lesson".to_string(),
+            analyst: AnalystOutput {
+                impact_summary: "Memory application remains Rust-owned".to_string(),
+                touched: vec!["crates/ratatoskr-nodes".to_string()],
+                risks: vec!["a model could attempt an unvalidated write".to_string()],
+                requirements: Vec::new(),
+                residual_risk: String::new(),
+                changes_code: true,
+                acceptance: Vec::new(),
+                interface: Vec::new(),
+            },
+            implementer: ImplementerOutput {
+                worktree_path: "/tmp/ratatoskr/worktree".to_string(),
+                branch: "ratatoskr/bookkeeper".to_string(),
+                diff_summary: " bookkeeper.rs | 4 ++++".to_string(),
+                touched_files: vec!["bookkeeper.rs".to_string()],
+                rewritten_files: Vec::new(),
+                commit_kind: "refactor".to_string(),
+                commit_scope: "nodes".to_string(),
+                commit_subject: "declare the bookkeeper".to_string(),
+                failing_tests: vec!["bookkeeper::schema".to_string()],
+                passed_tests: 3,
+                exit_code: 101,
+                narrative: Some("The writer must remain deterministic.".to_string()),
+            },
+            iterations: 2,
+            converged: false,
+            friction: crate::bookkeeper::RunFriction {
+                diagnostics: vec!["The decision omitted its action.".to_string()],
+                errors: vec![crate::bookkeeper::NodeFailure {
+                    node: "bookkeeper".to_string(),
+                    error: "schema validation failed".to_string(),
+                }],
+                effort: vec![crate::bookkeeper::NodeEffort {
+                    node: "bookkeeper".to_string(),
+                    turns: 7,
+                    seconds: 12,
+                }],
+            },
+        };
+        let expected_question = crate::bookkeeper::render_prompt(&input);
+        let captured = Arc::new(Mutex::new(None));
+        let capture = Arc::clone(&captured);
+        let host: HostFn = Arc::new(move |arg| {
+            let capture = Arc::clone(&capture);
+            Box::pin(async move {
+                *capture.lock().expect("bookkeeper capture mutex poisoned") =
+                    Some(serde_json::from_str::<serde_json::Value>(&arg).unwrap());
+                Ok(json!({ "decisions": [] }).to_string())
+            })
+        });
+        runtime
+            .run_with_question_renderers(
+                "run",
+                serde_json::to_string(&input).unwrap(),
+                HashMap::from([("bookkeeper".to_string(), host)]),
+                stage_question_renderers(&stages),
+            )
+            .await
+            .unwrap();
+        let envelope = captured
+            .lock()
+            .expect("bookkeeper capture mutex poisoned")
+            .take()
+            .unwrap();
+        assert_eq!(
+            envelope["__ratatoskrRenderedQuestion"]["question"],
+            expected_question
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn invalid_bookkeeper_decisions_cannot_write_memory_or_checkpoint() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-bookkeeper-invalid-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-bookkeeper-invalid", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "bookkeeper".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-bookkeeper-invalid",
+            "remember this",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = Arc::new(standard_stages().await.unwrap());
+        let bookkeeper = stages
+            .iter()
+            .find(|stage| stage.id == "bookkeeper")
+            .unwrap()
+            .clone();
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({ "decisions": [{ "reason": "missing action" }] }).to_string(),
+            ..Default::default()
+        });
+        let error = StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::clone(&stages),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .execute(StageInvocation {
+            stage: bookkeeper,
+            input_json: "{}".to_string(),
+            rendered_question: Some("compose a memory".to_string()),
+            resource_root: Some(dir.clone()),
+            shell: None,
+            publish: None,
+            clarifier: None,
+            invocation_guidance: None,
+            output: StageOutput::Checkpoint,
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("invalid `MemoryDecisions` output"),
+            "{error}"
+        );
+        let offered_tools = turn.tools.lock().expect("recording runner mutex poisoned")[0].clone();
+        assert!(!offered_tools.iter().any(|tool| {
+            matches!(
+                tool.as_str(),
+                "memory_create" | "memory_update" | "memory_mark_obsolete"
+            )
+        }));
+        assert!(
+            store
+                .checkpoints_for_run("run-bookkeeper-invalid")
+                .await
+                .unwrap()
+                .is_empty(),
+            "invalid decisions must not become a bookkeeper checkpoint"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

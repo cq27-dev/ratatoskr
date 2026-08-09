@@ -481,6 +481,100 @@ defineWorkflow({
       session: "compacted",
       appendRepositoryGuidance: false,
     }),
+    stage("bookkeeper", {
+      agent: "reason",
+      inputContract: "BookkeeperInput",
+      outputContract: "MemoryDecisions",
+      outputSchema: schemaWithDefs(
+        obj({
+          decisions: arr({ "$ref": "#/$defs/MemoryDecision" }),
+        }),
+        {
+          MemoryDecision: obj(
+            {
+              action: str(),
+              reason: str(),
+              memory_id: { type: ["string", "null"] },
+              kind: str(),
+              title: str(),
+              body: str(),
+              anchor: { type: ["string", "null"] },
+            },
+            ["action"],
+          ),
+        },
+      ),
+      instructions: LOAD("prompts/bookkeeper.md").trim(),
+      renderQuestion(input: any) {
+        let question = "";
+        if (input.converged) {
+          question +=
+            "OUTCOME: the run CONVERGED — the change landed and the tests pass.\n\n";
+        } else {
+          question +=
+            `OUTCOME: the run HIT A WALL — after ${input.iterations} implementer iterations ` +
+            `it could not resolve these failing tests: ${input.implementer.failing_tests.join(", ")}. ` +
+            "Record what a future run should know about this wall / this class of change.\n\n";
+        }
+        question += `TASK:\n${input.issue}\n\n`;
+        if (input.analyst.impact_summary) {
+          question += `IMPACT:\n${input.analyst.impact_summary}\n\n`;
+        }
+        if (input.analyst.risks.length > 0) {
+          question += "RISKS FLAGGED:\n";
+          for (const risk of input.analyst.risks) question += `- ${risk}\n`;
+          question += "\n";
+        }
+        if (input.implementer.diff_summary) {
+          question += `DIFF:\n${input.implementer.diff_summary}\n\n`;
+        }
+        if (input.implementer.narrative) {
+          question += `IMPLEMENTER NOTES:\n${input.implementer.narrative}\n\n`;
+        }
+        if (input.implementer.touched_files.length > 0) {
+          question += `TOUCHED FILES: ${input.implementer.touched_files.join(", ")}\n`;
+        }
+
+        const friction = input.friction;
+        if (
+          friction.diagnostics.length > 0 ||
+          friction.errors.length > 0 ||
+          friction.effort.length > 0
+        ) {
+          question += "\nFRICTION — what this run struggled with:\n";
+        }
+        if (friction.diagnostics.length > 0) {
+          question +=
+            "\nEach of these was handed to a fresh implementer session after the previous " +
+            "attempt broke something. Whatever a diagnostic keeps pointing at is a constraint " +
+            "nobody had written down:\n";
+          for (let index = 0; index < friction.diagnostics.length; index += 1) {
+            question += `- attempt ${index + 2}: ${friction.diagnostics[index]}\n`;
+          }
+        }
+        if (friction.errors.length > 0) {
+          question += "\nNodes that failed:\n";
+          for (const error of friction.errors) {
+            question += `- ${error.node}: ${error.error}\n`;
+          }
+        }
+        if (friction.effort.length > 0) {
+          question +=
+            "\nWhat each node's turn took. A node that spent many turns was hunting for " +
+            "something — that is a fact about how hard this repo is to navigate, not about " +
+            "the node:\n";
+          for (const effort of friction.effort) {
+            question += `- ${effort.node}: ${effort.turns} turns, ${effort.seconds}s\n`;
+          }
+        }
+        return question;
+      },
+      capabilities: ["read"],
+      tools: ["semantic_search", "symbol_lookup", "memory_search", "ask"],
+      // Preserve the selected TOML/profile/ruleset continuation policy.
+      session: null,
+      appendRepositoryGuidance: false,
+    }),
     stage("publisher", {
       agent: "publish",
       inputContract: "PublisherInput",

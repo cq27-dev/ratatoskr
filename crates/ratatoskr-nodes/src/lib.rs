@@ -1468,40 +1468,69 @@ async fn bookkeep_and_checkpoint(
         config,
         store,
         run_id,
+        issue,
         engine,
         clarifier,
         ledger,
         context,
         ..
     } = run;
-    let mut plugins_bookkeeper = context.for_node("bookkeeper");
-    let cfg = stage_agent_config(
-        engine,
-        config,
-        context.pool_for("bookkeeper", client.map(|c| c.offer())),
-        "bookkeeper",
-        bookkeeper::BOOKKEEPER_TOOLS,
-        &mut plugins_bookkeeper,
-    )?;
-    let mut tools = cfg.tools;
-    tools.add_local(clarify::ask_tool());
-    let node = BookkeeperNode {
-        route: cfg.route,
-        tools,
-        sink: client.map(|c| c.sink()),
-        policy: cfg.policy,
-        max_turns: cfg.max_turns,
-        clarifier: Some(clarifier.as_dyn()),
-        system_prompt: cfg.system_prompt,
-        plugins: plugins_bookkeeper,
-        files: cfg.files,
-        ledger: Some(Arc::clone(ledger)),
-    };
+    let sink = client.map(RagRatClient::sink);
     let input_json = serde_json::to_string(&input)?;
-    let out = node
-        .run(input)
+    let out = if let Some(output) = bookkeeper::skipped_before_compose(&input, sink.is_some()) {
+        output
+    } else {
+        let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let rendered_question = bookkeeper::render_prompt(&input);
+        let declared_context =
+            workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
+                client,
+                config,
+                store,
+                run_id,
+                issue,
+                engine,
+                plugin_context: context.clone(),
+                ledger: Arc::clone(ledger),
+            })?;
+        let raw = workflow::evaluate_standard_stage_with_resources(
+            declared_context,
+            "bookkeeper",
+            input_json.clone(),
+            rendered_question,
+            workflow::StandardStageResources {
+                resource_root: repo_root,
+                shell: None,
+                publish: None,
+                clarifier: Some(clarifier.as_dyn()),
+                guidance: None,
+            },
+        )
         .await
-        .map_err(|e| PlanError::node("bookkeeper", e))?;
+        .map_err(|error| {
+            PlanError::node(
+                "bookkeeper",
+                NodeError::Failed(format!("bookkeeper compose failed: {error}")),
+            )
+        })?;
+        let decisions: bookkeeper::MemoryDecisions =
+            serde_json::from_str(&raw).map_err(|error| {
+                PlanError::node(
+                    "bookkeeper",
+                    NodeError::Failed(format!(
+                        "bookkeeper decisions could not be reconstructed: {error}"
+                    )),
+                )
+            })?;
+        bookkeeper::apply_decisions(
+            sink.as_ref()
+                .expect("bookkeeper preflight requires a memory sink"),
+            decisions.decisions,
+            &input,
+        )
+        .await
+        .map_err(|error| PlanError::node("bookkeeper", error))?
+    };
     record(Record {
         store,
         run_id,
