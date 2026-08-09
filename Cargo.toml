@@ -79,7 +79,7 @@ http = "1"
 tower-http = { version = "0.7", features = ["fs"] }
 # Already in the tree under axum; a direct dev-dependency so serve's tests can drive its router.
 tower = "0.5"
-# Phase 3 execution: MicroVM sandbox + ACP client for driving a coding CLI.
+# Phase 3 execution: sandboxed repository commands and acceptance checks.
 microsandbox = "0.6.8"
 # Hosted-instance identity. Argon2id is the current default recommendation for passwords, and the
 # PHC string it emits carries its own parameters — so raising the cost later applies on next login

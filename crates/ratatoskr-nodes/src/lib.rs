@@ -353,8 +353,8 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
 /// it was given and what the turn cost.
 ///
 /// `input` and `ledger` are optional because not every checkpoint has them: the `issue` row is the
-/// run's own input rather than a node's, and the implementer drives a coding CLI that reports no
-/// token usage. A missing value here means "there was none", never "we forgot to look".
+/// run's own input rather than a node's. A missing value here means "there was none", never "we
+/// forgot to look".
 struct Record<'a, T> {
     store: &'a Store,
     run_id: &'a str,
@@ -2274,6 +2274,17 @@ pub(crate) fn build_converge_agents(
     };
     let (impl_cfg, impl_plugins) =
         build_implementer_agent(engine, config, context, client.map(|c| c.offer()))?;
+    let implementer_context =
+        workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
+            client,
+            config,
+            store: run.store,
+            run_id,
+            issue,
+            engine,
+            plugin_context: context.clone(),
+            ledger: Arc::clone(ledger),
+        })?;
     let implementer = ImplementerNode {
         clarifier: Some(clarifier.as_dyn()),
         repo_path: repo_path.to_path_buf(),
@@ -2299,6 +2310,7 @@ pub(crate) fn build_converge_agents(
             Some(Arc::clone(ledger)),
             characterizer_context,
         )?,
+        declared_context: Some(implementer_context),
     };
     Ok((red_team, implementer))
 }

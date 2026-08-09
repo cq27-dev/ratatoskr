@@ -123,23 +123,34 @@ pub const IMPLEMENTER_TOOLS: &[&str] = &[
 /// is read from the worktree afterwards, so this carries only the part nothing else can see: what
 /// it believes it did.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct Report {
+pub(crate) struct Report {
     /// What was changed and why. This becomes the commit's body, so write it for whoever reads
     /// the change later with no memory of the run: what you did, and the reasoning that is not
     /// recoverable from the diff. Not a list of files — the diff is already the list of files.
-    summary: String,
+    pub(crate) summary: String,
     /// The conventional-commit type of this change: `feat`, `fix`, `chore`, `docs`, `perf`,
     /// `refactor`, `style`, `test`, `ci`, `build`.
     #[serde(default)]
-    kind: String,
+    pub(crate) kind: String,
     /// The part of the repository this touches, as the log already names it — a crate, a module,
     /// a subsystem. Empty when the change belongs to no particular part.
     #[serde(default)]
-    scope: String,
+    pub(crate) scope: String,
     /// One line, imperative, no trailing period, under 60 characters: what the commit does. Not a
     /// restatement of the issue's title — what *this change* does.
     #[serde(default)]
-    subject: String,
+    pub(crate) subject: String,
+}
+
+/// Deterministic input for one model attempt. Rust decides whether this is the initial plan or a
+/// correction and TypeScript only renders that already-decided input into the user question.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct ImplementerAttemptInput {
+    pub issue: String,
+    pub analyst: AnalystOutput,
+    pub acceptance: Vec<ratatoskr_core::AcceptanceStep>,
+    #[serde(default)]
+    pub diagnostic: Option<String>,
 }
 
 /// The implementer node. Holds everything needed to create the worktree and drive the model.
@@ -176,6 +187,10 @@ pub struct ImplementerNode {
     pub acceptance: Vec<ratatoskr_core::AcceptanceStep>,
     /// Names the checks inside each step. `None` compares at step granularity instead.
     pub characterizer: Option<Characterizer>,
+    /// Present on production paths. Direct construction retains the native
+    /// [`ratatoskr_agent::NodeRun`] path as a compatibility path; both paths use Ratatoskr's own
+    /// model/tool loop.
+    pub(crate) declared_context: Option<Arc<crate::workflow::WorkflowContext>>,
 }
 
 impl ImplementerNode {
@@ -206,7 +221,7 @@ impl ImplementerNode {
 
     /// The first attempt, in a worktree that already exists.
     pub async fn work(&self, worktree: &WorktreePath) -> Result<ImplementerOutput, NodeError> {
-        self.attempt(worktree, &self.initial_prompt()).await
+        self.attempt(worktree, self.initial_input()).await
     }
 
     /// Remove a worktree whose run is not going to finish. Best-effort: a leftover tree is a
@@ -223,57 +238,84 @@ impl ImplementerNode {
         worktree: &WorktreePath,
         diagnostic: &str,
     ) -> Result<ImplementerOutput, NodeError> {
-        self.attempt(worktree, diagnostic).await
+        self.attempt(
+            worktree,
+            ImplementerAttemptInput {
+                issue: self.issue.clone(),
+                analyst: self.analyst.clone(),
+                acceptance: self.acceptance.clone(),
+                diagnostic: Some(diagnostic.to_string()),
+            },
+        )
+        .await
     }
 
     /// One attempt: drive the model, then run the worktree's acceptance checks and read its diff.
     async fn attempt(
         &self,
         worktree: &WorktreePath,
-        prompt: &str,
+        input: ImplementerAttemptInput,
     ) -> Result<ImplementerOutput, NodeError> {
+        let input_json = serde_json::to_string(&input)
+            .map_err(|error| NodeError::Failed(format!("implementer input: {error}")))?;
+        let prompt = render_attempt_prompt(&input);
         // One conversation for this node across the run, so a converge iteration continues the
         // attempt it is fixing instead of meeting the worktree for the first time again.
         let conversation = format!("{}-implementer", self.run_id);
-        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-            node: "implementer",
-            route: &self.route,
-            preamble: &crate::with_conventions(
-                "implementer",
-                self.conventions.as_deref(),
-                format!(
-                    "{}{}",
-                    crate::effective_preamble_with_profile(
-                        "implementer",
-                        NATIVE_PREAMBLE,
-                        self.plugins.profile_prompt.as_str(),
-                        self.system_prompt.as_deref(),
-                        self.plugins.context.as_deref(),
-                        &self.plugins.skills,
+        let raw = match &self.declared_context {
+            Some(ctx) => crate::workflow::evaluate_standard_stage_with_resources(
+                Arc::clone(ctx),
+                "implementer_attempt",
+                input_json,
+                prompt,
+                crate::workflow::StandardStageResources {
+                    resource_root: worktree.as_path().to_path_buf(),
+                    shell: Some(self.shell_access(worktree)),
+                    clarifier: self.clarifier.clone(),
+                    guidance: Some(where_you_are(worktree)),
+                },
+            )
+            .await
+            .map_err(|error| NodeError::Failed(format!("implementer agent failed: {error}")))?,
+            None => ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
+                node: "implementer",
+                route: &self.route,
+                preamble: &crate::with_conventions(
+                    "implementer",
+                    self.conventions.as_deref(),
+                    format!(
+                        "{}{}",
+                        crate::effective_preamble_with_profile(
+                            "implementer",
+                            NATIVE_PREAMBLE,
+                            self.plugins.profile_prompt.as_str(),
+                            self.system_prompt.as_deref(),
+                            self.plugins.context.as_deref(),
+                            &self.plugins.skills,
+                        ),
+                        where_you_are(worktree),
                     ),
-                    where_you_are(worktree),
                 ),
-            ),
-            question: prompt,
-            tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(Report),
-            policy: self.policy.clone(),
-            max_turns: self.max_turns,
-            // Nobody to ask. The prompt says so, and offering the tool would contradict it.
-            clarifier: self.clarifier.clone(),
-            observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills, "implementer"),
-            // Rooted at the worktree, not the checkout: every path it reads or writes has to be
-            // the copy it owns, or one attempt edits the tree another node is reading.
-            files: Some(worktree.as_path().to_path_buf()),
-            shell: Some(self.shell_access(worktree)),
-            push: None,
-            conversation: Some(&conversation),
-            ledger: self.ledger.clone(),
-            produces: Some("a change that satisfies the plan and passes the acceptance checks"),
-        })
-        .await
-        .map_err(|e| NodeError::Failed(format!("implementer agent failed: {e}")))?;
+                question: &prompt,
+                tools: self.tools.clone(),
+                output_schema: schemars::schema_for!(Report),
+                policy: self.policy.clone(),
+                max_turns: self.max_turns,
+                clarifier: self.clarifier.clone(),
+                observer: self.plugins.observer.clone(),
+                skills: crate::skills::loaded(&self.plugins.skills, "implementer"),
+                // Rooted at the worktree, not the checkout: every path it reads or writes has to be
+                // the copy it owns, or one attempt edits the tree another node is reading.
+                files: Some(worktree.as_path().to_path_buf()),
+                shell: Some(self.shell_access(worktree)),
+                push: None,
+                conversation: Some(&conversation),
+                ledger: self.ledger.clone(),
+                produces: Some("a change that satisfies the plan and passes the acceptance checks"),
+            })
+            .await
+            .map_err(|error| NodeError::Failed(format!("implementer agent failed: {error}")))?,
+        };
         let report = parse_validated::<Report>(&raw)?;
 
         let outcomes = run_acceptance(Acceptance {
@@ -347,59 +389,71 @@ impl ImplementerNode {
         format!("ratatoskr/{}", self.short_id())
     }
 
-    /// The initial prompt: the issue plus the analyst's requirements and risks.
-    fn initial_prompt(&self) -> String {
-        let mut s = String::new();
-        let _ = write!(
-            s,
-            "Implement this task in the current repository:\n\n{}\n\n",
-            self.issue
-        );
-        let a = &self.analyst;
-        if !a.impact_summary.is_empty() {
-            let _ = write!(s, "Impact analysis:\n{}\n\n", a.impact_summary);
+    fn initial_input(&self) -> ImplementerAttemptInput {
+        ImplementerAttemptInput {
+            issue: self.issue.clone(),
+            analyst: self.analyst.clone(),
+            acceptance: self.acceptance.clone(),
+            diagnostic: None,
         }
-        if !a.requirements.is_empty() {
-            s.push_str("Requirements the implementation must satisfy:\n");
-            for req in &a.requirements {
-                let _ = writeln!(s, "- {req}");
-            }
-            s.push('\n');
+    }
+}
+
+/// Render the exact user question for either the first attempt or a Rust-authored correction.
+pub(crate) fn render_attempt_prompt(input: &ImplementerAttemptInput) -> String {
+    if let Some(diagnostic) = &input.diagnostic {
+        return diagnostic.clone();
+    }
+    let mut s = String::new();
+    let _ = write!(
+        s,
+        "Implement this task in the current repository:\n\n{}\n\n",
+        input.issue
+    );
+    let a = &input.analyst;
+    if !a.impact_summary.is_empty() {
+        let _ = write!(s, "Impact analysis:\n{}\n\n", a.impact_summary);
+    }
+    if !a.requirements.is_empty() {
+        s.push_str("Requirements the implementation must satisfy:\n");
+        for req in &a.requirements {
+            let _ = writeln!(s, "- {req}");
         }
-        if !a.interface.is_empty() {
-            s.push_str(
-                "THE INTERFACE YOU ARE BUILDING TO. Someone else is writing tests against this \
+        s.push('\n');
+    }
+    if !a.interface.is_empty() {
+        s.push_str(
+            "THE INTERFACE YOU ARE BUILDING TO. Someone else is writing tests against this \
                  same description, without seeing your code. Match the shape exactly — a \
                  signature that differs by a parameter name or an argument order will fail tests \
                  that are not wrong:\n\n",
-            );
-            crate::analyst::render_interface(&mut s, &a.interface, "must", "must also");
-            s.push('\n');
+        );
+        crate::analyst::render_interface(&mut s, &a.interface, "must", "must also");
+        s.push('\n');
+    }
+    if !a.risks.is_empty() {
+        s.push_str("Known risks to avoid:\n");
+        for risk in &a.risks {
+            let _ = writeln!(s, "- {risk}");
         }
-        if !a.risks.is_empty() {
-            s.push_str("Known risks to avoid:\n");
-            for risk in &a.risks {
-                let _ = writeln!(s, "- {risk}");
-            }
-            s.push('\n');
-        }
-        if !self.acceptance.is_empty() {
-            s.push_str(
-                "The acceptance checks this change is judged by, which you can run yourself with \
-                 Bash:\n",
-            );
-            for step in &self.acceptance {
-                let _ = writeln!(s, "- {}: `{}`", step.name, step.command.join(" "));
-            }
-            s.push('\n');
-        }
+        s.push('\n');
+    }
+    if !input.acceptance.is_empty() {
         s.push_str(
-            "Apply the change directly with your editing tools — do NOT ask for confirmation or \
+            "The acceptance checks this change is judged by, which you can run yourself with \
+                 Bash:\n",
+        );
+        for step in &input.acceptance {
+            let _ = writeln!(s, "- {}: `{}`", step.name, step.command.join(" "));
+        }
+        s.push('\n');
+    }
+    s.push_str(
+        "Apply the change directly with your editing tools — do NOT ask for confirmation or \
              present options to choose between; just make the fix. Then run the acceptance checks \
              and make them pass.",
-        );
-        s
-    }
+    );
+    s
 }
 
 /// Where the model is working, appended to its preamble.
@@ -422,6 +476,21 @@ fn where_you_are(worktree: &WorktreePath) -> String {
 mod tests {
     use super::*;
 
+    fn run_git(repo: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn every_attempt_is_told_which_worktree_it_is_in() {
         // Each attempt is a fresh conversation — a re-driven one receives only a diagnostic — so
@@ -430,6 +499,72 @@ mod tests {
         let told = where_you_are(&WorktreePath(PathBuf::from("/w/ratatoskr/abc12345")));
         assert!(told.contains("/w/ratatoskr/abc12345"), "{told}");
         assert!(told.contains("branch"), "{told}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_native_stage_attempt_removes_its_worktree() {
+        let repo = std::env::current_dir().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-implementer-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ratatoskr_script::ScriptEngine::load(&dir).await.unwrap();
+        let store = ratatoskr_store::Store::open_in_memory().unwrap();
+        let run_id = format!("{:08x}-cleanup", std::process::id());
+        store.upsert_run(&run_id, None, "running").await.unwrap();
+        let mut config = ratatoskr_core::RatatoskrConfig::default();
+        config.models.get_mut("implementer").unwrap().provider = "not-a-provider".to_string();
+        let context = crate::workflow::WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            &run_id,
+            "exercise cleanup",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let node = ImplementerNode {
+            repo_path: repo.clone(),
+            worktree_root: dir.join("worktrees"),
+            sandbox: config.sandbox.clone(),
+            route: config.models["implementer"].clone(),
+            tools: ToolSet::default(),
+            policy: None,
+            max_turns: None,
+            system_prompt: None,
+            conventions: None,
+            plugins: crate::NodePlugins::default(),
+            ledger: None,
+            clarifier: None,
+            run_id,
+            issue: "exercise cleanup".to_string(),
+            analyst: AnalystOutput {
+                impact_summary: "The model turn will fail before editing.".to_string(),
+                touched: Vec::new(),
+                risks: Vec::new(),
+                requirements: Vec::new(),
+                residual_risk: String::new(),
+                changes_code: true,
+                acceptance: Vec::new(),
+                interface: Vec::new(),
+            },
+            acceptance: Vec::new(),
+            characterizer: None,
+            declared_context: Some(context),
+        };
+        let branch = node.branch();
+
+        let error = node.run().await.unwrap_err().to_string();
+        assert!(error.contains("unknown provider"), "{error}");
+        assert!(
+            !node.worktree_root.join(&branch).exists(),
+            "failed attempts must not leave a linked worktree"
+        );
+        run_git(&repo, &["branch", "-D", &branch]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

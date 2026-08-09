@@ -516,6 +516,7 @@ fn build_implementer(
         run_id: ctx.run_id.clone(),
         issue: ctx.issue.clone(),
         analyst,
+        declared_context: Some(Arc::clone(ctx)),
     })
 }
 
@@ -794,6 +795,9 @@ async fn verify_host(
                 input_json: input_json.clone(),
                 rendered_question: Some(rendered_question),
                 resource_root: Some(worktree.0.clone()),
+                shell: None,
+                clarifier: None,
+                invocation_guidance: None,
                 output: StageOutput::Checkpoint,
             })
             .await
@@ -853,6 +857,9 @@ async fn context_host(
             input_json,
             rendered_question: Some(rendered_question),
             resource_root: None,
+            shell: None,
+            clarifier: None,
+            invocation_guidance: None,
             output: StageOutput::Evidence,
         })
         .await?;
@@ -999,6 +1006,9 @@ struct StageInvocation {
     input_json: String,
     rendered_question: Option<String>,
     resource_root: Option<PathBuf>,
+    shell: Option<ratatoskr_agent::shell::ShellAccess>,
+    clarifier: Option<Arc<dyn ratatoskr_agent::Clarifier>>,
+    invocation_guidance: Option<String>,
     output: StageOutput,
 }
 
@@ -1023,6 +1033,9 @@ fn stage_invocation(stage: Stage, host_input_json: String) -> Result<StageInvoca
             input_json: host_input_json,
             rendered_question: None,
             resource_root: None,
+            shell: None,
+            clarifier: None,
+            invocation_guidance: None,
             output: StageOutput::Checkpoint,
         });
     };
@@ -1034,6 +1047,9 @@ fn stage_invocation(stage: Stage, host_input_json: String) -> Result<StageInvoca
             .map_err(|error| error.to_string())?,
         rendered_question: Some(envelope.rendered.question),
         resource_root: None,
+        shell: None,
+        clarifier: None,
+        invocation_guidance: None,
         output: StageOutput::Checkpoint,
     })
 }
@@ -1084,6 +1100,9 @@ impl StageExecutor {
             input_json,
             rendered_question,
             resource_root,
+            shell,
+            clarifier,
+            invocation_guidance,
             output: disposition,
         } = invocation;
         let input: serde_json::Value =
@@ -1102,6 +1121,23 @@ impl StageExecutor {
                 .local()
                 .tools
                 .extend(ratatoskr_agent::files::edit_declarations());
+        }
+        if stage
+            .tools
+            .iter()
+            .any(|tool| tool == ratatoskr_agent::shell::BASH)
+        {
+            offered
+                .local()
+                .tools
+                .push(ratatoskr_agent::shell::declaration());
+        }
+        if stage
+            .tools
+            .iter()
+            .any(|tool| tool == ratatoskr_agent::ASK_TOOL_NAME)
+        {
+            offered.local().tools.push(crate::clarify::ask_tool());
         }
         let (mut cfg, profile) = crate::plugins::declared_stage_agent_config(
             &self.ctx.engine,
@@ -1142,6 +1178,9 @@ impl StageExecutor {
                 input_json: serde_json::to_string(&task.input).map_err(|e| e.to_string())?,
                 rendered_question: None,
                 resource_root: resource_root.clone(),
+                shell: None,
+                clarifier: None,
+                invocation_guidance: None,
                 output: StageOutput::Evidence,
             }))
             .await?;
@@ -1156,7 +1195,7 @@ impl StageExecutor {
         let runtime_input_json =
             serde_json::to_string(&runtime_input).map_err(|e| e.to_string())?;
         let repository_guidance = crate::repo_conventions(&self.ctx.repo_path).unwrap_or_default();
-        let preamble = declared_stage_preamble(
+        let mut preamble = declared_stage_preamble(
             &stage,
             &governance_id,
             &profile,
@@ -1165,6 +1204,10 @@ impl StageExecutor {
             plugins.context.as_deref(),
             &plugins.skills,
         );
+        if let Some(guidance) = invocation_guidance.as_deref() {
+            preamble.push_str("\n\n");
+            preamble.push_str(guidance);
+        }
         if stage.question_renderer.is_some() && rendered_question.is_none() {
             return Err(format!(
                 "stage `{}` has renderQuestion but was invoked without its workflow host",
@@ -1196,11 +1239,11 @@ impl StageExecutor {
                     .unwrap_or_else(|| schemars::schema_for!(serde_json::Value)),
                 policy: cfg.policy,
                 max_turns: cfg.max_turns,
-                clarifier: None,
+                clarifier,
                 observer: plugins.observer.clone(),
                 skills: crate::skills::loaded(&plugins.skills, &governance_id),
                 files: resource_root.or(cfg.files),
-                shell: None,
+                shell,
                 push: None,
                 conversation: Some(&conversation),
                 ledger: Some(Arc::clone(&self.ctx.ledger)),
@@ -1384,12 +1427,46 @@ pub(crate) async fn evaluate_standard_stage_at(
     rendered_question: String,
     resource_root: std::path::PathBuf,
 ) -> Result<String, String> {
-    evaluate_standard_stage_at_with_turn(
+    evaluate_standard_stage_with_resources(
         ctx,
         stage_id,
         input_json,
         rendered_question,
-        resource_root,
+        StandardStageResources {
+            resource_root,
+            shell: None,
+            clarifier: None,
+            guidance: None,
+        },
+    )
+    .await
+}
+
+/// Rust-owned resources granted to one bundled evidence turn.
+///
+/// A stage may use these resources but cannot create, replace, retain, or clean them up. That
+/// keeps worktree and sandbox lifecycle in the operation adapter while the model call remains a
+/// generic declared-stage execution.
+pub(crate) struct StandardStageResources {
+    pub resource_root: PathBuf,
+    pub shell: Option<ratatoskr_agent::shell::ShellAccess>,
+    pub clarifier: Option<Arc<dyn ratatoskr_agent::Clarifier>>,
+    pub guidance: Option<String>,
+}
+
+pub(crate) async fn evaluate_standard_stage_with_resources(
+    ctx: Arc<WorkflowContext>,
+    stage_id: &str,
+    input_json: String,
+    rendered_question: String,
+    resources: StandardStageResources,
+) -> Result<String, String> {
+    evaluate_standard_stage_with_resources_and_turn(
+        ctx,
+        stage_id,
+        input_json,
+        rendered_question,
+        resources,
         Arc::new(LiveStageTurn),
     )
     .await
@@ -1402,7 +1479,7 @@ async fn evaluate_standard_stage_with_turn(
     rendered_question: String,
     turn: Arc<dyn StageTurn>,
 ) -> Result<String, String> {
-    evaluate_standard_stage_with_turn_and_root(
+    evaluate_standard_stage_with_turn_and_resources(
         ctx,
         stage_id,
         input_json,
@@ -1413,33 +1490,42 @@ async fn evaluate_standard_stage_with_turn(
     .await
 }
 
-async fn evaluate_standard_stage_at_with_turn(
+async fn evaluate_standard_stage_with_resources_and_turn(
     ctx: Arc<WorkflowContext>,
     stage_id: &str,
     input_json: String,
     rendered_question: String,
-    resource_root: std::path::PathBuf,
+    resources: StandardStageResources,
     turn: Arc<dyn StageTurn>,
 ) -> Result<String, String> {
-    evaluate_standard_stage_with_turn_and_root(
+    evaluate_standard_stage_with_turn_and_resources(
         ctx,
         stage_id,
         input_json,
         rendered_question,
-        Some(resource_root),
+        Some(resources),
         turn,
     )
     .await
 }
 
-async fn evaluate_standard_stage_with_turn_and_root(
+async fn evaluate_standard_stage_with_turn_and_resources(
     ctx: Arc<WorkflowContext>,
     stage_id: &str,
     input_json: String,
     rendered_question: String,
-    resource_root: Option<std::path::PathBuf>,
+    resources: Option<StandardStageResources>,
     turn: Arc<dyn StageTurn>,
 ) -> Result<String, String> {
+    let (resource_root, shell, clarifier, invocation_guidance) = match resources {
+        Some(resources) => (
+            Some(resources.resource_root),
+            resources.shell,
+            resources.clarifier,
+            resources.guidance,
+        ),
+        None => (None, None, None, None),
+    };
     let stages = Arc::new(standard_stages().await.map_err(|error| error.to_string())?);
     let stage = stages
         .iter()
@@ -1452,6 +1538,9 @@ async fn evaluate_standard_stage_with_turn_and_root(
             input_json,
             rendered_question: Some(rendered_question),
             resource_root,
+            shell,
+            clarifier,
+            invocation_guidance,
             output: StageOutput::Evidence,
         })
         .await
@@ -1809,6 +1898,8 @@ mod tests {
         ledger_ids: Mutex<Vec<Option<usize>>>,
         tools: Mutex<Vec<Vec<String>>>,
         files: Mutex<Vec<Option<std::path::PathBuf>>>,
+        has_shell: Mutex<Vec<bool>>,
+        has_clarifier: Mutex<Vec<bool>>,
         preambles: Mutex<Vec<String>>,
         questions: Mutex<Vec<String>>,
         has_ledger: Mutex<Vec<bool>>,
@@ -1824,6 +1915,8 @@ mod tests {
                 ledger_ids: Mutex::new(Vec::new()),
                 tools: Mutex::new(Vec::new()),
                 files: Mutex::new(Vec::new()),
+                has_shell: Mutex::new(Vec::new()),
+                has_clarifier: Mutex::new(Vec::new()),
                 preambles: Mutex::new(Vec::new()),
                 questions: Mutex::new(Vec::new()),
                 has_ledger: Mutex::new(Vec::new()),
@@ -1866,6 +1959,14 @@ mod tests {
                 .lock()
                 .expect("recording runner mutex poisoned")
                 .push(run.files.clone());
+            self.has_shell
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(run.shell.is_some());
+            self.has_clarifier
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(run.clarifier.is_some());
             self.preambles
                 .lock()
                 .expect("recording runner mutex poisoned")
@@ -1880,6 +1981,19 @@ mod tests {
                 .push(run.ledger.is_some());
             let output = self.output.clone();
             Box::pin(async move { Ok(output) })
+        }
+    }
+
+    struct StaticClarifier;
+
+    impl ratatoskr_agent::Clarifier for StaticClarifier {
+        fn answer<'a>(
+            &'a self,
+            _from: &'a str,
+            _to: &'a str,
+            _question: &'a str,
+        ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+            Box::pin(async { "static answer".to_string() })
         }
     }
 
@@ -1930,6 +2044,9 @@ mod tests {
                 input_json: "{}".to_string(),
                 rendered_question: None,
                 resource_root: None,
+                shell: None,
+                clarifier: None,
+                invocation_guidance: None,
                 output: StageOutput::Evidence,
             })
             .await
@@ -3110,12 +3227,17 @@ mod tests {
             output: json!({ "files": [], "tests": [], "covers": "no interface" }).to_string(),
             ..Default::default()
         });
-        evaluate_standard_stage_at_with_turn(
+        evaluate_standard_stage_with_resources_and_turn(
             Arc::clone(&ctx),
             "redteam_author",
             serde_json::to_string(&author).unwrap(),
             crate::redteam::author_prompt(&author.issue, &author.interface),
-            author_root.clone(),
+            StandardStageResources {
+                resource_root: author_root.clone(),
+                shell: None,
+                clarifier: None,
+                guidance: None,
+            },
             Arc::clone(&author_turn) as Arc<dyn StageTurn>,
         )
         .await
@@ -3177,6 +3299,378 @@ mod tests {
             without_schema_annotations(&mut declared);
             assert_eq!(declared, generated, "schema drift for {stage_id}");
         }
+    }
+
+    fn implementer_attempt_input(
+        diagnostic: Option<&str>,
+    ) -> crate::implementer::ImplementerAttemptInput {
+        crate::implementer::ImplementerAttemptInput {
+            issue: "add Store::claim".to_string(),
+            analyst: AnalystOutput {
+                impact_summary: "The store owns run claims.".to_string(),
+                touched: vec!["crates/ratatoskr-store".to_string()],
+                risks: vec!["Do not permit two owners".to_string()],
+                requirements: vec!["Keep claim acquisition atomic".to_string()],
+                residual_risk: String::new(),
+                changes_code: true,
+                acceptance: Vec::new(),
+                interface: vec![crate::analyst::InterfaceItem {
+                    name: "Store::claim".to_string(),
+                    shape: "fn claim(&self, run: &str) -> Result<Claim, StoreError>".to_string(),
+                    happy: vec!["an unclaimed run yields a Claim".to_string()],
+                    sad: vec!["an owned run returns an error".to_string()],
+                }],
+            },
+            acceptance: vec![ratatoskr_core::AcceptanceStep {
+                name: "store tests".to_string(),
+                command: vec![
+                    "cargo".to_string(),
+                    "test".to_string(),
+                    "-p".to_string(),
+                    "ratatoskr-store".to_string(),
+                ],
+            }],
+            diagnostic: diagnostic.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_implementer_attempt_is_generic_and_reuses_compacted_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-implementer-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"async function plan(input) {
+                 await implementer_attempt(input.initial);
+                 return await implementer_attempt(input.iteration);
+               }"#,
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::load(&workflow_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run(
+                "run-standard-implementer",
+                None,
+                RunStatus::Running.as_str(),
+            )
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.get_mut("implementer").unwrap().session = ratatoskr_core::SessionScope::Fresh;
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-standard-implementer",
+            "add Store::claim",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = standard_stages().await.unwrap();
+        let stage = stages
+            .iter()
+            .find(|stage| stage.id == "implementer_attempt")
+            .unwrap();
+        assert_eq!(stage.governance_id(), "implementer");
+        assert_eq!(stage.session, Some(ratatoskr_core::SessionScope::Compacted));
+        assert_eq!(stage.capabilities, [ratatoskr_core::Capability::Write]);
+        assert_eq!(
+            stage.instructions,
+            crate::implementer::NATIVE_PREAMBLE.trim()
+        );
+
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({
+                "summary": "made claim acquisition atomic",
+                "kind": "fix",
+                "scope": "store",
+                "subject": "make claim acquisition atomic"
+            })
+            .to_string(),
+            ..Default::default()
+        });
+        let hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        let initial = implementer_attempt_input(None);
+        let iteration = implementer_attempt_input(Some("Fix the failing concurrent claim test."));
+        runtime
+            .run_with_question_renderers(
+                "plan",
+                json!({ "initial": initial, "iteration": iteration }).to_string(),
+                hosts,
+                stage_question_renderers(&stages),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *turn.nodes.lock().expect("recording runner mutex poisoned"),
+            ["implementer", "implementer"]
+        );
+        assert_eq!(
+            *turn
+                .sessions
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            [
+                ratatoskr_core::SessionScope::Compacted,
+                ratatoskr_core::SessionScope::Compacted
+            ],
+            "the declared stage overrides the fresh route"
+        );
+        assert_eq!(
+            *turn
+                .conversations
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            [
+                Some("run-standard-implementer-implementer".to_string()),
+                Some("run-standard-implementer-implementer".to_string())
+            ]
+        );
+        {
+            let ledger_ids = turn
+                .ledger_ids
+                .lock()
+                .expect("recording runner mutex poisoned");
+            assert_eq!(ledger_ids.len(), 2);
+            assert_eq!(ledger_ids[0], ledger_ids[1]);
+            assert!(ledger_ids[0].is_some());
+        }
+        {
+            let questions = turn
+                .questions
+                .lock()
+                .expect("recording runner mutex poisoned");
+            let initial = implementer_attempt_input(None);
+            assert_eq!(
+                questions[0],
+                format!(
+                    "Input contract: ImplementerAttemptInput\nOutput contract: Report\n\n{}",
+                    crate::implementer::render_attempt_prompt(&initial)
+                )
+            );
+            assert_eq!(
+                questions[1],
+                "Input contract: ImplementerAttemptInput\nOutput contract: Report\n\nFix the failing concurrent claim test."
+            );
+        }
+        for offered in turn
+            .tools
+            .lock()
+            .expect("recording runner mutex poisoned")
+            .iter()
+        {
+            for expected in ["Read", "Grep", "Glob", "Write", "Edit", "Bash", "ask"] {
+                assert!(
+                    offered.iter().any(|tool| tool == expected),
+                    "missing {expected}"
+                );
+            }
+        }
+        let checkpoints = store
+            .checkpoints_for_run("run-standard-implementer")
+            .await
+            .unwrap();
+        assert_eq!(checkpoints.len(), 2);
+        let first: crate::implementer::ImplementerAttemptInput =
+            serde_json::from_str(checkpoints[0].input_json.as_deref().unwrap()).unwrap();
+        let second: crate::implementer::ImplementerAttemptInput =
+            serde_json::from_str(checkpoints[1].input_json.as_deref().unwrap()).unwrap();
+        assert!(first.diagnostic.is_none());
+        assert_eq!(
+            second.diagnostic.as_deref(),
+            Some("Fix the failing concurrent claim test.")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn implementer_stage_uses_host_resources_and_rejects_invalid_reports() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-implementer-resources-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let worktree = dir.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run(
+                "run-implementer-resources",
+                None,
+                RunStatus::Running.as_str(),
+            )
+            .await
+            .unwrap();
+        let config = RatatoskrConfig::default();
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-implementer-resources",
+            "add Store::claim",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let input = implementer_attempt_input(None);
+        let shell = ratatoskr_agent::shell::ShellAccess {
+            spec: ratatoskr_exec::SandboxSpec {
+                backend: "landlock".to_string(),
+                name: "implementer-test-shell".to_string(),
+                image: String::new(),
+                workdir: "/workspace".to_string(),
+                mounts: Vec::new(),
+                command: Vec::new(),
+                cpus: 1,
+                memory_mib: 64,
+                network: false,
+            },
+        };
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({ "summary": "implemented the claim" }).to_string(),
+            ..Default::default()
+        });
+        evaluate_standard_stage_with_resources_and_turn(
+            Arc::clone(&ctx),
+            "implementer_attempt",
+            serde_json::to_string(&input).unwrap(),
+            crate::implementer::render_attempt_prompt(&input),
+            StandardStageResources {
+                resource_root: worktree.clone(),
+                shell: Some(shell.clone()),
+                clarifier: Some(Arc::new(StaticClarifier)),
+                guidance: Some("# WHERE YOU ARE\nThis is the owned worktree.".to_string()),
+            },
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            turn.files.lock().expect("recording runner mutex poisoned")[0],
+            Some(worktree)
+        );
+        assert!(
+            turn.has_shell
+                .lock()
+                .expect("recording runner mutex poisoned")[0]
+        );
+        assert!(
+            turn.has_clarifier
+                .lock()
+                .expect("recording runner mutex poisoned")[0]
+        );
+        assert!(
+            turn.preambles
+                .lock()
+                .expect("recording runner mutex poisoned")[0]
+                .contains("This is the owned worktree")
+        );
+
+        let invalid = Arc::new(RecordingStageTurn {
+            output: json!({ "kind": "fix" }).to_string(),
+            ..Default::default()
+        });
+        let error = evaluate_standard_stage_with_resources_and_turn(
+            ctx,
+            "implementer_attempt",
+            serde_json::to_string(&input).unwrap(),
+            crate::implementer::render_attempt_prompt(&input),
+            StandardStageResources {
+                resource_root: dir.clone(),
+                shell: Some(shell),
+                clarifier: None,
+                guidance: None,
+            },
+            invalid,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("invalid `Report` output"), "{error}");
+        assert!(error.contains("summary"), "{error}");
+        assert!(
+            store
+                .checkpoints_for_run("run-implementer-resources")
+                .await
+                .unwrap()
+                .is_empty(),
+            "evidence invocations never own workflow checkpoints"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn standard_implementer_contract_matches_the_native_report_gate() {
+        let stages = standard_stages().await.unwrap();
+        let stage = stages
+            .iter()
+            .find(|stage| stage.id == "implementer_attempt")
+            .unwrap();
+        let mut declared = stage.output_schema.clone().unwrap();
+        let mut generated =
+            serde_json::to_value(schemars::schema_for!(crate::implementer::Report)).unwrap();
+        without_schema_annotations(&mut declared);
+        without_schema_annotations(&mut generated);
+        assert_eq!(declared, generated);
+    }
+
+    #[tokio::test]
+    async fn implementer_stage_migration_keeps_scripted_operation_guards() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-implementer-guards-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-implementer-guards", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let config = RatatoskrConfig::default();
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-implementer-guards",
+            "guard implementer lifecycle",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = standard_stages().await.unwrap();
+        let hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::new(RecordingStageTurn::default())).unwrap();
+        assert!(hosts.contains_key("implementer_attempt"));
+        assert!(hosts.contains_key("implement"));
+        assert!(hosts.contains_key("iterate"));
+
+        ctx.implement_started.store(true, Ordering::SeqCst);
+        let duplicate = implement_host(Arc::clone(&ctx), "{}".to_string())
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate, "implement() called more than once in a workflow");
+
+        let _held = ctx.iterate_lock.lock().await;
+        let overlap = iterate_host(Arc::clone(&ctx), "{}".to_string())
+            .await
+            .unwrap_err();
+        assert_eq!(overlap, "iterate() is already in progress");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

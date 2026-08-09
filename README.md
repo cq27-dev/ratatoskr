@@ -171,7 +171,7 @@ cargo run -p ratatoskr-cli -- serve --project ~/src/one --project ~/src/two
 
 Loopback — the default — needs no accounts: whoever can reach the port already owns the checkout.
 An instance other people can reach is different, because the dashboard can start runs, and a run
-drives a coding CLI against the repository and spends API credits.
+drives a tool-using model against the repository and spends API credits.
 
 Two things are gated. **Acting** — starting a run, answering a node's clarification — always needs
 an `operator` session, on every project. **Reading** needs a session too, unless the project was
