@@ -144,16 +144,13 @@ step in \`failing\`.`,
       outputContract: "Classification",
       outputSchema: schemaWithDefs(
         obj({
-          classifications: arr(
-            { "$ref": "#/$defs/FailureClassification" },
-            { default: [] },
-          ),
+          classifications: arr({ "$ref": "#/$defs/FailureClassification" }),
         }),
         {
           FailureClassification: obj(
             {
-              category: str({ default: "" }),
-              reason: str({ default: "" }),
+              category: str(),
+              reason: str(),
               test: str(),
             },
             ["test"],

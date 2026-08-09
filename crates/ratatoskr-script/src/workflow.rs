@@ -49,7 +49,7 @@ globalThis.str = Object.freeze(function (overrides) {
     return Object.assign({ type: "string" }, overrides || {});
 });
 globalThis.num = Object.freeze(function (overrides) {
-    return Object.assign({ type: "number" }, overrides || {});
+    return Object.assign({ type: "integer", minimum: 0 }, overrides || {});
 });
 globalThis.bool = Object.freeze(function (overrides) {
     return Object.assign({ type: "boolean" }, overrides || {});
@@ -828,7 +828,7 @@ mod tests {
                    outputSchema: schemaWithDefs(
                      obj({
                        finding: str(),
-                       confidence: num({ minimum: 0, maximum: 1 }),
+                       confidence: num({ maximum: 1 }),
                        blocking: bool(),
                        evidence: arr(str()),
                      }, ["finding", "confidence", "blocking", "evidence"]),
@@ -849,7 +849,10 @@ mod tests {
         assert_eq!(stage.instructions, "Review the declared result.");
         let schema = stage.output_schema.as_ref().unwrap();
         assert_eq!(schema["properties"]["finding"]["type"], "string");
-        assert_eq!(schema["properties"]["confidence"]["type"], "number");
+        assert_eq!(
+            schema["properties"]["confidence"],
+            serde_json::json!({ "type": "integer", "minimum": 0, "maximum": 1 })
+        );
         assert_eq!(schema["properties"]["blocking"]["type"], "boolean");
         assert_eq!(schema["properties"]["evidence"]["type"], "array");
         assert_eq!(schema["$defs"]["Note"]["required"][0], "text");

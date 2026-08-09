@@ -2615,6 +2615,23 @@ mod tests {
         }
     }
 
+    fn without_schema_defaults(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                object.remove("default");
+                for value in object.values_mut() {
+                    without_schema_defaults(value);
+                }
+            }
+            serde_json::Value::Array(array) => {
+                for value in array {
+                    without_schema_defaults(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
     #[tokio::test]
     async fn standard_analyst_contract_matches_the_typed_gate_and_rejects_missing_impact() {
         let stages = standard_stages().await.unwrap();
@@ -3311,6 +3328,15 @@ mod tests {
             let mut declared = stage.output_schema.clone().unwrap();
             without_schema_annotations(&mut generated);
             without_schema_annotations(&mut declared);
+            if stage_id == "redteam_classifier" {
+                let mut declared_without_defaults = declared.clone();
+                without_schema_defaults(&mut declared_without_defaults);
+                assert_eq!(
+                    declared, declared_without_defaults,
+                    "workflow schemas must not materialize output defaults"
+                );
+                without_schema_defaults(&mut generated);
+            }
             assert_eq!(declared, generated, "schema drift for {stage_id}");
         }
     }
