@@ -48,6 +48,7 @@ pub struct PublisherOutput {
 }
 
 /// What the publisher is given: the run, and what it produced.
+#[derive(Serialize)]
 pub struct PublisherInput {
     pub issue: String,
     pub analyst: AnalystOutput,
@@ -136,7 +137,7 @@ fn finished_clean(status: &str) -> bool {
     )
 }
 
-fn render_prompt(input: &PublisherInput) -> String {
+pub(crate) fn render_prompt(input: &PublisherInput) -> String {
     let mut s = String::new();
     let _ = write!(s, "THE TASK:\n{}\n\n", input.issue);
     let _ = writeln!(

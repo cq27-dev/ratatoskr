@@ -481,6 +481,87 @@ defineWorkflow({
       session: "compacted",
       appendRepositoryGuidance: false,
     }),
+    stage("publisher", {
+      agent: "publish",
+      inputContract: "PublisherInput",
+      outputContract: "PublisherOutput",
+      outputSchema: obj(
+        {
+          action: str(),
+          pull_request_url: str(),
+          comment_url: str(),
+          reasoning: str(),
+        },
+        ["action", "reasoning"],
+      ),
+      instructions: LOAD("prompts/publisher.md").trim(),
+      renderQuestion(input: any) {
+        let question = `THE TASK:\n${input.issue}\n\n`;
+        question +=
+          `OUTCOME: ${input.status} after ${input.iterations} implementer iteration(s).\n`;
+        if (!["converged", "no_code_change", "planned"].includes(input.status)) {
+          question +=
+            "THIS RUN DID NOT FINISH CLEAN. Whatever you write must say so in its own words, " +
+            "near the top, before anything it did well. The tests passing is not the same as the " +
+            "work being done.\n";
+        }
+        question += "\n";
+
+        if (input.unresolved.length > 0) {
+          question +=
+            "THE REVIEW STILL OBJECTED TO THIS. Report each one — a reviewer who finds it " +
+            "themselves has been misled by what you wrote:\n";
+          for (const finding of input.unresolved) {
+            question += `- [${finding.severity}] ${finding.summary}\n`;
+            if (finding.failure_scenario) {
+              question += `    ${finding.failure_scenario}\n`;
+            }
+          }
+          question += "\n";
+        }
+
+        const analyst = input.analyst;
+        if (analyst.impact_summary) {
+          question += `WHAT THE PLAN SAID:\n${analyst.impact_summary}\n\n`;
+        }
+        if (analyst.requirements.length > 0) {
+          question += "REQUIREMENTS IT WAS MEANT TO SATISFY:\n";
+          for (const requirement of analyst.requirements) {
+            question += `- ${requirement}\n`;
+          }
+          question += "\n";
+        }
+
+        const implementer = input.implementer;
+        if (implementer === null) {
+          question +=
+            "NO CODE WAS CHANGED. This run produced an answer, not a change — there is " +
+            "nothing to open a pull request for.\n";
+          return question;
+        }
+
+        question += `BRANCH: ${implementer.branch}\n`;
+        question += `WORKTREE: ${implementer.worktree_path}\n\n`;
+        if (implementer.touched_files.length > 0) {
+          question += `FILES CHANGED: ${implementer.touched_files.join(", ")}\n`;
+        }
+        if (implementer.diff_summary) {
+          question += `\nDIFF:\n${implementer.diff_summary}\n`;
+        }
+        question +=
+          `\nACCEPTANCE: ${implementer.failing_tests.length} failing, ` +
+          `${implementer.passed_tests} passing (exit ${implementer.exit_code}).\n`;
+        if (implementer.failing_tests.length > 0) {
+          question += `Still failing: ${implementer.failing_tests.join(", ")}\n`;
+        }
+        return question;
+      },
+      capabilities: ["publish"],
+      tools: ["gh", "git_push"],
+      // Preserve the selected TOML/profile/ruleset continuation policy.
+      session: null,
+      appendRepositoryGuidance: false,
+    }),
     stage("verifier", {
       agent: "explore",
       inputContract: "VerifierInput",

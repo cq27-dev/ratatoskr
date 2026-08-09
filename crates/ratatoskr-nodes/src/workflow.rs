@@ -61,6 +61,10 @@ const STANDARD_WORKFLOW_INCLUDES: &[(&str, &str)] = &[
         include_str!("../prompts/overseer.md"),
     ),
     (
+        "prompts/publisher.md",
+        include_str!("../prompts/publisher.md"),
+    ),
+    (
         "prompts/redteam-author.md",
         include_str!("../prompts/redteam-author.md"),
     ),
@@ -825,6 +829,7 @@ async fn verify_host(
                 rendered_question: Some(rendered_question),
                 resource_root: Some(worktree.0.clone()),
                 shell: None,
+                publish: None,
                 clarifier: None,
                 invocation_guidance: None,
                 output: StageOutput::Checkpoint,
@@ -887,6 +892,7 @@ async fn context_host(
             rendered_question: Some(rendered_question),
             resource_root: None,
             shell: None,
+            publish: None,
             clarifier: None,
             invocation_guidance: None,
             output: StageOutput::Evidence,
@@ -1036,6 +1042,7 @@ struct StageInvocation {
     rendered_question: Option<String>,
     resource_root: Option<PathBuf>,
     shell: Option<ratatoskr_agent::shell::ShellAccess>,
+    publish: Option<StandardStagePublishResources>,
     clarifier: Option<Arc<dyn ratatoskr_agent::Clarifier>>,
     invocation_guidance: Option<String>,
     output: StageOutput,
@@ -1063,6 +1070,7 @@ fn stage_invocation(stage: Stage, host_input_json: String) -> Result<StageInvoca
             rendered_question: None,
             resource_root: None,
             shell: None,
+            publish: None,
             clarifier: None,
             invocation_guidance: None,
             output: StageOutput::Checkpoint,
@@ -1077,6 +1085,7 @@ fn stage_invocation(stage: Stage, host_input_json: String) -> Result<StageInvoca
         rendered_question: Some(envelope.rendered.question),
         resource_root: None,
         shell: None,
+        publish: None,
         clarifier: None,
         invocation_guidance: None,
         output: StageOutput::Checkpoint,
@@ -1130,6 +1139,7 @@ impl StageExecutor {
             rendered_question,
             resource_root,
             shell,
+            publish,
             clarifier,
             invocation_guidance,
             output: disposition,
@@ -1167,6 +1177,31 @@ impl StageExecutor {
             .any(|tool| tool == ratatoskr_agent::ASK_TOOL_NAME)
         {
             offered.local().tools.push(crate::clarify::ask_tool());
+        }
+        if publish.is_some()
+            && stage
+                .tools
+                .iter()
+                .any(|tool| tool == ratatoskr_agent::publish::GH)
+        {
+            offered
+                .local()
+                .tools
+                .push(ratatoskr_agent::publish::declaration());
+        }
+        if publish
+            .as_ref()
+            .and_then(|publish| publish.push.as_ref())
+            .is_some()
+            && stage
+                .tools
+                .iter()
+                .any(|tool| tool == ratatoskr_agent::publish::PUSH)
+        {
+            offered
+                .local()
+                .tools
+                .push(ratatoskr_agent::publish::push_declaration());
         }
         let (mut cfg, profile) = crate::plugins::declared_stage_agent_config(
             &self.ctx.engine,
@@ -1208,6 +1243,7 @@ impl StageExecutor {
                 rendered_question: None,
                 resource_root: resource_root.clone(),
                 shell: None,
+                publish: None,
                 clarifier: None,
                 invocation_guidance: None,
                 output: StageOutput::Evidence,
@@ -1273,7 +1309,7 @@ impl StageExecutor {
                 skills: crate::skills::loaded(&plugins.skills, &governance_id),
                 files: resource_root.or(cfg.files),
                 shell,
-                push: None,
+                push: publish.and_then(|publish| publish.push),
                 conversation: Some(&conversation),
                 ledger: Some(Arc::clone(&self.ctx.ledger)),
                 produces: Some(&stage.output_contract),
@@ -1468,6 +1504,7 @@ pub(crate) async fn evaluate_standard_stage_at(
         StandardStageResources {
             resource_root,
             shell: None,
+            publish: None,
             clarifier: None,
             guidance: None,
         },
@@ -1483,8 +1520,17 @@ pub(crate) async fn evaluate_standard_stage_at(
 pub(crate) struct StandardStageResources {
     pub resource_root: PathBuf,
     pub shell: Option<ratatoskr_agent::shell::ShellAccess>,
+    pub publish: Option<StandardStagePublishResources>,
     pub clarifier: Option<Arc<dyn ratatoskr_agent::Clarifier>>,
     pub guidance: Option<String>,
+}
+
+/// External publish authority granted by Rust to one terminal stage invocation.
+///
+/// Merely declaring `gh` or `git_push` never installs their host implementations. This grant is
+/// what keeps a repository workflow from publishing before Rust has accepted a terminal outcome.
+pub(crate) struct StandardStagePublishResources {
+    pub push: Option<ratatoskr_agent::publish::PushAccess>,
 }
 
 pub(crate) async fn evaluate_standard_stage_with_resources(
@@ -1550,14 +1596,15 @@ async fn evaluate_standard_stage_with_turn_and_resources(
     resources: Option<StandardStageResources>,
     turn: Arc<dyn StageTurn>,
 ) -> Result<String, String> {
-    let (resource_root, shell, clarifier, invocation_guidance) = match resources {
+    let (resource_root, shell, publish, clarifier, invocation_guidance) = match resources {
         Some(resources) => (
             Some(resources.resource_root),
             resources.shell,
+            resources.publish,
             resources.clarifier,
             resources.guidance,
         ),
-        None => (None, None, None, None),
+        None => (None, None, None, None, None),
     };
     let stages = Arc::new(standard_stages().await.map_err(|error| error.to_string())?);
     let stage = stages
@@ -1572,6 +1619,7 @@ async fn evaluate_standard_stage_with_turn_and_resources(
             rendered_question: Some(rendered_question),
             resource_root,
             shell,
+            publish,
             clarifier,
             invocation_guidance,
             output: StageOutput::Evidence,
@@ -1581,6 +1629,9 @@ async fn evaluate_standard_stage_with_turn_and_resources(
 
 async fn execution_stages(runtime: &WorkflowRuntime) -> Result<Vec<Stage>, PlanError> {
     let mut stages = standard_stages().await?;
+    // Publishing is terminal external I/O, not a workflow operation. The declaration is executed
+    // only by the Rust terminal adapter, which supplies the invocation-scoped host authority.
+    stages.retain(|stage| stage.id != "publisher");
     stages.extend(crate::stage::stages_from_workflow(runtime.meta()));
     Ok(stages)
 }
@@ -1932,6 +1983,7 @@ mod tests {
         tools: Mutex<Vec<Vec<String>>>,
         files: Mutex<Vec<Option<std::path::PathBuf>>>,
         has_shell: Mutex<Vec<bool>>,
+        has_push: Mutex<Vec<bool>>,
         has_clarifier: Mutex<Vec<bool>>,
         preambles: Mutex<Vec<String>>,
         questions: Mutex<Vec<String>>,
@@ -1949,6 +2001,7 @@ mod tests {
                 tools: Mutex::new(Vec::new()),
                 files: Mutex::new(Vec::new()),
                 has_shell: Mutex::new(Vec::new()),
+                has_push: Mutex::new(Vec::new()),
                 has_clarifier: Mutex::new(Vec::new()),
                 preambles: Mutex::new(Vec::new()),
                 questions: Mutex::new(Vec::new()),
@@ -1996,6 +2049,10 @@ mod tests {
                 .lock()
                 .expect("recording runner mutex poisoned")
                 .push(run.shell.is_some());
+            self.has_push
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(run.push.is_some());
             self.has_clarifier
                 .lock()
                 .expect("recording runner mutex poisoned")
@@ -2078,6 +2135,7 @@ mod tests {
                 rendered_question: None,
                 resource_root: None,
                 shell: None,
+                publish: None,
                 clarifier: None,
                 invocation_guidance: None,
                 output: StageOutput::Evidence,
@@ -2655,6 +2713,7 @@ mod tests {
                 include_str!("../prompts/implementer.md"),
             ),
             ("overseer", include_str!("../prompts/overseer.md")),
+            ("publisher", include_str!("../prompts/publisher.md")),
             (
                 "redteam_author",
                 include_str!("../prompts/redteam-author.md"),
@@ -2682,6 +2741,259 @@ mod tests {
                 "workflow schema materializes output defaults for {stage_id}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn publisher_declaration_matches_its_typed_schema_and_rust_question() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-publisher-renderer-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            "async function run(input) { return await publisher(input); }",
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::load(&workflow_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let stages = standard_stages().await.unwrap();
+        assert!(
+            execution_stages(&runtime)
+                .await
+                .unwrap()
+                .iter()
+                .all(|stage| stage.id != "publisher"),
+            "repository workflows must not acquire terminal publish authority"
+        );
+        let publisher = stages.iter().find(|stage| stage.id == "publisher").unwrap();
+        assert_eq!(publisher.agent, "publish");
+        assert_eq!(
+            publisher.capabilities,
+            [ratatoskr_core::Capability::Publish]
+        );
+        assert_eq!(
+            publisher.tools,
+            [ratatoskr_agent::publish::GH, ratatoskr_agent::publish::PUSH]
+        );
+        assert_eq!(publisher.session, None);
+
+        let mut declared = publisher.output_schema.clone().unwrap();
+        let mut generated =
+            serde_json::to_value(schemars::schema_for!(crate::publisher::PublisherOutput)).unwrap();
+        without_schema_annotations(&mut declared);
+        without_schema_annotations(&mut generated);
+        assert_eq!(declared, generated, "schema drift for publisher");
+
+        let input = crate::publisher::PublisherInput {
+            issue: "GitHub issue #210: publish the result".to_string(),
+            analyst: AnalystOutput {
+                impact_summary: "keeps tracker links distinct".to_string(),
+                touched: vec!["crates/ratatoskr-nodes".to_string()],
+                risks: Vec::new(),
+                requirements: vec!["report the unresolved review".to_string()],
+                residual_risk: String::new(),
+                changes_code: true,
+                acceptance: Vec::new(),
+                interface: Vec::new(),
+            },
+            implementer: Some(ImplementerOutput {
+                worktree_path: "/tmp/ratatoskr/worktree".to_string(),
+                branch: "ratatoskr/publisher".to_string(),
+                diff_summary: " publisher.rs | 2 ++".to_string(),
+                touched_files: vec!["publisher.rs".to_string()],
+                rewritten_files: Vec::new(),
+                commit_kind: "fix".to_string(),
+                commit_scope: "publisher".to_string(),
+                commit_subject: "keep links distinct".to_string(),
+                failing_tests: vec!["publisher::links".to_string()],
+                passed_tests: 4,
+                exit_code: 101,
+                narrative: None,
+            }),
+            status: "max_iterations_reached".to_string(),
+            iterations: 2,
+            unresolved: vec![verifier::Finding {
+                severity: verifier::Severity::P2,
+                kind: verifier::FindingKind::Execution,
+                file: "publisher.rs".to_string(),
+                line: Some(12),
+                summary: "the URLs can still run together".to_string(),
+                failure_scenario: "both links are returned in one field".to_string(),
+            }],
+        };
+        let expected_question = crate::publisher::render_prompt(&input);
+        let input_json = serde_json::to_string(&input).unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        let capture = Arc::clone(&captured);
+        let host: HostFn = Arc::new(move |arg| {
+            let capture = Arc::clone(&capture);
+            Box::pin(async move {
+                *capture.lock().expect("publisher capture mutex poisoned") =
+                    Some(serde_json::from_str::<serde_json::Value>(&arg).unwrap());
+                Ok(json!({ "action": "none", "reasoning": "captured" }).to_string())
+            })
+        });
+        runtime
+            .run_with_question_renderers(
+                "run",
+                input_json,
+                HashMap::from([("publisher".to_string(), host)]),
+                stage_question_renderers(&stages),
+            )
+            .await
+            .unwrap();
+        let envelope = captured
+            .lock()
+            .expect("publisher capture mutex poisoned")
+            .take()
+            .unwrap();
+        assert_eq!(
+            envelope["__ratatoskrRenderedQuestion"]["question"],
+            expected_question
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn publisher_tools_require_a_rust_grant_and_invalid_output_is_not_checkpointed() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-publisher-authority-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-publisher-authority", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "publisher".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-publisher-authority",
+            "publish this",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = Arc::new(standard_stages().await.unwrap());
+        let publisher = stages
+            .iter()
+            .find(|stage| stage.id == "publisher")
+            .unwrap()
+            .clone();
+
+        let ungranted_turn = Arc::new(RecordingStageTurn {
+            output: json!({ "action": "none", "reasoning": "not granted" }).to_string(),
+            ..Default::default()
+        });
+        StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::clone(&stages),
+            Arc::clone(&ungranted_turn) as Arc<dyn StageTurn>,
+        )
+        .execute(StageInvocation {
+            stage: publisher.clone(),
+            input_json: "{}".to_string(),
+            rendered_question: Some("do not publish".to_string()),
+            resource_root: Some(dir.clone()),
+            shell: None,
+            publish: None,
+            clarifier: None,
+            invocation_guidance: None,
+            output: StageOutput::Evidence,
+        })
+        .await
+        .unwrap();
+        let ungranted_tools = ungranted_turn
+            .tools
+            .lock()
+            .expect("recording runner mutex poisoned")[0]
+            .clone();
+        assert!(!ungranted_tools.iter().any(|tool| {
+            tool == ratatoskr_agent::publish::GH || tool == ratatoskr_agent::publish::PUSH
+        }));
+        assert!(
+            !ungranted_turn
+                .has_push
+                .lock()
+                .expect("recording runner mutex poisoned")[0]
+        );
+
+        let invalid_turn = Arc::new(RecordingStageTurn {
+            output: json!({ "action": "none" }).to_string(),
+            ..Default::default()
+        });
+        let error = StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::clone(&stages),
+            Arc::clone(&invalid_turn) as Arc<dyn StageTurn>,
+        )
+        .execute(StageInvocation {
+            stage: publisher,
+            input_json: "{}".to_string(),
+            rendered_question: Some("publish".to_string()),
+            resource_root: Some(dir.clone()),
+            shell: None,
+            publish: Some(StandardStagePublishResources {
+                push: Some(ratatoskr_agent::publish::PushAccess {
+                    repo_root: dir.clone(),
+                    branch: "ratatoskr/publisher-authority".to_string(),
+                    issue: Some("GitHub issue #210".to_string()),
+                }),
+            }),
+            clarifier: None,
+            invocation_guidance: None,
+            output: StageOutput::Checkpoint,
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("invalid `PublisherOutput` output"),
+            "{error}"
+        );
+        let granted_tools = invalid_turn
+            .tools
+            .lock()
+            .expect("recording runner mutex poisoned")[0]
+            .clone();
+        assert!(granted_tools.contains(&ratatoskr_agent::publish::GH.to_string()));
+        assert!(granted_tools.contains(&ratatoskr_agent::publish::PUSH.to_string()));
+        assert!(
+            invalid_turn
+                .has_push
+                .lock()
+                .expect("recording runner mutex poisoned")[0]
+        );
+        assert!(
+            store
+                .checkpoints_for_run("run-publisher-authority")
+                .await
+                .unwrap()
+                .is_empty(),
+            "invalid output must not become a publisher result"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn without_schema_defaults(value: &mut serde_json::Value) {
@@ -3335,6 +3647,7 @@ mod tests {
             StandardStageResources {
                 resource_root: author_root.clone(),
                 shell: None,
+                publish: None,
                 clarifier: None,
                 guidance: None,
             },
@@ -3652,6 +3965,7 @@ mod tests {
             StandardStageResources {
                 resource_root: worktree.clone(),
                 shell: Some(shell.clone()),
+                publish: None,
                 clarifier: Some(Arc::new(StaticClarifier)),
                 guidance: Some("# WHERE YOU ARE\nThis is the owned worktree.".to_string()),
             },
@@ -3692,6 +4006,7 @@ mod tests {
             StandardStageResources {
                 resource_root: dir.clone(),
                 shell: Some(shell),
+                publish: None,
                 clarifier: None,
                 guidance: None,
             },

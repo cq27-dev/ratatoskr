@@ -1384,71 +1384,64 @@ async fn publish_and_checkpoint(
         config,
         store,
         run_id,
+        issue,
         engine,
         context,
         ledger,
         ..
     } = run;
-    let mut plugins = context.for_node("publisher");
-    let cfg = stage_agent_config(
-        engine,
-        config,
-        context.pool_for("publisher", client.map(|c| c.offer())),
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // Push is offered only when there is a branch to push, and only ever THAT branch: the access
+    // carries it, and what the tool takes is a name's parts, never a ref. A run with no fork has
+    // nothing to publish and is not given the tool at all.
+    let push = input
+        .implementer
+        .as_ref()
+        .map(|implementer| implementer.branch.clone())
+        .filter(|branch| ratatoskr_agent::publish::pushable(branch))
+        .map(|branch| ratatoskr_agent::publish::PushAccess {
+            repo_root: repo_root.clone(),
+            branch,
+            // From the run, not from the publisher: the number is what the branch is *for*, and it
+            // is not the naming step's to choose.
+            issue: Some(input.issue.clone()),
+        });
+    let input_json = serde_json::to_string(&input)?;
+    let rendered_question = publisher::render_prompt(&input);
+    let declared_context =
+        workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
+            client,
+            config,
+            store,
+            run_id,
+            issue,
+            engine,
+            plugin_context: context.clone(),
+            ledger: Arc::clone(ledger),
+        })?;
+    let raw = workflow::evaluate_standard_stage_with_resources(
+        declared_context,
         "publisher",
-        &[],
-        &mut plugins,
-    )?;
-    let may_publish = cfg.capability_ceiling == Some(ratatoskr_core::Capability::Publish);
-    let mut tools = cfg.tools;
-    let push = if may_publish {
-        // The tools that write outside this machine. Added here rather than in the default list so no
-        // other node can be handed one by widening a shared constant.
-        tools
-            .local()
-            .tools
-            .push(ratatoskr_agent::publish::declaration());
-
-        // Push is offered only when there is a branch to push, and only ever THAT branch: the access
-        // carries it, and what the tool takes is a name's parts, never a ref. A run with no fork has
-        // nothing to publish and is not given the tool at all.
-        let push = input
-            .implementer
-            .as_ref()
-            .map(|im| im.branch.clone())
-            .filter(|b| ratatoskr_agent::publish::pushable(b))
-            .map(|branch| ratatoskr_agent::publish::PushAccess {
-                repo_root: cfg.files.clone().unwrap_or_else(|| ".".into()),
-                branch,
-                // From the run, not from the publisher: the number is what the branch is *for*, and
-                // it is not the naming step's to choose.
-                issue: Some(input.issue.clone()),
-            });
-        if push.is_some() {
-            tools
-                .local()
-                .tools
-                .push(ratatoskr_agent::publish::push_declaration());
-        }
-        push
-    } else {
-        None
-    };
-
-    let node = PublisherNode {
-        push,
-        route: cfg.route,
-        tools,
-        policy: cfg.policy,
-        max_turns: cfg.max_turns,
-        system_prompt: cfg.system_prompt,
-        plugins,
-        ledger: Some(Arc::clone(ledger)),
-        files: cfg.files,
-    };
-    let out = node
-        .run(input)
-        .await
-        .map_err(|e| PlanError::node("publisher", e))?;
+        input_json,
+        rendered_question,
+        workflow::StandardStageResources {
+            resource_root: repo_root,
+            shell: None,
+            publish: Some(workflow::StandardStagePublishResources { push }),
+            clarifier: None,
+            guidance: None,
+        },
+    )
+    .await
+    .map_err(|error| PlanError::node("publisher", NodeError::Failed(error)))?;
+    let out: PublisherOutput = serde_json::from_str(&raw).map_err(|error| {
+        PlanError::node(
+            "publisher",
+            NodeError::Failed(format!(
+                "publisher output could not be reconstructed: {error}"
+            )),
+        )
+    })?;
     record(Record {
         store,
         run_id,
