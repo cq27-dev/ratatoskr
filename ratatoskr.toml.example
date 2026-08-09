@@ -54,8 +54,13 @@ model = "kimi-k2.5"
 # conservative 120k of history, which is safe on anything but summarises early on a large model.
 # Ask the endpoint rather than guessing — most report it (`/v1/models` carries `context_window` or
 # `context_length`), and a window declared larger than the model's turns a compaction into a
-# context-length error. Declaring one *smaller* is fine and sometimes right: the budget bounds
-# correctness, not spend, and history is paid for on every turn.
+# context-length error.
+#
+# Declaring one *smaller* is fine and sometimes the only sensible reading. Some providers price a
+# request above a threshold well below the model's window: OpenAI's Codex charges 2x input and
+# 1.5x output on the WHOLE request once it passes 272,000 input tokens, against a window of over a
+# million. Sized against the ceiling, a node would drift across that line and double its own bill
+# without anything looking wrong. Size against the cliff.
 #
 # A route may also set `temperature`, and `params` for anything the provider takes that this
 # config has no word for. `params` is merged into the request verbatim — which means the spelling
