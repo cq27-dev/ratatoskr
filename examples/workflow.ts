@@ -11,7 +11,8 @@
 // Bindings (all async except the pure converge helpers):
 //   scout(issue) -> ScoutOutput
 //   memory({issue, context}) -> MemoryOutput
-//   analyze({issue, scout, memory}) -> AnalystOutput
+//   analyst({issue, scout, memory}) -> AnalystOutput
+//   analyze({issue, scout, memory}) -> AnalystOutput // legacy compatibility alias
 //   redTeam() -> RedTeamOutput                     // baseline; throws if it ran no tests
 //   implement({analyst}) -> ImplementerOutput      // creates the worktree (once)
 //   iterate({}) -> ImplementerOutput               // re-drives the CLI on that worktree
@@ -20,7 +21,7 @@
 // `verify()` returns { configured, unavailable, findings, blocking, needsReplan }. Rust applies
 // `[implementer] verify_threshold` — a script decides *whether* to review and what to do about
 // findings, never what counts as blocking. `needsReplan` means a blocking finding faults the PLAN,
-// so the useful response is `analyze({...., previous, findings})` before `iterate()`, rather than
+// so the useful response is `analyst({...., previous, findings})` before `iterate()`, rather than
 // re-driving the implementer at a requirement already shown to be wrong.
 //
 // A run that calls verify() and returns with blocking findings standing does NOT converge: the
@@ -74,7 +75,7 @@ async function plan(input: { issue: string }) {
     issue: input.issue,
     context: `${scoutOut.papertrail_summary}\n\nRequirements:\n${requirementsOut.summary}`,
   });
-  const analystOut = await analyze({ issue: input.issue, scout: scoutOut, memory: memoryOut });
+  const analystOut = await analyst({ issue: input.issue, scout: scoutOut, memory: memoryOut });
   return { requirements: requirementsOut, scout: scoutOut, memory: memoryOut, analyst: analystOut };
 }
 
@@ -86,7 +87,7 @@ async function run(input: { issue: string; maxIterations: number }) {
     issue: input.issue,
     context: `${scoutOut.papertrail_summary}\n\nRequirements:\n${requirementsOut.summary}`,
   });
-  const analystOut = await analyze({ issue: input.issue, scout: scoutOut, memory: memoryOut });
+  const analystOut = await analyst({ issue: input.issue, scout: scoutOut, memory: memoryOut });
 
   // Fork: both run concurrently off the frozen post-analyst state.
   const [redTeamOut, first] = await Promise.all([redTeam(), implement({ analyst: analystOut })]);

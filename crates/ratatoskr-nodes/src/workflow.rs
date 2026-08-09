@@ -414,7 +414,7 @@ async fn note<T: serde::Serialize>(
 
 async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String, String> {
     ctx.guard()?;
-    // A script may call `redTeam()` before or after `analyze()`. When a plan exists, its acceptance
+    // A script may call `redTeam()` before or after `analyst()`. When a plan exists, its acceptance
     // is what the baseline is measured with; otherwise the configured command stands in.
     let planned = latest_checkpoint::<AnalystOutput>(&ctx.store, &ctx.run_id, "analyst")
         .await
@@ -1135,7 +1135,7 @@ impl StageExecutor {
 enum TemporaryOperation {
     Context,
     Memory,
-    Analyst,
+    Analyze,
     RedTeam,
     Implement,
     Iterate,
@@ -1150,7 +1150,7 @@ impl TemporaryOperation {
         match self {
             Self::Context => binding(Arc::clone(ctx), context_host),
             Self::Memory => binding(Arc::clone(ctx), memory_host),
-            Self::Analyst => binding(Arc::clone(ctx), analyze_host),
+            Self::Analyze => binding(Arc::clone(ctx), analyze_host),
             Self::RedTeam => binding(Arc::clone(ctx), red_team_host),
             Self::Implement => binding(Arc::clone(ctx), implement_host),
             Self::Iterate => binding(Arc::clone(ctx), iterate_host),
@@ -1165,8 +1165,7 @@ impl TemporaryOperation {
 const TEMPORARY_OPERATIONS: &[(&str, TemporaryOperation)] = &[
     ("context", TemporaryOperation::Context),
     ("memory", TemporaryOperation::Memory),
-    ("analyst", TemporaryOperation::Analyst),
-    ("analyze", TemporaryOperation::Analyst),
+    ("analyze", TemporaryOperation::Analyze),
     ("red_team", TemporaryOperation::RedTeam),
     ("redTeam", TemporaryOperation::RedTeam),
     ("implementer", TemporaryOperation::Implement),
@@ -1594,6 +1593,8 @@ mod tests {
     struct RecordingStageTurn {
         sessions: Mutex<Vec<ratatoskr_core::SessionScope>>,
         nodes: Mutex<Vec<String>>,
+        conversations: Mutex<Vec<Option<String>>>,
+        ledger_ids: Mutex<Vec<Option<usize>>>,
         tools: Mutex<Vec<Vec<String>>>,
         preambles: Mutex<Vec<String>>,
         questions: Mutex<Vec<String>>,
@@ -1606,6 +1607,8 @@ mod tests {
             Self {
                 sessions: Mutex::new(Vec::new()),
                 nodes: Mutex::new(Vec::new()),
+                conversations: Mutex::new(Vec::new()),
+                ledger_ids: Mutex::new(Vec::new()),
                 tools: Mutex::new(Vec::new()),
                 preambles: Mutex::new(Vec::new()),
                 questions: Mutex::new(Vec::new()),
@@ -1629,6 +1632,18 @@ mod tests {
                 .lock()
                 .expect("recording runner mutex poisoned")
                 .push(run.node.to_string());
+            self.conversations
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(run.conversation.map(str::to_string));
+            self.ledger_ids
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(
+                    run.ledger
+                        .as_ref()
+                        .map(|ledger| Arc::as_ptr(ledger) as usize),
+                );
             self.tools
                 .lock()
                 .expect("recording runner mutex poisoned")
@@ -1902,23 +1917,30 @@ mod tests {
                 "missing operation adapter `{name}`"
             );
         }
+        assert!(
+            !hosts.contains_key("analyst"),
+            "the canonical analyst id belongs to the declarative stage"
+        );
+        let error = hosts["analyze"]("{}".to_string()).await.unwrap_err();
+        assert!(
+            error.contains("analyze arg"),
+            "legacy alias changed: {error}"
+        );
 
         ctx.invocations.store(INVOCATION_CEILING, Ordering::Relaxed);
         let error = hosts["memory"]("{}".to_string()).await.unwrap_err();
         assert!(error.contains("runaway loop"));
 
-        let analyst = crate::built_in_stages()
+        let verifier = crate::built_in_stages()
             .into_iter()
-            .find(|stage| stage.id == "analyst")
+            .find(|stage| stage.id == "verifier")
             .unwrap();
-        let error = match build_hosts_with_turn(
-            &ctx,
-            &[analyst],
-            Arc::new(RecordingStageTurn::default()),
-        ) {
-            Ok(_) => panic!("a declared stage replaced a temporary operation adapter"),
-            Err(error) => error,
-        };
+        let error =
+            match build_hosts_with_turn(&ctx, &[verifier], Arc::new(RecordingStageTurn::default()))
+            {
+                Ok(_) => panic!("a declared stage replaced a temporary operation adapter"),
+                Err(error) => error,
+            };
         assert!(error.to_string().contains("legacy workflow operation"));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2037,6 +2059,264 @@ mod tests {
             .expect("recording runner mutex poisoned")[0];
         assert!(question.ends_with(r#""find prior work""#));
         assert!(!preamble.contains("find prior work"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn standard_analyst_renders_revisions_and_reuses_its_compacted_run_session() {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-standard-analyst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"async function plan(input) {
+                 await analyst(input.fresh);
+                 return await analyst(input.revision);
+               }"#,
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::load(&workflow_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let rules_dir = dir.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        let engine = ScriptEngine::load(&rules_dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-standard-analyst", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.get_mut("analyst").unwrap().session = ratatoskr_core::SessionScope::Fresh;
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-standard-analyst",
+            "preserve the contract",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = standard_stages().await.unwrap();
+        let analyst = stages.iter().find(|stage| stage.id == "analyst").unwrap();
+        assert_eq!(
+            analyst.session,
+            Some(ratatoskr_core::SessionScope::Compacted)
+        );
+        assert_eq!(analyst.capabilities, [ratatoskr_core::Capability::Read]);
+        assert_eq!(
+            analyst.tools,
+            ["impact_surface", "symbol_lookup", "semantic_search"]
+        );
+
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({ "impact_summary": "preserve the interface" }).to_string(),
+            ..Default::default()
+        });
+        let hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        let fresh = json!({
+            "issue": "preserve the contract",
+            "brief": "The writer is single-owner.",
+            "constraints": [{
+                "says": "Keep one writer",
+                "from_memory_id": "mem_writer"
+            }],
+            "scout": {
+                "related_items": [],
+                "papertrail_summary": "The existing plan introduced Store::claim."
+            },
+            "memory": { "memories": [] }
+        });
+        let revision = json!({
+            "issue": "preserve the contract",
+            "brief": "The writer is single-owner.",
+            "constraints": [],
+            "scout": {
+                "related_items": [],
+                "papertrail_summary": "The existing plan introduced Store::claim."
+            },
+            "memory": { "memories": [] },
+            "previous": {
+                "impact_summary": "Add a claim operation.",
+                "requirements": ["Keep one writer"],
+                "interface": [{
+                    "name": "Store::claim",
+                    "shape": "fn claim(&self, run: &str) -> Result<Claim, StoreError>",
+                    "happy": ["an unclaimed run yields a Claim"],
+                    "sad": ["a claimed run errors rather than blocking"]
+                }]
+            },
+            "findings": [{
+                "severity": "P1",
+                "kind": "plan",
+                "file": "crates/store.rs",
+                "summary": "The retry contract was omitted",
+                "failure_scenario": "a second claim waits forever"
+            }]
+        });
+        runtime
+            .run_with_question_renderers(
+                "plan",
+                json!({ "fresh": fresh, "revision": revision }).to_string(),
+                hosts,
+                stage_question_renderers(&stages),
+            )
+            .await
+            .unwrap();
+
+        {
+            let questions = turn
+                .questions
+                .lock()
+                .expect("recording runner mutex poisoned");
+            assert_eq!(questions.len(), 2);
+            assert!(questions[0].contains("ISSUE:\npreserve the contract"));
+            assert!(questions[0].contains("WHAT BEARS ON THIS:\nThe writer is single-owner."));
+            assert!(questions[0].contains("Keep one writer [mem_writer]"));
+            assert!(!questions[0].contains("THIS IS A REVISION"));
+            assert!(questions[1].contains("THIS IS A REVISION"));
+            assert!(questions[1].contains("Tests are already written against it"));
+            assert!(questions[1].contains("Store::claim"));
+            assert!(questions[1].contains("fn claim(&self, run: &str)"));
+            assert!(questions[1].contains("happy: an unclaimed run yields a Claim"));
+            assert!(questions[1].contains("sad: a claimed run errors rather than blocking"));
+            assert!(questions[1].contains("[P1] (crates/store.rs) The retry contract was omitted"));
+        }
+        assert_eq!(
+            *turn
+                .sessions
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            [
+                ratatoskr_core::SessionScope::Compacted,
+                ratatoskr_core::SessionScope::Compacted
+            ],
+            "the declared stage session must override the fresh TOML route"
+        );
+        assert_eq!(
+            *turn
+                .conversations
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            [
+                Some("run-standard-analyst-analyst".to_string()),
+                Some("run-standard-analyst-analyst".to_string())
+            ]
+        );
+        {
+            let ledger_ids = turn
+                .ledger_ids
+                .lock()
+                .expect("recording runner mutex poisoned");
+            assert_eq!(ledger_ids.len(), 2);
+            assert_eq!(ledger_ids[0], ledger_ids[1]);
+            assert!(ledger_ids[0].is_some());
+        }
+
+        let checkpoints = store
+            .checkpoints_for_run("run-standard-analyst")
+            .await
+            .unwrap();
+        assert_eq!(checkpoints.len(), 2);
+        assert!(checkpoints.iter().all(|row| row.node_name == "analyst"));
+        let first: analyst::AnalystInput =
+            serde_json::from_str(checkpoints[0].input_json.as_deref().unwrap()).unwrap();
+        assert_eq!(first.issue, "preserve the contract");
+        assert!(first.previous.is_none());
+        let second: analyst::AnalystInput =
+            serde_json::from_str(checkpoints[1].input_json.as_deref().unwrap()).unwrap();
+        assert_eq!(second.previous.unwrap().interface[0].name, "Store::claim");
+        assert_eq!(second.findings[0].summary, "The retry contract was omitted");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn without_schema_annotations(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                object.remove("$schema");
+                object.remove("title");
+                object.remove("description");
+                for value in object.values_mut() {
+                    without_schema_annotations(value);
+                }
+            }
+            serde_json::Value::Array(array) => {
+                for value in array {
+                    without_schema_annotations(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_analyst_contract_matches_the_typed_gate_and_rejects_missing_impact() {
+        let stages = standard_stages().await.unwrap();
+        let analyst_stage = stages.iter().find(|stage| stage.id == "analyst").unwrap();
+        assert_eq!(
+            analyst_stage.instructions,
+            include_str!("../prompts/analyst.md").trim()
+        );
+        let mut generated =
+            serde_json::to_value(schemars::schema_for!(analyst::AnalystOutput)).unwrap();
+        without_schema_annotations(&mut generated);
+        assert_eq!(analyst_stage.output_schema.as_ref().unwrap(), &generated);
+
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-analyst-schema-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-analyst-schema", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let config = RatatoskrConfig::default();
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-analyst-schema",
+            "validate this",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let turn = Arc::new(RecordingStageTurn::default());
+        let mut hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        let envelope = json!({
+            "__ratatoskrRenderedQuestion": {
+                "input": {
+                    "issue": "validate this",
+                    "scout": { "related_items": [], "papertrail_summary": "none" },
+                    "memory": { "memories": [] }
+                },
+                "question": "ISSUE:\nvalidate this"
+            }
+        })
+        .to_string();
+        let error = hosts.remove("analyst").unwrap()(envelope)
+            .await
+            .unwrap_err();
+        assert!(error.contains("invalid `AnalystOutput` output"), "{error}");
+        assert!(error.contains("impact_summary"), "{error}");
+        assert!(
+            store
+                .checkpoints_for_run("run-analyst-schema")
+                .await
+                .unwrap()
+                .is_empty(),
+            "invalid output must not be checkpointed"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
