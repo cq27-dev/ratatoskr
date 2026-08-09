@@ -417,8 +417,8 @@ rename to src/new.rs
         // model call would have to error — an Ok here can only come from short-circuiting first.
         //
         // Field reading of the contract: `RefereeInput { issue, requirements, hunks, candidates }`
-        // as String / Vec<String> / String / Vec<String>, and the node built with VerifierNode's
-        // shape (all fields public, tools/ledger/files optional).
+        // as String / Vec<String> / String / Vec<String>, with the fixed referee retaining its own
+        // private route, tool, and ledger fields.
         let node = RefereeNode::fixed(
             ratatoskr_core::ModelRoute {
                 context_window: None,

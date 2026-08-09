@@ -11,17 +11,14 @@
 
 use std::fmt::Write as _;
 
-use ratatoskr_core::ModelRoute;
-use ratatoskr_graph::{NodeError, parse_validated};
-use ratatoskr_mcp::ToolSet;
+#[cfg(test)]
+use ratatoskr_graph::parse_validated;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// rag-rat tools the overseer may use. It reads the task, not the repository — but a task that
 /// names an issue is worth resolving before deciding what kind of work it is.
 pub const OVERSEER_TOOLS: &[&str] = &["papertrail_issue_search", "semantic_search"];
-
-const PREAMBLE: &str = include_str!("../prompts/overseer.md");
 
 /// One workflow, as the overseer is shown it.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -47,56 +44,6 @@ pub struct OverseerOutput {
     /// Why this task fits that workflow. Recorded and read by a human when a run went somewhere
     /// unexpected, so it has to name what in the task drove the choice.
     pub reasoning: String,
-}
-
-/// The overseer node.
-pub struct OverseerNode {
-    pub route: ModelRoute,
-    pub tools: ToolSet,
-    pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
-    pub max_turns: Option<usize>,
-    /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
-    pub system_prompt: Option<String>,
-    pub plugins: crate::NodePlugins,
-    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
-    pub files: Option<std::path::PathBuf>,
-}
-
-impl OverseerNode {
-    pub async fn run(&self, issue: &str, choices: &[Choice]) -> Result<OverseerOutput, NodeError> {
-        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-            node: "overseer",
-            route: &self.route,
-            preamble: &crate::effective_preamble_with_profile(
-                "overseer",
-                PREAMBLE,
-                self.plugins.profile_prompt.as_str(),
-                self.system_prompt.as_deref(),
-                self.plugins.context.as_deref(),
-                &self.plugins.skills,
-            ),
-            question: &render_prompt(issue, choices),
-            tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(OverseerOutput),
-            policy: self.policy.clone(),
-            max_turns: self.max_turns,
-            // It chooses before any node exists to ask. There is nobody to clarify with.
-            clarifier: None,
-            observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills, "overseer"),
-            files: self.files.clone(),
-            // Reads and edits, but runs nothing.
-            shell: None,
-            push: None,
-            conversation: None,
-            ledger: self.ledger.clone(),
-            produces: Some("the name of the workflow to run, and why this task fits it"),
-        })
-        .await
-        .map_err(|e| NodeError::Failed(format!("overseer agent failed: {e}")))?;
-
-        parse_validated::<OverseerOutput>(&raw)
-    }
 }
 
 pub(crate) fn render_prompt(issue: &str, choices: &[Choice]) -> String {

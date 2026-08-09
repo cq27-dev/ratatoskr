@@ -12,7 +12,6 @@
 //   scout(issue) -> ScoutOutput
 //   memory({issue, context}) -> MemoryOutput
 //   analyst({issue, scout, memory}) -> AnalystOutput
-//   analyze({issue, scout, memory}) -> AnalystOutput // legacy compatibility alias
 //   redTeam() -> RedTeamOutput                     // baseline; throws if it ran no tests
 //   implement({analyst}) -> ImplementerOutput      // creates the worktree (once)
 //   iterate({}) -> ImplementerOutput               // re-drives the CLI on that worktree

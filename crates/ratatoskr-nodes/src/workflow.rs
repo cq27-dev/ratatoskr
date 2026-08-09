@@ -33,10 +33,10 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use crate::{
-    AnalystNode, AnalystOutput, BookkeeperInput, BookkeeperOutput, ChildTask, ImplementerNode,
+    AnalystOutput, BookkeeperInput, BookkeeperOutput, ChildTask, ImplementerNode,
     ImplementerOutput, MemoryNode, MemoryOutput, PlanError, PlanOutcome, RedTeamNode,
-    RedTeamOutput, RunOutcome, ScoutOutput, Stage, analyst, bookkeeper, checkpoint, converge,
-    memory, redteam, referee, stage_agent_config, verifier,
+    RedTeamOutput, RunOutcome, ScoutOutput, Stage, bookkeeper, checkpoint, converge, memory,
+    redteam, referee, stage_agent_config, verifier,
 };
 
 /// Backstop on total node-running binding calls per run — a runaway-loop guard, far above any real
@@ -372,40 +372,6 @@ async fn memory_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, S
         .await
         .map_err(|e| e.to_string())?;
     note(&ctx, "memory", &out, Some(arg)).await?;
-    serde_json::to_string(&out).map_err(|e| e.to_string())
-}
-
-async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
-    ctx.guard()?;
-    let input: analyst::AnalystInput =
-        serde_json::from_str(&arg).map_err(|e| format!("analyze arg: {e}"))?;
-    let mut plugins = ctx.plugin_context.for_node("analyst");
-    let cfg = stage_agent_config(
-        &ctx.engine,
-        &ctx.config,
-        ctx.plugin_context.pool_for("analyst", ctx.rag_rat.clone()),
-        "analyst",
-        analyst::ANALYST_TOOLS,
-        &mut plugins,
-    )
-    .map_err(|e| e.to_string())?;
-    let node = AnalystNode {
-        // A revision continues the plan it revises, when the route asks for that.
-        conversation: Some(format!("{}-analyst", ctx.run_id)),
-        route: cfg.route,
-        tools: cfg.tools,
-        files: cfg.files,
-        ledger: Some(Arc::clone(&ctx.ledger)),
-        policy: cfg.policy,
-        max_turns: cfg.max_turns,
-        system_prompt: cfg.system_prompt,
-        plugins,
-    };
-    let out = node
-        .run(input, &RunState::new(&ctx.run_id, None))
-        .await
-        .map_err(|e| e.to_string())?;
-    note(&ctx, "analyst", &out, Some(arg)).await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -1337,7 +1303,6 @@ impl StageExecutor {
 enum TemporaryOperation {
     Context,
     Memory,
-    Analyze,
     RedTeam,
     Implement,
     Iterate,
@@ -1360,7 +1325,6 @@ impl TemporaryOperation {
                 })
             }
             Self::Memory => binding(Arc::clone(ctx), memory_host),
-            Self::Analyze => binding(Arc::clone(ctx), analyze_host),
             Self::RedTeam => binding(Arc::clone(ctx), red_team_host),
             Self::Implement => binding(Arc::clone(ctx), implement_host),
             Self::Iterate => binding(Arc::clone(ctx), iterate_host),
@@ -1383,7 +1347,6 @@ impl TemporaryOperation {
 const TEMPORARY_OPERATIONS: &[(&str, TemporaryOperation)] = &[
     ("context", TemporaryOperation::Context),
     ("memory", TemporaryOperation::Memory),
-    ("analyze", TemporaryOperation::Analyze),
     ("red_team", TemporaryOperation::RedTeam),
     ("redTeam", TemporaryOperation::RedTeam),
     ("implementer", TemporaryOperation::Implement),
@@ -1892,6 +1855,7 @@ async fn bookkeep_scripted(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyst;
 
     fn red(failing: &[&str], passing: &[&str], exit: i32) -> RedTeamOutput {
         RedTeamOutput {
@@ -2373,10 +2337,9 @@ mod tests {
             !hosts.contains_key("verifier"),
             "the canonical verifier id belongs to the declarative stage"
         );
-        let error = hosts["analyze"]("{}".to_string()).await.unwrap_err();
         assert!(
-            error.contains("analyze arg"),
-            "legacy alias changed: {error}"
+            !hosts.contains_key("analyze"),
+            "the direct analyst compatibility path must not remain registered"
         );
         let error = hosts["verify"]("{}".to_string()).await.unwrap_err();
         assert!(

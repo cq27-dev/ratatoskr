@@ -12,16 +12,13 @@
 
 use std::fmt::Write as _;
 
-use ratatoskr_core::ModelRoute;
-use ratatoskr_graph::{NodeError, parse_validated};
-use ratatoskr_mcp::ToolSet;
+#[cfg(test)]
+use ratatoskr_graph::parse_validated;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::analyst::AnalystOutput;
 use crate::implementer::ImplementerOutput;
-
-const PREAMBLE: &str = include_str!("../prompts/publisher.md");
 
 /// What the publisher did.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -64,59 +61,6 @@ pub struct PublisherInput {
     /// `max_iterations_reached` means — and a pull request written from the test result alone
     /// reads as a clean landing.
     pub unresolved: Vec<crate::verifier::Finding>,
-}
-
-/// The publisher node.
-pub struct PublisherNode {
-    pub route: ModelRoute,
-    pub tools: ToolSet,
-    pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
-    pub max_turns: Option<usize>,
-    /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
-    pub system_prompt: Option<String>,
-    pub plugins: crate::NodePlugins,
-    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
-    /// The repository `gh` runs in. Also what roots the file tools it reads the diff with.
-    pub files: Option<std::path::PathBuf>,
-    /// The one branch this run may push, when it has one. `None` leaves the node without the tool.
-    pub push: Option<ratatoskr_agent::publish::PushAccess>,
-}
-
-impl PublisherNode {
-    pub async fn run(&self, input: PublisherInput) -> Result<PublisherOutput, NodeError> {
-        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-            node: "publisher",
-            route: &self.route,
-            preamble: &crate::effective_preamble_with_profile(
-                "publisher",
-                PREAMBLE,
-                self.plugins.profile_prompt.as_str(),
-                self.system_prompt.as_deref(),
-                self.plugins.context.as_deref(),
-                &self.plugins.skills,
-            ),
-            question: &render_prompt(&input),
-            tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(PublisherOutput),
-            policy: self.policy.clone(),
-            max_turns: self.max_turns,
-            // It runs after everything that could answer it has finished.
-            clarifier: None,
-            observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills, "publisher"),
-            files: self.files.clone(),
-            // Reads and edits, but runs nothing.
-            shell: None,
-            push: self.push.clone(),
-            conversation: None,
-            ledger: self.ledger.clone(),
-            produces: Some("what was published, where, and why"),
-        })
-        .await
-        .map_err(|e| NodeError::Failed(format!("publisher agent failed: {e}")))?;
-
-        parse_validated::<PublisherOutput>(&raw)
-    }
 }
 
 /// Whether the run ended having done what it set out to do.

@@ -33,22 +33,22 @@ pub use plugins::{NodePlugins, PluginContext};
 #[cfg(test)]
 use plugins::{default_allow, servers_to_start};
 
-pub use analyst::{AnalystNode, AnalystOutput};
-pub use bookkeeper::{BookkeeperInput, BookkeeperNode, BookkeeperOutput, MemoryWritten};
+pub use analyst::AnalystOutput;
+pub use bookkeeper::{BookkeeperInput, BookkeeperOutput, MemoryWritten};
 pub use child::ChildTask;
 pub use context::{Constraint, ContextNode, ContextOutput};
 pub use implementer::{ImplementerNode, ImplementerOutput};
 pub use memory::{MemoryNode, MemoryOutput, MemoryRecord};
-pub use overseer::{OverseerNode, OverseerOutput};
-pub use publisher::{PublisherNode, PublisherOutput};
+pub use overseer::OverseerOutput;
+pub use publisher::PublisherOutput;
 pub use redteam::{RedTeamNode, RedTeamOutput};
 pub use referee::{RefereeNode, RefereeOutput, Violation};
-pub use scout::{RelatedItem, ScoutNode, ScoutOutput};
+pub use scout::{RelatedItem, ScoutOutput};
 pub use stage::{
     AgentProfile, Delegation, Stage, agent_profiles, built_in_agents, built_in_stages,
 };
 pub use validate::validate;
-pub use verifier::{Finding, FindingKind, Severity, VerifierNode, VerifierOutput};
+pub use verifier::{Finding, FindingKind, Severity, VerifierOutput};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1179,6 +1179,45 @@ mod migrated_stage_path_tests {
         assert!(
             !built_in.contains(concat!("verifier::Verifier", "Node {")),
             "the built-in review must not construct the compatibility verifier wrapper"
+        );
+
+        for (component, source, wrapper) in [
+            (
+                "analyst",
+                include_str!("analyst.rs"),
+                concat!("Analyst", "Node"),
+            ),
+            (
+                "bookkeeper",
+                include_str!("bookkeeper.rs"),
+                concat!("Bookkeeper", "Node"),
+            ),
+            (
+                "overseer",
+                include_str!("overseer.rs"),
+                concat!("Overseer", "Node"),
+            ),
+            (
+                "publisher",
+                include_str!("publisher.rs"),
+                concat!("Publisher", "Node"),
+            ),
+            ("scout", include_str!("scout.rs"), concat!("Scout", "Node")),
+            (
+                "verifier",
+                include_str!("verifier.rs"),
+                concat!("Verifier", "Node"),
+            ),
+        ] {
+            assert!(
+                !source.contains(wrapper),
+                "{component} must not retain an obsolete direct model wrapper"
+            );
+        }
+
+        assert!(
+            !include_str!("workflow.rs").contains(concat!("(\"analy", "ze\",")),
+            "the direct analyst compatibility operation must remain removed"
         );
     }
 }
@@ -3704,7 +3743,7 @@ mod agent_config_tests {
             &config,
             ToolSet::default(),
             "analyst",
-            analyst::ANALYST_TOOLS,
+            &["impact_surface", "symbol_lookup", "semantic_search"],
             &mut NodePlugins::default(),
         )
         .unwrap();
@@ -3848,7 +3887,7 @@ mod agent_config_tests {
             &RatatoskrConfig::default(),
             ToolSet::default(),
             "analyst",
-            analyst::ANALYST_TOOLS,
+            &["impact_surface", "symbol_lookup", "semantic_search"],
             &mut NodePlugins::default(),
         )
         .unwrap();

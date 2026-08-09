@@ -7,8 +7,9 @@
 
 use std::fmt::Write as _;
 
-use ratatoskr_graph::{NodeError, parse_validated};
-use ratatoskr_mcp::ToolSet;
+use ratatoskr_graph::NodeError;
+#[cfg(test)]
+use ratatoskr_graph::parse_validated;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::ServerSink;
 use schemars::JsonSchema;
@@ -130,32 +131,6 @@ const VALID_KINDS: &[&str] = &[
     "Concept",
 ];
 
-/// What the bookkeeper is told to look for, and in what order.
-///
-/// The ordering is not arbitrary and should not be shortened without a reason as good as the ones
-/// that put each line here:
-///
-/// - **Rejected alternatives lead** because they are simultaneously the most-asked question about
-///   unfamiliar code and the least-supplied answer. The alternative not taken leaves no artifact
-///   anywhere — not in the diff, not in the types, not in the history. This repo had thirty-odd
-///   memories and none of that kind, while its commit messages argue about little else.
-/// - **"Could this be recovered by reading the repo?" is the gate**, stated first, because a
-///   generated record that restates the repo measurably makes agents *worse* rather than merely
-///   failing to help: it costs attention and returns nothing. Recording nothing is the correct
-///   answer for most runs, which is why `none` is described as common rather than as a fallback.
-/// - **Translate, never store the trajectory.** Retrieved raw traces score worse than having no
-///   memory at all; distilled situation-and-action rules are what carries the benefit.
-/// - **Trigger-and-action shape, with the evidence quoted.** Situated questions are not answered
-///   by general advice, and quoting what the rule was generalised from is what stops the next
-///   reader having to trust a summary of a summary.
-/// - **`revise` is preferred to `create`** because a memory that has drifted actively misleads
-///   while a missing one merely fails to help — removing wrong records is the single
-///   best-evidenced improvement to a knowledge base.
-/// - **Terseness is a staleness strategy, not a style preference**: every extra detail is another
-///   thing a later change can falsify, and inconsistent records carry a measurably higher chance
-///   of a bug in the code that trusts them.
-const PREAMBLE: &str = include_str!("../prompts/bookkeeper.md");
-
 /// What the bookkeeper decided the repository's memory should say.
 ///
 /// Flat rather than a tagged union because models fill a flat shape far more reliably, and
@@ -252,8 +227,8 @@ impl BookkeeperInput {
 
 /// Return the deterministic no-turn outcome when there is nowhere to write or nothing to learn.
 ///
-/// Both the direct compatibility node and the declared-stage production path call this before a
-/// model turn, so neither spends tokens composing a memory that Rust will discard.
+/// The declared-stage production path calls this before a model turn, so it never spends tokens
+/// composing a memory that Rust will discard.
 pub(crate) fn skipped_before_compose(
     input: &BookkeeperInput,
     has_memory_index: bool,
@@ -271,78 +246,6 @@ pub(crate) fn skipped_before_compose(
         return Some(input.nothing_recorded("the run changed nothing and hit nothing"));
     }
     None
-}
-
-/// The bookkeeper node. Holds a cheap model route, a small tool subset (for the compose agent), and
-/// rag-rat's sink (to call `memory_create` itself, outside the agent).
-pub struct BookkeeperNode {
-    pub route: ratatoskr_core::ModelRoute,
-    pub tools: ToolSet,
-    /// `None` without rag-rat. The node then has nowhere to write, so it returns before spending
-    /// a model turn deciding what it would have written.
-    pub sink: Option<ServerSink>,
-    pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
-    pub max_turns: Option<usize>,
-    pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
-    /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
-    pub system_prompt: Option<String>,
-    /// What the plugins this node binds contribute to it.
-    pub plugins: crate::NodePlugins,
-    /// Where this node reports what its turn cost, for the checkpoint the executor writes.
-    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
-    /// The repository its built-in file tools read within.
-    pub files: Option<std::path::PathBuf>,
-}
-
-impl BookkeeperNode {
-    pub async fn run(&self, input: BookkeeperInput) -> Result<BookkeeperOutput, NodeError> {
-        if let Some(output) = skipped_before_compose(&input, self.sink.is_some()) {
-            return Ok(output);
-        }
-
-        let prompt = render_prompt(&input);
-        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-            node: "bookkeeper",
-            route: &self.route,
-            preamble: &crate::effective_preamble_with_profile(
-                "bookkeeper",
-                PREAMBLE,
-                self.plugins.profile_prompt.as_str(),
-                self.system_prompt.as_deref(),
-                self.plugins.context.as_deref(),
-                &self.plugins.skills,
-            ),
-            question: &prompt,
-            tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(MemoryDecisions),
-            policy: self.policy.clone(),
-            max_turns: self.max_turns,
-            clarifier: self.clarifier.clone(),
-            observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills, "bookkeeper"),
-            files: self.files.clone(),
-            // Reads and edits, but runs nothing.
-            shell: None,
-            push: None,
-            conversation: None,
-            ledger: self.ledger.clone(),
-            produces: Some(
-                "a decision per durable learning: create, revise or none, with the memory body and its anchor",
-            ),
-        })
-        .await
-        .map_err(|e| NodeError::Failed(format!("bookkeeper compose failed: {e}")))?;
-
-        let decided = parse_validated::<MemoryDecisions>(&raw)?;
-        apply_decisions(
-            self.sink
-                .as_ref()
-                .expect("bookkeeper preflight requires a memory sink"),
-            decided.decisions,
-            &input,
-        )
-        .await
-    }
 }
 
 /// Apply a schema-validated model decision through rag-rat's durable memory API.

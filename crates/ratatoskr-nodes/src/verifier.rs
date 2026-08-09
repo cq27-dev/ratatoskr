@@ -11,25 +11,12 @@
 
 use std::fmt::Write as _;
 
-use ratatoskr_core::ModelRoute;
 use ratatoskr_graph::{NodeError, parse_validated};
-use ratatoskr_mcp::ToolSet;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::analyst::AnalystOutput;
-
-/// rag-rat tools the verifier may use. Read-only and grounding: it needs to check the change
-/// against current code and against what the repo already knows, not to explore freely.
-pub const VERIFIER_TOOLS: &[&str] = &[
-    "semantic_search",
-    "symbol_lookup",
-    "impact_surface",
-    "memory_search",
-];
-
-const PREAMBLE: &str = include_str!("../prompts/verifier.md");
 
 /// How bad a finding is. Ordered: `P1 < P2 < P3` by variant order, so "at least as severe as" is a
 /// `<=` on the enum.
@@ -122,68 +109,6 @@ pub struct VerifierInput {
     /// a fresh defect to patch, it is the plan being wrong, and saying so is the only way the run
     /// stops trading one symptom for the next.
     pub previous_findings: Vec<Finding>,
-}
-
-/// The verifier node: a reviewer restricted to read-only grounding tools.
-pub struct VerifierNode {
-    pub route: ModelRoute,
-    pub tools: ToolSet,
-    pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
-    pub max_turns: Option<usize>,
-    /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
-    pub system_prompt: Option<String>,
-    pub plugins: crate::NodePlugins,
-    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
-    pub files: Option<std::path::PathBuf>,
-}
-
-impl VerifierNode {
-    pub async fn run(&self, input: VerifierInput) -> Result<VerifierOutput, NodeError> {
-        // Nothing to review is not a clean review. Saying "no findings" about an empty diff would
-        // report the change as verified when there was no change.
-        if input.diff.trim().is_empty() {
-            return Ok(VerifierOutput {
-                findings: Vec::new(),
-                assessment: "there was no diff to review".to_string(),
-            });
-        }
-
-        run_judgement(
-            ratatoskr_agent::NodeRun {
-                node: "verifier",
-                route: &self.route,
-                preamble: &crate::effective_preamble_with_profile(
-                    "verifier",
-                    PREAMBLE,
-                    self.plugins.profile_prompt.as_str(),
-                    self.system_prompt.as_deref(),
-                    self.plugins.context.as_deref(),
-                    &self.plugins.skills,
-                ),
-                question: &render_prompt(&input),
-                tools: self.tools.clone(),
-                output_schema: schemars::schema_for!(VerifierOutput),
-                policy: self.policy.clone(),
-                max_turns: self.max_turns,
-                // The verifier judges; it does not negotiate. Asking the analyst what it meant would
-                // let the node being reviewed-for shape the review.
-                clarifier: None,
-                observer: self.plugins.observer.clone(),
-                skills: crate::skills::loaded(&self.plugins.skills, "verifier"),
-                files: self.files.clone(),
-                // Reads the diff; runs nothing — the acceptance run already happened.
-                shell: None,
-                push: None,
-                conversation: None,
-                ledger: self.ledger.clone(),
-            produces: Some(
-                "findings on the diff — each with a severity, a plan/execution kind, and a concrete failure scenario — or none",
-            ),
-            },
-            "verifier",
-        )
-        .await
-    }
 }
 
 /// Run and schema-validate a judgement node.

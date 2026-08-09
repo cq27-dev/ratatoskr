@@ -7,7 +7,7 @@ use crate::{AgentProfile, PlanError, Stage};
 const INTERNAL_GATES: &[&str] = &["referee"];
 // These names are kept for existing workflow.ts scripts. They are hosts, not stages: accepting
 // one as a declared stage would replace its declared binding with the legacy host below it.
-const LEGACY_HOST_ALIASES: &[&str] = &["memory", "analyze", "implement", "iterate", "verify"];
+const LEGACY_HOST_ALIASES: &[&str] = &["memory", "implement", "iterate", "verify"];
 
 /// Reject invalid stage references before a workflow can start a model call.
 pub fn validate(stages: &[Stage], profiles: &[AgentProfile]) -> Result<(), PlanError> {

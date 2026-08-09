@@ -2,19 +2,13 @@
 
 use std::fmt::Write as _;
 
-use ratatoskr_core::{ModelRoute, RunState};
-use ratatoskr_graph::{Node, NodeError, parse_validated};
-use ratatoskr_mcp::ToolSet;
+#[cfg(test)]
+use ratatoskr_graph::{NodeError, parse_validated};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::memory::MemoryOutput;
 use crate::scout::ScoutOutput;
-
-/// rag-rat tools the analyst may use to resolve what the change actually touches.
-pub const ANALYST_TOOLS: &[&str] = &["impact_surface", "symbol_lookup", "semantic_search"];
-
-const PREAMBLE: &str = include_str!("../prompts/analyst.md");
 
 /// Input to the analyst: the issue plus the two upstream node outputs.
 ///
@@ -172,76 +166,6 @@ pub struct InterfaceItem {
 /// drops the work the run was asked to do.
 fn changes_code_by_default() -> bool {
     true
-}
-
-/// The analyst node: a stronger agent restricted to impact/lookup tools.
-pub struct AnalystNode {
-    pub route: ModelRoute,
-    pub tools: ToolSet,
-    pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
-    pub max_turns: Option<usize>,
-    /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
-    pub system_prompt: Option<String>,
-    /// What the plugins this node binds contribute to it.
-    pub plugins: crate::NodePlugins,
-    /// Where this node reports what its turn cost, for the checkpoint the executor writes.
-    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
-    /// The repository its built-in file tools read within.
-    pub files: Option<std::path::PathBuf>,
-    /// Names this analyst's conversation within the run, so a revision can continue the plan it is
-    /// revising rather than reading the repository again from nothing.
-    pub conversation: Option<String>,
-}
-
-impl Node for AnalystNode {
-    type Input = AnalystInput;
-    type Output = AnalystOutput;
-
-    fn name(&self) -> &'static str {
-        "analyst"
-    }
-
-    async fn run(
-        &self,
-        input: AnalystInput,
-        _run_state: &RunState,
-    ) -> Result<AnalystOutput, NodeError> {
-        let prompt = render_prompt(&input);
-        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-            node: "analyst",
-            route: &self.route,
-            preamble: &crate::effective_preamble_with_profile(
-                "analyst",
-                PREAMBLE,
-                self.plugins.profile_prompt.as_str(),
-                self.system_prompt.as_deref(),
-                self.plugins.context.as_deref(),
-                &self.plugins.skills,
-            ),
-            question: &prompt,
-            tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(AnalystOutput),
-            policy: self.policy.clone(),
-            max_turns: self.max_turns,
-            // Analyst is the clarification terminus — it answers other nodes but never asks.
-            clarifier: None,
-            observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills, "analyst"),
-            files: self.files.clone(),
-            // Reads and edits, but runs nothing.
-            shell: None,
-            push: None,
-            conversation: self.conversation.as_deref(),
-            ledger: self.ledger.clone(),
-            produces: Some(
-                "an impact summary, the symbols and paths touched, risks, the concrete requirements the implementation must satisfy, and the acceptance steps that prove it done",
-            ),
-        })
-        .await
-        .map_err(|e| NodeError::Failed(format!("analyst agent failed: {e}")))?;
-
-        parse_validated::<AnalystOutput>(&raw)
-    }
 }
 
 /// Fold the issue + upstream outputs into the analyst's prompt.
