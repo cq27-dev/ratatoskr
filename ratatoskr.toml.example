@@ -176,6 +176,7 @@ model = "kimi-k2.5"
 # [models.implementer] route like any other node.
 [implementer]
 max_iterations = 3      # converge re-runs the implementer at most this many times
+max_turns = 100          # model/tool-call turns available to each implementer attempt
 # The least severe review finding that sends a change back to be fixed: "P1" (must-fix only),
 # "P2" (the default, also should-fix), or "P3" (nits too). Findings below it are still recorded.
 # P3 is deliberately not the default: the verifier shares max_iterations with the test-fixing

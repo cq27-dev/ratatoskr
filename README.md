@@ -282,7 +282,7 @@ worktrees, the dashboard, clarification, plugins, skills, publishing.
 ## Configuration
 
 `ratatoskr.toml` covers model routing per node, how rag-rat's MCP server is launched, the sandbox
-backend and test command, and the implementer's CLI and iteration budget. It is validated on load,
+backend and test command, and the implementer's per-attempt turn and iteration budgets. It is validated on load,
 so a bad backend or an empty test command fails immediately rather than deep inside a run.
 
 The sandbox backend is `landlock` (bubblewrap + Landlock — the default; no image, builds offline)
