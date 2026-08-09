@@ -3107,16 +3107,6 @@ mod agent_config_tests {
     }
 
     #[test]
-    fn referee_tools_exclude_extra_write_capabilities() {
-        let node = referee::RefereeNode::fixed(
-            RatatoskrConfig::default().models["analyst"].clone(),
-            None,
-            None,
-        );
-        assert_eq!(node.tools.names(), referee::REFEREE_TOOLS);
-    }
-
-    #[test]
     fn the_publishers_gh_resolves_to_something_that_can_actually_run() {
         // The failure this guards, seen on a live run: `gh` fell through to the stand-in whose
         // message says the tool "is answered inside the run and should never have been

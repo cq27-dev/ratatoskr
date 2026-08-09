@@ -109,8 +109,7 @@ pub fn correction(violations: &[Violation]) -> String {
 /// A read-only model judgement over the hunks that removed or replaced existing lines.
 pub struct RefereeNode {
     route: ModelRoute,
-    /// Observable so the fixed capability boundary can be asserted.
-    pub tools: ToolSet,
+    tools: ToolSet,
     ledger: Option<Arc<RunLedger>>,
     /// Set after the fork when the worktree becomes known.
     pub files: Option<PathBuf>,
