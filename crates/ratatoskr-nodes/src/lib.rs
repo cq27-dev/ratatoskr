@@ -1361,8 +1361,10 @@ fn node_agent_config(
             provider: m.provider.clone(),
             model: m.model.clone(),
             // A ruleset declares which model, not how much of it. The cap comes from the default,
-            // which is always sent — so a ruleset naming a brand-new model still works.
+            // which is always sent — so a ruleset naming a brand-new model still works. The window
+            // is unstated for the same reason, and falls back to the conservative history budget.
             max_tokens: None,
+            context_window: None,
             temperature: None,
             params: None,
             session: Default::default(),
@@ -3559,6 +3561,7 @@ mod agent_config_tests {
         config.models.insert(
             "characterizer".to_string(),
             ratatoskr_core::ModelRoute {
+                context_window: None,
                 provider: "anthropic".into(),
                 model: "claude-haiku-4-5-20251001".into(),
                 max_tokens: None,
@@ -3672,6 +3675,7 @@ mod agent_config_tests {
         config.models.insert(
             "redteam".to_string(),
             ratatoskr_core::ModelRoute {
+                context_window: None,
                 provider: "openai".to_string(),
                 model: "gpt-5".to_string(),
                 max_tokens: None,

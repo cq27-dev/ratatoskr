@@ -568,6 +568,19 @@ pub struct ModelRoute {
     /// this. Lower it for a model whose own ceiling is below the default.
     #[serde(default)]
     pub max_tokens: Option<u64>,
+    /// How many tokens this model can hold at once, when it is worth saying.
+    ///
+    /// What it decides is when a node's history is summarised rather than carried: the budget is a
+    /// share of this, leaving room for the summary call, the tool declarations, and the turn that
+    /// tripped it — a budget at the window's edge produces a context-length error instead of a
+    /// compaction.
+    ///
+    /// Stated here rather than looked up, for the same reason as `max_tokens`: a table of model
+    /// names compiled into this binary cannot know a model released after it, and the failure is
+    /// silent — a large-window model summarising early, or worse, a small one told it has room it
+    /// does not. `None` keeps a conservative default that fits every model this has run on.
+    #[serde(default)]
+    pub context_window: Option<u64>,
     /// Sampling temperature. `None` leaves the provider's default, which on Anthropic is 1.0.
     ///
     /// Worth setting to 0 for a node whose job is transcription or extraction rather than
@@ -686,6 +699,7 @@ impl Default for RatatoskrConfig {
     fn default() -> Self {
         let route = |provider: &str, model: &str| ModelRoute {
             max_tokens: None,
+            context_window: None,
             temperature: None,
             params: None,
             session: SessionScope::default(),
