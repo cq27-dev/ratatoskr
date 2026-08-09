@@ -191,6 +191,8 @@ pub struct AnalystNode {
     /// Names this analyst's conversation within the run, so a revision can continue the plan it is
     /// revising rather than reading the repository again from nothing.
     pub conversation: Option<String>,
+    /// Local continuation state for a compacted analyst revision.
+    pub compacted_session: Option<ratatoskr_agent::CompactedSession>,
 }
 
 impl Node for AnalystNode {
@@ -236,7 +238,7 @@ impl Node for AnalystNode {
             produces: Some(
                 "an impact summary, the symbols and paths touched, risks, the concrete requirements the implementation must satisfy, and the acceptance steps that prove it done",
             ),
-            compacted_session: None,
+            compacted_session: self.compacted_session.clone(),
         })
         .await
         .map_err(|e| NodeError::Failed(format!("analyst agent failed: {e}")))?;

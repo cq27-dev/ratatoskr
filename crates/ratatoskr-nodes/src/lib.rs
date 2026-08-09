@@ -72,6 +72,8 @@ pub struct PlanOutcome {
     pub scout: ScoutOutput,
     pub memory: MemoryOutput,
     pub analyst: AnalystOutput,
+    /// The analyst's run-local hand-off, retained for a later review-driven revision.
+    analyst_compacted_session: Option<ratatoskr_agent::CompactedSession>,
     /// What the context node distilled. Carried so a later analyst revision keeps it: what bears
     /// on the task did not stop being true because the plan turned out wrong.
     pub brief: String,
@@ -296,6 +298,11 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         analyst::ANALYST_TOOLS,
         &mut plugins_analyst,
     )?;
+    let analyst_compacted_session = matches!(
+        analyst_cfg.route.session,
+        ratatoskr_core::SessionScope::Compacted
+    )
+    .then(ratatoskr_agent::CompactedSession::default);
     let analyst = AnalystNode {
         conversation: Some(format!("{run_id}-analyst")),
         route: analyst_cfg.route,
@@ -306,6 +313,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         plugins: plugins_analyst,
         files: analyst_cfg.files,
         ledger: Some(Arc::clone(ledger)),
+        compacted_session: analyst_compacted_session.clone(),
     };
     let analyst_in =
         analyst::AnalystInput::fresh(issue.to_string(), scout_out.clone(), memory_out.clone());
@@ -332,6 +340,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         scout: scout_out,
         memory: memory_out,
         analyst: analyst_out,
+        analyst_compacted_session,
         brief: context_out.brief,
         constraints: context_out.constraints,
     })
@@ -1801,6 +1810,7 @@ impl Review {
                 plugins: plugins_analyst,
                 files: acfg.files,
                 ledger: Some(Arc::clone(ledger)),
+                compacted_session: plan.analyst_compacted_session.clone(),
             },
             scout: plan.scout.clone(),
             memory: plan.memory.clone(),

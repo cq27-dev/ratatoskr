@@ -58,6 +58,9 @@ pub struct WorkflowContext {
     repo_path: PathBuf,
     /// Set by `implement`, read by `iterate` and cleanup. The script never sees a raw path.
     worktree: Mutex<Option<WorktreePath>>,
+    /// Rebuilt scripted nodes share these run-local compacted hand-offs across their attempts.
+    implementer_compacted_session: Mutex<Option<ratatoskr_agent::CompactedSession>>,
+    analyst_compacted_session: Mutex<Option<ratatoskr_agent::CompactedSession>>,
     implement_started: AtomicBool,
     /// Serializes `iterate` calls — two implementers editing one worktree would corrupt it.
     iterate_lock: tokio::sync::Mutex<()>,
@@ -102,6 +105,8 @@ impl WorkflowContext {
             rag_rat: client.map(|c| c.offer()),
             repo_path,
             worktree: Mutex::new(None),
+            implementer_compacted_session: Mutex::new(None),
+            analyst_compacted_session: Mutex::new(None),
             implement_started: AtomicBool::new(false),
             iterate_lock: tokio::sync::Mutex::new(()),
             invocations: AtomicUsize::new(0),
@@ -128,6 +133,24 @@ impl WorkflowContext {
         }
         Ok(())
     }
+}
+
+/// Get a run-local hand-off for one route, clearing an earlier one if the route is fresh again.
+fn compacted_session(
+    slot: &Mutex<Option<ratatoskr_agent::CompactedSession>>,
+    scope: ratatoskr_core::SessionScope,
+) -> Option<ratatoskr_agent::CompactedSession> {
+    if !matches!(scope, ratatoskr_core::SessionScope::Compacted) {
+        *slot.lock().expect("compacted session mutex poisoned") = None;
+        return None;
+    }
+
+    let mut session = slot.lock().expect("compacted session mutex poisoned");
+    Some(
+        session
+            .get_or_insert_with(ratatoskr_agent::CompactedSession::default)
+            .clone(),
+    )
 }
 
 // --- reconstruction helpers -------------------------------------------------
@@ -238,6 +261,7 @@ async fn reconstruct_plan(store: &Store, run_id: &str) -> Result<PlanOutcome, Pl
         scout,
         memory,
         analyst,
+        analyst_compacted_session: None,
         brief,
         constraints,
     })
@@ -341,6 +365,7 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
         &mut plugins,
     )
     .map_err(|e| e.to_string())?;
+    let compacted_session = compacted_session(&ctx.analyst_compacted_session, cfg.route.session);
     let node = AnalystNode {
         // A revision continues the plan it revises, when the route asks for that.
         conversation: Some(format!("{}-analyst", ctx.run_id)),
@@ -352,6 +377,7 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
         max_turns: cfg.max_turns,
         system_prompt: cfg.system_prompt,
         plugins,
+        compacted_session,
     };
     let out = node
         .run(input, &RunState::new(&ctx.run_id, None))
@@ -474,8 +500,8 @@ fn build_implementer(
         &ctx.plugin_context,
         ctx.rag_rat.clone(),
     )?;
-    let compacted_session = matches!(cfg.route.session, ratatoskr_core::SessionScope::Compacted)
-        .then(ratatoskr_agent::CompactedSession::default);
+    let compacted_session =
+        compacted_session(&ctx.implementer_compacted_session, cfg.route.session);
     Ok(ImplementerNode {
         // As every node on the scripted path: clarification is wired by the built-in flow, which
         // owns the run's `NodeClarifier`.
@@ -1287,6 +1313,28 @@ async fn bookkeep_scripted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compacted_route_keeps_its_workflow_session_until_the_route_is_fresh() {
+        let slot = Mutex::new(None);
+
+        assert!(compacted_session(&slot, ratatoskr_core::SessionScope::Compacted).is_some());
+        assert!(
+            slot.lock()
+                .expect("compacted session mutex poisoned")
+                .is_some(),
+            "a rebuilt node must find the previous attempt's hand-off"
+        );
+        assert!(compacted_session(&slot, ratatoskr_core::SessionScope::Compacted).is_some());
+
+        assert!(compacted_session(&slot, ratatoskr_core::SessionScope::Fresh).is_none());
+        assert!(
+            slot.lock()
+                .expect("compacted session mutex poisoned")
+                .is_none(),
+            "a fresh route must not inherit an old compacted session"
+        );
+    }
 
     fn red(failing: &[&str], passing: &[&str], exit: i32) -> RedTeamOutput {
         RedTeamOutput {
