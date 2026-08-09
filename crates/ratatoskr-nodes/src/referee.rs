@@ -168,7 +168,6 @@ impl RefereeNode {
                 conversation: None,
                 ledger: self.ledger.clone(),
                 produces: Some("files whose diff hunks weakened task-completion checks, each with a reason, or none"),
-                compacted_session: None,
             },
             "referee",
         )

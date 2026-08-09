@@ -16,7 +16,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use ratatoskr_core::Capability;
+use ratatoskr_core::{Capability, SessionScope};
 use rquickjs::promise::{Promise, Promised};
 use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Function};
 
@@ -117,6 +117,9 @@ pub struct WorkflowStage {
     pub context: String,
     #[serde(default)]
     pub capabilities: Vec<Capability>,
+    /// Override the selected agent route's attempt-continuation policy for this stage.
+    #[serde(default)]
+    pub session: Option<SessionScope>,
     #[serde(default)]
     pub delegation: Option<WorkflowDelegation>,
     #[serde(default = "default_append_repository_guidance")]
@@ -472,6 +475,31 @@ mod tests {
         assert_eq!(requirements.agent, "requirements");
         assert_eq!(requirements.capabilities, [Capability::Read]);
         assert!(requirements.output_schema.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_workflow_stage_declares_its_session_policy() {
+        let dir = scratch("stage-session");
+        std::fs::write(
+            dir.join("review.ts"),
+            r#"defineWorkflow({
+                 name: "review",
+                 stages: [{
+                   id: "reviewer",
+                   agent: "reason",
+                   session: "compacted",
+                 }],
+               });
+               async function plan(issue) { return issue; }"#,
+        )
+        .unwrap();
+
+        let found = WorkflowRuntime::discover(&dir).await.unwrap();
+        assert_eq!(
+            found[0].meta().stages[0].session,
+            Some(SessionScope::Compacted)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

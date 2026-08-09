@@ -79,8 +79,8 @@ const MAX_TOOL_RESULT_CHARS: usize = 16 * 1024;
 /// budget is deliberately generous for a single long-running attempt, but a re-driven node needs
 /// a small hand-off rather than the entire previous attempt. A zero-token window demotes the whole
 /// completed attempt when the next one loads this memory, and the compactor replaces it with one
-/// summary. This state deliberately lives in the node instance: it is scoped to one run and cannot
-/// leak into a later run that happens to use the same route.
+/// summary. The run ledger owns this state by stage/session key, so rebuilt node values continue
+/// within one run while a later run cannot inherit it merely by using the same route.
 #[derive(Clone, Default)]
 pub struct CompactedSession {
     memory: Arc<Mutex<Option<Arc<dyn ConversationMemory>>>>,
@@ -113,6 +113,11 @@ impl CompactedSession {
             Arc::new(compacting_memory(model, node, produces, 0, ledger));
         *slot = Some(Arc::clone(&memory));
         memory
+    }
+
+    #[cfg(test)]
+    pub(crate) fn same_state_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.memory, &other.memory)
     }
 }
 

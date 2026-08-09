@@ -9,8 +9,9 @@ pub mod files;
 pub mod publish;
 pub mod shell;
 
-pub use compaction::CompactedSession;
+use compaction::CompactedSession;
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -474,8 +475,18 @@ fn continuing_session(
     match scope {
         ratatoskr_core::SessionScope::Fresh => false,
         ratatoskr_core::SessionScope::Reuse => conversation.is_some(),
-        ratatoskr_core::SessionScope::Compacted => conversation.is_some() && has_compacted_session,
+        ratatoskr_core::SessionScope::Compacted => has_compacted_session,
     }
+}
+
+/// A run-local key for local continuation state.
+///
+/// An explicit conversation names repeated attempts directly. Otherwise the output contract keeps
+/// two jobs that historically share a node name (for example red-team author and classifier) from
+/// inheriting each other's history.
+fn compacted_session_key(node: &str, conversation: Option<&str>, produces: Option<&str>) -> String {
+    let attempt = conversation.or(produces).unwrap_or("structured output");
+    format!("{node}:{attempt}")
 }
 
 /// The headers one request carries: this deployment's static set, plus the session id when the
@@ -1464,6 +1475,9 @@ async fn park(controller: &Arc<dyn Controller>, node: &str) -> Vec<String> {
 #[derive(Default)]
 pub struct RunLedger {
     entries: Mutex<Vec<(String, NodeTelemetry)>>,
+    /// Local continuation belongs to a run, just like the telemetry beside it. Keeping it here
+    /// lets rebuilt node values re-enter without every node type growing its own session field.
+    compacted_sessions: Mutex<HashMap<String, CompactedSession>>,
 }
 
 impl RunLedger {
@@ -1498,6 +1512,25 @@ impl RunLedger {
             .map(|(name, _)| name.clone())
             .collect()
     }
+
+    /// Resolve one stage's local continuation, or clear it when the stage is run without local
+    /// continuation. Clearing prevents a compacted -> fresh -> compacted route change from
+    /// resurrecting history that the fresh attempt explicitly left behind.
+    fn compacted_session(
+        &self,
+        key: &str,
+        scope: ratatoskr_core::SessionScope,
+    ) -> Option<CompactedSession> {
+        let mut sessions = self
+            .compacted_sessions
+            .lock()
+            .expect("compacted session mutex poisoned");
+        if !matches!(scope, ratatoskr_core::SessionScope::Compacted) {
+            sessions.remove(key);
+            return None;
+        }
+        Some(sessions.entry(key.to_string()).or_default().clone())
+    }
 }
 
 /// One node's structured agent turn: what to run it on, what it may call, and the gates around it.
@@ -1529,8 +1562,6 @@ pub struct NodeRun<'a> {
     /// Only consulted for a continuing session scope; the route decides whether endpoint or local
     /// memory state is reused.
     pub conversation: Option<&'a str>,
-    /// Shared local memory for `SessionScope::Compacted`.
-    pub compacted_session: Option<CompactedSession>,
     /// The sandbox the node's `Bash` calls run in; `None` for a node that runs no commands.
     ///
     /// Separate from `files` because they are different powers: reading and editing a tree is not
@@ -1604,7 +1635,6 @@ where
         shell,
         push,
         conversation,
-        compacted_session,
         ledger,
         produces,
     } = run;
@@ -1665,20 +1695,17 @@ where
     // Summarise the oldest turns rather than dropping them, once history outgrows the budget. A
     // plain window would evict exactly the turn that discovered a constraint — it is the oldest —
     // and the node would rediscover it, or retry the approach it ruled out.
-    if let (
-        ratatoskr_core::SessionScope::Compacted,
-        Some(conversation),
-        Some(session),
-        Some(produces),
-    ) = (
-        route.session,
-        conversation,
-        compacted_session.as_ref(),
-        produces,
-    ) {
+    let compacted_session_key = compacted_session_key(node, conversation, produces);
+    let compacted_session = ledger
+        .as_ref()
+        .and_then(|ledger| ledger.compacted_session(&compacted_session_key, route.session));
+    if let (ratatoskr_core::SessionScope::Compacted, Some(session)) =
+        (route.session, compacted_session.as_ref())
+    {
+        let produces = produces.unwrap_or("its declared structured output");
         builder = builder
             .memory(session.memory(for_compaction, node, produces, ledger.clone()))
-            .conversation(conversation);
+            .conversation(&compacted_session_key);
     } else if let Some(produces) = produces {
         builder = builder.memory(compaction::compacting_memory(
             for_compaction,
@@ -2162,6 +2189,55 @@ mod tests {
     }
 
     #[test]
+    fn compacted_sessions_share_by_stage_key_and_isolate_by_stage_and_run() {
+        let ledger = RunLedger::default();
+        let analyst_key = compacted_session_key(
+            "analyst",
+            Some("run-7-analyst"),
+            Some("an implementation plan"),
+        );
+        let first = ledger
+            .compacted_session(&analyst_key, ratatoskr_core::SessionScope::Compacted)
+            .unwrap();
+        let reentered = ledger
+            .compacted_session(&analyst_key, ratatoskr_core::SessionScope::Compacted)
+            .unwrap();
+        assert!(first.same_state_as(&reentered));
+
+        let verifier_key =
+            compacted_session_key("verifier", Some("run-7-analyst"), Some("review findings"));
+        let verifier = ledger
+            .compacted_session(&verifier_key, ratatoskr_core::SessionScope::Compacted)
+            .unwrap();
+        assert!(!first.same_state_as(&verifier));
+
+        let other_run = RunLedger::default();
+        let isolated = other_run
+            .compacted_session(&analyst_key, ratatoskr_core::SessionScope::Compacted)
+            .unwrap();
+        assert!(!first.same_state_as(&isolated));
+    }
+
+    #[test]
+    fn a_fresh_stage_clears_its_local_continuation() {
+        let ledger = RunLedger::default();
+        let key = compacted_session_key("implementer", None, Some("a repository change"));
+        let before = ledger
+            .compacted_session(&key, ratatoskr_core::SessionScope::Compacted)
+            .unwrap();
+
+        assert!(
+            ledger
+                .compacted_session(&key, ratatoskr_core::SessionScope::Fresh)
+                .is_none()
+        );
+        let after = ledger
+            .compacted_session(&key, ratatoskr_core::SessionScope::Compacted)
+            .unwrap();
+        assert!(!before.same_state_as(&after));
+    }
+
+    #[test]
     fn usage_accumulates_across_a_turn() {
         let mut total = TokenUsage::default();
         total.add(TokenUsage {
@@ -2240,7 +2316,6 @@ mod tests {
             conversation: None,
             ledger: None,
             produces: Some("a summary of the change"),
-            compacted_session: None,
         })
         .await
         .expect("the live run should complete");
@@ -2309,7 +2384,6 @@ mod tests {
             conversation: None,
             ledger: Some(Arc::clone(&ledger)),
             produces: None,
-            compacted_session: None,
         })
         .await
         .expect("the live run should complete");
@@ -2370,7 +2444,6 @@ mod tests {
                 conversation,
                 ledger: None,
                 produces: None,
-                compacted_session: None,
             }
         }
 
@@ -2389,11 +2462,13 @@ mod tests {
         );
 
         // A compacted continuation belongs to this process, not to the endpoint. It therefore
-        // sends no reusable id, and only claims a continuation once the node supplied the local
-        // memory that holds the prior attempt.
+        // sends no reusable id, and only claims a continuation once the run ledger resolved the
+        // local memory that holds the prior attempt. An explicit endpoint conversation is not
+        // required for local continuation.
         let compacted = route(ratatoskr_core::SessionScope::Compacted);
         assert_eq!(session_id(&run(&compacted, key)), None);
         assert!(continuing_session(compacted.session, key, true));
+        assert!(continuing_session(compacted.session, None, true));
         assert!(!continuing_session(compacted.session, key, false));
     }
 

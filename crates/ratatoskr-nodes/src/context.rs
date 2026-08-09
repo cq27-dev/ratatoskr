@@ -138,7 +138,6 @@ impl ContextNode {
                 "a brief on what bears on this task, the constraints it must respect with their \
                  sources, and the prior art found",
             ),
-            compacted_session: None,
         })
         .await
         .map_err(|e| NodeError::Failed(format!("context agent failed: {e}")))?;

@@ -129,7 +129,6 @@ impl RedTeamClassifier {
             produces: Some(
                 "a classification of each baseline test failure as flaky or real, with the reason",
             ),
-            compacted_session: None,
         })
         .await
         .map_err(|e| NodeError::Failed(format!("red-team classifier failed: {e}")))?;
@@ -217,7 +216,6 @@ impl TestAuthor {
             conversation: None,
             ledger: self.ledger.clone(),
             produces: Some("tests covering the contracted interface, written before the code"),
-            compacted_session: None,
         })
         .await
         .map_err(|e| NodeError::Failed(format!("test author failed: {e}")))?;

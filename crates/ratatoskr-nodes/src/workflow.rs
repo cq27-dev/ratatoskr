@@ -15,7 +15,9 @@
 //! live here and plug into `WorkflowRuntime` as `HostFn`s.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -58,9 +60,6 @@ pub struct WorkflowContext {
     repo_path: PathBuf,
     /// Set by `implement`, read by `iterate` and cleanup. The script never sees a raw path.
     worktree: Mutex<Option<WorktreePath>>,
-    /// Rebuilt scripted nodes share these run-local compacted hand-offs across their attempts.
-    implementer_compacted_session: Mutex<Option<ratatoskr_agent::CompactedSession>>,
-    analyst_compacted_session: Mutex<Option<ratatoskr_agent::CompactedSession>>,
     implement_started: AtomicBool,
     /// Serializes `iterate` calls — two implementers editing one worktree would corrupt it.
     iterate_lock: tokio::sync::Mutex<()>,
@@ -105,8 +104,6 @@ impl WorkflowContext {
             rag_rat: client.map(|c| c.offer()),
             repo_path,
             worktree: Mutex::new(None),
-            implementer_compacted_session: Mutex::new(None),
-            analyst_compacted_session: Mutex::new(None),
             implement_started: AtomicBool::new(false),
             iterate_lock: tokio::sync::Mutex::new(()),
             invocations: AtomicUsize::new(0),
@@ -133,24 +130,6 @@ impl WorkflowContext {
         }
         Ok(())
     }
-}
-
-/// Get a run-local hand-off for one route, clearing an earlier one if the route is fresh again.
-fn compacted_session(
-    slot: &Mutex<Option<ratatoskr_agent::CompactedSession>>,
-    scope: ratatoskr_core::SessionScope,
-) -> Option<ratatoskr_agent::CompactedSession> {
-    if !matches!(scope, ratatoskr_core::SessionScope::Compacted) {
-        *slot.lock().expect("compacted session mutex poisoned") = None;
-        return None;
-    }
-
-    let mut session = slot.lock().expect("compacted session mutex poisoned");
-    Some(
-        session
-            .get_or_insert_with(ratatoskr_agent::CompactedSession::default)
-            .clone(),
-    )
 }
 
 // --- reconstruction helpers -------------------------------------------------
@@ -261,7 +240,6 @@ async fn reconstruct_plan(store: &Store, run_id: &str) -> Result<PlanOutcome, Pl
         scout,
         memory,
         analyst,
-        analyst_compacted_session: None,
         brief,
         constraints,
     })
@@ -365,7 +343,6 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
         &mut plugins,
     )
     .map_err(|e| e.to_string())?;
-    let compacted_session = compacted_session(&ctx.analyst_compacted_session, cfg.route.session);
     let node = AnalystNode {
         // A revision continues the plan it revises, when the route asks for that.
         conversation: Some(format!("{}-analyst", ctx.run_id)),
@@ -377,7 +354,6 @@ async fn analyze_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
         max_turns: cfg.max_turns,
         system_prompt: cfg.system_prompt,
         plugins,
-        compacted_session,
     };
     let out = node
         .run(input, &RunState::new(&ctx.run_id, None))
@@ -500,8 +476,6 @@ fn build_implementer(
         &ctx.plugin_context,
         ctx.rag_rat.clone(),
     )?;
-    let compacted_session =
-        compacted_session(&ctx.implementer_compacted_session, cfg.route.session);
     Ok(ImplementerNode {
         // As every node on the scripted path: clarification is wired by the built-in flow, which
         // owns the run's `NodeClarifier`.
@@ -527,7 +501,6 @@ fn build_implementer(
         conventions: crate::repo_conventions(&ctx.repo_path),
         plugins,
         ledger: Some(Arc::clone(&ctx.ledger)),
-        compacted_session,
         run_id: ctx.run_id.clone(),
         issue: ctx.issue.clone(),
         analyst,
@@ -922,6 +895,25 @@ fn declared_stage_question(stage: &Stage, runtime_input_json: &str) -> String {
     )
 }
 
+trait DeclaredStageRunner: Send + Sync {
+    fn run<'a>(
+        &'a self,
+        run: ratatoskr_agent::NodeRun<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ratatoskr_agent::AgentError>> + Send + 'a>>;
+}
+
+struct LiveDeclaredStageRunner;
+
+impl DeclaredStageRunner for LiveDeclaredStageRunner {
+    fn run<'a>(
+        &'a self,
+        run: ratatoskr_agent::NodeRun<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ratatoskr_agent::AgentError>> + Send + 'a>>
+    {
+        Box::pin(ratatoskr_agent::run_structured(run))
+    }
+}
+
 async fn declared_stage_host(
     ctx: Arc<WorkflowContext>,
     stage: Stage,
@@ -929,11 +921,30 @@ async fn declared_stage_host(
     arg: String,
     checkpoint_output: bool,
 ) -> Result<String, String> {
+    declared_stage_host_with(
+        ctx,
+        stage,
+        stages,
+        arg,
+        checkpoint_output,
+        &LiveDeclaredStageRunner,
+    )
+    .await
+}
+
+async fn declared_stage_host_with(
+    ctx: Arc<WorkflowContext>,
+    stage: Stage,
+    stages: Arc<Vec<Stage>>,
+    arg: String,
+    checkpoint_output: bool,
+    runner: &dyn DeclaredStageRunner,
+) -> Result<String, String> {
     ctx.guard()?;
     let input: serde_json::Value =
         serde_json::from_str(&arg).map_err(|e| format!("{} arg: {e}", stage.id))?;
     let plugins = ctx.plugin_context.for_node(&stage.id);
-    let (cfg, profile) = crate::plugins::declared_stage_agent_config(
+    let (mut cfg, profile) = crate::plugins::declared_stage_agent_config(
         &ctx.engine,
         &ctx.config,
         ctx.plugin_context.pool_for(&stage.id, ctx.rag_rat.clone()),
@@ -942,6 +953,7 @@ async fn declared_stage_host(
         &plugins,
     )
     .map_err(|e| e.to_string())?;
+    cfg.route.session = stage.session_scope(cfg.route.session);
 
     // A child is evidence within its parent's call, never a second checkpointed graph stage.
     let runtime_input = if let Some(delegation) =
@@ -963,12 +975,13 @@ async fn declared_stage_host(
             .ok_or_else(|| format!("stage `{}` has no agent `{}`", target.id, target.agent))?;
         let task = ChildTask::spawn(&stage, &profile, &target, &target_profile, input.clone())
             .map_err(|e| e.to_string())?;
-        let child = Box::pin(declared_stage_host(
+        let child = Box::pin(declared_stage_host_with(
             Arc::clone(&ctx),
             target,
             Arc::clone(&stages),
             serde_json::to_string(&task.input).map_err(|e| e.to_string())?,
             false,
+            runner,
         ))
         .await?;
         let child_output: serde_json::Value =
@@ -995,28 +1008,32 @@ async fn declared_stage_host(
         .map(serde_json::from_value)
         .transpose()
         .map_err(|e| format!("stage `{}` has invalid outputSchema: {e}", stage.id))?;
-    let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-        node: &stage.id,
-        route: &cfg.route,
-        preamble: &preamble,
-        question: &question,
-        tools: cfg.tools,
-        output_schema: output_schema.unwrap_or_else(|| schemars::schema_for!(serde_json::Value)),
-        policy: cfg.policy,
-        max_turns: cfg.max_turns,
-        clarifier: None,
-        observer: plugins.observer.clone(),
-        skills: crate::skills::loaded(&plugins.skills, &stage.id),
-        files: cfg.files,
-        shell: None,
-        push: None,
-        conversation: None,
-        ledger: Some(Arc::clone(&ctx.ledger)),
-        produces: Some(&stage.output_contract),
-        compacted_session: None,
-    })
-    .await
-    .map_err(|e| format!("stage `{}` agent failed: {e}", stage.id))?;
+    // Stable within this run and stage, unique across runs. Endpoint reuse needs the uniqueness;
+    // local compaction uses the same key so both continuation modes agree on stage identity.
+    let conversation = format!("{}-{}", ctx.run_id, stage.id);
+    let raw = runner
+        .run(ratatoskr_agent::NodeRun {
+            node: &stage.id,
+            route: &cfg.route,
+            preamble: &preamble,
+            question: &question,
+            tools: cfg.tools,
+            output_schema: output_schema
+                .unwrap_or_else(|| schemars::schema_for!(serde_json::Value)),
+            policy: cfg.policy,
+            max_turns: cfg.max_turns,
+            clarifier: None,
+            observer: plugins.observer.clone(),
+            skills: crate::skills::loaded(&plugins.skills, &stage.id),
+            files: cfg.files,
+            shell: None,
+            push: None,
+            conversation: Some(&conversation),
+            ledger: Some(Arc::clone(&ctx.ledger)),
+            produces: Some(&stage.output_contract),
+        })
+        .await
+        .map_err(|e| format!("stage `{}` agent failed: {e}", stage.id))?;
     let output: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| format!("stage `{}` returned invalid JSON: {e}", stage.id))?;
     validate_declared_output(&stage, &output)?;
@@ -1314,28 +1331,6 @@ async fn bookkeep_scripted(
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_compacted_route_keeps_its_workflow_session_until_the_route_is_fresh() {
-        let slot = Mutex::new(None);
-
-        assert!(compacted_session(&slot, ratatoskr_core::SessionScope::Compacted).is_some());
-        assert!(
-            slot.lock()
-                .expect("compacted session mutex poisoned")
-                .is_some(),
-            "a rebuilt node must find the previous attempt's hand-off"
-        );
-        assert!(compacted_session(&slot, ratatoskr_core::SessionScope::Compacted).is_some());
-
-        assert!(compacted_session(&slot, ratatoskr_core::SessionScope::Fresh).is_none());
-        assert!(
-            slot.lock()
-                .expect("compacted session mutex poisoned")
-                .is_none(),
-            "a fresh route must not inherit an old compacted session"
-        );
-    }
-
     fn red(failing: &[&str], passing: &[&str], exit: i32) -> RedTeamOutput {
         RedTeamOutput {
             authored: None,
@@ -1436,6 +1431,81 @@ mod tests {
             );
         }
         assert!(!preamble.contains(r#"{"runtime":"input"}"#));
+    }
+
+    #[derive(Default)]
+    struct RecordingDeclaredStageRunner {
+        sessions: Mutex<Vec<ratatoskr_core::SessionScope>>,
+    }
+
+    impl DeclaredStageRunner for RecordingDeclaredStageRunner {
+        fn run<'a>(
+            &'a self,
+            run: ratatoskr_agent::NodeRun<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, ratatoskr_agent::AgentError>> + Send + 'a>>
+        {
+            self.sessions
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(run.route.session);
+            Box::pin(async { Ok("{}".to_string()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_stage_host_applies_the_stage_session_override() {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-declared-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "declared_review".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-session",
+            "review this",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let mut stage = crate::built_in_stages().pop().unwrap();
+        stage.id = "declared_review".to_string();
+        stage.agent = "reason".to_string();
+        stage.output_contract = "ReviewOutput".to_string();
+        stage.output_schema = Some(json!({ "type": "object" }));
+        stage.session = Some(ratatoskr_core::SessionScope::Compacted);
+        let stages = Arc::new(vec![stage.clone()]);
+        let runner = RecordingDeclaredStageRunner::default();
+
+        let output = declared_stage_host_with(ctx, stage, stages, "{}".to_string(), false, &runner)
+            .await
+            .unwrap();
+
+        assert_eq!(output, "{}");
+        assert_eq!(
+            *runner
+                .sessions
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            vec![ratatoskr_core::SessionScope::Compacted],
+            "the declared stage must override its route before NodeRun reaches the agent"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

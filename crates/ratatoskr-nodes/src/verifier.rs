@@ -178,7 +178,6 @@ impl VerifierNode {
             produces: Some(
                 "findings on the diff — each with a severity, a plan/execution kind, and a concrete failure scenario — or none",
             ),
-            compacted_session: None,
             },
             "verifier",
         )

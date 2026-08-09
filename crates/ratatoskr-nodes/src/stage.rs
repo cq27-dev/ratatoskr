@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use ratatoskr_core::{AgentProfileConfig, Capability, ModelRoute, ToolPolicy};
+use ratatoskr_core::{AgentProfileConfig, Capability, ModelRoute, SessionScope, ToolPolicy};
 
 /// Reusable model and authority defaults. A profile is not a checkpoint identity; [`Stage`] is.
 #[derive(Clone)]
@@ -45,6 +45,8 @@ pub struct Stage {
     pub context: String,
     /// A stage may only narrow its profile's ceiling.
     pub capabilities: Vec<Capability>,
+    /// Overrides the selected route's attempt-continuation policy when present.
+    pub session: Option<SessionScope>,
     pub delegation: Option<Delegation>,
     /// Built-ins append repository guidance; user-defined stages may replace their prompt.
     pub append_repository_guidance: bool,
@@ -57,6 +59,12 @@ impl Stage {
             (profile, None) => profile,
             (None, Some(_)) => None,
         }
+    }
+
+    /// The attempt-continuation policy for this stage. An omitted declaration preserves the
+    /// selected route, which keeps legacy `[models.<stage>]` configuration authoritative.
+    pub fn session_scope(&self, route_default: SessionScope) -> SessionScope {
+        self.session.unwrap_or(route_default)
     }
 
     /// Compose a stage prompt in authority-independent, stable order.
@@ -176,6 +184,7 @@ pub fn stages_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> 
             instructions: stage.instructions.clone(),
             context: stage.context.clone(),
             capabilities: stage.capabilities.clone(),
+            session: stage.session,
             delegation: stage.delegation.as_ref().map(|delegation| Delegation {
                 target: delegation.target.clone(),
                 evidence_contract: delegation.evidence_contract.clone(),
@@ -220,8 +229,49 @@ pub fn built_in_stages() -> Vec<Stage> {
         instructions: String::new(),
         context: String::new(),
         capabilities: Vec::new(),
+        session: None,
         delegation: None,
         append_repository_guidance: true,
     })
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workflow_stage_session_overrides_a_route_and_built_ins_preserve_it() {
+        let workflow = ratatoskr_script::workflow::WorkflowMeta {
+            name: "custom".to_string(),
+            purpose: String::new(),
+            when_to_use: Vec::new(),
+            nodes: Vec::new(),
+            stages: vec![ratatoskr_script::workflow::WorkflowStage {
+                id: "review".to_string(),
+                agent: "reason".to_string(),
+                input_contract: "ReviewInput".to_string(),
+                output_contract: "ReviewOutput".to_string(),
+                output_schema: Some(serde_json::json!({ "type": "object" })),
+                instructions: String::new(),
+                context: String::new(),
+                capabilities: vec![Capability::Read],
+                session: Some(SessionScope::Compacted),
+                delegation: None,
+                append_repository_guidance: true,
+            }],
+        };
+
+        let stages = stages_from_workflow(&workflow);
+        assert_eq!(
+            stages[0].session_scope(SessionScope::Fresh),
+            SessionScope::Compacted
+        );
+        assert!(
+            built_in_stages()
+                .iter()
+                .all(|stage| stage.session_scope(SessionScope::Reuse) == SessionScope::Reuse),
+            "legacy stages keep their TOML route session without an explicit workflow override"
+        );
+    }
 }
