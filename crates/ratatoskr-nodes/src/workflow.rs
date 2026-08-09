@@ -46,13 +46,32 @@ const INVOCATION_CEILING: usize = 500;
 
 const STANDARD_WORKFLOW_V1: &str = include_str!("../workflows/standard-v1.ts");
 const STANDARD_WORKFLOW_INCLUDES: &[(&str, &str)] = &[
+    ("prompts/analyst.md", include_str!("../prompts/analyst.md")),
+    (
+        "prompts/characterizer.md",
+        include_str!("../prompts/characterizer.md"),
+    ),
+    ("prompts/context.md", include_str!("../prompts/context.md")),
+    (
+        "prompts/implementer.md",
+        include_str!("../prompts/implementer.md"),
+    ),
     (
         "prompts/overseer.md",
         include_str!("../prompts/overseer.md"),
     ),
     (
+        "prompts/redteam-author.md",
+        include_str!("../prompts/redteam-author.md"),
+    ),
+    (
         "prompts/redteam-classifier.md",
         include_str!("../prompts/redteam-classifier.md"),
+    ),
+    ("prompts/scout.md", include_str!("../prompts/scout.md")),
+    (
+        "prompts/verifier.md",
+        include_str!("../prompts/verifier.md"),
     ),
 ];
 
@@ -2339,7 +2358,12 @@ mod tests {
         assert_eq!(scout.agent, "explore");
         assert_eq!(scout.capabilities, [ratatoskr_core::Capability::Read]);
         assert_eq!(scout.tools, ["papertrail_issue_search", "semantic_search"]);
-        assert!(scout.output_schema.is_some());
+        let mut declared = scout.output_schema.clone().unwrap();
+        let mut generated =
+            serde_json::to_value(schemars::schema_for!(crate::scout::ScoutOutput)).unwrap();
+        without_schema_annotations(&mut declared);
+        without_schema_annotations(&mut generated);
+        assert_eq!(declared, generated, "schema drift for scout");
         assert_eq!(scout.session, None, "TOML retains the session decision");
 
         let turn = Arc::new(RecordingStageTurn {
@@ -2602,6 +2626,7 @@ mod tests {
                 object.remove("$schema");
                 object.remove("title");
                 object.remove("description");
+                object.remove("default");
                 for value in object.values_mut() {
                     without_schema_annotations(value);
                 }
@@ -2612,6 +2637,50 @@ mod tests {
                 }
             }
             _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_stage_prompts_are_exact_and_schemas_do_not_default_output() {
+        let stages = standard_stages().await.unwrap();
+        let expected_prompts = [
+            ("analyst", include_str!("../prompts/analyst.md")),
+            ("characterizer", include_str!("../prompts/characterizer.md")),
+            (
+                "context_distillation",
+                include_str!("../prompts/context.md"),
+            ),
+            (
+                "implementer_attempt",
+                include_str!("../prompts/implementer.md"),
+            ),
+            ("overseer", include_str!("../prompts/overseer.md")),
+            (
+                "redteam_author",
+                include_str!("../prompts/redteam-author.md"),
+            ),
+            (
+                "redteam_classifier",
+                include_str!("../prompts/redteam-classifier.md"),
+            ),
+            ("scout", include_str!("../prompts/scout.md")),
+            ("verifier", include_str!("../prompts/verifier.md")),
+        ];
+        assert_eq!(stages.len(), expected_prompts.len());
+        for (stage_id, expected_prompt) in expected_prompts {
+            let stage = stages.iter().find(|stage| stage.id == stage_id).unwrap();
+            assert_eq!(
+                stage.instructions,
+                expected_prompt.trim(),
+                "prompt drift for {stage_id}"
+            );
+            let declared = stage.output_schema.as_ref().unwrap();
+            let mut without_defaults = declared.clone();
+            without_schema_defaults(&mut without_defaults);
+            assert_eq!(
+                declared, &without_defaults,
+                "workflow schema materializes output defaults for {stage_id}"
+            );
         }
     }
 
@@ -3328,15 +3397,6 @@ mod tests {
             let mut declared = stage.output_schema.clone().unwrap();
             without_schema_annotations(&mut generated);
             without_schema_annotations(&mut declared);
-            if stage_id == "redteam_classifier" {
-                let mut declared_without_defaults = declared.clone();
-                without_schema_defaults(&mut declared_without_defaults);
-                assert_eq!(
-                    declared, declared_without_defaults,
-                    "workflow schemas must not materialize output defaults"
-                );
-                without_schema_defaults(&mut generated);
-            }
             assert_eq!(declared, generated, "schema drift for {stage_id}");
         }
     }
