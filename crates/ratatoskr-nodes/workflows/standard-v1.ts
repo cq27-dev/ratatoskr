@@ -182,6 +182,147 @@ step in \`failing\`.`,
       appendRepositoryGuidance: false,
     },
     {
+      id: "context_distillation",
+      agent: "explore",
+      governedBy: "context",
+      inputContract: "ContextDistillationInput",
+      outputContract: "Distillation",
+      outputSchema: {
+        type: "object",
+        properties: {
+          brief: { type: "string" },
+          constraints: {
+            type: "array",
+            default: [],
+            items: { "$ref": "#/$defs/Constraint" },
+          },
+          papertrail_summary: { type: "string", default: "" },
+          prior_art: {
+            type: "array",
+            default: [],
+            items: { "$ref": "#/$defs/RelatedItem" },
+          },
+        },
+        required: ["brief"],
+        "$defs": {
+          Constraint: {
+            type: "object",
+            properties: {
+              from_memory_id: { type: "string", default: "" },
+              says: { type: "string" },
+            },
+            required: ["says"],
+          },
+          RelatedItem: {
+            type: "object",
+            properties: {
+              item_key: { type: "string", default: "" },
+              relation: { type: "string", default: "" },
+              summary: { type: "string", default: "" },
+              title: { type: "string", default: "" },
+              url: { type: "string", default: "" },
+            },
+          },
+        },
+      },
+      instructions: `You gather what this repository already knows about a task, and hand it to the node that will plan
+the work. You do not plan it, and you do not propose a change.
+
+You are given the task and the repository's recorded memories, already retrieved and ranked. You
+have tools to search the tracker, the code, and the memories for more.
+
+## What to produce
+
+\`brief\` — what someone planning this task needs to know before they start, that they would
+otherwise have to discover. Not a description of the task; they have that. What surrounds it: how
+this area already works, what has been tried, what an obvious approach here would collide with. If
+there is genuinely nothing surrounding it, say that in a line rather than padding.
+
+\`constraints\` — what this task must respect. One object per entry, with the constraint itself in
+\`says\` and, when you read it from a recorded memory, that memory's id in \`from_memory_id\` (leave
+\`from_memory_id\` empty when it came from the tracker or the code instead).
+
+Write \`says\` in the terms of THIS task rather than in general. "The store's migration adds columns in
+two places, so this change needs both" is a constraint; "be careful with migrations" is not.
+
+\`prior_art\` — tracker issues and PRs that bear on this task, each with a line on how it relates.
+
+\`papertrail_summary\` — a short free-text account of what the tracker and history show.
+
+Read an issue's COMMENTS, not only its body. The body is what somebody thought when they filed it;
+the comments are what was learnt since — a correction, a decision taken afterwards, a measurement,
+a note that part of it already shipped. Where a comment contradicts the body, report the
+contradiction rather than picking one: a plan built on a superseded description is wrong before any
+code is written.
+
+An empty tracker result is ambiguous and must not be reported as a finding on its own. "Nothing has
+been filed about this" and "the tracker is not readable from here" produce the same empty list and
+mean opposite things. Probe with a broad term you would expect to match; if that returns nothing
+either, say the papertrail is unavailable. Reporting "no prior art" when the mirror is simply empty
+hands the analyst a false all-clear.
+
+## How to work
+
+Search before you conclude. The retrieved memories are a ranked guess from the task text alone, so
+they are a starting point, not the answer: search again yourself with the terms you learn from
+reading the code. A memory that would have mattered and was not surfaced is the expensive miss here.
+
+Read the code the task touches. A memory or an issue tells you what someone decided; the code tells
+you what is true now, and where those disagree the disagreement is itself worth reporting.
+
+Look specifically for the collision: an approach the task implies that something recorded already
+rules out. Nothing else you produce is worth as much, because it is the finding that stops work
+being done twice.
+
+## What not to do
+
+Do not restate a memory as a constraint without saying what it means for this task. A reader who
+wanted the memory verbatim has it — the whole point of your entry is the translation.
+
+Do not invent a \`from_memory_id\`. If a constraint came from reading the code, leave it empty; a
+citation that does not resolve is worse than none, because it will be believed.
+
+Do not speculate about what the change should be. The node after you decides that, and a
+recommendation from you is one it has to spend attention agreeing or disagreeing with.`,
+      renderQuestion(input: any) {
+        let question = `TASK:\n${input.issue}\n\n`;
+        const memories = input.memory.memories || [];
+        if (memories.length === 0) {
+          question += input.searchable
+            ? "RECORDED MEMORIES: none matched this task. Search again yourself with different terms before concluding this repository records nothing about it.\n"
+            : "RECORDED MEMORIES: this repository keeps none — there is no memory index here. Work from what you can read.\n";
+          return question;
+        }
+        question +=
+          "RECORDED MEMORIES — already retrieved for you, ranked. Quote from these when you write a constraint, and cite the id:\n\n";
+        for (const memory of memories) {
+          question += `id: ${memory.memory_id}\n`;
+          question += `[${memory.kind} | ${memory.confidence}] ${memory.title}\n`;
+          const body = memory.summary === undefined || memory.summary === null
+            ? memory.body
+            : memory.summary;
+          question += `${body}\n\n`;
+        }
+        return question;
+      },
+      capabilities: ["read"],
+      tools: [
+        "papertrail_issue_search",
+        "semantic_search",
+        "symbol_lookup",
+        "memory_search",
+      ],
+      session: null,
+      appendRepositoryGuidance: false,
+      arrayNormalization: [
+        {
+          field: "prior_art",
+          defaultEmpty: true,
+          retainWhenAnyNonBlank: ["item_key", "title"],
+        },
+      ],
+    },
+    {
       id: "scout",
       agent: "explore",
       inputContract: "String",

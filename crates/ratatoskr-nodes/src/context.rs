@@ -65,6 +65,14 @@ pub struct Distillation {
     pub papertrail_summary: String,
 }
 
+/// Deterministic evidence prepared before the model distils repository context.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct ContextDistillationInput {
+    pub issue: String,
+    pub memory: MemoryOutput,
+    pub searchable: bool,
+}
+
 /// The node's output: the distillation, plus the evidence it was drawn from, unmodified.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ContextOutput {
@@ -97,6 +105,9 @@ pub struct ContextNode {
     pub plugins: crate::NodePlugins,
     pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
     pub files: Option<std::path::PathBuf>,
+    /// Present on production paths. Direct construction remains a compatibility path for callers
+    /// that still need the native model runner.
+    pub(crate) declared_context: Option<std::sync::Arc<crate::workflow::WorkflowContext>>,
 }
 
 impl ContextNode {
@@ -109,59 +120,88 @@ impl ContextNode {
             None => crate::memory::MemoryOutput::default(),
         };
 
-        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-            node: "context",
-            route: &self.route,
-            preamble: &crate::effective_preamble_with_profile(
-                "context",
-                PREAMBLE,
-                self.plugins.profile_prompt.as_str(),
-                self.system_prompt.as_deref(),
-                self.plugins.context.as_deref(),
-                &self.plugins.skills,
-            ),
-            question: &render_prompt(issue, &memory, self.sink.is_some()),
-            tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(Distillation),
-            policy: self.policy.clone(),
-            max_turns: self.max_turns,
-            clarifier: self.clarifier.clone(),
-            observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills, "context"),
-            files: self.files.clone(),
-            // Reads and edits, but runs nothing.
-            shell: None,
-            push: None,
-            conversation: None,
-            ledger: self.ledger.clone(),
-            produces: Some(
-                "a brief on what bears on this task, the constraints it must respect with their \
-                 sources, and the prior art found",
-            ),
-        })
-        .await
-        .map_err(|e| NodeError::Failed(format!("context agent failed: {e}")))?;
+        let input = distillation_input(issue, memory.clone(), self.sink.is_some());
+        let input_json = serde_json::to_string(&input)
+            .map_err(|error| NodeError::Failed(format!("context input: {error}")))?;
+        let question = render_prompt(issue, &memory, input.searchable);
+        let raw = match &self.declared_context {
+            Some(ctx) => crate::workflow::evaluate_standard_stage(
+                std::sync::Arc::clone(ctx),
+                "context_distillation",
+                input_json,
+                question,
+            )
+            .await
+            .map_err(|error| NodeError::Failed(format!("context agent failed: {error}")))?,
+            None => ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
+                node: "context",
+                route: &self.route,
+                preamble: &crate::effective_preamble_with_profile(
+                    "context",
+                    PREAMBLE,
+                    self.plugins.profile_prompt.as_str(),
+                    self.system_prompt.as_deref(),
+                    self.plugins.context.as_deref(),
+                    &self.plugins.skills,
+                ),
+                question: &question,
+                tools: self.tools.clone(),
+                output_schema: schemars::schema_for!(Distillation),
+                policy: self.policy.clone(),
+                max_turns: self.max_turns,
+                clarifier: self.clarifier.clone(),
+                observer: self.plugins.observer.clone(),
+                skills: crate::skills::loaded(&self.plugins.skills, "context"),
+                files: self.files.clone(),
+                // Reads and edits, but runs nothing.
+                shell: None,
+                push: None,
+                conversation: None,
+                ledger: self.ledger.clone(),
+                produces: Some(
+                    "a brief on what bears on this task, the constraints it must respect with \
+                     their sources, and the prior art found",
+                ),
+            })
+            .await
+            .map_err(|error| NodeError::Failed(format!("context agent failed: {error}")))?,
+        };
 
-        let mut distilled = parse_validated::<Distillation>(&raw)?;
-        // Empty placeholder items reach the analyst as noise otherwise — the scout node carried
-        // this same filter for the same reason.
-        distilled
-            .prior_art
-            .retain(|i| !i.item_key.trim().is_empty() || !i.title.trim().is_empty());
-
-        Ok(ContextOutput {
-            brief: distilled.brief,
-            constraints: distilled.constraints,
-            scout: ScoutOutput {
-                related_items: distilled.prior_art,
-                papertrail_summary: distilled.papertrail_summary,
-            },
-            memory,
-        })
+        let distilled = parse_validated::<Distillation>(&raw)?;
+        Ok(attach_evidence(distilled, memory))
     }
 }
 
-fn render_prompt(issue: &str, memory: &MemoryOutput, searchable: bool) -> String {
+pub(crate) fn distillation_input(
+    issue: &str,
+    memory: MemoryOutput,
+    searchable: bool,
+) -> ContextDistillationInput {
+    ContextDistillationInput {
+        issue: issue.to_string(),
+        memory,
+        searchable,
+    }
+}
+
+pub(crate) fn attach_evidence(mut distilled: Distillation, memory: MemoryOutput) -> ContextOutput {
+    // Empty placeholder items reach the analyst as noise otherwise — the scout node carried this
+    // same filter for the same reason. The evidence is attached only after the model output gate.
+    distilled
+        .prior_art
+        .retain(|item| !item.item_key.trim().is_empty() || !item.title.trim().is_empty());
+    ContextOutput {
+        brief: distilled.brief,
+        constraints: distilled.constraints,
+        scout: ScoutOutput {
+            related_items: distilled.prior_art,
+            papertrail_summary: distilled.papertrail_summary,
+        },
+        memory,
+    }
+}
+
+pub(crate) fn render_prompt(issue: &str, memory: &MemoryOutput, searchable: bool) -> String {
     let mut s = String::new();
     let _ = write!(s, "TASK:\n{issue}\n\n");
     if memory.memories.is_empty() {
@@ -242,6 +282,50 @@ mod tests {
         let prompt = render_prompt("x", &MemoryOutput { memories: vec![] }, false);
         assert!(prompt.contains("keeps none"));
         assert!(!prompt.contains("Search again"));
+    }
+
+    #[test]
+    fn no_rag_rat_prepares_an_empty_non_searchable_baseline() {
+        let input = distillation_input("explain the store", MemoryOutput::default(), false);
+        assert!(input.memory.memories.is_empty());
+        assert!(!input.searchable);
+        let prompt = render_prompt(&input.issue, &input.memory, input.searchable);
+        assert!(prompt.contains("keeps none"), "{prompt}");
+        assert!(!prompt.contains("Search again"), "{prompt}");
+    }
+
+    #[test]
+    fn rust_attaches_the_baseline_verbatim_after_distillation() {
+        let memory = MemoryOutput {
+            memories: vec![record(
+                "mem_exact",
+                "Keep this wording",
+                "This body must arrive byte-for-byte.",
+            )],
+        };
+        let expected = serde_json::to_value(&memory).unwrap();
+        let output = attach_evidence(
+            Distillation {
+                brief: "what bears on the task".to_string(),
+                constraints: vec![Constraint {
+                    says: "respect the recorded invariant".to_string(),
+                    from_memory_id: "mem_exact".to_string(),
+                }],
+                prior_art: vec![
+                    RelatedItem::default(),
+                    RelatedItem {
+                        item_key: "#118".to_string(),
+                        title: "context evidence".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                papertrail_summary: "one relevant issue".to_string(),
+            },
+            memory,
+        );
+        assert_eq!(serde_json::to_value(&output.memory).unwrap(), expected);
+        assert_eq!(output.scout.related_items.len(), 1);
+        assert_eq!(output.scout.related_items[0].item_key, "#118");
     }
 
     #[test]

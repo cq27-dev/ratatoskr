@@ -160,6 +160,10 @@ pub struct WorkflowStage {
     #[serde(alias = "name")]
     pub id: String,
     pub agent: String,
+    /// Route, ruleset, plugin and telemetry identity when this stage is embedded in a Rust-owned
+    /// operation whose stable public name differs from the stage declaration.
+    #[serde(default)]
+    pub governed_by: Option<String>,
     #[serde(default, alias = "input")]
     pub input_contract: String,
     #[serde(default, alias = "output")]
@@ -611,6 +615,7 @@ mod tests {
                  stages: [{
                    id: "reviewer",
                    agent: "reason",
+                   governedBy: "verifier",
                    session: "compacted",
                  }],
                });
@@ -622,6 +627,10 @@ mod tests {
         assert_eq!(
             found[0].meta().stages[0].session,
             Some(SessionScope::Compacted)
+        );
+        assert_eq!(
+            found[0].meta().stages[0].governed_by.as_deref(),
+            Some("verifier")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

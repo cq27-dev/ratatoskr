@@ -256,6 +256,17 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
     )?;
     let mut ctx_tools = ctx_cfg.tools;
     ctx_tools.add_local(clarify::ask_tool());
+    let declared_context =
+        workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
+            client,
+            config,
+            store,
+            run_id,
+            issue,
+            engine,
+            plugin_context: context.clone(),
+            ledger: Arc::clone(ledger),
+        })?;
     let context_node = ContextNode {
         route: ctx_cfg.route,
         tools: ctx_tools,
@@ -267,6 +278,7 @@ async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
         plugins: plugins_context,
         files: ctx_cfg.files,
         ledger: Some(Arc::clone(ledger)),
+        declared_context: Some(declared_context),
     };
     let context_out = context_node
         .run(issue)

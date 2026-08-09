@@ -823,32 +823,41 @@ async fn verify_host(
 ///
 /// `scout()` and `memory()` remain for a script that composes them itself. This is the one that
 /// guarantees the ranked memory search happened.
-async fn context_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
+async fn context_host(
+    ctx: Arc<WorkflowContext>,
+    executor: Arc<StageExecutor>,
+    arg: String,
+) -> Result<String, String> {
     ctx.guard()?;
     let issue: String = serde_json::from_str(&arg).map_err(|e| format!("context arg: {e}"))?;
-    let mut plugins = ctx.plugin_context.for_node("context");
-    let cfg = stage_agent_config(
-        &ctx.engine,
-        &ctx.config,
-        ctx.plugin_context.pool_for("context", ctx.rag_rat.clone()),
-        "context",
-        crate::context::CONTEXT_TOOLS,
-        &mut plugins,
-    )
-    .map_err(|e| e.to_string())?;
-    let node = crate::ContextNode {
-        route: cfg.route,
-        tools: cfg.tools,
-        sink: ctx.sink.clone(),
-        files: cfg.files,
-        ledger: Some(Arc::clone(&ctx.ledger)),
-        policy: cfg.policy,
-        max_turns: cfg.max_turns,
-        clarifier: None,
-        system_prompt: cfg.system_prompt,
-        plugins,
+    let memory = match &ctx.sink {
+        Some(sink) => crate::memory::search(sink, &issue, "")
+            .await
+            .map_err(|error| error.to_string())?,
+        None => crate::MemoryOutput::default(),
     };
-    let out = node.run(&issue).await.map_err(|e| e.to_string())?;
+    let input = crate::context::distillation_input(&issue, memory.clone(), ctx.sink.is_some());
+    let input_json = serde_json::to_string(&input).map_err(|error| error.to_string())?;
+    let rendered_question =
+        crate::context::render_prompt(&input.issue, &input.memory, input.searchable);
+    let stage = executor
+        .stages
+        .iter()
+        .find(|stage| stage.id == "context_distillation")
+        .cloned()
+        .ok_or_else(|| "standard stage `context_distillation` is not registered".to_string())?;
+    let raw = executor
+        .execute_after_guard(StageInvocation {
+            stage,
+            input_json,
+            rendered_question: Some(rendered_question),
+            resource_root: None,
+            output: StageOutput::Evidence,
+        })
+        .await?;
+    let distilled: crate::context::Distillation =
+        serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+    let out = crate::context::attach_evidence(distilled, memory);
     note(&ctx, "context", &out, Some(arg)).await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
@@ -916,6 +925,7 @@ fn normalize_declared_output(stage: &Stage, output: &mut serde_json::Value) -> R
 /// the user message after platform, agent, stage, repository, plugin, and skill guidance.
 fn declared_stage_preamble(
     stage: &Stage,
+    governance_id: &str,
     profile: &crate::AgentProfile,
     system_prompt: Option<&str>,
     repository_guidance: &str,
@@ -948,7 +958,7 @@ fn declared_stage_preamble(
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
-    crate::effective_preamble(&stage.id, &base, None, None, skills)
+    crate::effective_preamble(governance_id, &base, None, None, skills)
 }
 
 fn declared_stage_question(stage: &Stage, runtime_question: &str) -> String {
@@ -1077,14 +1087,15 @@ impl StageExecutor {
         } = invocation;
         let input: serde_json::Value =
             serde_json::from_str(&input_json).map_err(|e| format!("{} arg: {e}", stage.id))?;
-        let plugins = self.ctx.plugin_context.for_node(&stage.id);
+        let governance_id = stage.governance_id().to_string();
+        let plugins = self.ctx.plugin_context.for_node(&governance_id);
         let default_tools = stage.tools.iter().map(String::as_str).collect::<Vec<_>>();
         let (mut cfg, profile) = crate::plugins::declared_stage_agent_config(
             &self.ctx.engine,
             &self.ctx.config,
             self.ctx
                 .plugin_context
-                .pool_for(&stage.id, self.ctx.rag_rat.clone()),
+                .pool_for(&governance_id, self.ctx.rag_rat.clone()),
             &stage,
             &default_tools,
             &plugins,
@@ -1136,6 +1147,7 @@ impl StageExecutor {
         let repository_guidance = crate::repo_conventions(&self.ctx.repo_path).unwrap_or_default();
         let preamble = declared_stage_preamble(
             &stage,
+            &governance_id,
             &profile,
             cfg.system_prompt.as_deref(),
             &repository_guidance,
@@ -1160,11 +1172,11 @@ impl StageExecutor {
             .map_err(|e| format!("stage `{}` has invalid outputSchema: {e}", stage.id))?;
         // Stable within this run and stage, unique across runs. Endpoint reuse needs the uniqueness;
         // local compaction uses the same key so both continuation modes agree on stage identity.
-        let conversation = format!("{}-{}", self.ctx.run_id, stage.id);
+        let conversation = format!("{}-{governance_id}", self.ctx.run_id);
         let raw = self
             .turn
             .run(ratatoskr_agent::NodeRun {
-                node: &stage.id,
+                node: &governance_id,
                 route: &cfg.route,
                 preamble: &preamble,
                 question: &question,
@@ -1175,7 +1187,7 @@ impl StageExecutor {
                 max_turns: cfg.max_turns,
                 clarifier: None,
                 observer: plugins.observer.clone(),
-                skills: crate::skills::loaded(&plugins.skills, &stage.id),
+                skills: crate::skills::loaded(&plugins.skills, &governance_id),
                 files: resource_root.or(cfg.files),
                 shell: None,
                 push: None,
@@ -1215,7 +1227,15 @@ enum TemporaryOperation {
 impl TemporaryOperation {
     fn host(self, ctx: &Arc<WorkflowContext>, executor: &Arc<StageExecutor>) -> HostFn {
         match self {
-            Self::Context => binding(Arc::clone(ctx), context_host),
+            Self::Context => {
+                let ctx = Arc::clone(ctx);
+                let executor = Arc::clone(executor);
+                Arc::new(move |arg| {
+                    let ctx = Arc::clone(&ctx);
+                    let executor = Arc::clone(&executor);
+                    Box::pin(async move { context_host(ctx, executor, arg).await })
+                })
+            }
             Self::Memory => binding(Arc::clone(ctx), memory_host),
             Self::Analyze => binding(Arc::clone(ctx), analyze_host),
             Self::RedTeam => binding(Arc::clone(ctx), red_team_host),
@@ -1683,6 +1703,7 @@ mod tests {
         }];
         let preamble = declared_stage_preamble(
             &stage,
+            stage.governance_id(),
             &profile,
             None,
             "repository guidance",
@@ -2448,6 +2469,352 @@ mod tests {
                 .is_empty(),
             "invalid output must not be checkpointed"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn standard_context_distillation_uses_generic_dispatch_and_preserves_its_input() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-context-distillation-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"async function plan(input) { return await context_distillation(input); }"#,
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::load(&workflow_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run(
+                "run-standard-context-distillation",
+                None,
+                RunStatus::Running.as_str(),
+            )
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "context".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Compacted,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-standard-context-distillation",
+            "explain the checkpoint contract",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = standard_stages().await.unwrap();
+        let stage = stages
+            .iter()
+            .find(|stage| stage.id == "context_distillation")
+            .unwrap();
+        assert_eq!(stage.governance_id(), "context");
+        assert_eq!(stage.agent, "explore");
+        assert_eq!(stage.session, None);
+        assert_eq!(
+            stage.tools,
+            [
+                "papertrail_issue_search",
+                "semantic_search",
+                "symbol_lookup",
+                "memory_search"
+            ]
+        );
+
+        let input = crate::context::ContextDistillationInput {
+            issue: "explain the checkpoint contract".to_string(),
+            memory: crate::MemoryOutput {
+                memories: vec![crate::memory::MemoryRecord {
+                    memory_id: "mem_exact".to_string(),
+                    kind: "Invariant".to_string(),
+                    title: "Checkpoints keep original input".to_string(),
+                    confidence: "high".to_string(),
+                    status: "active".to_string(),
+                    body: "The full source evidence.".to_string(),
+                    summary: Some("The compact source evidence.".to_string()),
+                }],
+            },
+            searchable: true,
+        };
+        let expected_prompt =
+            crate::context::render_prompt(&input.issue, &input.memory, input.searchable);
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({
+                "brief": "The checkpoint retains its source evidence.",
+                "constraints": [{
+                    "says": "keep the original input",
+                    "from_memory_id": "mem_exact"
+                }],
+                "prior_art": [
+                    { "item_key": "", "title": "" },
+                    { "item_key": "#118", "title": "Context evidence" }
+                ],
+                "papertrail_summary": "Issue 118 introduced the split."
+            })
+            .to_string(),
+            ..Default::default()
+        });
+        let hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        runtime
+            .run_with_question_renderers(
+                "plan",
+                serde_json::to_string(&input).unwrap(),
+                hosts,
+                stage_question_renderers(&stages),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *turn.nodes.lock().expect("recording runner mutex poisoned"),
+            ["context"]
+        );
+        assert_eq!(
+            *turn
+                .sessions
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            [ratatoskr_core::SessionScope::Compacted]
+        );
+        let offered = turn.tools.lock().expect("recording runner mutex poisoned")[0].clone();
+        for tool in ["Read", "Grep", "Glob"] {
+            assert!(
+                offered.iter().any(|offered| offered == tool),
+                "missing {tool}"
+            );
+        }
+        assert_eq!(
+            turn.questions
+                .lock()
+                .expect("recording runner mutex poisoned")[0],
+            format!(
+                "Input contract: ContextDistillationInput\nOutput contract: Distillation\n\n{expected_prompt}"
+            )
+        );
+
+        let checkpoints = store
+            .checkpoints_for_run("run-standard-context-distillation")
+            .await
+            .unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].node_name, "context_distillation");
+        let checkpoint_input: crate::context::ContextDistillationInput =
+            serde_json::from_str(checkpoints[0].input_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            checkpoint_input.memory.memories[0].body,
+            "The full source evidence."
+        );
+        let checkpoint_output: serde_json::Value =
+            serde_json::from_str(&checkpoints[0].output_json).unwrap();
+        assert_eq!(checkpoint_output["prior_art"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn standard_context_contract_rejects_missing_brief_without_a_checkpoint() {
+        let stages = standard_stages().await.unwrap();
+        let stage = stages
+            .iter()
+            .find(|stage| stage.id == "context_distillation")
+            .unwrap();
+        assert_eq!(
+            stage.instructions,
+            include_str!("../prompts/context.md").trim()
+        );
+        let mut generated =
+            serde_json::to_value(schemars::schema_for!(crate::context::Distillation)).unwrap();
+        without_schema_annotations(&mut generated);
+        let mut declared = stage.output_schema.clone().unwrap();
+        without_schema_annotations(&mut declared);
+        assert_eq!(declared, generated);
+        assert!(
+            stage.output_schema.as_ref().unwrap()["$defs"]["RelatedItem"]["properties"]
+                .get("title")
+                .is_some()
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-context-schema-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-context-schema", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "context".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-context-schema",
+            "context",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({ "constraints": [], "prior_art": [] }).to_string(),
+            ..Default::default()
+        });
+        let mut hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        let envelope = json!({
+            "__ratatoskrRenderedQuestion": {
+                "input": {
+                    "issue": "context",
+                    "memory": { "memories": [] },
+                    "searchable": false
+                },
+                "question": "TASK:\ncontext\n\nRECORDED MEMORIES: none"
+            }
+        })
+        .to_string();
+        let error = hosts.remove("context_distillation").unwrap()(envelope)
+            .await
+            .unwrap_err();
+        assert!(error.contains("invalid `Distillation` output"), "{error}");
+        assert!(error.contains("brief"), "{error}");
+        assert!(
+            store
+                .checkpoints_for_run("run-context-schema")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn context_operation_keeps_the_no_rag_rat_baseline_rust_owned() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-context-no-rag-rat-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"async function plan(input) { return await context(input.issue); }"#,
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::load(&workflow_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-context-no-rag", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "context".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-context-no-rag",
+            "explain context",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = standard_stages().await.unwrap();
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({
+                "brief": "No indexed memories are available.",
+                "constraints": [],
+                "prior_art": [],
+                "papertrail_summary": ""
+            })
+            .to_string(),
+            ..Default::default()
+        });
+        let hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        runtime
+            .run_with_question_renderers(
+                "plan",
+                json!({ "issue": "explain context" }).to_string(),
+                hosts,
+                stage_question_renderers(&stages),
+            )
+            .await
+            .unwrap();
+
+        let question = turn
+            .questions
+            .lock()
+            .expect("recording runner mutex poisoned")[0]
+            .clone();
+        assert!(
+            question.contains("this repository keeps none"),
+            "{question}"
+        );
+        assert!(!question.contains("Search again"), "{question}");
+        let checkpoints = store
+            .checkpoints_for_run("run-context-no-rag")
+            .await
+            .unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].node_name, "context");
+        assert_eq!(
+            checkpoints[0].input_json.as_deref(),
+            Some(r#""explain context""#)
+        );
+        let output: crate::ContextOutput =
+            serde_json::from_str(&checkpoints[0].output_json).unwrap();
+        assert!(output.memory.memories.is_empty());
+        assert!(output.scout.related_items.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

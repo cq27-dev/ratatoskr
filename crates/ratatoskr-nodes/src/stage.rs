@@ -37,6 +37,8 @@ impl AgentProfile {
 pub struct Stage {
     pub id: String,
     pub agent: String,
+    /// Stable route/rules/plugin identity. Defaults to [`Self::id`].
+    pub governed_by: Option<String>,
     pub input_contract: String,
     pub output_contract: String,
     /// JSON Schema for [`Self::output_contract`] on user-declared stages.
@@ -66,6 +68,10 @@ pub struct ArrayNormalization {
 }
 
 impl Stage {
+    pub fn governance_id(&self) -> &str {
+        self.governed_by.as_deref().unwrap_or(&self.id)
+    }
+
     pub fn effective_ceiling(&self, profile: &AgentProfile) -> Option<Capability> {
         match (profile.ceiling(), Capability::ceiling(&self.capabilities)) {
             (Some(profile), Some(stage)) => Some(profile.min(stage)),
@@ -199,6 +205,7 @@ pub fn stages_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> 
         .map(|stage| Stage {
             id: stage.id.clone(),
             agent: stage.agent.clone(),
+            governed_by: stage.governed_by.clone(),
             input_contract: stage.input_contract.clone(),
             output_contract: stage.output_contract.clone(),
             output_schema: stage.output_schema.clone(),
@@ -255,6 +262,7 @@ pub fn built_in_stages() -> Vec<Stage> {
     .map(|(id, agent, input_contract, output_contract)| Stage {
         id: id.into(),
         agent: agent.into(),
+        governed_by: None,
         input_contract: input_contract.into(),
         output_contract: output_contract.into(),
         output_schema: None,
@@ -285,6 +293,7 @@ mod tests {
             stages: vec![ratatoskr_script::workflow::WorkflowStage {
                 id: "review".to_string(),
                 agent: "reason".to_string(),
+                governed_by: None,
                 input_contract: "ReviewInput".to_string(),
                 output_contract: "ReviewOutput".to_string(),
                 output_schema: Some(serde_json::json!({ "type": "object" })),
@@ -305,6 +314,7 @@ mod tests {
             stages[0].session_scope(SessionScope::Fresh),
             SessionScope::Compacted
         );
+        assert_eq!(stages[0].governance_id(), "review");
         assert!(
             built_in_stages()
                 .iter()

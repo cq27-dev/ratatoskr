@@ -700,7 +700,7 @@ pub(crate) fn declared_stage_agent_config(
         engine,
         config,
         tools,
-        &stage.id,
+        stage.governance_id(),
         default_tools,
         plugins,
         AgentSettings {
