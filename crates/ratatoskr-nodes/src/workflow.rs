@@ -34,7 +34,7 @@ use crate::{
     AnalystNode, AnalystOutput, BookkeeperInput, BookkeeperNode, BookkeeperOutput, ImplementerNode,
     ImplementerOutput, MemoryNode, MemoryOutput, PlanError, PlanOutcome, RedTeamNode,
     RedTeamOutput, RunOutcome, ScoutNode, ScoutOutput, analyst, bookkeeper, checkpoint, converge,
-    memory, node_agent_config, redteam, scout, verifier,
+    memory, node_agent_config, redteam, referee, scout, verifier,
 };
 
 /// Backstop on total node-running binding calls per run — a runaway-loop guard, far above any real
@@ -153,21 +153,18 @@ async fn count_checkpoints(store: &Store, run_id: &str, node: &str) -> Result<u3
     Ok(checkpoints.iter().filter(|c| c.node_name == node).count() as u32)
 }
 
-/// Terminal status, inferred from the baseline and the final implementer output — never trusted from
-/// the script. `Converged` only if the change left the referee alone AND the post run completed AND
-/// it introduced no failures the baseline lacked; anything else is a wall hit. The referee check
-/// comes first: once the tests or their runner have been edited, the test comparison is describing
-/// a bar the change wrote for itself.
+/// Terminal status, inferred from the baseline, final implementer output, and the async referee
+/// judgement — never trusted from the script. The exemption is applied before the judgement runs,
+/// so this pure function only decides whether its violations block the test result.
 fn infer_status(
     red_team: &RedTeamOutput,
     implementer: &ImplementerOutput,
-    may_modify_tests: &[String],
+    referee: &[referee::Violation],
     review: Option<&verifier::VerifierOutput>,
     threshold: verifier::Severity,
 ) -> RunStatus {
-    let referee = converge::referee_touches(&implementer.rewritten_files, may_modify_tests);
     if !referee.is_empty() {
-        tracing::warn!(files = ?referee, "run touched the referee; not converged");
+        tracing::warn!(violations = ?referee, "run weakened the referee; not converged");
         return RunStatus::MaxIterationsReached;
     }
     // A script chooses when to review; it does not get to ignore what a review said. Calling
@@ -528,6 +525,86 @@ async fn implement_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
+async fn referee_judgement(
+    ctx: &Arc<WorkflowContext>,
+    worktree: &WorktreePath,
+    analyst: &AnalystOutput,
+    implementer: &ImplementerOutput,
+) -> Vec<referee::Violation> {
+    let Some(route) = crate::referee_route(&ctx.engine, &ctx.config) else {
+        tracing::info!("no referee or verifier route configured; trusting test results alone");
+        return Vec::new();
+    };
+    let candidates =
+        converge::referee_candidates(&implementer.rewritten_files, ctx.engine.may_modify_tests());
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    // Retain the referee ruleset's prompt, policy and tool override while supplying the verifier
+    // route when it is the configured fallback.
+    let mut config = ctx.config.clone();
+    config.models.insert("referee".to_string(), route);
+    let plugins = ctx.plugin_context.for_node("referee");
+    let cfg = match node_agent_config(
+        &ctx.engine,
+        &config,
+        ctx.plugin_context.pool_for("referee", ctx.rag_rat.clone()),
+        "referee",
+        referee::REFEREE_TOOLS,
+        &plugins,
+    ) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            tracing::warn!("the referee could not be configured; trusting test results: {error}");
+            return Vec::new();
+        }
+    };
+    let node = referee::RefereeNode {
+        route: cfg.route,
+        tools: cfg.tools,
+        policy: cfg.policy,
+        max_turns: cfg.max_turns,
+        system_prompt: cfg.system_prompt,
+        plugins,
+        ledger: Some(Arc::clone(&ctx.ledger)),
+        files: Some(worktree.as_path().to_path_buf()),
+    };
+    let diff = ratatoskr_exec::full_diff_text(worktree)
+        .await
+        .unwrap_or_default();
+    let input = referee::RefereeInput {
+        issue: ctx.issue.clone(),
+        requirements: analyst.requirements.clone(),
+        hunks: referee::hunks_for(&diff, &candidates),
+        candidates,
+    };
+    match node.run(input).await {
+        Ok(out) => {
+            if let Err(error) = note(ctx, "referee", &out, None).await {
+                tracing::warn!("failed to record referee judgement: {error}");
+            }
+            out.violations
+        }
+        Err(error) => {
+            tracing::warn!(
+                "the referee could not judge this change; trusting test results: {error}"
+            );
+            if let Err(record_error) = note(
+                ctx,
+                "referee",
+                &serde_json::json!({ "error": error.to_string() }),
+                None,
+            )
+            .await
+            {
+                tracing::warn!("failed to record referee failure: {record_error}");
+            }
+            Vec::new()
+        }
+    }
+}
+
 async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String, String> {
     ctx.guard()?;
     // One iterate at a time — reject overlapping calls (e.g. `Promise.all([iterate(), iterate()])`)
@@ -561,11 +638,14 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String,
         .map_err(|e| e.to_string())?;
     let post_ran =
         converge::test_command_ran(&prev.failing_tests, prev.passed_tests, prev.exit_code);
-    let referee = converge::referee_touches(&prev.rewritten_files, ctx.engine.may_modify_tests());
+    let analyst: AnalystOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "analyst")
+        .await
+        .map_err(|e| e.to_string())?;
+    let referee = referee_judgement(&ctx, &worktree, &analyst, &prev).await;
     // Referee first, same as the built-in loop: a moved referee makes the test sets meaningless,
     // so reverting it is what this iteration has to be told to do.
     let diagnostic = if !referee.is_empty() {
-        converge::referee_correction(&referee)
+        referee::correction(&referee)
     } else if !post_ran {
         format!(
             "The test command did not run to completion (exit {}) — your change likely does not \
@@ -582,9 +662,6 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String,
         )
     };
 
-    let analyst: AnalystOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "analyst")
-        .await
-        .map_err(|e| e.to_string())?;
     let node = build_implementer(&ctx, analyst).map_err(|e| e.to_string())?;
     let out = node
         .iterate(&worktree, &diagnostic)
@@ -936,10 +1013,11 @@ async fn finish_full(ctx: &Arc<WorkflowContext>) -> Result<RunOutcome, PlanError
         latest_checkpoint(&ctx.store, &ctx.run_id, "verifier")
             .await
             .ok();
+    let referee = referee_judgement(ctx, &worktree, &plan.analyst, &implementer).await;
     let status = infer_status(
         &red_team,
         &implementer,
-        ctx.engine.may_modify_tests(),
+        &referee,
         review.as_ref(),
         crate::parse_threshold(&ctx.config.implementer.verify_threshold),
     );
@@ -1095,47 +1173,6 @@ mod tests {
                 verifier::Severity::P2
             ),
             RunStatus::MaxIterationsReached
-        );
-    }
-
-    #[test]
-    fn a_clean_test_run_does_not_convert_a_rewritten_referee_into_success() {
-        // The BenchJack shape: every test passes, because conftest.py was rewritten to say so.
-        let baseline = red(&["a"], &["b"], 1);
-        let mut cheated = imp(&[], &["a", "b"], 0);
-        cheated.touched_files = vec!["conftest.py".to_string()];
-        cheated.rewritten_files = vec!["conftest.py".to_string()];
-        cheated.rewritten_files = vec!["conftest.py".to_string()];
-        assert_eq!(
-            infer_status(&baseline, &cheated, &[], None, verifier::Severity::P2),
-            RunStatus::MaxIterationsReached
-        );
-        // Unless the task declared it up front.
-        assert_eq!(
-            infer_status(
-                &baseline,
-                &cheated,
-                &["conftest.py".to_string()],
-                None,
-                verifier::Severity::P2
-            ),
-            RunStatus::Converged
-        );
-    }
-
-    #[test]
-    fn adding_a_test_is_not_a_referee_touch() {
-        // The gate refuses rewriting a test to make failures stop; it must not refuse writing one.
-        // An implementer that believes otherwise ships untested code and contorts its design to
-        // avoid a fixture it was never forbidden to extend.
-        let baseline = red(&["a"], &["b"], 1);
-        let mut honest = imp(&[], &["a", "b"], 0);
-        honest.touched_files = vec!["src/lib.rs".to_string(), "tests/api.rs".to_string()];
-        // Only added lines, so nothing was rewritten.
-        honest.rewritten_files = vec!["src/lib.rs".to_string()];
-        assert_eq!(
-            infer_status(&baseline, &honest, &[], None, verifier::Severity::P2),
-            RunStatus::Converged
         );
     }
 
@@ -1296,5 +1333,60 @@ mod tests {
         // A later call proposing something else gets what the run already froze.
         let later = resolve(&[step("something-else")]);
         assert_eq!(later[0].name, "wasm");
+    }
+
+    /// Contract reading (#206): the judgement's violations reach `infer_status` as a
+    /// `&[referee::Violation]` where `may_modify_tests` used to sit. The exemption is applied by
+    /// `converge::referee_candidates` before the judgement runs, so by the time the status is
+    /// inferred there is nothing left to exempt — what arrives here is what the judgement found.
+    fn violation(file: &str, reason: &str) -> crate::referee::Violation {
+        crate::referee::Violation {
+            file: file.into(),
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn referee_violations_block_convergence_even_when_the_tests_are_clean() {
+        // The #205 shape with the gate working: the inline characterisation module was deleted,
+        // every remaining test passes, and the run still must not converge.
+        let baseline = red(&["a"], &["b"], 1);
+        let mut cheated = imp(&[], &["a", "b"], 0);
+        cheated.rewritten_files = vec!["crates/ratatoskr-nodes/src/lib.rs".to_string()];
+        let violations = vec![violation(
+            "crates/ratatoskr-nodes/src/lib.rs",
+            "deleted the #[cfg(test)] module that characterised the move",
+        )];
+        assert_eq!(
+            infer_status(
+                &baseline,
+                &cheated,
+                &violations,
+                None,
+                verifier::Severity::P2
+            ),
+            RunStatus::MaxIterationsReached
+        );
+    }
+
+    #[test]
+    fn an_empty_judgement_converges_on_the_tests_alone() {
+        let baseline = red(&["a"], &["b"], 1);
+        // A mayModifyTests-exempt rewrite never reaches the judgement, so the violations are
+        // empty and the rewrite cannot flip the status — infer_status trusts the judgement it is
+        // handed rather than re-deriving anything from the rewritten-file list.
+        let mut exempt = imp(&["a"], &["b", "c"], 0);
+        exempt.rewritten_files = vec!["tests/api.rs".to_string()];
+        assert_eq!(
+            infer_status(&baseline, &exempt, &[], None, verifier::Severity::P2),
+            RunStatus::Converged
+        );
+        // Which is also the no-route case: no referee and no verifier configured, the scripted
+        // path infers Converged from the tests alone (the #112 shape).
+        let plain = imp(&["a"], &["b", "c"], 0);
+        assert_eq!(
+            infer_status(&baseline, &plain, &[], None, verifier::Severity::P2),
+            RunStatus::Converged
+        );
     }
 }
