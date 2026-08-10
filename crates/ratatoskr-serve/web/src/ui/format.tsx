@@ -77,61 +77,6 @@ export function Json({ value }: { value: unknown }): JSX.Element {
   );
 }
 
-/**
- * A JSON string rendered inline and coloured, or the original text when it is not JSON.
- *
- * Tool arguments reach the feed already stringified. Parsing to colour them is worth it because
- * that is where a path or a command hides among the punctuation; failing to parse is ordinary and
- * means it was never JSON, so the text stands as it is.
- */
-export function InlineJson({ text }: { text: string }): JSX.Element {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return <>{text}</>;
-  }
-  if (parsed === null || typeof parsed !== "object") return <>{text}</>;
-  return <Compact v={parsed} />;
-}
-
-/** The same colouring with no line breaks, for a value shown on one line of the feed. */
-function Compact({ v }: { v: unknown }): JSX.Element {
-  if (v === null) return <span className="j-null">null</span>;
-  if (typeof v === "boolean") return <span className="j-bool">{String(v)}</span>;
-  if (typeof v === "number") return <span className="j-num">{String(v)}</span>;
-  if (typeof v === "string") return <span className="j-str">{JSON.stringify(v)}</span>;
-  if (Array.isArray(v)) {
-    return (
-      <>
-        <span className="j-punc">[</span>
-        {v.map((item, i) => (
-          <span key={i}>
-            {i > 0 && <span className="j-punc">, </span>}
-            <Compact v={item} />
-          </span>
-        ))}
-        <span className="j-punc">]</span>
-      </>
-    );
-  }
-  const entries = Object.entries(v as Record<string, unknown>);
-  return (
-    <>
-      <span className="j-punc">{"{"}</span>
-      {entries.map(([k, item], i) => (
-        <span key={k}>
-          {i > 0 && <span className="j-punc">, </span>}
-          <span className="j-key">{k}</span>
-          <span className="j-punc">: </span>
-          <Compact v={item} />
-        </span>
-      ))}
-      <span className="j-punc">{"}"}</span>
-    </>
-  );
-}
-
 /* ── Prose ─────────────────────────────────────────────────────────────── */
 
 /**

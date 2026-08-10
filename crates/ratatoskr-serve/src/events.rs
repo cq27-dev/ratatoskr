@@ -43,11 +43,12 @@ pub struct LiveEvent {
     /// Set on a `question` event: what a viewer's answer has to be posted against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub question_id: Option<String>,
-    /// The one argument that identifies a tool call — the path read, the pattern searched, the
-    /// command run. Without it every call reads `Read`, and a feed of forty of those says only
-    /// that the node was busy.
+    /// An optional producer-provided summary for a tool call.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub arg: Option<String>,
+    pub subject: Option<String>,
+    /// The bounded JSON arguments supplied to a tool call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<Value>,
     /// How long a tool took, on its `tool_result`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
@@ -240,55 +241,6 @@ fn stage_name(node: &str) -> &str {
     }
 }
 
-/// The argument worth showing for a tool call.
-///
-/// Tools name their subject differently — a path, a pattern, a command — so this takes the first
-/// field that identifies one, in the order a reader would look for it. Truncated hard: the feed is
-/// one line per call, and a `Write` carrying a file's whole contents would bury everything around
-/// it.
-fn tool_argument(record: &Value) -> Option<String> {
-    const IDENTIFYING: [&str; 7] = [
-        "file_path",
-        "command",
-        "pattern",
-        "path",
-        "query",
-        "symbol",
-        "name",
-    ];
-    let args: Value = serde_json::from_str(record.get("args")?.as_str()?).ok()?;
-    let found = IDENTIFYING
-        .iter()
-        .find_map(|k| args.get(k))
-        .map(|v| match v {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        })?;
-    Some(shorten(&found))
-}
-
-/// Shorten a tool's argument to what the feed can show, keeping the end.
-///
-/// The end is the part that identifies the call — the file name, not the directories above it, and
-/// the tail of a long command rather than its first flag. Trimming from the front and marking it
-/// with a leading `…` says so in the text itself.
-///
-/// The alternative was `direction: rtl` on the element, which puts the CSS ellipsis at the start
-/// without changing the string. It also reverses how the text selects, and reorders a neutral
-/// character sitting at either end of the string — an absolute path rendered with its leading `/`
-/// moved to the far end, which reads as a directory it is not.
-fn shorten(arg: &str) -> String {
-    let count = arg.chars().count();
-    if count <= ARG_LIMIT {
-        return arg.to_string();
-    }
-    let tail: String = arg.chars().skip(count - ARG_LIMIT).collect();
-    format!("…{tail}")
-}
-
-/// How much of a tool's argument the feed shows.
-const ARG_LIMIT: usize = 120;
-
 /// Normalise one log record, keeping only what a viewer can act on.
 fn to_event(record: &Value) -> LiveEvent {
     let kind = record
@@ -309,9 +261,17 @@ fn to_event(record: &Value) -> LiveEvent {
         None => detail.to_string(),
     };
 
+    let args = (kind == "tool_call")
+        .then(|| record.get("args")?.as_str())
+        .flatten()
+        .and_then(|args| serde_json::from_str(args).ok());
+
     LiveEvent {
         at: str_field("timestamp").unwrap_or_default().to_string(),
-        arg: tool_argument(record),
+        subject: (kind == "tool_call")
+            .then(|| str_field("tool_subject").map(str::to_string))
+            .flatten(),
+        args,
         duration_ms: record.get("duration_ms").and_then(Value::as_u64),
         question_id: str_field("question_id").map(str::to_string),
         facts: LiveNodeFacts::of(record),
@@ -642,63 +602,59 @@ mod tests {
     }
 
     #[test]
-    fn a_long_argument_keeps_the_end_that_identifies_it() {
-        // The file name is the part a reader is looking for, so a path too long to show loses its
-        // leading directories rather than its tail.
-        let deep = format!(
-            "/home/kk/{}/crates/ratatoskr-serve/src/events.rs",
-            "nested/".repeat(20)
-        );
-        let short = shorten(&deep);
-        assert!(short.starts_with('…'), "{short}");
-        assert!(
-            short.ends_with("crates/ratatoskr-serve/src/events.rs"),
-            "{short}"
-        );
-        assert_eq!(short.chars().count(), ARG_LIMIT + 1);
+    fn tool_calls_keep_complete_arguments_and_only_explicit_subjects() {
+        let args = serde_json::json!({
+            "query": null,
+            "symbol": "crate::T",
+            "ref": "main",
+            "id": "sym_1",
+            "target": {"opaque_key": [{"leaf": 7}]},
+        });
+        let record = serde_json::json!({
+            "timestamp": "t",
+            "kind": "tool_call",
+            "tool": "impact_surface",
+            "args": args.to_string(),
+            "spans": [{"run_id": "r1"}],
+        });
+        let event = to_event(&record);
+        assert_eq!(event.detail, "impact_surface");
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["args"], args);
+        assert!(wire.get("subject").is_none());
+        assert_eq!(event.args, Some(args));
+        assert_eq!(event.subject, None, "arguments never imply a subject");
 
-        // Anything that fits is untouched — no marker, and no reordering of a leading slash.
-        let fits = "/home/kk/src/lib.rs";
-        assert_eq!(shorten(fits), fits);
+        let record = serde_json::json!({
+            "kind": "tool_call",
+            "tool": "future_tool",
+            "tool_subject": "provided by the tool",
+            "args": r#"{"target":{"opaque_key":[{"leaf":7}]}}"#,
+        });
+        let event = to_event(&record);
+        assert_eq!(event.subject.as_deref(), Some("provided by the tool"));
+        assert_eq!(
+            event.args,
+            Some(serde_json::json!({"target": {"opaque_key": [{"leaf": 7}]}}))
+        );
     }
 
     #[test]
-    fn an_edit_is_identified_by_its_path_like_a_read_is() {
-        // These two halves live in different crates: the agent writes `args`, the dashboard reads
-        // it. When the agent bounded the serialized JSON rather than its values, an `Edit` arrived
-        // cut mid-`old_string`, parsed as nothing, and showed no path — while `Read` looked fine
-        // because its arguments were short enough to survive. Pin both shapes.
-        let record = |tool: &str, args: serde_json::Value| -> Value {
-            serde_json::json!({
-                "timestamp": "t",
-                "kind": "tool_call",
-                "tool": tool,
-                "args": args.to_string(),
-                "spans": [{"name": "run", "run_id": "r1"}],
-            })
-        };
-
-        let read = record(
-            "Read",
-            serde_json::json!({"file_path": "crates/foo/src/lib.rs"}),
-        );
-        assert_eq!(
-            to_event(&read).arg.as_deref(),
-            Some("crates/foo/src/lib.rs")
-        );
-
-        let edit = record(
-            "Edit",
-            serde_json::json!({
-                "file_path": "crates/foo/src/lib.rs",
-                "old_string": "a",
-                "new_string": "b",
-            }),
-        );
-        assert_eq!(
-            to_event(&edit).arg.as_deref(),
-            Some("crates/foo/src/lib.rs")
-        );
+    fn legacy_tool_arguments_fall_back_to_the_tool_name() {
+        for args in [
+            None,
+            Some(serde_json::json!({"not": "a string"})),
+            Some(serde_json::json!("{")),
+        ] {
+            let mut record = serde_json::json!({"kind": "tool_call", "tool": "find_callers"});
+            if let Some(args) = args {
+                record["args"] = args;
+            }
+            let event = to_event(&record);
+            assert_eq!(event.detail, "find_callers");
+            assert_eq!(event.args, None);
+            assert_eq!(event.subject, None);
+        }
     }
 
     #[test]
@@ -742,7 +698,8 @@ mod tests {
             node: None,
             detail: "which way?".into(),
             question_id: Some("q-1".into()),
-            arg: None,
+            subject: None,
+            args: None,
             duration_ms: None,
             facts: None,
             usage: None,
@@ -756,7 +713,8 @@ mod tests {
             node: Some("scout".into()),
             detail: "semantic_search".into(),
             question_id: None,
-            arg: None,
+            subject: None,
+            args: None,
             duration_ms: None,
             facts: None,
             usage: None,
@@ -1023,6 +981,40 @@ mod tests {
         let got = history(&store, &dir, "r1").await;
         let expected = to_event(&serde_json::from_str::<Value>(&payload).unwrap());
         assert_eq!(got, vec![expected]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn history_and_live_replay_normalize_tool_arguments_identically() {
+        let args = serde_json::json!({"query": null, "ref": "main", "nested": {"leaf": 7}});
+        let payload = serde_json::json!({
+            "timestamp": "2026-08-05T19:02:08Z",
+            "kind": "tool_call",
+            "tool": "find_callers",
+            "tool_subject": "explicit target",
+            "args": args.to_string(),
+            "spans": [{"run_id": "r1"}],
+        })
+        .to_string();
+        let live = events_for("r1", &[&payload]);
+
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("r1", None, "running").await.unwrap();
+        store
+            .ingest_events(
+                "r1",
+                vec![EventRow {
+                    seq: 0,
+                    at: "2026-08-05T19:02:08Z".into(),
+                    kind: "tool_call".into(),
+                    node: None,
+                    payload_json: payload,
+                }],
+            )
+            .await
+            .unwrap();
+        let dir = scratch("history-tool-args");
+        assert_eq!(history(&store, &dir, "r1").await, live);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
