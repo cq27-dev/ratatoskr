@@ -10,10 +10,12 @@
 //! come from several servers at once, which is what [`ToolSet`] carries: tools grouped by the
 //! server each is dispatched to.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use ratatoskr_core::{self, Capability, McpServerConfig, McpTransport, RagRatConfig};
+use ratatoskr_core::{
+    self, Capability, McpServerConfig, McpToolConfig, McpTransport, RagRatConfig,
+};
 use rmcp::ServiceExt;
 use rmcp::model::Tool;
 use rmcp::service::{RoleClient, RunningService, ServerSink};
@@ -265,6 +267,11 @@ pub struct ConfiguredMcpClient {
     capabilities: BTreeMap<String, Capability>,
 }
 
+struct ConfiguredToolMetadata {
+    renames: BTreeMap<String, String>,
+    capabilities: BTreeMap<String, Capability>,
+}
+
 impl ConfiguredMcpClient {
     pub async fn connect(origin: &str, config: &McpServerConfig) -> Result<Self, McpError> {
         let bearer_token = config
@@ -277,26 +284,11 @@ impl ConfiguredMcpClient {
                 Connection::connect_http(origin, &config.url, bearer_token).await?
             }
         };
-        let renames = config
-            .tools
-            .iter()
-            .filter_map(|(wire, tool)| tool.name.clone().map(|name| (wire.clone(), name)))
-            .collect();
-        validate_configured_tool_names(origin, &connection.tools, &renames)?;
-        let capabilities = config
-            .tools
-            .iter()
-            .map(|(wire, tool)| {
-                (
-                    tool.name.clone().unwrap_or_else(|| wire.clone()),
-                    tool.capability,
-                )
-            })
-            .collect();
+        let metadata = configured_tool_metadata(origin, &connection.tools, &config.tools)?;
         Ok(Self {
             connection,
-            renames,
-            capabilities,
+            renames: metadata.renames,
+            capabilities: metadata.capabilities,
         })
     }
 
@@ -317,17 +309,41 @@ impl ConfiguredMcpClient {
     }
 }
 
-/// Validate names only after discovery: configuration cannot see unlisted tools or alias
-/// collisions with them.
-fn validate_configured_tool_names(
+/// Validate and bind metadata only after discovery: configuration cannot see unlisted tools or
+/// alias collisions with them, and stale wire keys must never grant authority to another tool.
+fn configured_tool_metadata(
     origin: &str,
     tools: &[Tool],
-    renames: &BTreeMap<String, String>,
-) -> Result<(), McpError> {
+    configured: &BTreeMap<String, McpToolConfig>,
+) -> Result<ConfiguredToolMetadata, McpError> {
+    let discovered = tools
+        .iter()
+        .map(|tool| tool.name.as_ref())
+        .collect::<BTreeSet<_>>();
+    let missing = configured
+        .keys()
+        .filter(|wire| !discovered.contains(wire.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(McpError::InvalidToolSet {
+            origin: origin.to_string(),
+            detail: format!(
+                "configured metadata names tools the server did not expose: {}",
+                missing.join(", ")
+            ),
+        });
+    }
+
     let mut claimed = BTreeMap::new();
+    let mut renames = BTreeMap::new();
+    let mut capabilities = BTreeMap::new();
     for tool in tools {
         let wire = tool.name.as_ref();
-        let display = renames.get(wire).map_or(wire, String::as_str);
+        let metadata = configured.get(wire);
+        let display = metadata
+            .and_then(|tool| tool.name.as_deref())
+            .unwrap_or(wire);
         if !ratatoskr_core::valid_model_tool_name(display) {
             return Err(McpError::InvalidToolSet {
                 origin: origin.to_string(),
@@ -346,8 +362,17 @@ fn validate_configured_tool_names(
                 ),
             });
         }
+        if let Some(metadata) = metadata {
+            if metadata.name.is_some() {
+                renames.insert(wire.to_string(), display.to_string());
+            }
+            capabilities.insert(display.to_string(), metadata.capability);
+        }
     }
-    Ok(())
+    Ok(ConfiguredToolMetadata {
+        renames,
+        capabilities,
+    })
 }
 
 /// Where a tool offer came from. Authority defaults depend on provenance, never origin spelling.
@@ -760,10 +785,16 @@ mod tests {
     #[test]
     fn configured_aliases_cannot_collide_with_unlisted_tools() {
         let tools = vec![tool("foo"), tool("bar")];
-        let renames = BTreeMap::from([("foo".to_string(), "bar".to_string())]);
+        let configured = BTreeMap::from([(
+            "foo".to_string(),
+            McpToolConfig {
+                name: Some("bar".to_string()),
+                capability: Capability::Read,
+            },
+        )]);
 
         assert!(matches!(
-            validate_configured_tool_names("remote", &tools, &renames),
+            configured_tool_metadata("remote", &tools, &configured),
             Err(McpError::InvalidToolSet { origin, detail })
                 if origin == "remote"
                     && detail.contains("ambiguous")
@@ -776,13 +807,52 @@ mod tests {
     fn unlisted_tool_names_must_be_provider_safe() {
         for name in ["namespace.tool".to_string(), "x".repeat(65)] {
             assert!(matches!(
-                validate_configured_tool_names("remote", &[tool(&name)], &BTreeMap::new()),
+                configured_tool_metadata("remote", &[tool(&name)], &BTreeMap::new()),
                 Err(McpError::InvalidToolSet { origin, detail })
                     if origin == "remote"
                         && detail.contains(&name)
                         && detail.contains("configure a unique alias")
             ));
         }
+    }
+
+    #[test]
+    fn stale_configured_wire_tools_cannot_grant_an_unlisted_tool_authority() {
+        let stale = BTreeMap::from([(
+            "old_tool".to_string(),
+            McpToolConfig {
+                name: Some("search".to_string()),
+                capability: Capability::Read,
+            },
+        )]);
+        assert!(matches!(
+            configured_tool_metadata("remote", &[tool("search")], &stale),
+            Err(McpError::InvalidToolSet { origin, detail })
+                if origin == "remote"
+                    && detail.contains("did not expose")
+                    && detail.contains("old_tool")
+        ));
+
+        let configured = BTreeMap::from([(
+            "fetch".to_string(),
+            McpToolConfig {
+                name: Some("WebFetch".to_string()),
+                capability: Capability::Read,
+            },
+        )]);
+        let tools = vec![tool("fetch"), tool("search")];
+        let metadata = configured_tool_metadata("remote", &tools, &configured).unwrap();
+        let set = ToolSet::from_servers(vec![ServerTools {
+            origin: "remote".to_string(),
+            sink: None,
+            tools,
+            prefix: None,
+            renames: metadata.renames,
+            capabilities: metadata.capabilities,
+            provenance: ServerProvenance::Configured,
+        }]);
+        assert_eq!(set.capability("WebFetch"), Capability::Read);
+        assert_eq!(set.capability("search"), Capability::Publish);
     }
 
     #[test]
