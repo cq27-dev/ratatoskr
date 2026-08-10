@@ -22,6 +22,8 @@ use rmcp::service::{RoleClient, RunningService, ServerSink};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 
+const MCP_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The origin name of the connection made from `[rag_rat]` in the config.
 ///
 /// Also what a plugin-declared server is checked against: the rag-rat plugin declares the same
@@ -50,6 +52,12 @@ pub enum McpError {
     Handshake { origin: String, detail: String },
     #[error("listing `{origin}`'s tools failed: {detail}")]
     ListTools { origin: String, detail: String },
+    #[error("MCP {operation} with `{origin}` timed out after {timeout:?}")]
+    StartupTimeout {
+        origin: String,
+        operation: &'static str,
+        timeout: std::time::Duration,
+    },
     #[error("configured MCP server `{origin}` exposes an invalid tool set: {detail}")]
     InvalidToolSet { origin: String, detail: String },
     #[error("shutting down `{origin}` failed: {detail}")]
@@ -132,23 +140,38 @@ impl Connection {
         url: &str,
         bearer_token: Option<String>,
     ) -> Result<Self, McpError> {
+        Self::connect_http_with_timeout(origin, url, bearer_token, MCP_STARTUP_TIMEOUT).await
+    }
+
+    async fn connect_http_with_timeout(
+        origin: &str,
+        url: &str,
+        bearer_token: Option<String>,
+        startup_timeout: std::time::Duration,
+    ) -> Result<Self, McpError> {
         let config = bearer_token.map_or_else(
             || StreamableHttpClientTransportConfig::with_uri(url),
             |token| StreamableHttpClientTransportConfig::with_uri(url).auth_header(token),
         );
         let transport = StreamableHttpClientTransport::from_config(config);
-        let service = ().serve(transport).await.map_err(|_| McpError::Handshake {
-            origin: origin.to_string(),
-            detail: "streamable HTTP transport failed".to_string(),
-        })?;
-        let tools = service
-            .peer()
-            .list_all_tools()
-            .await
-            .map_err(|_| McpError::ListTools {
+        let service = bounded_startup(origin, "handshake", startup_timeout, async {
+            ().serve(transport).await.map_err(|_| McpError::Handshake {
                 origin: origin.to_string(),
                 detail: "streamable HTTP transport failed".to_string(),
-            })?;
+            })
+        })
+        .await?;
+        let tools = bounded_startup(origin, "tools/list", startup_timeout, async {
+            service
+                .peer()
+                .list_all_tools()
+                .await
+                .map_err(|_| McpError::ListTools {
+                    origin: origin.to_string(),
+                    detail: "streamable HTTP transport failed".to_string(),
+                })
+        })
+        .await?;
         tracing::info!(
             server = origin,
             tool_count = tools.len(),
@@ -202,6 +225,21 @@ impl Connection {
                 detail: "MCP service shutdown failed".to_string(),
             })
     }
+}
+
+async fn bounded_startup<T>(
+    origin: &str,
+    operation: &'static str,
+    timeout: std::time::Duration,
+    future: impl std::future::Future<Output = Result<T, McpError>>,
+) -> Result<T, McpError> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| McpError::StartupTimeout {
+            origin: origin.to_string(),
+            operation,
+            timeout,
+        })?
 }
 
 fn subprocess_command(
@@ -773,6 +811,56 @@ mod tests {
         assert!(matches!(
             Connection::connect_http("remote", "http://127.0.0.1:9/mcp", None).await,
             Err(McpError::Handshake { origin, .. }) if origin == "remote"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stalled_http_handshake_times_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (_connection, _) = listener.accept().unwrap();
+            let _ = stopped.recv_timeout(std::time::Duration::from_secs(2));
+        });
+
+        let result = Connection::connect_http_with_timeout(
+            "stalled",
+            &format!("http://{address}/mcp"),
+            None,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+
+        drop(stop);
+        server.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(McpError::StartupTimeout {
+                origin,
+                operation: "handshake",
+                ..
+            }) if origin == "stalled"
+        ));
+    }
+
+    #[tokio::test]
+    async fn every_startup_operation_uses_the_same_timeout_error() {
+        let result = bounded_startup(
+            "stalled",
+            "tools/list",
+            std::time::Duration::from_millis(1),
+            std::future::pending::<Result<(), McpError>>(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(McpError::StartupTimeout {
+                origin,
+                operation: "tools/list",
+                ..
+            }) if origin == "stalled"
         ));
     }
 

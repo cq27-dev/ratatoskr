@@ -556,12 +556,29 @@ fn node_agent_config(
         })
         .flat_map(ServerTools::display_names)
         .collect();
+    let configured_names = tools
+        .groups()
+        .iter()
+        .filter(|group| {
+            group.provenance == ServerProvenance::Configured
+                && group.origin != ratatoskr_mcp::RAG_RAT
+        })
+        .flat_map(ServerTools::display_names)
+        .collect::<std::collections::BTreeSet<_>>();
+    // A built-in list names rag-rat operations, not arbitrary operations that happen to claim the
+    // same display name. Keep absent names for the diagnostics below, but never let a configured
+    // server turn one into an implicit grant when rag-rat is not connected.
+    let implicit_defaults = default_tools
+        .iter()
+        .copied()
+        .filter(|name| !configured_names.contains(*name))
+        .collect::<Vec<_>>();
     let spelled_out = rc
         .and_then(|c| c.tools.as_ref())
         .and_then(|t| t.allow.as_deref());
     let allow: Vec<String> = match spelled_out {
         Some(a) => a.to_vec(),
-        None => default_allow(default_tools, from_plugins.clone()),
+        None => default_allow(&implicit_defaults, from_plugins.clone()),
     };
     let allowed: Vec<String> = allow
         .iter()
@@ -811,21 +828,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_tools_require_an_explicit_ruleset_allow() {
-        let mut web_fetch = rmcp::model::Tool::default();
-        web_fetch.name = "web_fetch_exa".to_string().into();
+    async fn configured_tools_cannot_inherit_a_rag_rat_default_allow() {
+        let mut remote_search = rmcp::model::Tool::default();
+        remote_search.name = "remote_search".to_string().into();
         let tools = ToolSet::from_servers(vec![ServerTools {
             // Origin spelling must not let a configured server impersonate host-local tools.
             origin: ratatoskr_mcp::LOCAL.to_string(),
             sink: None,
-            tools: vec![web_fetch],
+            tools: vec![remote_search],
             prefix: None,
             renames: std::collections::BTreeMap::from([(
-                "web_fetch_exa".to_string(),
-                "WebFetch".to_string(),
+                "remote_search".to_string(),
+                "semantic_search".to_string(),
             )]),
             capabilities: std::collections::BTreeMap::from([(
-                "WebFetch".to_string(),
+                "semantic_search".to_string(),
                 Capability::Read,
             )]),
             provenance: ServerProvenance::Configured,
@@ -838,15 +855,28 @@ mod tests {
             &config,
             tools.clone(),
             "analyst",
-            &[],
+            &["semantic_search"],
             &mut NodePlugins::default(),
         )
         .unwrap();
-        assert!(default.tools.is_empty());
+        assert!(
+            !default
+                .tools
+                .names()
+                .iter()
+                .any(|name| name == "semantic_search")
+        );
+        assert!(
+            default
+                .tools
+                .groups()
+                .iter()
+                .all(|group| group.provenance != ServerProvenance::Configured)
+        );
 
         let explicit_engine = binding_engine(
             "exa-explicit-allow",
-            r#"defineAgent("analyst", { tools: { allow: ["WebFetch"] } });"#,
+            r#"defineAgent("analyst", { tools: { allow: ["semantic_search"] } });"#,
         )
         .await;
         let explicit = stage_agent_config(
@@ -854,11 +884,11 @@ mod tests {
             &config,
             tools,
             "analyst",
-            &[],
+            &["semantic_search"],
             &mut NodePlugins::default(),
         )
         .unwrap();
-        assert_eq!(explicit.tools.names(), vec!["WebFetch"]);
+        assert_eq!(explicit.tools.names(), vec!["semantic_search"]);
     }
 
     #[tokio::test]
