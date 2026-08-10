@@ -514,10 +514,7 @@ fn node_agent_config(
     if !default_tools.is_empty()
         && ceiling.is_some_and(|capability| capability.permits(Capability::Read))
     {
-        tools
-            .local()
-            .tools
-            .extend(ratatoskr_agent::files::declarations());
+        tools.add_local_tools(ratatoskr_agent::files::declarations());
     }
     let ruleset = engine.ruleset(node);
     let rc = ruleset.as_ref().map(|r| r.config());
@@ -865,6 +862,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_tools_cannot_shadow_host_local_file_tools() {
+        let tools = ToolSet::from_servers(vec![ServerTools {
+            origin: "configured".to_string(),
+            sink: None,
+            tools: vec![{
+                let mut tool = rmcp::model::Tool::default();
+                tool.name = ratatoskr_agent::files::READ.to_string().into();
+                tool
+            }],
+            prefix: None,
+            renames: std::collections::BTreeMap::new(),
+            capabilities: std::collections::BTreeMap::from([(
+                ratatoskr_agent::files::READ.to_string(),
+                Capability::Read,
+            )]),
+            provenance: ServerProvenance::Configured,
+        }]);
+        let config = RatatoskrConfig::default();
+        let engine = binding_engine("configured-read-collision", "").await;
+
+        let configured = stage_agent_config(
+            &engine,
+            &config,
+            tools,
+            "analyst",
+            &[ratatoskr_agent::files::READ],
+            &mut NodePlugins::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            configured
+                .tools
+                .names()
+                .iter()
+                .filter(|name| name.as_str() == ratatoskr_agent::files::READ)
+                .count(),
+            1
+        );
+        assert_eq!(
+            configured.tools.capability(ratatoskr_agent::files::READ),
+            Capability::Read
+        );
+        assert!(configured.tools.groups().iter().any(|group| {
+            group.provenance == ServerProvenance::Builtin
+                && group
+                    .display_names()
+                    .iter()
+                    .any(|name| name == ratatoskr_agent::files::READ)
+        }));
+    }
+
+    #[tokio::test]
     async fn plugin_provenance_keeps_its_implicit_grant_even_on_a_configured_name() {
         let mut tool = rmcp::model::Tool::default();
         tool.name = "search".to_string().into();
@@ -967,10 +1017,7 @@ mod tests {
         let route = config.models["analyst"].clone();
         config.models.insert("redteam".to_string(), route);
         let mut tools = ToolSet::default();
-        tools
-            .local()
-            .tools
-            .extend(ratatoskr_agent::files::edit_declarations());
+        tools.add_local_tools(ratatoskr_agent::files::edit_declarations());
 
         let cfg = redteam_author_agent_config(
             &engine,

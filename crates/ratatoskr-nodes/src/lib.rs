@@ -1393,18 +1393,12 @@ fn build_implementer_agent_with_servers(
 ) -> Result<(NodeAgentConfig, NodePlugins), PlanError> {
     let mut plugins = context.for_node("implementer");
     let mut tools = context.pool_for("implementer", &configured);
-    tools
-        .local()
-        .tools
-        .extend(ratatoskr_agent::files::edit_declarations());
-    tools
-        .local()
-        .tools
-        .push(ratatoskr_agent::shell::declaration());
+    tools.add_local_tools(ratatoskr_agent::files::edit_declarations());
+    tools.add_local(ratatoskr_agent::shell::declaration());
     // The implementer can ask. It has the most turns to spend and is the only node that changes
     // code, so it is the one most likely to meet a question worth asking — and the run-wide
     // `ASK_BUDGET` is what keeps that a relief valve rather than a way to spend a run.
-    tools.local().tools.push(clarify::ask_tool());
+    tools.add_local(clarify::ask_tool());
     let mut cfg = stage_agent_config(
         engine,
         config,
@@ -2060,10 +2054,7 @@ mod agent_config_tests {
         // Without one there is nothing to run it in, which is exactly the state the publisher was
         // left in.
         let mut tools = ToolSet::default();
-        tools
-            .local()
-            .tools
-            .push(ratatoskr_agent::publish::declaration());
+        tools.add_local(ratatoskr_agent::publish::declaration());
         assert!(
             tools
                 .names()

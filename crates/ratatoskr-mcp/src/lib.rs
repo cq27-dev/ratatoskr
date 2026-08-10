@@ -445,9 +445,7 @@ impl ToolSet {
         self.groups.retain(|g| !g.tools.is_empty());
     }
 
-    /// Add a tool that is answered locally rather than dispatched — the synthetic `ask`, which a
-    /// hook intercepts. It joins the first group so it reaches the agent with everything else; the
-    /// sink it nominally belongs to is never used for it.
+    /// Add a tool that is answered locally rather than dispatched.
     ///
     /// The name is *taken*, not merely added: the hook that answers it matches on the name alone,
     /// so a server offering the same one would be shadowed anyway — silently, and with the wrong
@@ -473,12 +471,24 @@ impl ToolSet {
                 !clash
             });
         }
+        self.groups.retain(|group| !group.tools.is_empty());
         self.local().tools.push(tool);
     }
 
+    /// Add host-local tools while reserving every name against connected servers.
+    pub fn add_local_tools(&mut self, tools: impl IntoIterator<Item = Tool>) {
+        for tool in tools {
+            self.add_local(tool);
+        }
+    }
+
     /// The group of tools this host answers itself, created on first use.
-    pub fn local(&mut self) -> &mut ServerTools {
-        if !self.groups.iter().any(|g| g.sink.is_none()) {
+    fn local(&mut self) -> &mut ServerTools {
+        if !self
+            .groups
+            .iter()
+            .any(|g| g.provenance == ServerProvenance::Builtin)
+        {
             self.groups.push(ServerTools {
                 origin: LOCAL.to_string(),
                 sink: None,
@@ -491,7 +501,7 @@ impl ToolSet {
         }
         self.groups
             .iter_mut()
-            .find(|g| g.sink.is_none())
+            .find(|g| g.provenance == ServerProvenance::Builtin)
             .expect("just ensured")
     }
 
@@ -781,6 +791,32 @@ mod tests {
             }]);
             assert_eq!(set.capability("Read"), Capability::Publish);
         }
+    }
+
+    #[test]
+    fn host_local_tools_replace_configured_name_collisions() {
+        let mut set = ToolSet::from_servers(vec![ServerTools {
+            origin: "configured".to_string(),
+            sink: None,
+            tools: vec![tool("Read")],
+            prefix: None,
+            renames: BTreeMap::new(),
+            capabilities: BTreeMap::from([("Read".to_string(), Capability::Read)]),
+            provenance: ServerProvenance::Configured,
+        }]);
+
+        set.add_local(tool("Read"));
+
+        assert_eq!(set.names(), say(&["Read"]));
+        assert_eq!(set.capability("Read"), Capability::Read);
+        assert!(set.groups().iter().any(|group| {
+            group.provenance == ServerProvenance::Builtin && group.display_names() == say(&["Read"])
+        }));
+        assert!(
+            set.groups()
+                .iter()
+                .all(|group| group.provenance != ServerProvenance::Configured)
+        );
     }
 
     /// The names a keep-mask leaves, per group.

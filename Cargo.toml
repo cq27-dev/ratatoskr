@@ -59,6 +59,7 @@ tracing-appender = "0.2"
 thiserror = "2"
 anyhow = "1"
 toml = "1"
+url = "2"
 dotenvy = "0.15"
 # jsonschema validates node output values against their schemars-generated schema. default-features
 # off drops the reqwest-based remote-$ref resolver we don't need (schemas are local & self-contained).

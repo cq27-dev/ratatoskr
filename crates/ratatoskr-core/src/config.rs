@@ -852,14 +852,19 @@ impl RatatoskrConfig {
                     "mcp server name `{name}` is empty or reserved"
                 )));
             }
-            if !server
-                .url
-                .strip_prefix("http://")
-                .or_else(|| server.url.strip_prefix("https://"))
-                .is_some_and(|host| !host.is_empty() && !host.contains(char::is_whitespace))
-            {
+            if server.url.trim() != server.url {
                 return Err(ConfigError::Invalid(format!(
-                    "mcp.servers.{name}.url must be an http(s) URL"
+                    "mcp.servers.{name}.url must be a valid HTTP(S) URL with a host"
+                )));
+            }
+            let parsed_url = url::Url::parse(&server.url).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "mcp.servers.{name}.url is not a valid URL: {error}"
+                ))
+            })?;
+            if !matches!(parsed_url.scheme(), "http" | "https") || parsed_url.host_str().is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "mcp.servers.{name}.url must be an HTTP(S) URL with a host"
                 )));
             }
             if let Some(env) = &server.bearer_token_env
@@ -1544,6 +1549,9 @@ mod tests {
         for (fragment, expected) in [
             ("url = \"\"", "url"),
             ("url = \"not-a-url\"", "url"),
+            ("url = \"http://localhost:abc\"", "invalid port number"),
+            ("url = \"https://\"", "empty host"),
+            ("url = \"file:///tmp/mcp.sock\"", "url"),
             (
                 "url = \"https://example.test/mcp\"\nbearer_token_env = \"BAD-NAME\"",
                 "bearer_token_env",

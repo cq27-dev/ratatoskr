@@ -499,10 +499,7 @@ fn build_red_team(
         true => {
             let mut plugins = ctx.plugin_context.for_node("redteam");
             let mut tools = ctx.plugin_context.pool_for("redteam", &ctx.servers);
-            tools
-                .local()
-                .tools
-                .extend(ratatoskr_agent::files::edit_declarations());
+            tools.add_local_tools(ratatoskr_agent::files::edit_declarations());
             let cfg = crate::plugins::redteam_author_agent_config(
                 &ctx.engine,
                 &ctx.config,
@@ -1649,27 +1646,21 @@ impl StageExecutor {
         if ratatoskr_core::Capability::ceiling(&stage.capabilities)
             .is_some_and(|ceiling| ceiling.permits(ratatoskr_core::Capability::Write))
         {
-            offered
-                .local()
-                .tools
-                .extend(ratatoskr_agent::files::edit_declarations());
+            offered.add_local_tools(ratatoskr_agent::files::edit_declarations());
         }
         if stage
             .tools
             .iter()
             .any(|tool| tool == ratatoskr_agent::shell::BASH)
         {
-            offered
-                .local()
-                .tools
-                .push(ratatoskr_agent::shell::declaration());
+            offered.add_local(ratatoskr_agent::shell::declaration());
         }
         if stage
             .tools
             .iter()
             .any(|tool| tool == ratatoskr_agent::ASK_TOOL_NAME)
         {
-            offered.local().tools.push(crate::clarify::ask_tool());
+            offered.add_local(crate::clarify::ask_tool());
         }
         if publish.is_some()
             && stage
@@ -1677,10 +1668,7 @@ impl StageExecutor {
                 .iter()
                 .any(|tool| tool == ratatoskr_agent::publish::GH)
         {
-            offered
-                .local()
-                .tools
-                .push(ratatoskr_agent::publish::declaration());
+            offered.add_local(ratatoskr_agent::publish::declaration());
         }
         if publish
             .as_ref()
@@ -1691,10 +1679,7 @@ impl StageExecutor {
                 .iter()
                 .any(|tool| tool == ratatoskr_agent::publish::PUSH)
         {
-            offered
-                .local()
-                .tools
-                .push(ratatoskr_agent::publish::push_declaration());
+            offered.add_local(ratatoskr_agent::publish::push_declaration());
         }
         let (mut cfg, profile) = crate::plugins::declared_stage_agent_config(
             &self.ctx.engine,

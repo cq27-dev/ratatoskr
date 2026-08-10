@@ -2287,8 +2287,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let mut tools = ratatoskr_mcp::ToolSet::default();
-        tools.local().tools.extend(files::declarations());
-        tools.local().tools.extend(files::edit_declarations());
+        tools.add_local_tools(files::declarations());
+        tools.add_local_tools(files::edit_declarations());
 
         let route = ModelRoute {
             provider: "anthropic".into(),
