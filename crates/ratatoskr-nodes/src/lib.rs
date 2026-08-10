@@ -501,7 +501,13 @@ pub async fn validate_configured_stages(config: &RatatoskrConfig) -> Result<(), 
     stages.retain(|stage| {
         !matches!(
             stage.id.as_str(),
-            "overseer" | "scout" | "analyst" | "verifier" | "characterizer"
+            "overseer"
+                | "scout"
+                | "analyst"
+                | "verifier"
+                | "characterizer"
+                | "bookkeeper"
+                | "publisher"
         )
     });
     stages.extend(workflow::standard_stages().await?);
@@ -2454,6 +2460,13 @@ mod agent_config_tests {
         // Rust flow's gates without deleting a file.
         let picked = select(registry_of("override", &["only"]).await, Some(BUILT_IN)).unwrap();
         assert!(matches!(picked, Workflow::BuiltIn));
+    }
+
+    #[tokio::test]
+    async fn the_default_standard_stage_registry_has_unique_identifiers() {
+        validate_configured_stages(&RatatoskrConfig::default())
+            .await
+            .expect("the bundled standard declarations replace legacy terminal placeholders");
     }
 
     #[tokio::test]
