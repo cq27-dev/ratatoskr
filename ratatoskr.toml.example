@@ -121,8 +121,15 @@ model = "kimi-k2.5"
 # so this is the only one in the request.
 
 [models.analyst]
-provider = "anthropic"
-model = "claude-sonnet-4-6"
+provider = "openai"
+model = "gpt-5.6-terra"
+# Planning errors multiply across every implementation and review turn. Keep the analyst on the
+# stronger reasoning route, while compacting before OpenAI's whole-request pricing cliff.
+context_window = 272000
+session = "compacted"
+
+[models.analyst.params.reasoning]
+effort = "high"
 
 [models.implementer]
 provider = "anthropic"

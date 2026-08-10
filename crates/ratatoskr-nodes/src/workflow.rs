@@ -5325,6 +5325,17 @@ mod tests {
             analyst_stage.instructions,
             include_str!("../prompts/analyst.md").trim()
         );
+        assert!(
+            analyst_stage
+                .instructions
+                .contains("Treat the issue's proposed implementation as evidence")
+        );
+        assert!(analyst_stage.instructions.contains("run an extension test"));
+        assert!(
+            analyst_stage
+                .instructions
+                .contains("why the generic alternative loses")
+        );
         let mut generated =
             serde_json::to_value(schemars::schema_for!(analyst::AnalystOutput)).unwrap();
         without_schema_annotations(&mut generated);
