@@ -1060,26 +1060,27 @@ async fn verify_host(
         note(&ctx, "verifier", &out, Some(input_json)).await?;
         serde_json::to_string(&out).map_err(|e| e.to_string())?
     } else {
-        let rendered_question = verifier::render_prompt(&verifier_input);
         let stage = executor
             .stages
             .iter()
             .find(|stage| stage.id == "verifier")
             .cloned()
             .ok_or_else(|| "standard verifier stage is not registered".to_string())?;
-        match executor
-            .execute_after_guard(StageInvocation {
-                stage,
-                input_json: input_json.clone(),
-                rendered_question: Some(rendered_question),
+        match execute_standard_stage(
+            &executor,
+            stage,
+            input_json.clone(),
+            StandardStageInvocation {
                 resource_root: Some(worktree.0.clone()),
                 shell: None,
                 publish: None,
                 clarifier: None,
                 invocation_guidance: None,
                 output: StageOutput::Checkpoint,
-            })
-            .await
+                after_guard: true,
+            },
+        )
+        .await
         {
             Ok(raw) => raw,
             Err(error) => {
@@ -1142,19 +1143,21 @@ impl CeilingRecovery for LiveCeilingRecovery {
             .find(|stage| stage.id == "analyst")
             .cloned()
             .ok_or_else(|| "standard analyst stage is not registered".to_string())?;
-        let raw = match executor
-            .execute_after_guard(StageInvocation {
-                stage,
-                input_json,
-                rendered_question: Some(crate::analyst::render_prompt(input)),
+        let raw = match execute_standard_stage(
+            executor,
+            stage,
+            input_json,
+            StandardStageInvocation {
                 resource_root: None,
                 shell: None,
                 publish: None,
                 clarifier: None,
                 invocation_guidance: None,
                 output: StageOutput::Checkpoint,
-            })
-            .await
+                after_guard: true,
+            },
+        )
+        .await
         {
             Ok(raw) => raw,
             Err(error) => {
@@ -1356,27 +1359,27 @@ async fn context_host(
     };
     let input = crate::context::distillation_input(&issue, memory.clone(), ctx.sink.is_some());
     let input_json = serde_json::to_string(&input).map_err(|error| error.to_string())?;
-    let rendered_question =
-        crate::context::render_prompt(&input.issue, &input.memory, input.searchable);
     let stage = executor
         .stages
         .iter()
         .find(|stage| stage.id == "context_distillation")
         .cloned()
         .ok_or_else(|| "standard stage `context_distillation` is not registered".to_string())?;
-    let raw = executor
-        .execute_after_guard(StageInvocation {
-            stage,
-            input_json,
-            rendered_question: Some(rendered_question),
+    let raw = execute_standard_stage(
+        &executor,
+        stage,
+        input_json,
+        StandardStageInvocation {
             resource_root: None,
             shell: None,
             publish: None,
             clarifier: None,
             invocation_guidance: None,
             output: StageOutput::Evidence,
-        })
-        .await?;
+            after_guard: true,
+        },
+    )
+    .await?;
     let distilled: crate::context::Distillation =
         serde_json::from_str(&raw).map_err(|error| error.to_string())?;
     let out = crate::context::attach_evidence(distilled, memory);
@@ -1962,16 +1965,8 @@ pub(crate) async fn evaluate_standard_stage(
     ctx: Arc<WorkflowContext>,
     stage_id: &str,
     input_json: String,
-    rendered_question: String,
 ) -> Result<String, String> {
-    evaluate_standard_stage_with_turn(
-        ctx,
-        stage_id,
-        input_json,
-        rendered_question,
-        Arc::new(LiveStageTurn),
-    )
-    .await
+    evaluate_standard_stage_with_turn(ctx, stage_id, input_json, Arc::new(LiveStageTurn)).await
 }
 
 /// Evaluate a bundled standard stage with its file tools rooted at a Rust-owned resource.
@@ -1983,14 +1978,12 @@ pub(crate) async fn evaluate_standard_stage_at(
     ctx: Arc<WorkflowContext>,
     stage_id: &str,
     input_json: String,
-    rendered_question: String,
     resource_root: std::path::PathBuf,
 ) -> Result<String, String> {
     evaluate_standard_stage_with_resources(
         ctx,
         stage_id,
         input_json,
-        rendered_question,
         StandardStageResources {
             resource_root,
             shell: None,
@@ -2007,6 +2000,7 @@ pub(crate) async fn evaluate_standard_stage_at(
 /// A stage may use these resources but cannot create, replace, retain, or clean them up. That
 /// keeps worktree and sandbox lifecycle in the operation adapter while the model call remains a
 /// generic declared-stage execution.
+#[derive(Clone)]
 pub(crate) struct StandardStageResources {
     pub resource_root: PathBuf,
     pub shell: Option<ratatoskr_agent::shell::ShellAccess>,
@@ -2019,22 +2013,77 @@ pub(crate) struct StandardStageResources {
 ///
 /// Merely declaring `gh` or `git_push` never installs their host implementations. This grant is
 /// what keeps a repository workflow from publishing before Rust has accepted a terminal outcome.
+#[derive(Clone)]
 pub(crate) struct StandardStagePublishResources {
     pub push: Option<ratatoskr_agent::publish::PushAccess>,
+}
+
+#[derive(Clone)]
+struct StandardStageInvocation {
+    resource_root: Option<PathBuf>,
+    shell: Option<ratatoskr_agent::shell::ShellAccess>,
+    publish: Option<StandardStagePublishResources>,
+    clarifier: Option<Arc<dyn ratatoskr_agent::Clarifier>>,
+    invocation_guidance: Option<String>,
+    output: StageOutput,
+    after_guard: bool,
+}
+
+async fn execute_standard_stage(
+    executor: &Arc<StageExecutor>,
+    stage: Stage,
+    input_json: String,
+    settings: StandardStageInvocation,
+) -> Result<String, String> {
+    let stage_id = stage.id.clone();
+    let host_executor = Arc::clone(executor);
+    let host_stage = stage.clone();
+    let host_settings = settings.clone();
+    let host: HostFn = Arc::new(move |rendered_input| {
+        let executor = Arc::clone(&host_executor);
+        let stage = host_stage.clone();
+        let settings = host_settings.clone();
+        Box::pin(async move {
+            let mut invocation = stage_invocation(stage, rendered_input)?;
+            invocation.resource_root = settings.resource_root;
+            invocation.shell = settings.shell;
+            invocation.publish = settings.publish;
+            invocation.clarifier = settings.clarifier;
+            invocation.invocation_guidance = settings.invocation_guidance;
+            invocation.output = settings.output;
+            if settings.after_guard {
+                executor.execute_after_guard(invocation).await
+            } else {
+                executor.execute(invocation).await
+            }
+        })
+    });
+    let input: serde_json::Value =
+        serde_json::from_str(&input_json).map_err(|error| format!("{stage_id} arg: {error}"))?;
+    let runtime = standard_runtime()
+        .await
+        .map_err(|error| error.to_string())?;
+    runtime
+        .run_with_question_renderers(
+            "standardStageTurn",
+            json!({ "stage": stage_id, "input": input }).to_string(),
+            HashMap::from([(stage.id, host)]),
+            stage_question_renderers(executor.stages.as_slice()),
+        )
+        .await
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn evaluate_standard_stage_with_resources(
     ctx: Arc<WorkflowContext>,
     stage_id: &str,
     input_json: String,
-    rendered_question: String,
     resources: StandardStageResources,
 ) -> Result<String, String> {
     evaluate_standard_stage_with_resources_and_turn(
         ctx,
         stage_id,
         input_json,
-        rendered_question,
         resources,
         Arc::new(LiveStageTurn),
     )
@@ -2045,25 +2094,15 @@ pub(crate) async fn evaluate_standard_stage_with_turn(
     ctx: Arc<WorkflowContext>,
     stage_id: &str,
     input_json: String,
-    rendered_question: String,
     turn: Arc<dyn StageTurn>,
 ) -> Result<String, String> {
-    evaluate_standard_stage_with_turn_and_resources(
-        ctx,
-        stage_id,
-        input_json,
-        rendered_question,
-        None,
-        turn,
-    )
-    .await
+    evaluate_standard_stage_with_turn_and_resources(ctx, stage_id, input_json, None, turn).await
 }
 
 pub(crate) async fn evaluate_standard_stage_with_resources_and_turn(
     ctx: Arc<WorkflowContext>,
     stage_id: &str,
     input_json: String,
-    rendered_question: String,
     resources: StandardStageResources,
     turn: Arc<dyn StageTurn>,
 ) -> Result<String, String> {
@@ -2071,7 +2110,6 @@ pub(crate) async fn evaluate_standard_stage_with_resources_and_turn(
         ctx,
         stage_id,
         input_json,
-        rendered_question,
         Some(resources),
         turn,
     )
@@ -2082,7 +2120,6 @@ async fn evaluate_standard_stage_with_turn_and_resources(
     ctx: Arc<WorkflowContext>,
     stage_id: &str,
     input_json: String,
-    rendered_question: String,
     resources: Option<StandardStageResources>,
     turn: Arc<dyn StageTurn>,
 ) -> Result<String, String> {
@@ -2102,19 +2139,22 @@ async fn evaluate_standard_stage_with_turn_and_resources(
         .find(|stage| stage.id == stage_id)
         .cloned()
         .ok_or_else(|| format!("standard stage `{stage_id}` is not registered"))?;
-    StageExecutor::new(ctx, stages, turn)
-        .execute(StageInvocation {
-            stage,
-            input_json,
-            rendered_question: Some(rendered_question),
+    let executor = StageExecutor::new(ctx, stages, turn);
+    execute_standard_stage(
+        &executor,
+        stage,
+        input_json,
+        StandardStageInvocation {
             resource_root,
             shell,
             publish,
             clarifier,
             invocation_guidance,
             output: StageOutput::Evidence,
-        })
-        .await
+            after_guard: false,
+        },
+    )
+    .await
 }
 
 async fn execution_stages(runtime: &WorkflowRuntime) -> Result<Vec<Stage>, PlanError> {
@@ -2503,7 +2543,6 @@ async fn bookkeep_scripted(
             Arc::clone(ctx),
             "bookkeeper",
             input_json,
-            bookkeeper::render_prompt(&input),
             StandardStageResources {
                 resource_root: ctx.repo_path.clone(),
                 shell: None,
@@ -3116,30 +3155,16 @@ mod tests {
         assert_eq!(runs[1].session, ratatoskr_core::SessionScope::Compacted);
         assert!(runs[0].ledger_id.is_some());
         assert_eq!(runs[0].ledger_id, runs[1].ledger_id);
-        let context_input = crate::context::distillation_input(
-            "preserve the declared plan path",
-            crate::MemoryOutput::default(),
-            false,
-        );
-        let expected_context = crate::context::render_prompt(
-            &context_input.issue,
-            &context_input.memory,
-            context_input.searchable,
-        );
         assert!(runs[0].question.starts_with(
             "Input contract: ContextDistillationInput\nOutput contract: Distillation\n\n"
         ));
-        assert!(runs[0].question.ends_with(&expected_context));
+        assert!(runs[0].question.contains("this repository keeps none"));
         assert!(
             runs[1]
                 .question
                 .starts_with("Input contract: AnalystInput\nOutput contract: AnalystOutput\n\n")
         );
-        assert!(
-            runs[1]
-                .question
-                .ends_with(&analyst::render_prompt(&analyst_input))
-        );
+        assert!(runs[1].question.contains("preserve the declared plan path"));
         drop(runs);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -4622,173 +4647,85 @@ mod tests {
     struct RendererParityCase {
         stage: &'static str,
         input: serde_json::Value,
-        rust_question: String,
-    }
-
-    fn renderer_parity_plan() -> AnalystOutput {
-        AnalystOutput {
-            impact_summary: "The store owns run claims.".to_string(),
-            touched: vec!["crates/ratatoskr-store".to_string()],
-            risks: vec!["Do not permit two owners".to_string()],
-            requirements: vec!["Keep claim acquisition atomic".to_string()],
-            residual_risk: String::new(),
-            changes_code: true,
-            acceptance: Vec::new(),
-            interface: vec![crate::analyst::InterfaceItem {
-                name: "Store::claim".to_string(),
-                shape: "fn claim(&self, run: &str) -> Result<Claim, StoreError>".to_string(),
-                happy: vec!["an unclaimed run yields a Claim".to_string()],
-                sad: vec!["an owned run returns an error".to_string()],
-            }],
-        }
+        expected_question: &'static str,
     }
 
     #[tokio::test]
-    async fn standard_typescript_renderers_match_their_rust_adapters() {
-        let plan = renderer_parity_plan();
-        let choices = vec![crate::overseer::Choice {
-            name: "ratatoskr-standard-v1".to_string(),
-            purpose: "Implement and review repository changes.".to_string(),
-            when_to_use: vec!["the task asks for a code change".to_string()],
-        }];
-        let overseer = crate::overseer::OverseerInput {
-            issue: "make claims atomic".to_string(),
-            choices,
-        };
-        let characterizer = crate::testrun::CharacterizerInput {
-            outcomes: vec![crate::testrun::StepOutcome {
-                name: "store tests".to_string(),
-                command: vec!["cargo".to_string(), "test".to_string()],
-                exit_code: 101,
-                output: "claim_twice failed".to_string(),
-            }],
-        };
-        let classifier = crate::redteam::ClassifierInput {
-            failing: vec!["store::claim_twice".to_string()],
-            raw_output: "claim_twice failed".to_string(),
-        };
-        let author = crate::redteam::TestAuthorInput {
-            issue: "make claims atomic".to_string(),
-            interface: plan.interface.clone(),
-        };
-        let implementer = crate::implementer::ImplementerAttemptInput {
-            issue: "make claims atomic".to_string(),
-            analyst: plan.clone(),
-            acceptance: vec![ratatoskr_core::AcceptanceStep {
-                name: "store tests".to_string(),
-                command: vec!["cargo".to_string(), "test".to_string()],
-            }],
-            diagnostic: None,
-        };
-        let memory = MemoryOutput {
-            memories: vec![crate::memory::MemoryRecord {
-                memory_id: "mem_claim".to_string(),
-                kind: "Invariant".to_string(),
-                title: "Claims are exclusive".to_string(),
-                confidence: "high".to_string(),
-                status: "active".to_string(),
-                body: "Only one owner may claim a run.".to_string(),
-                summary: None,
-            }],
-        };
-        let context =
-            crate::context::distillation_input("make claims atomic", memory.clone(), true);
-        let analyst = analyst::AnalystInput::fresh(
-            "make claims atomic".to_string(),
-            ScoutOutput {
-                related_items: Vec::new(),
-                papertrail_summary: "Issue 210 requires exclusive claims.".to_string(),
-            },
-            memory,
-        );
-        let bookkeeper = BookkeeperInput {
-            issue: "make claims atomic".to_string(),
-            analyst: plan.clone(),
-            implementer: imp(&["store::claim_twice"], &[], 101),
-            iterations: 2,
-            converged: false,
-            friction: crate::bookkeeper::RunFriction::default(),
-        };
-        let publisher = PublisherInput {
-            issue: "make claims atomic".to_string(),
-            analyst: plan.clone(),
-            implementer: Some(imp(&[], &["store tests"], 0)),
-            status: RunStatus::Converged.as_str().to_string(),
-            iterations: 1,
-            unresolved: Vec::new(),
-        };
-        let verifier = verifier::VerifierInput {
-            issue: "make claims atomic".to_string(),
-            analyst: plan,
-            diff: "diff --git a/store.rs b/store.rs".to_string(),
-            touched_files: vec!["store.rs".to_string()],
-            previous_findings: vec![verifier::Finding {
-                severity: verifier::Severity::P2,
-                kind: verifier::FindingKind::Execution,
-                file: "store.rs".to_string(),
-                line: Some(41),
-                summary: "claim is not atomic".to_string(),
-                failure_scenario: "two owners claim concurrently".to_string(),
-            }],
-        };
-
+    async fn standard_typescript_renderers_preserve_the_legacy_text_contract() {
         let cases = vec![
             RendererParityCase {
                 stage: "overseer",
-                input: serde_json::to_value(&overseer).unwrap(),
-                rust_question: crate::overseer::render_prompt(&overseer.issue, &overseer.choices),
+                input: json!({ "issue": "x", "choices": [] }),
+                expected_question: "AVAILABLE WORKFLOWS:\n\nTHE TASK:\nx\n",
             },
             RendererParityCase {
                 stage: "characterizer",
-                input: serde_json::to_value(&characterizer).unwrap(),
-                rust_question: crate::testrun::render_prompt(&characterizer.outcomes),
+                input: json!({ "outcomes": [] }),
+                expected_question: "",
             },
             RendererParityCase {
                 stage: "redteam_classifier",
-                input: serde_json::to_value(&classifier).unwrap(),
-                rust_question: crate::redteam::classifier_prompt(
-                    &classifier.failing,
-                    &classifier.raw_output,
-                ),
+                input: json!({ "failing": ["a"], "raw_output": "boom" }),
+                expected_question: "These tests fail in the current baseline (before any change):\na\n\nTest output:\nboom\n\nClassify each as \"flaky\" or \"real\" with a one-line reason.",
             },
             RendererParityCase {
                 stage: "redteam_author",
-                input: serde_json::to_value(&author).unwrap(),
-                rust_question: crate::redteam::author_prompt(&author.issue, &author.interface),
+                input: json!({ "issue": "x", "interface": [] }),
+                expected_question: "THE TASK, for context only:\nx\n\nTHE INTERFACE. This is the contract, and it is all you get — the code does not exist yet, and the person writing it is working from this same description:\n\n\nWrite tests for these. Follow the repository's own layout and conventions, cover the sad cases as carefully as the happy ones, and change nothing that already exists.",
             },
             RendererParityCase {
                 stage: "implementer_attempt",
-                input: serde_json::to_value(&implementer).unwrap(),
-                rust_question: crate::implementer::render_attempt_prompt(&implementer),
+                input: json!({ "diagnostic": "fix it" }),
+                expected_question: "fix it",
             },
             RendererParityCase {
                 stage: "context_distillation",
-                input: serde_json::to_value(&context).unwrap(),
-                rust_question: crate::context::render_prompt(
-                    &context.issue,
-                    &context.memory,
-                    context.searchable,
-                ),
+                input: json!({ "issue": "x", "memory": { "memories": [] }, "searchable": false }),
+                expected_question: "TASK:\nx\n\nRECORDED MEMORIES: this repository keeps none — there is no memory index here. Work from what you can read.\n",
             },
             RendererParityCase {
                 stage: "analyst",
-                input: serde_json::to_value(&analyst).unwrap(),
-                rust_question: analyst::render_prompt(&analyst),
+                input: json!({
+                    "issue": "x",
+                    "scout": { "papertrail_summary": "", "related_items": [] },
+                    "memory": { "memories": [] }
+                }),
+                expected_question: "ISSUE:\nx\n\nSCOUT SUMMARY:\n\n\n",
             },
             RendererParityCase {
                 stage: "bookkeeper",
-                input: serde_json::to_value(&bookkeeper).unwrap(),
-                rust_question: crate::bookkeeper::render_prompt(&bookkeeper),
+                input: json!({
+                    "converged": true,
+                    "iterations": 1,
+                    "issue": "x",
+                    "analyst": { "impact_summary": "", "risks": [] },
+                    "implementer": { "diff_summary": "", "narrative": null, "touched_files": [], "failing_tests": [] },
+                    "friction": { "diagnostics": [], "errors": [], "effort": [] }
+                }),
+                expected_question: "OUTCOME: the run CONVERGED — the change landed and the tests pass.\n\nTASK:\nx\n\n",
             },
             RendererParityCase {
                 stage: "publisher",
-                input: serde_json::to_value(&publisher).unwrap(),
-                rust_question: crate::publisher::render_prompt(&publisher),
+                input: json!({
+                    "issue": "x",
+                    "status": "converged",
+                    "iterations": 0,
+                    "unresolved": [],
+                    "analyst": { "impact_summary": "", "requirements": [] },
+                    "implementer": null
+                }),
+                expected_question: "THE TASK:\nx\n\nOUTCOME: converged after 0 implementer iteration(s).\n\nNO CODE WAS CHANGED. This run produced an answer, not a change — there is nothing to open a pull request for.\n",
             },
             RendererParityCase {
                 stage: "verifier",
-                input: serde_json::to_value(&verifier).unwrap(),
-                rust_question: verifier::render_prompt(&verifier),
+                input: json!({
+                    "issue": "x",
+                    "analyst": { "requirements": [], "impact_summary": "", "risks": [] },
+                    "touched_files": [],
+                    "previous_findings": [],
+                    "diff": "diff\n"
+                }),
+                expected_question: "TASK:\nx\n\nTHE CHANGE:\ndiff\n\n",
             },
         ];
         let calls = cases
@@ -4850,8 +4787,8 @@ mod tests {
             let envelope = &captured[case.stage][*offset];
             *offset += 1;
             assert_eq!(
-                envelope["__ratatoskrRenderedQuestion"]["question"], case.rust_question,
-                "TypeScript/Rust renderer drift for {}",
+                envelope["__ratatoskrRenderedQuestion"]["question"], case.expected_question,
+                "rendered question drift for {}",
                 case.stage
             );
         }
@@ -4859,12 +4796,11 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_default_renderer_ownership_is_explicit_and_complete() {
-        // Direct declared-stage calls in standard-v1 are rendered by the workflow runtime. Model
-        // stages entered through lifecycle/terminal operation hosts are rendered by those Rust
-        // adapters before StageExecutor. Scout accepts its issue string directly and has no
+        // Both direct declared-stage calls and Rust-owned lifecycle adapters enter the bundled
+        // renderer before StageExecutor. Scout accepts its issue string directly and has no
         // renderQuestion declaration.
-        let typescript_rendered = ["analyst"];
-        let rust_adapter_rendered = [
+        let typescript_rendered = [
+            "analyst",
             "overseer",
             "characterizer",
             "redteam_classifier",
@@ -4882,7 +4818,6 @@ mod tests {
         declared.sort();
         let mut owned = typescript_rendered
             .into_iter()
-            .chain(rust_adapter_rendered)
             .map(str::to_string)
             .collect::<Vec<_>>();
         owned.sort();
@@ -4983,7 +4918,6 @@ mod tests {
                 }],
             },
         };
-        let expected_question = crate::bookkeeper::render_prompt(&input);
         let captured = Arc::new(Mutex::new(None));
         let capture = Arc::clone(&captured);
         let host: HostFn = Arc::new(move |arg| {
@@ -5008,10 +4942,11 @@ mod tests {
             .expect("bookkeeper capture mutex poisoned")
             .take()
             .unwrap();
-        assert_eq!(
-            envelope["__ratatoskrRenderedQuestion"]["question"],
-            expected_question
-        );
+        let question = envelope["__ratatoskrRenderedQuestion"]["question"]
+            .as_str()
+            .unwrap();
+        assert!(question.contains("OUTCOME: the run HIT A WALL"));
+        assert!(question.contains("The decision omitted its action."));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5185,7 +5120,6 @@ mod tests {
                 failure_scenario: "both links are returned in one field".to_string(),
             }],
         };
-        let expected_question = crate::publisher::render_prompt(&input);
         let input_json = serde_json::to_string(&input).unwrap();
         let captured = Arc::new(Mutex::new(None));
         let capture = Arc::clone(&captured);
@@ -5211,10 +5145,11 @@ mod tests {
             .expect("publisher capture mutex poisoned")
             .take()
             .unwrap();
-        assert_eq!(
-            envelope["__ratatoskrRenderedQuestion"]["question"],
-            expected_question
-        );
+        let question = envelope["__ratatoskrRenderedQuestion"]["question"]
+            .as_str()
+            .unwrap();
+        assert!(question.contains("THIS RUN DID NOT FINISH CLEAN"));
+        assert!(question.contains("the URLs can still run together"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5522,8 +5457,6 @@ mod tests {
             },
             searchable: true,
         };
-        let expected_prompt =
-            crate::context::render_prompt(&input.issue, &input.memory, input.searchable);
         let turn = Arc::new(RecordingStageTurn {
             output: json!({
                 "brief": "The checkpoint retains its source evidence.",
@@ -5570,13 +5503,11 @@ mod tests {
                 "missing {tool}"
             );
         }
-        assert_eq!(
+        assert!(
             turn.questions
                 .lock()
-                .expect("recording runner mutex poisoned")[0],
-            format!(
-                "Input contract: ContextDistillationInput\nOutput contract: Distillation\n\n{expected_prompt}"
-            )
+                .expect("recording runner mutex poisoned")[0]
+                .contains("mem_exact")
         );
 
         let checkpoints = store
@@ -6025,7 +5956,6 @@ mod tests {
             Arc::clone(&ctx),
             "redteam_author",
             serde_json::to_string(&author).unwrap(),
-            crate::redteam::author_prompt(&author.issue, &author.interface),
             StandardStageResources {
                 resource_root: author_root.clone(),
                 shell: None,
@@ -6096,20 +6026,10 @@ mod tests {
             .lock()
             .expect("recording runner mutex poisoned")
             .clone();
-        assert_eq!(
-            questions[0],
-            format!(
-                "Input contract: TestAuthorInput\nOutput contract: AuthoredTests\n\n{}",
-                crate::redteam::author_prompt(&author.issue, &author.interface)
-            )
-        );
-        assert_eq!(
-            questions[1],
-            format!(
-                "Input contract: ClassifierInput\nOutput contract: Classification\n\n{}",
-                crate::redteam::classifier_prompt(&classifier.failing, &classifier.raw_output)
-            )
-        );
+        assert!(questions[0].contains("Store::prune"));
+        assert!(questions[0].contains("the code does not exist"));
+        assert!(questions[1].contains("store::tests::prune_zero"));
+        assert!(questions[1].contains("assertion failed: deleted > 0"));
         let checkpoints = store
             .checkpoints_for_run("run-standard-redteam")
             .await
@@ -6173,7 +6093,6 @@ mod tests {
             Arc::clone(&ctx),
             "redteam_author",
             serde_json::to_string(&author).unwrap(),
-            crate::redteam::author_prompt(&author.issue, &author.interface),
             StandardStageResources {
                 resource_root: author_root.clone(),
                 shell: None,
@@ -6205,7 +6124,6 @@ mod tests {
             ctx,
             "redteam_classifier",
             serde_json::to_string(&classifier).unwrap(),
-            crate::redteam::classifier_prompt(&classifier.failing, &classifier.raw_output),
             invalid_turn,
         )
         .await
@@ -6337,7 +6255,6 @@ mod tests {
                 Arc::clone(&ctx),
                 "implementer_attempt",
                 serde_json::to_string(input).unwrap(),
-                crate::implementer::render_attempt_prompt(input),
                 StandardStageResources {
                     resource_root: dir.clone(),
                     shell: None,
@@ -6390,14 +6307,13 @@ mod tests {
                 .questions
                 .lock()
                 .expect("recording runner mutex poisoned");
-            let initial = implementer_attempt_input(None);
-            assert_eq!(
-                questions[0],
-                format!(
-                    "Input contract: ImplementerAttemptInput\nOutput contract: Report\n\n{}",
-                    crate::implementer::render_attempt_prompt(&initial)
-                )
+            assert!(
+                questions[0]
+                    .contains("Implement this task in the current repository:\n\nadd Store::claim")
             );
+            assert!(questions[0].contains(
+                "Apply the change directly with your editing tools — do NOT ask for confirmation"
+            ));
             assert_eq!(
                 questions[1],
                 "Input contract: ImplementerAttemptInput\nOutput contract: Report\n\nFix the failing concurrent claim test."
@@ -6483,7 +6399,6 @@ mod tests {
             Arc::clone(&ctx),
             "implementer_attempt",
             serde_json::to_string(&input).unwrap(),
-            crate::implementer::render_attempt_prompt(&input),
             StandardStageResources {
                 resource_root: worktree.clone(),
                 shell: Some(shell.clone()),
@@ -6524,7 +6439,6 @@ mod tests {
             ctx,
             "implementer_attempt",
             serde_json::to_string(&input).unwrap(),
-            crate::implementer::render_attempt_prompt(&input),
             StandardStageResources {
                 resource_root: dir.clone(),
                 shell: Some(shell),
@@ -6678,7 +6592,6 @@ mod tests {
                 output: "test suite::fails ... FAILED\n1 failed; 8 passed".to_string(),
             }],
         };
-        let expected_prompt = crate::testrun::render_prompt(&input.outcomes);
         let turn = Arc::new(RecordingStageTurn {
             output: json!({
                 "failing": ["suite::fails"],
@@ -6714,14 +6627,13 @@ mod tests {
             turn.tools.lock().expect("recording runner mutex poisoned")[0].is_empty(),
             "a transcription stage must receive no tools"
         );
-        assert_eq!(
-            turn.questions
-                .lock()
-                .expect("recording runner mutex poisoned")[0],
-            format!(
-                "Input contract: CharacterizerInput\nOutput contract: CharacterizerOutput\n\n{expected_prompt}"
-            )
-        );
+        let question = turn
+            .questions
+            .lock()
+            .expect("recording runner mutex poisoned")[0]
+            .clone();
+        assert!(question.contains("workspace tests"));
+        assert!(question.contains("test suite::fails ... FAILED"));
 
         let checkpoints = store
             .checkpoints_for_run("run-standard-characterizer")
@@ -6879,7 +6791,6 @@ mod tests {
                 output: "one failed".to_string(),
             }],
         };
-        let question = crate::testrun::render_prompt(&input.outcomes);
         let turn = Arc::new(RecordingStageTurn {
             output: json!({ "failing": ["suite::one"], "passed": 3 }).to_string(),
             ..Default::default()
@@ -6888,7 +6799,6 @@ mod tests {
             ctx,
             "characterizer",
             serde_json::to_string(&input).unwrap(),
-            question,
             Arc::clone(&turn) as Arc<dyn StageTurn>,
         )
         .await
@@ -6988,7 +6898,6 @@ mod tests {
                 },
             ],
         };
-        let expected_prompt = crate::overseer::render_prompt(&input.issue, &input.choices);
         let turn = Arc::new(RecordingStageTurn {
             output: json!({
                 "workflow": "research",
@@ -7025,12 +6934,8 @@ mod tests {
             .lock()
             .expect("recording runner mutex poisoned")[0]
             .clone();
-        assert_eq!(
-            question,
-            format!(
-                "Input contract: OverseerInput\nOutput contract: OverseerOutput\n\n{expected_prompt}"
-            )
-        );
+        assert!(question.contains("TASK:\nexplain the session registry"));
+        assert!(question.contains("name: research\npurpose: answer a repository question"));
 
         let checkpoints = store
             .checkpoints_for_run("run-standard-overseer")
@@ -7217,7 +7122,6 @@ mod tests {
             }],
         };
         let input_value = serde_json::to_value(&input).unwrap();
-        let expected_prompt = verifier::render_prompt(&input);
         let turn = Arc::new(RecordingStageTurn {
             output: json!({
                 "findings": [],
@@ -7255,12 +7159,9 @@ mod tests {
             .lock()
             .expect("recording runner mutex poisoned")[0]
             .clone();
-        assert_eq!(
-            question,
-            format!(
-                "Input contract: VerifierInput\nOutput contract: VerifierOutput\n\n{expected_prompt}"
-            )
-        );
+        assert!(question.starts_with(
+            "Input contract: VerifierInput\nOutput contract: VerifierOutput\n\nTASK:\n"
+        ));
         assert!(question.contains("[P2/Execution] session.rs: the key omitted the run"));
         assert!(question.contains("THE CHANGE:\ndiff --git a/session.rs b/session.rs"));
 

@@ -841,3 +841,22 @@ async function run(input: {
 }) {
   return full(input);
 }
+
+// Rust lifecycle adapters enter standard model stages here. The adapter supplies only the one
+// stage host it is authorized to run, while this bundled runtime applies that stage's declared
+// renderQuestion before the generic executor receives it.
+async function standardStageTurn(input: { stage: string; input: any }) {
+  switch (input.stage) {
+    case "overseer": return await overseer(input.input);
+    case "characterizer": return await characterizer(input.input);
+    case "redteam_classifier": return await redteam_classifier(input.input);
+    case "redteam_author": return await redteam_author(input.input);
+    case "implementer_attempt": return await implementer_attempt(input.input);
+    case "context_distillation": return await context_distillation(input.input);
+    case "analyst": return await analyst(input.input);
+    case "bookkeeper": return await bookkeeper(input.input);
+    case "publisher": return await publisher(input.input);
+    case "verifier": return await verifier(input.input);
+    default: throw new Error(`unknown standard stage ${input.stage}`);
+  }
+}

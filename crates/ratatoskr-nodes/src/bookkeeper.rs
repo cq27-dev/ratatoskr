@@ -5,8 +5,6 @@
 //! wouldn't rank on a later `MemoryNode` retrieval), then calls rag-rat's own `memory_create`
 //! directly (deterministic), adopting rag-rat's `kind` taxonomy rather than inventing one.
 
-use std::fmt::Write as _;
-
 use ratatoskr_graph::NodeError;
 #[cfg(test)]
 use ratatoskr_graph::parse_validated;
@@ -492,81 +490,6 @@ fn normalize_kind(kind: &str) -> String {
         .unwrap_or_else(|| "Decision".to_string())
 }
 
-pub(crate) fn render_prompt(input: &BookkeeperInput) -> String {
-    let mut s = String::new();
-    if input.converged {
-        s.push_str("OUTCOME: the run CONVERGED — the change landed and the tests pass.\n\n");
-    } else {
-        let _ = write!(
-            s,
-            "OUTCOME: the run HIT A WALL — after {} implementer iterations it could not resolve \
-             these failing tests: {}. Record what a future run should know about this wall / this \
-             class of change.\n\n",
-            input.iterations,
-            input.implementer.failing_tests.join(", ")
-        );
-    }
-    let _ = write!(s, "TASK:\n{}\n\n", input.issue);
-    let a = &input.analyst;
-    if !a.impact_summary.is_empty() {
-        let _ = write!(s, "IMPACT:\n{}\n\n", a.impact_summary);
-    }
-    if !a.risks.is_empty() {
-        s.push_str("RISKS FLAGGED:\n");
-        for r in &a.risks {
-            let _ = writeln!(s, "- {r}");
-        }
-        s.push('\n');
-    }
-    let im = &input.implementer;
-    if !im.diff_summary.is_empty() {
-        let _ = write!(s, "DIFF:\n{}\n\n", im.diff_summary);
-    }
-    if let Some(narrative) = &im.narrative
-        && !narrative.is_empty()
-    {
-        let _ = write!(s, "IMPLEMENTER NOTES:\n{narrative}\n\n");
-    }
-    if !im.touched_files.is_empty() {
-        let _ = writeln!(s, "TOUCHED FILES: {}", im.touched_files.join(", "));
-    }
-
-    // Last, and deliberately: it is the section the preamble tells the model to reason from, and
-    // what a model reads last is what it reasons from first.
-    let f = &input.friction;
-    if !f.diagnostics.is_empty() || !f.errors.is_empty() || !f.effort.is_empty() {
-        s.push_str("\nFRICTION — what this run struggled with:\n");
-    }
-    if !f.diagnostics.is_empty() {
-        let _ = writeln!(
-            s,
-            "\nEach of these was handed to a fresh implementer session after the previous attempt \
-             broke something. Whatever a diagnostic keeps pointing at is a constraint nobody had \
-             written down:"
-        );
-        for (i, d) in f.diagnostics.iter().enumerate() {
-            let _ = writeln!(s, "- attempt {}: {}", i + 2, d);
-        }
-    }
-    if !f.errors.is_empty() {
-        s.push_str("\nNodes that failed:\n");
-        for e in &f.errors {
-            let _ = writeln!(s, "- {}: {}", e.node, e.error);
-        }
-    }
-    if !f.effort.is_empty() {
-        s.push_str(
-            "\nWhat each node's turn took. A node that spent many turns was hunting for \
-                    something — that is a fact about how hard this repo is to navigate, not about \
-                    the node:\n",
-        );
-        for e in &f.effort {
-            let _ = writeln!(s, "- {}: {} turns, {}s", e.node, e.turns, e.seconds);
-        }
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,17 +678,5 @@ mod tests {
         // Nothing decided at all still owes an explanation: an empty result with no reason is
         // indistinguishable from a failure.
         assert!(skip_reason(0, &[]).is_some());
-    }
-
-    #[test]
-    fn the_prompt_shows_the_model_what_the_run_struggled_with() {
-        let mut input = input(true, &["a.rs"], "diff");
-        input.friction.diagnostics = vec!["You broke store::migrate.".into()];
-        let prompt = render_prompt(&input);
-        assert!(prompt.contains("FRICTION"));
-        assert!(prompt.contains("You broke store::migrate."));
-        // Numbered from 2: the first attempt was given the plan, so the first diagnostic belongs
-        // to the second attempt.
-        assert!(prompt.contains("attempt 2"));
     }
 }

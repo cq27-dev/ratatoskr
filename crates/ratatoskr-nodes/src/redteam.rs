@@ -107,26 +107,15 @@ impl RedTeamClassifier {
         };
         let input_json = serde_json::to_string(&input)
             .map_err(|error| NodeError::Failed(format!("red-team classifier input: {error}")))?;
-        let prompt = classifier_prompt(&input.failing, &input.raw_output);
         let raw = crate::workflow::evaluate_standard_stage(
             std::sync::Arc::clone(&self.declared_context),
             "redteam_classifier",
             input_json,
-            prompt,
         )
         .await
         .map_err(|error| NodeError::Failed(format!("red-team classifier failed: {error}")))?;
         Ok(parse_validated::<Classification>(&raw)?.classifications)
     }
-}
-
-pub(crate) fn classifier_prompt(failing: &[String], raw_output: &str) -> String {
-    format!(
-        "These tests fail in the current baseline (before any change):\n{}\n\nTest output:\n{}\n\n\
-         Classify each as \"flaky\" or \"real\" with a one-line reason.",
-        failing.join("\n"),
-        truncate(raw_output, 6000)
-    )
 }
 
 /// The red-team node: run the baseline checkout's tests in a sandbox, optionally classify failures.
@@ -192,35 +181,16 @@ impl TestAuthor {
         };
         let input_json = serde_json::to_string(&input)
             .map_err(|error| NodeError::Failed(format!("test author input: {error}")))?;
-        let prompt = author_prompt(&input.issue, &input.interface);
         let raw = crate::workflow::evaluate_standard_stage_at(
             std::sync::Arc::clone(&self.declared_context),
             "redteam_author",
             input_json,
-            prompt,
             worktree.to_path_buf(),
         )
         .await
         .map_err(|error| NodeError::Failed(format!("test author failed: {error}")))?;
         parse_validated::<AuthoredTests>(&raw)
     }
-}
-
-/// What the author is given: the task for context, and the contract it writes against.
-pub(crate) fn author_prompt(issue: &str, interface: &[crate::analyst::InterfaceItem]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::new();
-    let _ = write!(s, "THE TASK, for context only:\n{issue}\n\n");
-    s.push_str(
-        "THE INTERFACE. This is the contract, and it is all you get — the code does not exist \
-         yet, and the person writing it is working from this same description:\n\n",
-    );
-    crate::analyst::render_interface(&mut s, interface, "happy", "sad");
-    s.push_str(
-        "\nWrite tests for these. Follow the repository's own layout and conventions, cover the \
-         sad cases as carefully as the happy ones, and change nothing that already exists.",
-    );
-    s
 }
 
 pub struct RedTeamNode {
@@ -371,30 +341,9 @@ impl RedTeamNode {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut i = max;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    format!("{}…", &s[..i])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn item() -> crate::analyst::InterfaceItem {
-        crate::analyst::InterfaceItem {
-            name: "store::prune".into(),
-            shape: "pub async fn prune(&self, older_than: Duration) -> Result<u64, StoreError>"
-                .into(),
-            happy: vec!["removes rows older than the cutoff and returns how many".into()],
-            sad: vec!["a zero duration removes nothing and returns 0".into()],
-        }
-    }
 
     /// A repository with one commit, plus an untracked `node_modules/installed` — what a live
     /// checkout carries and a fresh fork does not.
@@ -496,21 +445,6 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn the_author_is_given_the_contract_and_told_the_code_does_not_exist() {
-        // The whole reason this node writes the tests: it works from the contract, so its tests
-        // can be wrong about the implementation and still right about the requirement.
-        let p = author_prompt("Prune old rows", &[item()]);
-        assert!(p.contains("store::prune"), "the surface");
-        assert!(p.contains("older_than: Duration"), "and its exact shape");
-        assert!(p.contains("happy: removes rows older than the cutoff"));
-        assert!(p.contains("sad: a zero duration removes nothing"));
-        assert!(
-            p.contains("the code does not exist"),
-            "why it cannot read it"
-        );
     }
 
     #[test]

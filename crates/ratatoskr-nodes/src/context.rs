@@ -10,8 +10,6 @@
 //! reads; the evidence is what it can check the distillation against. A model writes the first and
 //! never touches the second.
 
-use std::fmt::Write as _;
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -112,38 +110,6 @@ pub(crate) fn attach_evidence(mut distilled: Distillation, memory: MemoryOutput)
     }
 }
 
-pub(crate) fn render_prompt(issue: &str, memory: &MemoryOutput, searchable: bool) -> String {
-    let mut s = String::new();
-    let _ = write!(s, "TASK:\n{issue}\n\n");
-    if memory.memories.is_empty() {
-        // Two different emptinesses. "Nothing matched" is worth searching again for; "there is no
-        // memory here" is not, and telling a node to search anyway sends it after a tool it does
-        // not have.
-        s.push_str(match searchable {
-            true => {
-                "RECORDED MEMORIES: none matched this task. Search again yourself with different \
-                 terms before concluding this repository records nothing about it.\n"
-            }
-            false => {
-                "RECORDED MEMORIES: this repository keeps none — there is no memory index here. \
-                 Work from what you can read.\n"
-            }
-        });
-        return s;
-    }
-    s.push_str(
-        "RECORDED MEMORIES — already retrieved for you, ranked. Quote from these when you write a \
-         constraint, and cite the id:\n\n",
-    );
-    for m in &memory.memories {
-        let _ = writeln!(s, "id: {}", m.memory_id);
-        let _ = writeln!(s, "[{} | {}] {}", m.kind, m.confidence, m.title);
-        let body = m.summary.as_deref().unwrap_or(&m.body);
-        let _ = writeln!(s, "{body}\n");
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,47 +128,10 @@ mod tests {
     }
 
     #[test]
-    fn the_model_is_shown_the_memories_it_is_expected_to_cite() {
-        let memory = MemoryOutput {
-            memories: vec![record(
-                "mem_1",
-                "Adding a column needs both places",
-                "schema.sql and ADDED_COLUMNS; neither alone migrates an existing store.",
-            )],
-        };
-        let prompt = render_prompt("Add a repo_sha column.", &memory, true);
-        assert!(prompt.contains("id: mem_1"));
-        assert!(prompt.contains("ADDED_COLUMNS"), "the body arrives whole");
-        assert!(prompt.contains("cite the id"));
-    }
-
-    #[test]
-    fn no_matches_is_told_apart_from_nothing_recorded() {
-        // Otherwise an empty baseline reads as "this repo records nothing", and the model stops
-        // looking — when the far more likely truth is that the ranked query missed.
-        let prompt = render_prompt("x", &MemoryOutput { memories: vec![] }, true);
-        assert!(prompt.contains("none matched"));
-        assert!(prompt.contains("Search again"));
-    }
-
-    #[test]
-    fn a_repository_with_no_memory_index_is_not_told_to_search_again() {
-        // Three states, not two: matches, no matches, and no index. The middle one sends the node
-        // back to `memory_search`; the last one must not, because that tool is not in its pool and
-        // a node chasing a tool it does not have burns turns achieving nothing.
-        let prompt = render_prompt("x", &MemoryOutput { memories: vec![] }, false);
-        assert!(prompt.contains("keeps none"));
-        assert!(!prompt.contains("Search again"));
-    }
-
-    #[test]
     fn no_rag_rat_prepares_an_empty_non_searchable_baseline() {
         let input = distillation_input("explain the store", MemoryOutput::default(), false);
         assert!(input.memory.memories.is_empty());
         assert!(!input.searchable);
-        let prompt = render_prompt(&input.issue, &input.memory, input.searchable);
-        assert!(prompt.contains("keeps none"), "{prompt}");
-        assert!(!prompt.contains("Search again"), "{prompt}");
     }
 
     #[test]

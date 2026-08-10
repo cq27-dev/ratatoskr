@@ -1,7 +1,5 @@
 //! Analyst: given the issue, scout's findings, and repo memories, assess impact and risk.
 
-use std::fmt::Write as _;
-
 #[cfg(test)]
 use ratatoskr_graph::{NodeError, parse_validated};
 use schemars::JsonSchema;
@@ -65,10 +63,6 @@ impl AnalystInput {
             findings: Vec::new(),
         }
     }
-
-    fn is_revision(&self) -> bool {
-        self.previous.is_some() && !self.findings.is_empty()
-    }
 }
 
 /// Analyst's structured output — the plan's substance.
@@ -123,25 +117,6 @@ pub struct AnalystOutput {
     pub interface: Vec<InterfaceItem>,
 }
 
-/// Render an interface as the prompts show it, with the labels the reading node needs.
-///
-/// Three nodes see this contract and each must see the same shape: the analyst that sets it, the
-/// red team that writes tests from it, and the implementer that builds to it. Rendering it three
-/// ways invites them to drift apart on a detail — a signature shown one way here and another
-/// there is exactly the mismatch the shared contract exists to prevent.
-pub(crate) fn render_interface(s: &mut String, items: &[InterfaceItem], happy: &str, sad: &str) {
-    use std::fmt::Write as _;
-    for item in items {
-        let _ = write!(s, "- {}\n  {}\n", item.name, item.shape);
-        for h in &item.happy {
-            let _ = writeln!(s, "  {happy}: {h}");
-        }
-        for entry in &item.sad {
-            let _ = writeln!(s, "  {sad}: {entry}");
-        }
-    }
-}
-
 /// One piece of surface the change adds or alters, with what it owes its caller.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InterfaceItem {
@@ -168,99 +143,6 @@ fn changes_code_by_default() -> bool {
     true
 }
 
-/// Fold the issue + upstream outputs into the analyst's prompt.
-pub(crate) fn render_prompt(input: &AnalystInput) -> String {
-    let mut s = String::new();
-    if input.is_revision() {
-        s.push_str(
-            "THIS IS A REVISION. A change was implemented against your previous plan and reviewed. \
-             The review found faults it judged to be in the PLAN rather than in the code — the \
-             requirement was wrong, missing, or impossible as written, so re-implementing it will \
-             not help.\n\n\
-             Decide, for each finding: does the plan need to change, or was the plan right and the \
-             implementation simply did not follow it? Amend the requirements where they were \
-             wrong. Where they were right, restate them unchanged — repeating a correct \
-             requirement is how you say the fault was in the execution.\n\n\
-             Keep everything that still holds. You are amending a plan, not writing a new one.\n\n",
-        );
-    }
-    let _ = write!(s, "ISSUE:\n{}\n\n", input.issue);
-    // First, because it is the one section written for a reader about to plan rather than a record
-    // of what was found.
-    if !input.brief.is_empty() {
-        let _ = write!(s, "WHAT BEARS ON THIS:\n{}\n\n", input.brief);
-    }
-    if !input.constraints.is_empty() {
-        s.push_str("CONSTRAINTS THIS MUST RESPECT:\n");
-        for c in &input.constraints {
-            let from = match c.from_memory_id.as_str() {
-                "" => String::new(),
-                id => format!(" [{id}]"),
-            };
-            let _ = writeln!(s, "- {}{from}", c.says);
-        }
-        s.push('\n');
-    }
-    if let Some(previous) = &input.previous {
-        let _ = write!(s, "YOUR PREVIOUS PLAN:\n{}\n", previous.impact_summary);
-        if !previous.requirements.is_empty() {
-            s.push_str("Requirements you set:\n");
-            for r in &previous.requirements {
-                let _ = writeln!(s, "- {r}");
-            }
-        }
-        if !previous.interface.is_empty() {
-            // Without this the analyst re-emits `interface` from nothing on every revision, and the
-            // tests the red team already wrote are pinned to the contract it cannot see. A revised
-            // signature does not fail those tests honestly — it strands them.
-            s.push_str(
-                "\nThe interface you contracted. Tests are already written against it, by \
-                 someone who cannot see the code. Restate it unchanged unless a finding is about \
-                 the interface itself: changing a name or a signature here breaks tests that are \
-                 not wrong.\n",
-            );
-            render_interface(&mut s, &previous.interface, "happy", "sad");
-        }
-        s.push('\n');
-    }
-    if !input.findings.is_empty() {
-        s.push_str("WHAT THE REVIEW FOUND:\n");
-        for f in &input.findings {
-            let where_ = match f.file.as_str() {
-                "" => String::new(),
-                file => format!(" ({file})"),
-            };
-            let _ = writeln!(s, "- [{:?}]{} {}", f.severity, where_, f.summary);
-            let _ = writeln!(s, "  Fails when: {}", f.failure_scenario);
-        }
-        s.push('\n');
-    }
-    let _ = write!(s, "SCOUT SUMMARY:\n{}\n\n", input.scout.papertrail_summary);
-
-    if !input.scout.related_items.is_empty() {
-        s.push_str("RELATED ITEMS:\n");
-        for item in &input.scout.related_items {
-            let _ = writeln!(
-                s,
-                "- [{}] {} — {}",
-                item.item_key, item.title, item.relation
-            );
-        }
-        s.push('\n');
-    }
-
-    if !input.memory.memories.is_empty() {
-        s.push_str("REPO MEMORIES:\n");
-        for m in &input.memory.memories {
-            let detail = m.summary.as_deref().unwrap_or(&m.body);
-            let _ = writeln!(s, "- ({}) {}: {}", m.kind, m.title, detail);
-        }
-        s.push('\n');
-    }
-
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,58 +159,6 @@ mod tests {
         let out = parse_validated::<AnalystOutput>(raw).unwrap();
         assert_eq!(out.touched, ["ratatoskr-store::Store"]);
         assert_eq!(out.risks[0], "medium: lock contention");
-    }
-
-    #[test]
-    fn a_revision_shows_the_analyst_the_contract_it_already_set() {
-        // The red team writes its tests from `interface` and never sees the code. An analyst
-        // re-planning without that contract in front of it re-derives one from memory, and a
-        // signature that comes back different strands tests that were right all along.
-        let mut previous = parse_validated::<AnalystOutput>(
-            r#"{"impact_summary":"touches the store","requirements":["keep single-writer"]}"#,
-        )
-        .unwrap();
-        previous.interface.push(InterfaceItem {
-            name: "Store::claim".into(),
-            shape: "fn claim(&self, run: &str) -> Result<Claim, StoreError>".into(),
-            happy: vec!["an unclaimed run yields a Claim".into()],
-            sad: vec!["a claimed run errors rather than blocking".into()],
-        });
-        let findings = serde_json::from_str(
-            r#"[{"severity":"P1","kind":"plan","file":"","summary":"impossible as written",
-                 "failure_scenario":"a second writer is unavoidable under the stated shape"}]"#,
-        )
-        .unwrap();
-        let input = AnalystInput {
-            previous: Some(Box::new(previous)),
-            findings,
-            ..AnalystInput::fresh(
-                "keep the writer single".into(),
-                ScoutOutput {
-                    related_items: Vec::new(),
-                    papertrail_summary: String::new(),
-                },
-                MemoryOutput {
-                    memories: Vec::new(),
-                },
-            )
-        };
-        assert!(input.is_revision());
-
-        let prompt = render_prompt(&input);
-        assert!(prompt.contains("Store::claim"), "{prompt}");
-        assert!(
-            prompt.contains("fn claim(&self, run: &str) -> Result<Claim, StoreError>"),
-            "the signature is the part tests are pinned to: {prompt}"
-        );
-        assert!(
-            prompt.contains("a claimed run errors rather than blocking"),
-            "{prompt}"
-        );
-        assert!(
-            prompt.contains("Tests are already written against it"),
-            "showing the contract is not enough — it has to say why it is expensive to churn: {prompt}"
-        );
     }
 
     #[test]
@@ -367,55 +197,5 @@ mod tests {
         // question, and reading it as a signal that code changes is how the fork ran on a run that
         // produced an empty diff.
         assert_eq!(out.touched.len(), 2);
-    }
-
-    #[test]
-    fn the_brief_and_its_constraints_lead_the_analyst_prompt() {
-        use crate::context::{Constraint, ContextOutput};
-        let context = ContextOutput {
-            brief: "The store migrates by ALTER, not by rewriting schema.sql.".into(),
-            constraints: vec![
-                Constraint {
-                    says: "a new column needs both schema.sql and ADDED_COLUMNS".into(),
-                    from_memory_id: "mem_1".into(),
-                },
-                Constraint {
-                    says: "read from the code, not a memory".into(),
-                    from_memory_id: String::new(),
-                },
-            ],
-            scout: ScoutOutput {
-                related_items: Vec::new(),
-                papertrail_summary: "nothing in the tracker".into(),
-            },
-            memory: MemoryOutput {
-                memories: Vec::new(),
-            },
-        };
-        let input = AnalystInput::from_context("Add repo_sha.".into(), context);
-        let prompt = render_prompt(&input);
-
-        // The distillation is written for a reader about to plan; the record of what was found is
-        // not, so it comes first.
-        let brief_at = prompt.find("WHAT BEARS ON THIS").unwrap();
-        assert!(brief_at < prompt.find("SCOUT SUMMARY").unwrap());
-        assert!(prompt.contains("ALTER, not by rewriting"));
-
-        // A constraint carries its source so the analyst can check the wording against it.
-        assert!(prompt.contains("[mem_1]"), "{prompt}");
-        // One drawn from the code has no id to cite, and does not get an empty bracket.
-        assert!(!prompt.contains("[]"), "{prompt}");
-    }
-
-    #[test]
-    fn a_hand_composed_analyst_input_still_works_without_a_brief() {
-        // A script that composes `scout()` and `memory()` itself hands over the evidence with no
-        // synthesis. That has to keep working, not fail schema validation.
-        let raw = r#"{"issue":"x","scout":{"papertrail_summary":"s"},"memory":{"memories":[]}}"#;
-        let input: AnalystInput = serde_json::from_str(raw).unwrap();
-        assert!(input.brief.is_empty());
-        assert!(input.constraints.is_empty());
-        let prompt = render_prompt(&input);
-        assert!(!prompt.contains("WHAT BEARS ON THIS"));
     }
 }

@@ -9,8 +9,6 @@
 //! Opt-in on having a route, like the verifier and the characterizer. Without one, a repo with
 //! several workflows is asked to name one rather than having a choice made for it silently.
 
-use std::fmt::Write as _;
-
 #[cfg(test)]
 use ratatoskr_graph::parse_validated;
 use schemars::JsonSchema;
@@ -46,61 +44,9 @@ pub struct OverseerOutput {
     pub reasoning: String,
 }
 
-pub(crate) fn render_prompt(issue: &str, choices: &[Choice]) -> String {
-    let mut s = String::new();
-    s.push_str("AVAILABLE WORKFLOWS:\n\n");
-    for c in choices {
-        let _ = writeln!(s, "name: {}", c.name);
-        if !c.purpose.is_empty() {
-            let _ = writeln!(s, "purpose: {}", c.purpose);
-        }
-        for case in &c.when_to_use {
-            let _ = writeln!(s, "  use when: {case}");
-        }
-        s.push('\n');
-    }
-    let _ = write!(s, "THE TASK:\n{issue}\n");
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn choice(name: &str, cases: &[&str]) -> Choice {
-        Choice {
-            name: name.to_string(),
-            purpose: format!("what {name} does"),
-            when_to_use: cases.iter().map(|c| (*c).to_string()).collect(),
-        }
-    }
-
-    #[test]
-    fn the_prompt_shows_every_workflow_with_the_cases_that_select_it() {
-        // `whenToUse` is the part selection actually matches against — a purpose alone describes a
-        // workflow, the cases say when it is the right one.
-        let prompt = render_prompt(
-            "Rename the store's migrate helper.",
-            &[
-                choice("built-in", &["the task asks for a code change"]),
-                choice("research", &["the task asks what or why"]),
-            ],
-        );
-        assert!(prompt.contains("name: built-in"));
-        assert!(prompt.contains("use when: the task asks what or why"));
-        // The task comes last, so it is what the model reads immediately before deciding.
-        let task_at = prompt.find("THE TASK:").unwrap();
-        assert!(task_at > prompt.find("name: research").unwrap());
-        assert!(prompt.contains("Rename the store's migrate helper."));
-    }
-
-    #[test]
-    fn a_workflow_that_declared_no_cases_still_appears() {
-        // Otherwise a workflow becomes unselectable by omitting an optional field, which is a
-        // silent way to disable something.
-        let prompt = render_prompt("x", &[choice("bare", &[])]);
-        assert!(prompt.contains("name: bare"));
-    }
 
     #[test]
     fn the_decision_parses_from_the_shape_a_model_writes() {

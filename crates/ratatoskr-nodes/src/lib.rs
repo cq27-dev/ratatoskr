@@ -655,7 +655,6 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
         choices,
     };
     let input_json = serde_json::to_string(&input)?;
-    let rendered_question = overseer::render_prompt(&input.issue, &input.choices);
     let cwd = std::env::current_dir().unwrap_or_default();
     let plugin_context = PluginContext::resolve(request.config, request.engine, &cwd).await?;
     let ctx = workflow::WorkflowContext::new(
@@ -667,14 +666,9 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
         request.engine,
         plugin_context,
     )?;
-    let raw = workflow::evaluate_standard_stage(
-        Arc::clone(&ctx),
-        "overseer",
-        input_json.clone(),
-        rendered_question,
-    )
-    .await
-    .map_err(|error| PlanError::node("overseer", NodeError::Failed(error)))?;
+    let raw = workflow::evaluate_standard_stage(Arc::clone(&ctx), "overseer", input_json.clone())
+        .await
+        .map_err(|error| PlanError::node("overseer", NodeError::Failed(error)))?;
     let decided: OverseerOutput = serde_json::from_str(&raw)?;
 
     // Its own ledger: the overseer runs before the run's, and its cost is still a cost. Drained
@@ -1114,7 +1108,6 @@ async fn publish_and_checkpoint(
             issue: Some(input.issue.clone()),
         });
     let input_json = serde_json::to_string(&input)?;
-    let rendered_question = publisher::render_prompt(&input);
     let declared_context =
         workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
             client,
@@ -1130,7 +1123,6 @@ async fn publish_and_checkpoint(
         declared_context,
         "publisher",
         input_json,
-        rendered_question,
         workflow::StandardStageResources {
             resource_root: repo_root,
             shell: None,
@@ -1188,7 +1180,6 @@ async fn bookkeep_and_checkpoint(
         output
     } else {
         let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let rendered_question = bookkeeper::render_prompt(&input);
         let declared_context =
             workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
                 client,
@@ -1204,7 +1195,6 @@ async fn bookkeep_and_checkpoint(
             declared_context,
             "bookkeeper",
             input_json.clone(),
-            rendered_question,
             workflow::StandardStageResources {
                 resource_root: repo_root,
                 shell: None,

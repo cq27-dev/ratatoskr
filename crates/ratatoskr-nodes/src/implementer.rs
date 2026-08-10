@@ -8,7 +8,6 @@
 //! run — nobody answers, and a question is a stopped node. Driving the model directly is also what
 //! puts every command inside the run's own sandbox and every model turn on the run's ledger.
 
-use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -256,12 +255,10 @@ impl ImplementerNode {
     ) -> Result<ImplementerOutput, NodeError> {
         let input_json = serde_json::to_string(&input)
             .map_err(|error| NodeError::Failed(format!("implementer input: {error}")))?;
-        let prompt = render_attempt_prompt(&input);
         let raw = crate::workflow::evaluate_standard_stage_with_resources(
             Arc::clone(&self.declared_context),
             "implementer_attempt",
             input_json,
-            prompt,
             crate::workflow::StandardStageResources {
                 resource_root: worktree.as_path().to_path_buf(),
                 shell: Some(self.shell_access(worktree)),
@@ -353,63 +350,6 @@ impl ImplementerNode {
             diagnostic: None,
         }
     }
-}
-
-/// Render the exact user question for either the first attempt or a Rust-authored correction.
-pub(crate) fn render_attempt_prompt(input: &ImplementerAttemptInput) -> String {
-    if let Some(diagnostic) = &input.diagnostic {
-        return diagnostic.clone();
-    }
-    let mut s = String::new();
-    let _ = write!(
-        s,
-        "Implement this task in the current repository:\n\n{}\n\n",
-        input.issue
-    );
-    let a = &input.analyst;
-    if !a.impact_summary.is_empty() {
-        let _ = write!(s, "Impact analysis:\n{}\n\n", a.impact_summary);
-    }
-    if !a.requirements.is_empty() {
-        s.push_str("Requirements the implementation must satisfy:\n");
-        for req in &a.requirements {
-            let _ = writeln!(s, "- {req}");
-        }
-        s.push('\n');
-    }
-    if !a.interface.is_empty() {
-        s.push_str(
-            "THE INTERFACE YOU ARE BUILDING TO. Someone else is writing tests against this \
-                 same description, without seeing your code. Match the shape exactly — a \
-                 signature that differs by a parameter name or an argument order will fail tests \
-                 that are not wrong:\n\n",
-        );
-        crate::analyst::render_interface(&mut s, &a.interface, "must", "must also");
-        s.push('\n');
-    }
-    if !a.risks.is_empty() {
-        s.push_str("Known risks to avoid:\n");
-        for risk in &a.risks {
-            let _ = writeln!(s, "- {risk}");
-        }
-        s.push('\n');
-    }
-    if !input.acceptance.is_empty() {
-        s.push_str(
-            "The acceptance checks this change is judged by, which you can run yourself with \
-                 Bash:\n",
-        );
-        for step in &input.acceptance {
-            let _ = writeln!(s, "- {}: `{}`", step.name, step.command.join(" "));
-        }
-        s.push('\n');
-    }
-    s.push_str(
-        "Apply the change directly with your editing tools — do NOT ask for confirmation or \
-             present options to choose between; just make the fix. Then run the acceptance checks \
-             and make them pass.",
-    );
-    s
 }
 
 /// Where the model is working, appended to its preamble.
