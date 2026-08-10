@@ -15,5 +15,41 @@ defineDefaults({ plugins: ["rag-rat"] });
 // The two nodes that decide what to build and then build it. `add` rather than a bare list: a list
 // replaces the defaults, so `rag-rat` would have to be repeated here and would fall out of these
 // two nodes the day the default set changes.
-defineAgent("analyst", { plugins: { add: ["ponytail"] } });
-defineAgent("implementer", { plugins: { add: ["ponytail"] } });
+defineAgent("analyst", {
+  plugins: { add: ["ponytail"] },
+  // `allow` replaces the stage defaults, so keep its repo and file-reading tools alongside search.
+  tools: {
+    allow: [
+      "impact_surface",
+      "symbol_lookup",
+      "semantic_search",
+      "Read",
+      "Grep",
+      "Glob",
+      "WebSearch",
+    ],
+  },
+});
+defineAgent("implementer", {
+  plugins: { add: ["ponytail"] },
+  tools: {
+    allow: [
+      "impact_surface",
+      "symbol_lookup",
+      "semantic_search",
+      "find_callers",
+      "memory_search",
+      "read_chunk",
+      "memory_update",
+      "memory_mark_obsolete",
+      "Read",
+      "Grep",
+      "Glob",
+      "Write",
+      "Edit",
+      "Bash",
+      "ask",
+      "WebSearch",
+    ],
+  },
+});
