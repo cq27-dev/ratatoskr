@@ -12,8 +12,8 @@
 //   scout(issue) -> ScoutOutput
 //   memory({issue, context}) -> MemoryOutput
 //   analyst({issue, scout, memory}) -> AnalystOutput
-//   redTeam() -> RedTeamOutput                     // baseline; throws if it ran no tests
-//   implement({analyst}) -> ImplementerOutput      // creates the worktree (once)
+//   redTeam() -> RedTeamOutput                     // prepares the tree; baseline + authored tests
+//   implement({analyst}) -> ImplementerOutput      // edits the prepared worktree (once)
 //   iterate({}) -> ImplementerOutput               // re-drives the CLI on that worktree
 //   verify({analyst}) -> VerifyResult              // reviews the diff against the plan
 //
@@ -80,7 +80,7 @@ async function plan(input: { issue: string }) {
   return { requirements: requirementsOut, scout: scoutOut, memory: memoryOut, analyst: analystOut };
 }
 
-// `run`: requirements, plan, then fork red-team ∥ implementer, then converge. Backs `ratatoskr run`.
+// `run`: requirements, plan, red-team, implementer, then converge. Backs `ratatoskr run`.
 async function run(input: { issue: string; maxIterations: number }) {
   const requirementsOut = await requirements({ issue: input.issue });
   const scoutOut = await scout(input.issue);
@@ -90,8 +90,10 @@ async function run(input: { issue: string; maxIterations: number }) {
   });
   const analystOut = await analyst({ issue: input.issue, scout: scoutOut, memory: memoryOut });
 
-  // Fork: both run concurrently off the frozen post-analyst state.
-  const [redTeamOut, first] = await Promise.all([redTeam(), implement({ analyst: analystOut })]);
+  // Red-team authoring finishes before implementation so the implementer meets independently
+  // authored tests and the two model turns never write the same tree concurrently.
+  const redTeamOut = await redTeam();
+  const first = await implement({ analyst: analystOut });
 
   // Converge: iterate the implementer until it introduces no new failures, or the budget runs out.
   // (`maxIterations` is also hard-enforced inside `iterate` — this loop just stops first.)

@@ -97,8 +97,12 @@ pub struct WorkflowContext {
     /// rag-rat's whole offer, the base of every node's tool pool.
     rag_rat: Option<ServerTools>,
     repo_path: PathBuf,
-    /// Set by `implement`, read by `iterate` and cleanup. The script never sees a raw path.
+    /// Prepared by `redTeam` (or `implement` when no red team runs), then reused by implementation,
+    /// iteration, and cleanup. The script never sees a raw path.
     worktree: Mutex<Option<WorktreePath>>,
+    /// Red-team authoring must finish before the implementer can edit the same worktree.
+    red_team_started: AtomicBool,
+    red_team_completed: AtomicBool,
     implement_started: AtomicBool,
     /// Serializes `iterate` calls — two implementers editing one worktree would corrupt it.
     iterate_lock: tokio::sync::Mutex<()>,
@@ -179,6 +183,8 @@ impl WorkflowContext {
             rag_rat: client.map(|c| c.offer()),
             repo_path,
             worktree: Mutex::new(None),
+            red_team_started: AtomicBool::new(false),
+            red_team_completed: AtomicBool::new(false),
             implement_started: AtomicBool::new(false),
             iterate_lock: tokio::sync::Mutex::new(()),
             invocations: AtomicUsize::new(0),
@@ -383,7 +389,8 @@ fn build_red_team(
     acceptance: Vec<ratatoskr_core::AcceptanceStep>,
 ) -> Result<RedTeamNode, PlanError> {
     let short: String = ctx.run_id.chars().take(8).collect();
-    let classifier = match crate::classifier_enabled(&ctx.engine, &ctx.config) {
+    let enabled = crate::classifier_enabled(&ctx.engine, &ctx.config);
+    let classifier = match enabled {
         true => {
             let mut plugins = ctx.plugin_context.for_node("redteam");
             let cfg = stage_agent_config(
@@ -409,11 +416,37 @@ fn build_red_team(
         }
         false => None,
     };
+    let author = match enabled {
+        true => {
+            let mut plugins = ctx.plugin_context.for_node("redteam");
+            let mut tools = ctx.plugin_context.pool_for("redteam", ctx.rag_rat.clone());
+            tools
+                .local()
+                .tools
+                .extend(ratatoskr_agent::files::edit_declarations());
+            let cfg = crate::plugins::redteam_author_agent_config(
+                &ctx.engine,
+                &ctx.config,
+                tools,
+                redteam::AUTHOR_TOOLS,
+                &mut plugins,
+            )?;
+            Some(redteam::TestAuthor {
+                route: cfg.route,
+                tools: cfg.tools,
+                policy: cfg.policy,
+                max_turns: cfg.max_turns,
+                system_prompt: cfg.system_prompt,
+                conventions: crate::repo_conventions(&ctx.repo_path),
+                plugins,
+                ledger: Some(Arc::clone(&ctx.ledger)),
+                declared_context: Arc::clone(ctx),
+            })
+        }
+        false => None,
+    };
     Ok(RedTeamNode {
-        // The scripted path forks with its own sequencing and does not create the worktree before
-        // red-team runs, so there is nothing to write tests into. Authoring belongs to the built-in
-        // flow until a script can say where the tree is.
-        author: None,
+        author,
         acceptance,
         characterizer: crate::build_characterizer(
             &ctx.engine,
@@ -459,15 +492,27 @@ async fn note<T: serde::Serialize>(
 
 async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String, String> {
     ctx.guard()?;
-    // A script may call `redTeam()` before or after `analyst()`. When a plan exists, its acceptance
-    // is what the baseline is measured with; otherwise the configured command stands in.
-    let planned = latest_checkpoint::<AnalystOutput>(&ctx.store, &ctx.run_id, "analyst")
+    if ctx.red_team_started.swap(true, Ordering::SeqCst) {
+        return Err("redTeam() called more than once in a workflow".to_string());
+    }
+    if ctx.implement_started.load(Ordering::SeqCst) {
+        return Err(
+            "redTeam() must run and finish before implement() starts, so test authoring cannot race implementation"
+                .to_string(),
+        );
+    }
+    let analyst = latest_checkpoint::<AnalystOutput>(&ctx.store, &ctx.run_id, "analyst")
         .await
-        .map(|a| a.acceptance)
-        .unwrap_or_default();
-    let acceptance = ctx.acceptance(&planned);
+        .map_err(|error| error.to_string())?;
+    let acceptance = ctx.acceptance(&analyst.acceptance);
+    let implementer = build_implementer(&ctx, analyst.clone()).map_err(|e| e.to_string())?;
+    let worktree = implementer.prepare().await.map_err(|e| e.to_string())?;
+    *ctx.worktree.lock().unwrap() = Some(worktree.clone());
     let node = build_red_team(&ctx, acceptance).map_err(|e| e.to_string())?;
-    let out = node.run().await.map_err(|e| e.to_string())?;
+    let out = node
+        .run_and_author(worktree.as_path(), &ctx.issue, &analyst.interface)
+        .await
+        .map_err(|e| e.to_string())?;
     // Checkpoint before the guard so a failed baseline stays inspectable.
     note(&ctx, "red_team", &out, None).await?;
     // The false-convergence guard is enforced here — the script cannot skip it.
@@ -477,6 +522,7 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
             out.exit_code
         ));
     }
+    ctx.red_team_completed.store(true, Ordering::SeqCst);
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -534,11 +580,32 @@ async fn implement_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String
     if ctx.implement_started.swap(true, Ordering::SeqCst) {
         return Err("implement() called more than once in a workflow".to_string());
     }
+    if ctx.red_team_started.load(Ordering::SeqCst) && !ctx.red_team_completed.load(Ordering::SeqCst)
+    {
+        return Err(
+            "implement() cannot start until the awaited redTeam() call has finished".to_string(),
+        );
+    }
     let input: ImplementArg =
         serde_json::from_str(&arg).map_err(|e| format!("implement arg: {e}"))?;
     let node = build_implementer(&ctx, input.analyst).map_err(|e| e.to_string())?;
-    let (worktree, out) = node.run().await.map_err(|e| e.to_string())?;
-    *ctx.worktree.lock().unwrap() = Some(worktree);
+    let prepared = { ctx.worktree.lock().unwrap().clone() };
+    let worktree = match prepared {
+        Some(worktree) => worktree,
+        None => {
+            let worktree = node.prepare().await.map_err(|e| e.to_string())?;
+            *ctx.worktree.lock().unwrap() = Some(worktree.clone());
+            worktree
+        }
+    };
+    let out = match node.work(&worktree).await {
+        Ok(out) => out,
+        Err(error) => {
+            node.discard(&worktree).await;
+            ctx.worktree.lock().unwrap().take();
+            return Err(error.to_string());
+        }
+    };
     note(&ctx, "implementer", &out, Some(arg)).await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
@@ -1896,6 +1963,41 @@ mod tests {
             exit_code: exit,
             narrative: None,
         }
+    }
+
+    fn model_route() -> ratatoskr_core::ModelRoute {
+        ratatoskr_core::ModelRoute {
+            provider: "test".to_string(),
+            model: "test-model".to_string(),
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            params: None,
+            session: ratatoskr_core::SessionScope::Fresh,
+        }
+    }
+
+    async fn init_test_repo(root: &std::path::Path) -> PathBuf {
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("tracked.txt"), "baseline\n").unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "test@example.com"],
+            &["config", "user.name", "Test"],
+            &["add", "."],
+            &["commit", "-qm", "initial"],
+        ] {
+            let output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        }
+        repo
     }
 
     #[test]
@@ -3916,6 +4018,158 @@ mod tests {
             serde_json::from_str(&checkpoints[0].output_json).unwrap();
         assert!(output.memory.memories.is_empty());
         assert!(output.scout.related_items.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn scripted_redteam_matches_built_in_evidence_and_worktree_lifecycle() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-scripted-redteam-parity-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = init_test_repo(&dir).await;
+        let rules = dir.join("rules");
+        let engine = ScriptEngine::load(&rules).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let run_id = "redteam-parity";
+        store
+            .upsert_run(run_id, None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let analyst = AnalystOutput {
+            impact_summary: "Keep scripted red-team evidence equivalent.".to_string(),
+            touched: Vec::new(),
+            risks: Vec::new(),
+            requirements: Vec::new(),
+            residual_risk: String::new(),
+            changes_code: true,
+            acceptance: Vec::new(),
+            // An empty interface proves the host lifecycle without spending a model turn. The
+            // declared author invocation and its rooted Write ceiling are covered below by the
+            // generic-stage parity test.
+            interface: Vec::new(),
+        };
+        checkpoint(&store, run_id, "analyst", &analyst)
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.worktree.root = dir.join("worktrees");
+        config
+            .models
+            .insert("implementer".to_string(), model_route());
+        config.models.insert("redteam".to_string(), model_route());
+        let mut ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            run_id,
+            "exercise red-team parity",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut ctx).unwrap().repo_path = repo.clone();
+        *ctx.acceptance.lock().unwrap() = Some(Vec::new());
+
+        let configured = build_red_team(&ctx, Vec::new()).unwrap();
+        let author_tools = configured.author.as_ref().unwrap().tools.names();
+        assert!(author_tools.iter().any(|tool| tool == "Write"));
+        assert!(author_tools.iter().any(|tool| tool == "Edit"));
+        let classifier_tools = configured.classifier.as_ref().unwrap().tools.names();
+        assert!(
+            !classifier_tools
+                .iter()
+                .any(|tool| tool == "Write" || tool == "Edit")
+        );
+
+        let returned: RedTeamOutput = serde_json::from_str(
+            &red_team_host(Arc::clone(&ctx), "null".to_string())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let worktree = ctx
+            .worktree
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("redTeam prepares and retains the implementer worktree");
+        assert!(worktree.as_path().exists());
+        let scripted = latest_checkpoint::<RedTeamOutput>(&store, run_id, "red_team")
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&returned).unwrap(),
+            serde_json::to_value(&scripted).unwrap()
+        );
+
+        // Both flows use `run_and_author`: the scripted checkpoint must carry the same
+        // deterministic evidence as a built-in invocation on the retained pre-change tree.
+        let built_in = build_red_team(&ctx, Vec::new())
+            .unwrap()
+            .run_and_author(worktree.as_path(), &ctx.issue, &analyst.interface)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&scripted).unwrap(),
+            serde_json::to_value(&built_in).unwrap()
+        );
+        assert!(scripted.authored.is_none());
+        assert!(
+            !ratatoskr_exec::managed_worktree_branches(&repo)
+                .await
+                .unwrap()
+                .contains(&format!(
+                    "ratatoskr/{}-baseline",
+                    run_id.chars().take(8).collect::<String>()
+                )),
+            "the fresh baseline worktree and branch are removed after measurement"
+        );
+
+        remove_worktree(&repo, &worktree).await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn scripted_redteam_and_implementer_cannot_edit_one_tree_concurrently() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-redteam-order-gate-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let ctx = WorkflowContext::new(
+            None,
+            &RatatoskrConfig::default(),
+            &store,
+            "redteam-order-gate",
+            "keep model writes ordered",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        ctx.red_team_started.store(true, Ordering::SeqCst);
+        let implement_error = implement_host(Arc::clone(&ctx), "{}".to_string())
+            .await
+            .unwrap_err();
+        assert!(implement_error.contains("redTeam() call has finished"));
+
+        let other = WorkflowContext::new(
+            None,
+            &RatatoskrConfig::default(),
+            &store,
+            "redteam-order-gate-other",
+            "keep model writes ordered",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        other.implement_started.store(true, Ordering::SeqCst);
+        let redteam_error = red_team_host(other, "null".to_string()).await.unwrap_err();
+        assert!(redteam_error.contains("test authoring cannot race implementation"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
