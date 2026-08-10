@@ -12,10 +12,6 @@
 
 use std::fmt::Write as _;
 
-use ratatoskr_core::ModelRoute;
-use ratatoskr_graph::{NodeError, parse_validated};
-use ratatoskr_mcp::ToolSet;
-use rmcp::service::ServerSink;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -85,54 +81,6 @@ pub struct ContextOutput {
     /// worse than one that never arrives: it looks like a constraint while no longer being the
     /// constraint.
     pub memory: MemoryOutput,
-}
-
-/// The context node: one agent turn over a guaranteed memory baseline.
-pub struct ContextNode {
-    pub route: ModelRoute,
-    pub tools: ToolSet,
-    /// For the deterministic `memory_search` that runs whatever the model does. `None` without
-    /// rag-rat, where the baseline is empty and the node still does its other half: distilling the
-    /// task from what it can read.
-    pub sink: Option<ServerSink>,
-    pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
-    pub max_turns: Option<usize>,
-    pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
-    /// Legacy ruleset prompt slot; the declared stage resolves the effective prompt.
-    pub system_prompt: Option<String>,
-    pub plugins: crate::NodePlugins,
-    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
-    pub files: Option<std::path::PathBuf>,
-    /// The generic stage executor context used for the model distillation turn.
-    pub(crate) declared_context: std::sync::Arc<crate::workflow::WorkflowContext>,
-}
-
-impl ContextNode {
-    pub async fn run(&self, issue: &str) -> Result<ContextOutput, NodeError> {
-        // The baseline retrieval happens before the model is asked anything, and it happens
-        // whatever the model does. Making it a tool the model may call would make "were the repo's
-        // recorded constraints consulted" a thing that varies per run.
-        let memory = match &self.sink {
-            Some(sink) => crate::memory::search(sink, issue, "").await?,
-            None => crate::memory::MemoryOutput::default(),
-        };
-
-        let input = distillation_input(issue, memory.clone(), self.sink.is_some());
-        let input_json = serde_json::to_string(&input)
-            .map_err(|error| NodeError::Failed(format!("context input: {error}")))?;
-        let question = render_prompt(issue, &memory, input.searchable);
-        let raw = crate::workflow::evaluate_standard_stage(
-            std::sync::Arc::clone(&self.declared_context),
-            "context_distillation",
-            input_json,
-            question,
-        )
-        .await
-        .map_err(|error| NodeError::Failed(format!("context agent failed: {error}")))?;
-
-        let distilled = parse_validated::<Distillation>(&raw)?;
-        Ok(attach_evidence(distilled, memory))
-    }
 }
 
 pub(crate) fn distillation_input(
@@ -310,7 +258,7 @@ mod tests {
             {"says":"both places or neither migrates","from_memory_id":"mem_1"},
             {"says":"from the tracker, not a memory"}
         ]}"#;
-        let out = parse_validated::<Distillation>(raw).unwrap();
+        let out = ratatoskr_graph::parse_validated::<Distillation>(raw).unwrap();
         assert_eq!(out.constraints[0].from_memory_id, "mem_1");
         // A constraint from the code or the tracker has no memory to cite, and that is not an
         // error — it is the absence of one.

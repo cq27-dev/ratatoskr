@@ -936,13 +936,6 @@ async fn test_command_ran_host(_ctx: Arc<WorkflowContext>, arg: String) -> Resul
     serde_json::to_string(&v).map_err(|e| e.to_string())
 }
 
-async fn newly_introduced_host(_ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
-    let bp: BaselinePost =
-        serde_json::from_str(&arg).map_err(|e| format!("newlyIntroducedFailures arg: {e}"))?;
-    let v = converge::newly_introduced_failures(&bp.baseline.failing_tests, &bp.post.failing_tests);
-    serde_json::to_string(&v).map_err(|e| e.to_string())
-}
-
 /// What `verify()` hands the script.
 ///
 /// `blocking` is the part that matters and the part the script does not get to compute: Rust reads
@@ -1815,7 +1808,6 @@ enum TemporaryOperation {
     Verify,
     IsConverged,
     TestCommandRan,
-    NewlyIntroducedFailures,
 }
 
 impl TemporaryOperation {
@@ -1854,7 +1846,6 @@ impl TemporaryOperation {
             }
             Self::IsConverged => binding(Arc::clone(ctx), is_converged_host),
             Self::TestCommandRan => binding(Arc::clone(ctx), test_command_ran_host),
-            Self::NewlyIntroducedFailures => binding(Arc::clone(ctx), newly_introduced_host),
         }
     }
 }
@@ -1862,19 +1853,13 @@ impl TemporaryOperation {
 const TEMPORARY_OPERATIONS: &[(&str, TemporaryOperation)] = &[
     ("context", TemporaryOperation::Context),
     ("memory", TemporaryOperation::Memory),
-    ("red_team", TemporaryOperation::RedTeam),
     ("redTeam", TemporaryOperation::RedTeam),
-    ("implementer", TemporaryOperation::Implement),
     ("implement", TemporaryOperation::Implement),
     ("iterate", TemporaryOperation::Iterate),
     ("replanAtCeiling", TemporaryOperation::ReplanAtCeiling),
     ("verify", TemporaryOperation::Verify),
     ("isConverged", TemporaryOperation::IsConverged),
     ("testCommandRan", TemporaryOperation::TestCommandRan),
-    (
-        "newlyIntroducedFailures",
-        TemporaryOperation::NewlyIntroducedFailures,
-    ),
 ];
 
 fn build_legacy_operation_hosts(
@@ -4058,6 +4043,16 @@ mod tests {
             assert!(
                 hosts.contains_key(*name),
                 "missing operation adapter `{name}`"
+            );
+        }
+        assert!(
+            hosts.contains_key("memory"),
+            "repository workflows still use the deterministic memory adapter"
+        );
+        for removed in ["red_team", "implementer", "newlyIntroducedFailures"] {
+            assert!(
+                !hosts.contains_key(removed),
+                "obsolete operation alias `{removed}` was re-registered"
             );
         }
         assert!(

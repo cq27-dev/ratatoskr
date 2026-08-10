@@ -36,7 +36,7 @@ use plugins::{default_allow, servers_to_start};
 pub use analyst::AnalystOutput;
 pub use bookkeeper::{BookkeeperInput, BookkeeperOutput, MemoryWritten};
 pub use child::ChildTask;
-pub use context::{Constraint, ContextNode, ContextOutput};
+pub use context::{Constraint, ContextOutput};
 pub use implementer::{ImplementerNode, ImplementerOutput};
 pub use memory::{MemoryNode, MemoryOutput, MemoryRecord};
 pub use overseer::OverseerOutput;
@@ -857,7 +857,6 @@ mod migrated_stage_path_tests {
     #[test]
     fn migrated_native_components_have_one_stage_executor_model_path() {
         for (component, source) in [
-            ("context", include_str!("context.rs")),
             ("implementer", include_str!("implementer.rs")),
             ("redteam", include_str!("redteam.rs")),
             ("characterizer", include_str!("testrun.rs")),
@@ -875,6 +874,16 @@ mod migrated_stage_path_tests {
                 "{component} must require a declared workflow context"
             );
         }
+
+        let context = include_str!("context.rs");
+        assert!(
+            !context.contains(concat!("Context", "Node")),
+            "context must not retain an obsolete direct wrapper"
+        );
+        assert!(
+            include_str!("workflow.rs").contains("context_distillation"),
+            "the context operation must retain its declared StageExecutor turn"
+        );
 
         let built_in = include_str!("lib.rs");
         assert!(
