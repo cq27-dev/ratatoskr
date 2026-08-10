@@ -4619,6 +4619,282 @@ mod tests {
         }
     }
 
+    struct RendererParityCase {
+        stage: &'static str,
+        input: serde_json::Value,
+        rust_question: String,
+    }
+
+    fn renderer_parity_plan() -> AnalystOutput {
+        AnalystOutput {
+            impact_summary: "The store owns run claims.".to_string(),
+            touched: vec!["crates/ratatoskr-store".to_string()],
+            risks: vec!["Do not permit two owners".to_string()],
+            requirements: vec!["Keep claim acquisition atomic".to_string()],
+            residual_risk: String::new(),
+            changes_code: true,
+            acceptance: Vec::new(),
+            interface: vec![crate::analyst::InterfaceItem {
+                name: "Store::claim".to_string(),
+                shape: "fn claim(&self, run: &str) -> Result<Claim, StoreError>".to_string(),
+                happy: vec!["an unclaimed run yields a Claim".to_string()],
+                sad: vec!["an owned run returns an error".to_string()],
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_typescript_renderers_match_their_rust_adapters() {
+        let plan = renderer_parity_plan();
+        let choices = vec![crate::overseer::Choice {
+            name: "ratatoskr-standard-v1".to_string(),
+            purpose: "Implement and review repository changes.".to_string(),
+            when_to_use: vec!["the task asks for a code change".to_string()],
+        }];
+        let overseer = crate::overseer::OverseerInput {
+            issue: "make claims atomic".to_string(),
+            choices,
+        };
+        let characterizer = crate::testrun::CharacterizerInput {
+            outcomes: vec![crate::testrun::StepOutcome {
+                name: "store tests".to_string(),
+                command: vec!["cargo".to_string(), "test".to_string()],
+                exit_code: 101,
+                output: "claim_twice failed".to_string(),
+            }],
+        };
+        let classifier = crate::redteam::ClassifierInput {
+            failing: vec!["store::claim_twice".to_string()],
+            raw_output: "claim_twice failed".to_string(),
+        };
+        let author = crate::redteam::TestAuthorInput {
+            issue: "make claims atomic".to_string(),
+            interface: plan.interface.clone(),
+        };
+        let implementer = crate::implementer::ImplementerAttemptInput {
+            issue: "make claims atomic".to_string(),
+            analyst: plan.clone(),
+            acceptance: vec![ratatoskr_core::AcceptanceStep {
+                name: "store tests".to_string(),
+                command: vec!["cargo".to_string(), "test".to_string()],
+            }],
+            diagnostic: None,
+        };
+        let memory = MemoryOutput {
+            memories: vec![crate::memory::MemoryRecord {
+                memory_id: "mem_claim".to_string(),
+                kind: "Invariant".to_string(),
+                title: "Claims are exclusive".to_string(),
+                confidence: "high".to_string(),
+                status: "active".to_string(),
+                body: "Only one owner may claim a run.".to_string(),
+                summary: None,
+            }],
+        };
+        let context =
+            crate::context::distillation_input("make claims atomic", memory.clone(), true);
+        let analyst = analyst::AnalystInput::fresh(
+            "make claims atomic".to_string(),
+            ScoutOutput {
+                related_items: Vec::new(),
+                papertrail_summary: "Issue 210 requires exclusive claims.".to_string(),
+            },
+            memory,
+        );
+        let bookkeeper = BookkeeperInput {
+            issue: "make claims atomic".to_string(),
+            analyst: plan.clone(),
+            implementer: imp(&["store::claim_twice"], &[], 101),
+            iterations: 2,
+            converged: false,
+            friction: crate::bookkeeper::RunFriction::default(),
+        };
+        let publisher = PublisherInput {
+            issue: "make claims atomic".to_string(),
+            analyst: plan.clone(),
+            implementer: Some(imp(&[], &["store tests"], 0)),
+            status: RunStatus::Converged.as_str().to_string(),
+            iterations: 1,
+            unresolved: Vec::new(),
+        };
+        let verifier = verifier::VerifierInput {
+            issue: "make claims atomic".to_string(),
+            analyst: plan,
+            diff: "diff --git a/store.rs b/store.rs".to_string(),
+            touched_files: vec!["store.rs".to_string()],
+            previous_findings: vec![verifier::Finding {
+                severity: verifier::Severity::P2,
+                kind: verifier::FindingKind::Execution,
+                file: "store.rs".to_string(),
+                line: Some(41),
+                summary: "claim is not atomic".to_string(),
+                failure_scenario: "two owners claim concurrently".to_string(),
+            }],
+        };
+
+        let cases = vec![
+            RendererParityCase {
+                stage: "overseer",
+                input: serde_json::to_value(&overseer).unwrap(),
+                rust_question: crate::overseer::render_prompt(&overseer.issue, &overseer.choices),
+            },
+            RendererParityCase {
+                stage: "characterizer",
+                input: serde_json::to_value(&characterizer).unwrap(),
+                rust_question: crate::testrun::render_prompt(&characterizer.outcomes),
+            },
+            RendererParityCase {
+                stage: "redteam_classifier",
+                input: serde_json::to_value(&classifier).unwrap(),
+                rust_question: crate::redteam::classifier_prompt(
+                    &classifier.failing,
+                    &classifier.raw_output,
+                ),
+            },
+            RendererParityCase {
+                stage: "redteam_author",
+                input: serde_json::to_value(&author).unwrap(),
+                rust_question: crate::redteam::author_prompt(&author.issue, &author.interface),
+            },
+            RendererParityCase {
+                stage: "implementer_attempt",
+                input: serde_json::to_value(&implementer).unwrap(),
+                rust_question: crate::implementer::render_attempt_prompt(&implementer),
+            },
+            RendererParityCase {
+                stage: "context_distillation",
+                input: serde_json::to_value(&context).unwrap(),
+                rust_question: crate::context::render_prompt(
+                    &context.issue,
+                    &context.memory,
+                    context.searchable,
+                ),
+            },
+            RendererParityCase {
+                stage: "analyst",
+                input: serde_json::to_value(&analyst).unwrap(),
+                rust_question: analyst::render_prompt(&analyst),
+            },
+            RendererParityCase {
+                stage: "bookkeeper",
+                input: serde_json::to_value(&bookkeeper).unwrap(),
+                rust_question: crate::bookkeeper::render_prompt(&bookkeeper),
+            },
+            RendererParityCase {
+                stage: "publisher",
+                input: serde_json::to_value(&publisher).unwrap(),
+                rust_question: crate::publisher::render_prompt(&publisher),
+            },
+            RendererParityCase {
+                stage: "verifier",
+                input: serde_json::to_value(&verifier).unwrap(),
+                rust_question: verifier::render_prompt(&verifier),
+            },
+        ];
+        let calls = cases
+            .iter()
+            .enumerate()
+            .map(|(index, case)| format!("await {}(input.c{index});", case.stage))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = format!(
+            "defineWorkflow({{ name: \"renderer-parity\" }}); async function run(input) {{ {calls} return true; }}"
+        );
+        let runtime = WorkflowRuntime::bundled_with_includes("renderer-parity", &source, &[])
+            .await
+            .unwrap();
+        let captured = Arc::new(Mutex::new(HashMap::<String, Vec<serde_json::Value>>::new()));
+        let mut hosts: HashMap<String, HostFn> = HashMap::new();
+        for case in &cases {
+            let stage = case.stage.to_string();
+            let captured = Arc::clone(&captured);
+            let capture_key = stage.clone();
+            hosts.entry(stage).or_insert_with(|| {
+                Arc::new(move |arg: String| {
+                    let captured = Arc::clone(&captured);
+                    let capture_key = capture_key.clone();
+                    Box::pin(async move {
+                        captured
+                            .lock()
+                            .expect("renderer capture mutex poisoned")
+                            .entry(capture_key)
+                            .or_default()
+                            .push(serde_json::from_str(&arg).unwrap());
+                        Ok("{}".to_string())
+                    })
+                })
+            });
+        }
+        let input = serde_json::Value::Object(
+            cases
+                .iter()
+                .enumerate()
+                .map(|(index, case)| (format!("c{index}"), case.input.clone()))
+                .collect(),
+        );
+        let stages = standard_stages().await.unwrap();
+        runtime
+            .run_with_question_renderers(
+                "run",
+                input.to_string(),
+                hosts,
+                stage_question_renderers(&stages),
+            )
+            .await
+            .unwrap();
+
+        let captured = captured.lock().expect("renderer capture mutex poisoned");
+        let mut offsets = HashMap::<&str, usize>::new();
+        for case in &cases {
+            let offset = offsets.entry(case.stage).or_default();
+            let envelope = &captured[case.stage][*offset];
+            *offset += 1;
+            assert_eq!(
+                envelope["__ratatoskrRenderedQuestion"]["question"], case.rust_question,
+                "TypeScript/Rust renderer drift for {}",
+                case.stage
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_default_renderer_ownership_is_explicit_and_complete() {
+        // Direct declared-stage calls in standard-v1 are rendered by the workflow runtime. Model
+        // stages entered through lifecycle/terminal operation hosts are rendered by those Rust
+        // adapters before StageExecutor. Scout accepts its issue string directly and has no
+        // renderQuestion declaration.
+        let typescript_rendered = ["analyst"];
+        let rust_adapter_rendered = [
+            "overseer",
+            "characterizer",
+            "redteam_classifier",
+            "redteam_author",
+            "implementer_attempt",
+            "context_distillation",
+            "bookkeeper",
+            "publisher",
+            "verifier",
+        ];
+        let stages = standard_stages().await.unwrap();
+        let mut declared = stage_question_renderers(&stages)
+            .into_keys()
+            .collect::<Vec<_>>();
+        declared.sort();
+        let mut owned = typescript_rendered
+            .into_iter()
+            .chain(rust_adapter_rendered)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        owned.sort();
+        assert_eq!(owned, declared, "every bundled renderer needs one owner");
+        assert!(
+            stages
+                .iter()
+                .find(|stage| stage.id == "scout")
+                .is_some_and(|stage| stage.question_renderer.is_none())
+        );
+    }
+
     #[tokio::test]
     async fn bookkeeper_declaration_matches_its_typed_schema_and_rust_question() {
         let dir = std::env::temp_dir().join(format!(
