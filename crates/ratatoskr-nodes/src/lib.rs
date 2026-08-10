@@ -631,6 +631,9 @@ pub const WORKFLOW_DIR: &str = ".ratatoskr/workflows";
 /// The name of the flow this binary implements in Rust.
 pub const BUILT_IN: &str = "built-in";
 
+const SCRIPTED_REVIEW_WARNING: &str = "this workflow controls whether to run the verifier; if it \
+    omits verify(), the change will be accepted on its Rust-owned test and referee gates alone";
+
 /// The nodes a ruleset may govern out of the box — the LLM agents that go through
 /// `run_structured`. `memory` is absent because it is a direct rag-rat call with no model or tool
 /// set to override, so targeting it is a config error rather than a no-op.
@@ -1672,14 +1675,9 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
     } = request;
     // A workflow, when this repo defines one, overrides the whole run flow.
     if let Workflow::Scripted(runtime) = chosen {
-        // Said out loud because it is a gate the run will not have. The scripted path checkpoints,
-        // validates and enforces the referee and iteration limits, but it has no verifier binding
-        // — so a change that passes its tests is accepted without anything reading the diff.
-        tracing::warn!(
-            workflow = runtime.meta().name,
-            "this workflow does not run the verifier; the change will be accepted on its tests \
-             alone. `--workflow {BUILT_IN}` runs the flow that reviews the diff."
-        );
+        // Said out loud because review is compositional on this path. The binding exists and keeps
+        // its threshold in Rust, but a repository workflow may choose not to call it.
+        tracing::warn!(workflow = runtime.meta().name, "{SCRIPTED_REVIEW_WARNING}");
         let plugin_context =
             PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
                 .await?;
@@ -3205,13 +3203,23 @@ pub(crate) async fn commit_run(
     impl_out: &ImplementerOutput,
 ) {
     let branch = implementer.branch();
+    commit_worktree(run.config, run.issue, worktree, &branch, impl_out).await;
+}
+
+pub(crate) async fn commit_worktree(
+    config: &RatatoskrConfig,
+    issue: &str,
+    worktree: &WorktreePath,
+    branch: &str,
+    impl_out: &ImplementerOutput,
+) {
     match ratatoskr_exec::commit_all(
         worktree,
-        &branch,
-        &commit_message(&run.config.publish, run.issue, impl_out),
+        branch,
+        &commit_message(&config.publish, issue, impl_out),
         ratatoskr_exec::Committer {
-            name: &run.config.publish.committer_name,
-            email: &run.config.publish.committer_email,
+            name: &config.publish.committer_name,
+            email: &config.publish.committer_email,
         },
     )
     .await

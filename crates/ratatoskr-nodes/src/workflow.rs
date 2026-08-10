@@ -36,6 +36,7 @@ use crate::{
     AnalystOutput, BookkeeperInput, BookkeeperOutput, ChildTask, ImplementerNode,
     ImplementerOutput, MemoryNode, MemoryOutput, PlanError, PlanOutcome, RedTeamNode,
     RedTeamOutput, RunOutcome, ScoutOutput, Stage, bookkeeper, checkpoint, converge, memory,
+    publisher::{PublisherInput, PublisherOutput},
     redteam, referee, stage_agent_config, verifier,
 };
 
@@ -1935,6 +1936,14 @@ pub async fn run_full_scripted(
     runtime: WorkflowRuntime,
     ctx: Arc<WorkflowContext>,
 ) -> Result<RunOutcome, PlanError> {
+    run_full_scripted_with_actions(runtime, ctx, &LiveTerminalActions).await
+}
+
+async fn run_full_scripted_with_actions<A: FullTerminalActions>(
+    runtime: WorkflowRuntime,
+    ctx: Arc<WorkflowContext>,
+    actions: &A,
+) -> Result<RunOutcome, PlanError> {
     // The run row first: the issue checkpoint references it, and the schema enforces that.
     ctx.store
         .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
@@ -1963,7 +1972,7 @@ pub async fn run_full_scripted(
         .run_with_question_renderers("run", input, hosts, stage_question_renderers(&stages))
         .await
     {
-        Ok(_) => finish_full(&ctx).await,
+        Ok(_) => finish_full(&ctx, actions).await,
         Err(e) => Err(PlanError::node(
             "workflow",
             NodeError::Failed(e.to_string()),
@@ -1996,12 +2005,138 @@ pub async fn run_full_scripted(
     result
 }
 
+trait FullTerminalActions: Sync {
+    async fn commit(
+        &self,
+        ctx: &WorkflowContext,
+        worktree: &WorktreePath,
+        implementer: &ImplementerOutput,
+    );
+
+    async fn publish(
+        &self,
+        ctx: &Arc<WorkflowContext>,
+        input: PublisherInput,
+        terminal: bool,
+    ) -> Option<PublisherOutput>;
+
+    async fn bookkeep(
+        &self,
+        ctx: &Arc<WorkflowContext>,
+        input: BookkeeperInput,
+    ) -> Option<BookkeeperOutput>;
+}
+
+struct LiveTerminalActions;
+
+impl FullTerminalActions for LiveTerminalActions {
+    async fn commit(
+        &self,
+        ctx: &WorkflowContext,
+        worktree: &WorktreePath,
+        implementer: &ImplementerOutput,
+    ) {
+        crate::commit_worktree(
+            &ctx.config,
+            &ctx.issue,
+            worktree,
+            &implementer.branch,
+            implementer,
+        )
+        .await;
+    }
+
+    async fn publish(
+        &self,
+        ctx: &Arc<WorkflowContext>,
+        input: PublisherInput,
+        terminal: bool,
+    ) -> Option<PublisherOutput> {
+        let clarifier = crate::clarify::NodeClarifier::new(
+            &ctx.config,
+            &ctx.store,
+            &ctx.engine,
+            &ctx.run_id,
+            &ctx.issue,
+        );
+        let run = crate::Run {
+            client: None,
+            config: &ctx.config,
+            store: &ctx.store,
+            run_id: &ctx.run_id,
+            issue: &ctx.issue,
+            engine: &ctx.engine,
+            clarifier: &clarifier,
+            context: &ctx.plugin_context,
+            ledger: &ctx.ledger,
+        };
+        crate::publish_if_enabled(&run, input, terminal).await
+    }
+
+    async fn bookkeep(
+        &self,
+        ctx: &Arc<WorkflowContext>,
+        input: BookkeeperInput,
+    ) -> Option<BookkeeperOutput> {
+        match bookkeep_scripted(ctx, input).await {
+            Ok(bookkeeper) => Some(bookkeeper),
+            Err(error) => {
+                tracing::warn!("bookkeeping failed: {error}");
+                None
+            }
+        }
+    }
+}
+
 /// Reconstruct the `RunOutcome` from the store after a successful script run, write the Rust-inferred
-/// terminal status, and do the run-back bookkeeping. Any error here is handled by the caller's
-/// cleanup path.
-async fn finish_full(ctx: &Arc<WorkflowContext>) -> Result<RunOutcome, PlanError> {
+/// terminal status, commit and deliver the result. Any error here is handled by the caller's cleanup
+/// path.
+async fn finish_full<A: FullTerminalActions>(
+    ctx: &Arc<WorkflowContext>,
+    actions: &A,
+) -> Result<RunOutcome, PlanError> {
     // The store is the source of truth the script can't fake; a missing checkpoint is a hard error.
     let plan = reconstruct_plan(&ctx.store, &ctx.run_id).await?;
+    if !crate::fork_is_needed(&plan.analyst, &ctx.config) {
+        let status = RunStatus::NoCodeChange;
+        if let Err(error) = ctx
+            .store
+            .upsert_run(&ctx.run_id, None, status.as_str())
+            .await
+        {
+            tracing::warn!("failed to record the run's final status: {error}");
+        }
+        let published = actions
+            .publish(
+                ctx,
+                PublisherInput {
+                    issue: ctx.issue.clone(),
+                    analyst: plan.analyst.clone(),
+                    implementer: None,
+                    status: status.as_str().to_string(),
+                    iterations: 0,
+                    unresolved: Vec::new(),
+                },
+                true,
+            )
+            .await;
+        let mut state = plan.state.clone();
+        state.status = status;
+        if let Some(published) = &published {
+            state.artifacts.push(serde_json::to_value(published)?);
+        }
+        return Ok(RunOutcome {
+            state,
+            plan,
+            red_team: None,
+            implementer: None,
+            worktree: None,
+            iterations: 0,
+            status,
+            bookkeeper: None,
+        });
+    }
+
     let red_team: RedTeamOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "red_team").await?;
     let implementer: ImplementerOutput =
         latest_checkpoint(&ctx.store, &ctx.run_id, "implementer").await?;
@@ -2026,32 +2161,51 @@ async fn finish_full(ctx: &Arc<WorkflowContext>) -> Result<RunOutcome, PlanError
         crate::parse_threshold(&ctx.config.implementer.verify_threshold),
     );
     let status = status_with_review_availability(status, &review);
-    ctx.store
+    actions.commit(ctx, &worktree, &implementer).await;
+    if let Err(error) = ctx
+        .store
         .upsert_run(&ctx.run_id, None, status.as_str())
-        .await?;
+        .await
+    {
+        tracing::warn!("failed to record final run status: {error}");
+    }
 
-    let bookkeeper = if matches!(
+    let terminal = matches!(
         status,
-        RunStatus::Converged | RunStatus::MaxIterationsReached
-    ) {
-        let input = BookkeeperInput {
-            issue: ctx.issue.clone(),
-            analyst: plan.analyst.clone(),
-            implementer: implementer.clone(),
-            iterations,
-            converged: status == RunStatus::Converged,
-            friction: crate::friction_of(&ctx.store, &ctx.run_id).await,
-        };
-        match bookkeep_scripted(ctx, input).await {
-            Ok(bk) => Some(bk),
-            Err(e) => {
-                tracing::warn!("bookkeeping failed: {e}");
-                None
+        RunStatus::Converged | RunStatus::MaxIterationsReached | RunStatus::Unreviewed
+    );
+    let (bookkeeper, published) = tokio::join!(
+        async {
+            if !terminal {
+                return None;
             }
-        }
-    } else {
-        None
-    };
+            actions
+                .bookkeep(
+                    ctx,
+                    BookkeeperInput {
+                        issue: ctx.issue.clone(),
+                        analyst: plan.analyst.clone(),
+                        implementer: implementer.clone(),
+                        iterations,
+                        converged: status == RunStatus::Converged,
+                        friction: crate::friction_of(&ctx.store, &ctx.run_id).await,
+                    },
+                )
+                .await
+        },
+        actions.publish(
+            ctx,
+            PublisherInput {
+                issue: ctx.issue.clone(),
+                analyst: plan.analyst.clone(),
+                implementer: Some(implementer.clone()),
+                status: status.as_str().to_string(),
+                iterations,
+                unresolved: crate::unresolved_of(&ctx.store, &ctx.run_id).await,
+            },
+            terminal,
+        )
+    );
 
     let mut state = plan.state.clone();
     state.red_team = Some(serde_json::to_value(&red_team)?);
@@ -2059,6 +2213,9 @@ async fn finish_full(ctx: &Arc<WorkflowContext>) -> Result<RunOutcome, PlanError
     state.status = status;
     if let Some(bk) = &bookkeeper {
         state.artifacts = vec![serde_json::to_value(bk)?];
+    }
+    if let Some(published) = &published {
+        state.artifacts.push(serde_json::to_value(published)?);
     }
 
     Ok(RunOutcome {
@@ -2172,6 +2329,148 @@ mod tests {
             params: None,
             session: ratatoskr_core::SessionScope::Fresh,
         }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum TerminalCall {
+        Commit {
+            branch: String,
+            worktree: PathBuf,
+        },
+        Publish {
+            status: String,
+            has_implementer: bool,
+            terminal: bool,
+            iterations: u32,
+            unresolved: usize,
+        },
+        Bookkeep {
+            converged: bool,
+            iterations: u32,
+        },
+    }
+
+    struct RecordingTerminalActions {
+        calls: Mutex<Vec<TerminalCall>>,
+        published: Option<PublisherOutput>,
+        bookkeeper: Option<BookkeeperOutput>,
+    }
+
+    impl RecordingTerminalActions {
+        fn new(publish: bool, bookkeep: bool) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                published: publish.then(|| PublisherOutput {
+                    action: "comment".to_string(),
+                    pull_request_url: String::new(),
+                    comment_url: "https://example.test/comment".to_string(),
+                    reasoning: "delivered by the Rust terminal adapter".to_string(),
+                }),
+                bookkeeper: bookkeep.then(|| BookkeeperOutput {
+                    memories_written: Vec::new(),
+                    memories_revised: Vec::new(),
+                    skipped: Some("nothing durable".to_string()),
+                    iterations: 0,
+                    residual_risk_accepted: false,
+                }),
+            }
+        }
+
+        fn calls(&self) -> Vec<TerminalCall> {
+            self.calls
+                .lock()
+                .expect("terminal calls mutex poisoned")
+                .clone()
+        }
+    }
+
+    impl FullTerminalActions for RecordingTerminalActions {
+        async fn commit(
+            &self,
+            _ctx: &WorkflowContext,
+            worktree: &WorktreePath,
+            implementer: &ImplementerOutput,
+        ) {
+            self.calls
+                .lock()
+                .expect("terminal calls mutex poisoned")
+                .push(TerminalCall::Commit {
+                    branch: implementer.branch.clone(),
+                    worktree: worktree.as_path().to_path_buf(),
+                });
+        }
+
+        async fn publish(
+            &self,
+            _ctx: &Arc<WorkflowContext>,
+            input: PublisherInput,
+            terminal: bool,
+        ) -> Option<PublisherOutput> {
+            self.calls
+                .lock()
+                .expect("terminal calls mutex poisoned")
+                .push(TerminalCall::Publish {
+                    status: input.status,
+                    has_implementer: input.implementer.is_some(),
+                    terminal,
+                    iterations: input.iterations,
+                    unresolved: input.unresolved.len(),
+                });
+            self.published.clone()
+        }
+
+        async fn bookkeep(
+            &self,
+            _ctx: &Arc<WorkflowContext>,
+            input: BookkeeperInput,
+        ) -> Option<BookkeeperOutput> {
+            self.calls
+                .lock()
+                .expect("terminal calls mutex poisoned")
+                .push(TerminalCall::Bookkeep {
+                    converged: input.converged,
+                    iterations: input.iterations,
+                });
+            self.bookkeeper.clone().map(|mut output| {
+                output.iterations = input.iterations;
+                output
+            })
+        }
+    }
+
+    async fn terminal_plan(store: &Store, run_id: &str, changes_code: bool) -> AnalystOutput {
+        store
+            .upsert_run(run_id, None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        checkpoint(
+            store,
+            run_id,
+            "scout",
+            &ScoutOutput {
+                related_items: Vec::new(),
+                papertrail_summary: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        checkpoint(store, run_id, "memory", &MemoryOutput::default())
+            .await
+            .unwrap();
+        let analyst = AnalystOutput {
+            impact_summary: "exercise terminal parity".to_string(),
+            touched: Vec::new(),
+            risks: Vec::new(),
+            requirements: vec!["keep external effects Rust-owned".to_string()],
+            residual_risk: String::new(),
+            changes_code,
+            acceptance: Vec::new(),
+            interface: Vec::new(),
+        };
+        checkpoint(store, run_id, "analyst", &analyst)
+            .await
+            .unwrap();
+        analyst
     }
 
     async fn init_test_repo(root: &std::path::Path) -> PathBuf {
@@ -6210,6 +6509,202 @@ mod tests {
                 .unwrap(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn scripted_no_code_terminal_publishes_the_plan_without_fork_or_bookkeeping() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-scripted-no-code-terminal-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let run_id = "scripted-no-code-terminal";
+        terminal_plan(&store, run_id, false).await;
+        let config = RatatoskrConfig::default();
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            run_id,
+            "summarize the architecture",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let actions = RecordingTerminalActions::new(true, true);
+
+        let outcome = finish_full(&ctx, &actions).await.unwrap();
+
+        assert_eq!(outcome.status, RunStatus::NoCodeChange);
+        assert!(outcome.red_team.is_none());
+        assert!(outcome.implementer.is_none());
+        assert!(outcome.worktree.is_none());
+        assert!(outcome.bookkeeper.is_none());
+        assert_eq!(outcome.iterations, 0);
+        assert_eq!(outcome.state.artifacts.len(), 1);
+        assert_eq!(
+            store.run_status(run_id).await.unwrap().as_deref(),
+            Some(RunStatus::NoCodeChange.as_str())
+        );
+        assert_eq!(
+            actions.calls(),
+            [TerminalCall::Publish {
+                status: RunStatus::NoCodeChange.as_str().to_string(),
+                has_implementer: false,
+                terminal: true,
+                iterations: 0,
+                unresolved: 0,
+            }]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn scripted_terminal_commits_before_delivery_and_bookkeeps_unreviewed_work() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-scripted-terminal-parity-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let run_id = "scripted-terminal-parity";
+        terminal_plan(&store, run_id, true).await;
+        checkpoint(&store, run_id, "red_team", &red(&["old"], &[], 1))
+            .await
+            .unwrap();
+        let worktree = dir.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let mut implementer = imp(&["old"], &["new"], 0);
+        implementer.worktree_path = worktree.display().to_string();
+        checkpoint(&store, run_id, "implementer", &implementer)
+            .await
+            .unwrap();
+        checkpoint(
+            &store,
+            run_id,
+            "verifier",
+            &json!({ "error": "provider unavailable" }),
+        )
+        .await
+        .unwrap();
+        let config = RatatoskrConfig::default();
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            run_id,
+            "implement terminal parity",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let actions = RecordingTerminalActions::new(true, true);
+
+        let outcome = finish_full(&ctx, &actions).await.unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Unreviewed);
+        assert!(outcome.bookkeeper.is_some());
+        assert_eq!(outcome.state.artifacts.len(), 2);
+        assert_eq!(
+            store.run_status(run_id).await.unwrap().as_deref(),
+            Some(RunStatus::Unreviewed.as_str())
+        );
+        let calls = actions.calls();
+        assert_eq!(
+            calls.first(),
+            Some(&TerminalCall::Commit {
+                branch: implementer.branch.clone(),
+                worktree,
+            }),
+            "commit must finish before either external delivery begins"
+        );
+        assert!(calls.contains(&TerminalCall::Bookkeep {
+            converged: false,
+            iterations: 1,
+        }));
+        assert!(calls.contains(&TerminalCall::Publish {
+            status: RunStatus::Unreviewed.as_str().to_string(),
+            has_implementer: true,
+            terminal: true,
+            iterations: 1,
+            unresolved: 0,
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn scripted_full_failure_removes_its_owned_worktree_and_records_failed() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-scripted-full-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = init_test_repo(&dir).await;
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            "async function run() { throw new Error('terminal failure'); }",
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::load(&workflow_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let config = RatatoskrConfig::default();
+        let run_id = "scripted-full-cleanup";
+        let mut ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            run_id,
+            "fail after creating a worktree",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut ctx).unwrap().repo_path = repo.clone();
+        let worktree = ratatoskr_exec::create_worktree(
+            &repo,
+            &dir.join("worktrees"),
+            "ratatoskr/scripted-full-cleanup",
+        )
+        .await
+        .unwrap();
+        *ctx.worktree.lock().unwrap() = Some(worktree.clone());
+
+        let error = match run_full_scripted_with_actions(
+            runtime,
+            Arc::clone(&ctx),
+            &RecordingTerminalActions::new(false, false),
+        )
+        .await
+        {
+            Ok(_) => panic!("the workflow failure must fail the run"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("terminal failure"), "{error}");
+        assert!(!worktree.as_path().exists());
+        assert!(ctx.worktree.lock().unwrap().is_none());
+        assert_eq!(
+            store.run_status(run_id).await.unwrap().as_deref(),
+            Some(RunStatus::Failed.as_str())
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scripted_review_warning_describes_the_optional_binding() {
+        assert!(crate::SCRIPTED_REVIEW_WARNING.contains("controls whether to run the verifier"));
+        assert!(crate::SCRIPTED_REVIEW_WARNING.contains("if it omits verify()"));
+        assert!(!crate::SCRIPTED_REVIEW_WARNING.contains("has no verifier binding"));
     }
 
     fn finding(severity: verifier::Severity) -> verifier::Finding {
