@@ -27,6 +27,7 @@ defineAgent("analyst", {
       "Grep",
       "Glob",
       "WebSearch",
+      "WebFetch",
     ],
   },
 });
@@ -50,6 +51,7 @@ defineAgent("implementer", {
       "Bash",
       "ask",
       "WebSearch",
+      "WebFetch",
     ],
   },
 });
