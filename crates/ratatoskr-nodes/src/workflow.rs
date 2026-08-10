@@ -1643,7 +1643,9 @@ impl StageExecutor {
             .ctx
             .plugin_context
             .pool_for(&governance_id, &self.ctx.servers);
-        if ratatoskr_core::Capability::ceiling(&stage.capabilities)
+        if stage.tools.iter().any(|tool| {
+            tool == ratatoskr_agent::files::WRITE || tool == ratatoskr_agent::files::EDIT
+        }) && ratatoskr_core::Capability::ceiling(&stage.capabilities)
             .is_some_and(|ceiling| ceiling.permits(ratatoskr_core::Capability::Write))
         {
             offered.add_local_tools(ratatoskr_agent::files::edit_declarations());
@@ -2233,7 +2235,8 @@ pub async fn run_full_scripted(
     runtime: WorkflowRuntime,
     ctx: Arc<WorkflowContext>,
 ) -> Result<RunOutcome, PlanError> {
-    run_full_scripted_with_actions(runtime, ctx, &LiveTerminalActions).await
+    let actions = LiveTerminalActions::default();
+    run_full_scripted_with_actions(runtime, ctx, &actions).await
 }
 
 async fn run_full_scripted_with_actions<A: FullTerminalActions>(
@@ -2318,6 +2321,7 @@ trait FullTerminalActions: Sync {
         ctx: &Arc<WorkflowContext>,
         input: PublisherInput,
         terminal: bool,
+        worktree: Option<&WorktreePath>,
     ) -> Option<PublisherOutput>;
 
     async fn bookkeep(
@@ -2327,7 +2331,24 @@ trait FullTerminalActions: Sync {
     ) -> Option<BookkeeperOutput>;
 }
 
-struct LiveTerminalActions;
+struct LiveTerminalActions {
+    publisher_turn: Arc<dyn StageTurn>,
+}
+
+impl Default for LiveTerminalActions {
+    fn default() -> Self {
+        Self {
+            publisher_turn: Arc::new(LiveStageTurn),
+        }
+    }
+}
+
+#[cfg(test)]
+impl LiveTerminalActions {
+    fn with_publisher_turn(publisher_turn: Arc<dyn StageTurn>) -> Self {
+        Self { publisher_turn }
+    }
+}
 
 fn terminal_run(ctx: &WorkflowContext) -> crate::Run<'_> {
     crate::Run {
@@ -2366,9 +2387,18 @@ impl FullTerminalActions for LiveTerminalActions {
         ctx: &Arc<WorkflowContext>,
         input: PublisherInput,
         terminal: bool,
+        worktree: Option<&WorktreePath>,
     ) -> Option<PublisherOutput> {
         let run = terminal_run(ctx);
-        crate::publish_if_enabled(&run, input, terminal).await
+        crate::publish_if_enabled(
+            &run,
+            input,
+            terminal,
+            &ctx.repo_path,
+            worktree,
+            Arc::clone(&self.publisher_turn),
+        )
+        .await
     }
 
     async fn bookkeep(
@@ -2416,6 +2446,7 @@ async fn finish_full<A: FullTerminalActions>(
                     unresolved: Vec::new(),
                 },
                 true,
+                None,
             )
             .await;
         let mut state = plan.state.clone();
@@ -2440,7 +2471,14 @@ async fn finish_full<A: FullTerminalActions>(
     let implementer: ImplementerOutput =
         latest_checkpoint(&ctx.store, &ctx.run_id, "implementer").await?;
     let iterations = count_checkpoints(&ctx.store, &ctx.run_id, "implementer").await?;
-    let worktree = WorktreePath(PathBuf::from(&implementer.worktree_path));
+    // The worktree is Rust-owned lifecycle state. The implementer checkpoint's rendered path is
+    // report data and must never select a terminal file or Git root.
+    let worktree = ctx.worktree.lock().unwrap().clone().ok_or_else(|| {
+        PlanError::node(
+            "publisher",
+            NodeError::Failed("run has no worktree".to_string()),
+        )
+    })?;
 
     // Terminal status is Rust-inferred, never trusted from the script.
     // The last review, if the script ran one. Absent is not the same as clean: a workflow that
@@ -2503,6 +2541,7 @@ async fn finish_full<A: FullTerminalActions>(
                 unresolved: crate::unresolved_of(&ctx.store, &ctx.run_id).await,
             },
             terminal,
+            Some(&worktree),
         )
     );
 
@@ -2696,6 +2735,7 @@ mod tests {
 
     struct RecordingTerminalActions {
         calls: Mutex<Vec<TerminalCall>>,
+        publisher_worktrees: Mutex<Vec<Option<PathBuf>>>,
         published: Option<PublisherOutput>,
         bookkeeper: Option<BookkeeperOutput>,
     }
@@ -2704,6 +2744,7 @@ mod tests {
         fn new(publish: bool, bookkeep: bool) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                publisher_worktrees: Mutex::new(Vec::new()),
                 published: publish.then(|| PublisherOutput {
                     action: crate::publisher::PublisherAction::Comment,
                     pull_request_url: String::new(),
@@ -2718,6 +2759,13 @@ mod tests {
                     residual_risk_accepted: false,
                 }),
             }
+        }
+
+        fn publisher_worktrees(&self) -> Vec<Option<PathBuf>> {
+            self.publisher_worktrees
+                .lock()
+                .expect("terminal publisher worktree mutex poisoned")
+                .clone()
         }
 
         fn calls(&self) -> Vec<TerminalCall> {
@@ -2749,7 +2797,12 @@ mod tests {
             _ctx: &Arc<WorkflowContext>,
             input: PublisherInput,
             terminal: bool,
+            worktree: Option<&WorktreePath>,
         ) -> Option<PublisherOutput> {
+            self.publisher_worktrees
+                .lock()
+                .expect("terminal publisher worktree mutex poisoned")
+                .push(worktree.map(|worktree| worktree.as_path().to_path_buf()));
             self.calls
                 .lock()
                 .expect("terminal calls mutex poisoned")
@@ -3290,6 +3343,7 @@ mod tests {
             crate::PluginContext::default(),
         )
         .unwrap();
+        *ctx.worktree.lock().unwrap() = Some(WorktreePath(dir.join("worktree")));
         store
             .upsert_run(run_id, None, RunStatus::Running.as_str())
             .await
@@ -5206,6 +5260,7 @@ mod tests {
             .unwrap();
         assert!(question.contains("THIS RUN DID NOT FINISH CLEAN"));
         assert!(question.contains("the URLs can still run together"));
+        assert!(!question.contains("WORKTREE:"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5342,6 +5397,528 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "invalid output must not become a publisher result"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn publisher_tool_assembly_grants_publication_and_read_tools_but_never_mutation() {
+        // Issue #227, tool-assembly regression: the publisher declares exactly `gh` and
+        // `git_push` under a `Publish` ceiling. `Publish` is authority for the external
+        // publication actions Rust granted — it is not `Write`, so the ordered capability must
+        // not add `Write`, `Edit` or `Bash` to the offer.
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-publisher-tool-assembly-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-publisher-tools", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("publisher".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-publisher-tools",
+            "publish this",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = Arc::new(standard_stages().await.unwrap());
+        let publisher = stages
+            .iter()
+            .find(|stage| stage.id == "publisher")
+            .unwrap()
+            .clone();
+
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({ "action": "none", "reasoning": "nothing to deliver" }).to_string(),
+            ..Default::default()
+        });
+        StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::clone(&stages),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .execute(StageInvocation {
+            stage: publisher,
+            input_json: "{}".to_string(),
+            rendered_question: Some("deliver the run".to_string()),
+            resource_root: Some(dir.clone()),
+            shell: None,
+            publish: Some(StandardStagePublishResources {
+                push: Some(ratatoskr_agent::publish::PushAccess {
+                    repo_root: dir.clone(),
+                    branch: "ratatoskr/run-publisher-tools".to_string(),
+                    issue: Some("GitHub issue #227".to_string()),
+                }),
+            }),
+            clarifier: None,
+            invocation_guidance: None,
+            output: StageOutput::Evidence,
+        })
+        .await
+        .unwrap();
+
+        let tools = turn.tools.lock().expect("recording runner mutex poisoned")[0].clone();
+        // The publication tools the stage declared, both granted by Rust here...
+        assert!(tools.contains(&ratatoskr_agent::publish::GH.to_string()));
+        assert!(tools.contains(&ratatoskr_agent::publish::PUSH.to_string()));
+        assert!(
+            turn.has_push
+                .lock()
+                .expect("recording runner mutex poisoned")[0]
+        );
+        // ...plus the ordinary read reach a publisher reasons with...
+        for read in [
+            ratatoskr_agent::files::READ,
+            ratatoskr_agent::files::GREP,
+            ratatoskr_agent::files::GLOB,
+        ] {
+            assert!(
+                tools.iter().any(|tool| tool == read),
+                "publisher lost {read}: {tools:?}"
+            );
+        }
+        // ...and no repository mutation. A Publish ceiling is not Write authority.
+        for mutation in [
+            ratatoskr_agent::files::WRITE,
+            ratatoskr_agent::files::EDIT,
+            ratatoskr_agent::shell::BASH,
+        ] {
+            assert!(
+                !tools.iter().any(|tool| tool == mutation),
+                "publisher was offered {mutation} from a Publish ceiling: {tools:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn publisher_without_a_worktree_keeps_gh_but_loses_push_and_all_mutation_tools() {
+        // A run that changed no code still publishes — a comment is the sensible form — so `gh`
+        // is granted against the run context's captured repository root. There is no run branch,
+        // so no `git_push`, and still no generic file mutation.
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-publisher-no-worktree-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run(
+                "run-publisher-no-worktree",
+                None,
+                RunStatus::Running.as_str(),
+            )
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("publisher".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-publisher-no-worktree",
+            "publish this",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = Arc::new(standard_stages().await.unwrap());
+        let publisher = stages
+            .iter()
+            .find(|stage| stage.id == "publisher")
+            .unwrap()
+            .clone();
+
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({ "action": "none", "reasoning": "nothing to deliver" }).to_string(),
+            ..Default::default()
+        });
+        StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::clone(&stages),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .execute(StageInvocation {
+            stage: publisher,
+            input_json: "{}".to_string(),
+            rendered_question: Some("deliver the run".to_string()),
+            resource_root: Some(dir.clone()),
+            shell: None,
+            publish: Some(StandardStagePublishResources { push: None }),
+            clarifier: None,
+            invocation_guidance: None,
+            output: StageOutput::Evidence,
+        })
+        .await
+        .unwrap();
+
+        let tools = turn.tools.lock().expect("recording runner mutex poisoned")[0].clone();
+        assert!(tools.contains(&ratatoskr_agent::publish::GH.to_string()));
+        assert!(
+            !tools.contains(&ratatoskr_agent::publish::PUSH.to_string()),
+            "no run branch means no push tool: {tools:?}"
+        );
+        assert!(
+            !turn
+                .has_push
+                .lock()
+                .expect("recording runner mutex poisoned")[0]
+        );
+        for mutation in [
+            ratatoskr_agent::files::WRITE,
+            ratatoskr_agent::files::EDIT,
+            ratatoskr_agent::shell::BASH,
+        ] {
+            assert!(
+                !tools.iter().any(|tool| tool == mutation),
+                "a comment-only publisher was offered {mutation}: {tools:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn publisher_without_a_rust_grant_gets_no_publication_and_no_mutation_tools() {
+        // No publish resources at all: a `Publish` ceiling and the publish profile alone must
+        // assemble nothing beyond reads — no `gh`, no `git_push`, and no `Write`/`Edit`/`Bash`.
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-publisher-ungranted-tools-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run(
+                "run-publisher-ungranted-tools",
+                None,
+                RunStatus::Running.as_str(),
+            )
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("publisher".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-publisher-ungranted-tools",
+            "publish this",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = Arc::new(standard_stages().await.unwrap());
+        let publisher = stages
+            .iter()
+            .find(|stage| stage.id == "publisher")
+            .unwrap()
+            .clone();
+
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({ "action": "none", "reasoning": "nothing to deliver" }).to_string(),
+            ..Default::default()
+        });
+        StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::clone(&stages),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .execute(StageInvocation {
+            stage: publisher,
+            input_json: "{}".to_string(),
+            rendered_question: Some("deliver the run".to_string()),
+            resource_root: Some(dir.clone()),
+            shell: None,
+            publish: None,
+            clarifier: None,
+            invocation_guidance: None,
+            output: StageOutput::Evidence,
+        })
+        .await
+        .unwrap();
+
+        let tools = turn.tools.lock().expect("recording runner mutex poisoned")[0].clone();
+        for publication in [
+            ratatoskr_agent::publish::GH,
+            ratatoskr_agent::publish::PUSH,
+            ratatoskr_agent::files::WRITE,
+            ratatoskr_agent::files::EDIT,
+            ratatoskr_agent::shell::BASH,
+        ] {
+            assert!(
+                !tools.iter().any(|tool| tool == publication),
+                "an ungranted publisher was offered {publication}: {tools:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The publisher turn from issue #227: handed any mutation authority, it uses it against
+    /// whatever file root it was given — which the live run proved was the operator's checkout.
+    #[derive(Default)]
+    struct OperatorCheckoutDirtyingTurn {
+        /// Every tool name offered, per invocation.
+        tools: Mutex<Vec<Vec<String>>>,
+        /// The mutation-capable tools offered, per invocation.
+        mutation_tools: Mutex<Vec<Vec<String>>>,
+        /// The file root handed to the turn, per invocation.
+        roots: Mutex<Vec<Option<PathBuf>>>,
+    }
+
+    impl StageTurn for OperatorCheckoutDirtyingTurn {
+        fn run<'a>(
+            &'a self,
+            run: ratatoskr_agent::NodeRun<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, ratatoskr_agent::AgentError>> + Send + 'a>>
+        {
+            let tools = run.tools.names();
+            let mutation: Vec<String> = [
+                ratatoskr_agent::files::WRITE,
+                ratatoskr_agent::files::EDIT,
+                ratatoskr_agent::shell::BASH,
+            ]
+            .into_iter()
+            .filter(|name| tools.iter().any(|tool| tool == name))
+            .map(str::to_string)
+            .collect();
+            // Play the call the live publisher made: a write under the root it was handed. The
+            // offered Write/Edit are rooted writes, so a direct rooted write here is exactly
+            // their effect — the authority being probed is whether they are offered at all.
+            let can_write = mutation.iter().any(|name| {
+                name == ratatoskr_agent::files::WRITE || name == ratatoskr_agent::files::EDIT
+            });
+            if can_write && let Some(root) = run.files.as_ref() {
+                let target = root.join("crates/ratatoskr-core/src/config.rs");
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::fs::write(&target, "dirtied by the publisher\n").unwrap();
+            }
+            self.tools
+                .lock()
+                .expect("dirtying turn mutex poisoned")
+                .push(tools);
+            self.mutation_tools
+                .lock()
+                .expect("dirtying turn mutex poisoned")
+                .push(mutation);
+            self.roots
+                .lock()
+                .expect("dirtying turn mutex poisoned")
+                .push(run.files.clone());
+            Box::pin(async move {
+                Ok(json!({ "action": "none", "reasoning": "nothing to deliver" }).to_string())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_publisher_with_a_writable_looking_request_leaves_the_operator_checkout_untouched() {
+        // Issue #227: a publisher asks for `gh`/`git_push` under a Publish ceiling and behaves as
+        // the reported incident did if mutation is available. Its Rust-granted root is a committed
+        // run worktree, while the separate operator checkout must remain byte-for-byte clean.
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-publisher-containment-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let operator = init_test_repo(&dir).await;
+        let run_worktree = dir.join("committed-run-worktree");
+        let created = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&operator)
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "ratatoskr/run-publisher-containment",
+            ])
+            .arg(&run_worktree)
+            .output()
+            .await
+            .unwrap();
+        assert!(created.status.success(), "git worktree add: {created:?}");
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let run_id = "run-publisher-containment";
+        store
+            .upsert_run(run_id, None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("publisher".to_string(), model_route());
+        config.publish.enabled = true;
+        let mut ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            run_id,
+            "publish the run",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut ctx)
+            .expect("publisher context has no other owners")
+            .repo_path = operator.clone();
+
+        // The model-facing input claims the operator checkout; it is data for the write-up, never
+        // the root. Rust grants the separate committed run worktree below.
+        let implementer = ImplementerOutput {
+            worktree_path: operator.display().to_string(),
+            branch: format!("ratatoskr/{run_id}"),
+            ..imp(&[], &["post"], 0)
+        };
+        let input = crate::publisher::PublisherInput {
+            issue: "GitHub issue #227: keep the publisher out of the live checkout".to_string(),
+            analyst: AnalystOutput {
+                impact_summary: "publisher containment".to_string(),
+                touched: vec!["crates/ratatoskr-nodes".to_string()],
+                risks: Vec::new(),
+                requirements: vec!["the operator checkout stays clean".to_string()],
+                residual_risk: String::new(),
+                changes_code: true,
+                acceptance: Vec::new(),
+                interface: Vec::new(),
+            },
+            implementer: Some(implementer),
+            status: "converged".to_string(),
+            iterations: 1,
+            unresolved: Vec::new(),
+        };
+        let turn = Arc::new(OperatorCheckoutDirtyingTurn::default());
+        let actions =
+            LiveTerminalActions::with_publisher_turn(Arc::clone(&turn) as Arc<dyn StageTurn>);
+        let published = actions
+            .publish(&ctx, input, true, Some(&WorktreePath(run_worktree.clone())))
+            .await;
+        assert!(published.is_some(), "terminal publication did not run");
+
+        let offered = turn.tools.lock().expect("dirtying turn mutex poisoned")[0].clone();
+        assert!(
+            offered.contains(&ratatoskr_agent::publish::GH.to_string()),
+            "the publisher can still do its job: {offered:?}"
+        );
+        let mutation = turn
+            .mutation_tools
+            .lock()
+            .expect("dirtying turn mutex poisoned")[0]
+            .clone();
+        assert!(
+            mutation.is_empty(),
+            "the publisher was offered mutation tools: {mutation:?}"
+        );
+        // The root the turn ran with is the one Rust supplied — the model-claimed path in the
+        // input never reaches the tool layer.
+        let root = turn.roots.lock().expect("dirtying turn mutex poisoned")[0].clone();
+        assert_eq!(root.as_deref(), Some(run_worktree.as_path()));
+
+        let status = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&operator)
+            .args(["status", "--porcelain"])
+            .output()
+            .await
+            .unwrap();
+        assert!(status.status.success());
+        let stdout = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            stdout.trim().is_empty(),
+            "the operator checkout was dirtied: {stdout}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(operator.join("tracked.txt")).unwrap(),
+            "baseline\n"
+        );
+        assert!(
+            !operator
+                .join("crates/ratatoskr-core/src/config.rs")
+                .exists()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn terminal_publication_uses_the_rust_held_worktree_not_the_model_claimed_path() {
+        // Issue #227, root selection: the implementer's output is model-produced, so its
+        // `worktree_path` is a claim, not authority. The terminal phase — the commit and the
+        // publication that follows it — must resolve its file/Git root from the worktree Rust
+        // created and held on the run context, even when the model-reported path disagrees.
+        //
+        // Contract reading: `publisher(PublisherInput)` carries no root; Rust supplies the
+        // trusted `&WorktreePath`, and `finish_full` is where the terminal phase's root is
+        // chosen. Asserted on the commit call and the outcome, the two places that root leaves
+        // this function.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-publisher-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rust_worktree = dir.join("run-worktree");
+        std::fs::create_dir_all(&rust_worktree).unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let run_id = "run-publisher-root";
+        terminal_plan(&store, run_id, true).await;
+        let config = RatatoskrConfig::default();
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            run_id,
+            "publish from the run worktree",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        *ctx.worktree.lock().unwrap() = Some(WorktreePath(rust_worktree.clone()));
+        checkpoint(&store, run_id, "red_team", &red(&[], &["baseline"], 0))
+            .await
+            .unwrap();
+        // The model claims a different directory — standing in for the operator checkout — was
+        // its worktree.
+        let claimed = dir.join("operator-checkout");
+        std::fs::create_dir_all(&claimed).unwrap();
+        let implementer = ImplementerOutput {
+            worktree_path: claimed.display().to_string(),
+            branch: format!("ratatoskr/{run_id}"),
+            ..imp(&[], &["post"], 0)
+        };
+        checkpoint(&store, run_id, "implementer", &implementer)
+            .await
+            .unwrap();
+
+        let actions = RecordingTerminalActions::new(true, false);
+        let outcome = finish_full(&ctx, &actions).await.unwrap();
+        assert_eq!(
+            outcome.worktree.as_ref().map(WorktreePath::as_path),
+            Some(rust_worktree.as_path()),
+            "the terminal phase took the model-claimed path as its root"
+        );
+        assert_eq!(
+            actions.publisher_worktrees(),
+            [Some(rust_worktree.clone())],
+            "publisher ran outside the Rust-held worktree"
+        );
+        assert!(
+            matches!(
+                actions.calls().first(),
+                Some(TerminalCall::Commit { worktree, .. }) if worktree == &rust_worktree
+            ),
+            "commit ran against the model-claimed path: {:?}",
+            actions.calls()
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -7902,6 +8479,7 @@ mod tests {
             crate::PluginContext::default(),
         )
         .unwrap();
+        *ctx.worktree.lock().unwrap() = Some(WorktreePath(worktree.clone()));
         let actions = RecordingTerminalActions::new(true, true);
 
         let outcome = finish_full(&ctx, &actions).await.unwrap();
