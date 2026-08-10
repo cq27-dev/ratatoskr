@@ -908,7 +908,7 @@ fn valid_env_name(name: &str) -> bool {
 
 /// The common provider contract for client tool names. Keeping configured aliases inside the
 /// narrowest supported grammar prevents a valid config from failing only when a model is called.
-fn valid_model_tool_name(name: &str) -> bool {
+pub fn valid_model_tool_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && name
             .bytes()

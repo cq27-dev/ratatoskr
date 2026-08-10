@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use ratatoskr_core::{Capability, McpServerConfig, McpTransport, RagRatConfig};
+use ratatoskr_core::{self, Capability, McpServerConfig, McpTransport, RagRatConfig};
 use rmcp::ServiceExt;
 use rmcp::model::Tool;
 use rmcp::service::{RoleClient, RunningService, ServerSink};
@@ -48,6 +48,8 @@ pub enum McpError {
     Handshake { origin: String, detail: String },
     #[error("listing `{origin}`'s tools failed: {detail}")]
     ListTools { origin: String, detail: String },
+    #[error("configured MCP server `{origin}` exposes an invalid tool set: {detail}")]
+    InvalidToolSet { origin: String, detail: String },
     #[error("shutting down `{origin}` failed: {detail}")]
     Shutdown { origin: String, detail: String },
 }
@@ -280,6 +282,7 @@ impl ConfiguredMcpClient {
             .iter()
             .filter_map(|(wire, tool)| tool.name.clone().map(|name| (wire.clone(), name)))
             .collect();
+        validate_configured_tool_names(origin, &connection.tools, &renames)?;
         let capabilities = config
             .tools
             .iter()
@@ -312,6 +315,39 @@ impl ConfiguredMcpClient {
     pub async fn shutdown(self) -> Result<(), McpError> {
         self.connection.shutdown().await
     }
+}
+
+/// Validate names only after discovery: configuration cannot see unlisted tools or alias
+/// collisions with them.
+fn validate_configured_tool_names(
+    origin: &str,
+    tools: &[Tool],
+    renames: &BTreeMap<String, String>,
+) -> Result<(), McpError> {
+    let mut claimed = BTreeMap::new();
+    for tool in tools {
+        let wire = tool.name.as_ref();
+        let display = renames.get(wire).map_or(wire, String::as_str);
+        if !ratatoskr_core::valid_model_tool_name(display) {
+            return Err(McpError::InvalidToolSet {
+                origin: origin.to_string(),
+                detail: format!(
+                    "tool `{wire}` has provider-invalid display name `{display}`; configure a \
+                     unique alias matching ^[A-Za-z0-9_-]{{1,64}}$"
+                ),
+            });
+        }
+        if let Some(previous) = claimed.insert(display.to_string(), wire.to_string()) {
+            return Err(McpError::InvalidToolSet {
+                origin: origin.to_string(),
+                detail: format!(
+                    "display name `{display}` is ambiguous between server tools `{previous}` and \
+                     `{wire}`; configure a unique alias"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Where a tool offer came from. Authority defaults depend on provenance, never origin spelling.
@@ -719,6 +755,34 @@ mod tests {
         let mut tool = Tool::default();
         tool.name = name.to_string().into();
         tool
+    }
+
+    #[test]
+    fn configured_aliases_cannot_collide_with_unlisted_tools() {
+        let tools = vec![tool("foo"), tool("bar")];
+        let renames = BTreeMap::from([("foo".to_string(), "bar".to_string())]);
+
+        assert!(matches!(
+            validate_configured_tool_names("remote", &tools, &renames),
+            Err(McpError::InvalidToolSet { origin, detail })
+                if origin == "remote"
+                    && detail.contains("ambiguous")
+                    && detail.contains("`foo`")
+                    && detail.contains("`bar`")
+        ));
+    }
+
+    #[test]
+    fn unlisted_tool_names_must_be_provider_safe() {
+        for name in ["namespace.tool".to_string(), "x".repeat(65)] {
+            assert!(matches!(
+                validate_configured_tool_names("remote", &[tool(&name)], &BTreeMap::new()),
+                Err(McpError::InvalidToolSet { origin, detail })
+                    if origin == "remote"
+                        && detail.contains(&name)
+                        && detail.contains("configure a unique alias")
+            ));
+        }
     }
 
     #[test]
