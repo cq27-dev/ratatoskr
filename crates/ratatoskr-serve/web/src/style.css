@@ -982,7 +982,7 @@ body {
 
 /* Inline markers in model prose. Deliberately quiet: a feed row is one line among hundreds, and
    emphasis that shouts costs more than the emphasis is worth. */
-.ev-d code,
+.ev-d code {
   background: #1c1c1c;
   border: 1px solid var(--rule);
   padding: 0 3px;
