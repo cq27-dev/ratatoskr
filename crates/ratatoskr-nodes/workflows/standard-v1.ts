@@ -580,14 +580,22 @@ defineWorkflow({
       agent: "publish",
       inputContract: "PublisherInput",
       outputContract: "PublisherOutput",
-      outputSchema: obj(
+      outputSchema: schemaWithDefs(
+        obj(
+          {
+            action: { "$ref": "#/$defs/PublisherAction" },
+            pull_request_url: str(),
+            comment_url: str(),
+            reasoning: str(),
+          },
+          ["action", "reasoning"],
+        ),
         {
-          action: str(),
-          pull_request_url: str(),
-          comment_url: str(),
-          reasoning: str(),
+          PublisherAction: {
+            type: "string",
+            enum: ["pull_request", "comment", "both", "none"],
+          },
         },
-        ["action", "reasoning"],
       ),
       instructions: LOAD("prompts/publisher.md").trim(),
       renderQuestion(input: any) {

@@ -817,7 +817,7 @@ fn pull_request_view(checkpoints: &[Checkpoint]) -> Option<PullRequestView> {
         .as_str();
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     match value.get("action").and_then(|v| v.as_str()) {
-        Some("pull_request") | Some("both") => {}
+        Some("pull_request") | Some("pr") | Some("both") => {}
         _ => return None,
     }
     ["pull_request_url", "url"]
@@ -1800,6 +1800,17 @@ mod tests {
         let pr = pull_request_view(&cps).unwrap();
         assert_eq!(pr.number, 42);
         assert_eq!(pr.url, "https://github.com/o/r/pull/42");
+    }
+
+    #[test]
+    fn action_pr_still_yields_the_pull_request() {
+        let cps = vec![cp(
+            "publisher",
+            r#"{"action":"pr","pull_request_url":"https://github.com/cq27-dev/ratatoskr/pull/221","comment_url":"","reasoning":"opened the pull request"}"#,
+        )];
+        let pr = pull_request_view(&cps).unwrap();
+        assert_eq!(pr.number, 221);
+        assert_eq!(pr.url, "https://github.com/cq27-dev/ratatoskr/pull/221");
     }
 
     #[test]

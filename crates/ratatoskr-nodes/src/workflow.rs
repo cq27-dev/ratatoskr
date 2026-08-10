@@ -2659,7 +2659,7 @@ mod tests {
             Self {
                 calls: Mutex::new(Vec::new()),
                 published: publish.then(|| PublisherOutput {
-                    action: "comment".to_string(),
+                    action: crate::publisher::PublisherAction::Comment,
                     pull_request_url: String::new(),
                     comment_url: "https://example.test/comment".to_string(),
                     reasoning: "delivered by the Rust terminal adapter".to_string(),
