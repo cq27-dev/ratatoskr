@@ -543,15 +543,26 @@ async fn note<T: serde::Serialize>(
     out: &T,
     input: Option<String>,
 ) -> Result<(), String> {
+    // Implementer attempts are the only repeated model checkpoints whose ordinal is durable
+    // friction evidence. Derive it from the persisted sequence rather than trusting the script's
+    // loop variable, which has no authority over bookkeeping semantics.
+    let iteration = if node == "implementer" {
+        Some(
+            count_checkpoints(&ctx.store, &ctx.run_id, node)
+                .await
+                .map_err(|error| error.to_string())?
+                + 1,
+        )
+    } else {
+        None
+    };
     crate::record(crate::Record {
         store: &ctx.store,
         run_id: &ctx.run_id,
         node,
         output: out,
         input,
-        // A script chooses its own order, so a checkpoint's position in the loop is whatever the
-        // script made it; counting them here would invent an iteration the script never declared.
-        iteration: None,
+        iteration,
         ledger: Some(&ctx.ledger),
     })
     .await
@@ -7500,6 +7511,59 @@ mod tests {
                 .unwrap(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn scripted_implementer_checkpoints_preserve_attempt_ordinals_for_friction() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-scripted-implementer-iteration-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let run_id = "scripted-implementer-iteration";
+        store
+            .upsert_run(run_id, None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let ctx = WorkflowContext::new(
+            None,
+            &RatatoskrConfig::default(),
+            &store,
+            run_id,
+            "preserve corrective diagnostics",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+
+        note(&ctx, "implementer", &imp(&[], &["first"], 0), None)
+            .await
+            .unwrap();
+        note(
+            &ctx,
+            "implementer",
+            &imp(&[], &["second"], 0),
+            Some("Fix the checkpointed correction.".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let checkpoints = store.checkpoints_for_run(run_id).await.unwrap();
+        assert_eq!(
+            checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.iteration)
+                .collect::<Vec<_>>(),
+            [Some(1), Some(2)]
+        );
+        assert_eq!(
+            crate::bookkeeper::RunFriction::from_checkpoints(&checkpoints).diagnostics,
+            ["Fix the checkpointed correction."]
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
