@@ -1887,10 +1887,17 @@ fn build_legacy_operation_hosts(
         .collect()
 }
 
+// These model turns need write authority only inside Rust-owned lifecycle adapters that provide
+// the prepared worktree and, for implementation, the sandbox and clarification rendezvous. The
+// declarations stay in `StageExecutor` for those adapters, but must never become repository-JS
+// globals: a generic host has no worktree lifecycle from which to derive a safe resource root.
+const INTERNAL_WRITE_STAGE_IDS: &[&str] = &["redteam_author", "implementer_attempt"];
+
 fn build_declared_stage_hosts(executor: &Arc<StageExecutor>) -> HashMap<String, HostFn> {
     executor
         .stages
         .iter()
+        .filter(|stage| !INTERNAL_WRITE_STAGE_IDS.contains(&stage.id.as_str()))
         .map(|stage| (stage.id.clone(), executor.host(stage.clone())))
         .collect()
 }
@@ -4155,6 +4162,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repository_workflows_cannot_invoke_internal_write_stages() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-internal-write-stage-boundary-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"defineWorkflow({ name: "write-stage-probe" });
+               async function plan(input) {
+                 return input.target === "redteam_author"
+                   ? await redteam_author(input)
+                   : await implementer_attempt(input);
+               }"#,
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::load(&workflow_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let ctx = WorkflowContext::new(
+            None,
+            &RatatoskrConfig::default(),
+            &store,
+            "run-internal-write-stage-boundary",
+            "try an internal write stage",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = execution_stages(&runtime).await.unwrap();
+        for stage_id in INTERNAL_WRITE_STAGE_IDS {
+            let stage = stages
+                .iter()
+                .find(|stage| stage.id == *stage_id)
+                .expect("internal stage remains available to Rust adapters");
+            assert_eq!(stage.capabilities, [ratatoskr_core::Capability::Write]);
+        }
+        let turn = Arc::new(RecordingStageTurn::default());
+        let hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        assert!(hosts.contains_key("redTeam"));
+        assert!(hosts.contains_key("implement"));
+        for stage_id in INTERNAL_WRITE_STAGE_IDS {
+            assert!(!hosts.contains_key(*stage_id));
+            let error = runtime
+                .run_with_question_renderers(
+                    "plan",
+                    json!({ "target": stage_id }).to_string(),
+                    hosts.clone(),
+                    stage_question_renderers(&stages),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(stage_id),
+                "write-stage error changed: {error}"
+            );
+            assert!(
+                error.contains("not defined"),
+                "internal write stage unexpectedly had a JS host: {error}"
+            );
+        }
+        assert!(
+            turn.nodes
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .is_empty(),
+            "rejected repository calls must not reach a model turn"
+        );
+        assert!(
+            store
+                .checkpoints_for_run("run-internal-write-stage-boundary")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn standard_scout_uses_generic_dispatch_and_checkpoints_normalized_output() {
         let dir =
             std::env::temp_dir().join(format!("ratatoskr-standard-scout-{}", std::process::id()));
@@ -5568,7 +5661,6 @@ mod tests {
         std::fs::write(
             &workflow_path,
             r#"async function plan(input) {
-                await redteam_author(input.author);
                 return await redteam_classifier(input.classifier);
             }"#,
         )
@@ -5640,12 +5732,32 @@ mod tests {
             raw_output: "assertion failed: deleted > 0".to_string(),
         };
         let turn = Arc::new(RecordingStageTurn::default());
+        let author_root = dir.join("author-root");
+        std::fs::create_dir_all(&author_root).unwrap();
+        evaluate_standard_stage_with_resources_and_turn(
+            Arc::clone(&ctx),
+            "redteam_author",
+            serde_json::to_string(&author).unwrap(),
+            crate::redteam::author_prompt(&author.issue, &author.interface),
+            StandardStageResources {
+                resource_root: author_root.clone(),
+                shell: None,
+                publish: None,
+                clarifier: None,
+                guidance: None,
+            },
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await
+        .unwrap();
         let hosts =
             build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        assert!(!hosts.contains_key("redteam_author"));
+        assert!(hosts.contains_key("redteam_classifier"));
         runtime
             .run_with_question_renderers(
                 "plan",
-                json!({ "author": author, "classifier": classifier }).to_string(),
+                json!({ "classifier": classifier }).to_string(),
                 hosts,
                 stage_question_renderers(&stages),
             )
@@ -5677,6 +5789,10 @@ mod tests {
                 "missing {tool}"
             );
         }
+        assert_eq!(
+            turn.files.lock().expect("recording runner mutex poisoned")[0],
+            Some(author_root)
+        );
         assert!(
             !tools[1]
                 .iter()
@@ -5711,14 +5827,10 @@ mod tests {
             .checkpoints_for_run("run-standard-redteam")
             .await
             .unwrap();
-        assert_eq!(checkpoints.len(), 2);
-        assert_eq!(checkpoints[0].node_name, "redteam_author");
-        assert_eq!(checkpoints[1].node_name, "redteam_classifier");
-        let checkpoint_author: crate::redteam::TestAuthorInput =
-            serde_json::from_str(checkpoints[0].input_json.as_deref().unwrap()).unwrap();
-        assert_eq!(checkpoint_author.interface[0].name, "Store::prune");
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].node_name, "redteam_classifier");
         let checkpoint_classifier: crate::redteam::ClassifierInput =
-            serde_json::from_str(checkpoints[1].input_json.as_deref().unwrap()).unwrap();
+            serde_json::from_str(checkpoints[0].input_json.as_deref().unwrap()).unwrap();
         assert_eq!(
             checkpoint_classifier.raw_output,
             "assertion failed: deleted > 0"
@@ -5886,19 +5998,6 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let workflow_path = dir.join("workflow.ts");
-        std::fs::write(
-            &workflow_path,
-            r#"async function plan(input) {
-                 await implementer_attempt(input.initial);
-                 return await implementer_attempt(input.iteration);
-               }"#,
-        )
-        .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
-            .await
-            .unwrap()
-            .unwrap();
         let engine = ScriptEngine::load(&dir).await.unwrap();
         let store = Store::open_in_memory().unwrap();
         store
@@ -5944,19 +6043,26 @@ mod tests {
             .to_string(),
             ..Default::default()
         });
-        let hosts =
-            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
         let initial = implementer_attempt_input(None);
         let iteration = implementer_attempt_input(Some("Fix the failing concurrent claim test."));
-        runtime
-            .run_with_question_renderers(
-                "plan",
-                json!({ "initial": initial, "iteration": iteration }).to_string(),
-                hosts,
-                stage_question_renderers(&stages),
+        for input in [&initial, &iteration] {
+            evaluate_standard_stage_with_resources_and_turn(
+                Arc::clone(&ctx),
+                "implementer_attempt",
+                serde_json::to_string(input).unwrap(),
+                crate::implementer::render_attempt_prompt(input),
+                StandardStageResources {
+                    resource_root: dir.clone(),
+                    shell: None,
+                    publish: None,
+                    clarifier: None,
+                    guidance: None,
+                },
+                Arc::clone(&turn) as Arc<dyn StageTurn>,
             )
             .await
             .unwrap();
+        }
 
         assert_eq!(
             *turn.nodes.lock().expect("recording runner mutex poisoned"),
@@ -6027,15 +6133,13 @@ mod tests {
             .checkpoints_for_run("run-standard-implementer")
             .await
             .unwrap();
-        assert_eq!(checkpoints.len(), 2);
-        let first: crate::implementer::ImplementerAttemptInput =
-            serde_json::from_str(checkpoints[0].input_json.as_deref().unwrap()).unwrap();
-        let second: crate::implementer::ImplementerAttemptInput =
-            serde_json::from_str(checkpoints[1].input_json.as_deref().unwrap()).unwrap();
-        assert!(first.diagnostic.is_none());
+        assert!(
+            checkpoints.is_empty(),
+            "internal evidence turns do not own workflow checkpoints"
+        );
         assert_eq!(
-            second.diagnostic.as_deref(),
-            Some("Fix the failing concurrent claim test.")
+            *turn.files.lock().expect("recording runner mutex poisoned"),
+            [Some(dir.clone()), Some(dir.clone())]
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -6201,7 +6305,7 @@ mod tests {
         let stages = standard_stages().await.unwrap();
         let hosts =
             build_hosts_with_turn(&ctx, &stages, Arc::new(RecordingStageTurn::default())).unwrap();
-        assert!(hosts.contains_key("implementer_attempt"));
+        assert!(!hosts.contains_key("implementer_attempt"));
         assert!(hosts.contains_key("implement"));
         assert!(hosts.contains_key("iterate"));
 
