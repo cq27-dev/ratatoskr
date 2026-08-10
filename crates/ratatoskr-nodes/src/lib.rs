@@ -55,7 +55,7 @@ use std::sync::Arc;
 use ratatoskr_core::{RatatoskrConfig, RunState, RunStatus, ToolPolicy};
 use ratatoskr_exec::WorktreePath;
 use ratatoskr_graph::NodeError;
-use ratatoskr_mcp::{RagRatClient, ServerTools, ToolSet};
+use ratatoskr_mcp::{ExaClient, RagRatClient, ServerTools, ToolSet};
 use ratatoskr_script::{ScriptEngine, WorkflowRuntime};
 use ratatoskr_store::{Store, StoreError};
 
@@ -121,6 +121,7 @@ pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError>
     let chosen = choose(&request).await?;
     let RunRequest {
         client,
+        exa,
         config,
         store,
         run_id,
@@ -136,15 +137,17 @@ pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError>
     let plugin_context =
         PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
             .await?;
-    let ctx = workflow::WorkflowContext::new(
+    let ctx = workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
         client,
+        exa,
         config,
         store,
         run_id,
         issue,
         engine,
         plugin_context,
-    )?;
+        ledger: Arc::new(RunLedger::default()),
+    })?;
     workflow::run_plan_scripted(runtime, ctx).await
 }
 
@@ -656,15 +659,17 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
     let input_json = serde_json::to_string(&input)?;
     let cwd = std::env::current_dir().unwrap_or_default();
     let plugin_context = PluginContext::resolve(request.config, request.engine, &cwd).await?;
-    let ctx = workflow::WorkflowContext::new(
-        request.client,
-        request.config,
-        request.store,
-        request.run_id,
-        request.issue,
-        request.engine,
+    let ctx = workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
+        client: request.client,
+        exa: request.exa,
+        config: request.config,
+        store: request.store,
+        run_id: request.run_id,
+        issue: request.issue,
+        engine: request.engine,
         plugin_context,
-    )?;
+        ledger: Arc::new(RunLedger::default()),
+    })?;
     let raw = workflow::evaluate_standard_stage(Arc::clone(&ctx), "overseer", input_json.clone())
         .await
         .map_err(|error| PlanError::node("overseer", NodeError::Failed(error)))?;
@@ -695,6 +700,8 @@ pub struct RunRequest<'a> {
     /// `None` when this repository runs without rag-rat: the nodes keep their file tools and the
     /// memory baseline is simply empty. See `RagRatConfig::configured`.
     pub client: Option<&'a RagRatClient>,
+    /// `None` when `[exa]` is absent; its tools are otherwise an optional second server offer.
+    pub exa: Option<&'a ExaClient>,
     pub config: &'a RatatoskrConfig,
     pub store: &'a Store,
     pub run_id: &'a str,
@@ -1028,6 +1035,7 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
     let chosen = choose(&request).await?;
     let RunRequest {
         client,
+        exa,
         config,
         store,
         run_id,
@@ -1045,15 +1053,17 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
     let plugin_context =
         PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
             .await?;
-    let ctx = workflow::WorkflowContext::new(
+    let ctx = workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
         client,
+        exa,
         config,
         store,
         run_id,
         issue,
         engine,
         plugin_context,
-    )?;
+        ledger: Arc::new(RunLedger::default()),
+    })?;
     workflow::run_full_scripted(runtime, ctx).await
 }
 
@@ -1114,6 +1124,7 @@ async fn publish_and_checkpoint(
     let declared_context =
         workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
             client,
+            exa: None,
             config,
             store,
             run_id,
@@ -1186,6 +1197,7 @@ async fn bookkeep_and_checkpoint(
         let declared_context =
             workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
                 client,
+                exa: None,
                 config,
                 store,
                 run_id,
@@ -1317,7 +1329,7 @@ pub(crate) fn build_characterizer(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     context: &PluginContext,
-    offer: Option<ServerTools>,
+    configured: Vec<ServerTools>,
     ledger: Option<Arc<RunLedger>>,
     declared_context: Option<Arc<workflow::WorkflowContext>>,
 ) -> Result<Option<testrun::Characterizer>, PlanError> {
@@ -1338,7 +1350,7 @@ pub(crate) fn build_characterizer(
     let cfg = stage_agent_config(
         engine,
         config,
-        context.pool_for("characterizer", offer),
+        context.pool_for("characterizer", &configured),
         "characterizer",
         &[],
         &mut plugins,
@@ -1358,14 +1370,24 @@ pub(crate) fn build_characterizer(
 /// the read tools each node gets. Built in one place because those two powers belong together and
 /// to exactly one node — a second construction site is how one of them comes to be granted
 /// somewhere it was not meant to be.
+#[cfg(test)]
 fn build_implementer_agent(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     context: &PluginContext,
     offer: Option<ServerTools>,
 ) -> Result<(NodeAgentConfig, NodePlugins), PlanError> {
+    build_implementer_agent_with_servers(engine, config, context, offer.into_iter().collect())
+}
+
+fn build_implementer_agent_with_servers(
+    engine: &Arc<ScriptEngine>,
+    config: &RatatoskrConfig,
+    context: &PluginContext,
+    configured: Vec<ServerTools>,
+) -> Result<(NodeAgentConfig, NodePlugins), PlanError> {
     let mut plugins = context.for_node("implementer");
-    let mut tools = context.pool_for("implementer", offer);
+    let mut tools = context.pool_for("implementer", &configured);
     tools
         .local()
         .tools

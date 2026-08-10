@@ -884,6 +884,8 @@ async fn run_hook(
     for key in inherited_host_vars(std::env::vars_os().map(|(k, _)| k)) {
         command.env_remove(&key);
     }
+    // Exa's credential belongs only to its MCP connection; hooks do not need web authority.
+    command.env_remove("EXA_API_KEY");
     let mut child = command
         // Plugins address their own files through these; the shell expands them from the
         // environment, so no path is ever spliced into the command text.

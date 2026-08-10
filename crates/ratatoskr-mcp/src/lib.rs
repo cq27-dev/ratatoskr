@@ -1,9 +1,9 @@
-//! Clients to the MCP servers a run talks to, each over a stdio subprocess.
+//! Clients to the MCP servers a run talks to, over stdio subprocesses or streamable HTTP.
 //!
-//! [`Connection::spawn`] launches a server, performs the MCP handshake, and lists its tools. It
-//! hands back the tool list plus a [`ServerSink`] (a cloneable client handle) — everything
+//! [`Connection::spawn`] and [`Connection::connect_http`] perform the MCP handshake and list tools.
+//! They hand back the tool list plus a [`ServerSink`] (a cloneable client handle) — everything
 //! `ratatoskr-agent` needs to bind those tools to a `rig` agent. The running service is held so the
-//! subprocess stays alive; drop or [`shutdown`](Connection::shutdown) tears it down.
+//! connection stays alive; drop or [`shutdown`](Connection::shutdown) tears it down.
 //!
 //! rag-rat is the server ratatoskr is built around and is connected from config
 //! ([`RagRatClient`]); a plugin's servers are connected alongside it. A node's tools can therefore
@@ -13,17 +13,21 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use ratatoskr_core::{Capability, RagRatConfig};
+use ratatoskr_core::{Capability, ExaConfig, RagRatConfig};
 use rmcp::ServiceExt;
 use rmcp::model::Tool;
 use rmcp::service::{RoleClient, RunningService, ServerSink};
-use rmcp::transport::TokioChildProcess;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 
 /// The origin name of the connection made from `[rag_rat]` in the config.
 ///
 /// Also what a plugin-declared server is checked against: the rag-rat plugin declares the same
 /// server ratatoskr already launches, and it must not be spawned twice.
 pub const RAG_RAT: &str = "rag-rat";
+
+/// The origin name of the hosted Exa MCP server.
+pub const EXA: &str = "exa";
 
 /// The origin of tools this host answers itself rather than dispatching.
 pub const LOCAL: &str = "builtin";
@@ -51,7 +55,7 @@ pub enum McpError {
     Shutdown { origin: String, detail: String },
 }
 
-/// A live connection to one MCP server. Holds the running service so the subprocess stays up.
+/// A live connection to one MCP server. Holds the running service so the session stays alive.
 pub struct Connection {
     origin: String,
     service: RunningService<RoleClient, ()>,
@@ -114,6 +118,46 @@ impl Connection {
         })
     }
 
+    /// Connect to a streamable-HTTP MCP server, complete its handshake, and list its tools.
+    ///
+    /// rmcp owns request-scoped and persistent SSE streams, including session/protocol negotiation
+    /// and recovery. HTTP transport errors deliberately cross this boundary without server response
+    /// text because a proxy may reflect the bearer credential in that text.
+    pub async fn connect_http(
+        origin: &str,
+        url: &str,
+        bearer_token: Option<String>,
+    ) -> Result<Self, McpError> {
+        let config = bearer_token.map_or_else(
+            || StreamableHttpClientTransportConfig::with_uri(url),
+            |token| StreamableHttpClientTransportConfig::with_uri(url).auth_header(token),
+        );
+        let transport = StreamableHttpClientTransport::from_config(config);
+        let service = ().serve(transport).await.map_err(|_| McpError::Handshake {
+            origin: origin.to_string(),
+            detail: "streamable HTTP transport failed".to_string(),
+        })?;
+        let tools = service
+            .peer()
+            .list_all_tools()
+            .await
+            .map_err(|_| McpError::ListTools {
+                origin: origin.to_string(),
+                detail: "streamable HTTP transport failed".to_string(),
+            })?;
+        tracing::info!(
+            server = origin,
+            tool_count = tools.len(),
+            tools = ?tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>(),
+            "connected to MCP server"
+        );
+        Ok(Connection {
+            origin: origin.to_string(),
+            service,
+            tools,
+        })
+    }
+
     pub fn origin(&self) -> &str {
         &self.origin
     }
@@ -135,19 +179,21 @@ impl Connection {
             sink: Some(self.sink()),
             tools: self.tools.clone(),
             prefix: None,
+            renames: BTreeMap::new(),
         }
     }
 
-    /// Cleanly cancel the connection and tear down the subprocess.
+    /// Cleanly cancel the connection.
     pub async fn shutdown(self) -> Result<(), McpError> {
         let origin = self.origin;
         self.service
             .cancel()
             .await
             .map(|_| ())
-            .map_err(|e| McpError::Shutdown {
+            // An rmcp HTTP error can retain reflected request credentials in its response text.
+            .map_err(|_| McpError::Shutdown {
                 origin,
-                detail: e.to_string(),
+                detail: "MCP service shutdown failed".to_string(),
             })
     }
 }
@@ -186,6 +232,43 @@ impl RagRatClient {
     }
 }
 
+/// The connection to Exa's hosted web MCP server.
+pub struct ExaClient(Connection);
+
+impl ExaClient {
+    /// Connect to Exa. An API key is optional; when supplied it is sent only as bearer auth.
+    pub async fn connect(config: &ExaConfig) -> Result<Self, McpError> {
+        let bearer_token = std::env::var("EXA_API_KEY")
+            .ok()
+            .filter(|key| !key.is_empty());
+        Connection::connect_http(EXA, &config.url, bearer_token)
+            .await
+            .map(ExaClient)
+    }
+
+    pub fn tools(&self) -> Vec<Tool> {
+        self.0.tools()
+    }
+
+    pub fn sink(&self) -> ServerSink {
+        self.0.sink()
+    }
+
+    /// Exa's web tools under the names stages, rulesets, and plugins expect.
+    pub fn offer(&self) -> ServerTools {
+        let mut offer = self.0.offer();
+        offer.renames = BTreeMap::from([
+            ("web_search_exa".to_string(), "WebSearch".to_string()),
+            ("web_fetch_exa".to_string(), "WebFetch".to_string()),
+        ]);
+        offer
+    }
+
+    pub async fn shutdown(self) -> Result<(), McpError> {
+        self.0.shutdown().await
+    }
+}
+
 /// One server's contribution to a node's tools: the tools, and the handle they are called on.
 #[derive(Clone)]
 pub struct ServerTools {
@@ -198,6 +281,9 @@ pub struct ServerTools {
     /// matches on a name. `None` for a server this host launched itself, whose tools keep the
     /// names they were always called by.
     pub prefix: Option<String>,
+    /// Per-tool wire-name to display-name rewrites. Unlike a prefix, these can follow a host's
+    /// existing vocabulary exactly while dispatch still uses the wire name.
+    pub renames: BTreeMap<String, String>,
 }
 
 /// How the plugin format names the tools of a server a plugin declared:
@@ -224,8 +310,16 @@ fn segment(raw: &str) -> String {
 }
 
 impl ServerTools {
+    /// Whether this server was declared by a plugin rather than host configuration.
+    pub fn is_plugin(&self) -> bool {
+        self.prefix.is_some()
+    }
+
     /// The name the model sees for `tool`.
     pub fn display_name(&self, tool: &Tool) -> String {
+        if let Some(name) = self.renames.get(tool.name.as_ref()) {
+            return name.clone();
+        }
         match &self.prefix {
             Some(prefix) => format!("{prefix}{}", tool.name),
             None => tool.name.to_string(),
@@ -305,11 +399,13 @@ impl ToolSet {
     pub fn add_local(&mut self, tool: Tool) {
         for group in &mut self.groups {
             let prefix = group.prefix.clone();
+            let renames = group.renames.clone();
             group.tools.retain(|t| {
-                let shown = match &prefix {
-                    Some(prefix) => format!("{prefix}{}", t.name),
-                    None => t.name.to_string(),
-                };
+                let shown = renames
+                    .get(t.name.as_ref())
+                    .cloned()
+                    .or_else(|| prefix.as_ref().map(|p| format!("{p}{}", t.name)))
+                    .unwrap_or_else(|| t.name.to_string());
                 let clash = shown == tool.name;
                 if clash {
                     tracing::warn!(
@@ -332,6 +428,7 @@ impl ToolSet {
                 sink: None,
                 tools: Vec::new(),
                 prefix: None,
+                renames: BTreeMap::new(),
             });
         }
         self.groups
@@ -356,7 +453,13 @@ impl ToolSet {
                     .display_names()
                     .into_iter()
                     .any(|offered| offered == name)
-                    .then(|| declared_capability(&group.origin, name))
+                    .then(|| {
+                        if group.is_plugin() {
+                            Capability::Publish
+                        } else {
+                            declared_capability(&group.origin, name)
+                        }
+                    })
             })
             .unwrap_or(Capability::Publish)
     }
@@ -433,6 +536,11 @@ fn declared_capability(origin: &str, name: &str) -> Capability {
             "memory_create" | "memory_update" | "memory_mark_obsolete" => Capability::Write,
             _ => Capability::Publish,
         },
+        EXA => match name {
+            // Egress is controlled by a stage's named tool list, not repository authority.
+            "WebSearch" | "WebFetch" => Capability::Read,
+            _ => Capability::Publish,
+        },
         // Plugin and user-provided MCP servers do not currently declare authority in their
         // manifests. Publish is the safe declaration until they do.
         _ => Capability::Publish,
@@ -497,6 +605,71 @@ mod tests {
             RagRatClient::connect(config).await,
             Err(McpError::Spawn { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn unreachable_http_server_is_a_handshake_error() {
+        assert!(matches!(
+            Connection::connect_http(EXA, "http://127.0.0.1:9/mcp", None).await,
+            Err(McpError::Handshake { origin, .. }) if origin == EXA
+        ));
+    }
+
+    fn tool(name: &str) -> Tool {
+        let mut tool = Tool::default();
+        tool.name = name.to_string().into();
+        tool
+    }
+
+    #[test]
+    fn renamed_tools_are_offered_and_narrowed_by_display_name() {
+        let server = ServerTools {
+            origin: EXA.to_string(),
+            sink: None,
+            tools: vec![
+                tool("web_fetch_exa"),
+                tool("web_search_exa"),
+                tool("other_exa_tool"),
+            ],
+            prefix: None,
+            renames: BTreeMap::from([
+                ("web_fetch_exa".to_string(), "WebFetch".to_string()),
+                ("web_search_exa".to_string(), "WebSearch".to_string()),
+            ]),
+        };
+        assert_eq!(
+            server.display_names(),
+            say(&["WebFetch", "WebSearch", "other_exa_tool"])
+        );
+        assert_eq!(
+            server
+                .offered()
+                .into_iter()
+                .map(|(shown, wire)| (shown.name.to_string(), wire))
+                .collect::<Vec<_>>(),
+            vec![
+                ("WebFetch".to_string(), "web_fetch_exa".to_string()),
+                ("WebSearch".to_string(), "web_search_exa".to_string()),
+                ("other_exa_tool".to_string(), "other_exa_tool".to_string()),
+            ]
+        );
+        let mut wire_name = ToolSet::from_servers(vec![server.clone()]);
+        wire_name.narrow(&say(&["web_fetch_exa"]), &[]);
+        assert!(wire_name.is_empty());
+
+        let mut set = ToolSet::from_servers(vec![server]);
+        assert_eq!(set.capability("WebFetch"), Capability::Read);
+        assert_eq!(set.capability("WebSearch"), Capability::Read);
+        assert_eq!(set.capability("other_exa_tool"), Capability::Publish);
+        set.narrow(&say(&["WebFetch"]), &[]);
+        assert_eq!(set.names(), say(&["WebFetch"]));
+    }
+
+    #[test]
+    fn absent_webfetch_name_is_a_no_op_when_narrowing() {
+        let mut set = ToolSet::default();
+        set.narrow(&say(&["WebFetch"]), &[]);
+        assert!(set.is_empty());
     }
 
     /// The names a keep-mask leaves, per group.

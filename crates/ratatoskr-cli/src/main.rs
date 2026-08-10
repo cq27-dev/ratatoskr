@@ -541,11 +541,13 @@ async fn plan(
     let store = ratatoskr_store::Store::open(&config.store.path)
         .with_context(|| format!("opening store at {}", config.store.path.display()))?;
     let client = connect_rag_rat(&config.rag_rat).await?;
+    let exa = connect_exa(config.exa.as_ref()).await;
 
     let engine = load_rules(&config).await?;
     let run_id = uuid::Uuid::new_v4().to_string();
     let result = ratatoskr_nodes::run_plan(ratatoskr_nodes::RunRequest {
         client: client.as_ref(),
+        exa: exa.as_ref(),
         config: &config,
         store: &store,
         run_id: &run_id,
@@ -556,7 +558,8 @@ async fn plan(
     .instrument(tracing::info_span!("run", run_id = %run_id))
     .await;
 
-    // Tear down rag-rat regardless of outcome.
+    // Tear down configured MCP clients regardless of outcome.
+    shutdown_exa(exa).await;
     shutdown_rag_rat(client).await;
 
     let outcome = result.context("plan run failed")?;
@@ -626,6 +629,7 @@ async fn run_cmd(
     let store = ratatoskr_store::Store::open(&config.store.path)
         .with_context(|| format!("opening store at {}", config.store.path.display()))?;
     let client = connect_rag_rat(&config.rag_rat).await?;
+    let exa = connect_exa(config.exa.as_ref()).await;
 
     let engine = load_rules(&config).await?;
     let run_id = match run_id {
@@ -639,6 +643,7 @@ async fn run_cmd(
     };
     let result = ratatoskr_nodes::run_full(ratatoskr_nodes::RunRequest {
         client: client.as_ref(),
+        exa: exa.as_ref(),
         config: &config,
         store: &store,
         run_id: &run_id,
@@ -649,6 +654,7 @@ async fn run_cmd(
     .instrument(tracing::info_span!("run", run_id = %run_id))
     .await;
 
+    shutdown_exa(exa).await;
     shutdown_rag_rat(client).await;
 
     // Make the run's history durable now that it has finished, so it survives the log files
@@ -1039,6 +1045,28 @@ async fn shutdown_rag_rat(client: Option<ratatoskr_mcp::RagRatClient>) {
         && let Err(e) = client.shutdown().await
     {
         tracing::warn!("failed to shut down rag-rat cleanly: {e}");
+    }
+}
+
+/// Connect to Exa only when the config explicitly opts into third-party web egress.
+async fn connect_exa(
+    config: Option<&ratatoskr_core::ExaConfig>,
+) -> Option<ratatoskr_mcp::ExaClient> {
+    let config = config.filter(|config| config.configured())?;
+    match ratatoskr_mcp::ExaClient::connect(config).await {
+        Ok(client) => Some(client),
+        Err(error) => {
+            tracing::warn!("Exa MCP server unavailable, web tools are not offered: {error}");
+            None
+        }
+    }
+}
+
+async fn shutdown_exa(client: Option<ratatoskr_mcp::ExaClient>) {
+    if let Some(client) = client
+        && let Err(error) = client.shutdown().await
+    {
+        tracing::warn!("failed to shut down Exa cleanly: {error}");
     }
 }
 

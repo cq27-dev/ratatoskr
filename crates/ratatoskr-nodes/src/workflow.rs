@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use ratatoskr_core::{RatatoskrConfig, RunState, RunStatus};
 use ratatoskr_exec::{WorktreePath, remove_worktree};
 use ratatoskr_graph::{Node, NodeError};
-use ratatoskr_mcp::{RagRatClient, ServerTools};
+use ratatoskr_mcp::{ExaClient, RagRatClient, ServerTools};
 use ratatoskr_script::{HostFn, ScriptEngine, WorkflowRuntime};
 use ratatoskr_store::Store;
 use rmcp::service::ServerSink;
@@ -96,8 +96,8 @@ pub struct WorkflowContext {
     /// `None` without rag-rat. The nodes that call it outside the agent — the memory baseline and
     /// the bookkeeper — check before reaching for it.
     sink: Option<ServerSink>,
-    /// rag-rat's whole offer, the base of every node's tool pool.
-    rag_rat: Option<ServerTools>,
+    /// rag-rat's whole offer, followed by other configured server offers, for every node's pool.
+    servers: Vec<ServerTools>,
     repo_path: PathBuf,
     /// Prepared by `redTeam` (or `implement` when no red team runs), then reused by implementation,
     /// iteration, and cleanup. The script never sees a raw path.
@@ -131,6 +131,7 @@ pub struct WorkflowContext {
 
 pub(crate) struct WorkflowContextParams<'a> {
     pub client: Option<&'a RagRatClient>,
+    pub exa: Option<&'a ExaClient>,
     pub config: &'a RatatoskrConfig,
     pub store: &'a Store,
     pub run_id: &'a str,
@@ -152,6 +153,7 @@ impl WorkflowContext {
     ) -> Result<Arc<Self>, PlanError> {
         Self::new_with_ledger(WorkflowContextParams {
             client,
+            exa: None,
             config,
             store,
             run_id,
@@ -167,6 +169,7 @@ impl WorkflowContext {
     ) -> Result<Arc<Self>, PlanError> {
         let WorkflowContextParams {
             client,
+            exa,
             config,
             store,
             run_id,
@@ -189,7 +192,11 @@ impl WorkflowContext {
             run_id: run_id.to_string(),
             issue: issue.to_string(),
             sink: client.map(|c| c.sink()),
-            rag_rat: client.map(|c| c.offer()),
+            servers: client
+                .map(|c| c.offer())
+                .into_iter()
+                .chain(exa.map(|c| c.offer()))
+                .collect(),
             repo_path,
             worktree: Mutex::new(None),
             red_team_started: AtomicBool::new(false),
@@ -464,7 +471,7 @@ fn build_red_team(
             let cfg = stage_agent_config(
                 &ctx.engine,
                 &ctx.config,
-                ctx.plugin_context.pool_for("redteam", ctx.rag_rat.clone()),
+                ctx.plugin_context.pool_for("redteam", &ctx.servers),
                 "redteam",
                 redteam::CLASSIFIER_TOOLS,
                 &mut plugins,
@@ -487,7 +494,7 @@ fn build_red_team(
     let author = match enabled {
         true => {
             let mut plugins = ctx.plugin_context.for_node("redteam");
-            let mut tools = ctx.plugin_context.pool_for("redteam", ctx.rag_rat.clone());
+            let mut tools = ctx.plugin_context.pool_for("redteam", &ctx.servers);
             tools
                 .local()
                 .tools
@@ -520,7 +527,7 @@ fn build_red_team(
             &ctx.engine,
             &ctx.config,
             &ctx.plugin_context,
-            ctx.rag_rat.clone(),
+            ctx.servers.clone(),
             Some(Arc::clone(&ctx.ledger)),
             Some(Arc::clone(ctx)),
         )?,
@@ -609,11 +616,11 @@ fn build_implementer(
     ctx: &Arc<WorkflowContext>,
     analyst: AnalystOutput,
 ) -> Result<ImplementerNode, PlanError> {
-    let (cfg, plugins) = crate::build_implementer_agent(
+    let (cfg, plugins) = crate::build_implementer_agent_with_servers(
         &ctx.engine,
         &ctx.config,
         &ctx.plugin_context,
-        ctx.rag_rat.clone(),
+        ctx.servers.clone(),
     )?;
     Ok(ImplementerNode {
         clarifier: Some(ctx.clarifier.as_dyn()),
@@ -622,7 +629,7 @@ fn build_implementer(
             &ctx.engine,
             &ctx.config,
             &ctx.plugin_context,
-            ctx.rag_rat.clone(),
+            ctx.servers.clone(),
             Some(Arc::clone(&ctx.ledger)),
             Some(Arc::clone(ctx)),
         )
@@ -1634,7 +1641,7 @@ impl StageExecutor {
         let mut offered = self
             .ctx
             .plugin_context
-            .pool_for(&governance_id, self.ctx.rag_rat.clone());
+            .pool_for(&governance_id, &self.ctx.servers);
         if ratatoskr_core::Capability::ceiling(&stage.capabilities)
             .is_some_and(|ceiling| ceiling.permits(ratatoskr_core::Capability::Write))
         {

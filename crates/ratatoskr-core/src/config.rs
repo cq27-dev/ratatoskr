@@ -13,6 +13,9 @@ use crate::Capability;
 pub struct RatatoskrConfig {
     #[serde(default)]
     pub rag_rat: RagRatConfig,
+    /// Optional hosted Exa MCP server. Its presence opts a run into third-party web egress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exa: Option<ExaConfig>,
     pub store: StoreConfig,
     pub worktree: WorktreeConfig,
     /// Per-node model routing, keyed by stage name (`"scout"`, `"analyst"`, ...).
@@ -613,6 +616,53 @@ impl RagRatConfig {
     }
 }
 
+/// How to connect to Exa's hosted MCP server.
+///
+/// The section is optional: no `[exa]` means no remote web tools. Its presence is the deliberate
+/// security decision to let a stage explicitly named `WebFetch` or `WebSearch` send arbitrary
+/// stage-constructed URLs and queries to Exa, including for write-capable stages; rulesets remain
+/// the per-stage gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExaConfig {
+    #[serde(
+        default = "default_exa_url",
+        deserialize_with = "default_exa_url_when_empty"
+    )]
+    pub url: String,
+}
+
+fn default_exa_url() -> String {
+    "https://mcp.exa.ai/mcp".to_string()
+}
+
+fn default_exa_url_when_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let url = String::deserialize(deserializer)?;
+    Ok(if url.is_empty() {
+        default_exa_url()
+    } else {
+        url
+    })
+}
+
+impl Default for ExaConfig {
+    fn default() -> Self {
+        Self {
+            url: default_exa_url(),
+        }
+    }
+}
+
+impl ExaConfig {
+    /// An Exa section is always on; omitting it is the only off state.
+    pub fn configured(&self) -> bool {
+        true
+    }
+}
+
 /// Ratatoskr's own checkpoint database — deliberately a separate file from rag-rat's index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreConfig {
@@ -787,6 +837,17 @@ impl RatatoskrConfig {
                 "implementer.max_turns must be >= 1".to_string(),
             ));
         }
+        if let Some(exa) = &self.exa
+            && !exa
+                .url
+                .strip_prefix("http://")
+                .or_else(|| exa.url.strip_prefix("https://"))
+                .is_some_and(|host| !host.is_empty() && !host.contains(char::is_whitespace))
+        {
+            return Err(ConfigError::Invalid(
+                "exa.url must be an http(s) URL".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -815,6 +876,7 @@ impl Default for RatatoskrConfig {
                     .to_vec(),
                 working_dir: None,
             },
+            exa: None,
             store: StoreConfig {
                 path: PathBuf::from(".ratatoskr/state.sqlite3"),
             },
@@ -1382,6 +1444,46 @@ mod tests {
         let with = format!("{toml}\n[rag_rat]\ncommand = [\"rag-rat\", \"mcp\"]\n");
         let cfg: RatatoskrConfig = toml::from_str(&with).expect("parses");
         assert!(cfg.rag_rat.configured());
+    }
+
+    #[test]
+    fn exa_is_off_when_omitted_and_on_when_its_section_is_present() {
+        let base = r#"
+            [store]
+            path = ".ratatoskr/state.sqlite3"
+            [worktree]
+            root = "../wt"
+            [sandbox]
+            backend = "landlock"
+            image = "checks"
+            test_command = ["cargo", "test"]
+        "#;
+        let absent: RatatoskrConfig = toml::from_str(base).unwrap();
+        assert!(absent.exa.is_none());
+
+        let present: RatatoskrConfig = toml::from_str(&format!("{base}\n[exa]\n")).unwrap();
+        assert!(present.exa.as_ref().is_some_and(|exa| exa.configured()));
+        assert_eq!(present.exa.unwrap().url, "https://mcp.exa.ai/mcp");
+
+        let empty: RatatoskrConfig =
+            toml::from_str(&format!("{base}\n[exa]\nurl = \"\"\n")).unwrap();
+        assert!(empty.exa.as_ref().is_some_and(|exa| exa.configured()));
+        assert_eq!(empty.exa.unwrap().url, "https://mcp.exa.ai/mcp");
+
+        let error = toml::from_str::<RatatoskrConfig>(&format!("{base}\n[exa]\ntyop = 1\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("tyop"), "{error}");
+
+        let malformed = RatatoskrConfig {
+            exa: Some(ExaConfig {
+                url: "not-a-url".to_string(),
+            }),
+            ..RatatoskrConfig::default()
+        };
+        assert!(
+            matches!(malformed.validate(), Err(ConfigError::Invalid(error)) if error.contains("exa.url"))
+        );
     }
 
     #[test]

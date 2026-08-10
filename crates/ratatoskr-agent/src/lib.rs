@@ -897,13 +897,17 @@ fn bind_tools<M: CompletionModel + 'static>(
     // is what lets the groups below be a plain loop over two different binding calls.
     let mut bound: AgentBuilder<M, WithBuilderTools> = builder.dynamic_tools(Vec::new());
     for group in tools.groups() {
-        bound = match (&group.sink, &group.prefix) {
+        let renamed = group
+            .tools
+            .iter()
+            .any(|tool| group.display_name(tool) != tool.name.as_ref());
+        bound = match (&group.sink, renamed) {
             // Named as the server names them: rig's own adapter, which sends the tool's name
             // straight back to the server as the call's method.
-            (Some(sink), None) => bound.rmcp_tools(group.tools.clone(), sink.clone()),
-            // Named as the plugin format names them, which is not what the server answers to.
-            // `DynamicTool` takes a runtime name and a closure, so the two are independent.
-            (Some(sink), Some(_)) => bound.dynamic_tools(
+            (Some(sink), false) => bound.rmcp_tools(group.tools.clone(), sink.clone()),
+            // Named differently from the server's wire name. `DynamicTool` takes a runtime name
+            // and a closure, so a prefix and a per-tool vocabulary rewrite both dispatch safely.
+            (Some(sink), true) => bound.dynamic_tools(
                 group
                     .offered()
                     .into_iter()

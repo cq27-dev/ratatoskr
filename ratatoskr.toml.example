@@ -8,6 +8,13 @@
 command = ["npx", "-y", "@rag-rat/bin", "mcp", "--json"]
 # working_dir = "/path/to/target/repo"
 
+# Optional hosted MCP web tools. Adding this section permits stages whose ruleset explicitly names
+# WebSearch or WebFetch to send their queries and stage-constructed URLs to Exa. This includes
+# write-capable stages; use ruleset allow/deny and onToolCall policy to limit that authority.
+# EXA_API_KEY is optional and read only from the environment.
+# [exa]
+# url = "https://mcp.exa.ai/mcp"
+
 [store]
 # Ratatoskr's own checkpoint database — a separate file from rag-rat's index.
 path = ".ratatoskr/state.sqlite3"

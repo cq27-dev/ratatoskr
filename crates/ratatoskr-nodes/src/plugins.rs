@@ -238,7 +238,14 @@ impl PluginContext {
             contexts,
             discovered,
             engine: Some(Arc::clone(engine)),
-            servers: Arc::new(connect_plugin_servers(&plugins, cwd).await),
+            servers: Arc::new(
+                connect_plugin_servers(
+                    &plugins,
+                    cwd,
+                    config.exa.as_ref().is_some_and(|exa| exa.configured()),
+                )
+                .await,
+            ),
             plugins: Arc::new(plugins),
             hook_time: Arc::default(),
             limits: config.plugins.hooks.clone(),
@@ -335,18 +342,13 @@ impl PluginContext {
         }
     }
 
-    /// Every tool `node` may call: rag-rat's catalogue, then the servers its plugins declare.
+    /// Every tool `node` may call: configured servers in precedence order, then bound plugins.
     ///
-    /// rag-rat comes first so it wins any name collision — see [`ToolSet::from_servers`].
-    /// The tools one node may call: rag-rat's, when there is a rag-rat, plus the plugin servers
-    /// bound to that node.
-    ///
-    /// `None` omits the group rather than passing an empty one, so a pool without rag-rat is the
-    /// same shape as a pool that never had it — nothing downstream has to special-case a server
-    /// that offers nothing.
-    pub(crate) fn pool_for(&self, node: &str, rag_rat: Option<ServerTools>) -> ToolSet {
+    /// rag-rat is supplied first by the caller so it wins any name collision — see
+    /// [`ToolSet::from_servers`]. `None` is omitted rather than represented by an empty group.
+    pub(crate) fn pool_for(&self, node: &str, configured: &[ServerTools]) -> ToolSet {
         let bound = self.bound(node);
-        let mut servers: Vec<ServerTools> = rag_rat.into_iter().collect();
+        let mut servers = configured.to_vec();
         servers.extend(
             self.servers
                 .iter()
@@ -364,9 +366,10 @@ impl PluginContext {
 async fn connect_plugin_servers(
     plugins: &[ratatoskr_plugin::Plugin],
     cwd: &std::path::Path,
+    configured_exa: bool,
 ) -> Vec<PluginServer> {
     let mut connected = Vec::new();
-    for (plugin, spec) in servers_to_start(plugins) {
+    for (plugin, spec) in servers_to_start_with_configured_exa(plugins, configured_exa) {
         match Connection::spawn(&spec.name, &spec.command, &spec.env, Some(cwd)).await {
             Ok(connection) => connected.push(PluginServer {
                 plugin: plugin.to_string(),
@@ -384,13 +387,24 @@ async fn connect_plugin_servers(
 
 /// Which declared servers actually get started, paired with the plugin that declared each.
 ///
-/// One per server name, and rag-rat's name counts as already taken: the rag-rat plugin declares
-/// the very server ratatoskr launched from `[rag_rat]`, and a second copy would pay for another
-/// index load to offer the identical tools.
+/// One per server name, and configured server names count as already taken: the rag-rat plugin
+/// declares the very server ratatoskr launched from `[rag_rat]`, and a second copy would pay for
+/// another index load to offer the identical tools.
+#[cfg(test)]
 pub(crate) fn servers_to_start(
     plugins: &[ratatoskr_plugin::Plugin],
 ) -> Vec<(&str, &ratatoskr_plugin::McpServerSpec)> {
+    servers_to_start_with_configured_exa(plugins, false)
+}
+
+fn servers_to_start_with_configured_exa(
+    plugins: &[ratatoskr_plugin::Plugin],
+    configured_exa: bool,
+) -> Vec<(&str, &ratatoskr_plugin::McpServerSpec)> {
     let mut claimed: Vec<&str> = vec![ratatoskr_mcp::RAG_RAT];
+    if configured_exa {
+        claimed.push(ratatoskr_mcp::EXA);
+    }
     let mut start = Vec::new();
     for plugin in plugins {
         for spec in &plugin.mcp_servers {
@@ -504,8 +518,15 @@ fn node_agent_config(
 
     // A ruleset's `allow` is exhaustive. The default is not just the node's built-in list: those
     // name rag-rat tools, written before any plugin was in the picture, so a plugin the node binds
-    // would otherwise contribute a server whose every tool is filtered straight back out.
-    let from_plugins = tools.names_beyond(ratatoskr_mcp::RAG_RAT);
+    // would otherwise contribute a server whose every tool is filtered straight back out. Include
+    // host-local tools generated for a stage, but only plugin-declared remote servers: configured
+    // servers (including Exa) require an explicit ruleset allow.
+    let from_plugins: Vec<String> = tools
+        .groups()
+        .iter()
+        .filter(|group| group.origin == ratatoskr_mcp::LOCAL || group.is_plugin())
+        .flat_map(ServerTools::display_names)
+        .collect();
     let spelled_out = rc
         .and_then(|c| c.tools.as_ref())
         .and_then(|t| t.allow.as_deref());
@@ -758,6 +779,119 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn exa_tools_require_an_explicit_ruleset_allow() {
+        let mut web_fetch = rmcp::model::Tool::default();
+        web_fetch.name = "web_fetch_exa".to_string().into();
+        let tools = ToolSet::from_servers(vec![ServerTools {
+            origin: ratatoskr_mcp::EXA.to_string(),
+            sink: None,
+            tools: vec![web_fetch],
+            prefix: None,
+            renames: std::collections::BTreeMap::from([(
+                "web_fetch_exa".to_string(),
+                "WebFetch".to_string(),
+            )]),
+        }]);
+        let config = RatatoskrConfig::default();
+
+        let default_engine = binding_engine("exa-default-denied", "").await;
+        let default = stage_agent_config(
+            &default_engine,
+            &config,
+            tools.clone(),
+            "analyst",
+            &[],
+            &mut NodePlugins::default(),
+        )
+        .unwrap();
+        assert!(default.tools.is_empty());
+
+        let explicit_engine = binding_engine(
+            "exa-explicit-allow",
+            r#"defineAgent("analyst", { tools: { allow: ["WebFetch"] } });"#,
+        )
+        .await;
+        let explicit = stage_agent_config(
+            &explicit_engine,
+            &config,
+            tools,
+            "analyst",
+            &[],
+            &mut NodePlugins::default(),
+        )
+        .unwrap();
+        assert_eq!(explicit.tools.names(), vec!["WebFetch"]);
+    }
+
+    #[tokio::test]
+    async fn plugin_server_named_exa_keeps_its_implicit_grant() {
+        let mut tool = rmcp::model::Tool::default();
+        tool.name = "search".to_string().into();
+        let tools = ToolSet::from_servers(vec![ServerTools {
+            origin: ratatoskr_mcp::EXA.to_string(),
+            sink: None,
+            tools: vec![tool],
+            prefix: Some(ratatoskr_mcp::qualified_prefix(
+                "web-plugin",
+                ratatoskr_mcp::EXA,
+            )),
+            renames: std::collections::BTreeMap::new(),
+        }]);
+        let engine = binding_engine("plugin-named-exa", "").await;
+        let config = RatatoskrConfig::default();
+        let capabilities = [Capability::Publish];
+
+        let configured = node_agent_config(
+            &engine,
+            &config,
+            tools,
+            "analyst",
+            &[],
+            &NodePlugins::default(),
+            AgentSettings {
+                capabilities: &capabilities,
+                profile: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            configured.tools.names(),
+            vec!["mcp__plugin_web-plugin_exa__search"]
+        );
+    }
+
+    #[test]
+    fn configured_exa_server_name_is_not_started_from_a_plugin() {
+        let plugins = [ratatoskr_plugin::Plugin {
+            name: "web-plugin".to_string(),
+            root: PathBuf::new(),
+            hooks: Vec::new(),
+            skills: Vec::new(),
+            mcp_servers: vec![
+                ratatoskr_plugin::McpServerSpec {
+                    name: ratatoskr_mcp::EXA.to_string(),
+                    command: vec!["false".to_string()],
+                    env: Default::default(),
+                },
+                ratatoskr_plugin::McpServerSpec {
+                    name: "other".to_string(),
+                    command: vec!["true".to_string()],
+                    env: Default::default(),
+                },
+            ],
+        }];
+
+        assert_eq!(
+            servers_to_start_with_configured_exa(&plugins, true)
+                .into_iter()
+                .map(|(plugin, spec)| (plugin, spec.name.as_str()))
+                .collect::<Vec<_>>(),
+            [("web-plugin", "other")]
+        );
     }
 
     #[tokio::test]
