@@ -208,10 +208,14 @@ always_fork = false
 
 # Phase 3: red-team and implementer run the repo's tests in a sandbox.
 [sandbox]
-backend = "landlock"                        # "landlock" (bwrap+Landlock, default) or "microsandbox"
-                                            # ("microsandbox" needs KVM AND a build with
-                                            #  `--features microsandbox`)
-image = "docker.io/library/rust:1-slim"     # OCI image the sandbox boots (microsandbox only)
+backend = "landlock"                        # "landlock" (bwrap+Landlock, default), "container",
+                                            # or "microsandbox" (needs KVM AND a build with
+                                            # `--features microsandbox`)
+image = "docker.io/library/rust:1-slim"     # OCI image the container or microsandbox boots
+# Resource limits for each acceptance step and implementer Bash call. Container and microsandbox
+# enforce both; landlock logs once that bwrap cannot enforce them.
+cpus = 2
+memory_mib = 2048
 # The DEFAULT acceptance: one step, used when the analyst proposes none. The analyst decides what
 # "done" means per task and may replace this with an ordered pipeline — "build the wasm, then drive
 # it in a browser" is two steps, not one.

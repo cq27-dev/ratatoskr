@@ -119,8 +119,8 @@ pub async fn run_acceptance(a: Acceptance<'_>) -> Result<Vec<StepOutcome>, Strin
             workdir: GUEST_WORKSPACE.to_string(),
             mounts: mounts_for(cfg, repo_root, worktree),
             command: step.command.clone(),
-            cpus: 2,
-            memory_mib: 2048,
+            cpus: cfg.cpus,
+            memory_mib: cfg.memory_mib,
             // Offline unless this step's program was named in `[sandbox] network_allow`. A test
             // that reaches the network fails for reasons the repository does not control; an
             // install step has to, and a repository whose deps are not vendored cannot check

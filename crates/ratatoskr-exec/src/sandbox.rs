@@ -19,7 +19,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use tokio::process::Command;
@@ -123,6 +123,7 @@ pub async fn run(spec: SandboxSpec) -> Result<ExecOutput, SandboxError> {
 /// The container runtimes this knows how to drive, in preference order. Both take the subset of
 /// arguments used here identically, so the choice is availability rather than configuration.
 const RUNTIMES: &[&str] = &["docker", "podman"];
+static BWRAP_LIMITS_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// The first runtime on `PATH`, or nothing.
 fn container_runtime() -> Option<&'static str> {
@@ -216,10 +217,27 @@ async fn run_container(spec: SandboxSpec) -> Result<ExecOutput, SandboxError> {
         .output()
         .await
         .map_err(|source| SandboxError::Container { runtime, source })?;
+    let exit_code = output.status.code().unwrap_or(-1);
+    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if let Some(hint) = oom_hint(exit_code, spec.memory_mib) {
+        if !stderr.is_empty() {
+            stderr.push('\n');
+        }
+        stderr.push_str(&hint);
+    }
     Ok(ExecOutput {
-        exit_code: output.status.code().unwrap_or(-1),
+        exit_code,
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stderr,
+    })
+}
+
+/// Explain the exit code OCI runtimes report for a likely memory-limit kill.
+fn oom_hint(exit_code: i32, memory_mib: u64) -> Option<String> {
+    (exit_code == 137).then(|| {
+        format!(
+            "process was likely killed because it exceeded the configured {memory_mib} MiB memory limit"
+        )
     })
 }
 
@@ -505,6 +523,13 @@ fn bwrap_argv(spec: &SandboxSpec) -> Vec<String> {
 /// bwrap/Landlock backend: the host root read-only, mounts bind-mounted writable, network
 /// optionally unshared. No image needed — runs the host's toolchain against the mounted worktree.
 async fn run_bwrap(spec: SandboxSpec) -> Result<ExecOutput, SandboxError> {
+    if !BWRAP_LIMITS_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            cpus = spec.cpus,
+            memory_mib = spec.memory_mib,
+            "sandbox cpus and memory_mib limits are not enforced by the landlock backend"
+        );
+    }
     let args = bwrap_argv(&spec);
 
     // Killed if this future is dropped — which is what a caller's timeout does. Without it a
@@ -597,6 +622,27 @@ mod tests {
                 PASSED_THROUGH.contains(&name.as_str()),
                 "{name} is set but not on the passlist"
             );
+        }
+    }
+
+    #[test]
+    fn bwrap_argv_has_no_limit_flags() {
+        let argv = bwrap_argv(&SandboxSpec {
+            cpus: 4,
+            memory_mib: 8192,
+            ..spec(&["true"])
+        });
+        assert!(!argv.iter().any(|arg| arg == "--cpus"), "{argv:?}");
+        assert!(!argv.iter().any(|arg| arg == "--memory"), "{argv:?}");
+    }
+
+    #[test]
+    fn oom_hint_only_marks_sigkill_as_a_likely_memory_limit() {
+        let hint = oom_hint(137, 2048).expect("SIGKILL gets an OOM hint");
+        assert!(hint.contains("likely"), "{hint}");
+        assert!(hint.contains("2048 MiB memory limit"), "{hint}");
+        for exit_code in [0, 1, 139] {
+            assert_eq!(oom_hint(exit_code, 2048), None, "exit {exit_code}");
         }
     }
 
@@ -757,7 +803,19 @@ mod tests {
         // else. There is no equivalent of `--ro-bind / /` here, so `$HOME` is not in scope — and a
         // test that asserted its absence would be asserting the absence of a string, so what is
         // checked is that every host path named is one the caller asked for.
-        let argv = container_argv(&container_spec(&["true"]), Some("1000:1000"));
+        let argv = container_argv(
+            &SandboxSpec {
+                cpus: 4,
+                memory_mib: 8192,
+                ..container_spec(&["true"])
+            },
+            Some("1000:1000"),
+        );
+        assert!(argv.windows(2).any(|w| w == ["--cpus", "4"]), "{argv:?}");
+        assert!(
+            argv.windows(2).any(|w| w == ["--memory", "8192m"]),
+            "{argv:?}"
+        );
         let tmp = std::env::temp_dir().display().to_string();
         let volumes: Vec<&String> = argv
             .iter()
