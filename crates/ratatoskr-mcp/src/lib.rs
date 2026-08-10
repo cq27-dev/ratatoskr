@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use ratatoskr_core::{Capability, ExaConfig, RagRatConfig};
+use ratatoskr_core::{Capability, McpServerConfig, McpTransport, RagRatConfig};
 use rmcp::ServiceExt;
 use rmcp::model::Tool;
 use rmcp::service::{RoleClient, RunningService, ServerSink};
@@ -25,9 +25,6 @@ use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 /// Also what a plugin-declared server is checked against: the rag-rat plugin declares the same
 /// server ratatoskr already launches, and it must not be spawned twice.
 pub const RAG_RAT: &str = "rag-rat";
-
-/// The origin name of the hosted Exa MCP server.
-pub const EXA: &str = "exa";
 
 /// The origin of tools this host answers itself rather than dispatching.
 pub const LOCAL: &str = "builtin";
@@ -180,6 +177,8 @@ impl Connection {
             tools: self.tools.clone(),
             prefix: None,
             renames: BTreeMap::new(),
+            capabilities: BTreeMap::new(),
+            provenance: ServerProvenance::Configured,
         }
     }
 
@@ -232,41 +231,70 @@ impl RagRatClient {
     }
 }
 
-/// The connection to Exa's hosted web MCP server.
-pub struct ExaClient(Connection);
+/// A connection declared in `[mcp.servers]`, with host-owned naming and authority metadata.
+pub struct ConfiguredMcpClient {
+    connection: Connection,
+    renames: BTreeMap<String, String>,
+    capabilities: BTreeMap<String, Capability>,
+}
 
-impl ExaClient {
-    /// Connect to Exa. An API key is optional; when supplied it is sent only as bearer auth.
-    pub async fn connect(config: &ExaConfig) -> Result<Self, McpError> {
-        let bearer_token = std::env::var("EXA_API_KEY")
-            .ok()
-            .filter(|key| !key.is_empty());
-        Connection::connect_http(EXA, &config.url, bearer_token)
-            .await
-            .map(ExaClient)
+impl ConfiguredMcpClient {
+    pub async fn connect(origin: &str, config: &McpServerConfig) -> Result<Self, McpError> {
+        let bearer_token = config
+            .bearer_token_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|token| !token.is_empty());
+        let connection = match config.transport {
+            McpTransport::StreamableHttp => {
+                Connection::connect_http(origin, &config.url, bearer_token).await?
+            }
+        };
+        let renames = config
+            .tools
+            .iter()
+            .filter_map(|(wire, tool)| tool.name.clone().map(|name| (wire.clone(), name)))
+            .collect();
+        let capabilities = config
+            .tools
+            .iter()
+            .map(|(wire, tool)| {
+                (
+                    tool.name.clone().unwrap_or_else(|| wire.clone()),
+                    tool.capability,
+                )
+            })
+            .collect();
+        Ok(Self {
+            connection,
+            renames,
+            capabilities,
+        })
     }
 
-    pub fn tools(&self) -> Vec<Tool> {
-        self.0.tools()
-    }
-
-    pub fn sink(&self) -> ServerSink {
-        self.0.sink()
-    }
-
-    /// Exa's web tools under the names stages, rulesets, and plugins expect.
     pub fn offer(&self) -> ServerTools {
-        let mut offer = self.0.offer();
-        offer.renames = BTreeMap::from([
-            ("web_search_exa".to_string(), "WebSearch".to_string()),
-            ("web_fetch_exa".to_string(), "WebFetch".to_string()),
-        ]);
-        offer
+        ServerTools {
+            renames: self.renames.clone(),
+            capabilities: self.capabilities.clone(),
+            ..self.connection.offer()
+        }
+    }
+
+    pub fn origin(&self) -> &str {
+        self.connection.origin()
     }
 
     pub async fn shutdown(self) -> Result<(), McpError> {
-        self.0.shutdown().await
+        self.connection.shutdown().await
     }
+}
+
+/// Where a tool offer came from. Authority defaults depend on provenance, never origin spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerProvenance {
+    Configured,
+    Plugin,
+    Builtin,
 }
 
 /// One server's contribution to a node's tools: the tools, and the handle they are called on.
@@ -284,6 +312,9 @@ pub struct ServerTools {
     /// Per-tool wire-name to display-name rewrites. Unlike a prefix, these can follow a host's
     /// existing vocabulary exactly while dispatch still uses the wire name.
     pub renames: BTreeMap<String, String>,
+    /// Minimum authority keyed by the display name seen by stages and rulesets.
+    pub capabilities: BTreeMap<String, Capability>,
+    pub provenance: ServerProvenance,
 }
 
 /// How the plugin format names the tools of a server a plugin declared:
@@ -312,7 +343,7 @@ fn segment(raw: &str) -> String {
 impl ServerTools {
     /// Whether this server was declared by a plugin rather than host configuration.
     pub fn is_plugin(&self) -> bool {
-        self.prefix.is_some()
+        self.provenance == ServerProvenance::Plugin
     }
 
     /// The name the model sees for `tool`.
@@ -429,6 +460,8 @@ impl ToolSet {
                 tools: Vec::new(),
                 prefix: None,
                 renames: BTreeMap::new(),
+                capabilities: BTreeMap::new(),
+                provenance: ServerProvenance::Builtin,
             });
         }
         self.groups
@@ -454,11 +487,17 @@ impl ToolSet {
                     .into_iter()
                     .any(|offered| offered == name)
                     .then(|| {
-                        if group.is_plugin() {
-                            Capability::Publish
-                        } else {
-                            declared_capability(&group.origin, name)
-                        }
+                        group.capabilities.get(name).copied().unwrap_or_else(|| {
+                            match group.provenance {
+                                ServerProvenance::Builtin => declared_capability(LOCAL, name),
+                                ServerProvenance::Configured if group.origin == RAG_RAT => {
+                                    declared_capability(RAG_RAT, name)
+                                }
+                                ServerProvenance::Configured | ServerProvenance::Plugin => {
+                                    Capability::Publish
+                                }
+                            }
+                        })
                     })
             })
             .unwrap_or(Capability::Publish)
@@ -536,11 +575,6 @@ fn declared_capability(origin: &str, name: &str) -> Capability {
             "memory_create" | "memory_update" | "memory_mark_obsolete" => Capability::Write,
             _ => Capability::Publish,
         },
-        EXA => match name {
-            // Egress is controlled by a stage's named tool list, not repository authority.
-            "WebSearch" | "WebFetch" => Capability::Read,
-            _ => Capability::Publish,
-        },
         // Plugin and user-provided MCP servers do not currently declare authority in their
         // manifests. Publish is the safe declaration until they do.
         _ => Capability::Publish,
@@ -610,8 +644,8 @@ mod tests {
     #[tokio::test]
     async fn unreachable_http_server_is_a_handshake_error() {
         assert!(matches!(
-            Connection::connect_http(EXA, "http://127.0.0.1:9/mcp", None).await,
-            Err(McpError::Handshake { origin, .. }) if origin == EXA
+            Connection::connect_http("remote", "http://127.0.0.1:9/mcp", None).await,
+            Err(McpError::Handshake { origin, .. }) if origin == "remote"
         ));
     }
 
@@ -624,7 +658,7 @@ mod tests {
     #[test]
     fn renamed_tools_are_offered_and_narrowed_by_display_name() {
         let server = ServerTools {
-            origin: EXA.to_string(),
+            origin: "remote".to_string(),
             sink: None,
             tools: vec![
                 tool("web_fetch_exa"),
@@ -636,6 +670,11 @@ mod tests {
                 ("web_fetch_exa".to_string(), "WebFetch".to_string()),
                 ("web_search_exa".to_string(), "WebSearch".to_string()),
             ]),
+            capabilities: BTreeMap::from([
+                ("WebFetch".to_string(), Capability::Read),
+                ("WebSearch".to_string(), Capability::Read),
+            ]),
+            provenance: ServerProvenance::Configured,
         };
         assert_eq!(
             server.display_names(),
@@ -670,6 +709,22 @@ mod tests {
         let mut set = ToolSet::default();
         set.narrow(&say(&["WebFetch"]), &[]);
         assert!(set.is_empty());
+    }
+
+    #[test]
+    fn origin_spelling_cannot_grant_authority_to_an_external_server() {
+        for provenance in [ServerProvenance::Configured, ServerProvenance::Plugin] {
+            let set = ToolSet::from_servers(vec![ServerTools {
+                origin: LOCAL.to_string(),
+                sink: None,
+                tools: vec![tool("Read")],
+                prefix: None,
+                renames: BTreeMap::new(),
+                capabilities: BTreeMap::new(),
+                provenance,
+            }]);
+            assert_eq!(set.capability("Read"), Capability::Publish);
+        }
     }
 
     /// The names a keep-mask leaves, per group.

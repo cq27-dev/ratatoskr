@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use ratatoskr_core::{Capability, RatatoskrConfig, ToolDecision, ToolPolicy};
 use ratatoskr_graph::NodeError;
-use ratatoskr_mcp::{Connection, ServerTools, ToolSet};
+use ratatoskr_mcp::{Connection, ServerProvenance, ServerTools, ToolSet};
 use ratatoskr_script::ScriptEngine;
 
 use crate::stage::stage_profile;
@@ -41,6 +41,8 @@ pub struct PluginContext {
     limits: ratatoskr_core::HookLimits,
     /// Skills this repository does not want offered, by name.
     skills_deny: Vec<String>,
+    /// Host-owned transport credentials withheld from third-party hook subprocesses.
+    protected_env: Arc<Vec<String>>,
 }
 
 /// Shared node execution context: plugin contributions plus reusable profile guidance.
@@ -70,17 +72,19 @@ struct NodeObserver {
     cwd: PathBuf,
     hook_time: Arc<std::sync::atomic::AtomicU64>,
     limits: ratatoskr_core::HookLimits,
+    protected_env: Arc<Vec<String>>,
 }
 
 impl NodeObserver {
     /// Run one event past this node's plugins.
     fn run<'a>(&'a self, event: ratatoskr_plugin::HookEvent<'a>) -> ratatoskr_agent::Answer<'a> {
-        Box::pin(ratatoskr_plugin::run_event(
+        Box::pin(ratatoskr_plugin::run_event_with_env(
             &self.plugins,
             event,
             &self.cwd,
             &self.limits,
             &self.hook_time,
+            &self.protected_env,
         ))
     }
 }
@@ -163,6 +167,7 @@ impl PluginServer {
                 &self.plugin,
                 self.connection.origin(),
             )),
+            provenance: ServerProvenance::Plugin,
             ..self.connection.offer()
         }
     }
@@ -230,7 +235,14 @@ impl PluginContext {
         }
 
         let discovered: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
-        let contexts = ratatoskr_plugin::session_start(&plugins, cwd, &config.plugins.hooks).await;
+        let protected_env = Arc::new(config.mcp.credential_envs());
+        let contexts = ratatoskr_plugin::session_start_with_env(
+            &plugins,
+            cwd,
+            &config.plugins.hooks,
+            &protected_env,
+        )
+        .await;
         for (name, text) in &contexts {
             tracing::info!(plugin = name, chars = text.len(), "plugin session context");
         }
@@ -242,7 +254,7 @@ impl PluginContext {
                 connect_plugin_servers(
                     &plugins,
                     cwd,
-                    config.exa.as_ref().is_some_and(|exa| exa.configured()),
+                    config.mcp.servers.keys().map(String::as_str),
                 )
                 .await,
             ),
@@ -250,6 +262,7 @@ impl PluginContext {
             hook_time: Arc::default(),
             limits: config.plugins.hooks.clone(),
             skills_deny: config.plugins.skills_deny.clone(),
+            protected_env,
         })
     }
 
@@ -260,12 +273,13 @@ impl PluginContext {
     /// left to inject into — so this runs for what a hook *does*.
     pub async fn session_end(&self, reason: &str) {
         let cwd = std::env::current_dir().unwrap_or_default();
-        if let Some(unused) = ratatoskr_plugin::run_event(
+        if let Some(unused) = ratatoskr_plugin::run_event_with_env(
             &self.plugins,
             ratatoskr_plugin::HookEvent::session_end(reason),
             &cwd,
             &self.limits,
             &self.hook_time,
+            &self.protected_env,
         )
         .await
         {
@@ -321,6 +335,7 @@ impl PluginContext {
                     cwd: std::env::current_dir().unwrap_or_default(),
                     hook_time: Arc::clone(&self.hook_time),
                     limits: self.limits.clone(),
+                    protected_env: Arc::clone(&self.protected_env),
                 }) as Arc<dyn ratatoskr_agent::PluginHooks>
             }),
         }
@@ -366,10 +381,10 @@ impl PluginContext {
 async fn connect_plugin_servers(
     plugins: &[ratatoskr_plugin::Plugin],
     cwd: &std::path::Path,
-    configured_exa: bool,
+    configured: impl IntoIterator<Item = &str>,
 ) -> Vec<PluginServer> {
     let mut connected = Vec::new();
-    for (plugin, spec) in servers_to_start_with_configured_exa(plugins, configured_exa) {
+    for (plugin, spec) in servers_to_start_with_configured(plugins, configured) {
         match Connection::spawn(&spec.name, &spec.command, &spec.env, Some(cwd)).await {
             Ok(connection) => connected.push(PluginServer {
                 plugin: plugin.to_string(),
@@ -394,21 +409,21 @@ async fn connect_plugin_servers(
 pub(crate) fn servers_to_start(
     plugins: &[ratatoskr_plugin::Plugin],
 ) -> Vec<(&str, &ratatoskr_plugin::McpServerSpec)> {
-    servers_to_start_with_configured_exa(plugins, false)
+    servers_to_start_with_configured(plugins, std::iter::empty())
 }
 
-fn servers_to_start_with_configured_exa(
-    plugins: &[ratatoskr_plugin::Plugin],
-    configured_exa: bool,
-) -> Vec<(&str, &ratatoskr_plugin::McpServerSpec)> {
-    let mut claimed: Vec<&str> = vec![ratatoskr_mcp::RAG_RAT];
-    if configured_exa {
-        claimed.push(ratatoskr_mcp::EXA);
-    }
+fn servers_to_start_with_configured<'p, 'c>(
+    plugins: &'p [ratatoskr_plugin::Plugin],
+    configured: impl IntoIterator<Item = &'c str>,
+) -> Vec<(&'p str, &'p ratatoskr_plugin::McpServerSpec)> {
+    let mut claimed: std::collections::BTreeSet<String> = [ratatoskr_mcp::RAG_RAT.to_string()]
+        .into_iter()
+        .chain(configured.into_iter().map(str::to_string))
+        .collect();
     let mut start = Vec::new();
     for plugin in plugins {
         for spec in &plugin.mcp_servers {
-            if claimed.contains(&spec.name.as_str()) {
+            if claimed.contains(&spec.name) {
                 tracing::info!(
                     plugin = plugin.name,
                     server = spec.name,
@@ -416,7 +431,7 @@ fn servers_to_start_with_configured_exa(
                 );
                 continue;
             }
-            claimed.push(&spec.name);
+            claimed.insert(spec.name.clone());
             start.push((plugin.name.as_str(), spec));
         }
     }
@@ -782,11 +797,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exa_tools_require_an_explicit_ruleset_allow() {
+    async fn configured_tools_require_an_explicit_ruleset_allow() {
         let mut web_fetch = rmcp::model::Tool::default();
         web_fetch.name = "web_fetch_exa".to_string().into();
         let tools = ToolSet::from_servers(vec![ServerTools {
-            origin: ratatoskr_mcp::EXA.to_string(),
+            origin: "web".to_string(),
             sink: None,
             tools: vec![web_fetch],
             prefix: None,
@@ -794,6 +809,11 @@ mod tests {
                 "web_fetch_exa".to_string(),
                 "WebFetch".to_string(),
             )]),
+            capabilities: std::collections::BTreeMap::from([(
+                "WebFetch".to_string(),
+                Capability::Read,
+            )]),
+            provenance: ServerProvenance::Configured,
         }]);
         let config = RatatoskrConfig::default();
 
@@ -827,18 +847,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugin_server_named_exa_keeps_its_implicit_grant() {
+    async fn plugin_provenance_keeps_its_implicit_grant_even_on_a_configured_name() {
         let mut tool = rmcp::model::Tool::default();
         tool.name = "search".to_string().into();
         let tools = ToolSet::from_servers(vec![ServerTools {
-            origin: ratatoskr_mcp::EXA.to_string(),
+            origin: "web".to_string(),
             sink: None,
             tools: vec![tool],
-            prefix: Some(ratatoskr_mcp::qualified_prefix(
-                "web-plugin",
-                ratatoskr_mcp::EXA,
-            )),
+            prefix: Some(ratatoskr_mcp::qualified_prefix("web-plugin", "web")),
             renames: std::collections::BTreeMap::new(),
+            capabilities: std::collections::BTreeMap::new(),
+            provenance: ServerProvenance::Plugin,
         }]);
         let engine = binding_engine("plugin-named-exa", "").await;
         let config = RatatoskrConfig::default();
@@ -860,12 +879,12 @@ mod tests {
 
         assert_eq!(
             configured.tools.names(),
-            vec!["mcp__plugin_web-plugin_exa__search"]
+            vec!["mcp__plugin_web-plugin_web__search"]
         );
     }
 
     #[test]
-    fn configured_exa_server_name_is_not_started_from_a_plugin() {
+    fn configured_server_names_are_not_started_from_plugins() {
         let plugins = [ratatoskr_plugin::Plugin {
             name: "web-plugin".to_string(),
             root: PathBuf::new(),
@@ -873,7 +892,7 @@ mod tests {
             skills: Vec::new(),
             mcp_servers: vec![
                 ratatoskr_plugin::McpServerSpec {
-                    name: ratatoskr_mcp::EXA.to_string(),
+                    name: "web".to_string(),
                     command: vec!["false".to_string()],
                     env: Default::default(),
                 },
@@ -886,7 +905,7 @@ mod tests {
         }];
 
         assert_eq!(
-            servers_to_start_with_configured_exa(&plugins, true)
+            servers_to_start_with_configured(&plugins, ["web"])
                 .into_iter()
                 .map(|(plugin, spec)| (plugin, spec.name.as_str()))
                 .collect::<Vec<_>>(),

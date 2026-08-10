@@ -1,6 +1,6 @@
 //! `ratatoskr.toml` configuration.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,9 +13,9 @@ use crate::Capability;
 pub struct RatatoskrConfig {
     #[serde(default)]
     pub rag_rat: RagRatConfig,
-    /// Optional hosted Exa MCP server. Its presence opts a run into third-party web egress.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exa: Option<ExaConfig>,
+    /// MCP servers configured by the repository owner.
+    #[serde(default)]
+    pub mcp: McpConfig,
     pub store: StoreConfig,
     pub worktree: WorktreeConfig,
     /// Per-node model routing, keyed by stage name (`"scout"`, `"analyst"`, ...).
@@ -616,50 +616,59 @@ impl RagRatConfig {
     }
 }
 
-/// How to connect to Exa's hosted MCP server.
-///
-/// The section is optional: no `[exa]` means no remote web tools. Its presence is the deliberate
-/// security decision to let a stage explicitly named `WebFetch` or `WebSearch` send arbitrary
-/// stage-constructed URLs and queries to Exa, including for write-capable stages; rulesets remain
-/// the per-stage gate.
+/// Repository-configured MCP servers, keyed by the stable origin name used in logs and plugins.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub servers: BTreeMap<String, McpServerConfig>,
+}
+
+/// A remote MCP server and the authority of the tools Ratatoskr exposes from it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ExaConfig {
-    #[serde(
-        default = "default_exa_url",
-        deserialize_with = "default_exa_url_when_empty"
-    )]
+pub struct McpServerConfig {
+    pub transport: McpTransport,
     pub url: String,
+    /// Environment variable containing a bare bearer token. Its value is never serialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token_env: Option<String>,
+    /// Whether failure to connect should fail the run rather than omit this server's tools.
+    #[serde(default)]
+    pub required: bool,
+    /// Wire tool names and the names/capabilities exposed to stages.
+    #[serde(default)]
+    pub tools: BTreeMap<String, McpToolConfig>,
 }
 
-fn default_exa_url() -> String {
-    "https://mcp.exa.ai/mcp".to_string()
+/// Transport used to reach a configured MCP server.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    StreamableHttp,
 }
 
-fn default_exa_url_when_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let url = String::deserialize(deserializer)?;
-    Ok(if url.is_empty() {
-        default_exa_url()
-    } else {
-        url
-    })
+/// Host-side metadata for one remote tool. Unlisted tools remain available as `publish`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpToolConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default = "default_mcp_tool_capability")]
+    pub capability: Capability,
 }
 
-impl Default for ExaConfig {
-    fn default() -> Self {
-        Self {
-            url: default_exa_url(),
-        }
-    }
+fn default_mcp_tool_capability() -> Capability {
+    Capability::Publish
 }
 
-impl ExaConfig {
-    /// An Exa section is always on; omitting it is the only off state.
-    pub fn configured(&self) -> bool {
-        true
+impl McpConfig {
+    /// Credential variable names owned by MCP transports and withheld from plugin hooks.
+    pub fn credential_envs(&self) -> Vec<String> {
+        self.servers
+            .values()
+            .filter_map(|server| server.bearer_token_env.clone())
+            .collect()
     }
 }
 
@@ -837,19 +846,54 @@ impl RatatoskrConfig {
                 "implementer.max_turns must be >= 1".to_string(),
             ));
         }
-        if let Some(exa) = &self.exa
-            && !exa
+        for (name, server) in &self.mcp.servers {
+            if name.trim().is_empty() || name == "rag-rat" {
+                return Err(ConfigError::Invalid(format!(
+                    "mcp server name `{name}` is empty or reserved"
+                )));
+            }
+            if !server
                 .url
                 .strip_prefix("http://")
-                .or_else(|| exa.url.strip_prefix("https://"))
+                .or_else(|| server.url.strip_prefix("https://"))
                 .is_some_and(|host| !host.is_empty() && !host.contains(char::is_whitespace))
-        {
-            return Err(ConfigError::Invalid(
-                "exa.url must be an http(s) URL".to_string(),
-            ));
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "mcp.servers.{name}.url must be an http(s) URL"
+                )));
+            }
+            if let Some(env) = &server.bearer_token_env
+                && !valid_env_name(env)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "mcp.servers.{name}.bearer_token_env is not a valid environment variable name"
+                )));
+            }
+            let mut shown = std::collections::BTreeSet::new();
+            for (wire, tool) in &server.tools {
+                let display = tool.name.as_deref().unwrap_or(wire);
+                if wire.trim().is_empty() || display.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "mcp.servers.{name}.tools contains an empty tool name"
+                    )));
+                }
+                if !shown.insert(display) {
+                    return Err(ConfigError::Invalid(format!(
+                        "mcp.servers.{name}.tools exposes duplicate name `{display}`"
+                    )));
+                }
+            }
         }
         Ok(())
     }
+}
+
+fn valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 impl Default for RatatoskrConfig {
@@ -876,7 +920,7 @@ impl Default for RatatoskrConfig {
                     .to_vec(),
                 working_dir: None,
             },
-            exa: None,
+            mcp: McpConfig::default(),
             store: StoreConfig {
                 path: PathBuf::from(".ratatoskr/state.sqlite3"),
             },
@@ -1447,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn exa_is_off_when_omitted_and_on_when_its_section_is_present() {
+    fn configured_mcp_servers_are_explicit_and_validated() {
         let base = r#"
             [store]
             path = ".ratatoskr/state.sqlite3"
@@ -1459,31 +1503,46 @@ mod tests {
             test_command = ["cargo", "test"]
         "#;
         let absent: RatatoskrConfig = toml::from_str(base).unwrap();
-        assert!(absent.exa.is_none());
+        assert!(absent.mcp.servers.is_empty());
 
-        let present: RatatoskrConfig = toml::from_str(&format!("{base}\n[exa]\n")).unwrap();
-        assert!(present.exa.as_ref().is_some_and(|exa| exa.configured()));
-        assert_eq!(present.exa.unwrap().url, "https://mcp.exa.ai/mcp");
+        let source = format!(
+            r#"{base}
+            [mcp.servers.exa]
+            transport = "streamable_http"
+            url = "https://mcp.exa.ai/mcp"
+            bearer_token_env = "EXA_API_KEY"
 
-        let empty: RatatoskrConfig =
-            toml::from_str(&format!("{base}\n[exa]\nurl = \"\"\n")).unwrap();
-        assert!(empty.exa.as_ref().is_some_and(|exa| exa.configured()));
-        assert_eq!(empty.exa.unwrap().url, "https://mcp.exa.ai/mcp");
-
-        let error = toml::from_str::<RatatoskrConfig>(&format!("{base}\n[exa]\ntyop = 1\n"))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("tyop"), "{error}");
-
-        let malformed = RatatoskrConfig {
-            exa: Some(ExaConfig {
-                url: "not-a-url".to_string(),
-            }),
-            ..RatatoskrConfig::default()
-        };
-        assert!(
-            matches!(malformed.validate(), Err(ConfigError::Invalid(error)) if error.contains("exa.url"))
+            [mcp.servers.exa.tools.web_search_exa]
+            name = "WebSearch"
+            capability = "read"
+            "#
         );
+        let present: RatatoskrConfig = toml::from_str(&source).unwrap();
+        present.validate().unwrap();
+        let exa = &present.mcp.servers["exa"];
+        assert!(!exa.required);
+        assert_eq!(
+            exa.tools["web_search_exa"].name.as_deref(),
+            Some("WebSearch")
+        );
+        assert_eq!(present.mcp.credential_envs(), ["EXA_API_KEY"]);
+
+        for (fragment, expected) in [
+            ("url = \"\"", "url"),
+            ("url = \"not-a-url\"", "url"),
+            (
+                "url = \"https://example.test/mcp\"\nbearer_token_env = \"BAD-NAME\"",
+                "bearer_token_env",
+            ),
+        ] {
+            let malformed: RatatoskrConfig = toml::from_str(&format!(
+                "{base}\n[mcp.servers.remote]\ntransport = \"streamable_http\"\n{fragment}"
+            ))
+            .unwrap();
+            assert!(
+                matches!(malformed.validate(), Err(ConfigError::Invalid(error)) if error.contains(expected))
+            );
+        }
     }
 
     #[test]

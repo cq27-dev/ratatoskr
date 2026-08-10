@@ -55,7 +55,7 @@ use std::sync::Arc;
 use ratatoskr_core::{RatatoskrConfig, RunState, RunStatus, ToolPolicy};
 use ratatoskr_exec::WorktreePath;
 use ratatoskr_graph::NodeError;
-use ratatoskr_mcp::{ExaClient, RagRatClient, ServerTools, ToolSet};
+use ratatoskr_mcp::{RagRatClient, ServerTools, ToolSet};
 use ratatoskr_script::{ScriptEngine, WorkflowRuntime};
 use ratatoskr_store::{Store, StoreError};
 
@@ -121,7 +121,7 @@ pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError>
     let chosen = choose(&request).await?;
     let RunRequest {
         client,
-        exa,
+        configured,
         config,
         store,
         run_id,
@@ -139,7 +139,7 @@ pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError>
             .await?;
     let ctx = workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
         client,
-        exa,
+        configured,
         config,
         store,
         run_id,
@@ -661,7 +661,7 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
     let plugin_context = PluginContext::resolve(request.config, request.engine, &cwd).await?;
     let ctx = workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
         client: request.client,
-        exa: request.exa,
+        configured: request.configured,
         config: request.config,
         store: request.store,
         run_id: request.run_id,
@@ -700,8 +700,8 @@ pub struct RunRequest<'a> {
     /// `None` when this repository runs without rag-rat: the nodes keep their file tools and the
     /// memory baseline is simply empty. See `RagRatConfig::configured`.
     pub client: Option<&'a RagRatClient>,
-    /// `None` when `[exa]` is absent; its tools are otherwise an optional second server offer.
-    pub exa: Option<&'a ExaClient>,
+    /// Repository-configured MCP server offers, in configured precedence order.
+    pub configured: &'a [ServerTools],
     pub config: &'a RatatoskrConfig,
     pub store: &'a Store,
     pub run_id: &'a str,
@@ -1035,7 +1035,7 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
     let chosen = choose(&request).await?;
     let RunRequest {
         client,
-        exa,
+        configured,
         config,
         store,
         run_id,
@@ -1055,7 +1055,7 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
             .await?;
     let ctx = workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
         client,
-        exa,
+        configured,
         config,
         store,
         run_id,
@@ -1124,7 +1124,7 @@ async fn publish_and_checkpoint(
     let declared_context =
         workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
             client,
-            exa: None,
+            configured: &[],
             config,
             store,
             run_id,
@@ -1197,7 +1197,7 @@ async fn bookkeep_and_checkpoint(
         let declared_context =
             workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
                 client,
-                exa: None,
+                configured: &[],
                 config,
                 store,
                 run_id,

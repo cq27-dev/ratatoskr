@@ -8,12 +8,23 @@
 command = ["npx", "-y", "@rag-rat/bin", "mcp", "--json"]
 # working_dir = "/path/to/target/repo"
 
-# Optional hosted MCP web tools. Adding this section permits stages whose ruleset explicitly names
-# WebSearch or WebFetch to send their queries and stage-constructed URLs to Exa. This includes
-# write-capable stages; use ruleset allow/deny and onToolCall policy to limit that authority.
-# EXA_API_KEY is optional and read only from the environment.
-# [exa]
+# Optional remote MCP servers. Each server declares its transport, startup requirement, credential
+# variable, and the display name and minimum capability of any tool whose default should not be
+# `publish`. Unlisted tools keep their wire names and require publish authority.
+#
+# [mcp.servers.exa]
+# transport = "streamable_http"
 # url = "https://mcp.exa.ai/mcp"
+# bearer_token_env = "EXA_API_KEY"
+# required = false
+#
+# [mcp.servers.exa.tools.web_search_exa]
+# name = "WebSearch"
+# capability = "read"
+#
+# [mcp.servers.exa.tools.web_fetch_exa]
+# name = "WebFetch"
+# capability = "read"
 
 [store]
 # Ratatoskr's own checkpoint database — a separate file from rag-rat's index.

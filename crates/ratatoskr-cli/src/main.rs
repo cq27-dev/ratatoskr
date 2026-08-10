@@ -541,13 +541,14 @@ async fn plan(
     let store = ratatoskr_store::Store::open(&config.store.path)
         .with_context(|| format!("opening store at {}", config.store.path.display()))?;
     let client = connect_rag_rat(&config.rag_rat).await?;
-    let exa = connect_exa(config.exa.as_ref()).await;
+    let configured = connect_configured_mcp(&config.mcp).await?;
+    let configured_offers: Vec<_> = configured.iter().map(|client| client.offer()).collect();
 
     let engine = load_rules(&config).await?;
     let run_id = uuid::Uuid::new_v4().to_string();
     let result = ratatoskr_nodes::run_plan(ratatoskr_nodes::RunRequest {
         client: client.as_ref(),
-        exa: exa.as_ref(),
+        configured: &configured_offers,
         config: &config,
         store: &store,
         run_id: &run_id,
@@ -559,7 +560,7 @@ async fn plan(
     .await;
 
     // Tear down configured MCP clients regardless of outcome.
-    shutdown_exa(exa).await;
+    shutdown_configured_mcp(configured).await;
     shutdown_rag_rat(client).await;
 
     let outcome = result.context("plan run failed")?;
@@ -629,7 +630,8 @@ async fn run_cmd(
     let store = ratatoskr_store::Store::open(&config.store.path)
         .with_context(|| format!("opening store at {}", config.store.path.display()))?;
     let client = connect_rag_rat(&config.rag_rat).await?;
-    let exa = connect_exa(config.exa.as_ref()).await;
+    let configured = connect_configured_mcp(&config.mcp).await?;
+    let configured_offers: Vec<_> = configured.iter().map(|client| client.offer()).collect();
 
     let engine = load_rules(&config).await?;
     let run_id = match run_id {
@@ -643,7 +645,7 @@ async fn run_cmd(
     };
     let result = ratatoskr_nodes::run_full(ratatoskr_nodes::RunRequest {
         client: client.as_ref(),
-        exa: exa.as_ref(),
+        configured: &configured_offers,
         config: &config,
         store: &store,
         run_id: &run_id,
@@ -654,7 +656,7 @@ async fn run_cmd(
     .instrument(tracing::info_span!("run", run_id = %run_id))
     .await;
 
-    shutdown_exa(exa).await;
+    shutdown_configured_mcp(configured).await;
     shutdown_rag_rat(client).await;
 
     // Make the run's history durable now that it has finished, so it survives the log files
@@ -1048,25 +1050,40 @@ async fn shutdown_rag_rat(client: Option<ratatoskr_mcp::RagRatClient>) {
     }
 }
 
-/// Connect to Exa only when the config explicitly opts into third-party web egress.
-async fn connect_exa(
-    config: Option<&ratatoskr_core::ExaConfig>,
-) -> Option<ratatoskr_mcp::ExaClient> {
-    let config = config.filter(|config| config.configured())?;
-    match ratatoskr_mcp::ExaClient::connect(config).await {
-        Ok(client) => Some(client),
-        Err(error) => {
-            tracing::warn!("Exa MCP server unavailable, web tools are not offered: {error}");
-            None
+/// Connect every repository-configured MCP server. Optional failures omit only that server;
+/// required failures tear down connections already opened and fail before any node runs.
+async fn connect_configured_mcp(
+    config: &ratatoskr_core::McpConfig,
+) -> anyhow::Result<Vec<ratatoskr_mcp::ConfiguredMcpClient>> {
+    let mut connected = Vec::new();
+    for (name, server) in &config.servers {
+        match ratatoskr_mcp::ConfiguredMcpClient::connect(name, server).await {
+            Ok(client) => connected.push(client),
+            Err(error) if !server.required => {
+                tracing::warn!(
+                    server = name,
+                    "optional MCP server unavailable; its tools are not offered: {error}"
+                );
+            }
+            Err(error) => {
+                shutdown_configured_mcp(connected).await;
+                return Err(error)
+                    .with_context(|| format!("connecting required MCP server `{name}`"));
+            }
         }
     }
+    Ok(connected)
 }
 
-async fn shutdown_exa(client: Option<ratatoskr_mcp::ExaClient>) {
-    if let Some(client) = client
-        && let Err(error) = client.shutdown().await
-    {
-        tracing::warn!("failed to shut down Exa cleanly: {error}");
+async fn shutdown_configured_mcp(clients: Vec<ratatoskr_mcp::ConfiguredMcpClient>) {
+    for client in clients {
+        let origin = client.origin().to_string();
+        if let Err(error) = client.shutdown().await {
+            tracing::warn!(
+                server = origin,
+                "failed to shut down configured MCP server cleanly: {error}"
+            );
+        }
     }
 }
 

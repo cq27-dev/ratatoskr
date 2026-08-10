@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use ratatoskr_core::{RatatoskrConfig, RunState, RunStatus};
 use ratatoskr_exec::{WorktreePath, remove_worktree};
 use ratatoskr_graph::{Node, NodeError};
-use ratatoskr_mcp::{ExaClient, RagRatClient, ServerTools};
+use ratatoskr_mcp::{RagRatClient, ServerTools};
 use ratatoskr_script::{HostFn, ScriptEngine, WorkflowRuntime};
 use ratatoskr_store::Store;
 use rmcp::service::ServerSink;
@@ -131,7 +131,7 @@ pub struct WorkflowContext {
 
 pub(crate) struct WorkflowContextParams<'a> {
     pub client: Option<&'a RagRatClient>,
-    pub exa: Option<&'a ExaClient>,
+    pub configured: &'a [ServerTools],
     pub config: &'a RatatoskrConfig,
     pub store: &'a Store,
     pub run_id: &'a str,
@@ -153,7 +153,7 @@ impl WorkflowContext {
     ) -> Result<Arc<Self>, PlanError> {
         Self::new_with_ledger(WorkflowContextParams {
             client,
-            exa: None,
+            configured: &[],
             config,
             store,
             run_id,
@@ -169,7 +169,7 @@ impl WorkflowContext {
     ) -> Result<Arc<Self>, PlanError> {
         let WorkflowContextParams {
             client,
-            exa,
+            configured,
             config,
             store,
             run_id,
@@ -195,7 +195,7 @@ impl WorkflowContext {
             servers: client
                 .map(|c| c.offer())
                 .into_iter()
-                .chain(exa.map(|c| c.offer()))
+                .chain(configured.iter().cloned())
                 .collect(),
             repo_path,
             worktree: Mutex::new(None),
