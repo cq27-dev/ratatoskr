@@ -123,10 +123,7 @@ impl RefereeNode {
         files: Option<PathBuf>,
     ) -> Self {
         let mut tools = ToolSet::default();
-        tools
-            .local()
-            .tools
-            .extend(ratatoskr_agent::files::declarations());
+        tools.add_local_tools(ratatoskr_agent::files::declarations());
         tools.narrow(
             &REFEREE_TOOLS
                 .iter()

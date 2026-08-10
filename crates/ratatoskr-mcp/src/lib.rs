@@ -1,23 +1,28 @@
-//! Clients to the MCP servers a run talks to, each over a stdio subprocess.
+//! Clients to the MCP servers a run talks to, over stdio subprocesses or streamable HTTP.
 //!
-//! [`Connection::spawn`] launches a server, performs the MCP handshake, and lists its tools. It
-//! hands back the tool list plus a [`ServerSink`] (a cloneable client handle) — everything
+//! [`Connection::spawn`] and [`Connection::connect_http`] perform the MCP handshake and list tools.
+//! They hand back the tool list plus a [`ServerSink`] (a cloneable client handle) — everything
 //! `ratatoskr-agent` needs to bind those tools to a `rig` agent. The running service is held so the
-//! subprocess stays alive; drop or [`shutdown`](Connection::shutdown) tears it down.
+//! connection stays alive; drop or [`shutdown`](Connection::shutdown) tears it down.
 //!
 //! rag-rat is the server ratatoskr is built around and is connected from config
 //! ([`RagRatClient`]); a plugin's servers are connected alongside it. A node's tools can therefore
 //! come from several servers at once, which is what [`ToolSet`] carries: tools grouped by the
 //! server each is dispatched to.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use ratatoskr_core::{Capability, RagRatConfig};
+use ratatoskr_core::{
+    self, Capability, McpServerConfig, McpToolConfig, McpTransport, RagRatConfig,
+};
 use rmcp::ServiceExt;
 use rmcp::model::Tool;
 use rmcp::service::{RoleClient, RunningService, ServerSink};
-use rmcp::transport::TokioChildProcess;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
+
+const MCP_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The origin name of the connection made from `[rag_rat]` in the config.
 ///
@@ -47,15 +52,31 @@ pub enum McpError {
     Handshake { origin: String, detail: String },
     #[error("listing `{origin}`'s tools failed: {detail}")]
     ListTools { origin: String, detail: String },
+    #[error("MCP {operation} with `{origin}` timed out after {timeout:?}")]
+    StartupTimeout {
+        origin: String,
+        operation: &'static str,
+        timeout: std::time::Duration,
+    },
+    #[error("configured MCP server `{origin}` exposes an invalid tool set: {detail}")]
+    InvalidToolSet { origin: String, detail: String },
     #[error("shutting down `{origin}` failed: {detail}")]
     Shutdown { origin: String, detail: String },
 }
 
-/// A live connection to one MCP server. Holds the running service so the subprocess stays up.
+/// A live connection to one MCP server. Holds the running service so the session stays alive.
 pub struct Connection {
     origin: String,
     service: RunningService<RoleClient, ()>,
     tools: Vec<Tool>,
+}
+
+/// Environment changes for an MCP subprocess.
+pub struct SpawnEnvironment<'a> {
+    /// Variables explicitly supplied by the server declaration.
+    pub set: &'a BTreeMap<String, String>,
+    /// Ambient variables this subprocess must not inherit, even when `set` names them too.
+    pub remove: &'a [String],
 }
 
 impl Connection {
@@ -66,17 +87,12 @@ impl Connection {
     pub async fn spawn(
         origin: &str,
         command: &[String],
-        env: &BTreeMap<String, String>,
+        environment: SpawnEnvironment<'_>,
         working_dir: Option<&Path>,
     ) -> Result<Self, McpError> {
         let (program, args) = command.split_first().ok_or(McpError::EmptyCommand)?;
 
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(args);
-        cmd.envs(env);
-        if let Some(dir) = working_dir {
-            cmd.current_dir(dir);
-        }
+        let cmd = subprocess_command(program, args, environment, working_dir);
 
         // `new` spawns the child; a missing program surfaces here as the most common failure mode.
         let transport = TokioChildProcess::new(cmd).map_err(|source| McpError::Spawn {
@@ -114,6 +130,61 @@ impl Connection {
         })
     }
 
+    /// Connect to a streamable-HTTP MCP server, complete its handshake, and list its tools.
+    ///
+    /// rmcp owns request-scoped and persistent SSE streams, including session/protocol negotiation
+    /// and recovery. HTTP transport errors deliberately cross this boundary without server response
+    /// text because a proxy may reflect the bearer credential in that text.
+    pub async fn connect_http(
+        origin: &str,
+        url: &str,
+        bearer_token: Option<String>,
+    ) -> Result<Self, McpError> {
+        Self::connect_http_with_timeout(origin, url, bearer_token, MCP_STARTUP_TIMEOUT).await
+    }
+
+    async fn connect_http_with_timeout(
+        origin: &str,
+        url: &str,
+        bearer_token: Option<String>,
+        startup_timeout: std::time::Duration,
+    ) -> Result<Self, McpError> {
+        let config = bearer_token.map_or_else(
+            || StreamableHttpClientTransportConfig::with_uri(url),
+            |token| StreamableHttpClientTransportConfig::with_uri(url).auth_header(token),
+        );
+        let transport = StreamableHttpClientTransport::from_config(config);
+        let service = bounded_startup(origin, "handshake", startup_timeout, async {
+            ().serve(transport).await.map_err(|_| McpError::Handshake {
+                origin: origin.to_string(),
+                detail: "streamable HTTP transport failed".to_string(),
+            })
+        })
+        .await?;
+        let tools = bounded_startup(origin, "tools/list", startup_timeout, async {
+            service
+                .peer()
+                .list_all_tools()
+                .await
+                .map_err(|_| McpError::ListTools {
+                    origin: origin.to_string(),
+                    detail: "streamable HTTP transport failed".to_string(),
+                })
+        })
+        .await?;
+        tracing::info!(
+            server = origin,
+            tool_count = tools.len(),
+            tools = ?tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>(),
+            "connected to MCP server"
+        );
+        Ok(Connection {
+            origin: origin.to_string(),
+            service,
+            tools,
+        })
+    }
+
     pub fn origin(&self) -> &str {
         &self.origin
     }
@@ -135,21 +206,59 @@ impl Connection {
             sink: Some(self.sink()),
             tools: self.tools.clone(),
             prefix: None,
+            renames: BTreeMap::new(),
+            capabilities: BTreeMap::new(),
+            provenance: ServerProvenance::Configured,
         }
     }
 
-    /// Cleanly cancel the connection and tear down the subprocess.
+    /// Cleanly cancel the connection.
     pub async fn shutdown(self) -> Result<(), McpError> {
         let origin = self.origin;
         self.service
             .cancel()
             .await
             .map(|_| ())
-            .map_err(|e| McpError::Shutdown {
+            // An rmcp HTTP error can retain reflected request credentials in its response text.
+            .map_err(|_| McpError::Shutdown {
                 origin,
-                detail: e.to_string(),
+                detail: "MCP service shutdown failed".to_string(),
             })
     }
+}
+
+async fn bounded_startup<T>(
+    origin: &str,
+    operation: &'static str,
+    timeout: std::time::Duration,
+    future: impl std::future::Future<Output = Result<T, McpError>>,
+) -> Result<T, McpError> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| McpError::StartupTimeout {
+            origin: origin.to_string(),
+            operation,
+            timeout,
+        })?
+}
+
+fn subprocess_command(
+    program: &str,
+    args: &[String],
+    environment: SpawnEnvironment<'_>,
+    working_dir: Option<&Path>,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    command.args(args).envs(environment.set);
+    // Removal comes after the explicit overlay so a plugin manifest cannot reintroduce a
+    // credential owned by a configured host transport under the same variable name.
+    for key in environment.remove {
+        command.env_remove(key);
+    }
+    if let Some(dir) = working_dir {
+        command.current_dir(dir);
+    }
+    command
 }
 
 /// The connection to rag-rat, which every run has and every node can call.
@@ -161,7 +270,10 @@ impl RagRatClient {
         Connection::spawn(
             RAG_RAT,
             &config.command,
-            &BTreeMap::new(),
+            SpawnEnvironment {
+                set: &BTreeMap::new(),
+                remove: &[],
+            },
             config.working_dir.as_deref(),
         )
         .await
@@ -186,6 +298,129 @@ impl RagRatClient {
     }
 }
 
+/// A connection declared in `[mcp.servers]`, with host-owned naming and authority metadata.
+pub struct ConfiguredMcpClient {
+    connection: Connection,
+    renames: BTreeMap<String, String>,
+    capabilities: BTreeMap<String, Capability>,
+}
+
+struct ConfiguredToolMetadata {
+    renames: BTreeMap<String, String>,
+    capabilities: BTreeMap<String, Capability>,
+}
+
+impl ConfiguredMcpClient {
+    pub async fn connect(origin: &str, config: &McpServerConfig) -> Result<Self, McpError> {
+        let bearer_token = config
+            .bearer_token_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|token| !token.is_empty());
+        let connection = match config.transport {
+            McpTransport::StreamableHttp => {
+                Connection::connect_http(origin, &config.url, bearer_token).await?
+            }
+        };
+        let metadata = configured_tool_metadata(origin, &connection.tools, &config.tools)?;
+        Ok(Self {
+            connection,
+            renames: metadata.renames,
+            capabilities: metadata.capabilities,
+        })
+    }
+
+    pub fn offer(&self) -> ServerTools {
+        ServerTools {
+            renames: self.renames.clone(),
+            capabilities: self.capabilities.clone(),
+            ..self.connection.offer()
+        }
+    }
+
+    pub fn origin(&self) -> &str {
+        self.connection.origin()
+    }
+
+    pub async fn shutdown(self) -> Result<(), McpError> {
+        self.connection.shutdown().await
+    }
+}
+
+/// Validate and bind metadata only after discovery: configuration cannot see unlisted tools or
+/// alias collisions with them, and stale wire keys must never grant authority to another tool.
+fn configured_tool_metadata(
+    origin: &str,
+    tools: &[Tool],
+    configured: &BTreeMap<String, McpToolConfig>,
+) -> Result<ConfiguredToolMetadata, McpError> {
+    let discovered = tools
+        .iter()
+        .map(|tool| tool.name.as_ref())
+        .collect::<BTreeSet<_>>();
+    let missing = configured
+        .keys()
+        .filter(|wire| !discovered.contains(wire.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(McpError::InvalidToolSet {
+            origin: origin.to_string(),
+            detail: format!(
+                "configured metadata names tools the server did not expose: {}",
+                missing.join(", ")
+            ),
+        });
+    }
+
+    let mut claimed = BTreeMap::new();
+    let mut renames = BTreeMap::new();
+    let mut capabilities = BTreeMap::new();
+    for tool in tools {
+        let wire = tool.name.as_ref();
+        let metadata = configured.get(wire);
+        let display = metadata
+            .and_then(|tool| tool.name.as_deref())
+            .unwrap_or(wire);
+        if !ratatoskr_core::valid_model_tool_name(display) {
+            return Err(McpError::InvalidToolSet {
+                origin: origin.to_string(),
+                detail: format!(
+                    "tool `{wire}` has provider-invalid display name `{display}`; configure a \
+                     unique alias matching ^[A-Za-z0-9_-]{{1,64}}$"
+                ),
+            });
+        }
+        if let Some(previous) = claimed.insert(display.to_string(), wire.to_string()) {
+            return Err(McpError::InvalidToolSet {
+                origin: origin.to_string(),
+                detail: format!(
+                    "display name `{display}` is ambiguous between server tools `{previous}` and \
+                     `{wire}`; configure a unique alias"
+                ),
+            });
+        }
+        if let Some(metadata) = metadata {
+            if metadata.name.is_some() {
+                renames.insert(wire.to_string(), display.to_string());
+            }
+            capabilities.insert(display.to_string(), metadata.capability);
+        }
+    }
+    Ok(ConfiguredToolMetadata {
+        renames,
+        capabilities,
+    })
+}
+
+/// Where a tool offer came from. Authority defaults depend on provenance, never origin spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerProvenance {
+    Configured,
+    Plugin,
+    Builtin,
+}
+
 /// One server's contribution to a node's tools: the tools, and the handle they are called on.
 #[derive(Clone)]
 pub struct ServerTools {
@@ -198,6 +433,12 @@ pub struct ServerTools {
     /// matches on a name. `None` for a server this host launched itself, whose tools keep the
     /// names they were always called by.
     pub prefix: Option<String>,
+    /// Per-tool wire-name to display-name rewrites. Unlike a prefix, these can follow a host's
+    /// existing vocabulary exactly while dispatch still uses the wire name.
+    pub renames: BTreeMap<String, String>,
+    /// Minimum authority keyed by the display name seen by stages and rulesets.
+    pub capabilities: BTreeMap<String, Capability>,
+    pub provenance: ServerProvenance,
 }
 
 /// How the plugin format names the tools of a server a plugin declared:
@@ -224,8 +465,16 @@ fn segment(raw: &str) -> String {
 }
 
 impl ServerTools {
+    /// Whether this server was declared by a plugin rather than host configuration.
+    pub fn is_plugin(&self) -> bool {
+        self.provenance == ServerProvenance::Plugin
+    }
+
     /// The name the model sees for `tool`.
     pub fn display_name(&self, tool: &Tool) -> String {
+        if let Some(name) = self.renames.get(tool.name.as_ref()) {
+            return name.clone();
+        }
         match &self.prefix {
             Some(prefix) => format!("{prefix}{}", tool.name),
             None => tool.name.to_string(),
@@ -295,9 +544,7 @@ impl ToolSet {
         self.groups.retain(|g| !g.tools.is_empty());
     }
 
-    /// Add a tool that is answered locally rather than dispatched — the synthetic `ask`, which a
-    /// hook intercepts. It joins the first group so it reaches the agent with everything else; the
-    /// sink it nominally belongs to is never used for it.
+    /// Add a tool that is answered locally rather than dispatched.
     ///
     /// The name is *taken*, not merely added: the hook that answers it matches on the name alone,
     /// so a server offering the same one would be shadowed anyway — silently, and with the wrong
@@ -305,11 +552,13 @@ impl ToolSet {
     pub fn add_local(&mut self, tool: Tool) {
         for group in &mut self.groups {
             let prefix = group.prefix.clone();
+            let renames = group.renames.clone();
             group.tools.retain(|t| {
-                let shown = match &prefix {
-                    Some(prefix) => format!("{prefix}{}", t.name),
-                    None => t.name.to_string(),
-                };
+                let shown = renames
+                    .get(t.name.as_ref())
+                    .cloned()
+                    .or_else(|| prefix.as_ref().map(|p| format!("{p}{}", t.name)))
+                    .unwrap_or_else(|| t.name.to_string());
                 let clash = shown == tool.name;
                 if clash {
                     tracing::warn!(
@@ -321,22 +570,37 @@ impl ToolSet {
                 !clash
             });
         }
+        self.groups.retain(|group| !group.tools.is_empty());
         self.local().tools.push(tool);
     }
 
+    /// Add host-local tools while reserving every name against connected servers.
+    pub fn add_local_tools(&mut self, tools: impl IntoIterator<Item = Tool>) {
+        for tool in tools {
+            self.add_local(tool);
+        }
+    }
+
     /// The group of tools this host answers itself, created on first use.
-    pub fn local(&mut self) -> &mut ServerTools {
-        if !self.groups.iter().any(|g| g.sink.is_none()) {
+    fn local(&mut self) -> &mut ServerTools {
+        if !self
+            .groups
+            .iter()
+            .any(|g| g.provenance == ServerProvenance::Builtin)
+        {
             self.groups.push(ServerTools {
                 origin: LOCAL.to_string(),
                 sink: None,
                 tools: Vec::new(),
                 prefix: None,
+                renames: BTreeMap::new(),
+                capabilities: BTreeMap::new(),
+                provenance: ServerProvenance::Builtin,
             });
         }
         self.groups
             .iter_mut()
-            .find(|g| g.sink.is_none())
+            .find(|g| g.provenance == ServerProvenance::Builtin)
             .expect("just ensured")
     }
 
@@ -356,7 +620,19 @@ impl ToolSet {
                     .display_names()
                     .into_iter()
                     .any(|offered| offered == name)
-                    .then(|| declared_capability(&group.origin, name))
+                    .then(|| {
+                        group.capabilities.get(name).copied().unwrap_or_else(|| {
+                            match group.provenance {
+                                ServerProvenance::Builtin => declared_capability(LOCAL, name),
+                                ServerProvenance::Configured if group.origin == RAG_RAT => {
+                                    declared_capability(RAG_RAT, name)
+                                }
+                                ServerProvenance::Configured | ServerProvenance::Plugin => {
+                                    Capability::Publish
+                                }
+                            }
+                        })
+                    })
             })
             .unwrap_or(Capability::Publish)
     }
@@ -497,6 +773,272 @@ mod tests {
             RagRatClient::connect(config).await,
             Err(McpError::Spawn { .. })
         ));
+    }
+
+    #[test]
+    fn subprocess_environment_removes_protected_variables_after_the_overlay() {
+        let set = BTreeMap::from([
+            ("PLUGIN_SETTING".to_string(), "kept".to_string()),
+            ("HOSTED_MCP_TOKEN".to_string(), "must-not-win".to_string()),
+        ]);
+        let remove = ["HOSTED_MCP_TOKEN".to_string()];
+        let command = subprocess_command(
+            "unused",
+            &[],
+            SpawnEnvironment {
+                set: &set,
+                remove: &remove,
+            },
+            None,
+        );
+        let changes: BTreeMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        assert_eq!(changes["PLUGIN_SETTING"].as_deref(), Some("kept"));
+        assert_eq!(changes["HOSTED_MCP_TOKEN"], None);
+    }
+
+    #[tokio::test]
+    async fn unreachable_http_server_is_a_handshake_error() {
+        assert!(matches!(
+            Connection::connect_http("remote", "http://127.0.0.1:9/mcp", None).await,
+            Err(McpError::Handshake { origin, .. }) if origin == "remote"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stalled_http_handshake_times_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (_connection, _) = listener.accept().unwrap();
+            let _ = stopped.recv_timeout(std::time::Duration::from_secs(2));
+        });
+
+        let result = Connection::connect_http_with_timeout(
+            "stalled",
+            &format!("http://{address}/mcp"),
+            None,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+
+        drop(stop);
+        server.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(McpError::StartupTimeout {
+                origin,
+                operation: "handshake",
+                ..
+            }) if origin == "stalled"
+        ));
+    }
+
+    #[tokio::test]
+    async fn every_startup_operation_uses_the_same_timeout_error() {
+        let result = bounded_startup(
+            "stalled",
+            "tools/list",
+            std::time::Duration::from_millis(1),
+            std::future::pending::<Result<(), McpError>>(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(McpError::StartupTimeout {
+                origin,
+                operation: "tools/list",
+                ..
+            }) if origin == "stalled"
+        ));
+    }
+
+    fn tool(name: &str) -> Tool {
+        let mut tool = Tool::default();
+        tool.name = name.to_string().into();
+        tool
+    }
+
+    #[test]
+    fn configured_aliases_cannot_collide_with_unlisted_tools() {
+        let tools = vec![tool("foo"), tool("bar")];
+        let configured = BTreeMap::from([(
+            "foo".to_string(),
+            McpToolConfig {
+                name: Some("bar".to_string()),
+                capability: Capability::Read,
+            },
+        )]);
+
+        assert!(matches!(
+            configured_tool_metadata("remote", &tools, &configured),
+            Err(McpError::InvalidToolSet { origin, detail })
+                if origin == "remote"
+                    && detail.contains("ambiguous")
+                    && detail.contains("`foo`")
+                    && detail.contains("`bar`")
+        ));
+    }
+
+    #[test]
+    fn unlisted_tool_names_must_be_provider_safe() {
+        for name in ["namespace.tool".to_string(), "x".repeat(65)] {
+            assert!(matches!(
+                configured_tool_metadata("remote", &[tool(&name)], &BTreeMap::new()),
+                Err(McpError::InvalidToolSet { origin, detail })
+                    if origin == "remote"
+                        && detail.contains(&name)
+                        && detail.contains("configure a unique alias")
+            ));
+        }
+    }
+
+    #[test]
+    fn stale_configured_wire_tools_cannot_grant_an_unlisted_tool_authority() {
+        let stale = BTreeMap::from([(
+            "old_tool".to_string(),
+            McpToolConfig {
+                name: Some("search".to_string()),
+                capability: Capability::Read,
+            },
+        )]);
+        assert!(matches!(
+            configured_tool_metadata("remote", &[tool("search")], &stale),
+            Err(McpError::InvalidToolSet { origin, detail })
+                if origin == "remote"
+                    && detail.contains("did not expose")
+                    && detail.contains("old_tool")
+        ));
+
+        let configured = BTreeMap::from([(
+            "fetch".to_string(),
+            McpToolConfig {
+                name: Some("WebFetch".to_string()),
+                capability: Capability::Read,
+            },
+        )]);
+        let tools = vec![tool("fetch"), tool("search")];
+        let metadata = configured_tool_metadata("remote", &tools, &configured).unwrap();
+        let set = ToolSet::from_servers(vec![ServerTools {
+            origin: "remote".to_string(),
+            sink: None,
+            tools,
+            prefix: None,
+            renames: metadata.renames,
+            capabilities: metadata.capabilities,
+            provenance: ServerProvenance::Configured,
+        }]);
+        assert_eq!(set.capability("WebFetch"), Capability::Read);
+        assert_eq!(set.capability("search"), Capability::Publish);
+    }
+
+    #[test]
+    fn renamed_tools_are_offered_and_narrowed_by_display_name() {
+        let server = ServerTools {
+            origin: "remote".to_string(),
+            sink: None,
+            tools: vec![
+                tool("web_fetch_exa"),
+                tool("web_search_exa"),
+                tool("other_exa_tool"),
+            ],
+            prefix: None,
+            renames: BTreeMap::from([
+                ("web_fetch_exa".to_string(), "WebFetch".to_string()),
+                ("web_search_exa".to_string(), "WebSearch".to_string()),
+            ]),
+            capabilities: BTreeMap::from([
+                ("WebFetch".to_string(), Capability::Read),
+                ("WebSearch".to_string(), Capability::Read),
+            ]),
+            provenance: ServerProvenance::Configured,
+        };
+        assert_eq!(
+            server.display_names(),
+            say(&["WebFetch", "WebSearch", "other_exa_tool"])
+        );
+        assert_eq!(
+            server
+                .offered()
+                .into_iter()
+                .map(|(shown, wire)| (shown.name.to_string(), wire))
+                .collect::<Vec<_>>(),
+            vec![
+                ("WebFetch".to_string(), "web_fetch_exa".to_string()),
+                ("WebSearch".to_string(), "web_search_exa".to_string()),
+                ("other_exa_tool".to_string(), "other_exa_tool".to_string()),
+            ]
+        );
+        let mut wire_name = ToolSet::from_servers(vec![server.clone()]);
+        wire_name.narrow(&say(&["web_fetch_exa"]), &[]);
+        assert!(wire_name.is_empty());
+
+        let mut set = ToolSet::from_servers(vec![server]);
+        assert_eq!(set.capability("WebFetch"), Capability::Read);
+        assert_eq!(set.capability("WebSearch"), Capability::Read);
+        assert_eq!(set.capability("other_exa_tool"), Capability::Publish);
+        set.narrow(&say(&["WebFetch"]), &[]);
+        assert_eq!(set.names(), say(&["WebFetch"]));
+    }
+
+    #[test]
+    fn absent_webfetch_name_is_a_no_op_when_narrowing() {
+        let mut set = ToolSet::default();
+        set.narrow(&say(&["WebFetch"]), &[]);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn origin_spelling_cannot_grant_authority_to_an_external_server() {
+        for provenance in [ServerProvenance::Configured, ServerProvenance::Plugin] {
+            let set = ToolSet::from_servers(vec![ServerTools {
+                origin: LOCAL.to_string(),
+                sink: None,
+                tools: vec![tool("Read")],
+                prefix: None,
+                renames: BTreeMap::new(),
+                capabilities: BTreeMap::new(),
+                provenance,
+            }]);
+            assert_eq!(set.capability("Read"), Capability::Publish);
+        }
+    }
+
+    #[test]
+    fn host_local_tools_replace_configured_name_collisions() {
+        let mut set = ToolSet::from_servers(vec![ServerTools {
+            origin: "configured".to_string(),
+            sink: None,
+            tools: vec![tool("Read")],
+            prefix: None,
+            renames: BTreeMap::new(),
+            capabilities: BTreeMap::from([("Read".to_string(), Capability::Read)]),
+            provenance: ServerProvenance::Configured,
+        }]);
+
+        set.add_local(tool("Read"));
+
+        assert_eq!(set.names(), say(&["Read"]));
+        assert_eq!(set.capability("Read"), Capability::Read);
+        assert!(set.groups().iter().any(|group| {
+            group.provenance == ServerProvenance::Builtin && group.display_names() == say(&["Read"])
+        }));
+        assert!(
+            set.groups()
+                .iter()
+                .all(|group| group.provenance != ServerProvenance::Configured)
+        );
     }
 
     /// The names a keep-mask leaves, per group.

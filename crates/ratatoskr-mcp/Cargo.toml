@@ -12,7 +12,7 @@ tracing.workspace = true
 # rmcp carries client + transport-child-process features (see workspace Cargo.toml); the version
 # is pinned to 2.x to match rig-agent, so the ServerSink handed to `.rmcp_tools()` type-checks.
 rmcp.workspace = true
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["process", "time"] }
 
 [lints]
 workspace = true

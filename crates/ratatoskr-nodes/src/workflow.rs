@@ -96,8 +96,10 @@ pub struct WorkflowContext {
     /// `None` without rag-rat. The nodes that call it outside the agent — the memory baseline and
     /// the bookkeeper — check before reaching for it.
     sink: Option<ServerSink>,
-    /// rag-rat's whole offer, the base of every node's tool pool.
-    rag_rat: Option<ServerTools>,
+    /// rag-rat's whole offer, followed by other configured server offers, for every node's pool.
+    servers: Vec<ServerTools>,
+    /// Configured offers without rag-rat, retained for fresh terminal-stage contexts.
+    configured_servers: Vec<ServerTools>,
     repo_path: PathBuf,
     /// Prepared by `redTeam` (or `implement` when no red team runs), then reused by implementation,
     /// iteration, and cleanup. The script never sees a raw path.
@@ -131,6 +133,7 @@ pub struct WorkflowContext {
 
 pub(crate) struct WorkflowContextParams<'a> {
     pub client: Option<&'a RagRatClient>,
+    pub configured: &'a [ServerTools],
     pub config: &'a RatatoskrConfig,
     pub store: &'a Store,
     pub run_id: &'a str,
@@ -152,6 +155,7 @@ impl WorkflowContext {
     ) -> Result<Arc<Self>, PlanError> {
         Self::new_with_ledger(WorkflowContextParams {
             client,
+            configured: &[],
             config,
             store,
             run_id,
@@ -167,6 +171,7 @@ impl WorkflowContext {
     ) -> Result<Arc<Self>, PlanError> {
         let WorkflowContextParams {
             client,
+            configured,
             config,
             store,
             run_id,
@@ -178,6 +183,7 @@ impl WorkflowContext {
         let repo_path = std::env::current_dir()
             .map_err(|e| PlanError::node("workflow", NodeError::Failed(format!("cwd: {e}"))))?;
         let clarifier = crate::clarify::NodeClarifier::new(config, store, engine, run_id, issue);
+        let configured_servers = configured.to_vec();
         Ok(Arc::new(Self {
             ledger,
             clarifier,
@@ -189,7 +195,12 @@ impl WorkflowContext {
             run_id: run_id.to_string(),
             issue: issue.to_string(),
             sink: client.map(|c| c.sink()),
-            rag_rat: client.map(|c| c.offer()),
+            servers: client
+                .map(|c| c.offer())
+                .into_iter()
+                .chain(configured_servers.iter().cloned())
+                .collect(),
+            configured_servers,
             repo_path,
             worktree: Mutex::new(None),
             red_team_started: AtomicBool::new(false),
@@ -464,7 +475,7 @@ fn build_red_team(
             let cfg = stage_agent_config(
                 &ctx.engine,
                 &ctx.config,
-                ctx.plugin_context.pool_for("redteam", ctx.rag_rat.clone()),
+                ctx.plugin_context.pool_for("redteam", &ctx.servers),
                 "redteam",
                 redteam::CLASSIFIER_TOOLS,
                 &mut plugins,
@@ -487,11 +498,8 @@ fn build_red_team(
     let author = match enabled {
         true => {
             let mut plugins = ctx.plugin_context.for_node("redteam");
-            let mut tools = ctx.plugin_context.pool_for("redteam", ctx.rag_rat.clone());
-            tools
-                .local()
-                .tools
-                .extend(ratatoskr_agent::files::edit_declarations());
+            let mut tools = ctx.plugin_context.pool_for("redteam", &ctx.servers);
+            tools.add_local_tools(ratatoskr_agent::files::edit_declarations());
             let cfg = crate::plugins::redteam_author_agent_config(
                 &ctx.engine,
                 &ctx.config,
@@ -520,7 +528,7 @@ fn build_red_team(
             &ctx.engine,
             &ctx.config,
             &ctx.plugin_context,
-            ctx.rag_rat.clone(),
+            ctx.servers.clone(),
             Some(Arc::clone(&ctx.ledger)),
             Some(Arc::clone(ctx)),
         )?,
@@ -609,11 +617,11 @@ fn build_implementer(
     ctx: &Arc<WorkflowContext>,
     analyst: AnalystOutput,
 ) -> Result<ImplementerNode, PlanError> {
-    let (cfg, plugins) = crate::build_implementer_agent(
+    let (cfg, plugins) = crate::build_implementer_agent_with_servers(
         &ctx.engine,
         &ctx.config,
         &ctx.plugin_context,
-        ctx.rag_rat.clone(),
+        ctx.servers.clone(),
     )?;
     Ok(ImplementerNode {
         clarifier: Some(ctx.clarifier.as_dyn()),
@@ -622,7 +630,7 @@ fn build_implementer(
             &ctx.engine,
             &ctx.config,
             &ctx.plugin_context,
-            ctx.rag_rat.clone(),
+            ctx.servers.clone(),
             Some(Arc::clone(&ctx.ledger)),
             Some(Arc::clone(ctx)),
         )
@@ -1634,31 +1642,25 @@ impl StageExecutor {
         let mut offered = self
             .ctx
             .plugin_context
-            .pool_for(&governance_id, self.ctx.rag_rat.clone());
+            .pool_for(&governance_id, &self.ctx.servers);
         if ratatoskr_core::Capability::ceiling(&stage.capabilities)
             .is_some_and(|ceiling| ceiling.permits(ratatoskr_core::Capability::Write))
         {
-            offered
-                .local()
-                .tools
-                .extend(ratatoskr_agent::files::edit_declarations());
+            offered.add_local_tools(ratatoskr_agent::files::edit_declarations());
         }
         if stage
             .tools
             .iter()
             .any(|tool| tool == ratatoskr_agent::shell::BASH)
         {
-            offered
-                .local()
-                .tools
-                .push(ratatoskr_agent::shell::declaration());
+            offered.add_local(ratatoskr_agent::shell::declaration());
         }
         if stage
             .tools
             .iter()
             .any(|tool| tool == ratatoskr_agent::ASK_TOOL_NAME)
         {
-            offered.local().tools.push(crate::clarify::ask_tool());
+            offered.add_local(crate::clarify::ask_tool());
         }
         if publish.is_some()
             && stage
@@ -1666,10 +1668,7 @@ impl StageExecutor {
                 .iter()
                 .any(|tool| tool == ratatoskr_agent::publish::GH)
         {
-            offered
-                .local()
-                .tools
-                .push(ratatoskr_agent::publish::declaration());
+            offered.add_local(ratatoskr_agent::publish::declaration());
         }
         if publish
             .as_ref()
@@ -1680,10 +1679,7 @@ impl StageExecutor {
                 .iter()
                 .any(|tool| tool == ratatoskr_agent::publish::PUSH)
         {
-            offered
-                .local()
-                .tools
-                .push(ratatoskr_agent::publish::push_declaration());
+            offered.add_local(ratatoskr_agent::publish::push_declaration());
         }
         let (mut cfg, profile) = crate::plugins::declared_stage_agent_config(
             &self.ctx.engine,
@@ -2333,6 +2329,21 @@ trait FullTerminalActions: Sync {
 
 struct LiveTerminalActions;
 
+fn terminal_run(ctx: &WorkflowContext) -> crate::Run<'_> {
+    crate::Run {
+        client: None,
+        configured: &ctx.configured_servers,
+        config: &ctx.config,
+        store: &ctx.store,
+        run_id: &ctx.run_id,
+        issue: &ctx.issue,
+        engine: &ctx.engine,
+        clarifier: &ctx.clarifier,
+        context: &ctx.plugin_context,
+        ledger: &ctx.ledger,
+    }
+}
+
 impl FullTerminalActions for LiveTerminalActions {
     async fn commit(
         &self,
@@ -2356,17 +2367,7 @@ impl FullTerminalActions for LiveTerminalActions {
         input: PublisherInput,
         terminal: bool,
     ) -> Option<PublisherOutput> {
-        let run = crate::Run {
-            client: None,
-            config: &ctx.config,
-            store: &ctx.store,
-            run_id: &ctx.run_id,
-            issue: &ctx.issue,
-            engine: &ctx.engine,
-            clarifier: &ctx.clarifier,
-            context: &ctx.plugin_context,
-            ledger: &ctx.ledger,
-        };
+        let run = terminal_run(ctx);
         crate::publish_if_enabled(&run, input, terminal).await
     }
 
@@ -2627,6 +2628,51 @@ mod tests {
             params: None,
             session: ratatoskr_core::SessionScope::Fresh,
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_run_retains_configured_server_offers() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-terminal-configured-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let config = RatatoskrConfig::default();
+        let mut tool = rmcp::model::Tool::default();
+        tool.name = "RemotePublish".to_string().into();
+        let configured = [ServerTools {
+            origin: "remote".to_string(),
+            sink: None,
+            tools: vec![tool],
+            prefix: None,
+            renames: std::collections::BTreeMap::new(),
+            capabilities: std::collections::BTreeMap::from([(
+                "RemotePublish".to_string(),
+                ratatoskr_core::Capability::Publish,
+            )]),
+            provenance: ratatoskr_mcp::ServerProvenance::Configured,
+        }];
+        let ctx = WorkflowContext::new_with_ledger(WorkflowContextParams {
+            client: None,
+            configured: &configured,
+            config: &config,
+            store: &store,
+            run_id: "terminal-configured",
+            issue: "publish through a configured server",
+            engine: &engine,
+            plugin_context: crate::PluginContext::default(),
+            ledger: Arc::new(ratatoskr_agent::RunLedger::default()),
+        })
+        .unwrap();
+
+        assert_eq!(
+            terminal_run(&ctx).configured[0].display_names(),
+            ["RemotePublish"]
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

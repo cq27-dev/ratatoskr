@@ -39,7 +39,7 @@ rig-agent = { version = "0.41", features = ["rmcp"] }
 # Conversation-memory policies + the CompactingMemory adapter. Version-locked to rig-core: the
 # `Compactor` trait itself lives there, so a skew here is a trait mismatch rather than a warning.
 rig-memory = "0.41"
-rmcp = { version = "2.2", features = ["client", "transport-child-process"] }
+rmcp = { version = "2.2", features = ["client", "reqwest", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 gix = "0.86"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -59,6 +59,7 @@ tracing-appender = "0.2"
 thiserror = "2"
 anyhow = "1"
 toml = "1"
+url = "2"
 dotenvy = "0.15"
 # jsonschema validates node output values against their schemars-generated schema. default-features
 # off drops the reqwest-based remote-$ref resolver we don't need (schemas are local & self-contained).

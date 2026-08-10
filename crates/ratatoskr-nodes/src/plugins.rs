@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use ratatoskr_core::{Capability, RatatoskrConfig, ToolDecision, ToolPolicy};
 use ratatoskr_graph::NodeError;
-use ratatoskr_mcp::{Connection, ServerTools, ToolSet};
+use ratatoskr_mcp::{Connection, ServerProvenance, ServerTools, SpawnEnvironment, ToolSet};
 use ratatoskr_script::ScriptEngine;
 
 use crate::stage::stage_profile;
@@ -41,6 +41,8 @@ pub struct PluginContext {
     limits: ratatoskr_core::HookLimits,
     /// Skills this repository does not want offered, by name.
     skills_deny: Vec<String>,
+    /// Host-owned transport credentials withheld from third-party hook subprocesses.
+    protected_env: Arc<Vec<String>>,
 }
 
 /// Shared node execution context: plugin contributions plus reusable profile guidance.
@@ -70,17 +72,19 @@ struct NodeObserver {
     cwd: PathBuf,
     hook_time: Arc<std::sync::atomic::AtomicU64>,
     limits: ratatoskr_core::HookLimits,
+    protected_env: Arc<Vec<String>>,
 }
 
 impl NodeObserver {
     /// Run one event past this node's plugins.
     fn run<'a>(&'a self, event: ratatoskr_plugin::HookEvent<'a>) -> ratatoskr_agent::Answer<'a> {
-        Box::pin(ratatoskr_plugin::run_event(
+        Box::pin(ratatoskr_plugin::run_event_with_env(
             &self.plugins,
             event,
             &self.cwd,
             &self.limits,
             &self.hook_time,
+            &self.protected_env,
         ))
     }
 }
@@ -163,6 +167,7 @@ impl PluginServer {
                 &self.plugin,
                 self.connection.origin(),
             )),
+            provenance: ServerProvenance::Plugin,
             ..self.connection.offer()
         }
     }
@@ -230,7 +235,14 @@ impl PluginContext {
         }
 
         let discovered: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
-        let contexts = ratatoskr_plugin::session_start(&plugins, cwd, &config.plugins.hooks).await;
+        let protected_env = Arc::new(config.mcp.credential_envs());
+        let contexts = ratatoskr_plugin::session_start_with_env(
+            &plugins,
+            cwd,
+            &config.plugins.hooks,
+            &protected_env,
+        )
+        .await;
         for (name, text) in &contexts {
             tracing::info!(plugin = name, chars = text.len(), "plugin session context");
         }
@@ -238,11 +250,20 @@ impl PluginContext {
             contexts,
             discovered,
             engine: Some(Arc::clone(engine)),
-            servers: Arc::new(connect_plugin_servers(&plugins, cwd).await),
+            servers: Arc::new(
+                connect_plugin_servers(
+                    &plugins,
+                    cwd,
+                    config.mcp.servers.keys().map(String::as_str),
+                    &protected_env,
+                )
+                .await,
+            ),
             plugins: Arc::new(plugins),
             hook_time: Arc::default(),
             limits: config.plugins.hooks.clone(),
             skills_deny: config.plugins.skills_deny.clone(),
+            protected_env,
         })
     }
 
@@ -253,12 +274,13 @@ impl PluginContext {
     /// left to inject into — so this runs for what a hook *does*.
     pub async fn session_end(&self, reason: &str) {
         let cwd = std::env::current_dir().unwrap_or_default();
-        if let Some(unused) = ratatoskr_plugin::run_event(
+        if let Some(unused) = ratatoskr_plugin::run_event_with_env(
             &self.plugins,
             ratatoskr_plugin::HookEvent::session_end(reason),
             &cwd,
             &self.limits,
             &self.hook_time,
+            &self.protected_env,
         )
         .await
         {
@@ -314,6 +336,7 @@ impl PluginContext {
                     cwd: std::env::current_dir().unwrap_or_default(),
                     hook_time: Arc::clone(&self.hook_time),
                     limits: self.limits.clone(),
+                    protected_env: Arc::clone(&self.protected_env),
                 }) as Arc<dyn ratatoskr_agent::PluginHooks>
             }),
         }
@@ -335,18 +358,13 @@ impl PluginContext {
         }
     }
 
-    /// Every tool `node` may call: rag-rat's catalogue, then the servers its plugins declare.
+    /// Every tool `node` may call: configured servers in precedence order, then bound plugins.
     ///
-    /// rag-rat comes first so it wins any name collision — see [`ToolSet::from_servers`].
-    /// The tools one node may call: rag-rat's, when there is a rag-rat, plus the plugin servers
-    /// bound to that node.
-    ///
-    /// `None` omits the group rather than passing an empty one, so a pool without rag-rat is the
-    /// same shape as a pool that never had it — nothing downstream has to special-case a server
-    /// that offers nothing.
-    pub(crate) fn pool_for(&self, node: &str, rag_rat: Option<ServerTools>) -> ToolSet {
+    /// rag-rat is supplied first by the caller so it wins any name collision — see
+    /// [`ToolSet::from_servers`]. `None` is omitted rather than represented by an empty group.
+    pub(crate) fn pool_for(&self, node: &str, configured: &[ServerTools]) -> ToolSet {
         let bound = self.bound(node);
-        let mut servers: Vec<ServerTools> = rag_rat.into_iter().collect();
+        let mut servers = configured.to_vec();
         servers.extend(
             self.servers
                 .iter()
@@ -364,10 +382,22 @@ impl PluginContext {
 async fn connect_plugin_servers(
     plugins: &[ratatoskr_plugin::Plugin],
     cwd: &std::path::Path,
+    configured: impl IntoIterator<Item = &str>,
+    protected_env: &[String],
 ) -> Vec<PluginServer> {
     let mut connected = Vec::new();
-    for (plugin, spec) in servers_to_start(plugins) {
-        match Connection::spawn(&spec.name, &spec.command, &spec.env, Some(cwd)).await {
+    for (plugin, spec) in servers_to_start_with_configured(plugins, configured) {
+        match Connection::spawn(
+            &spec.name,
+            &spec.command,
+            SpawnEnvironment {
+                set: &spec.env,
+                remove: protected_env,
+            },
+            Some(cwd),
+        )
+        .await
+        {
             Ok(connection) => connected.push(PluginServer {
                 plugin: plugin.to_string(),
                 connection,
@@ -384,17 +414,28 @@ async fn connect_plugin_servers(
 
 /// Which declared servers actually get started, paired with the plugin that declared each.
 ///
-/// One per server name, and rag-rat's name counts as already taken: the rag-rat plugin declares
-/// the very server ratatoskr launched from `[rag_rat]`, and a second copy would pay for another
-/// index load to offer the identical tools.
+/// One per server name, and configured server names count as already taken: the rag-rat plugin
+/// declares the very server ratatoskr launched from `[rag_rat]`, and a second copy would pay for
+/// another index load to offer the identical tools.
+#[cfg(test)]
 pub(crate) fn servers_to_start(
     plugins: &[ratatoskr_plugin::Plugin],
 ) -> Vec<(&str, &ratatoskr_plugin::McpServerSpec)> {
-    let mut claimed: Vec<&str> = vec![ratatoskr_mcp::RAG_RAT];
+    servers_to_start_with_configured(plugins, std::iter::empty())
+}
+
+fn servers_to_start_with_configured<'p, 'c>(
+    plugins: &'p [ratatoskr_plugin::Plugin],
+    configured: impl IntoIterator<Item = &'c str>,
+) -> Vec<(&'p str, &'p ratatoskr_plugin::McpServerSpec)> {
+    let mut claimed: std::collections::BTreeSet<String> = [ratatoskr_mcp::RAG_RAT.to_string()]
+        .into_iter()
+        .chain(configured.into_iter().map(str::to_string))
+        .collect();
     let mut start = Vec::new();
     for plugin in plugins {
         for spec in &plugin.mcp_servers {
-            if claimed.contains(&spec.name.as_str()) {
+            if claimed.contains(&spec.name) {
                 tracing::info!(
                     plugin = plugin.name,
                     server = spec.name,
@@ -402,7 +443,7 @@ pub(crate) fn servers_to_start(
                 );
                 continue;
             }
-            claimed.push(&spec.name);
+            claimed.insert(spec.name.clone());
             start.push((plugin.name.as_str(), spec));
         }
     }
@@ -473,10 +514,7 @@ fn node_agent_config(
     if !default_tools.is_empty()
         && ceiling.is_some_and(|capability| capability.permits(Capability::Read))
     {
-        tools
-            .local()
-            .tools
-            .extend(ratatoskr_agent::files::declarations());
+        tools.add_local_tools(ratatoskr_agent::files::declarations());
     }
     let ruleset = engine.ruleset(node);
     let rc = ruleset.as_ref().map(|r| r.config());
@@ -504,14 +542,43 @@ fn node_agent_config(
 
     // A ruleset's `allow` is exhaustive. The default is not just the node's built-in list: those
     // name rag-rat tools, written before any plugin was in the picture, so a plugin the node binds
-    // would otherwise contribute a server whose every tool is filtered straight back out.
-    let from_plugins = tools.names_beyond(ratatoskr_mcp::RAG_RAT);
+    // would otherwise contribute a server whose every tool is filtered straight back out. Include
+    // host-local tools generated for a stage, but only plugin-declared remote servers: configured
+    // servers (including Exa) require an explicit ruleset allow.
+    let from_plugins: Vec<String> = tools
+        .groups()
+        .iter()
+        .filter(|group| {
+            matches!(
+                group.provenance,
+                ServerProvenance::Builtin | ServerProvenance::Plugin
+            )
+        })
+        .flat_map(ServerTools::display_names)
+        .collect();
+    let configured_names = tools
+        .groups()
+        .iter()
+        .filter(|group| {
+            group.provenance == ServerProvenance::Configured
+                && group.origin != ratatoskr_mcp::RAG_RAT
+        })
+        .flat_map(ServerTools::display_names)
+        .collect::<std::collections::BTreeSet<_>>();
+    // A built-in list names rag-rat operations, not arbitrary operations that happen to claim the
+    // same display name. Keep absent names for the diagnostics below, but never let a configured
+    // server turn one into an implicit grant when rag-rat is not connected.
+    let implicit_defaults = default_tools
+        .iter()
+        .copied()
+        .filter(|name| !configured_names.contains(*name))
+        .collect::<Vec<_>>();
     let spelled_out = rc
         .and_then(|c| c.tools.as_ref())
         .and_then(|t| t.allow.as_deref());
     let allow: Vec<String> = match spelled_out {
         Some(a) => a.to_vec(),
-        None => default_allow(default_tools, from_plugins.clone()),
+        None => default_allow(&implicit_defaults, from_plugins.clone()),
     };
     let allowed: Vec<String> = allow
         .iter()
@@ -761,6 +828,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_tools_cannot_inherit_a_rag_rat_default_allow() {
+        let mut remote_search = rmcp::model::Tool::default();
+        remote_search.name = "remote_search".to_string().into();
+        let tools = ToolSet::from_servers(vec![ServerTools {
+            // Origin spelling must not let a configured server impersonate host-local tools.
+            origin: ratatoskr_mcp::LOCAL.to_string(),
+            sink: None,
+            tools: vec![remote_search],
+            prefix: None,
+            renames: std::collections::BTreeMap::from([(
+                "remote_search".to_string(),
+                "semantic_search".to_string(),
+            )]),
+            capabilities: std::collections::BTreeMap::from([(
+                "semantic_search".to_string(),
+                Capability::Read,
+            )]),
+            provenance: ServerProvenance::Configured,
+        }]);
+        let config = RatatoskrConfig::default();
+
+        let default_engine = binding_engine("exa-default-denied", "").await;
+        let default = stage_agent_config(
+            &default_engine,
+            &config,
+            tools.clone(),
+            "analyst",
+            &["semantic_search"],
+            &mut NodePlugins::default(),
+        )
+        .unwrap();
+        assert!(
+            !default
+                .tools
+                .names()
+                .iter()
+                .any(|name| name == "semantic_search")
+        );
+        assert!(
+            default
+                .tools
+                .groups()
+                .iter()
+                .all(|group| group.provenance != ServerProvenance::Configured)
+        );
+
+        let explicit_engine = binding_engine(
+            "exa-explicit-allow",
+            r#"defineAgent("analyst", { tools: { allow: ["semantic_search"] } });"#,
+        )
+        .await;
+        let explicit = stage_agent_config(
+            &explicit_engine,
+            &config,
+            tools,
+            "analyst",
+            &["semantic_search"],
+            &mut NodePlugins::default(),
+        )
+        .unwrap();
+        assert_eq!(explicit.tools.names(), vec!["semantic_search"]);
+    }
+
+    #[tokio::test]
+    async fn configured_tools_cannot_shadow_host_local_file_tools() {
+        let tools = ToolSet::from_servers(vec![ServerTools {
+            origin: "configured".to_string(),
+            sink: None,
+            tools: vec![{
+                let mut tool = rmcp::model::Tool::default();
+                tool.name = ratatoskr_agent::files::READ.to_string().into();
+                tool
+            }],
+            prefix: None,
+            renames: std::collections::BTreeMap::new(),
+            capabilities: std::collections::BTreeMap::from([(
+                ratatoskr_agent::files::READ.to_string(),
+                Capability::Read,
+            )]),
+            provenance: ServerProvenance::Configured,
+        }]);
+        let config = RatatoskrConfig::default();
+        let engine = binding_engine("configured-read-collision", "").await;
+
+        let configured = stage_agent_config(
+            &engine,
+            &config,
+            tools,
+            "analyst",
+            &[ratatoskr_agent::files::READ],
+            &mut NodePlugins::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            configured
+                .tools
+                .names()
+                .iter()
+                .filter(|name| name.as_str() == ratatoskr_agent::files::READ)
+                .count(),
+            1
+        );
+        assert_eq!(
+            configured.tools.capability(ratatoskr_agent::files::READ),
+            Capability::Read
+        );
+        assert!(configured.tools.groups().iter().any(|group| {
+            group.provenance == ServerProvenance::Builtin
+                && group
+                    .display_names()
+                    .iter()
+                    .any(|name| name == ratatoskr_agent::files::READ)
+        }));
+    }
+
+    #[tokio::test]
+    async fn plugin_provenance_keeps_its_implicit_grant_even_on_a_configured_name() {
+        let mut tool = rmcp::model::Tool::default();
+        tool.name = "search".to_string().into();
+        let tools = ToolSet::from_servers(vec![ServerTools {
+            origin: "web".to_string(),
+            sink: None,
+            tools: vec![tool],
+            prefix: Some(ratatoskr_mcp::qualified_prefix("web-plugin", "web")),
+            renames: std::collections::BTreeMap::new(),
+            capabilities: std::collections::BTreeMap::new(),
+            provenance: ServerProvenance::Plugin,
+        }]);
+        let engine = binding_engine("plugin-named-exa", "").await;
+        let config = RatatoskrConfig::default();
+        let capabilities = [Capability::Publish];
+
+        let configured = node_agent_config(
+            &engine,
+            &config,
+            tools,
+            "analyst",
+            &[],
+            &NodePlugins::default(),
+            AgentSettings {
+                capabilities: &capabilities,
+                profile: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            configured.tools.names(),
+            vec!["mcp__plugin_web-plugin_web__search"]
+        );
+    }
+
+    #[test]
+    fn configured_server_names_are_not_started_from_plugins() {
+        let plugins = [ratatoskr_plugin::Plugin {
+            name: "web-plugin".to_string(),
+            root: PathBuf::new(),
+            hooks: Vec::new(),
+            skills: Vec::new(),
+            mcp_servers: vec![
+                ratatoskr_plugin::McpServerSpec {
+                    name: "web".to_string(),
+                    command: vec!["false".to_string()],
+                    env: Default::default(),
+                },
+                ratatoskr_plugin::McpServerSpec {
+                    name: "other".to_string(),
+                    command: vec!["true".to_string()],
+                    env: Default::default(),
+                },
+            ],
+        }];
+
+        assert_eq!(
+            servers_to_start_with_configured(&plugins, ["web"])
+                .into_iter()
+                .map(|(plugin, spec)| (plugin, spec.name.as_str()))
+                .collect::<Vec<_>>(),
+            [("web-plugin", "other")]
+        );
+    }
+
+    #[tokio::test]
     async fn a_profile_policy_applies_to_every_stage_using_the_profile() {
         let engine = binding_engine("profile-policy", "").await;
         let mut config = RatatoskrConfig::default();
@@ -796,10 +1047,7 @@ mod tests {
         let route = config.models["analyst"].clone();
         config.models.insert("redteam".to_string(), route);
         let mut tools = ToolSet::default();
-        tools
-            .local()
-            .tools
-            .extend(ratatoskr_agent::files::edit_declarations());
+        tools.add_local_tools(ratatoskr_agent::files::edit_declarations());
 
         let cfg = redteam_author_agent_config(
             &engine,

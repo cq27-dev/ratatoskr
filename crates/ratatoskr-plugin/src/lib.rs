@@ -512,6 +512,16 @@ pub async fn session_start(
     cwd: &Path,
     limits: &HookLimits,
 ) -> BTreeMap<String, String> {
+    session_start_with_env(plugins, cwd, limits, &[]).await
+}
+
+/// [`session_start`] while withholding host-owned transport credential variables from hooks.
+pub async fn session_start_with_env(
+    plugins: &[Plugin],
+    cwd: &Path,
+    limits: &HookLimits,
+    protected_env: &[String],
+) -> BTreeMap<String, String> {
     let mut contexts = BTreeMap::new();
 
     // Per plugin, because nodes bind different sets and each composes from this map. Run through
@@ -519,7 +529,7 @@ pub async fn session_start(
     // *source*, not a tool name — is applied the same way.
     for plugin in plugins {
         let one = std::slice::from_ref(plugin);
-        let Some(text) = session_output(one, cwd, limits).await else {
+        let Some(text) = session_output(one, cwd, limits, protected_env).await else {
             continue;
         };
         // Whole plugins in or out, decided here rather than at composition: half a digest is
@@ -542,7 +552,12 @@ pub async fn session_start(
 ///
 /// `SessionStart` answers with plain text on stdout — no envelope — so its own reader is used
 /// rather than [`run_event`]'s. Everything else about it is the same.
-async fn session_output(plugins: &[Plugin], cwd: &Path, limits: &HookLimits) -> Option<String> {
+async fn session_output(
+    plugins: &[Plugin],
+    cwd: &Path,
+    limits: &HookLimits,
+    protected_env: &[String],
+) -> Option<String> {
     let plugin = plugins.first()?;
     let payload = envelope(&HookEvent::session_start(), cwd);
     let matching: Vec<&Hook> = plugin
@@ -552,11 +567,16 @@ async fn session_output(plugins: &[Plugin], cwd: &Path, limits: &HookLimits) -> 
         .collect();
 
     let started = std::time::Instant::now();
-    let answers = futures::future::join_all(
-        matching
-            .iter()
-            .map(|hook| run_hook(plugin, hook, hook.timeout(limits), &payload, cwd)),
-    )
+    let answers = futures::future::join_all(matching.iter().map(|hook| {
+        run_hook(
+            plugin,
+            hook,
+            hook.timeout(limits),
+            &payload,
+            cwd,
+            protected_env,
+        )
+    }))
     .await;
     // Not charged to the tool-hook budget: that bounds what plugins cost a node *per tool call*,
     // and this runs once for the whole run.
@@ -723,6 +743,18 @@ pub async fn run_event(
     limits: &HookLimits,
     spent: &AtomicU64,
 ) -> Option<String> {
+    run_event_with_env(plugins, event, cwd, limits, spent, &[]).await
+}
+
+/// [`run_event`] while withholding host-owned transport credential variables from hooks.
+pub async fn run_event_with_env(
+    plugins: &[Plugin],
+    event: HookEvent<'_>,
+    cwd: &Path,
+    limits: &HookLimits,
+    spent: &AtomicU64,
+    protected_env: &[String],
+) -> Option<String> {
     let budget = tool_time_budget(limits);
     if budget.is_some_and(|b| Duration::from_millis(spent.load(Ordering::Relaxed)) >= b) {
         return None;
@@ -745,7 +777,15 @@ pub async fn run_event(
 
     let payload = envelope(&event, cwd);
     let answers = futures::future::join_all(matching.iter().map(|(plugin, hook)| async {
-        let raw = run_hook(plugin, hook, hook.timeout(limits), &payload, cwd).await?;
+        let raw = run_hook(
+            plugin,
+            hook,
+            hook.timeout(limits),
+            &payload,
+            cwd,
+            protected_env,
+        )
+        .await?;
         additional_context(&raw, &plugin.name)
     }))
     .await;
@@ -857,6 +897,7 @@ async fn run_hook(
     timeout: Duration,
     payload: &serde_json::Value,
     cwd: &Path,
+    protected_env: &[String],
 ) -> Option<String> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -883,6 +924,9 @@ async fn run_hook(
     // as its own. Clear them all and set the three this host actually defines.
     for key in inherited_host_vars(std::env::vars_os().map(|(k, _)| k)) {
         command.env_remove(&key);
+    }
+    for key in protected_env {
+        command.env_remove(key);
     }
     let mut child = command
         // Plugins address their own files through these; the shell expands them from the
@@ -1184,6 +1228,31 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(".ratatoskr/plugin-data/environment");
+    }
+
+    #[tokio::test]
+    async fn configured_transport_credentials_are_withheld_from_hooks() {
+        const KEY: &str = "RATATOSKR_TEST_MCP_SECRET_232";
+        // This test owns a unique process variable and restores it before returning.
+        unsafe { std::env::set_var(KEY, "must-not-leak") };
+        let root = tool_plugin("protected-environment", ".*", "SessionStart", "");
+        std::fs::write(
+            root.join("hooks/hooks.json"),
+            format!(
+                r#"{{"hooks": {{"SessionStart": [{{"hooks": [{{"type": "command",
+                "command": "sh", "args": ["-c", "echo ${{{KEY}-missing}}"]}}]}}]}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let plugins = discover(std::slice::from_ref(&root));
+        let contexts =
+            session_start_with_env(&plugins, Path::new("."), &limits(), &[KEY.to_string()]).await;
+
+        unsafe { std::env::remove_var(KEY) };
+        assert_eq!(contexts["protected-environment"], "missing");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(".ratatoskr/plugin-data/protected-environment");
     }
 
     #[tokio::test]

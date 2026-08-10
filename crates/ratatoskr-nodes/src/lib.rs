@@ -121,6 +121,7 @@ pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError>
     let chosen = choose(&request).await?;
     let RunRequest {
         client,
+        configured,
         config,
         store,
         run_id,
@@ -136,15 +137,17 @@ pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError>
     let plugin_context =
         PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
             .await?;
-    let ctx = workflow::WorkflowContext::new(
+    let ctx = workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
         client,
+        configured,
         config,
         store,
         run_id,
         issue,
         engine,
         plugin_context,
-    )?;
+        ledger: Arc::new(RunLedger::default()),
+    })?;
     workflow::run_plan_scripted(runtime, ctx).await
 }
 
@@ -656,15 +659,17 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
     let input_json = serde_json::to_string(&input)?;
     let cwd = std::env::current_dir().unwrap_or_default();
     let plugin_context = PluginContext::resolve(request.config, request.engine, &cwd).await?;
-    let ctx = workflow::WorkflowContext::new(
-        request.client,
-        request.config,
-        request.store,
-        request.run_id,
-        request.issue,
-        request.engine,
+    let ctx = workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
+        client: request.client,
+        configured: request.configured,
+        config: request.config,
+        store: request.store,
+        run_id: request.run_id,
+        issue: request.issue,
+        engine: request.engine,
         plugin_context,
-    )?;
+        ledger: Arc::new(RunLedger::default()),
+    })?;
     let raw = workflow::evaluate_standard_stage(Arc::clone(&ctx), "overseer", input_json.clone())
         .await
         .map_err(|error| PlanError::node("overseer", NodeError::Failed(error)))?;
@@ -695,6 +700,8 @@ pub struct RunRequest<'a> {
     /// `None` when this repository runs without rag-rat: the nodes keep their file tools and the
     /// memory baseline is simply empty. See `RagRatConfig::configured`.
     pub client: Option<&'a RagRatClient>,
+    /// Repository-configured MCP server offers, in configured precedence order.
+    pub configured: &'a [ServerTools],
     pub config: &'a RatatoskrConfig,
     pub store: &'a Store,
     pub run_id: &'a str,
@@ -739,6 +746,7 @@ pub struct NodeAgentConfig {
 /// individually made each helper's signature grow with the run rather than with its job.
 pub(crate) struct Run<'a> {
     client: Option<&'a RagRatClient>,
+    configured: &'a [ServerTools],
     config: &'a RatatoskrConfig,
     store: &'a Store,
     run_id: &'a str,
@@ -1028,6 +1036,7 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
     let chosen = choose(&request).await?;
     let RunRequest {
         client,
+        configured,
         config,
         store,
         run_id,
@@ -1045,15 +1054,17 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
     let plugin_context =
         PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
             .await?;
-    let ctx = workflow::WorkflowContext::new(
+    let ctx = workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
         client,
+        configured,
         config,
         store,
         run_id,
         issue,
         engine,
         plugin_context,
-    )?;
+        ledger: Arc::new(RunLedger::default()),
+    })?;
     workflow::run_full_scripted(runtime, ctx).await
 }
 
@@ -1085,6 +1096,7 @@ async fn publish_and_checkpoint(
 ) -> Result<PublisherOutput, PlanError> {
     let &Run {
         client,
+        configured,
         config,
         store,
         run_id,
@@ -1114,6 +1126,7 @@ async fn publish_and_checkpoint(
     let declared_context =
         workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
             client,
+            configured,
             config,
             store,
             run_id,
@@ -1167,6 +1180,7 @@ async fn bookkeep_and_checkpoint(
     // `input` here, which on a replay is reconstructed from the store rather than passed in.
     let &Run {
         client,
+        configured,
         config,
         store,
         run_id,
@@ -1186,6 +1200,7 @@ async fn bookkeep_and_checkpoint(
         let declared_context =
             workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
                 client,
+                configured,
                 config,
                 store,
                 run_id,
@@ -1248,6 +1263,7 @@ async fn bookkeep_and_checkpoint(
 /// re-run. Reads the issue/analyst/implementer checkpoints and composes a fresh memory.
 pub async fn run_bookkeeper(
     client: Option<&RagRatClient>,
+    configured: &[ServerTools],
     config: &RatatoskrConfig,
     store: &Store,
     run_id: &str,
@@ -1296,6 +1312,7 @@ pub async fn run_bookkeeper(
     let ledger = Arc::new(RunLedger::default());
     let run = Run {
         client,
+        configured,
         config,
         store,
         run_id,
@@ -1317,7 +1334,7 @@ pub(crate) fn build_characterizer(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     context: &PluginContext,
-    offer: Option<ServerTools>,
+    configured: Vec<ServerTools>,
     ledger: Option<Arc<RunLedger>>,
     declared_context: Option<Arc<workflow::WorkflowContext>>,
 ) -> Result<Option<testrun::Characterizer>, PlanError> {
@@ -1338,7 +1355,7 @@ pub(crate) fn build_characterizer(
     let cfg = stage_agent_config(
         engine,
         config,
-        context.pool_for("characterizer", offer),
+        context.pool_for("characterizer", &configured),
         "characterizer",
         &[],
         &mut plugins,
@@ -1358,26 +1375,30 @@ pub(crate) fn build_characterizer(
 /// the read tools each node gets. Built in one place because those two powers belong together and
 /// to exactly one node — a second construction site is how one of them comes to be granted
 /// somewhere it was not meant to be.
+#[cfg(test)]
 fn build_implementer_agent(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     context: &PluginContext,
     offer: Option<ServerTools>,
 ) -> Result<(NodeAgentConfig, NodePlugins), PlanError> {
+    build_implementer_agent_with_servers(engine, config, context, offer.into_iter().collect())
+}
+
+fn build_implementer_agent_with_servers(
+    engine: &Arc<ScriptEngine>,
+    config: &RatatoskrConfig,
+    context: &PluginContext,
+    configured: Vec<ServerTools>,
+) -> Result<(NodeAgentConfig, NodePlugins), PlanError> {
     let mut plugins = context.for_node("implementer");
-    let mut tools = context.pool_for("implementer", offer);
-    tools
-        .local()
-        .tools
-        .extend(ratatoskr_agent::files::edit_declarations());
-    tools
-        .local()
-        .tools
-        .push(ratatoskr_agent::shell::declaration());
+    let mut tools = context.pool_for("implementer", &configured);
+    tools.add_local_tools(ratatoskr_agent::files::edit_declarations());
+    tools.add_local(ratatoskr_agent::shell::declaration());
     // The implementer can ask. It has the most turns to spend and is the only node that changes
     // code, so it is the one most likely to meet a question worth asking — and the run-wide
     // `ASK_BUDGET` is what keeps that a relief valve rather than a way to spend a run.
-    tools.local().tools.push(clarify::ask_tool());
+    tools.add_local(clarify::ask_tool());
     let mut cfg = stage_agent_config(
         engine,
         config,
@@ -2033,10 +2054,7 @@ mod agent_config_tests {
         // Without one there is nothing to run it in, which is exactly the state the publisher was
         // left in.
         let mut tools = ToolSet::default();
-        tools
-            .local()
-            .tools
-            .push(ratatoskr_agent::publish::declaration());
+        tools.add_local(ratatoskr_agent::publish::declaration());
         assert!(
             tools
                 .names()

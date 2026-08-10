@@ -15,8 +15,9 @@ pub mod telemetry;
 pub use capability::Capability;
 pub use config::{
     AcceptanceStep, AgentProfileConfig, CACHE_ROOT, CacheMount, ConfigError, DEFAULT_MAX_TOKENS,
-    EndpointConfig, HookLimits, ImplementerConfig, ModelRoute, PluginConfig, PublishConfig,
-    RagRatConfig, RatatoskrConfig, SandboxConfig, SessionScope, StoreConfig, WorktreeConfig,
+    EndpointConfig, HookLimits, ImplementerConfig, McpConfig, McpServerConfig, McpToolConfig,
+    McpTransport, ModelRoute, PluginConfig, PublishConfig, RagRatConfig, RatatoskrConfig,
+    SandboxConfig, SessionScope, StoreConfig, WorktreeConfig, valid_model_tool_name,
 };
 pub use control::{Command, Control, ControlView, Directive, RunControl};
 pub use policy::{ToolDecision, ToolPolicy};

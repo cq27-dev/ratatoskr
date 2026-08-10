@@ -5380,6 +5380,7 @@ dependencies = [
  "strum 0.28.0",
  "thiserror 2.0.19",
  "toml",
+ "url",
 ]
 
 [[package]]
@@ -5791,13 +5792,16 @@ dependencies = [
  "base64",
  "chrono",
  "futures",
+ "http",
  "pastey",
  "pin-project-lite",
  "process-wrap",
+ "reqwest",
  "rmcp-macros",
  "schemars",
  "serde",
  "serde_json",
+ "sse-stream",
  "thiserror 2.0.19",
  "tokio",
  "tokio-stream",
@@ -6816,6 +6820,19 @@ dependencies = [
  "thiserror 2.0.19",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "sse-stream"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39f24a9b78c40b90817bbcd1821c74ddfd74916aadd29403d001532a9195532d"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
 ]
 
 [[package]]

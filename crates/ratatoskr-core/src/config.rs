@@ -1,6 +1,6 @@
 //! `ratatoskr.toml` configuration.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,6 +13,9 @@ use crate::Capability;
 pub struct RatatoskrConfig {
     #[serde(default)]
     pub rag_rat: RagRatConfig,
+    /// MCP servers configured by the repository owner.
+    #[serde(default)]
+    pub mcp: McpConfig,
     pub store: StoreConfig,
     pub worktree: WorktreeConfig,
     /// Per-node model routing, keyed by stage name (`"scout"`, `"analyst"`, ...).
@@ -613,6 +616,62 @@ impl RagRatConfig {
     }
 }
 
+/// Repository-configured MCP servers, keyed by the stable origin name used in logs and plugins.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub servers: BTreeMap<String, McpServerConfig>,
+}
+
+/// A remote MCP server and the authority of the tools Ratatoskr exposes from it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerConfig {
+    pub transport: McpTransport,
+    pub url: String,
+    /// Environment variable containing a bare bearer token. Its value is never serialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token_env: Option<String>,
+    /// Whether failure to connect should fail the run rather than omit this server's tools.
+    #[serde(default)]
+    pub required: bool,
+    /// Wire tool names and the names/capabilities exposed to stages.
+    #[serde(default)]
+    pub tools: BTreeMap<String, McpToolConfig>,
+}
+
+/// Transport used to reach a configured MCP server.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    StreamableHttp,
+}
+
+/// Host-side metadata for one remote tool. Unlisted tools remain available as `publish`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpToolConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default = "default_mcp_tool_capability")]
+    pub capability: Capability,
+}
+
+fn default_mcp_tool_capability() -> Capability {
+    Capability::Publish
+}
+
+impl McpConfig {
+    /// Credential variable names owned by MCP transports and withheld from plugin hooks.
+    pub fn credential_envs(&self) -> Vec<String> {
+        self.servers
+            .values()
+            .filter_map(|server| server.bearer_token_env.clone())
+            .collect()
+    }
+}
+
 /// Ratatoskr's own checkpoint database — deliberately a separate file from rag-rat's index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreConfig {
@@ -787,8 +846,73 @@ impl RatatoskrConfig {
                 "implementer.max_turns must be >= 1".to_string(),
             ));
         }
+        for (name, server) in &self.mcp.servers {
+            if name.trim().is_empty() || name == "rag-rat" {
+                return Err(ConfigError::Invalid(format!(
+                    "mcp server name `{name}` is empty or reserved"
+                )));
+            }
+            if server.url.trim() != server.url {
+                return Err(ConfigError::Invalid(format!(
+                    "mcp.servers.{name}.url must be a valid HTTP(S) URL with a host"
+                )));
+            }
+            let parsed_url = url::Url::parse(&server.url).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "mcp.servers.{name}.url is not a valid URL: {error}"
+                ))
+            })?;
+            if !matches!(parsed_url.scheme(), "http" | "https") || parsed_url.host_str().is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "mcp.servers.{name}.url must be an HTTP(S) URL with a host"
+                )));
+            }
+            if let Some(env) = &server.bearer_token_env
+                && !valid_env_name(env)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "mcp.servers.{name}.bearer_token_env is not a valid environment variable name"
+                )));
+            }
+            let mut shown = std::collections::BTreeSet::new();
+            for (wire, tool) in &server.tools {
+                let display = tool.name.as_deref().unwrap_or(wire);
+                if wire.trim().is_empty() || display.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "mcp.servers.{name}.tools contains an empty tool name"
+                    )));
+                }
+                if !valid_model_tool_name(display) {
+                    return Err(ConfigError::Invalid(format!(
+                        "mcp.servers.{name}.tools.{wire}.name must match ^[A-Za-z0-9_-]{{1,64}}$"
+                    )));
+                }
+                if !shown.insert(display) {
+                    return Err(ConfigError::Invalid(format!(
+                        "mcp.servers.{name}.tools exposes duplicate name `{display}`"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
+}
+
+fn valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// The common provider contract for client tool names. Keeping configured aliases inside the
+/// narrowest supported grammar prevents a valid config from failing only when a model is called.
+pub fn valid_model_tool_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 impl Default for RatatoskrConfig {
@@ -815,6 +939,7 @@ impl Default for RatatoskrConfig {
                     .to_vec(),
                 working_dir: None,
             },
+            mcp: McpConfig::default(),
             store: StoreConfig {
                 path: PathBuf::from(".ratatoskr/state.sqlite3"),
             },
@@ -1397,6 +1522,81 @@ mod tests {
         let with = format!("{toml}\n[rag_rat]\ncommand = [\"rag-rat\", \"mcp\"]\n");
         let cfg: RatatoskrConfig = toml::from_str(&with).expect("parses");
         assert!(cfg.rag_rat.configured());
+    }
+
+    #[test]
+    fn configured_mcp_servers_are_explicit_and_validated() {
+        let base = r#"
+            [store]
+            path = ".ratatoskr/state.sqlite3"
+            [worktree]
+            root = "../wt"
+            [sandbox]
+            backend = "landlock"
+            image = "checks"
+            test_command = ["cargo", "test"]
+        "#;
+        let absent: RatatoskrConfig = toml::from_str(base).unwrap();
+        assert!(absent.mcp.servers.is_empty());
+
+        let source = format!(
+            r#"{base}
+            [mcp.servers.exa]
+            transport = "streamable_http"
+            url = "https://mcp.exa.ai/mcp"
+            bearer_token_env = "EXA_API_KEY"
+
+            [mcp.servers.exa.tools.web_search_exa]
+            name = "WebSearch"
+            capability = "read"
+            "#
+        );
+        let present: RatatoskrConfig = toml::from_str(&source).unwrap();
+        present.validate().unwrap();
+        let exa = &present.mcp.servers["exa"];
+        assert!(!exa.required);
+        assert_eq!(
+            exa.tools["web_search_exa"].name.as_deref(),
+            Some("WebSearch")
+        );
+        assert_eq!(present.mcp.credential_envs(), ["EXA_API_KEY"]);
+
+        for (fragment, expected) in [
+            ("url = \"\"", "url"),
+            ("url = \"not-a-url\"", "url"),
+            ("url = \"http://localhost:abc\"", "invalid port number"),
+            ("url = \"https://\"", "empty host"),
+            ("url = \"file:///tmp/mcp.sock\"", "url"),
+            (
+                "url = \"https://example.test/mcp\"\nbearer_token_env = \"BAD-NAME\"",
+                "bearer_token_env",
+            ),
+        ] {
+            let malformed: RatatoskrConfig = toml::from_str(&format!(
+                "{base}\n[mcp.servers.remote]\ntransport = \"streamable_http\"\n{fragment}"
+            ))
+            .unwrap();
+            assert!(
+                matches!(malformed.validate(), Err(ConfigError::Invalid(error)) if error.contains(expected))
+            );
+        }
+
+        for alias in ["Web Search".to_string(), "é".to_string(), "x".repeat(65)] {
+            let malformed: RatatoskrConfig = toml::from_str(&format!(
+                r#"{base}
+                [mcp.servers.remote]
+                transport = "streamable_http"
+                url = "https://example.test/mcp"
+                [mcp.servers.remote.tools.search]
+                name = "{alias}"
+                "#
+            ))
+            .unwrap();
+            assert!(
+                matches!(malformed.validate(), Err(ConfigError::Invalid(error)) if error.contains("must match")),
+                "alias `{alias}` must be rejected"
+            );
+        }
     }
 
     #[test]
