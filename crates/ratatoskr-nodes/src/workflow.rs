@@ -1418,16 +1418,20 @@ fn stage_question_renderers(stages: &[Stage]) -> HashMap<String, String> {
 }
 
 pub(crate) async fn standard_stages() -> Result<Vec<Stage>, PlanError> {
-    let meta = WorkflowRuntime::bundled_meta_with_includes(
+    let runtime = standard_runtime().await?;
+    let stages = crate::stage::stages_from_workflow(runtime.meta());
+    crate::validate::validate_declared_contracts(&stages)?;
+    Ok(stages)
+}
+
+pub(crate) async fn standard_runtime() -> Result<WorkflowRuntime, PlanError> {
+    WorkflowRuntime::bundled_with_includes(
         "ratatoskr-standard-v1",
         STANDARD_WORKFLOW_V1,
         STANDARD_WORKFLOW_INCLUDES,
     )
     .await
-    .map_err(|error| PlanError::node("workflow", NodeError::Failed(error.to_string())))?;
-    let stages = crate::stage::stages_from_workflow(&meta);
-    crate::validate::validate_declared_contracts(&stages)?;
-    Ok(stages)
+    .map_err(|error| PlanError::node("workflow", NodeError::Failed(error.to_string())))
 }
 
 /// Evaluate one bundled standard stage outside a repository workflow script.
@@ -1610,6 +1614,14 @@ pub async fn run_plan_scripted(
     runtime: WorkflowRuntime,
     ctx: Arc<WorkflowContext>,
 ) -> Result<PlanOutcome, PlanError> {
+    run_plan_scripted_with_turn(runtime, ctx, Arc::new(LiveStageTurn)).await
+}
+
+async fn run_plan_scripted_with_turn(
+    runtime: WorkflowRuntime,
+    ctx: Arc<WorkflowContext>,
+    turn: Arc<dyn StageTurn>,
+) -> Result<PlanOutcome, PlanError> {
     // The run row first: the issue checkpoint references it, and the schema enforces that.
     ctx.store
         .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
@@ -1626,7 +1638,7 @@ pub async fn run_plan_scripted(
     .await?;
 
     let stages = execution_stages(&runtime).await?;
-    let hosts = build_hosts(&ctx, &stages)?;
+    let hosts = build_hosts_with_turn(&ctx, &stages, turn)?;
     let input = json!({ "issue": ctx.issue }).to_string();
     let result = runtime
         .run_with_question_renderers("plan", input, hosts, stage_question_renderers(&stages))
@@ -1854,6 +1866,8 @@ async fn bookkeep_scripted(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
     use crate::analyst;
 
@@ -2057,6 +2071,231 @@ mod tests {
             let output = self.output.clone();
             Box::pin(async move { Ok(output) })
         }
+    }
+
+    struct SequencedStageTurn {
+        outputs: Mutex<VecDeque<String>>,
+        runs: Mutex<Vec<ObservedStageRun>>,
+    }
+
+    struct ObservedStageRun {
+        node: String,
+        session: ratatoskr_core::SessionScope,
+        question: String,
+        ledger_id: Option<usize>,
+    }
+
+    impl SequencedStageTurn {
+        fn new(outputs: impl IntoIterator<Item = serde_json::Value>) -> Self {
+            Self {
+                outputs: Mutex::new(outputs.into_iter().map(|value| value.to_string()).collect()),
+                runs: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl StageTurn for SequencedStageTurn {
+        fn run<'a>(
+            &'a self,
+            run: ratatoskr_agent::NodeRun<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, ratatoskr_agent::AgentError>> + Send + 'a>>
+        {
+            self.runs
+                .lock()
+                .expect("sequenced runner mutex poisoned")
+                .push(ObservedStageRun {
+                    node: run.node.to_string(),
+                    session: run.route.session,
+                    question: run.question.to_string(),
+                    ledger_id: run
+                        .ledger
+                        .as_ref()
+                        .map(|ledger| Arc::as_ptr(ledger) as usize),
+                });
+            let output = self
+                .outputs
+                .lock()
+                .expect("sequenced runner mutex poisoned")
+                .pop_front()
+                .expect("one staged output per model turn");
+            Box::pin(async move { Ok(output) })
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_standard_plan_sequences_typed_checkpointed_stages() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-plan-entry-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "context".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "test".to_string(),
+                model: "context-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-standard-plan",
+            "preserve the declared plan path",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let turn = Arc::new(SequencedStageTurn::new([
+            json!({
+                "brief": "the generic stage boundary is load-bearing",
+                "constraints": [{ "says": "checkpoint the original input" }],
+                "prior_art": [],
+                "papertrail_summary": "standard-v1 owns sequencing"
+            }),
+            json!({
+                "impact_summary": "route built-in plan through the bundled runtime",
+                "changes_code": true,
+                "requirements": ["preserve checkpoint reconstruction"]
+            }),
+        ]));
+
+        let outcome = run_plan_scripted_with_turn(
+            standard_runtime().await.unwrap(),
+            Arc::clone(&ctx),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.state.status, RunStatus::Planned);
+        assert_eq!(
+            outcome.analyst.impact_summary,
+            "route built-in plan through the bundled runtime"
+        );
+        assert_eq!(outcome.brief, "the generic stage boundary is load-bearing");
+
+        let checkpoints = store
+            .checkpoints_for_run("run-standard-plan")
+            .await
+            .unwrap();
+        assert_eq!(
+            checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.node_name.as_str())
+                .collect::<Vec<_>>(),
+            ["issue", "context", "analyst"]
+        );
+        let context: crate::ContextOutput =
+            serde_json::from_str(&checkpoints[1].output_json).unwrap();
+        let analyst_input: analyst::AnalystInput =
+            serde_json::from_str(checkpoints[2].input_json.as_deref().unwrap()).unwrap();
+        assert_eq!(analyst_input.issue, "preserve the declared plan path");
+        assert!(analyst_input.brief.is_empty());
+        assert!(analyst_input.constraints.is_empty());
+        assert_eq!(
+            analyst_input.scout.papertrail_summary,
+            context.scout.papertrail_summary
+        );
+        assert_eq!(
+            analyst_input.memory.memories.len(),
+            context.memory.memories.len()
+        );
+
+        let runs = turn.runs.lock().expect("sequenced runner mutex poisoned");
+        assert_eq!(
+            runs.iter().map(|run| run.node.as_str()).collect::<Vec<_>>(),
+            ["context", "analyst"]
+        );
+        assert_eq!(runs[1].session, ratatoskr_core::SessionScope::Compacted);
+        assert!(runs[0].ledger_id.is_some());
+        assert_eq!(runs[0].ledger_id, runs[1].ledger_id);
+        let context_input = crate::context::distillation_input(
+            "preserve the declared plan path",
+            crate::MemoryOutput::default(),
+            false,
+        );
+        let expected_context = crate::context::render_prompt(
+            &context_input.issue,
+            &context_input.memory,
+            context_input.searchable,
+        );
+        assert!(runs[0].question.starts_with(
+            "Input contract: ContextDistillationInput\nOutput contract: Distillation\n\n"
+        ));
+        assert!(runs[0].question.ends_with(&expected_context));
+        assert!(
+            runs[1]
+                .question
+                .starts_with("Input contract: AnalystInput\nOutput contract: AnalystOutput\n\n")
+        );
+        assert!(
+            runs[1]
+                .question
+                .ends_with(&analyst::render_prompt(&analyst_input))
+        );
+        drop(runs);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn bundled_standard_plan_cannot_succeed_without_required_checkpoints() {
+        let runtime = WorkflowRuntime::bundled_with_includes(
+            "incomplete-standard-plan",
+            r#"defineWorkflow({ name: "incomplete-standard-plan" });
+               async function plan(input) { return input; }"#,
+            &[],
+        )
+        .await
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-incomplete-standard-plan-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let ctx = WorkflowContext::new(
+            None,
+            &RatatoskrConfig::default(),
+            &store,
+            "run-incomplete-standard-plan",
+            "skip every stage",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+
+        let error =
+            match run_plan_scripted_with_turn(runtime, ctx, Arc::new(SequencedStageTurn::new([])))
+                .await
+            {
+                Ok(_) => panic!("a plan without required checkpoints must fail"),
+                Err(error) => error,
+            };
+        assert!(
+            matches!(error, PlanError::MissingCheckpoint(_, "scout")),
+            "missing context evidence must fail reconstruction: {error}"
+        );
+        assert_eq!(
+            store
+                .run_status("run-incomplete-standard-plan")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(RunStatus::Failed.as_str())
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     struct StaticClarifier;
@@ -2364,6 +2603,69 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("legacy workflow operation"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn repository_workflows_cannot_invoke_standard_terminal_stages() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-terminal-stage-boundary-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"defineWorkflow({ name: "terminal-probe" });
+               async function plan(input) {
+                 return input.target === "publisher"
+                   ? await publisher(input)
+                   : await bookkeeper(input);
+               }"#,
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::load(&workflow_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let ctx = WorkflowContext::new(
+            None,
+            &RatatoskrConfig::default(),
+            &store,
+            "run-terminal-stage-boundary",
+            "try a terminal stage",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = execution_stages(&runtime).await.unwrap();
+        let hosts = build_hosts(&ctx, &stages).unwrap();
+        assert!(!hosts.contains_key("publisher"));
+        assert!(!hosts.contains_key("bookkeeper"));
+
+        for target in ["publisher", "bookkeeper"] {
+            let error = runtime
+                .run_with_question_renderers(
+                    "plan",
+                    json!({ "target": target }).to_string(),
+                    hosts.clone(),
+                    stage_question_renderers(&stages),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(target),
+                "terminal call error changed: {error}"
+            );
+            assert!(
+                error.contains("not defined"),
+                "terminal stage unexpectedly had a host: {error}"
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -1,5 +1,5 @@
-// Bundled standard-stage declarations, version 1. Repository workflow scripts still own
-// sequencing; these declarations own the generic host contract for migrated standard stages.
+// Bundled standard workflow, version 1. The declarations own generic model-stage contracts; its
+// entrypoints compose Rust-owned operation hosts, which retain checkpointing and workflow gates.
 defineWorkflow({
   name: "ratatoskr-standard-v1",
   stages: [
@@ -743,3 +743,19 @@ defineWorkflow({
     }),
   ],
 });
+
+// Back `ratatoskr plan` with the same runtime used by repository workflows. `context` owns the
+// deterministic evidence baseline and checkpoints the merged result; `analyst` is the declared
+// model stage and checkpoints the exact structured input below. Rust reconstructs the returned
+// PlanOutcome from those checkpoints, so this function's return value is informational only.
+async function plan(input: { issue: string }) {
+  const gathered = await context(input.issue);
+  // The initial built-in hand-off is AnalystInput::fresh. Rust retains the brief and constraints
+  // in PlanOutcome and supplies them if review later asks the analyst to revise the plan.
+  const analysis = await analyst({
+    issue: input.issue,
+    scout: gathered.scout,
+    memory: gathered.memory,
+  });
+  return { context: gathered, analyst: analysis };
+}

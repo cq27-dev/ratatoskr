@@ -298,13 +298,34 @@ impl WorkflowRuntime {
         src: &str,
         includes: &[(&str, &str)],
     ) -> Result<WorkflowMeta, ScriptError> {
+        Ok(Self::bundled_with_includes(name, src, includes)
+            .await?
+            .meta()
+            .clone())
+    }
+
+    /// Load an executable workflow bundled into the binary, with explicit compile-time `LOAD`
+    /// assets. Bundled workflows have no filesystem dependencies: their source and includes are
+    /// part of the owning binary rather than files watched in a repository.
+    pub async fn bundled_with_includes(
+        name: &str,
+        src: &str,
+        includes: &[(&str, &str)],
+    ) -> Result<Self, ScriptError> {
         let source = transpile::transpile_bundled_workflow(name, src, includes)?;
         let runtime = AsyncRuntime::new().map_err(|e| ScriptError::Eval(e.to_string()))?;
         let context = AsyncContext::full(&runtime)
             .await
             .map_err(|e| ScriptError::Eval(e.to_string()))?;
-        Self::declared(&context, &source).await?.ok_or_else(|| {
+        let meta = Self::declared(&context, &source).await?.ok_or_else(|| {
             ScriptError::Eval(format!("bundled workflow `{name}` has no declaration"))
+        })?;
+        Ok(Self {
+            _runtime: runtime,
+            context,
+            source: source.into_boxed_str(),
+            meta: Box::new(meta),
+            dependencies: Box::new([]),
         })
     }
 
@@ -652,6 +673,41 @@ mod tests {
         // Selection is a matching problem, so the concrete cases are the part that carries.
         assert_eq!(meta.when_to_use.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_bundled_workflow_with_includes_is_executable() {
+        let runtime = WorkflowRuntime::bundled_with_includes(
+            "bundled-test",
+            r#"defineWorkflow({
+                 name: "bundled-test",
+                 stages: [stage("probe", {
+                   agent: "reason",
+                   instructions: LOAD("prompt.md").trim(),
+                 })],
+               });
+               async function plan(input) { return await probe(input); }"#,
+            &[("prompt.md", "bundled guidance\n")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(runtime.meta().stages[0].instructions, "bundled guidance");
+        assert!(runtime.dependencies().is_empty());
+
+        let mut hosts = HashMap::new();
+        hosts.insert("probe".to_string(), host(|arg| async move { Ok(arg) }));
+        let output = runtime
+            .run(
+                "plan",
+                serde_json::json!({ "issue": "exercise it" }).to_string(),
+                hosts,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            serde_json::json!({ "issue": "exercise it" })
+        );
     }
 
     #[tokio::test]

@@ -129,50 +129,24 @@ pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError>
         engine,
         ..
     } = request;
-    // A workflow, when this repo defines one, overrides the built-in sequencing.
-    if let Workflow::Scripted(runtime) = chosen {
-        let plugin_context =
-            PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
-                .await?;
-        let ctx = workflow::WorkflowContext::new(
-            client,
-            config,
-            store,
-            run_id,
-            issue,
-            engine,
-            plugin_context,
-        )?;
-        return workflow::run_plan_scripted(runtime, ctx).await;
-    }
-
-    // Once per run: `SessionStart` describes the repository, not the node.
-    let context =
+    let runtime = match chosen {
+        Workflow::BuiltIn => workflow::standard_runtime().await?,
+        Workflow::Scripted(runtime) => runtime,
+    };
+    // Once per run: `SessionStart` describes the repository, not the stage or entrypoint.
+    let plugin_context =
         PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
             .await?;
-    let ledger = Arc::new(RunLedger::default());
-    let outcome = plan_half(PlanHalfRequest {
+    let ctx = workflow::WorkflowContext::new(
         client,
         config,
         store,
         run_id,
         issue,
         engine,
-        context: &context,
-        ledger: &ledger,
-    })
-    .await;
-    // Closed by whoever owns the run's lifetime: a `plan` ends here, a `run` carries on.
-    context.session_end(status_of(&outcome)).await;
-    outcome
-}
-
-/// The status a finished plan reports, which is also the reason its session ended.
-fn status_of(outcome: &Result<PlanOutcome, PlanError>) -> &'static str {
-    match outcome.is_ok() {
-        true => RunStatus::Planned.as_str(),
-        false => RunStatus::Failed.as_str(),
-    }
+        plugin_context,
+    )?;
+    workflow::run_plan_scripted(runtime, ctx).await
 }
 
 struct PlanHalfRequest<'a> {
