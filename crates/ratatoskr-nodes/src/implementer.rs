@@ -264,7 +264,7 @@ impl ImplementerNode {
                 shell: Some(self.shell_access(worktree)),
                 publish: None,
                 clarifier: self.clarifier.clone(),
-                guidance: Some(where_you_are(worktree)),
+                guidance: Some(where_you_are()),
             },
         )
         .await
@@ -358,14 +358,12 @@ impl ImplementerNode {
 /// conversation that receives only a diagnostic — it would otherwise have to rediscover this every
 /// iteration. Told rather than left to be found: a node that has to run `git rev-parse` and `ls`
 /// before it can start has spent two turns learning something nobody had a reason to withhold.
-fn where_you_are(worktree: &WorktreePath) -> String {
-    format!(
-        "\n\n# WHERE YOU ARE\n\nYour worktree is `{}`, and it is already checked out on your own \
-         branch. Your tools start there: a relative path is resolved against it, Bash starts there, \
-         and reading or writing outside it is refused. It is a full copy of the repository — the \
-         change you are asked for is made here, and nowhere else.",
-        worktree.as_path().display()
-    )
+fn where_you_are() -> String {
+    "\n\n# WHERE YOU ARE\n\nYour tools already start in this run's worktree, which is already \
+     checked out on your own branch. Use relative paths with Read, Edit, and Bash; relative paths \
+     resolve against the worktree. Reading or writing outside the worktree is refused. It is a full \
+     copy of the repository — the change you are asked for is made here, and nowhere else."
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -392,9 +390,70 @@ mod tests {
         // Each attempt is a fresh conversation — a re-driven one receives only a diagnostic — so
         // this rides on the preamble rather than the task prompt. Left out, the first thing a run
         // does is spend turns on `git rev-parse` and `ls` to find out where it woke up.
-        let told = where_you_are(&WorktreePath(PathBuf::from("/w/ratatoskr/abc12345")));
-        assert!(told.contains("/w/ratatoskr/abc12345"), "{told}");
+        let told = where_you_are();
+        assert!(!told.contains("/w/ratatoskr/abc12345"), "{told}");
+        assert!(
+            told.contains("relative paths with Read, Edit, and Bash"),
+            "{told}"
+        );
         assert!(told.contains("branch"), "{told}");
+    }
+
+    #[test]
+    fn where_you_are_states_the_backend_neutral_worktree_contract() {
+        // Issue #212: the guidance block takes no WorktreePath — the signature is the contract,
+        // because a parameter is an invitation to render it. Asserted on the facts rather than the
+        // wording, whitespace-collapsed so a reflowed paragraph is not a failing test.
+        let told = where_you_are()
+            .to_ascii_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        // The tools start in the run's worktree and relative paths resolve there.
+        assert!(told.contains("worktree"), "{told}");
+        assert!(told.contains("relative"), "{told}");
+        // The implementer is told to use relative paths with each tool it would otherwise
+        // hand an absolute path to.
+        assert!(told.contains("read"), "{told}");
+        assert!(told.contains("edit"), "{told}");
+        assert!(told.contains("bash"), "{told}");
+        // The invariants the run actually enforces are still stated: its own already-checked-out
+        // branch, and access outside the worktree refused.
+        assert!(told.contains("branch"), "{told}");
+        assert!(told.contains("outside"), "{told}");
+        assert!(told.contains("refused"), "{told}");
+    }
+
+    #[test]
+    fn where_you_are_renders_no_host_absolute_path() {
+        // Regression for #212: the preamble used to render the host-side WorktreePath, which is
+        // not a valid path for every sandbox backend (the container backend mounts the worktree
+        // at a guest path; bwrap binds it in place). The block takes no worktree argument now, so
+        // the only way this fails is a host path being reintroduced by name.
+        let told = where_you_are();
+        assert!(
+            !told.contains("/w/ratatoskr/abc12345"),
+            "the implementer preamble must not contain a host absolute worktree path: {told}"
+        );
+        // No absolute path of any flavour: the guidance is relative-paths-only, so a `/`-rooted
+        // token has no legitimate reason to appear.
+        assert!(
+            !told
+                .split_whitespace()
+                .any(|word| word.starts_with('/') && word.len() > 1),
+            "the implementer preamble must not name an absolute path: {told}"
+        );
+    }
+
+    #[test]
+    fn where_you_are_is_identical_regardless_of_sandbox_backend() {
+        // The block must hold for both the container and bwrap backends: it takes no backend
+        // input, so the strongest checkable form of the contract is that the output names no
+        // backend and carries no backend-conditional text.
+        let told = where_you_are().to_ascii_lowercase();
+        assert!(!told.contains("container"), "{told}");
+        assert!(!told.contains("bwrap"), "{told}");
+        assert!(!told.contains("microsandbox"), "{told}");
     }
 
     #[tokio::test]
