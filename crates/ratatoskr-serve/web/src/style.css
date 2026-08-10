@@ -492,18 +492,25 @@ body {
   min-width: 0;
 }
 
-/* The argument that distinguishes one call from the next, in plain LTR. The server trims a long
-   one from the front and marks it, so the end — the file name, the tail of a command — is what
-   survives. `direction: rtl` used to do that job here and cost more than it gave: it reverses how
-   the text selects, and it reorders a neutral character at either end of the string — so an
-   absolute path rendered with its leading `/` at the far end, reading as a directory it is not. */
-.ev-a {
+/* Tool arguments are structured data, collapsed until a reader asks for them. */
+.ev-args {
   flex: 1;
   min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
   color: var(--fg);
+}
+.ev-args > summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+.ev-args > summary:focus-visible {
+  outline: 1px solid var(--fg);
+  outline-offset: 2px;
+}
+.ev-args[open] > summary {
+  color: var(--fg);
+}
+.ev-args .json {
+  margin-top: 4px;
 }
 
 /* A collapsed run. Quiet — it is a count, not the point of the line. */
@@ -976,7 +983,6 @@ body {
 /* Inline markers in model prose. Deliberately quiet: a feed row is one line among hundreds, and
    emphasis that shouts costs more than the emphasis is worth. */
 .ev-d code,
-.ev-a code {
   background: #1c1c1c;
   border: 1px solid var(--rule);
   padding: 0 3px;

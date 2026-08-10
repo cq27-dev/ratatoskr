@@ -287,8 +287,10 @@ export interface LiveEvent {
   detail: string;
   /** Present on a `question` event: what an answer is posted against. */
   question_id?: string;
-  /** The one argument that identifies a tool call: the path read, the pattern searched. */
-  arg?: string;
+  /** An optional producer-provided summary for a tool call. */
+  subject?: string;
+  /** The bounded JSON arguments supplied to a tool call. */
+  args?: unknown;
   /** How long a tool took, on its `tool_result`. */
   duration_ms?: number;
   /** Present on `node_start` and `checkpoint`: what the node ran on. */

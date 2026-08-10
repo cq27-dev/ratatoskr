@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { InlineJson, Prose } from "../ui/format";
+import { Json, Prose } from "../ui/format";
 import { RowIcon, kindLabel } from "../ui/tools";
 import { accent, prose, rowTint } from "../ui/tint";
 import { clock } from "../ui/text";
@@ -46,8 +46,10 @@ interface Row {
   node: string | null;
   action: string;
   detail: string;
-  /** The identifying argument, shown apart from the action so it can be styled as data. */
-  arg?: string;
+  /** A producer-provided tool-call summary. */
+  subject?: string;
+  /** The tool call's bounded structured arguments. */
+  args?: unknown;
   /** How many identical calls this row stands for. 1 unless collapsed. */
   count: number;
   durationMs?: number;
@@ -63,7 +65,8 @@ interface Row {
 
 interface RowPart {
   at: string;
-  arg?: string;
+  subject?: string;
+  args?: unknown;
   durationMs?: number;
 }
 
@@ -131,10 +134,15 @@ function rows(events: LiveEvent[]): Row[] {
       last.action === e.detail
     ) {
       last.count += 1;
-      // The last argument, so the row still says where the run got to.
-      if (e.arg) last.arg = e.arg;
+      // The summary retains the latest explicit subject; every call keeps its own arguments below.
+      if (e.subject !== undefined) last.subject = e.subject;
+      last.args = e.args;
       last.at = e.at;
-      last.parts.push({ at: e.at, ...(e.arg ? { arg: e.arg } : {}) });
+      last.parts.push({
+        at: e.at,
+        ...(e.subject !== undefined ? { subject: e.subject } : {}),
+        ...(e.args !== undefined ? { args: e.args } : {}),
+      });
       continue;
     }
     const action = e.kind === "tool_call" ? e.detail : kindLabel(e.kind);
@@ -144,13 +152,29 @@ function rows(events: LiveEvent[]): Row[] {
       action,
       // A message that only restates the action is not a second column: `checkpoint checkpoint`.
       detail: e.kind === "tool_call" || detail === action ? "" : detail,
-      ...(e.arg ? { arg: e.arg } : {}),
+      ...(e.subject !== undefined ? { subject: e.subject } : {}),
+      ...(e.args !== undefined ? { args: e.args } : {}),
       count: 1,
       kind: e.kind,
-      parts: [{ at: e.at, ...(e.arg ? { arg: e.arg } : {}) }],
+      parts: [
+        {
+          at: e.at,
+          ...(e.subject !== undefined ? { subject: e.subject } : {}),
+          ...(e.args !== undefined ? { args: e.args } : {}),
+        },
+      ],
     });
   }
   return out;
+}
+
+function Arguments({ args }: { args: unknown }) {
+  return (
+    <details className="ev-args">
+      <summary>arguments</summary>
+      <Json value={args} />
+    </details>
+  );
 }
 
 /**
@@ -246,11 +270,8 @@ export function Feed({
                 </span>
               )}
             </span>
-            {r.arg && (
-              <span className="ev-a">
-                <InlineJson text={r.arg} />
-              </span>
-            )}
+            {r.subject !== undefined && <span className="ev-d">{r.subject}</span>}
+            {!grouped && r.args !== undefined && <Arguments args={r.args} />}
             {r.detail && (
               <span
                 className="ev-d"
@@ -309,7 +330,8 @@ export function Feed({
                   <span className="ev-t">{clock(p.at)}</span>
                   {!node && <span className="ev-n" />}
                   <span className="ev-k ev-k--sub">{r.action}</span>
-                  {p.arg && <span className="ev-a">{p.arg}</span>}
+                  {p.subject !== undefined && <span className="ev-d">{p.subject}</span>}
+                  {p.args !== undefined && <Arguments args={p.args} />}
                   {p.durationMs !== undefined && p.durationMs >= 1000 && (
                     <span className="ev-ms">{(p.durationMs / 1000).toFixed(1)}s</span>
                   )}
