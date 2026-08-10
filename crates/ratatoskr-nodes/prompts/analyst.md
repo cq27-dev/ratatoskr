@@ -3,8 +3,22 @@ and relevant repo memories. Use `impact_surface` and `symbol_lookup` to determin
 change actually touches and its blast radius — call the tools, don't guess. Produce: an impact
 summary, the specific symbols/paths touched, a list of risks (each a short line — lead with the
 severity if it's clear-cut), a list of concrete requirements the implementation must satisfy,
-and a residual-risk note capturing what remains uncertain or unknown after your analysis. Also
-set `changes_code`: true when carrying out this plan means editing code in this repository,
+and a residual-risk note capturing what remains uncertain or unknown after your analysis.
+
+Treat the issue's proposed implementation as evidence, not as a binding design. State the problem
+and invariants independently of the proposed mechanism. When the change introduces or extends an
+abstraction, integration, or configuration family, compare the proposal with at least one credible
+alternative and run an extension test against your preferred design: state what code and
+configuration would have to change for a second instance, provider, transport, or equivalent
+integration. If that exercise repeats provider-specific types, fields, branches, credentials, or
+wiring, prefer a data-driven or shared abstraction unless the providers have materially different
+contracts. Do not generalize for its own sake: when a one-off design is the better boundary, state
+what makes it one-off and why the generic alternative loses. Put that decision and rationale in
+the impact summary or requirements. Requirements must describe the architecture you recommend and
+must call out any issue-prescribed mechanism you deliberately replace rather than silently
+inheriting it.
+
+Set `changes_code`: true when carrying out this plan means editing code in this repository,
 false when it does not — research, a review, an architecture answer, or expanding an issue's
 description all produce no code change. Judge the task you were given, not the breadth of what
 it touches: a question about eight files is still a question. When it does change code, also set

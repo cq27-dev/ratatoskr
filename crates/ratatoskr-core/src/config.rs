@@ -1358,6 +1358,21 @@ mod tests {
         let template = include_str!("../../../ratatoskr.toml.example");
         let cfg: RatatoskrConfig = toml::from_str(template).expect("the template parses");
         cfg.validate().expect("the template is valid");
+
+        let analyst = &cfg.models["analyst"];
+        assert_eq!(analyst.provider, "openai");
+        assert_eq!(analyst.model, "gpt-5.6-terra");
+        assert_eq!(analyst.context_window, Some(272_000));
+        assert_eq!(analyst.session, SessionScope::Compacted);
+        assert_eq!(
+            analyst
+                .params
+                .as_ref()
+                .and_then(|params| params.get("reasoning"))
+                .and_then(|reasoning| reasoning.get("effort"))
+                .and_then(toml::Value::as_str),
+            Some("high")
+        );
     }
 
     #[test]
