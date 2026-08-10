@@ -231,6 +231,10 @@ test_command = ["cargo", "test"]
 #
 #   network_allow = ["npm install", "npm ci"]
 #
+# A standalone "*" permits network access for every non-empty command. This is deliberately
+# all-or-nothing: a network namespace cannot restrict access by host, so use it only when
+# unrestricted outbound access is acceptable.
+#
 # Not by host. The sandbox's network namespace is all-or-nothing for one invocation, so a step that
 # can reach a registry can reach anything; restricting by hostname needs something that can see the
 # request, which a namespace cannot.

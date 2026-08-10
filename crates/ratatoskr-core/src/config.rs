@@ -192,11 +192,15 @@ impl SandboxConfig {
     /// its network.
     ///
     /// Matching a prefix rather than searching the arguments is deliberate: an argument appearing
-    /// somewhere later cannot make a step allowed.
+    /// somewhere later cannot make a step allowed. A standalone `"*"` entry is the explicit
+    /// exception: it permits network access for every non-empty command.
     pub fn may_use_network(&self, command: &[String]) -> bool {
         let Some(program) = command.first() else {
             return false;
         };
+        if self.network_allow.iter().any(|entry| entry.trim() == "*") {
+            return true;
+        }
         let program = Path::new(program)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -448,7 +452,9 @@ pub struct SandboxConfig {
     /// An entry is matched against the start of a step's command, so it may name a program or a
     /// program and its subcommand: `"npm install"` allows the install and leaves `npm run build`
     /// offline. That distinction is the point — in most ecosystems the installer and the test
-    /// runner are the same program, so a bare `"npm"` would put the checks online too.
+    /// runner are the same program, so a bare `"npm"` would put the checks online too. A standalone
+    /// `"*"` instead permits network access for every non-empty command; use it only when the
+    /// all-or-nothing network namespace restriction is acceptable.
     ///
     /// Not by host: the sandbox's network namespace is all or nothing for one invocation, so a
     /// step that can reach a registry can reach anything. Restricting by hostname needs something
@@ -893,6 +899,41 @@ mod sandbox_network_tests {
         // But an argument buried later cannot make a step allowed — the match is a prefix.
         assert!(!allowed.may_use_network(&argv(&["sh", "-c", "npm install"])));
         assert!(!allowed.may_use_network(&argv(&["curl", "https://npm"])));
+    }
+
+    #[test]
+    fn a_standalone_star_allows_every_non_empty_command() {
+        // `network_allow = ["*"]` is the explicit allow-all: enumerating every executable is
+        // impractical for repositories that need unrestricted outbound access.
+        let allowed = cfg(&["*"]);
+        assert!(allowed.may_use_network(&argv(&["cargo", "test"])));
+        assert!(allowed.may_use_network(&argv(&["anything", "--at", "all"])));
+        assert!(cfg(&[" * "]).may_use_network(&argv(&["curl"])));
+
+        // The wildcard keeps working alongside literal entries.
+        let mixed = cfg(&["npm install", "*"]);
+        assert!(mixed.may_use_network(&argv(&["curl", "x"])));
+    }
+
+    #[test]
+    fn the_wildcard_still_denies_an_empty_command() {
+        // There is no program to run, so there is nothing to allow — the wildcard is not a
+        // license for the empty command.
+        assert!(!cfg(&["*"]).may_use_network(&argv(&[])));
+    }
+
+    #[test]
+    fn a_star_is_only_a_wildcard_when_it_is_the_whole_entry() {
+        // No glob semantics: a star embedded in a longer entry is literal text, and neither
+        // shape matches a real command.
+        assert!(!cfg(&["* test"]).may_use_network(&argv(&["cargo"])));
+        assert!(!cfg(&["cargo*"]).may_use_network(&argv(&["cargo", "test"])));
+        assert!(!cfg(&["npm*"]).may_use_network(&argv(&["npm", "install"])));
+        // The literal reading is exact: `"cargo*"` is not the program `cargo`, and `"* test"`
+        // only matches a command whose executable is literally named `*`.
+        assert!(!cfg(&["cargo*"]).may_use_network(&argv(&["cargo"])));
+        // Unchanged literal prefix matching still applies to star-containing entries.
+        assert!(cfg(&["* test"]).may_use_network(&argv(&["*", "test", "extra"])));
     }
 }
 
