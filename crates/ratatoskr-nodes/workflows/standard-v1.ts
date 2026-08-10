@@ -759,3 +759,88 @@ async function plan(input: { issue: string }) {
   });
   return { context: gathered, analyst: analysis };
 }
+
+// The standard full flow composes only ordinary stage/operation hosts. Worktree creation,
+// acceptance, the referee, review thresholds, iteration limits, checkpointing, terminal status,
+// commits, publishing, bookkeeping, and cleanup remain inside their Rust owners.
+async function full(input: {
+  issue: string;
+  maxIterations: number;
+  alwaysFork: boolean;
+}) {
+  const gathered = await context(input.issue);
+  let analysis = await analyst({
+    issue: input.issue,
+    scout: gathered.scout,
+    memory: gathered.memory,
+  });
+
+  // AnalystOutput defaults an omitted changes_code to true at the Rust typed boundary. Mirror that
+  // fail-safe here: only an explicit false may skip the fork, and the configured override only
+  // ever adds work.
+  if (analysis.changes_code === false && !input.alwaysFork) {
+    return { context: gathered, analyst: analysis, iterations: 0 };
+  }
+
+  // Red-team authoring must finish before implementation: both use the same prepared worktree,
+  // and tests are authored from the frozen interface before implementation can observe them.
+  const baseline = await redTeam();
+  let implementation = await implement({ analyst: analysis });
+  let iterations = 1;
+
+  // The ordinary budget is hard. Once it is spent, Rust may offer exactly one recovery when the
+  // checkpointed review history shows a pattern worth taking back to the analyst. This operation
+  // accepts no evidence or plan from the workflow and performs the revision + final attempt as one
+  // bounded host action; `null` means the ceiling is final.
+  async function recoverAtCeiling() {
+    const recovery = await replanAtCeiling();
+    if (recovery === null) return false;
+    analysis = recovery.analyst;
+    implementation = recovery.implementation;
+    iterations += 1;
+    return true;
+  }
+
+  while (true) {
+    const testsClean =
+      testCommandRan(implementation) &&
+      isConverged({ baseline, post: implementation });
+    if (testsClean) {
+      const review = await verify({ analyst: analysis });
+      if (!review.configured || review.unavailable || review.blocking.length === 0) break;
+      if (iterations >= input.maxIterations) {
+        if (await recoverAtCeiling()) continue;
+        break;
+      }
+      if (review.needsReplan) {
+        analysis = await analyst({
+          issue: input.issue,
+          scout: gathered.scout,
+          memory: gathered.memory,
+          brief: gathered.brief,
+          constraints: gathered.constraints,
+          previous: analysis,
+          findings: review.blocking,
+        });
+      }
+      implementation = await iterate({ review });
+      iterations += 1;
+      continue;
+    }
+    if (iterations >= input.maxIterations) {
+      if (await recoverAtCeiling()) continue;
+      break;
+    }
+    implementation = await iterate({});
+    iterations += 1;
+  }
+  return { context: gathered, analyst: analysis, iterations };
+}
+
+async function run(input: {
+  issue: string;
+  maxIterations: number;
+  alwaysFork: boolean;
+}) {
+  return full(input);
+}

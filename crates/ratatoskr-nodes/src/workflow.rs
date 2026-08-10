@@ -1,9 +1,9 @@
 //! Scriptable orchestration: run `.ratatoskr/workflow.ts` (issue #18) instead of the hardcoded
 //! `run_plan`/`run_full` flow. The script composes host bindings — one per node call site — but
 //! every gate stays Rust-enforced: schema validation and checkpointing happen inside each binding,
-//! the false-convergence guard lives in `redTeam`, `max_iterations` is capped in `iterate`, and the
-//! terminal status is inferred from checkpoints after the script returns (never trusted from the
-//! script). A missing `workflow.ts` runs the built-in Rust flow unchanged (see [`super::run_full`]).
+//! the false-convergence guard lives in `redTeam`, `max_iterations` is capped in `iterate`, the one
+//! ceiling re-plan is owned by `replanAtCeiling`, and the terminal status is inferred from
+//! checkpoints after the script returns (never trusted from the script).
 //!
 //! Gates the script cannot weaken: schema validation and checkpointing per binding, the
 //! false-convergence guard in `redTeam`, `max_iterations` in `iterate`, the referee check, the
@@ -45,6 +45,7 @@ use crate::{
 /// catches a script that ignores them and loops.
 const INVOCATION_CEILING: usize = 500;
 
+const STANDARD_WORKFLOW_NAME: &str = "ratatoskr-standard-v1";
 const STANDARD_WORKFLOW_V1: &str = include_str!("../workflows/standard-v1.ts");
 const STANDARD_WORKFLOW_INCLUDES: &[(&str, &str)] = &[
     ("prompts/analyst.md", include_str!("../prompts/analyst.md")),
@@ -107,6 +108,9 @@ pub struct WorkflowContext {
     implement_started: AtomicBool,
     /// Serializes `iterate` calls — two implementers editing one worktree would corrupt it.
     iterate_lock: tokio::sync::Mutex<()>,
+    /// The iteration ceiling has one Rust-owned recovery: revise the plan from accumulated review
+    /// evidence and make one final attempt. A script can decline it but cannot mint a second one.
+    ceiling_replan_started: AtomicBool,
     invocations: AtomicUsize,
     iterations: AtomicU32,
     /// What plugins contributed for this run, prefixed to each node's preamble.
@@ -114,6 +118,8 @@ pub struct WorkflowContext {
     /// Where this run's nodes report what their turns cost. A scripted run records the same
     /// telemetry as a built-in one — the script chooses the order, not what gets measured.
     ledger: Arc<ratatoskr_agent::RunLedger>,
+    /// One clarification rendezvous for the whole run, shared by every host that can ask.
+    clarifier: Arc<crate::clarify::NodeClarifier>,
     /// The acceptance this run is judged by, resolved once and reused.
     ///
     /// The built-in flow resolves it before the fork and freezes it for the same reason it matters
@@ -171,8 +177,10 @@ impl WorkflowContext {
         } = params;
         let repo_path = std::env::current_dir()
             .map_err(|e| PlanError::node("workflow", NodeError::Failed(format!("cwd: {e}"))))?;
+        let clarifier = crate::clarify::NodeClarifier::new(config, store, engine, run_id, issue);
         Ok(Arc::new(Self {
             ledger,
+            clarifier,
             acceptance: Mutex::new(None),
             plugin_context,
             config: config.clone(),
@@ -188,6 +196,7 @@ impl WorkflowContext {
             red_team_completed: AtomicBool::new(false),
             implement_started: AtomicBool::new(false),
             iterate_lock: tokio::sync::Mutex::new(()),
+            ceiling_replan_started: AtomicBool::new(false),
             invocations: AtomicUsize::new(0),
             iterations: AtomicU32::new(0),
         }))
@@ -596,9 +605,7 @@ fn build_implementer(
         ctx.rag_rat.clone(),
     )?;
     Ok(ImplementerNode {
-        // As every node on the scripted path: clarification is wired by the built-in flow, which
-        // owns the run's `NodeClarifier`.
-        clarifier: None,
+        clarifier: Some(ctx.clarifier.as_dyn()),
         acceptance: ctx.acceptance(&analyst.acceptance),
         characterizer: crate::build_characterizer(
             &ctx.engine,
@@ -1091,6 +1098,241 @@ async fn verify_host(
     serde_json::to_string(&verification_result(out, threshold)).map_err(|e| e.to_string())
 }
 
+#[derive(serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CeilingReplanResult {
+    analyst: AnalystOutput,
+    implementation: ImplementerOutput,
+}
+
+trait CeilingRecovery: Sync {
+    async fn revise(
+        &self,
+        _ctx: &Arc<WorkflowContext>,
+        executor: &Arc<StageExecutor>,
+        input: &crate::analyst::AnalystInput,
+    ) -> Result<Option<AnalystOutput>, String>;
+
+    async fn iterate(
+        &self,
+        ctx: &Arc<WorkflowContext>,
+        worktree: &WorktreePath,
+        revised: &AnalystOutput,
+        diagnostic: &str,
+    ) -> Result<ImplementerOutput, String>;
+}
+
+struct LiveCeilingRecovery;
+
+impl CeilingRecovery for LiveCeilingRecovery {
+    async fn revise(
+        &self,
+        _ctx: &Arc<WorkflowContext>,
+        executor: &Arc<StageExecutor>,
+        input: &crate::analyst::AnalystInput,
+    ) -> Result<Option<AnalystOutput>, String> {
+        let input_json = serde_json::to_string(input).map_err(|error| error.to_string())?;
+        let stage = executor
+            .stages
+            .iter()
+            .find(|stage| stage.id == "analyst")
+            .cloned()
+            .ok_or_else(|| "standard analyst stage is not registered".to_string())?;
+        let raw = match executor
+            .execute_after_guard(StageInvocation {
+                stage,
+                input_json,
+                rendered_question: Some(crate::analyst::render_prompt(input)),
+                resource_root: None,
+                shell: None,
+                publish: None,
+                clarifier: None,
+                invocation_guidance: None,
+                output: StageOutput::Checkpoint,
+            })
+            .await
+        {
+            Ok(raw) => raw,
+            Err(error) => {
+                tracing::warn!("the analyst could not re-plan at the ceiling: {error}");
+                return Ok(None);
+            }
+        };
+        serde_json::from_str(&raw)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn iterate(
+        &self,
+        ctx: &Arc<WorkflowContext>,
+        worktree: &WorktreePath,
+        revised: &AnalystOutput,
+        diagnostic: &str,
+    ) -> Result<ImplementerOutput, String> {
+        build_implementer(ctx, revised.clone())
+            .map_err(|error| error.to_string())?
+            .iterate(worktree, diagnostic)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Spend the one recovery the built-in convergence loop historically allowed after the ordinary
+/// attempt budget was exhausted.
+///
+/// The workflow supplies no evidence or plan. Rust reconstructs both from checkpoints, proves the
+/// current result still needs correction, and owns the analyst + implementer calls as one bounded
+/// operation. Returning `null` means the ceiling is final. This is deliberately not split into a
+/// script-visible "authorize" token and a later iteration: such a token would let a workflow replay
+/// or reorder the extra attempt.
+async fn replan_at_ceiling_host(
+    ctx: Arc<WorkflowContext>,
+    executor: Arc<StageExecutor>,
+    _arg: String,
+) -> Result<String, String> {
+    replan_at_ceiling_with(ctx, executor, &LiveCeilingRecovery).await
+}
+
+async fn replan_at_ceiling_with<R: CeilingRecovery>(
+    ctx: Arc<WorkflowContext>,
+    executor: Arc<StageExecutor>,
+    recovery: &R,
+) -> Result<String, String> {
+    ctx.guard()?;
+    let _iterate = ctx
+        .iterate_lock
+        .try_lock()
+        .map_err(|_| "replanAtCeiling() cannot overlap iterate()".to_string())?;
+    if ctx.ceiling_replan_started.load(Ordering::SeqCst) {
+        return Ok("null".to_string());
+    }
+
+    let checkpoints = ctx
+        .store
+        .checkpoints_for_run(&ctx.run_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let attempts = checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.node_name == "implementer")
+        .count() as u32;
+    if attempts < ctx.config.implementer.max_iterations {
+        return Ok("null".to_string());
+    }
+    let already_replanned = checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.node_name == "analyst")
+        .filter_map(|checkpoint| checkpoint.input_json.as_deref())
+        .filter_map(|input| serde_json::from_str::<crate::analyst::AnalystInput>(input).ok())
+        .any(|input| input.previous.is_some());
+    if already_replanned {
+        return Ok("null".to_string());
+    }
+
+    let threshold = crate::parse_threshold(&ctx.config.implementer.verify_threshold);
+    let findings = previous_verifier_findings(&checkpoints, threshold);
+    if findings.is_empty() {
+        return Ok("null".to_string());
+    }
+
+    let red_team: RedTeamOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "red_team")
+        .await
+        .map_err(|error| error.to_string())?;
+    let implementation: ImplementerOutput =
+        latest_checkpoint(&ctx.store, &ctx.run_id, "implementer")
+            .await
+            .map_err(|error| error.to_string())?;
+    let current_plan: AnalystOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "analyst")
+        .await
+        .map_err(|error| error.to_string())?;
+    let worktree = ctx
+        .worktree
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| "replanAtCeiling() called before implement()".to_string())?;
+
+    // A stale finding from an earlier iteration is not authority to extend a now-clean run. The
+    // current attempt must still need a correction under the same Rust-owned referee/test/review
+    // gates as the convergence loop.
+    let referee = referee_judgement(&ctx, &worktree, &current_plan, &implementation).await;
+    let authored = red_team
+        .authored
+        .as_ref()
+        .map(|authored| authored.tests.as_slice())
+        .unwrap_or_default();
+    let tests_clean = converge::test_command_ran(
+        &implementation.failing_tests,
+        implementation.passed_tests,
+        implementation.exit_code,
+    ) && converge::unsatisfied(authored, &implementation.failing_tests)
+        .is_empty()
+        && converge::is_converged(&red_team.failing_tests, &implementation.failing_tests);
+    let current_review_blocks = checkpoints
+        .iter()
+        .rposition(|checkpoint| checkpoint.node_name == "implementer")
+        .and_then(|position| {
+            checkpoints
+                .iter()
+                .skip(position + 1)
+                .rev()
+                .find(|checkpoint| checkpoint.node_name == "verifier")
+        })
+        .and_then(|checkpoint| {
+            serde_json::from_str::<verifier::VerifierOutput>(&checkpoint.output_json).ok()
+        })
+        .is_some_and(|output| !output.blocking(threshold).is_empty());
+    if referee.is_empty() && tests_clean && !current_review_blocks {
+        return Ok("null".to_string());
+    }
+
+    // Consume the recovery before either model turn. A failed best-effort analyst re-plan stops at
+    // the wall just like the legacy loop; it never earns a retry of the extra budget.
+    if ctx.ceiling_replan_started.swap(true, Ordering::SeqCst) {
+        return Ok("null".to_string());
+    }
+    tracing::warn!(
+        attempts,
+        findings = findings.len(),
+        "the iteration budget is spent; asking the analyst to look at the plan before one final attempt"
+    );
+
+    let gathered: crate::ContextOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "context")
+        .await
+        .map_err(|error| error.to_string())?;
+    let revision = crate::analyst::AnalystInput {
+        issue: ctx.issue.clone(),
+        scout: gathered.scout,
+        memory: gathered.memory,
+        brief: gathered.brief,
+        constraints: gathered.constraints,
+        previous: Some(Box::new(current_plan)),
+        findings,
+    };
+    let Some(revised) = recovery.revise(&ctx, &executor, &revision).await? else {
+        return Ok("null".to_string());
+    };
+    let borrowed = revision.findings.iter().collect::<Vec<_>>();
+    let diagnostic = crate::replan(&revised, &borrowed);
+    ctx.iterations.fetch_add(1, Ordering::SeqCst);
+    let implementation = recovery
+        .iterate(&ctx, &worktree, &revised, &diagnostic)
+        .await?;
+    note(
+        &ctx,
+        "implementer",
+        &implementation,
+        Some(serde_json::to_string(&revised).map_err(|error| error.to_string())?),
+    )
+    .await?;
+    serde_json::to_string(&CeilingReplanResult {
+        analyst: revised,
+        implementation,
+    })
+    .map_err(|error| error.to_string())
+}
+
 /// `context(issue)` — the merged gather step: distilled findings plus the memories unmodified.
 ///
 /// `scout()` and `memory()` remain for a script that composes them itself. This is the one that
@@ -1569,6 +1811,7 @@ enum TemporaryOperation {
     RedTeam,
     Implement,
     Iterate,
+    ReplanAtCeiling,
     Verify,
     IsConverged,
     TestCommandRan,
@@ -1591,6 +1834,15 @@ impl TemporaryOperation {
             Self::RedTeam => binding(Arc::clone(ctx), red_team_host),
             Self::Implement => binding(Arc::clone(ctx), implement_host),
             Self::Iterate => binding(Arc::clone(ctx), iterate_host),
+            Self::ReplanAtCeiling => {
+                let ctx = Arc::clone(ctx);
+                let executor = Arc::clone(executor);
+                Arc::new(move |arg| {
+                    let ctx = Arc::clone(&ctx);
+                    let executor = Arc::clone(&executor);
+                    Box::pin(async move { replan_at_ceiling_host(ctx, executor, arg).await })
+                })
+            }
             Self::Verify => {
                 let ctx = Arc::clone(ctx);
                 let executor = Arc::clone(executor);
@@ -1615,6 +1867,7 @@ const TEMPORARY_OPERATIONS: &[(&str, TemporaryOperation)] = &[
     ("implementer", TemporaryOperation::Implement),
     ("implement", TemporaryOperation::Implement),
     ("iterate", TemporaryOperation::Iterate),
+    ("replanAtCeiling", TemporaryOperation::ReplanAtCeiling),
     ("verify", TemporaryOperation::Verify),
     ("isConverged", TemporaryOperation::IsConverged),
     ("testCommandRan", TemporaryOperation::TestCommandRan),
@@ -1689,7 +1942,7 @@ pub(crate) async fn standard_stages() -> Result<Vec<Stage>, PlanError> {
 
 pub(crate) async fn standard_runtime() -> Result<WorkflowRuntime, PlanError> {
     WorkflowRuntime::bundled_with_includes(
-        "ratatoskr-standard-v1",
+        STANDARD_WORKFLOW_NAME,
         STANDARD_WORKFLOW_V1,
         STANDARD_WORKFLOW_INCLUDES,
     )
@@ -1866,7 +2119,12 @@ async fn execution_stages(runtime: &WorkflowRuntime) -> Result<Vec<Stage>, PlanE
     // Delivery is terminal external I/O, not a workflow operation. These declarations are
     // executed only by their Rust terminal adapters, after Rust has accepted the run outcome.
     stages.retain(|stage| !matches!(stage.id.as_str(), "bookkeeper" | "publisher"));
-    stages.extend(crate::stage::stages_from_workflow(runtime.meta()));
+    // The bundled runtime declares the base stages themselves. Repository workflows add only
+    // their own declarations; appending standard-v1 to itself would duplicate every model host and
+    // reintroduce the terminal declarations filtered above.
+    if runtime.meta().name != STANDARD_WORKFLOW_NAME {
+        stages.extend(crate::stage::stages_from_workflow(runtime.meta()));
+    }
     Ok(stages)
 }
 
@@ -1961,9 +2219,12 @@ async fn run_full_scripted_with_actions<A: FullTerminalActions>(
 
     let stages = execution_stages(&runtime).await?;
     let hosts = build_hosts(&ctx, &stages)?;
-    let input =
-        json!({ "issue": ctx.issue, "maxIterations": ctx.config.implementer.max_iterations })
-            .to_string();
+    let input = json!({
+        "issue": ctx.issue,
+        "maxIterations": ctx.config.implementer.max_iterations,
+        "alwaysFork": ctx.config.implementer.always_fork,
+    })
+    .to_string();
 
     // Run the script, then reconstruct the outcome. EITHER failing is a run failure: on any error
     // (a script/binding error, or a reconstruction error like a missing checkpoint) the worktree is
@@ -2052,13 +2313,6 @@ impl FullTerminalActions for LiveTerminalActions {
         input: PublisherInput,
         terminal: bool,
     ) -> Option<PublisherOutput> {
-        let clarifier = crate::clarify::NodeClarifier::new(
-            &ctx.config,
-            &ctx.store,
-            &ctx.engine,
-            &ctx.run_id,
-            &ctx.issue,
-        );
         let run = crate::Run {
             client: None,
             config: &ctx.config,
@@ -2066,7 +2320,7 @@ impl FullTerminalActions for LiveTerminalActions {
             run_id: &ctx.run_id,
             issue: &ctx.issue,
             engine: &ctx.engine,
-            clarifier: &clarifier,
+            clarifier: &ctx.clarifier,
             context: &ctx.plugin_context,
             ledger: &ctx.ledger,
         };
@@ -2122,6 +2376,7 @@ async fn finish_full<A: FullTerminalActions>(
             .await;
         let mut state = plan.state.clone();
         state.status = status;
+        state.clarifications.extend(ctx.clarifier.drain());
         if let Some(published) = &published {
             state.artifacts.push(serde_json::to_value(published)?);
         }
@@ -2211,6 +2466,7 @@ async fn finish_full<A: FullTerminalActions>(
     state.red_team = Some(serde_json::to_value(&red_team)?);
     state.implementer = Some(serde_json::to_value(&implementer)?);
     state.status = status;
+    state.clarifications.extend(ctx.clarifier.drain());
     if let Some(bk) = &bookkeeper {
         state.artifacts = vec![serde_json::to_value(bk)?];
     }
@@ -2720,6 +2976,46 @@ mod tests {
         }
     }
 
+    struct RecordingCeilingRecovery {
+        revised: AnalystOutput,
+        implementation: ImplementerOutput,
+        revisions: Mutex<Vec<crate::analyst::AnalystInput>>,
+        diagnostics: Mutex<Vec<String>>,
+    }
+
+    impl CeilingRecovery for RecordingCeilingRecovery {
+        async fn revise(
+            &self,
+            ctx: &Arc<WorkflowContext>,
+            _executor: &Arc<StageExecutor>,
+            input: &crate::analyst::AnalystInput,
+        ) -> Result<Option<AnalystOutput>, String> {
+            self.revisions.lock().unwrap().push(input.clone());
+            note(
+                ctx,
+                "analyst",
+                &self.revised,
+                Some(serde_json::to_string(input).unwrap()),
+            )
+            .await?;
+            Ok(Some(self.revised.clone()))
+        }
+
+        async fn iterate(
+            &self,
+            _ctx: &Arc<WorkflowContext>,
+            _worktree: &WorktreePath,
+            _revised: &AnalystOutput,
+            diagnostic: &str,
+        ) -> Result<ImplementerOutput, String> {
+            self.diagnostics
+                .lock()
+                .unwrap()
+                .push(diagnostic.to_string());
+            Ok(self.implementation.clone())
+        }
+    }
+
     #[tokio::test]
     async fn bundled_standard_plan_sequences_typed_checkpointed_stages() {
         let dir = std::env::temp_dir().join(format!(
@@ -2892,6 +3188,597 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some(RunStatus::Failed.as_str())
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn bundled_standard_full_sequences_revision_review_and_rust_terminal_actions() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-full-entry-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("worktree")).unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("analyst".to_string(), model_route());
+        config.implementer.max_iterations = 3;
+        let run_id = "run-standard-full";
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            run_id,
+            "migrate the standard full flow",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        store
+            .upsert_run(run_id, None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        checkpoint(&store, run_id, "issue", &json!({ "issue": ctx.issue }))
+            .await
+            .unwrap();
+
+        let initial = json!({
+            "impact_summary": "use the bundled full workflow",
+            "changes_code": true,
+            "requirements": ["keep terminal actions in Rust"]
+        });
+        let revised = json!({
+            "impact_summary": "use the bundled full workflow with the corrected plan",
+            "changes_code": true,
+            "requirements": ["keep terminal actions private to Rust"]
+        });
+        let turn = Arc::new(SequencedStageTurn::new([initial, revised]));
+        let runtime = standard_runtime().await.unwrap();
+        let stages = execution_stages(&runtime).await.unwrap();
+        let mut hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        assert!(!hosts.contains_key("publisher"));
+        assert!(!hosts.contains_key("bookkeeper"));
+
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let context_out = crate::ContextOutput {
+            brief: "the workflow runtime owns composition".to_string(),
+            constraints: vec![crate::context::Constraint {
+                says: "Rust owns terminal side effects".to_string(),
+                from_memory_id: "memory-terminal-boundary".to_string(),
+            }],
+            scout: ScoutOutput {
+                related_items: Vec::new(),
+                papertrail_summary: "standard-v1 is the built-in runtime".to_string(),
+            },
+            memory: MemoryOutput::default(),
+        };
+        let context_calls = Arc::clone(&calls);
+        let context_value = context_out.clone();
+        hosts.insert(
+            "context".to_string(),
+            binding(Arc::clone(&ctx), move |ctx, arg| {
+                let calls = Arc::clone(&context_calls);
+                let output = context_value.clone();
+                async move {
+                    calls.lock().unwrap().push("context".to_string());
+                    note(&ctx, "context", &output, Some(arg)).await?;
+                    serde_json::to_string(&output).map_err(|error| error.to_string())
+                }
+            }),
+        );
+
+        let baseline = red(&["pre_existing"], &["baseline_pass"], 1);
+        let red_calls = Arc::clone(&calls);
+        hosts.insert(
+            "redTeam".to_string(),
+            binding(Arc::clone(&ctx), move |ctx, _arg| {
+                let calls = Arc::clone(&red_calls);
+                let output = baseline.clone();
+                async move {
+                    calls.lock().unwrap().push("redTeam".to_string());
+                    note(&ctx, "red_team", &output, None).await?;
+                    serde_json::to_string(&output).map_err(|error| error.to_string())
+                }
+            }),
+        );
+
+        let first = ImplementerOutput {
+            worktree_path: dir.join("worktree").display().to_string(),
+            branch: "ratatoskr/standard-full".to_string(),
+            failing_tests: Vec::new(),
+            passed_tests: 1,
+            exit_code: 0,
+            ..imp(&[], &[], 0)
+        };
+        let implement_calls = Arc::clone(&calls);
+        let first_output = first.clone();
+        hosts.insert(
+            "implement".to_string(),
+            binding(Arc::clone(&ctx), move |ctx, arg| {
+                let calls = Arc::clone(&implement_calls);
+                let output = first_output.clone();
+                async move {
+                    calls.lock().unwrap().push("implement".to_string());
+                    note(&ctx, "implementer", &output, Some(arg)).await?;
+                    serde_json::to_string(&output).map_err(|error| error.to_string())
+                }
+            }),
+        );
+
+        let plan_finding = verifier::Finding {
+            severity: verifier::Severity::P1,
+            kind: verifier::FindingKind::Plan,
+            summary: "the terminal boundary is underspecified".to_string(),
+            failure_scenario: "a script can invoke delivery directly".to_string(),
+            file: "crates/ratatoskr-nodes/src/workflow.rs".to_string(),
+            line: Some(1),
+        };
+        let reviews = Arc::new(Mutex::new(VecDeque::from([
+            verifier::VerifierOutput {
+                findings: vec![plan_finding],
+                assessment: "revise the plan".to_string(),
+            },
+            verifier::VerifierOutput {
+                findings: Vec::new(),
+                assessment: "the corrected change is clean".to_string(),
+            },
+        ])));
+        let verify_calls = Arc::clone(&calls);
+        let verify_outputs = Arc::clone(&reviews);
+        hosts.insert(
+            "verify".to_string(),
+            binding(Arc::clone(&ctx), move |ctx, arg| {
+                let calls = Arc::clone(&verify_calls);
+                let outputs = Arc::clone(&verify_outputs);
+                async move {
+                    calls.lock().unwrap().push("verify".to_string());
+                    let supplied: serde_json::Value =
+                        serde_json::from_str(&arg).map_err(|error| error.to_string())?;
+                    let analyst: AnalystOutput = serde_json::from_value(
+                        supplied
+                            .get("analyst")
+                            .cloned()
+                            .ok_or_else(|| "verify input has no analyst".to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let output = outputs
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("one verifier result per call");
+                    let verifier_input = verifier::VerifierInput {
+                        issue: ctx.issue.clone(),
+                        analyst,
+                        diff: "diff --git a/old b/new".to_string(),
+                        touched_files: vec!["src/lib.rs".to_string()],
+                        previous_findings: Vec::new(),
+                    };
+                    note(
+                        &ctx,
+                        "verifier",
+                        &output,
+                        Some(serde_json::to_string(&verifier_input).unwrap()),
+                    )
+                    .await?;
+                    serde_json::to_string(&verification_result(output, verifier::Severity::P2))
+                        .map_err(|error| error.to_string())
+                }
+            }),
+        );
+
+        let iterate_calls = Arc::clone(&calls);
+        let iterated = first.clone();
+        hosts.insert(
+            "iterate".to_string(),
+            binding(Arc::clone(&ctx), move |ctx, arg| {
+                let calls = Arc::clone(&iterate_calls);
+                let output = iterated.clone();
+                async move {
+                    calls.lock().unwrap().push("iterate".to_string());
+                    note(&ctx, "implementer", &output, Some(arg)).await?;
+                    serde_json::to_string(&output).map_err(|error| error.to_string())
+                }
+            }),
+        );
+
+        runtime
+            .run_with_question_renderers(
+                "run",
+                json!({
+                    "issue": ctx.issue,
+                    "maxIterations": config.implementer.max_iterations,
+                    "alwaysFork": false,
+                })
+                .to_string(),
+                hosts,
+                stage_question_renderers(&stages),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                "context",
+                "redTeam",
+                "implement",
+                "verify",
+                "iterate",
+                "verify"
+            ]
+        );
+        let checkpoints = store.checkpoints_for_run(run_id).await.unwrap();
+        assert_eq!(
+            checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.node_name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "issue",
+                "context",
+                "analyst",
+                "red_team",
+                "implementer",
+                "verifier",
+                "analyst",
+                "implementer",
+                "verifier",
+            ]
+        );
+        let revision: analyst::AnalystInput = serde_json::from_str(
+            checkpoints[6]
+                .input_json
+                .as_deref()
+                .expect("revision keeps its typed input"),
+        )
+        .unwrap();
+        assert_eq!(revision.brief, context_out.brief);
+        assert_eq!(revision.constraints.len(), 1);
+        assert!(revision.previous.is_some());
+        assert_eq!(revision.findings.len(), 1);
+
+        {
+            let runs = turn.runs.lock().unwrap();
+            assert_eq!(
+                runs.iter().map(|run| run.node.as_str()).collect::<Vec<_>>(),
+                ["analyst", "analyst"]
+            );
+            assert!(
+                runs.iter()
+                    .all(|run| run.session == ratatoskr_core::SessionScope::Compacted)
+            );
+            assert_eq!(runs[0].ledger_id, runs[1].ledger_id);
+        }
+
+        let actions = RecordingTerminalActions::new(true, true);
+        let outcome = finish_full(&ctx, &actions).await.unwrap();
+        assert_eq!(outcome.status, RunStatus::Converged);
+        assert_eq!(outcome.iterations, 2);
+        assert_eq!(outcome.state.artifacts.len(), 2);
+        assert!(matches!(
+            actions.calls().first(),
+            Some(TerminalCall::Commit { .. })
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn ceiling_replan_is_checkpoint_derived_and_can_add_exactly_one_attempt() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-ceiling-replan-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("worktree")).unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.implementer.max_iterations = 1;
+        let run_id = "run-standard-ceiling-replan";
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            run_id,
+            "recover from a sequence of execution findings",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        store
+            .upsert_run(run_id, None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        *ctx.worktree.lock().unwrap() = Some(WorktreePath(dir.join("worktree")));
+
+        let gathered = crate::ContextOutput {
+            brief: "three fixes exposed three different faults".to_string(),
+            constraints: Vec::new(),
+            scout: ScoutOutput {
+                related_items: Vec::new(),
+                papertrail_summary: String::new(),
+            },
+            memory: MemoryOutput::default(),
+        };
+        note(
+            &ctx,
+            "context",
+            &gathered,
+            Some(json!(ctx.issue).to_string()),
+        )
+        .await
+        .unwrap();
+        let initial = AnalystOutput {
+            impact_summary: "implement the original plan".to_string(),
+            touched: Vec::new(),
+            risks: Vec::new(),
+            requirements: vec!["keep the original behavior".to_string()],
+            residual_risk: String::new(),
+            changes_code: true,
+            acceptance: Vec::new(),
+            interface: Vec::new(),
+        };
+        let initial_input =
+            crate::analyst::AnalystInput::from_context(ctx.issue.clone(), gathered.clone());
+        note(
+            &ctx,
+            "analyst",
+            &initial,
+            Some(serde_json::to_string(&initial_input).unwrap()),
+        )
+        .await
+        .unwrap();
+        note(&ctx, "red_team", &red(&[], &["baseline"], 0), None)
+            .await
+            .unwrap();
+        let first = ImplementerOutput {
+            worktree_path: dir.join("worktree").display().to_string(),
+            ..imp(&[], &["post"], 0)
+        };
+        note(
+            &ctx,
+            "implementer",
+            &first,
+            Some("first attempt".to_string()),
+        )
+        .await
+        .unwrap();
+        let finding = verifier::Finding {
+            severity: verifier::Severity::P1,
+            kind: verifier::FindingKind::Execution,
+            summary: "the correction exposed another fault".to_string(),
+            failure_scenario: "the edge case is still mishandled".to_string(),
+            file: "src/lib.rs".to_string(),
+            line: Some(7),
+        };
+        note(
+            &ctx,
+            "verifier",
+            &verifier::VerifierOutput {
+                findings: vec![finding.clone()],
+                assessment: "the plan may be the common cause".to_string(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let revised = AnalystOutput {
+            impact_summary: "amend the common faulty assumption".to_string(),
+            requirements: vec!["handle the edge case explicitly".to_string()],
+            ..initial.clone()
+        };
+        let final_implementation = ImplementerOutput {
+            worktree_path: dir.join("worktree").display().to_string(),
+            diff_summary: "one bounded recovery".to_string(),
+            ..first.clone()
+        };
+        let recovery = RecordingCeilingRecovery {
+            revised: revised.clone(),
+            implementation: final_implementation.clone(),
+            revisions: Mutex::new(Vec::new()),
+            diagnostics: Mutex::new(Vec::new()),
+        };
+        let stages = Arc::new(standard_stages().await.unwrap());
+        let executor = StageExecutor::new(
+            Arc::clone(&ctx),
+            stages,
+            Arc::new(RecordingStageTurn::default()),
+        );
+
+        let first_recovery =
+            replan_at_ceiling_with(Arc::clone(&ctx), Arc::clone(&executor), &recovery)
+                .await
+                .unwrap();
+        let output: CeilingReplanResult = serde_json::from_str(&first_recovery).unwrap();
+        assert_eq!(output.analyst.requirements, revised.requirements);
+        assert_eq!(output.implementation.diff_summary, "one bounded recovery");
+        assert_eq!(ctx.iterations.load(Ordering::SeqCst), 1);
+
+        let second_recovery = replan_at_ceiling_with(ctx.clone(), executor, &recovery)
+            .await
+            .unwrap();
+        assert_eq!(second_recovery, "null");
+        assert_eq!(
+            count_checkpoints(&store, run_id, "implementer")
+                .await
+                .unwrap(),
+            2
+        );
+        let revisions = recovery.revisions.lock().unwrap();
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].findings.len(), 1);
+        assert_eq!(revisions[0].findings[0].summary, finding.summary);
+        assert_eq!(
+            revisions[0].previous.as_deref().unwrap().requirements,
+            initial.requirements
+        );
+        drop(revisions);
+        let diagnostics = recovery.diagnostics.lock().unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        let requirement = diagnostics[0]
+            .find("handle the edge case explicitly")
+            .unwrap();
+        let evidence = diagnostics[0]
+            .find("the correction exposed another fault")
+            .unwrap();
+        assert!(requirement < evidence);
+        drop(diagnostics);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn bundled_standard_full_stops_before_fork_on_an_explicit_no_code_plan() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-full-no-code-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("analyst".to_string(), model_route());
+        let run_id = "run-standard-full-no-code";
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            run_id,
+            "explain the architecture",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        store
+            .upsert_run(run_id, None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        checkpoint(&store, run_id, "issue", &json!({ "issue": ctx.issue }))
+            .await
+            .unwrap();
+        let turn = Arc::new(SequencedStageTurn::new([json!({
+            "impact_summary": "answer from the plan",
+            "changes_code": false
+        })]));
+        let runtime = standard_runtime().await.unwrap();
+        let stages = execution_stages(&runtime).await.unwrap();
+        let mut hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        let context_out = crate::ContextOutput {
+            brief: String::new(),
+            constraints: Vec::new(),
+            scout: ScoutOutput {
+                related_items: Vec::new(),
+                papertrail_summary: String::new(),
+            },
+            memory: MemoryOutput::default(),
+        };
+        hosts.insert(
+            "context".to_string(),
+            binding(Arc::clone(&ctx), move |ctx, arg| {
+                let output = context_out.clone();
+                async move {
+                    note(&ctx, "context", &output, Some(arg)).await?;
+                    serde_json::to_string(&output).map_err(|error| error.to_string())
+                }
+            }),
+        );
+        for name in ["redTeam", "implement", "verify", "iterate"] {
+            hosts.insert(
+                name.to_string(),
+                Arc::new(move |_| {
+                    Box::pin(async move { Err(format!("{name} must not run for no-code work")) })
+                }),
+            );
+        }
+        runtime
+            .run_with_question_renderers(
+                "run",
+                json!({
+                    "issue": ctx.issue,
+                    "maxIterations": config.implementer.max_iterations,
+                    "alwaysFork": false,
+                })
+                .to_string(),
+                hosts,
+                stage_question_renderers(&stages),
+            )
+            .await
+            .unwrap();
+
+        let actions = RecordingTerminalActions::new(true, true);
+        let outcome = finish_full(&ctx, &actions).await.unwrap();
+        assert_eq!(outcome.status, RunStatus::NoCodeChange);
+        assert_eq!(
+            store
+                .checkpoints_for_run(run_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|checkpoint| checkpoint.node_name.as_str())
+                .collect::<Vec<_>>(),
+            ["issue", "context", "analyst"]
+        );
+        assert_eq!(actions.calls().len(), 1);
+        assert!(matches!(actions.calls()[0], TerminalCall::Publish { .. }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn implementer_host_shares_and_reconstructs_run_clarifications() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-standard-clarifier-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config
+            .models
+            .insert("implementer".to_string(), model_route());
+        let run_id = "run-standard-clarifier";
+        let analyst = terminal_plan(&store, run_id, false).await;
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            run_id,
+            "preserve implementer clarification",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let implementer = build_implementer(&ctx, analyst).unwrap();
+        let clarifier = implementer
+            .clarifier
+            .expect("the native implementer receives the run clarifier");
+        let _ = clarifier
+            .answer(
+                "implementer",
+                "analyst",
+                "Which invariant controls this change?",
+            )
+            .await;
+
+        let outcome = finish_full(&ctx, &RecordingTerminalActions::new(false, false))
+            .await
+            .unwrap();
+        assert_eq!(outcome.state.clarifications.len(), 1);
+        assert_eq!(outcome.state.clarifications[0]["from"], "implementer");
+        assert_eq!(outcome.state.clarifications[0]["to"], "analyst");
+        assert!(
+            store
+                .checkpoints_for_run(run_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|checkpoint| checkpoint.node_name == "clarification")
         );
         let _ = std::fs::remove_dir_all(dir);
     }
