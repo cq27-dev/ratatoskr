@@ -19,14 +19,20 @@ use crate::analyst::AnalystOutput;
 use crate::implementer::ImplementerOutput;
 
 /// What the publisher did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublisherAction {
+    PullRequest,
+    Comment,
+    Both,
+    None,
+}
+
+/// What the publisher did.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PublisherOutput {
-    /// `pull_request`, `comment`, `both`, or `none`.
-    ///
-    /// The dashboard uses this to decide whether the checkpoint contains a pull request. Keep the
-    /// value low-cardinality even though an unexpected word must not turn an already-complete run
-    /// into a failure.
-    pub action: String,
+    /// The dashboard uses this closed classification to decide which published URLs are present.
+    pub action: PublisherAction,
     /// The one pull request URL, if a pull request was opened.
     ///
     /// Never combine this with an issue-comment URL or a label such as `PR:`. Its absence is an
@@ -71,7 +77,7 @@ mod tests {
         // whether publishing nothing was right.
         let raw = r#"{"action":"none","reasoning":"the run changed nothing and answered nothing"}"#;
         let out = parse_validated::<PublisherOutput>(raw).unwrap();
-        assert_eq!(out.action, "none");
+        assert_eq!(out.action, PublisherAction::None);
         assert!(out.pull_request_url.is_empty());
         assert!(out.comment_url.is_empty());
 
@@ -93,5 +99,16 @@ mod tests {
             out.comment_url,
             "https://github.com/o/r/issues/210#issuecomment-1"
         );
+    }
+
+    #[test]
+    fn action_is_enforced_by_the_json_schema() {
+        let raw = r#"{
+            "action":"pr",
+            "pull_request_url":"https://github.com/o/r/pull/221",
+            "reasoning":"opened the pull request"
+        }"#;
+
+        assert!(parse_validated::<PublisherOutput>(raw).is_err());
     }
 }
