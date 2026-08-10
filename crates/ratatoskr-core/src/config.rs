@@ -877,6 +877,11 @@ impl RatatoskrConfig {
                         "mcp.servers.{name}.tools contains an empty tool name"
                     )));
                 }
+                if !valid_model_tool_name(display) {
+                    return Err(ConfigError::Invalid(format!(
+                        "mcp.servers.{name}.tools.{wire}.name must match ^[A-Za-z0-9_-]{{1,64}}$"
+                    )));
+                }
                 if !shown.insert(display) {
                     return Err(ConfigError::Invalid(format!(
                         "mcp.servers.{name}.tools exposes duplicate name `{display}`"
@@ -894,6 +899,15 @@ fn valid_env_name(name: &str) -> bool {
         .next()
         .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// The common provider contract for client tool names. Keeping configured aliases inside the
+/// narrowest supported grammar prevents a valid config from failing only when a model is called.
+fn valid_model_tool_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 impl Default for RatatoskrConfig {
@@ -1541,6 +1555,23 @@ mod tests {
             .unwrap();
             assert!(
                 matches!(malformed.validate(), Err(ConfigError::Invalid(error)) if error.contains(expected))
+            );
+        }
+
+        for alias in ["Web Search".to_string(), "é".to_string(), "x".repeat(65)] {
+            let malformed: RatatoskrConfig = toml::from_str(&format!(
+                r#"{base}
+                [mcp.servers.remote]
+                transport = "streamable_http"
+                url = "https://example.test/mcp"
+                [mcp.servers.remote.tools.search]
+                name = "{alias}"
+                "#
+            ))
+            .unwrap();
+            assert!(
+                matches!(malformed.validate(), Err(ConfigError::Invalid(error)) if error.contains("must match")),
+                "alias `{alias}` must be rejected"
             );
         }
     }

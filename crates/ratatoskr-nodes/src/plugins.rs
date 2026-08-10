@@ -551,7 +551,12 @@ fn node_agent_config(
     let from_plugins: Vec<String> = tools
         .groups()
         .iter()
-        .filter(|group| group.origin == ratatoskr_mcp::LOCAL || group.is_plugin())
+        .filter(|group| {
+            matches!(
+                group.provenance,
+                ServerProvenance::Builtin | ServerProvenance::Plugin
+            )
+        })
         .flat_map(ServerTools::display_names)
         .collect();
     let spelled_out = rc
@@ -813,7 +818,8 @@ mod tests {
         let mut web_fetch = rmcp::model::Tool::default();
         web_fetch.name = "web_fetch_exa".to_string().into();
         let tools = ToolSet::from_servers(vec![ServerTools {
-            origin: "web".to_string(),
+            // Origin spelling must not let a configured server impersonate host-local tools.
+            origin: ratatoskr_mcp::LOCAL.to_string(),
             sink: None,
             tools: vec![web_fetch],
             prefix: None,

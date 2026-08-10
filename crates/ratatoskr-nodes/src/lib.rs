@@ -746,6 +746,7 @@ pub struct NodeAgentConfig {
 /// individually made each helper's signature grow with the run rather than with its job.
 pub(crate) struct Run<'a> {
     client: Option<&'a RagRatClient>,
+    configured: &'a [ServerTools],
     config: &'a RatatoskrConfig,
     store: &'a Store,
     run_id: &'a str,
@@ -1095,6 +1096,7 @@ async fn publish_and_checkpoint(
 ) -> Result<PublisherOutput, PlanError> {
     let &Run {
         client,
+        configured,
         config,
         store,
         run_id,
@@ -1124,7 +1126,7 @@ async fn publish_and_checkpoint(
     let declared_context =
         workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
             client,
-            configured: &[],
+            configured,
             config,
             store,
             run_id,
@@ -1178,6 +1180,7 @@ async fn bookkeep_and_checkpoint(
     // `input` here, which on a replay is reconstructed from the store rather than passed in.
     let &Run {
         client,
+        configured,
         config,
         store,
         run_id,
@@ -1197,7 +1200,7 @@ async fn bookkeep_and_checkpoint(
         let declared_context =
             workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
                 client,
-                configured: &[],
+                configured,
                 config,
                 store,
                 run_id,
@@ -1260,6 +1263,7 @@ async fn bookkeep_and_checkpoint(
 /// re-run. Reads the issue/analyst/implementer checkpoints and composes a fresh memory.
 pub async fn run_bookkeeper(
     client: Option<&RagRatClient>,
+    configured: &[ServerTools],
     config: &RatatoskrConfig,
     store: &Store,
     run_id: &str,
@@ -1308,6 +1312,7 @@ pub async fn run_bookkeeper(
     let ledger = Arc::new(RunLedger::default());
     let run = Run {
         client,
+        configured,
         config,
         store,
         run_id,

@@ -98,6 +98,8 @@ pub struct WorkflowContext {
     sink: Option<ServerSink>,
     /// rag-rat's whole offer, followed by other configured server offers, for every node's pool.
     servers: Vec<ServerTools>,
+    /// Configured offers without rag-rat, retained for fresh terminal-stage contexts.
+    configured_servers: Vec<ServerTools>,
     repo_path: PathBuf,
     /// Prepared by `redTeam` (or `implement` when no red team runs), then reused by implementation,
     /// iteration, and cleanup. The script never sees a raw path.
@@ -181,6 +183,7 @@ impl WorkflowContext {
         let repo_path = std::env::current_dir()
             .map_err(|e| PlanError::node("workflow", NodeError::Failed(format!("cwd: {e}"))))?;
         let clarifier = crate::clarify::NodeClarifier::new(config, store, engine, run_id, issue);
+        let configured_servers = configured.to_vec();
         Ok(Arc::new(Self {
             ledger,
             clarifier,
@@ -195,8 +198,9 @@ impl WorkflowContext {
             servers: client
                 .map(|c| c.offer())
                 .into_iter()
-                .chain(configured.iter().cloned())
+                .chain(configured_servers.iter().cloned())
                 .collect(),
+            configured_servers,
             repo_path,
             worktree: Mutex::new(None),
             red_team_started: AtomicBool::new(false),
@@ -2340,6 +2344,21 @@ trait FullTerminalActions: Sync {
 
 struct LiveTerminalActions;
 
+fn terminal_run(ctx: &WorkflowContext) -> crate::Run<'_> {
+    crate::Run {
+        client: None,
+        configured: &ctx.configured_servers,
+        config: &ctx.config,
+        store: &ctx.store,
+        run_id: &ctx.run_id,
+        issue: &ctx.issue,
+        engine: &ctx.engine,
+        clarifier: &ctx.clarifier,
+        context: &ctx.plugin_context,
+        ledger: &ctx.ledger,
+    }
+}
+
 impl FullTerminalActions for LiveTerminalActions {
     async fn commit(
         &self,
@@ -2363,17 +2382,7 @@ impl FullTerminalActions for LiveTerminalActions {
         input: PublisherInput,
         terminal: bool,
     ) -> Option<PublisherOutput> {
-        let run = crate::Run {
-            client: None,
-            config: &ctx.config,
-            store: &ctx.store,
-            run_id: &ctx.run_id,
-            issue: &ctx.issue,
-            engine: &ctx.engine,
-            clarifier: &ctx.clarifier,
-            context: &ctx.plugin_context,
-            ledger: &ctx.ledger,
-        };
+        let run = terminal_run(ctx);
         crate::publish_if_enabled(&run, input, terminal).await
     }
 
@@ -2634,6 +2643,51 @@ mod tests {
             params: None,
             session: ratatoskr_core::SessionScope::Fresh,
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_run_retains_configured_server_offers() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-terminal-configured-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let config = RatatoskrConfig::default();
+        let mut tool = rmcp::model::Tool::default();
+        tool.name = "RemotePublish".to_string().into();
+        let configured = [ServerTools {
+            origin: "remote".to_string(),
+            sink: None,
+            tools: vec![tool],
+            prefix: None,
+            renames: std::collections::BTreeMap::new(),
+            capabilities: std::collections::BTreeMap::from([(
+                "RemotePublish".to_string(),
+                ratatoskr_core::Capability::Publish,
+            )]),
+            provenance: ratatoskr_mcp::ServerProvenance::Configured,
+        }];
+        let ctx = WorkflowContext::new_with_ledger(WorkflowContextParams {
+            client: None,
+            configured: &configured,
+            config: &config,
+            store: &store,
+            run_id: "terminal-configured",
+            issue: "publish through a configured server",
+            engine: &engine,
+            plugin_context: crate::PluginContext::default(),
+            ledger: Arc::new(ratatoskr_agent::RunLedger::default()),
+        })
+        .unwrap();
+
+        assert_eq!(
+            terminal_run(&ctx).configured[0].display_names(),
+            ["RemotePublish"]
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

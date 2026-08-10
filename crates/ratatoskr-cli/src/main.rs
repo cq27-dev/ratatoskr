@@ -685,12 +685,22 @@ async fn bookkeep(run_id: &str, config_path: &Path) -> anyhow::Result<()> {
     let store = ratatoskr_store::Store::open(&config.store.path)
         .with_context(|| format!("opening store at {}", config.store.path.display()))?;
     let client = connect_rag_rat(&config.rag_rat).await?;
+    let configured = connect_configured_mcp(&config.mcp).await?;
+    let configured_offers: Vec<_> = configured.iter().map(|client| client.offer()).collect();
 
     let engine = load_rules(&config).await?;
-    let result = ratatoskr_nodes::run_bookkeeper(client.as_ref(), &config, &store, run_id, &engine)
-        .instrument(tracing::info_span!("run", run_id = %run_id))
-        .await;
+    let result = ratatoskr_nodes::run_bookkeeper(
+        client.as_ref(),
+        &configured_offers,
+        &config,
+        &store,
+        run_id,
+        &engine,
+    )
+    .instrument(tracing::info_span!("run", run_id = %run_id))
+    .await;
 
+    shutdown_configured_mcp(configured).await;
     shutdown_rag_rat(client).await;
 
     let out = result.context("bookkeeper failed")?;
