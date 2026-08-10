@@ -15,8 +15,7 @@ flowchart LR
     overseer --> context[context]
     context --> analyst[analyst]
     analyst --> redteam[red-team]
-    analyst --> impl[implementer]
-    redteam --> tests{tests}
+    redteam --> impl[implementer]
     impl --> tests
     tests -->|new failures| impl
     tests -->|clean| verifier[verifier]
@@ -44,12 +43,15 @@ to the built-in workflow and converges on its test result alone.
    its source.
 3. **analyst** determines the blast radius, the requirements the change must satisfy, and the
    acceptance steps that prove it done.
-4. **red-team ∥ implementer** run concurrently: red-team characterises the *baseline* acceptance run
-   in a sandbox, while the implementer edits a fresh git worktree — reading, writing and running its
-   checks with this pipeline's own tools.
+4. **red-team → implementer** run in that order on a fresh git worktree: red-team characterises the
+   *baseline* acceptance run and authors tests from the analyst's frozen interface before the
+   implementation exists. The implementer then edits the worktree — reading, writing and running
+   its checks with this pipeline's own tools.
 5. **converge** re-runs the implementer until the change introduces no new failures. An iteration
    that edited the tests or their runner is refused outright — a gate that can be satisfied by
-   editing itself is not one.
+   editing itself is not one. The ordinary iteration budget is hard; at its ceiling, Rust may grant
+   one bounded analyst-revision plus implementation attempt when the checkpointed review history
+   still justifies it.
 6. **verifier** reads the diff against the requirements once the tests are clean, and answers what
    the tests cannot. Findings that fault the *plan* go back to the analyst; the rest go back to the
    implementer.
@@ -132,7 +134,7 @@ read back from cache.
 | `init` | Write a default `ratatoskr.toml`. |
 | `ask <question>` | One agent answers a question about the repo, grounded in rag-rat's tools. |
 | `plan <issue>` | context → analyst, printing a grounded plan. No code is changed. |
-| `run <issue>` | Everything `plan` does, then fork, converge, and bookkeep. |
+| `run <issue>` | Everything `plan` does, then run the bundled TypeScript fork/converge flow and Rust-owned terminal actions. |
 | `bookkeep <run-id>` | Replay just the bookkeeper against a stored run — no re-run. |
 | `status <run-id>` | A run's status and every per-node checkpoint. Pure read: no rag-rat, no LLM. |
 | `workflows` | List the workflows a run can be given, and what each is for. |
@@ -543,10 +545,16 @@ rather than half-applied. `${CLAUDE_SKILL_DIR}` in a body resolves to the skill'
 
 ### Scripted orchestration
 
-`.ratatoskr/workflow.ts` replaces the built-in run flow outright when present, letting a repo
-express its own ordering, fan-out, and gating over the same nodes. See
-[`examples/workflow.ts`](examples/workflow.ts). Every safety gate stays enforced in Rust on the
-bindings rather than delegated to the script.
+The standard workflow is itself bundled TypeScript: it composes `context`, declared model stages,
+red-team, implementation, verification and bounded convergence. A repository workflow replaces
+that composition, letting a repo express its own ordering and optional stages over the same hosts.
+See [`examples/workflow.ts`](examples/workflow.ts).
+
+TypeScript never owns authority. Rust hosts still create and clean worktrees, grant the sandboxed
+command tool, freeze acceptance and the test interface, apply review thresholds, enforce iteration
+and ceiling-replan limits, write checkpoints, infer terminal status, and perform delivery and
+bookkeeping. Internal write-capable model stages and terminal publisher/bookkeeper stages are not
+repository-script globals.
 
 `.ratatoskr/` otherwise holds runtime state — logs and the store — and is gitignored, except for
 `rules/` and `workflow.ts`, which are version-controlled.
@@ -565,7 +573,7 @@ read-only. Ratatoskr warns when it is pointed at a nested root.
 | `ratatoskr-mcp` | rag-rat MCP client — spawns rag-rat, lists tools, hands back a cloneable sink. |
 | `ratatoskr-agent` | Builds a `rig` agent bound to a model + rag-rat's tools; the per-call ruleset gate. |
 | `ratatoskr-script` | TypeScript rulesets and `workflow.ts`: transpile (swc) + evaluate (rquickjs). |
-| `ratatoskr-nodes` | The nodes, plus the `run_plan` / `run_full` executors and the converge loop. |
+| `ratatoskr-nodes` | Declared stage execution plus Rust-owned workflow operations, gates, checkpoint reconstruction and terminal actions. |
 | `ratatoskr-exec` | Git worktrees and sandboxed command execution. |
 | `ratatoskr-store` | SQLite checkpoint store, single-writer by construction. |
 | `ratatoskr-serve` | HTTP API over the store (read-only on it), the run launcher, sessions and roles, and the dashboard UI. |
