@@ -4544,6 +4544,7 @@ mod tests {
                 object.remove("title");
                 object.remove("description");
                 object.remove("default");
+                object.remove("format");
                 for value in object.values_mut() {
                     without_schema_annotations(value);
                 }
@@ -4599,6 +4600,10 @@ mod tests {
             assert_eq!(
                 declared, &without_defaults,
                 "workflow schema materializes output defaults for {stage_id}"
+            );
+            assert!(
+                !declared.to_string().contains("\"format\""),
+                "workflow schema uses a non-portable format annotation for {stage_id}"
             );
         }
     }

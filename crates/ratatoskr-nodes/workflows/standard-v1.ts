@@ -37,7 +37,7 @@ defineWorkflow({
       outputContract: "CharacterizerOutput",
       outputSchema: obj({
         failing: arr(str()),
-        passed: num({ format: "uint" }),
+        passed: num(),
       }),
       instructions: LOAD("prompts/characterizer.md").trim(),
       renderQuestion(input: any) {
@@ -313,6 +313,7 @@ defineWorkflow({
         "symbol_lookup",
         "memory_search",
       ],
+      // Null defers to the selected route's session policy.
       session: null,
       appendRepositoryGuidance: false,
       arrayNormalization: [
@@ -348,7 +349,7 @@ defineWorkflow({
       instructions: LOAD("prompts/scout.md").trim(),
       capabilities: ["read"],
       tools: ["papertrail_issue_search", "semantic_search"],
-      // null means the selected TOML/profile/ruleset route owns the session policy.
+      // Null defers to the selected route's session policy.
       session: null,
       appendRepositoryGuidance: false,
       arrayNormalization: [
@@ -571,7 +572,7 @@ defineWorkflow({
       },
       capabilities: ["read"],
       tools: ["semantic_search", "symbol_lookup", "memory_search", "ask"],
-      // Preserve the selected TOML/profile/ruleset continuation policy.
+      // Null defers to the selected route's session policy.
       session: null,
       appendRepositoryGuidance: false,
     }),
@@ -652,7 +653,7 @@ defineWorkflow({
       },
       capabilities: ["publish"],
       tools: ["gh", "git_push"],
-      // Preserve the selected TOML/profile/ruleset continuation policy.
+      // Null defers to the selected route's session policy.
       session: null,
       appendRepositoryGuidance: false,
     }),
@@ -671,11 +672,7 @@ defineWorkflow({
               failure_scenario: str(),
               file: str(),
               kind: { "$ref": "#/$defs/FindingKind" },
-              line: {
-                type: ["integer", "null"],
-                format: "uint32",
-                minimum: 0,
-              },
+              line: { ...num(), type: ["integer", "null"] },
               severity: { "$ref": "#/$defs/Severity" },
               summary: str(),
             },
