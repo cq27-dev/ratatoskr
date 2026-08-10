@@ -4644,6 +4644,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn publisher_prompt_treats_the_committed_result_as_immutable() {
+        let prompt = include_str!("../prompts/publisher.md");
+
+        assert!(prompt.contains("Never change the repository."));
+        assert!(prompt.contains("having a tool is not permission to use it here"));
+        assert!(prompt.contains("through\n`git_push` and `gh`"));
+        assert!(prompt.contains("do not repair it"));
+    }
+
     struct RendererParityCase {
         stage: &'static str,
         input: serde_json::Value,
