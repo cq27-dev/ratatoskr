@@ -446,7 +446,7 @@ const INTERNAL_GATES: &[&str] = &["referee"];
 /// before a workflow is chosen — and a ruleset targeting a node that some workflow declares is
 /// legitimate whether or not this particular run uses that workflow. The internal referee is
 /// never governable, even when a workflow names it.
-fn governable_from(workflows: impl IntoIterator<Item = WorkflowRuntime>) -> Vec<String> {
+fn governable_from<'a>(workflows: impl IntoIterator<Item = &'a WorkflowRuntime>) -> Vec<String> {
     let mut names: Vec<String> = BUILT_IN_NODES.iter().map(|s| s.to_string()).collect();
     for workflow in workflows {
         names.extend(workflow.meta().nodes.iter().cloned());
@@ -459,7 +459,7 @@ fn governable_from(workflows: impl IntoIterator<Item = WorkflowRuntime>) -> Vec<
 }
 
 pub async fn governable_nodes() -> Result<Vec<String>, PlanError> {
-    Ok(governable_from(defined().await?))
+    Ok(governable_from(&defined().await?))
 }
 
 /// Every workflow a run could use: the built-in, then whatever this repo defines.
@@ -496,7 +496,18 @@ pub async fn defined() -> Result<Vec<WorkflowRuntime>, PlanError> {
 
 /// Validate the stage registry every configured workflow contributes before any run starts.
 pub async fn validate_configured_stages(config: &RatatoskrConfig) -> Result<(), PlanError> {
+    let workflows = defined().await?;
+    let standard_stages = workflow::standard_stages().await?;
+    validate_configured_stage_registry(config, &workflows, standard_stages)
+}
+
+fn validate_configured_stage_registry(
+    config: &RatatoskrConfig,
+    workflows: &[WorkflowRuntime],
+    standard_stages: Vec<Stage>,
+) -> Result<(), PlanError> {
     let profiles = agent_profiles(config);
+    let mut permitted_governance = governable_from(workflows);
     let mut stages = built_in_stages();
     stages.retain(|stage| {
         !matches!(
@@ -510,13 +521,16 @@ pub async fn validate_configured_stages(config: &RatatoskrConfig) -> Result<(), 
                 | "publisher"
         )
     });
-    stages.extend(workflow::standard_stages().await?);
-    for workflow in defined().await? {
+    stages.extend(standard_stages);
+    for workflow in workflows {
         let workflow_stages = stage::stages_from_workflow(workflow.meta());
         validate::validate_declared_contracts(&workflow_stages)?;
         stages.extend(workflow_stages);
     }
-    validate::validate(&stages, &profiles)
+    permitted_governance.extend(stages.iter().map(|stage| stage.id.clone()));
+    permitted_governance.sort();
+    permitted_governance.dedup();
+    validate::validate(&stages, &profiles, &permitted_governance)
 }
 
 /// Pick the workflow a run should use.
@@ -2478,6 +2492,26 @@ mod agent_config_tests {
             .expect("the bundled standard declarations replace legacy terminal placeholders");
     }
 
+    #[test]
+    fn configured_registry_allows_governance_by_another_declared_stage() {
+        let template = built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        let mut policy = template.clone();
+        policy.id = "shared_policy".to_string();
+        let mut consumer = template;
+        consumer.id = "custom_plan".to_string();
+        consumer.governed_by = Some(policy.id.clone());
+
+        validate_configured_stage_registry(
+            &RatatoskrConfig::default(),
+            &[],
+            vec![policy, consumer],
+        )
+        .expect("resolved declared stage IDs are permitted governance identities");
+    }
+
     #[tokio::test]
     async fn a_workflow_can_add_to_the_nodes_a_ruleset_may_govern() {
         let built_in = Workflow::BuiltIn;
@@ -2925,7 +2959,7 @@ mod referee_governance_tests {
         let found = WorkflowRuntime::discover(&dir).await.unwrap();
         assert_eq!(found[0].meta().nodes, ["referee"]);
         assert!(
-            !governable_from(found).iter().any(|name| name == "referee"),
+            !governable_from(&found).iter().any(|name| name == "referee"),
             "a workflow declaration cannot make the internal judge governable"
         );
         let _ = std::fs::remove_dir_all(&dir);

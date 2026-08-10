@@ -10,9 +10,15 @@ const INTERNAL_GATES: &[&str] = &["referee"];
 const LEGACY_HOST_ALIASES: &[&str] = &["memory", "implement", "iterate", "verify"];
 
 /// Reject invalid stage references before a workflow can start a model call.
-pub fn validate(stages: &[Stage], profiles: &[AgentProfile]) -> Result<(), PlanError> {
+pub fn validate(
+    stages: &[Stage],
+    profiles: &[AgentProfile],
+    permitted_governance: &[String],
+) -> Result<(), PlanError> {
     let agents: BTreeSet<&str> = profiles.iter().map(|profile| profile.id.as_str()).collect();
     let stage_names: BTreeSet<&str> = stages.iter().map(|stage| stage.id.as_str()).collect();
+    let governance_names: BTreeSet<&str> =
+        permitted_governance.iter().map(String::as_str).collect();
     if stage_names.len() != stages.len() {
         return Err(PlanError::Configuration(
             "stage identifiers must be unique across configured workflows".to_string(),
@@ -60,6 +66,25 @@ pub fn validate(stages: &[Stage], profiles: &[AgentProfile]) -> Result<(), PlanE
                 "stage `{}` must use an underscore-separated identifier",
                 stage.id
             )));
+        }
+        if let Some(governed_by) = stage.governed_by.as_deref() {
+            if !machine_name(governed_by) {
+                return Err(PlanError::Configuration(format!(
+                    "stage `{}` governedBy `{governed_by}` must use an underscore-separated identifier",
+                    stage.id
+                )));
+            }
+            if !governance_names.contains(governed_by) {
+                return Err(PlanError::Configuration(format!(
+                    "stage `{}` references unknown governedBy `{governed_by}`; valid governance identities: {}",
+                    stage.id,
+                    governance_names
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
         }
     }
 
@@ -154,6 +179,14 @@ fn machine_name(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn permitted_for(stages: &[Stage]) -> Vec<String> {
+        crate::BUILT_IN_NODES
+            .iter()
+            .map(|name| (*name).to_string())
+            .chain(stages.iter().map(|stage| stage.id.clone()))
+            .collect()
+    }
+
     #[test]
     fn declared_contracts_require_a_valid_schema() {
         let mut stage = crate::built_in_stages().pop().unwrap();
@@ -191,7 +224,91 @@ mod tests {
         // The workflow script calls hosts explicitly, so metadata order cannot create a dataflow
         // edge or make two independently useful stages incompatible.
         assert!(validate_declared_contracts(&stages).is_ok());
-        assert!(validate(&stages, &crate::built_in_agents()).is_ok());
+        assert!(validate(&stages, &crate::built_in_agents(), &permitted_for(&stages)).is_ok());
+    }
+
+    #[test]
+    fn omitted_governance_keeps_the_stage_identifier_fallback() {
+        let mut stage = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        stage.id = "custom_plan".to_string();
+        stage.governed_by = None;
+
+        assert!(validate(&[stage], &crate::built_in_agents(), &[]).is_ok());
+    }
+
+    #[test]
+    fn explicit_builtin_governance_is_permitted() {
+        let mut stage = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        stage.id = "test_author".to_string();
+        stage.governed_by = Some("redteam".to_string());
+        let permitted = crate::BUILT_IN_NODES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+
+        assert!(validate(&[stage], &crate::built_in_agents(), &permitted).is_ok());
+    }
+
+    #[test]
+    fn explicit_workflow_governance_is_permitted() {
+        let mut stage = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        stage.id = "custom_plan".to_string();
+        stage.governed_by = Some("shared_policy".to_string());
+
+        assert!(
+            validate(
+                &[stage],
+                &crate::built_in_agents(),
+                &["shared_policy".to_string()],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn explicit_governance_may_name_another_declared_stage() {
+        let template = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        let mut policy = template.clone();
+        policy.id = "shared_policy".to_string();
+        let mut plan = template;
+        plan.id = "custom_plan".to_string();
+        plan.governed_by = Some(policy.id.clone());
+        let stages = [policy, plan];
+
+        assert!(validate(&stages, &crate::built_in_agents(), &permitted_for(&stages),).is_ok());
+    }
+
+    #[test]
+    fn explicit_unknown_governance_is_rejected_before_execution() {
+        let mut stage = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        stage.id = "custom_plan".to_string();
+        stage.governed_by = Some("verifer".to_string());
+        let permitted = crate::BUILT_IN_NODES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+
+        let error = validate(&[stage], &crate::built_in_agents(), &permitted)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unknown governedBy `verifer`"), "{error}");
+        assert!(error.contains("verifier"), "{error}");
     }
 
     #[test]
@@ -205,7 +322,10 @@ mod tests {
         for alias in LEGACY_HOST_ALIASES {
             let mut stage = template.clone();
             stage.id = (*alias).to_string();
-            let error = validate(&[stage], &profiles).unwrap_err().to_string();
+            let stages = [stage];
+            let error = validate(&stages, &profiles, &permitted_for(&stages))
+                .unwrap_err()
+                .to_string();
             assert!(
                 error.contains("legacy workflow host alias"),
                 "{alias} must be reserved: {error}"
@@ -232,7 +352,8 @@ mod tests {
         child.output_schema = Some(serde_json::json!({ "type": "object" }));
         child.question_renderer = Some("input => JSON.stringify(input)".to_string());
 
-        let error = validate(&[parent, child], &crate::built_in_agents())
+        let stages = [parent, child];
+        let error = validate(&stages, &crate::built_in_agents(), &permitted_for(&stages))
             .unwrap_err()
             .to_string();
 
