@@ -325,8 +325,8 @@ impl ImplementerNode {
                 mounts: mounts_for(&self.sandbox, &self.repo_path, worktree.as_path()),
                 // Filled in per call.
                 command: Vec::new(),
-                cpus: 2,
-                memory_mib: 2048,
+                cpus: self.sandbox.cpus,
+                memory_mib: self.sandbox.memory_mib,
                 network: false,
             },
         }

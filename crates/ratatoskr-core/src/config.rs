@@ -407,6 +407,14 @@ impl Default for PublishConfig {
     }
 }
 
+fn default_sandbox_cpus() -> u8 {
+    2
+}
+
+fn default_sandbox_memory_mib() -> u64 {
+    2048
+}
+
 /// Phase 3 sandbox settings — where red-team and implementer run the acceptance check.
 ///
 /// Unknown keys are refused, for the same reason `ImplementerConfig` refuses them and with a
@@ -415,10 +423,17 @@ impl Default for PublishConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
-    /// `"microsandbox"` (MicroVM, needs KVM) or `"landlock"` (bwrap+Landlock fallback).
+    /// `"container"` (OCI), `"microsandbox"` (MicroVM, needs KVM), or `"landlock"`
+    /// (bwrap+Landlock fallback).
     pub backend: String,
-    /// OCI image the sandbox boots (microsandbox backend).
+    /// OCI image the container or microsandbox boots.
     pub image: String,
+    /// CPU cores available to each sandboxed command.
+    #[serde(default = "default_sandbox_cpus")]
+    pub cpus: u8,
+    /// Memory available to each sandboxed command, in MiB.
+    #[serde(default = "default_sandbox_memory_mib")]
+    pub memory_mib: u64,
     /// The default acceptance check: one command, for the repo that has one and nothing to add.
     /// Superseded per-task by the analyst's `acceptance` unless `pin_acceptance` is set.
     pub test_command: Vec<String>,
@@ -519,6 +534,8 @@ impl Default for SandboxConfig {
             // ratatoskr-exec's `microsandbox` feature (see its Cargo.toml).
             backend: "landlock".to_string(),
             image: "docker.io/library/rust:1-slim".to_string(),
+            cpus: default_sandbox_cpus(),
+            memory_mib: default_sandbox_memory_mib(),
             test_command: vec!["cargo".to_string(), "test".to_string()],
             network_allow: Vec::new(),
             pin_acceptance: false,
@@ -736,6 +753,22 @@ impl RatatoskrConfig {
             return Err(ConfigError::Invalid(format!(
                 "sandbox.backend `{}` is not one of {BACKENDS:?}",
                 self.sandbox.backend
+            )));
+        }
+        if self.sandbox.cpus == 0 {
+            return Err(ConfigError::Invalid(
+                "sandbox.cpus must be >= 1".to_string(),
+            ));
+        }
+        if self.sandbox.memory_mib == 0 {
+            return Err(ConfigError::Invalid(
+                "sandbox.memory_mib must be >= 1".to_string(),
+            ));
+        }
+        if self.sandbox.backend == "microsandbox" && self.sandbox.memory_mib > u64::from(u32::MAX) {
+            return Err(ConfigError::Invalid(format!(
+                "sandbox.memory_mib must be <= {} for the microsandbox backend",
+                u32::MAX
             )));
         }
         if self.implementer.max_iterations == 0 {
@@ -1167,6 +1200,83 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         RatatoskrConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn sandbox_limits_default_when_omitted_and_are_configurable() {
+        let omitted = RatatoskrConfig::from_toml_str(
+            r#"
+            [store]
+            path = "s"
+            [worktree]
+            root = "w"
+            [sandbox]
+            backend = "landlock"
+            image = "checks"
+            test_command = ["cargo", "test"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(omitted.sandbox.cpus, 2);
+        assert_eq!(omitted.sandbox.memory_mib, 2048);
+
+        let configured = RatatoskrConfig::from_toml_str(
+            r#"
+            [store]
+            path = "s"
+            [worktree]
+            root = "w"
+            [sandbox]
+            backend = "container"
+            image = "checks"
+            cpus = 4
+            memory_mib = 8192
+            test_command = ["cargo", "test"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(configured.sandbox.cpus, 4);
+        assert_eq!(configured.sandbox.memory_mib, 8192);
+
+        assert!(
+            RatatoskrConfig::from_toml_str(
+                r#"
+            [store]
+            path = "s"
+            [worktree]
+            root = "w"
+            [sandbox]
+            backend = "landlock"
+            image = "checks"
+            test_command = ["cargo", "test"]
+            memory_mb = 2048
+            "#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_sandbox_limits() {
+        let mut cfg = RatatoskrConfig::default();
+        cfg.sandbox.cpus = 0;
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("sandbox.cpus"), "{error}");
+
+        let mut cfg = RatatoskrConfig::default();
+        cfg.sandbox.memory_mib = 0;
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("sandbox.memory_mib"), "{error}");
+    }
+
+    #[test]
+    fn validate_rejects_microsandbox_memory_above_u32_max() {
+        let mut cfg = RatatoskrConfig::default();
+        cfg.sandbox.backend = "microsandbox".to_string();
+        cfg.sandbox.memory_mib = u64::from(u32::MAX) + 1;
+
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("sandbox.memory_mib"), "{error}");
     }
 
     #[test]
