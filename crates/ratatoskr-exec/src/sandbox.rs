@@ -17,7 +17,10 @@
 //! - `microsandbox` — a **MicroVM**, adding a VM boundary on top of the image. Needs KVM, and is
 //!   behind `--features microsandbox` because its build script needs the network.
 
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use tokio::process::Command;
 
@@ -83,6 +86,8 @@ pub enum SandboxError {
     Microsandbox(String),
     #[error("bwrap not found or failed to launch: {0}")]
     Bwrap(#[from] std::io::Error),
+    #[error("could not prepare linked-worktree Git metadata for the sandbox")]
+    GitMetadata,
     #[error(
         "no container runtime found; the `container` backend needs one of {} on PATH",
         RUNTIMES.join(" or ")
@@ -198,6 +203,7 @@ fn container_argv(spec: &SandboxSpec, user: Option<&str>) -> Vec<String> {
 /// needs KVM), this is the rung that removes the host filesystem without requiring anything beyond
 /// an ordinary container runtime.
 async fn run_container(spec: SandboxSpec) -> Result<ExecOutput, SandboxError> {
+    let (spec, _git_view) = with_linked_git_metadata(spec)?;
     let runtime = container_runtime().ok_or(SandboxError::NoContainerRuntime)?;
     let args = container_argv(&spec, host_user().as_deref());
 
@@ -254,6 +260,147 @@ async fn run_microsandbox(spec: SandboxSpec) -> Result<ExecOutput, SandboxError>
         stdout: output.stdout().unwrap_or_default(),
         stderr: output.stderr().unwrap_or_default(),
     })
+}
+
+/// A sandbox-local view of a linked worktree's Git metadata.
+///
+/// Git writes its per-worktree index below the common Git directory, while the worktree's `.git`
+/// file contains a host-absolute pointer to that directory.  A container only sees `/workspace`,
+/// so mounting the worktree alone makes ordinary `git status` fail and exposes the host path in
+/// its error.  This view rewrites both indirections to stable guest paths and keeps the real
+/// metadata mounted with the least authority Git needs.
+struct LinkedGitView {
+    temp_dir: PathBuf,
+    mounts: Vec<Mount>,
+}
+
+impl Drop for LinkedGitView {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.temp_dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %self.temp_dir.display(), "failed to remove sandbox Git view: {error}");
+        }
+    }
+}
+
+const GIT_VIEW_ROOT: &str = "/run/ratatoskr/git";
+static GIT_VIEW_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Extend a container spec with a private guest-path representation of linked-worktree metadata.
+/// Ordinary repositories use a `.git` directory and therefore need no transformation.
+fn with_linked_git_metadata(
+    mut spec: SandboxSpec,
+) -> Result<(SandboxSpec, Option<LinkedGitView>), SandboxError> {
+    let Some(worktree_mount) = spec
+        .mounts
+        .iter()
+        .find(|mount| mount.guest == spec.workdir && !mount.read_only)
+    else {
+        return Ok((spec, None));
+    };
+    let Some(view) = linked_git_view(worktree_mount)? else {
+        return Ok((spec, None));
+    };
+    spec.mounts.extend(view.mounts.iter().cloned());
+    Ok((spec, Some(view)))
+}
+
+fn linked_git_view(worktree_mount: &Mount) -> Result<Option<LinkedGitView>, SandboxError> {
+    let dot_git = worktree_mount.host.join(".git");
+    if dot_git.is_dir() || !dot_git.exists() {
+        return Ok(None);
+    }
+
+    let pointer = std::fs::read_to_string(&dot_git).map_err(|_| SandboxError::GitMetadata)?;
+    let Some(git_dir) = pointer
+        .strip_prefix("gitdir: ")
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        return Err(SandboxError::GitMetadata);
+    };
+    let git_dir = dot_git
+        .parent()
+        .expect("`.git` has a parent")
+        .join(git_dir)
+        .canonicalize()
+        .map_err(|_| SandboxError::GitMetadata)?;
+    let common_relative = std::fs::read_to_string(git_dir.join("commondir"))
+        .map_err(|_| SandboxError::GitMetadata)?;
+    let common_dir = git_dir
+        .join(common_relative.trim())
+        .canonicalize()
+        .map_err(|_| SandboxError::GitMetadata)?;
+    let worktree_name = git_dir
+        .strip_prefix(common_dir.join("worktrees"))
+        .ok()
+        .filter(|relative| relative.components().count() == 1)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+        .ok_or(SandboxError::GitMetadata)?;
+
+    let temp_dir = create_git_view_dir()?;
+    let guest_git_dir = format!("{GIT_VIEW_ROOT}/common/worktrees/{worktree_name}");
+    let guest_dot_git = format!("{worktree}/.git", worktree = worktree_mount.guest);
+    let guest_gitdir_file = format!("{guest_git_dir}/gitdir");
+    if std::fs::write(
+        temp_dir.join("dot-git"),
+        format!("gitdir: {guest_git_dir}\n"),
+    )
+    .is_err()
+        || std::fs::write(temp_dir.join("gitdir"), format!("{guest_dot_git}\n")).is_err()
+    {
+        std::fs::remove_dir_all(&temp_dir).ok();
+        return Err(SandboxError::GitMetadata);
+    }
+
+    Ok(Some(LinkedGitView {
+        mounts: vec![
+            Mount {
+                host: common_dir,
+                guest: format!("{GIT_VIEW_ROOT}/common"),
+                read_only: true,
+            },
+            // This is deliberately after the common directory mount: `git status` refreshes the
+            // worktree index, but it must not be able to rewrite shared refs or configuration.
+            Mount {
+                host: git_dir,
+                guest: guest_git_dir.clone(),
+                read_only: false,
+            },
+            Mount {
+                host: temp_dir.join("dot-git"),
+                guest: guest_dot_git,
+                read_only: true,
+            },
+            // Git's metadata records the worktree `.git` location too. Replace that second
+            // host-path pointer so inspection never leaks the checkout's location.
+            Mount {
+                host: temp_dir.join("gitdir"),
+                guest: guest_gitdir_file,
+                read_only: true,
+            },
+        ],
+        temp_dir,
+    }))
+}
+
+fn create_git_view_dir() -> Result<PathBuf, SandboxError> {
+    for _ in 0..32 {
+        let sequence = GIT_VIEW_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "ratatoskr-git-view-{}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(SandboxError::GitMetadata),
+        }
+    }
+    Err(SandboxError::GitMetadata)
 }
 
 /// The only variables a sandboxed command sees. Everything else `--clearenv` drops.
@@ -470,6 +617,140 @@ mod tests {
         }
     }
 
+    fn linked_worktree() -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "ratatoskr-linked-git-{}-{}",
+            std::process::id(),
+            GIT_VIEW_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let checkout = root.join("checkout");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&checkout).unwrap();
+        for args in [
+            ["init"].as_slice(),
+            ["config", "user.email", "test@example.invalid"].as_slice(),
+            ["config", "user.name", "Sandbox test"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&checkout)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        std::fs::write(checkout.join("tracked"), "contents\n").unwrap();
+        for args in [
+            ["add", "tracked"].as_slice(),
+            ["commit", "-m", "initial"].as_slice(),
+            ["worktree", "add", "-b", "run", worktree.to_str().unwrap()].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&checkout)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        (root, worktree)
+    }
+
+    #[test]
+    fn linked_worktree_git_metadata_is_mounted_at_guest_only_paths() {
+        let (root, worktree) = linked_worktree();
+        let spec = SandboxSpec {
+            mounts: vec![Mount {
+                host: worktree.clone(),
+                guest: "/workspace".into(),
+                read_only: false,
+            }],
+            workdir: "/workspace".into(),
+            ..container_spec(&["true"])
+        };
+
+        let (mapped, view) = with_linked_git_metadata(spec).unwrap();
+        let view = view.expect("linked worktree gets Git metadata mounts");
+        let dot_git = std::fs::read_to_string(view.temp_dir.join("dot-git")).unwrap();
+        let gitdir = std::fs::read_to_string(view.temp_dir.join("gitdir")).unwrap();
+        assert!(dot_git.starts_with("gitdir: /run/ratatoskr/git/common/worktrees/"));
+        assert_eq!(gitdir, "/workspace/.git\n");
+        assert!(!dot_git.contains(&root.display().to_string()));
+        assert!(!gitdir.contains(&root.display().to_string()));
+
+        let mounts = &mapped.mounts[1..];
+        assert_eq!(mounts[0].guest, "/run/ratatoskr/git/common");
+        assert!(mounts[0].read_only);
+        assert!(
+            mounts[1]
+                .guest
+                .starts_with("/run/ratatoskr/git/common/worktrees/")
+        );
+        assert!(!mounts[1].read_only, "Git refreshes the worktree index");
+        assert_eq!(mounts[2].guest, "/workspace/.git");
+        assert!(mounts[2].read_only);
+        assert!(mounts[3].guest.ends_with("/gitdir"));
+        assert!(mounts[3].read_only);
+
+        drop(view);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linked_worktree_git_metadata_accepts_a_relative_pointer() {
+        let (root, worktree) = linked_worktree();
+        // Git permits this form and resolves it from the directory holding the `.git` file.
+        let metadata_name = std::fs::read_to_string(worktree.join(".git"))
+            .unwrap()
+            .strip_prefix("gitdir: ")
+            .unwrap()
+            .trim()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: ../checkout/.git/worktrees/{metadata_name}\n"),
+        )
+        .unwrap();
+        let spec = SandboxSpec {
+            mounts: vec![Mount {
+                host: worktree,
+                guest: "/workspace".into(),
+                read_only: false,
+            }],
+            workdir: "/workspace".into(),
+            ..container_spec(&["true"])
+        };
+
+        let (_, view) = with_linked_git_metadata(spec).unwrap();
+        assert!(view.is_some());
+        drop(view);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ordinary_repository_git_directory_needs_no_metadata_view() {
+        let root = std::env::temp_dir().join(format!(
+            "ratatoskr-ordinary-git-{}-{}",
+            std::process::id(),
+            GIT_VIEW_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let spec = SandboxSpec {
+            mounts: vec![Mount {
+                host: root.clone(),
+                guest: "/workspace".into(),
+                read_only: false,
+            }],
+            workdir: "/workspace".into(),
+            ..container_spec(&["true"])
+        };
+        let (mapped, view) = with_linked_git_metadata(spec).unwrap();
+        assert!(view.is_none());
+        assert_eq!(mapped.mounts.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn a_container_gets_the_mounts_and_no_host_root() {
         // The whole argument for this backend: what a command can read is the mounts, and nothing
@@ -618,6 +899,39 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker and the locally built ratatoskr-checks image"]
+    async fn a_container_can_use_git_in_a_linked_worktree_without_host_paths() {
+        let (root, worktree) = linked_worktree();
+        let spec = SandboxSpec {
+            image: "ratatoskr-checks".into(),
+            mounts: vec![Mount {
+                host: worktree,
+                guest: "/workspace".into(),
+                read_only: false,
+            }],
+            workdir: "/workspace".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "git status --short && git diff --check && \
+                 test \"$(git rev-parse --show-toplevel)\" = /workspace && \
+                 test \"$(cat .git)\" != *'/home/'* && \
+                 test \"$(cat \"$(git rev-parse --git-dir)/gitdir\")\" = /workspace/.git"
+                    .into(),
+            ],
+            ..container_spec(&[])
+        };
+
+        let output = run(spec).await.unwrap();
+        assert_eq!(
+            output.exit_code, 0,
+            "stdout {} stderr {}",
+            output.stdout, output.stderr
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
