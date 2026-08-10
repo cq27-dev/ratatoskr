@@ -458,13 +458,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_native_stage_attempt_removes_its_worktree() {
-        let repo = std::env::current_dir().unwrap();
         let dir = std::env::temp_dir().join(format!(
             "ratatoskr-implementer-cleanup-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "test@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Test"]);
+        run_git(&repo, &["commit", "--allow-empty", "-qm", "initial"]);
         let engine = ratatoskr_script::ScriptEngine::load(&dir).await.unwrap();
         let store = ratatoskr_store::Store::open_in_memory().unwrap();
         let run_id = format!("{:08x}-cleanup", std::process::id());
