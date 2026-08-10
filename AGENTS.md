@@ -105,8 +105,8 @@ Rust workspace (2024 edition), crates in a layered DAG under `crates/`:
   on `ScriptEngine`.
 - `ratatoskr-nodes` — the concrete nodes (scout, memory, analyst, red-team, implementer, bookkeeper)
   and the `run_plan` / `run_full` orchestration.
-- `ratatoskr-exec` — execution primitives for the fork: isolated git worktrees, sandboxed command
-  runs (microsandbox / bwrap+Landlock), and the ACP client that drives a coding CLI.
+- `ratatoskr-exec` — execution primitives for the fork: isolated git worktrees and sandboxed
+  command runs (microsandbox / bwrap+Landlock).
 - `ratatoskr-store` — the checkpoint store: a single SQLite file, one writer by construction. Also
   the instance's identity database (`auth.rs`), a *separate* file: `serve` writes sessions to that
   one and still never writes to a project's store.
@@ -125,7 +125,7 @@ worktrees) and is gitignored — except `.ratatoskr/rules/`, which is version-co
 
 Changes to `ratatoskr-exec` worktree/sandbox behavior must keep the main checkout and linked
 worktrees working against the same store, and should carry a regression test for the behavior they
-touch. Live-run integration gotchas (ACP absolute cwd, permission-option selection, bwrap
+touch. Live-run integration gotchas (worktree cwd, permission-option selection, bwrap
 mount-in-place) are recorded as rag-rat memories — check them before editing that path.
 
 ## Style

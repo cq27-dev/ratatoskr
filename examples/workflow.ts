@@ -1,100 +1,168 @@
-// Reference `.ratatoskr/workflow.ts` — reproduces Ratatoskr's built-in run flow and adds a
-// declared requirements stage. Copy it to `.ratatoskr/workflow.ts` and edit to customize how a
+// Reference `.ratatoskr/workflow.ts` — follows Ratatoskr's bundled standard-v1 topology and adds
+// a declared requirements stage. Copy it to `.ratatoskr/workflow.ts` and edit to customize how a
 // run is sequenced. It expects the `requirements` profile from `examples/agent-profiles.toml`.
 //
 // The script only *composes* the node bindings. Every gate stays Rust-enforced no matter what the
-// script does: each binding validates and checkpoints its own output; `redTeam()` runs the
-// false-convergence guard itself; `iterate()` enforces `max_iterations`; and the run's terminal
-// status (converged vs. max-iterations) is inferred from the checkpoints Rust wrote, never from
-// anything the script returns. A script can reorder and choose, but it cannot weaken a gate.
+// script does: `context()` owns deterministic evidence collection; `redTeam()` owns its fresh
+// baseline and test-author worktree; `implement()`/`iterate()` own the sandbox and acceptance;
+// `verify()` owns diff collection and review thresholds; and terminal status and effects are
+// reconstructed from Rust checkpoints, never from anything the script returns.
 //
-// Bindings (all async except the pure converge helpers):
-//   scout(issue) -> ScoutOutput
-//   memory({issue, context}) -> MemoryOutput
-//   analyze({issue, scout, memory}) -> AnalystOutput
-//   redTeam() -> RedTeamOutput                     // baseline; throws if it ran no tests
-//   implement({analyst}) -> ImplementerOutput      // creates the worktree (once)
-//   iterate({}) -> ImplementerOutput               // re-drives the CLI on that worktree
+// Relevant bindings (all async except the pure convergence helpers):
+//   context(issue) -> ContextOutput
+//   analyst({issue, scout, memory, brief?, constraints?, previous?, findings?}) -> AnalystOutput
+//   redTeam() -> RedTeamOutput                     // prepares the tree; baseline + authored tests
+//   implement({analyst}) -> ImplementerOutput      // edits the prepared worktree (once)
+//   iterate({ review? }) -> ImplementerOutput       // applies Rust-derived test/review correction
 //   verify({analyst}) -> VerifyResult              // reviews the diff against the plan
+//   replanAtCeiling() -> null | {analyst, implementation}
+//                                                    // one Rust-authorized final recovery at most
+//   isConverged({baseline, post}) -> boolean
+//   testCommandRan(output) -> boolean
 //
 // `verify()` returns { configured, unavailable, findings, blocking, needsReplan }. Rust applies
 // `[implementer] verify_threshold` — a script decides *whether* to review and what to do about
 // findings, never what counts as blocking. `needsReplan` means a blocking finding faults the PLAN,
-// so the useful response is `analyze({...., previous, findings})` before `iterate()`, rather than
+// so the useful response is `analyst({...., previous, findings})` before
+// `iterate({ review })`, rather than
 // re-driving the implementer at a requirement already shown to be wrong.
 //
 // A run that calls verify() and returns with blocking findings standing does NOT converge: the
 // terminal status is inferred from the verifier checkpoint, not from what the script returns.
 //
-// A workflow that introduces a node of its own declares it, so its `.ratatoskr/rules/<node>.ts` is
+// `replanAtCeiling()` takes no workflow-supplied plan or evidence. Rust reconstructs both from the
+// checkpoint ledger and either performs one bounded analyst revision plus implementation attempt,
+// or returns null. A script cannot replay it into an unbounded extra loop.
+//
+// A workflow that introduces a stage of its own declares it, so its `.ratatoskr/rules/<node>.ts` is
 // accepted rather than read as a typo:
 //
 //   defineWorkflow({ name: "deep", nodes: ["reviewer2"] });
-//   isConverged({baseline, post}) -> boolean
-//   testCommandRan(output) -> boolean
-//   newlyIntroducedFailures({baseline, post}) -> string[]
 
 defineWorkflow({
   name: "standard",
   purpose: "Plan and implement a repository change with an explicit requirements digest.",
   whenToUse: ["the task requests a code change"],
   stages: [
-    {
-      id: "requirements",
+    stage("requirements", {
       agent: "requirements",
       inputContract: "{ issue: string }",
       outputContract: "RequirementsDigest",
-      outputSchema: {
-        type: "object",
-        properties: {
-          summary: { type: "string" },
-          risks: { type: "array", items: { type: "string" } },
+      outputSchema: obj(
+        {
+          summary: str(),
+          risks: arr(str()),
         },
-        required: ["summary", "risks"],
-        additionalProperties: false,
-      },
+        ["summary", "risks"],
+        { additionalProperties: false },
+      ),
+      // A longer prompt can live beside the workflow and be compiled in with
+      // `LOAD("requirements.md").trim()`. LOAD accepts one literal relative path, never runs at
+      // runtime, and cannot leave the workflow directory.
       instructions:
         "Extract the requirements and delivery risks that must shape the implementation plan. " +
         "Do not propose code. Return only the declared JSON object.",
+      // Optional and synchronous: format structured input for the model without changing what the
+      // Rust host checkpoints. The function must be self-contained and return a string.
+      renderQuestion(input: { issue: string }) {
+        return `ISSUE TO DISTIL:\n${input.issue}`;
+      },
       capabilities: ["read"],
-    },
+      appendRepositoryGuidance: true,
+    }),
   ],
 });
 
-// `plan`: requirements -> scout -> memory -> analyst. Backs `ratatoskr plan`.
-async function plan(input: { issue: string }) {
-  const requirementsOut = await requirements({ issue: input.issue });
-  const scoutOut = await scout(input.issue);
-  const memoryOut = await memory({
+function analystInput(
+  input: { issue: string },
+  gathered: any,
+  requirementsOut: { summary: string; risks: string[] },
+  previous?: any,
+  findings?: any[],
+) {
+  const requirementsBrief =
+    `EXPLICIT REQUIREMENTS:\n${requirementsOut.summary}\n` +
+    requirementsOut.risks.map((risk) => `Risk: ${risk}`).join("\n");
+  return {
     issue: input.issue,
-    context: `${scoutOut.papertrail_summary}\n\nRequirements:\n${requirementsOut.summary}`,
-  });
-  const analystOut = await analyze({ issue: input.issue, scout: scoutOut, memory: memoryOut });
-  return { requirements: requirementsOut, scout: scoutOut, memory: memoryOut, analyst: analystOut };
+    scout: gathered.scout,
+    memory: gathered.memory,
+    brief: [gathered.brief, requirementsBrief].filter(Boolean).join("\n\n"),
+    constraints: gathered.constraints,
+    previous,
+    findings,
+  };
 }
 
-// `run`: requirements, plan, then fork red-team ∥ implementer, then converge. Backs `ratatoskr run`.
-async function run(input: { issue: string; maxIterations: number }) {
+async function gatherPlan(input: { issue: string }) {
+  const gathered = await context(input.issue);
   const requirementsOut = await requirements({ issue: input.issue });
-  const scoutOut = await scout(input.issue);
-  const memoryOut = await memory({
-    issue: input.issue,
-    context: `${scoutOut.papertrail_summary}\n\nRequirements:\n${requirementsOut.summary}`,
-  });
-  const analystOut = await analyze({ issue: input.issue, scout: scoutOut, memory: memoryOut });
+  const analysis = await analyst(analystInput(input, gathered, requirementsOut));
+  return { gathered, requirementsOut, analysis };
+}
 
-  // Fork: both run concurrently off the frozen post-analyst state.
-  const [redTeamOut, first] = await Promise.all([redTeam(), implement({ analyst: analystOut })]);
+// `plan`: context -> requirements -> analyst. Rust reconstructs the PlanOutcome from checkpoints.
+async function plan(input: { issue: string }) {
+  const { gathered, requirementsOut, analysis } = await gatherPlan(input);
+  return { context: gathered, requirements: requirementsOut, analyst: analysis };
+}
 
-  // Converge: iterate the implementer until it introduces no new failures, or the budget runs out.
-  // (`maxIterations` is also hard-enforced inside `iterate` — this loop just stops first.)
-  let impl = first;
+// `run`: plan, optional fork, sequential red-team -> implementation, then bounded convergence.
+async function run(input: { issue: string; maxIterations: number; alwaysFork: boolean }) {
+  const planned = await gatherPlan(input);
+  let analystOut = planned.analysis;
+
+  // Only an explicit no-code plan may skip the fork; alwaysFork can only add work.
+  if (analystOut.changes_code === false && !input.alwaysFork) {
+    return { context: planned.gathered, analyst: analystOut, iterations: 0 };
+  }
+
+  // Both operations use the prepared worktree. Authoring completes against the frozen interface
+  // before implementation starts, so the author cannot tailor tests to code that already exists.
+  const redTeamOut = await redTeam();
+  let impl = await implement({ analyst: analystOut });
   let iterations = 1;
+
+  async function recoverAtCeiling() {
+    const recovery = await replanAtCeiling();
+    if (recovery === null) return false;
+    analystOut = recovery.analyst;
+    impl = recovery.implementation;
+    iterations += 1;
+    return true;
+  }
+
+  // The loop mirrors standard-v1, but Rust owns every decision that grants another model attempt.
   while (true) {
-    if (testCommandRan(impl) && isConverged({ baseline: redTeamOut, post: impl })) break;
-    if (iterations >= input.maxIterations) break;
+    const testsClean = testCommandRan(impl) && isConverged({ baseline: redTeamOut, post: impl });
+    if (testsClean) {
+      const review = await verify({ analyst: analystOut });
+      if (!review.configured || review.unavailable || review.blocking.length === 0) break;
+      if (iterations >= input.maxIterations) {
+        if (await recoverAtCeiling()) continue;
+        break;
+      }
+      if (review.needsReplan) {
+        analystOut = await analyst(
+          analystInput(
+            input,
+            planned.gathered,
+            planned.requirementsOut,
+            analystOut,
+            review.blocking,
+          ),
+        );
+      }
+      impl = await iterate({ review });
+      iterations += 1;
+      continue;
+    }
+    if (iterations >= input.maxIterations) {
+      if (await recoverAtCeiling()) continue;
+      break;
+    }
     impl = await iterate({});
     iterations += 1;
   }
-  return { iterations };
+  return { context: planned.gathered, analyst: analystOut, iterations };
 }

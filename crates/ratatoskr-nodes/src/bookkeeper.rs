@@ -5,10 +5,9 @@
 //! wouldn't rank on a later `MemoryNode` retrieval), then calls rag-rat's own `memory_create`
 //! directly (deterministic), adopting rag-rat's `kind` taxonomy rather than inventing one.
 
-use std::fmt::Write as _;
-
-use ratatoskr_graph::{NodeError, parse_validated};
-use ratatoskr_mcp::ToolSet;
+use ratatoskr_graph::NodeError;
+#[cfg(test)]
+use ratatoskr_graph::parse_validated;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::ServerSink;
 use schemars::JsonSchema;
@@ -130,32 +129,6 @@ const VALID_KINDS: &[&str] = &[
     "Concept",
 ];
 
-/// What the bookkeeper is told to look for, and in what order.
-///
-/// The ordering is not arbitrary and should not be shortened without a reason as good as the ones
-/// that put each line here:
-///
-/// - **Rejected alternatives lead** because they are simultaneously the most-asked question about
-///   unfamiliar code and the least-supplied answer. The alternative not taken leaves no artifact
-///   anywhere — not in the diff, not in the types, not in the history. This repo had thirty-odd
-///   memories and none of that kind, while its commit messages argue about little else.
-/// - **"Could this be recovered by reading the repo?" is the gate**, stated first, because a
-///   generated record that restates the repo measurably makes agents *worse* rather than merely
-///   failing to help: it costs attention and returns nothing. Recording nothing is the correct
-///   answer for most runs, which is why `none` is described as common rather than as a fallback.
-/// - **Translate, never store the trajectory.** Retrieved raw traces score worse than having no
-///   memory at all; distilled situation-and-action rules are what carries the benefit.
-/// - **Trigger-and-action shape, with the evidence quoted.** Situated questions are not answered
-///   by general advice, and quoting what the rule was generalised from is what stops the next
-///   reader having to trust a summary of a summary.
-/// - **`revise` is preferred to `create`** because a memory that has drifted actively misleads
-///   while a missing one merely fails to help — removing wrong records is the single
-///   best-evidenced improvement to a knowledge base.
-/// - **Terseness is a staleness strategy, not a style preference**: every extra detail is another
-///   thing a later change can falsify, and inconsistent records carry a measurably higher chance
-///   of a bug in the code that trusts them.
-const PREAMBLE: &str = include_str!("../prompts/bookkeeper.md");
-
 /// What the bookkeeper decided the repository's memory should say.
 ///
 /// Flat rather than a tagged union because models fill a flat shape far more reliably, and
@@ -250,84 +223,46 @@ impl BookkeeperInput {
     }
 }
 
-/// The bookkeeper node. Holds a cheap model route, a small tool subset (for the compose agent), and
-/// rag-rat's sink (to call `memory_create` itself, outside the agent).
-pub struct BookkeeperNode {
-    pub route: ratatoskr_core::ModelRoute,
-    pub tools: ToolSet,
-    /// `None` without rag-rat. The node then has nowhere to write, so it returns before spending
-    /// a model turn deciding what it would have written.
-    pub sink: Option<ServerSink>,
-    pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
-    pub max_turns: Option<usize>,
-    pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
-    /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
-    pub system_prompt: Option<String>,
-    /// What the plugins this node binds contribute to it.
-    pub plugins: crate::NodePlugins,
-    /// Where this node reports what its turn cost, for the checkpoint the executor writes.
-    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
-    /// The repository its built-in file tools read within.
-    pub files: Option<std::path::PathBuf>,
+/// Return the deterministic no-turn outcome when there is nowhere to write or nothing to learn.
+///
+/// The declared-stage production path calls this before a model turn, so it never spends tokens
+/// composing a memory that Rust will discard.
+pub(crate) fn skipped_before_compose(
+    input: &BookkeeperInput,
+    has_memory_index: bool,
+) -> Option<BookkeeperOutput> {
+    if !has_memory_index {
+        tracing::info!("no memory index in this repository; recording no memory");
+        return Some(input.nothing_recorded("this repository keeps no memory index"));
+    }
+    if input.converged
+        && input.implementer.touched_files.is_empty()
+        && input.implementer.diff_summary.trim().is_empty()
+        && input.friction.is_empty()
+    {
+        tracing::info!("nothing was changed and nothing went wrong; recording no memory");
+        return Some(input.nothing_recorded("the run changed nothing and hit nothing"));
+    }
+    None
 }
 
-impl BookkeeperNode {
-    pub async fn run(&self, input: BookkeeperInput) -> Result<BookkeeperOutput, NodeError> {
-        // Nowhere to put anything. Checked before the friction check and before the model, because
-        // asking one to compose memories that cannot be stored spends a turn to produce nothing.
-        if self.sink.is_none() {
-            tracing::info!("no memory index in this repository; recording no memory");
-            return Ok(input.nothing_recorded("this repository keeps no memory index"));
-        }
-        // A run that changed nothing AND hit nothing has nothing to teach. The friction check is
-        // what keeps this from throwing away the interesting case: a run that fought its way to an
-        // empty diff learned something expensive about why the change was not needed.
-        if input.converged
-            && input.implementer.touched_files.is_empty()
-            && input.implementer.diff_summary.trim().is_empty()
-            && input.friction.is_empty()
-        {
-            tracing::info!("nothing was changed and nothing went wrong; recording no memory");
-            return Ok(input.nothing_recorded("the run changed nothing and hit nothing"));
-        }
+/// Apply a schema-validated model decision through rag-rat's durable memory API.
+///
+/// The model stage has read authority only. This Rust boundary is the sole writer and is entered
+/// only after the decision schema gate succeeds.
+pub(crate) async fn apply_decisions(
+    sink: &ServerSink,
+    decisions: Vec<MemoryDecision>,
+    input: &BookkeeperInput,
+) -> Result<BookkeeperOutput, NodeError> {
+    MemoryApplication { sink }.act_on(decisions, input).await
+}
 
-        let prompt = render_prompt(&input);
-        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-            node: "bookkeeper",
-            route: &self.route,
-            preamble: &crate::effective_preamble_with_profile(
-                "bookkeeper",
-                PREAMBLE,
-                self.plugins.profile_prompt.as_str(),
-                self.system_prompt.as_deref(),
-                self.plugins.context.as_deref(),
-                &self.plugins.skills,
-            ),
-            question: &prompt,
-            tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(MemoryDecisions),
-            policy: self.policy.clone(),
-            max_turns: self.max_turns,
-            clarifier: self.clarifier.clone(),
-            observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills, "bookkeeper"),
-            files: self.files.clone(),
-            // Reads and edits, but runs nothing.
-            shell: None,
-            push: None,
-            conversation: None,
-            ledger: self.ledger.clone(),
-            produces: Some(
-                "a decision per durable learning: create, revise or none, with the memory body and its anchor",
-            ),
-        })
-        .await
-        .map_err(|e| NodeError::Failed(format!("bookkeeper compose failed: {e}")))?;
+struct MemoryApplication<'a> {
+    sink: &'a ServerSink,
+}
 
-        let decided = parse_validated::<MemoryDecisions>(&raw)?;
-        self.act_on(decided.decisions, &input).await
-    }
-
+impl MemoryApplication<'_> {
     /// Carry out what the model decided. The model chooses; this performs the writes, so the
     /// memory layer only ever changes through a call this code made deliberately.
     ///
@@ -462,8 +397,6 @@ impl BookkeeperNode {
 
         let result = self
             .sink
-            .as_ref()
-            .ok_or_else(|| NodeError::Failed("no memory index to update".to_string()))?
             .call_tool(param)
             .await
             .map_err(|e| NodeError::Failed(format!("memory_update call failed: {e}")))?;
@@ -511,8 +444,6 @@ impl BookkeeperNode {
 
         let result = self
             .sink
-            .as_ref()
-            .ok_or_else(|| NodeError::Failed("no memory index to write to".to_string()))?
             .call_tool(param)
             .await
             .map_err(|e| NodeError::Failed(format!("memory_create call failed: {e}")))?;
@@ -557,81 +488,6 @@ fn normalize_kind(kind: &str) -> String {
         .find(|k| k.eq_ignore_ascii_case(kind.trim()))
         .map(|k| k.to_string())
         .unwrap_or_else(|| "Decision".to_string())
-}
-
-fn render_prompt(input: &BookkeeperInput) -> String {
-    let mut s = String::new();
-    if input.converged {
-        s.push_str("OUTCOME: the run CONVERGED — the change landed and the tests pass.\n\n");
-    } else {
-        let _ = write!(
-            s,
-            "OUTCOME: the run HIT A WALL — after {} implementer iterations it could not resolve \
-             these failing tests: {}. Record what a future run should know about this wall / this \
-             class of change.\n\n",
-            input.iterations,
-            input.implementer.failing_tests.join(", ")
-        );
-    }
-    let _ = write!(s, "TASK:\n{}\n\n", input.issue);
-    let a = &input.analyst;
-    if !a.impact_summary.is_empty() {
-        let _ = write!(s, "IMPACT:\n{}\n\n", a.impact_summary);
-    }
-    if !a.risks.is_empty() {
-        s.push_str("RISKS FLAGGED:\n");
-        for r in &a.risks {
-            let _ = writeln!(s, "- {r}");
-        }
-        s.push('\n');
-    }
-    let im = &input.implementer;
-    if !im.diff_summary.is_empty() {
-        let _ = write!(s, "DIFF:\n{}\n\n", im.diff_summary);
-    }
-    if let Some(narrative) = &im.narrative
-        && !narrative.is_empty()
-    {
-        let _ = write!(s, "IMPLEMENTER NOTES:\n{narrative}\n\n");
-    }
-    if !im.touched_files.is_empty() {
-        let _ = writeln!(s, "TOUCHED FILES: {}", im.touched_files.join(", "));
-    }
-
-    // Last, and deliberately: it is the section the preamble tells the model to reason from, and
-    // what a model reads last is what it reasons from first.
-    let f = &input.friction;
-    if !f.diagnostics.is_empty() || !f.errors.is_empty() || !f.effort.is_empty() {
-        s.push_str("\nFRICTION — what this run struggled with:\n");
-    }
-    if !f.diagnostics.is_empty() {
-        let _ = writeln!(
-            s,
-            "\nEach of these was handed to a fresh implementer session after the previous attempt \
-             broke something. Whatever a diagnostic keeps pointing at is a constraint nobody had \
-             written down:"
-        );
-        for (i, d) in f.diagnostics.iter().enumerate() {
-            let _ = writeln!(s, "- attempt {}: {}", i + 2, d);
-        }
-    }
-    if !f.errors.is_empty() {
-        s.push_str("\nNodes that failed:\n");
-        for e in &f.errors {
-            let _ = writeln!(s, "- {}: {}", e.node, e.error);
-        }
-    }
-    if !f.effort.is_empty() {
-        s.push_str(
-            "\nWhat each node's turn took. A node that spent many turns was hunting for \
-                    something — that is a fact about how hard this repo is to navigate, not about \
-                    the node:\n",
-        );
-        for e in &f.effort {
-            let _ = writeln!(s, "- {}: {} turns, {}s", e.node, e.turns, e.seconds);
-        }
-    }
-    s
 }
 
 #[cfg(test)]
@@ -822,17 +678,5 @@ mod tests {
         // Nothing decided at all still owes an explanation: an empty result with no reason is
         // indistinguishable from a failure.
         assert!(skip_reason(0, &[]).is_some());
-    }
-
-    #[test]
-    fn the_prompt_shows_the_model_what_the_run_struggled_with() {
-        let mut input = input(true, &["a.rs"], "diff");
-        input.friction.diagnostics = vec!["You broke store::migrate.".into()];
-        let prompt = render_prompt(&input);
-        assert!(prompt.contains("FRICTION"));
-        assert!(prompt.contains("You broke store::migrate."));
-        // Numbered from 2: the first attempt was given the plan, so the first diagnostic belongs
-        // to the second attempt.
-        assert!(prompt.contains("attempt 2"));
     }
 }

@@ -2,8 +2,8 @@
 //!
 //! Loopback needs none of this: whoever can reach the port is already the person who owns the
 //! repository. A hosted instance is the other case — the dashboard can start runs, and a run
-//! drives a coding CLI against a checkout and spends API credits, so "can reach the port" stops
-//! being an acceptable answer to "may start a run".
+//! drives a tool-using model against a checkout and spends API credits, so "can reach the port"
+//! stops being an acceptable answer to "may start a run".
 
 use serde::{Deserialize, Serialize};
 
@@ -43,10 +43,10 @@ pub enum Role {
     Viewer,
     /// May also start runs and answer a node's clarification.
     ///
-    /// This is the expensive one: starting a run spawns a process that drives a coding CLI against
-    /// the repository, and answering a clarification puts text into the prompt of an agent that
-    /// holds tools. Both are "may spend money and change a checkout", which is why they are one
-    /// role and not folded into `Viewer`.
+    /// This is the expensive one: starting a run drives a tool-using model against the repository,
+    /// and answering a clarification puts text into the prompt of an agent that holds tools. Both
+    /// are "may spend money and change a checkout", which is why they are one role and not folded
+    /// into `Viewer`.
     Operator,
     /// May also manage principals: who exists, what role they hold, and who is disabled.
     Admin,

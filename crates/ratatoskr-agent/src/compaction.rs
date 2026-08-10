@@ -10,11 +10,12 @@
 //! exact identifier, the exact command. So the template asks for those verbatim and says why,
 //! rather than asking for "a summary".
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rig_agent::completion::Prompt;
+use rig_core::completion::message::{ToolResult, ToolResultContent};
 use rig_core::completion::{CompletionModel, Message};
-use rig_core::memory::{Compactor, MemoryError};
+use rig_core::memory::{Compactor, ConversationMemory, MemoryError};
 use rig_core::wasm_compat::WasmBoxedFuture;
 use rig_memory::{InMemoryConversationMemory, TokenWindowMemory};
 
@@ -63,6 +64,62 @@ const CHARS_PER_TOKEN: usize = 3;
 /// every node here ends by filling a JSON schema, so the test for "did this summary keep enough" is
 /// whether the node can still fill its schema from it — not whether it reads well.
 const PREAMBLE: &str = include_str!("../prompts/compaction.md");
+
+/// Most of one tool-result content block that the compactor sees.
+///
+/// A result can be a whole file or a noisy test suite, and carrying it without a limit turns the
+/// summary request into the same context-length failure compaction is meant to avoid. Keep both
+/// ends: reads identify their path and range at the front, while commands put their diagnostics and
+/// exit summary at the end.
+const MAX_TOOL_RESULT_CHARS: usize = 16 * 1024;
+
+/// A run-local conversation that is reduced to one summary before its next attempt.
+///
+/// `rig` retains every tool call and result in its conversation memory. The normal compaction
+/// budget is deliberately generous for a single long-running attempt, but a re-driven node needs
+/// a small hand-off rather than the entire previous attempt. A zero-token window demotes the whole
+/// completed attempt when the next one loads this memory, and the compactor replaces it with one
+/// summary. The run ledger owns this state by stage/session key, so rebuilt node values continue
+/// within one run while a later run cannot inherit it merely by using the same route.
+#[derive(Clone, Default)]
+pub struct CompactedSession {
+    memory: Arc<Mutex<Option<Arc<dyn ConversationMemory>>>>,
+}
+
+impl CompactedSession {
+    /// Return the one memory backend shared by every attempt of this node.
+    pub fn memory<M>(
+        &self,
+        model: M,
+        node: &str,
+        produces: &str,
+        ledger: Option<Arc<crate::RunLedger>>,
+    ) -> Arc<dyn ConversationMemory>
+    where
+        M: CompletionModel + 'static,
+    {
+        let mut slot = self
+            .memory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(memory) = &*slot {
+            return Arc::clone(memory);
+        }
+
+        // Each stored message costs at least one token, so this window carries no raw history into
+        // a re-entry. CompactingMemory retains its rolling summary separately and includes it in
+        // the following compaction, preserving facts from every earlier attempt.
+        let memory: Arc<dyn ConversationMemory> =
+            Arc::new(compacting_memory(model, node, produces, 0, ledger));
+        *slot = Some(Arc::clone(&memory));
+        memory
+    }
+
+    #[cfg(test)]
+    pub(crate) fn same_state_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.memory, &other.memory)
+    }
+}
 
 /// Summarises evicted turns with a model call.
 pub struct SummaryCompactor<M> {
@@ -185,7 +242,7 @@ fn render(message: &Message) -> String {
                 .iter()
                 .map(|c| match c {
                     UserContent::Text(t) => t.text.clone(),
-                    UserContent::ToolResult(r) => format!("[result of {}]", r.id),
+                    UserContent::ToolResult(result) => render_tool_result(result),
                     _ => "[attachment]".to_string(),
                 })
                 .collect();
@@ -206,6 +263,42 @@ fn render(message: &Message) -> String {
             format!("assistant: {}", parts.join("\n"))
         }
     }
+}
+
+/// Render the usable parts of a tool result for the compaction transcript.
+///
+/// The agent's conversation memory holds typed tool output, not the MCP response, so both text and
+/// JSON must be made explicit here. Images have no textual facts to preserve and are named rather
+/// than inlining their base64 payload.
+fn render_tool_result(result: &ToolResult) -> String {
+    let content = result
+        .content
+        .iter()
+        .map(|content| match content {
+            ToolResultContent::Text(text) => bounded_tool_result(&text.text),
+            ToolResultContent::Json { value } => bounded_tool_result(&value.to_string()),
+            ToolResultContent::Image(_) => "[image result omitted]".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("[result of {}]\n{content}", result.id)
+}
+
+/// Bound a tool result without dropping either the file/range prefix or a command's final error.
+fn bounded_tool_result(content: &str) -> String {
+    let count = content.chars().count();
+    if count <= MAX_TOOL_RESULT_CHARS {
+        return content.to_string();
+    }
+
+    let head_len = MAX_TOOL_RESULT_CHARS / 2;
+    let tail_len = MAX_TOOL_RESULT_CHARS - head_len;
+    let head: String = content.chars().take(head_len).collect();
+    let tail: String = content.chars().skip(count - tail_len).collect();
+    format!(
+        "{head}\n[{} middle characters omitted]\n{tail}",
+        count - MAX_TOOL_RESULT_CHARS
+    )
 }
 
 /// Estimate a message's token cost from its rendered length.
@@ -243,6 +336,8 @@ pub fn default_budget() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_core::OneOrMany;
+    use rig_core::completion::message::{ToolResult, ToolResultContent, UserContent};
 
     #[test]
     fn a_rendered_turn_keeps_the_tool_calls_and_their_results() {
@@ -254,6 +349,39 @@ mod tests {
 
         let user = Message::user("read crates/ratatoskr-store/src/lib.rs");
         assert!(render(&user).contains("crates/ratatoskr-store/src/lib.rs"));
+    }
+
+    #[test]
+    fn a_compacted_tool_result_keeps_bounded_text_and_json_content() {
+        let result = Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: "call-read".into(),
+                call_id: None,
+                content: OneOrMany::many(vec![
+                    ToolResultContent::text("crates/ratatoskr-store/src/lib.rs:42\nmissing column"),
+                    ToolResultContent::json(serde_json::json!({
+                        "test": "store::tests::migrates_existing_database",
+                        "status": "failed",
+                    })),
+                ])
+                .unwrap(),
+            })),
+        };
+
+        let rendered = render(&result);
+        assert!(rendered.contains("call-read"));
+        assert!(rendered.contains("missing column"));
+        assert!(rendered.contains("migrates_existing_database"));
+
+        let long = format!(
+            "crates/ratatoskr-store/src/lib.rs:1\n{}\nerror: migration test failed",
+            "x".repeat(MAX_TOOL_RESULT_CHARS)
+        );
+        let bounded = bounded_tool_result(&long);
+        assert!(bounded.contains("lib.rs:1"));
+        assert!(bounded.contains("error: migration test failed"));
+        assert!(bounded.contains("middle characters omitted"));
+        assert!(bounded.chars().count() < long.chars().count());
     }
 
     #[test]

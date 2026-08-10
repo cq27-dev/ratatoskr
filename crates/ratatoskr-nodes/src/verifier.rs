@@ -11,25 +11,12 @@
 
 use std::fmt::Write as _;
 
-use ratatoskr_core::ModelRoute;
 use ratatoskr_graph::{NodeError, parse_validated};
-use ratatoskr_mcp::ToolSet;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::analyst::AnalystOutput;
-
-/// rag-rat tools the verifier may use. Read-only and grounding: it needs to check the change
-/// against current code and against what the repo already knows, not to explore freely.
-pub const VERIFIER_TOOLS: &[&str] = &[
-    "semantic_search",
-    "symbol_lookup",
-    "impact_surface",
-    "memory_search",
-];
-
-const PREAMBLE: &str = include_str!("../prompts/verifier.md");
 
 /// How bad a finding is. Ordered: `P1 < P2 < P3` by variant order, so "at least as severe as" is a
 /// `<=` on the enum.
@@ -108,6 +95,7 @@ impl VerifierOutput {
 }
 
 /// What the verifier is given: the change, and what it was for.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VerifierInput {
     pub issue: String,
     pub analyst: AnalystOutput,
@@ -123,68 +111,6 @@ pub struct VerifierInput {
     pub previous_findings: Vec<Finding>,
 }
 
-/// The verifier node: a reviewer restricted to read-only grounding tools.
-pub struct VerifierNode {
-    pub route: ModelRoute,
-    pub tools: ToolSet,
-    pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
-    pub max_turns: Option<usize>,
-    /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
-    pub system_prompt: Option<String>,
-    pub plugins: crate::NodePlugins,
-    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
-    pub files: Option<std::path::PathBuf>,
-}
-
-impl VerifierNode {
-    pub async fn run(&self, input: VerifierInput) -> Result<VerifierOutput, NodeError> {
-        // Nothing to review is not a clean review. Saying "no findings" about an empty diff would
-        // report the change as verified when there was no change.
-        if input.diff.trim().is_empty() {
-            return Ok(VerifierOutput {
-                findings: Vec::new(),
-                assessment: "there was no diff to review".to_string(),
-            });
-        }
-
-        run_judgement(
-            ratatoskr_agent::NodeRun {
-                node: "verifier",
-                route: &self.route,
-                preamble: &crate::effective_preamble_with_profile(
-                    "verifier",
-                    PREAMBLE,
-                    self.plugins.profile_prompt.as_str(),
-                    self.system_prompt.as_deref(),
-                    self.plugins.context.as_deref(),
-                    &self.plugins.skills,
-                ),
-                question: &render_prompt(&input),
-                tools: self.tools.clone(),
-                output_schema: schemars::schema_for!(VerifierOutput),
-                policy: self.policy.clone(),
-                max_turns: self.max_turns,
-                // The verifier judges; it does not negotiate. Asking the analyst what it meant would
-                // let the node being reviewed-for shape the review.
-                clarifier: None,
-                observer: self.plugins.observer.clone(),
-                skills: crate::skills::loaded(&self.plugins.skills, "verifier"),
-                files: self.files.clone(),
-                // Reads the diff; runs nothing — the acceptance run already happened.
-                shell: None,
-                push: None,
-                conversation: None,
-                ledger: self.ledger.clone(),
-                produces: Some(
-                    "findings on the diff — each with a severity, a plan/execution kind, and a concrete failure scenario — or none",
-                ),
-            },
-            "verifier",
-        )
-        .await
-    }
-}
-
 /// Run and schema-validate a judgement node.
 pub(crate) async fn run_judgement<T: DeserializeOwned + JsonSchema>(
     run: ratatoskr_agent::NodeRun<'_>,
@@ -194,51 +120,6 @@ pub(crate) async fn run_judgement<T: DeserializeOwned + JsonSchema>(
         .await
         .map_err(|e| NodeError::Failed(format!("{name} agent failed: {e}")))?;
     parse_validated::<T>(&raw)
-}
-
-fn render_prompt(input: &VerifierInput) -> String {
-    let mut s = String::new();
-    let _ = write!(s, "TASK:\n{}\n\n", input.issue);
-
-    let a = &input.analyst;
-    if !a.requirements.is_empty() {
-        s.push_str("REQUIREMENTS THE CHANGE MUST SATISFY:\n");
-        for r in &a.requirements {
-            let _ = writeln!(s, "- {r}");
-        }
-        s.push('\n');
-    }
-    if !a.impact_summary.is_empty() {
-        let _ = write!(s, "EXPECTED IMPACT:\n{}\n\n", a.impact_summary);
-    }
-    if !a.risks.is_empty() {
-        s.push_str("RISKS THE PLAN FLAGGED — check whether the change hit any:\n");
-        for r in &a.risks {
-            let _ = writeln!(s, "- {r}");
-        }
-        s.push('\n');
-    }
-    if !input.touched_files.is_empty() {
-        let _ = write!(s, "FILES CHANGED: {}\n\n", input.touched_files.join(", "));
-    }
-    if !input.previous_findings.is_empty() {
-        s.push_str(
-            "WHAT YOU ALREADY FOUND IN THIS RUN, and the implementer has since tried to fix. Read \
-             these before the diff. If what you are about to report exists because of the fix for \
-             one of them, the plan is wrong and you must say so with kind `plan` — reporting it as \
-             another `execution` finding buys one more patch and the next finding after it:\n",
-        );
-        for f in &input.previous_findings {
-            let _ = writeln!(
-                s,
-                "- [{:?}/{:?}] {}: {}",
-                f.severity, f.kind, f.file, f.summary
-            );
-        }
-        s.push('\n');
-    }
-    let _ = write!(s, "THE CHANGE:\n{}\n", input.diff);
-    s
 }
 
 /// Turn blocking findings into the correction the implementer is re-driven with.
@@ -319,55 +200,6 @@ mod tests {
         assert!(text.contains("a.rs:4"));
         assert!(text.contains("P1"));
         assert!(text.contains("scenario"));
-    }
-
-    #[test]
-    fn a_pass_is_shown_what_the_last_one_found() {
-        // The pattern this exists to surface: three passes on one live run found three different
-        // defects, each caused by the fix for the one before, severity climbing P2 -> P2 -> P1.
-        // A pass that cannot see the earlier findings reviews as if it were the first, reports
-        // another execution fault, and buys exactly one more patch.
-        let earlier = Finding {
-            severity: Severity::P2,
-            kind: FindingKind::Execution,
-            file: "lib.rs".into(),
-            line: None,
-            summary: "terminal gate not updated for the new status".into(),
-            failure_scenario: "a no-change run skips publishing".into(),
-        };
-        let input = VerifierInput {
-            issue: "i".into(),
-            analyst: AnalystOutput {
-                impact_summary: String::new(),
-                touched: Vec::new(),
-                risks: Vec::new(),
-                requirements: Vec::new(),
-                residual_risk: String::new(),
-                changes_code: true,
-                acceptance: Vec::new(),
-                interface: Vec::new(),
-            },
-            diff: "--- a
-+++ b
-"
-            .into(),
-            touched_files: vec!["lib.rs".into()],
-            previous_findings: vec![earlier],
-        };
-        let p = render_prompt(&input);
-        assert!(p.contains("WHAT YOU ALREADY FOUND"), "the history is shown");
-        assert!(p.contains("terminal gate not updated"), "and its substance");
-        assert!(
-            p.contains("the plan is wrong"),
-            "with what it means when the new finding follows from the old fix"
-        );
-
-        // A first pass has none, and is not told to look for a pattern that cannot exist yet.
-        let first = VerifierInput {
-            previous_findings: Vec::new(),
-            ..input
-        };
-        assert!(!render_prompt(&first).contains("WHAT YOU ALREADY FOUND"));
     }
 
     #[test]

@@ -27,3 +27,25 @@ pub enum ExecError {
     #[error("path is not valid UTF-8: {0:?}")]
     NonUtf8Path(std::path::PathBuf),
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn execution_has_no_external_agent_protocol_surface() {
+        let workspace_manifest =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"));
+        let lockfile = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
+        let crate_manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+
+        for dependency_file in [workspace_manifest, lockfile, crate_manifest] {
+            assert!(!dependency_file.contains("agent-client-protocol"));
+        }
+        assert!(
+            !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/acp.rs")
+                .exists()
+        );
+        let forbidden_module = ["pub mod ", "acp"].concat();
+        assert!(!include_str!("lib.rs").contains(&forbidden_module));
+    }
+}

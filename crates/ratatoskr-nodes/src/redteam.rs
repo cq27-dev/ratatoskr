@@ -32,8 +32,6 @@ pub const AUTHOR_TOOLS: &[&str] = &[
     ratatoskr_agent::files::EDIT,
 ];
 
-const CLASSIFY_PREAMBLE: &str = include_str!("../prompts/redteam-classifier.md");
-
 /// One baseline failure's classification. Additive context, not part of the strict pass/fail.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FailureClassification {
@@ -47,9 +45,15 @@ pub struct FailureClassification {
 
 /// The compose model's output.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct Classification {
+pub(crate) struct Classification {
     #[serde(default)]
-    classifications: Vec<FailureClassification>,
+    pub(crate) classifications: Vec<FailureClassification>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct ClassifierInput {
+    pub failing: Vec<String>,
+    pub raw_output: String,
 }
 
 /// Deterministic baseline characterization (strict schema — built from a real test run, not an LLM).
@@ -79,7 +83,7 @@ pub struct RedTeamClassifier {
     pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
     pub max_turns: Option<usize>,
     pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
-    /// Ruleset `systemPrompt`; replaces [`CLASSIFY_PREAMBLE`] when set.
+    /// Legacy ruleset prompt slot; the declared stage resolves the effective prompt.
     pub system_prompt: Option<String>,
     /// What the plugins this node binds contribute to it.
     pub plugins: crate::NodePlugins,
@@ -87,6 +91,8 @@ pub struct RedTeamClassifier {
     pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
     /// The repository its built-in file tools read within.
     pub files: Option<std::path::PathBuf>,
+    /// The generic stage executor context used for classification.
+    pub(crate) declared_context: std::sync::Arc<crate::workflow::WorkflowContext>,
 }
 
 impl RedTeamClassifier {
@@ -95,43 +101,19 @@ impl RedTeamClassifier {
         failing: &[String],
         raw_output: &str,
     ) -> Result<Vec<FailureClassification>, NodeError> {
-        let prompt = format!(
-            "These tests fail in the current baseline (before any change):\n{}\n\nTest output:\n{}\n\n\
-             Classify each as \"flaky\" or \"real\" with a one-line reason.",
-            failing.join("\n"),
-            truncate(raw_output, 6000)
-        );
-        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-            node: "redteam",
-            route: &self.route,
-            preamble: &crate::effective_preamble_with_profile(
-                "redteam",
-                CLASSIFY_PREAMBLE,
-                self.plugins.profile_prompt.as_str(),
-                self.system_prompt.as_deref(),
-                self.plugins.context.as_deref(),
-                &self.plugins.skills,
-            ),
-            question: &prompt,
-            tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(Classification),
-            policy: self.policy.clone(),
-            max_turns: self.max_turns,
-            clarifier: self.clarifier.clone(),
-            observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills, "redteam"),
-            files: self.files.clone(),
-            // Reads and edits, but runs nothing.
-            shell: None,
-            push: None,
-            conversation: None,
-            ledger: self.ledger.clone(),
-            produces: Some(
-                "a classification of each baseline test failure as flaky or real, with the reason",
-            ),
-        })
+        let input = ClassifierInput {
+            failing: failing.to_vec(),
+            raw_output: raw_output.to_string(),
+        };
+        let input_json = serde_json::to_string(&input)
+            .map_err(|error| NodeError::Failed(format!("red-team classifier input: {error}")))?;
+        let raw = crate::workflow::evaluate_standard_stage(
+            std::sync::Arc::clone(&self.declared_context),
+            "redteam_classifier",
+            input_json,
+        )
         .await
-        .map_err(|e| NodeError::Failed(format!("red-team classifier failed: {e}")))?;
+        .map_err(|error| NodeError::Failed(format!("red-team classifier failed: {error}")))?;
         Ok(parse_validated::<Classification>(&raw)?.classifications)
     }
 }
@@ -155,6 +137,7 @@ pub struct AuthoredTests {
     pub covers: String,
 }
 
+#[cfg(test)]
 const AUTHOR_PREAMBLE: &str = include_str!("../prompts/redteam-author.md");
 
 /// The red team's other half: writing the tests the change will be judged against.
@@ -174,6 +157,14 @@ pub struct TestAuthor {
     pub conventions: Option<String>,
     pub plugins: crate::NodePlugins,
     pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
+    /// The generic stage executor context used for test authoring.
+    pub(crate) declared_context: std::sync::Arc<crate::workflow::WorkflowContext>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct TestAuthorInput {
+    pub issue: String,
+    pub interface: Vec<crate::analyst::InterfaceItem>,
 }
 
 impl TestAuthor {
@@ -184,60 +175,22 @@ impl TestAuthor {
         issue: &str,
         interface: &[crate::analyst::InterfaceItem],
     ) -> Result<AuthoredTests, NodeError> {
-        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-            node: "redteam",
-            route: &self.route,
-            preamble: &crate::with_conventions(
-                "redteam",
-                self.conventions.as_deref(),
-                crate::effective_preamble_with_profile(
-                    "redteam",
-                    AUTHOR_PREAMBLE,
-                    self.plugins.profile_prompt.as_str(),
-                    self.system_prompt.as_deref(),
-                    self.plugins.context.as_deref(),
-                    &self.plugins.skills,
-                ),
-            ),
-            question: &author_prompt(issue, interface),
-            tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(AuthoredTests),
-            policy: self.policy.clone(),
-            max_turns: self.max_turns,
-            clarifier: None,
-            observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills, "redteam"),
-            // Rooted at the worktree: the tests have to land where the implementer will meet them.
-            files: Some(worktree.to_path_buf()),
-            // No shell. Writing a test is not running one, and the baseline run is what says
-            // whether these fail — which at this point they should.
-            shell: None,
-            push: None,
-            conversation: None,
-            ledger: self.ledger.clone(),
-            produces: Some("tests covering the contracted interface, written before the code"),
-        })
+        let input = TestAuthorInput {
+            issue: issue.to_string(),
+            interface: interface.to_vec(),
+        };
+        let input_json = serde_json::to_string(&input)
+            .map_err(|error| NodeError::Failed(format!("test author input: {error}")))?;
+        let raw = crate::workflow::evaluate_standard_stage_at(
+            std::sync::Arc::clone(&self.declared_context),
+            "redteam_author",
+            input_json,
+            worktree.to_path_buf(),
+        )
         .await
-        .map_err(|e| NodeError::Failed(format!("test author failed: {e}")))?;
+        .map_err(|error| NodeError::Failed(format!("test author failed: {error}")))?;
         parse_validated::<AuthoredTests>(&raw)
     }
-}
-
-/// What the author is given: the task for context, and the contract it writes against.
-fn author_prompt(issue: &str, interface: &[crate::analyst::InterfaceItem]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::new();
-    let _ = write!(s, "THE TASK, for context only:\n{issue}\n\n");
-    s.push_str(
-        "THE INTERFACE. This is the contract, and it is all you get — the code does not exist \
-         yet, and the person writing it is working from this same description:\n\n",
-    );
-    crate::analyst::render_interface(&mut s, interface, "happy", "sad");
-    s.push_str(
-        "\nWrite tests for these. Follow the repository's own layout and conventions, cover the \
-         sad cases as carefully as the happy ones, and change nothing that already exists.",
-    );
-    s
 }
 
 pub struct RedTeamNode {
@@ -388,30 +341,9 @@ impl RedTeamNode {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut i = max;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    format!("{}…", &s[..i])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn item() -> crate::analyst::InterfaceItem {
-        crate::analyst::InterfaceItem {
-            name: "store::prune".into(),
-            shape: "pub async fn prune(&self, older_than: Duration) -> Result<u64, StoreError>"
-                .into(),
-            happy: vec!["removes rows older than the cutoff and returns how many".into()],
-            sad: vec!["a zero duration removes nothing and returns 0".into()],
-        }
-    }
 
     /// A repository with one commit, plus an untracked `node_modules/installed` — what a live
     /// checkout carries and a fresh fork does not.
@@ -513,21 +445,6 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn the_author_is_given_the_contract_and_told_the_code_does_not_exist() {
-        // The whole reason this node writes the tests: it works from the contract, so its tests
-        // can be wrong about the implementation and still right about the requirement.
-        let p = author_prompt("Prune old rows", &[item()]);
-        assert!(p.contains("store::prune"), "the surface");
-        assert!(p.contains("older_than: Duration"), "and its exact shape");
-        assert!(p.contains("happy: removes rows older than the cutoff"));
-        assert!(p.contains("sad: a zero duration removes nothing"));
-        assert!(
-            p.contains("the code does not exist"),
-            "why it cannot read it"
-        );
     }
 
     #[test]

@@ -11,9 +11,8 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 
 -- Per-node checkpoint snapshots: what a node was given, what it produced, what it cost, and which
--- model produced it. Everything past `created_at` is nullable — a node that is not a model agent
--- (the implementer drives a coding CLI) has no usage to report, and a run recorded before these
--- columns existed has none either.
+-- model produced it. Everything past `created_at` is nullable — nodes that do no model work have
+-- no usage to report, and a run recorded before these columns existed has none either.
 CREATE TABLE IF NOT EXISTS checkpoints (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL REFERENCES runs(run_id),

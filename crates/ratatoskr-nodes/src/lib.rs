@@ -5,22 +5,19 @@
 //! policy guarantee (schema-validated handoffs, a checkpoint after every node, nothing skipped)
 //! with nothing to get wrong. The real executor arrives in Phase 3 when fork/join needs one.
 
-pub mod analyst;
 pub mod bookkeeper;
 pub mod child;
 pub mod clarify;
-pub mod context;
+pub mod contracts;
 pub mod control;
 pub mod converge;
 pub mod implementer;
 pub mod issue;
 pub mod memory;
-pub mod overseer;
 pub mod plugins;
 pub mod publisher;
 pub mod redteam;
 pub mod referee;
-pub mod scout;
 pub mod skills;
 pub mod stage;
 pub mod testrun;
@@ -28,34 +25,36 @@ pub mod validate;
 pub mod verifier;
 pub mod workflow;
 
+pub use contracts::{analyst, context, overseer, scout};
+
 pub(crate) use plugins::stage_agent_config;
 pub use plugins::{NodePlugins, PluginContext};
 #[cfg(test)]
 use plugins::{default_allow, servers_to_start};
 
-pub use analyst::{AnalystNode, AnalystOutput};
-pub use bookkeeper::{BookkeeperInput, BookkeeperNode, BookkeeperOutput, MemoryWritten};
+pub use analyst::AnalystOutput;
+pub use bookkeeper::{BookkeeperInput, BookkeeperOutput, MemoryWritten};
 pub use child::ChildTask;
-pub use context::{Constraint, ContextNode, ContextOutput};
+pub use context::{Constraint, ContextOutput};
 pub use implementer::{ImplementerNode, ImplementerOutput};
 pub use memory::{MemoryNode, MemoryOutput, MemoryRecord};
-pub use overseer::{OverseerNode, OverseerOutput};
-pub use publisher::{PublisherNode, PublisherOutput};
+pub use overseer::OverseerOutput;
+pub use publisher::PublisherOutput;
 pub use redteam::{RedTeamNode, RedTeamOutput};
 pub use referee::{RefereeNode, RefereeOutput, Violation};
-pub use scout::{RelatedItem, ScoutNode, ScoutOutput};
+pub use scout::{RelatedItem, ScoutOutput};
 pub use stage::{
     AgentProfile, Delegation, Stage, agent_profiles, built_in_agents, built_in_stages,
 };
 pub use validate::validate;
-pub use verifier::{Finding, FindingKind, Severity, VerifierNode, VerifierOutput};
+pub use verifier::{Finding, FindingKind, Severity, VerifierOutput};
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ratatoskr_core::{RatatoskrConfig, RunState, RunStatus, ToolPolicy};
-use ratatoskr_exec::{WorktreePath, remove_worktree};
-use ratatoskr_graph::{Node, NodeError};
+use ratatoskr_exec::WorktreePath;
+use ratatoskr_graph::NodeError;
 use ratatoskr_mcp::{RagRatClient, ServerTools, ToolSet};
 use ratatoskr_script::{ScriptEngine, WorkflowRuntime};
 use ratatoskr_store::{Store, StoreError};
@@ -129,220 +128,32 @@ pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError>
         engine,
         ..
     } = request;
-    // A workflow, when this repo defines one, overrides the built-in sequencing.
-    if let Workflow::Scripted(runtime) = chosen {
-        let plugin_context =
-            PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
-                .await?;
-        let ctx = workflow::WorkflowContext::new(
-            client,
-            config,
-            store,
-            run_id,
-            issue,
-            engine,
-            plugin_context,
-        )?;
-        return workflow::run_plan_scripted(runtime, ctx).await;
-    }
-
-    // Once per run: `SessionStart` describes the repository, not the node.
-    let context =
+    let runtime = match chosen {
+        Workflow::BuiltIn => workflow::standard_runtime().await?,
+        Workflow::Scripted(runtime) => runtime,
+    };
+    // Once per run: `SessionStart` describes the repository, not the stage or entrypoint.
+    let plugin_context =
         PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
             .await?;
-    let outcome = plan_half(client, config, store, run_id, issue, engine, &context).await;
-    // Closed by whoever owns the run's lifetime: a `plan` ends here, a `run` carries on.
-    context.session_end(status_of(&outcome)).await;
-    outcome
-}
-
-/// The status a finished plan reports, which is also the reason its session ended.
-fn status_of(outcome: &Result<PlanOutcome, PlanError>) -> &'static str {
-    match outcome.is_ok() {
-        true => RunStatus::Planned.as_str(),
-        false => RunStatus::Failed.as_str(),
-    }
-}
-
-/// The planning half, against an already-resolved plugin context. `run_full` resolves it once and
-/// reuses it for both halves, so a full run doesn't pay for every plugin's `SessionStart` twice.
-async fn plan_half(
-    client: Option<&RagRatClient>,
-    config: &RatatoskrConfig,
-    store: &Store,
-    run_id: &str,
-    issue: &str,
-    engine: &Arc<ScriptEngine>,
-    context: &PluginContext,
-) -> Result<PlanOutcome, PlanError> {
-    // First, and here rather than in a caller: every checkpoint references this row, and the
-    // schema enforces it. `run_full` reaches this function directly, so a caller-side write would
-    // leave that path creating checkpoints for a run that doesn't exist yet.
-    store
-        .upsert_run(run_id, None, RunStatus::Running.as_str())
-        .await?;
-
-    record_provenance(store, run_id, config).await;
-
-    let clarifier = NodeClarifier::new(config, store, engine, run_id, issue);
-    let ledger = Arc::new(RunLedger::default());
-    let run = Run {
+    let ctx = workflow::WorkflowContext::new(
         client,
         config,
         store,
         run_id,
         issue,
         engine,
-        clarifier: &clarifier,
-        ledger: &ledger,
-        context,
-    };
-    let outcome = run_nodes(&run)
-        .await
-        // Drain the plan-half clarifications into the outcome's state (the clarifier can't reach the
-        // borrowed RunState during the run).
-        .map(|mut o| {
-            o.state.clarifications = clarifier.drain();
-            o
-        });
-
-    let final_status = if outcome.is_ok() {
-        RunStatus::Planned
-    } else {
-        RunStatus::Failed
-    };
-    // Best-effort status write; don't mask a node error with a store error on the failure path.
-    if let Err(e) = store.upsert_run(run_id, None, final_status.as_str()).await {
-        tracing::warn!("failed to record final run status: {e}");
-    }
-    outcome
-}
-
-async fn run_nodes(run: &Run<'_>) -> Result<PlanOutcome, PlanError> {
-    // Every field is a shared reference, so this just names them locally.
-    let &Run {
-        client,
-        config,
-        store,
-        run_id,
-        issue,
-        engine,
-        clarifier,
-        ledger,
-        context,
-    } = run;
-    let sink = client.map(|c| c.sink());
-    let mut state = RunState::new(run_id, None);
-    state.status = RunStatus::Running;
-
-    // Persist the issue so `ratatoskr bookkeep <run-id>` can replay against stored checkpoints.
-    checkpoint(
-        store,
-        run_id,
-        "issue",
-        &serde_json::json!({ "issue": issue }),
-    )
-    .await?;
-
-    // --- context ---
-    let mut plugins_context = context.for_node("context");
-    let ctx_cfg = stage_agent_config(
-        engine,
-        config,
-        context.pool_for("context", client.map(|c| c.offer())),
-        "context",
-        context::CONTEXT_TOOLS,
-        &mut plugins_context,
+        plugin_context,
     )?;
-    let mut ctx_tools = ctx_cfg.tools;
-    ctx_tools.add_local(clarify::ask_tool());
-    let context_node = ContextNode {
-        route: ctx_cfg.route,
-        tools: ctx_tools,
-        sink: sink.clone(),
-        policy: ctx_cfg.policy,
-        max_turns: ctx_cfg.max_turns,
-        clarifier: Some(clarifier.as_dyn()),
-        system_prompt: ctx_cfg.system_prompt,
-        plugins: plugins_context,
-        files: ctx_cfg.files,
-        ledger: Some(Arc::clone(ledger)),
-    };
-    let context_out = context_node
-        .run(issue)
-        .await
-        .map_err(|e| PlanError::node("context", e))?;
-    record(Record {
-        store,
-        run_id,
-        node: "context",
-        output: &context_out,
-        input: Some(serde_json::to_string(issue)?),
-        iteration: None,
-        ledger: Some(ledger),
-    })
-    .await?;
-    let scout_out = context_out.scout.clone();
-    let memory_out = context_out.memory.clone();
-    state.scout_report = Some(serde_json::to_value(&scout_out)?);
-
-    // --- analyst ---
-    let mut plugins_analyst = context.for_node("analyst");
-    let analyst_cfg = stage_agent_config(
-        engine,
-        config,
-        context.pool_for("analyst", client.map(|c| c.offer())),
-        "analyst",
-        analyst::ANALYST_TOOLS,
-        &mut plugins_analyst,
-    )?;
-    let analyst = AnalystNode {
-        conversation: Some(format!("{run_id}-analyst")),
-        route: analyst_cfg.route,
-        tools: analyst_cfg.tools,
-        policy: analyst_cfg.policy,
-        max_turns: analyst_cfg.max_turns,
-        system_prompt: analyst_cfg.system_prompt,
-        plugins: plugins_analyst,
-        files: analyst_cfg.files,
-        ledger: Some(Arc::clone(ledger)),
-    };
-    let analyst_in =
-        analyst::AnalystInput::fresh(issue.to_string(), scout_out.clone(), memory_out.clone());
-    let analyst_input_json = serde_json::to_string(&analyst_in)?;
-    let analyst_out = analyst
-        .run(analyst_in, &state)
-        .await
-        .map_err(|e| PlanError::node("analyst", e))?;
-    record(Record {
-        store,
-        run_id,
-        node: "analyst",
-        output: &analyst_out,
-        input: Some(analyst_input_json),
-        iteration: None,
-        ledger: Some(ledger),
-    })
-    .await?;
-    state.analysis = Some(serde_json::to_value(&analyst_out)?);
-
-    state.status = RunStatus::Planned;
-    Ok(PlanOutcome {
-        state,
-        scout: scout_out,
-        memory: memory_out,
-        analyst: analyst_out,
-        brief: context_out.brief,
-        constraints: context_out.constraints,
-    })
+    workflow::run_plan_scripted(runtime, ctx).await
 }
 
 /// One checkpoint to write: which node, what it produced, and — for a node that ran a model — what
 /// it was given and what the turn cost.
 ///
 /// `input` and `ledger` are optional because not every checkpoint has them: the `issue` row is the
-/// run's own input rather than a node's, and the implementer drives a coding CLI that reports no
-/// token usage. A missing value here means "there was none", never "we forgot to look".
+/// run's own input rather than a node's. A missing value here means "there was none", never "we
+/// forgot to look".
 struct Record<'a, T> {
     store: &'a Store,
     run_id: &'a str,
@@ -486,20 +297,28 @@ fn graph_fingerprint(repo: &std::path::Path) -> String {
     let mut sources = scripts_in(repo.join(".ratatoskr/rules"));
     // Every workflow, not just the one this run used: which workflows exist is part of what the
     // graph *is* now, and two runs cannot be compared across a registry that changed under them.
-    sources.extend(scripts_in(repo.join(WORKFLOW_DIR)));
+    let mut workflows = scripts_in(repo.join(WORKFLOW_DIR));
+    workflows.push(repo.join(LEGACY_WORKFLOW));
+    for workflow in &workflows {
+        if let Ok(dependencies) = ratatoskr_script::workflow::dependencies(workflow) {
+            sources.extend(dependencies);
+        }
+    }
+    sources.extend(workflows);
     // Sorted, because `read_dir` order is the filesystem's business and a fingerprint that depends
     // on it would differ between two checkouts of identical files.
     sources.sort();
-    sources.insert(0, repo.join(LEGACY_WORKFLOW));
+    sources.dedup();
 
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for path in sources {
         // A missing file still contributes its name, so adding a `workflow.ts` changes the
         // fingerprint even if it is empty.
         for byte in path
-            .file_name()
-            .map(|n| n.as_encoded_bytes().to_vec())
-            .unwrap_or_default()
+            .strip_prefix(repo)
+            .unwrap_or(&path)
+            .as_os_str()
+            .as_encoded_bytes()
             .iter()
             .chain(std::fs::read(&path).unwrap_or_default().iter())
         {
@@ -535,6 +354,9 @@ pub const WORKFLOW_DIR: &str = ".ratatoskr/workflows";
 /// The name of the flow this binary implements in Rust.
 pub const BUILT_IN: &str = "built-in";
 
+const SCRIPTED_REVIEW_WARNING: &str = "this workflow controls whether to run the verifier; if it \
+    omits verify(), the change will be accepted on its Rust-owned test and referee gates alone";
+
 /// The nodes a ruleset may govern out of the box — the LLM agents that go through
 /// `run_structured`. `memory` is absent because it is a direct rag-rat call with no model or tool
 /// set to override, so targeting it is a config error rather than a no-op.
@@ -560,13 +382,11 @@ pub const BUILT_IN_NODES: &[&str] = &[
 
 /// One workflow a run can use.
 ///
-/// The built-in is not a script and deliberately is not going to become one. Its gates — the
-/// referee check, the verifier and the analyst re-entry it routes findings to, the frozen
-/// acceptance — live in `fork_and_converge`, and the scripted path does not have them. Rewriting it
-/// as a script would register it in the same list at the cost of the review gate, which is the
-/// opposite trade to the one worth making.
+/// The built-in uses the bundled standard TypeScript runtime for composition. Its host operations
+/// still own the referee, review routing, frozen acceptance, iteration limits, checkpoints, and
+/// terminal effects, so repository-authored sequencing cannot weaken those gates.
 pub enum Workflow {
-    /// scout → memory → analyst → (red-team ∥ implementer) → verify → converge → bookkeeper.
+    /// context → analyst → red-team → implementer → verify/converge → terminal delivery.
     BuiltIn,
     Scripted(WorkflowRuntime),
 }
@@ -625,7 +445,7 @@ const INTERNAL_GATES: &[&str] = &["referee"];
 /// before a workflow is chosen — and a ruleset targeting a node that some workflow declares is
 /// legitimate whether or not this particular run uses that workflow. The internal referee is
 /// never governable, even when a workflow names it.
-fn governable_from(workflows: impl IntoIterator<Item = WorkflowRuntime>) -> Vec<String> {
+fn governable_from<'a>(workflows: impl IntoIterator<Item = &'a WorkflowRuntime>) -> Vec<String> {
     let mut names: Vec<String> = BUILT_IN_NODES.iter().map(|s| s.to_string()).collect();
     for workflow in workflows {
         names.extend(workflow.meta().nodes.iter().cloned());
@@ -638,7 +458,7 @@ fn governable_from(workflows: impl IntoIterator<Item = WorkflowRuntime>) -> Vec<
 }
 
 pub async fn governable_nodes() -> Result<Vec<String>, PlanError> {
-    Ok(governable_from(defined().await?))
+    Ok(governable_from(&defined().await?))
 }
 
 /// Every workflow a run could use: the built-in, then whatever this repo defines.
@@ -675,14 +495,41 @@ pub async fn defined() -> Result<Vec<WorkflowRuntime>, PlanError> {
 
 /// Validate the stage registry every configured workflow contributes before any run starts.
 pub async fn validate_configured_stages(config: &RatatoskrConfig) -> Result<(), PlanError> {
+    let workflows = defined().await?;
+    let standard_stages = workflow::standard_stages().await?;
+    validate_configured_stage_registry(config, &workflows, standard_stages)
+}
+
+fn validate_configured_stage_registry(
+    config: &RatatoskrConfig,
+    workflows: &[WorkflowRuntime],
+    standard_stages: Vec<Stage>,
+) -> Result<(), PlanError> {
     let profiles = agent_profiles(config);
+    let mut permitted_governance = governable_from(workflows);
     let mut stages = built_in_stages();
-    for workflow in defined().await? {
+    stages.retain(|stage| {
+        !matches!(
+            stage.id.as_str(),
+            "overseer"
+                | "scout"
+                | "analyst"
+                | "verifier"
+                | "characterizer"
+                | "bookkeeper"
+                | "publisher"
+        )
+    });
+    stages.extend(standard_stages);
+    for workflow in workflows {
         let workflow_stages = stage::stages_from_workflow(workflow.meta());
         validate::validate_declared_contracts(&workflow_stages)?;
         stages.extend(workflow_stages);
     }
-    validate::validate(&stages, &profiles)
+    permitted_governance.extend(stages.iter().map(|stage| stage.id.clone()));
+    permitted_governance.sort();
+    permitted_governance.dedup();
+    validate::validate(&stages, &profiles, &permitted_governance)
 }
 
 /// Pick the workflow a run should use.
@@ -730,6 +577,49 @@ fn overseer_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> boo
     node_route(engine, config, "overseer").is_some()
 }
 
+fn should_consult_overseer(
+    defined_workflows: usize,
+    workflow_named: bool,
+    configured: bool,
+) -> bool {
+    !workflow_named && defined_workflows > 1 && configured
+}
+
+struct OverseerDecision<'a> {
+    store: &'a Store,
+    run_id: &'a str,
+    found: Vec<Workflow>,
+    decided: OverseerOutput,
+    input_json: String,
+    ledger: &'a Arc<RunLedger>,
+}
+
+async fn select_and_record_overseer(decision: OverseerDecision<'_>) -> Result<Workflow, PlanError> {
+    let OverseerDecision {
+        store,
+        run_id,
+        found,
+        decided,
+        input_json,
+        ledger,
+    } = decision;
+    let selected = select(found, Some(&decided.workflow))?;
+    store
+        .upsert_run(run_id, None, RunStatus::Running.as_str())
+        .await?;
+    record(Record {
+        store,
+        run_id,
+        node: "overseer",
+        output: &decided,
+        input: Some(input_json),
+        iteration: None,
+        ledger: Some(ledger),
+    })
+    .await?;
+    Ok(selected)
+}
+
 /// Pick the workflow for this run, asking the overseer when there is a real choice to make.
 ///
 /// The order is deliberate. A named workflow wins outright — a caller that said which shape it
@@ -738,13 +628,15 @@ fn overseer_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> boo
 /// overseer, and without one configured the run still refuses to guess rather than picking.
 pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
     let found = registry().await?;
-    let real_choice = request.workflow.is_none()
-        && found
-            .iter()
-            .filter(|w| !matches!(w, Workflow::BuiltIn))
-            .count()
-            > 1;
-    if !real_choice || !overseer_enabled(request.engine, request.config) {
+    let defined_workflows = found
+        .iter()
+        .filter(|workflow| !matches!(workflow, Workflow::BuiltIn))
+        .count();
+    if !should_consult_overseer(
+        defined_workflows,
+        request.workflow.is_some(),
+        overseer_enabled(request.engine, request.config),
+    ) {
         return select(found, request.workflow);
     }
 
@@ -757,56 +649,41 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
         })
         .collect();
 
+    let input = overseer::OverseerInput {
+        issue: request.issue.to_string(),
+        choices,
+    };
+    let input_json = serde_json::to_string(&input)?;
     let cwd = std::env::current_dir().unwrap_or_default();
-    let context = PluginContext::resolve(request.config, request.engine, &cwd).await?;
-    let mut plugins = context.for_node("overseer");
-    let cfg = stage_agent_config(
-        request.engine,
+    let plugin_context = PluginContext::resolve(request.config, request.engine, &cwd).await?;
+    let ctx = workflow::WorkflowContext::new(
+        request.client,
         request.config,
-        context.pool_for("overseer", request.client.map(|c| c.offer())),
-        "overseer",
-        overseer::OVERSEER_TOOLS,
-        &mut plugins,
+        request.store,
+        request.run_id,
+        request.issue,
+        request.engine,
+        plugin_context,
     )?;
+    let raw = workflow::evaluate_standard_stage(Arc::clone(&ctx), "overseer", input_json.clone())
+        .await
+        .map_err(|error| PlanError::node("overseer", NodeError::Failed(error)))?;
+    let decided: OverseerOutput = serde_json::from_str(&raw)?;
+
     // Its own ledger: the overseer runs before the run's, and its cost is still a cost. Drained
     // straight onto the checkpoint below rather than carried, because nothing after this point
     // would claim it.
-    let ledger = Arc::new(RunLedger::default());
-    let decided = OverseerNode {
-        route: cfg.route,
-        tools: cfg.tools,
-        policy: cfg.policy,
-        max_turns: cfg.max_turns,
-        system_prompt: cfg.system_prompt,
-        plugins,
-        ledger: Some(Arc::clone(&ledger)),
-        files: cfg.files,
-    }
-    .run(request.issue, &choices)
-    .await
-    .map_err(|e| PlanError::node("overseer", e))?;
-
-    // Recorded before it is acted on, and recorded even when the name turns out to be wrong: the
-    // reasoning is what a reader needs when a run went somewhere unexpected, and a rejected choice
-    // is exactly such a case.
-    request
-        .store
-        .upsert_run(request.run_id, None, RunStatus::Running.as_str())
-        .await?;
-    record(Record {
+    // A model naming something absent is rejected before this writes anything, so the store never
+    // presents a rejected routing decision as a completed stage.
+    select_and_record_overseer(OverseerDecision {
         store: request.store,
         run_id: request.run_id,
-        node: "overseer",
-        output: &decided,
-        input: Some(serde_json::to_string(request.issue)?),
-        iteration: None,
-        ledger: Some(&ledger),
+        found,
+        decided,
+        input_json,
+        ledger: ctx.ledger(),
     })
-    .await?;
-
-    // A model naming something that is not there does not get to select it. Falling through to the
-    // named lookup gives the error that lists what was available.
-    select(found, Some(&decided.workflow))
+    .await
 }
 
 /// What one run needs to start.
@@ -968,6 +845,7 @@ pub(crate) fn repo_conventions(repo_root: &std::path::Path) -> Option<String> {
 /// Prefix a writing node's preamble with the repository conventions, recording how much of the
 /// composed preamble came from them. `None` conventions (no `AGENTS.md`) leaves `base` byte-for-byte
 /// unchanged — no header, no separator — so a repo with no conventions file runs exactly as before.
+#[cfg(test)]
 pub(crate) fn with_conventions(node: &str, conventions: Option<&str>, base: String) -> String {
     let Some(conventions) = conventions else {
         return base;
@@ -979,6 +857,94 @@ pub(crate) fn with_conventions(node: &str, conventions: Option<&str>, base: Stri
         "repository conventions injected into node preamble"
     );
     format!("{conventions}\n\n{base}")
+}
+
+#[cfg(test)]
+mod migrated_stage_path_tests {
+    #[test]
+    fn migrated_native_components_have_one_stage_executor_model_path() {
+        for (component, source) in [
+            ("implementer", include_str!("implementer.rs")),
+            ("redteam", include_str!("redteam.rs")),
+            ("characterizer", include_str!("testrun.rs")),
+        ] {
+            assert!(
+                source.contains("evaluate_standard_stage"),
+                "{component} must invoke the generic stage executor"
+            );
+            assert!(
+                !source.contains("NodeRun"),
+                "{component} must not retain a direct model-loop fallback"
+            );
+            assert!(
+                !source.contains("declared_context: Option"),
+                "{component} must require a declared workflow context"
+            );
+        }
+
+        let context = include_str!("contracts/context.rs");
+        assert!(
+            !context.contains(concat!("Context", "Node")),
+            "context must not retain an obsolete direct wrapper"
+        );
+        assert!(
+            include_str!("workflow.rs").contains("context_distillation"),
+            "the context operation must retain its declared StageExecutor turn"
+        );
+
+        let built_in = include_str!("lib.rs");
+        assert!(
+            !built_in.contains(concat!("Analyst", "Node {")),
+            "the built-in plan and review must not construct the compatibility analyst wrapper"
+        );
+        assert!(
+            !built_in.contains(concat!("verifier::Verifier", "Node {")),
+            "the built-in review must not construct the compatibility verifier wrapper"
+        );
+
+        for (component, source, wrapper) in [
+            (
+                "analyst",
+                include_str!("contracts/analyst.rs"),
+                concat!("Analyst", "Node"),
+            ),
+            (
+                "bookkeeper",
+                include_str!("bookkeeper.rs"),
+                concat!("Bookkeeper", "Node"),
+            ),
+            (
+                "overseer",
+                include_str!("contracts/overseer.rs"),
+                concat!("Overseer", "Node"),
+            ),
+            (
+                "publisher",
+                include_str!("publisher.rs"),
+                concat!("Publisher", "Node"),
+            ),
+            (
+                "scout",
+                include_str!("contracts/scout.rs"),
+                concat!("Scout", "Node"),
+            ),
+            (
+                "verifier",
+                include_str!("verifier.rs"),
+                concat!("Verifier", "Node"),
+            ),
+        ] {
+            assert!(
+                !source.contains(wrapper),
+                "{component} must not retain an obsolete direct model wrapper"
+            );
+        }
+
+        assert!(
+            !include_str!("workflow.rs").contains(concat!("(\"analy", "ze\",")),
+            "the direct analyst compatibility operation must remain removed"
+        );
+    }
 }
 
 /// Everything a full fork+converge run produced. The worktree is the reviewable deliverable and is
@@ -1046,77 +1012,19 @@ fn fork_is_needed(analyst: &AnalystOutput, config: &RatatoskrConfig) -> bool {
     analyst.changes_code || config.implementer.always_fork
 }
 
-/// Finish a run whose analyst judged that carrying out the plan changes no code.
+/// Run the selected full workflow through the TypeScript composition runtime.
 ///
-/// The plan itself is the artifact, and it is already checkpointed. The bookkeeper is not run:
-/// it composes memories from the implementer's diff, and there is none — a research run's learning
-/// is worth recording, but doing it means teaching that node to compose from the analyst alone,
-/// which is a change to what it produces rather than to when it fires.
-async fn no_code_change(
-    run: &Run<'_>,
-    store: &Store,
-    run_id: &str,
-    context: &PluginContext,
-    plan: PlanOutcome,
-) -> Result<RunOutcome, PlanError> {
-    tracing::info!(
-        kind = "fork_skipped",
-        impact = %plan.analyst.impact_summary,
-        "the analyst judged this task to need no code change; skipping the fork"
-    );
-    let status = RunStatus::NoCodeChange;
-    if let Err(e) = store.upsert_run(run_id, None, status.as_str()).await {
-        tracing::warn!("failed to record the run's final status: {e}");
-    }
-    // This is the run the publisher exists for. Its deliverable is the plan, and before there was
-    // anywhere to send it the whole thing finished as a checkpoint in SQLite that somebody had to
-    // go and find.
-    let published = publish_if_enabled(
-        run,
-        publisher::PublisherInput {
-            issue: run.issue.to_string(),
-            analyst: plan.analyst.clone(),
-            implementer: None,
-            status: status.as_str().to_string(),
-            iterations: 0,
-            // No fork ran, so there was nothing to review.
-            unresolved: Vec::new(),
-        },
-        true,
-    )
-    .await;
-    context.session_end(status.as_str()).await;
-
-    let mut state = plan.state.clone();
-    state.status = status;
-    if let Some(p) = &published {
-        state.artifacts.push(serde_json::to_value(p)?);
-    }
-    Ok(RunOutcome {
-        state,
-        plan,
-        red_team: None,
-        implementer: None,
-        worktree: None,
-        iterations: 0,
-        status,
-        bookkeeper: None,
-    })
-}
-
-/// The full Phase 3 run: plan (scout → memory → analyst), then fork red-team ∥ implementer, then
-/// converge. Reuses [`run_plan`] for the planning half.
+/// The bundled standard workflow uses the same host registry as a repository workflow. Rust still
+/// owns every operation, gate, checkpoint, terminal action, and cleanup decision; the script owns
+/// only their order.
 pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> {
     validate_configured_stages(request.config).await?;
-    // Before any node runs, so the first one can already be paused.
     control::install(request.run_id);
-    // Before the issue checkpoint is written, so what is recorded is what every node was given.
     let filled = issue::enriched(request.issue, &std::env::current_dir().unwrap_or_default()).await;
     let request = RunRequest {
         issue: &filled,
         ..request
     };
-    // Decided before the request is taken apart: choosing needs the whole of it.
     let chosen = choose(&request).await?;
     let RunRequest {
         client,
@@ -1127,167 +1035,26 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
         engine,
         ..
     } = request;
-    // A workflow, when this repo defines one, overrides the whole run flow.
-    if let Workflow::Scripted(runtime) = chosen {
-        // Said out loud because it is a gate the run will not have. The scripted path checkpoints,
-        // validates and enforces the referee and iteration limits, but it has no verifier binding
-        // — so a change that passes its tests is accepted without anything reading the diff.
-        tracing::warn!(
-            workflow = runtime.meta().name,
-            "this workflow does not run the verifier; the change will be accepted on its tests \
-             alone. `--workflow {BUILT_IN}` runs the flow that reviews the diff."
-        );
-        let plugin_context =
-            PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
-                .await?;
-        let ctx = workflow::WorkflowContext::new(
-            client,
-            config,
-            store,
-            run_id,
-            issue,
-            engine,
-            plugin_context,
-        )?;
-        return workflow::run_full_scripted(runtime, ctx).await;
+    let (runtime, repository_workflow) = match chosen {
+        Workflow::BuiltIn => (workflow::standard_runtime().await?, false),
+        Workflow::Scripted(runtime) => (runtime, true),
+    };
+    if repository_workflow {
+        tracing::warn!(workflow = runtime.meta().name, "{SCRIPTED_REVIEW_WARNING}");
     }
-
-    // Resolved here and shared with both halves.
-    let plan_context =
+    let plugin_context =
         PluginContext::resolve(config, engine, &std::env::current_dir().unwrap_or_default())
             .await?;
-    let plan = match plan_half(client, config, store, run_id, issue, engine, &plan_context).await {
-        Ok(plan) => plan,
-        Err(e) => {
-            plan_context.session_end(RunStatus::Failed.as_str()).await;
-            return Err(e);
-        }
-    };
-
-    // Built before the fork decision, because the no-code-change path publishes too and a
-    // publisher needs the same run handle every other node gets.
-    let clarifier = NodeClarifier::new(config, store, engine, run_id, issue);
-    let ledger = Arc::new(RunLedger::default());
-    let run = Run {
+    let ctx = workflow::WorkflowContext::new(
         client,
         config,
         store,
         run_id,
         issue,
         engine,
-        clarifier: &clarifier,
-        ledger: &ledger,
-        // The plan half's context, reused: `SessionStart` runs once per run, not once per stage.
-        context: &plan_context,
-    };
-
-    // Some tasks call for no code change: research, a review, an architecture answer. Running the
-    // fork for one costs a sandboxed baseline test run and an implementer session to produce an
-    // empty diff,
-    // and then reports `Converged` — a success claim about a change that was never made.
-    if !fork_is_needed(&plan.analyst, config) {
-        return no_code_change(&run, store, run_id, &plan_context, plan).await;
-    }
-    // `plan.state.clarifications` already holds the plan-half asks; the fork/bookkeep half gets its
-    // own clarifier, drained and appended at the end.
-    let mut state = plan.state.clone();
-
-    // `run_plan` signs off with `Planned`, but a full run is only half done — the fork+converge
-    // phase that follows is the longest one. Without this write the store would report `Planned`
-    // for its entire duration, making an in-flight full run indistinguishable from a finished
-    // `plan` (and a run that died mid-fork look like it planned successfully).
-    //
-    // Best-effort like the other mid-run status writes: this is observability bookkeeping, and
-    // failing the run over it would discard completed planning work for a cosmetic reason.
-    if let Err(e) = store
-        .upsert_run(run_id, None, RunStatus::Running.as_str())
-        .await
-    {
-        tracing::warn!("failed to record run status before the fork: {e}");
-    }
-
-    let result = fork_and_converge(&run, &plan).await;
-
-    let status = match &result {
-        Ok((_, _, _, status, _)) => *status,
-        Err(_) => RunStatus::Failed,
-    };
-    if let Err(e) = store.upsert_run(run_id, None, status.as_str()).await {
-        tracing::warn!("failed to record final run status: {e}");
-    }
-    plan_context.session_end(status.as_str()).await;
-
-    let (red_team, implementer, worktree, status, iterations) = result?;
-    state.red_team = Some(serde_json::to_value(&red_team)?);
-    state.implementer = Some(serde_json::to_value(&implementer)?);
-    state.status = status;
-
-    // Bookkeeping fires on a terminal fork outcome: `Converged` (record the learning),
-    // `MaxIterationsReached` (record the wall, tagged `unresolved`), or `Unreviewed` — a change was
-    // still made and its friction is still worth recording, whether or not anyone reviewed it. A
-    // bookkeeping failure is logged but doesn't discard the run's work.
-    let terminal = matches!(
-        status,
-        RunStatus::Converged | RunStatus::MaxIterationsReached | RunStatus::Unreviewed
-    );
-    // Concurrently: one writes to the memory graph, the other to the tracker, and neither needs
-    // the other's result. `join!` rather than spawn — both are I/O-bound and borrow their inputs.
-    let (bookkeeper, published) = tokio::join!(
-        async {
-            if !terminal {
-                return None;
-            }
-            // Read back what the run's own checkpoints recorded about its path. The same source
-            // the `bookkeep` replay reads, so a replay composes from what the live run did.
-            let input = BookkeeperInput {
-                issue: issue.to_string(),
-                analyst: plan.analyst.clone(),
-                implementer: implementer.clone(),
-                iterations,
-                converged: status == RunStatus::Converged,
-                friction: friction_of(store, run_id).await,
-            };
-            match bookkeep_and_checkpoint(&run, input).await {
-                Ok(bk) => Some(bk),
-                Err(e) => {
-                    tracing::warn!("bookkeeping failed: {e}");
-                    None
-                }
-            }
-        },
-        publish_if_enabled(
-            &run,
-            publisher::PublisherInput {
-                issue: issue.to_string(),
-                analyst: plan.analyst.clone(),
-                implementer: Some(implementer.clone()),
-                status: status.as_str().to_string(),
-                iterations,
-                unresolved: unresolved_of(store, run_id).await,
-            },
-            terminal,
-        )
-    );
-    if let Some(bk) = &bookkeeper {
-        state.artifacts = vec![serde_json::to_value(bk)?];
-    }
-    if let Some(p) = &published {
-        state.artifacts.push(serde_json::to_value(p)?);
-    }
-
-    // Append the fork/bookkeep-half clarifications to the plan-half ones.
-    state.clarifications.extend(clarifier.drain());
-
-    Ok(RunOutcome {
-        state,
-        plan,
-        red_team: Some(red_team),
-        implementer: Some(implementer),
-        worktree: Some(worktree),
-        iterations,
-        status,
-        bookkeeper,
-    })
+        plugin_context,
+    )?;
+    workflow::run_full_scripted(runtime, ctx).await
 }
 
 /// Run the publisher, when this repo has turned it on and there is an outcome worth delivering.
@@ -1321,71 +1088,62 @@ async fn publish_and_checkpoint(
         config,
         store,
         run_id,
+        issue,
         engine,
         context,
         ledger,
         ..
     } = run;
-    let mut plugins = context.for_node("publisher");
-    let cfg = stage_agent_config(
-        engine,
-        config,
-        context.pool_for("publisher", client.map(|c| c.offer())),
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // Push is offered only when there is a branch to push, and only ever THAT branch: the access
+    // carries it, and what the tool takes is a name's parts, never a ref. A run with no fork has
+    // nothing to publish and is not given the tool at all.
+    let push = input
+        .implementer
+        .as_ref()
+        .map(|implementer| implementer.branch.clone())
+        .filter(|branch| ratatoskr_agent::publish::pushable(branch))
+        .map(|branch| ratatoskr_agent::publish::PushAccess {
+            repo_root: repo_root.clone(),
+            branch,
+            // From the run, not from the publisher: the number is what the branch is *for*, and it
+            // is not the naming step's to choose.
+            issue: Some(input.issue.clone()),
+        });
+    let input_json = serde_json::to_string(&input)?;
+    let declared_context =
+        workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
+            client,
+            config,
+            store,
+            run_id,
+            issue,
+            engine,
+            plugin_context: context.clone(),
+            ledger: Arc::clone(ledger),
+        })?;
+    let raw = workflow::evaluate_standard_stage_with_resources(
+        declared_context,
         "publisher",
-        &[],
-        &mut plugins,
-    )?;
-    let may_publish = cfg.capability_ceiling == Some(ratatoskr_core::Capability::Publish);
-    let mut tools = cfg.tools;
-    let push = if may_publish {
-        // The tools that write outside this machine. Added here rather than in the default list so no
-        // other node can be handed one by widening a shared constant.
-        tools
-            .local()
-            .tools
-            .push(ratatoskr_agent::publish::declaration());
-
-        // Push is offered only when there is a branch to push, and only ever THAT branch: the access
-        // carries it, and what the tool takes is a name's parts, never a ref. A run with no fork has
-        // nothing to publish and is not given the tool at all.
-        let push = input
-            .implementer
-            .as_ref()
-            .map(|im| im.branch.clone())
-            .filter(|b| ratatoskr_agent::publish::pushable(b))
-            .map(|branch| ratatoskr_agent::publish::PushAccess {
-                repo_root: cfg.files.clone().unwrap_or_else(|| ".".into()),
-                branch,
-                // From the run, not from the publisher: the number is what the branch is *for*, and
-                // it is not the naming step's to choose.
-                issue: Some(input.issue.clone()),
-            });
-        if push.is_some() {
-            tools
-                .local()
-                .tools
-                .push(ratatoskr_agent::publish::push_declaration());
-        }
-        push
-    } else {
-        None
-    };
-
-    let node = PublisherNode {
-        push,
-        route: cfg.route,
-        tools,
-        policy: cfg.policy,
-        max_turns: cfg.max_turns,
-        system_prompt: cfg.system_prompt,
-        plugins,
-        ledger: Some(Arc::clone(ledger)),
-        files: cfg.files,
-    };
-    let out = node
-        .run(input)
-        .await
-        .map_err(|e| PlanError::node("publisher", e))?;
+        input_json,
+        workflow::StandardStageResources {
+            resource_root: repo_root,
+            shell: None,
+            publish: Some(workflow::StandardStagePublishResources { push }),
+            clarifier: None,
+            guidance: None,
+        },
+    )
+    .await
+    .map_err(|error| PlanError::node("publisher", NodeError::Failed(error)))?;
+    let out: PublisherOutput = serde_json::from_str(&raw).map_err(|error| {
+        PlanError::node(
+            "publisher",
+            NodeError::Failed(format!(
+                "publisher output could not be reconstructed: {error}"
+            )),
+        )
+    })?;
     record(Record {
         store,
         run_id,
@@ -1412,40 +1170,67 @@ async fn bookkeep_and_checkpoint(
         config,
         store,
         run_id,
+        issue,
         engine,
         clarifier,
         ledger,
         context,
         ..
     } = run;
-    let mut plugins_bookkeeper = context.for_node("bookkeeper");
-    let cfg = stage_agent_config(
-        engine,
-        config,
-        context.pool_for("bookkeeper", client.map(|c| c.offer())),
-        "bookkeeper",
-        bookkeeper::BOOKKEEPER_TOOLS,
-        &mut plugins_bookkeeper,
-    )?;
-    let mut tools = cfg.tools;
-    tools.add_local(clarify::ask_tool());
-    let node = BookkeeperNode {
-        route: cfg.route,
-        tools,
-        sink: client.map(|c| c.sink()),
-        policy: cfg.policy,
-        max_turns: cfg.max_turns,
-        clarifier: Some(clarifier.as_dyn()),
-        system_prompt: cfg.system_prompt,
-        plugins: plugins_bookkeeper,
-        files: cfg.files,
-        ledger: Some(Arc::clone(ledger)),
-    };
+    let sink = client.map(RagRatClient::sink);
     let input_json = serde_json::to_string(&input)?;
-    let out = node
-        .run(input)
+    let out = if let Some(output) = bookkeeper::skipped_before_compose(&input, sink.is_some()) {
+        output
+    } else {
+        let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let declared_context =
+            workflow::WorkflowContext::new_with_ledger(workflow::WorkflowContextParams {
+                client,
+                config,
+                store,
+                run_id,
+                issue,
+                engine,
+                plugin_context: context.clone(),
+                ledger: Arc::clone(ledger),
+            })?;
+        let raw = workflow::evaluate_standard_stage_with_resources(
+            declared_context,
+            "bookkeeper",
+            input_json.clone(),
+            workflow::StandardStageResources {
+                resource_root: repo_root,
+                shell: None,
+                publish: None,
+                clarifier: Some(clarifier.as_dyn()),
+                guidance: None,
+            },
+        )
         .await
-        .map_err(|e| PlanError::node("bookkeeper", e))?;
+        .map_err(|error| {
+            PlanError::node(
+                "bookkeeper",
+                NodeError::Failed(format!("bookkeeper compose failed: {error}")),
+            )
+        })?;
+        let decisions: bookkeeper::MemoryDecisions =
+            serde_json::from_str(&raw).map_err(|error| {
+                PlanError::node(
+                    "bookkeeper",
+                    NodeError::Failed(format!(
+                        "bookkeeper decisions could not be reconstructed: {error}"
+                    )),
+                )
+            })?;
+        bookkeeper::apply_decisions(
+            sink.as_ref()
+                .expect("bookkeeper preflight requires a memory sink"),
+            decisions.decisions,
+            &input,
+        )
+        .await
+        .map_err(|error| PlanError::node("bookkeeper", error))?
+    };
     record(Record {
         store,
         run_id,
@@ -1523,50 +1308,6 @@ pub async fn run_bookkeeper(
     bookkeep_and_checkpoint(&run, input).await
 }
 
-/// The review stage: the verifier, plus the analyst re-entry it routes plan-level findings to.
-///
-/// Built once per run and reused across converge iterations, so a second review costs a model call
-/// rather than a rebuild. `None` when the verifier has no route — like the red team's classifier,
-/// it is opt-in by being given a model rather than by a separate switch.
-pub(crate) struct Review {
-    verifier: verifier::VerifierNode,
-    threshold: verifier::Severity,
-    /// The analyst, kept alive for revisions. It is the principal: it owns the plan, so it is the
-    /// only node that can tell "the plan was wrong" from "the code did not follow the plan".
-    analyst: AnalystNode,
-    scout: ScoutOutput,
-    memory: MemoryOutput,
-    brief: String,
-    constraints: Vec<Constraint>,
-}
-
-/// What a review concluded the run should do next.
-///
-/// `Unavailable` is the case that is easy to get wrong: a verifier that could not run has not
-/// approved anything, but it has not found anything either. Its error is evidence about our
-/// infrastructure, not about the change, so it must neither block the run nor pass as a clean
-/// review.
-pub(crate) enum Reviewed {
-    /// Nothing above the threshold. The change is accepted.
-    Clean,
-    /// Send this back.
-    Fix(Box<Correction>),
-    /// The verifier could not be asked. The reason is on its checkpoint.
-    Unavailable,
-}
-
-/// What a review concluded the run should do next.
-pub(crate) struct Correction {
-    /// What the review found, carried so the next pass can see what the last one said — and notice
-    /// when a new finding exists only because of the fix for an old one.
-    found: Vec<verifier::Finding>,
-    /// What to hand the implementer.
-    prompt: String,
-    /// The amended plan, when the analyst revised one. Kept so later reviews judge the change
-    /// against what was actually asked for by the end, not against the plan that was wrong.
-    revised: Option<AnalystOutput>,
-}
-
 /// Build the acceptance characterizer, when `[models.characterizer]` gives it somewhere to run.
 ///
 /// Optional on purpose: without it a run still converges on exit codes, comparing at step
@@ -1578,6 +1319,7 @@ pub(crate) fn build_characterizer(
     context: &PluginContext,
     offer: Option<ServerTools>,
     ledger: Option<Arc<RunLedger>>,
+    declared_context: Option<Arc<workflow::WorkflowContext>>,
 ) -> Result<Option<testrun::Characterizer>, PlanError> {
     if node_route(engine, config, "characterizer").is_none() {
         return Ok(None);
@@ -1606,6 +1348,7 @@ pub(crate) fn build_characterizer(
         tools: cfg.tools,
         max_turns: cfg.max_turns,
         ledger,
+        declared_context: declared_context.expect("characterizer route requires its stage context"),
     }))
 }
 
@@ -1721,289 +1464,6 @@ fn parse_threshold(raw: &str) -> verifier::Severity {
     }
 }
 
-impl Review {
-    /// Point the verifier's file tools at the tree the change is actually in.
-    ///
-    /// The verifier is handed the diff as text and then reads the repository to check it against.
-    /// Without this it reads the process's working directory — the main checkout — which does not
-    /// contain the change, so every `Read` and `Grep` it makes describes the code as it was before.
-    /// On a live run that produced three consecutive blocking findings saying the diff's changes
-    /// "are not actually present in the repository": true of the tree it could see, and the wrong
-    /// conclusion, which sent the implementer back to fix work that was never broken.
-    ///
-    /// Set here rather than at construction because [`Review::build`] runs before the worktree
-    /// exists — deliberately, so a misconfigured verifier fails the run before an implementer
-    /// session has been spent on it. This is the earliest moment the path is known.
-    ///
-    /// The analyst kept alive for revisions is left rooted at the checkout: it owns the plan and
-    /// reasons about the repository, not about the diff.
-    fn rooted_at(&mut self, worktree: &std::path::Path) {
-        self.verifier.files = Some(worktree.to_path_buf());
-    }
-
-    fn build(run: &Run<'_>, plan: &PlanOutcome) -> Result<Option<Self>, PlanError> {
-        let &Run {
-            client,
-            config,
-            engine,
-            context,
-            ledger,
-            ..
-        } = run;
-        if !verifier_enabled(engine, config) {
-            return Ok(None);
-        }
-
-        let mut plugins_verifier = context.for_node("verifier");
-        let cfg = stage_agent_config(
-            engine,
-            config,
-            context.pool_for("verifier", client.map(|c| c.offer())),
-            "verifier",
-            verifier::VERIFIER_TOOLS,
-            &mut plugins_verifier,
-        )?;
-        let verifier = verifier::VerifierNode {
-            route: cfg.route,
-            tools: cfg.tools,
-            policy: cfg.policy,
-            max_turns: cfg.max_turns,
-            system_prompt: cfg.system_prompt,
-            plugins: plugins_verifier,
-            // Left unset here, and set by `rooted_at` once the worktree exists. `cfg.files` is the
-            // process's working directory — the main checkout — which does not contain the change
-            // this node reviews. Leaving it None means a review that was never rooted loses its file
-            // tools and says so, rather than quietly reading the wrong tree and reporting the change
-            // as missing.
-            files: None,
-            ledger: Some(Arc::clone(ledger)),
-        };
-
-        let mut plugins_analyst = context.for_node("analyst");
-        let acfg = stage_agent_config(
-            engine,
-            config,
-            context.pool_for("analyst", client.map(|c| c.offer())),
-            "analyst",
-            analyst::ANALYST_TOOLS,
-            &mut plugins_analyst,
-        )?;
-        Ok(Some(Review {
-            verifier,
-            threshold: parse_threshold(&config.implementer.verify_threshold),
-            analyst: AnalystNode {
-                conversation: Some(format!("{}-analyst", run.run_id)),
-                route: acfg.route,
-                tools: acfg.tools,
-                policy: acfg.policy,
-                max_turns: acfg.max_turns,
-                system_prompt: acfg.system_prompt,
-                plugins: plugins_analyst,
-                files: acfg.files,
-                ledger: Some(Arc::clone(ledger)),
-            },
-            scout: plan.scout.clone(),
-            memory: plan.memory.clone(),
-            brief: plan.brief.clone(),
-            constraints: plan.constraints.clone(),
-        }))
-    }
-
-    /// Review the change.
-    async fn review(
-        &self,
-        run: &Run<'_>,
-        plan: &AnalystOutput,
-        impl_out: &ImplementerOutput,
-        worktree: &WorktreePath,
-        iteration: u32,
-        previous_findings: &[verifier::Finding],
-    ) -> Result<Reviewed, PlanError> {
-        let &Run {
-            store,
-            run_id,
-            issue,
-            ledger,
-            ..
-        } = run;
-
-        // The patch, not the `--stat` the implementer records: a summary cannot show a weakened
-        // assertion, and that is one of the things this stage exists to catch.
-        let diff = ratatoskr_exec::diff_text(worktree)
-            .await
-            .unwrap_or_default();
-        let input = verifier::VerifierInput {
-            issue: issue.to_string(),
-            analyst: plan.clone(),
-            diff,
-            touched_files: impl_out.touched_files.clone(),
-            previous_findings: previous_findings.to_vec(),
-        };
-        let input_json = serde_json::to_string(&serde_json::json!({
-            "requirements": plan.requirements,
-            "touched_files": input.touched_files,
-            "diff_bytes": input.diff.len(),
-        }))?;
-        // A verifier that cannot run must not discard a change that was made and passed. Every
-        // other fallible node here is best-effort for the same reason; this one propagating its
-        // error was an oversight, and the run it cost had already implemented the task correctly.
-        let out = match self.verifier.run(input).await {
-            Ok(out) => out,
-            Err(e) => {
-                tracing::warn!("the verifier could not review this change: {e}");
-                record(Record {
-                    store,
-                    run_id,
-                    node: "verifier",
-                    output: &serde_json::json!({ "error": e.to_string() }),
-                    input: Some(input_json),
-                    iteration: Some(iteration),
-                    ledger: Some(ledger),
-                })
-                .await?;
-                return Ok(Reviewed::Unavailable);
-            }
-        };
-        record(Record {
-            store,
-            run_id,
-            node: "verifier",
-            output: &out,
-            // The diff itself is not recorded: it is reproducible from the worktree, and a copy of
-            // it in every checkpoint would dwarf everything else in the store.
-            input: Some(input_json),
-            iteration: Some(iteration),
-            ledger: Some(ledger),
-        })
-        .await?;
-
-        let blocking = out.blocking(self.threshold);
-        if blocking.is_empty() {
-            return Ok(Reviewed::Clean);
-        }
-        let found: Vec<verifier::Finding> = out.findings.clone();
-        // Findings below the threshold were still recorded above; say what was set aside so a
-        // reader of the logs does not read "2 findings" as "2 problems being fixed".
-        tracing::info!(
-            blocking = blocking.len(),
-            total = out.findings.len(),
-            "the review found problems the tests did not catch"
-        );
-
-        // Anything the verifier judged a fault in the PLAN goes to the analyst first. Sending it
-        // to the implementer instead would re-drive it against a requirement already shown to be
-        // wrong, which is the loop this stage exists to break.
-        let plan_faults: Vec<verifier::Finding> = blocking
-            .iter()
-            .filter(|f| f.kind == verifier::FindingKind::Plan)
-            .map(|f| (*f).clone())
-            .collect();
-        if plan_faults.is_empty() {
-            return Ok(Reviewed::Fix(Box::new(Correction {
-                prompt: verifier::correction(&blocking),
-                revised: None,
-                found,
-            })));
-        }
-
-        let revision = analyst::AnalystInput {
-            issue: issue.to_string(),
-            scout: self.scout.clone(),
-            memory: self.memory.clone(),
-            // Carried unchanged into the revision: what bears on the task and what constrains it
-            // did not stop being true because the plan was wrong.
-            brief: self.brief.clone(),
-            constraints: self.constraints.clone(),
-            previous: Some(Box::new(plan.clone())),
-            findings: plan_faults,
-        };
-        let revision_json = serde_json::to_string(&revision)?;
-        let revised = self
-            .analyst
-            .run(revision, &RunState::new(run_id, None))
-            .await
-            .map_err(|e| PlanError::node("analyst", e))?;
-        record(Record {
-            store,
-            run_id,
-            node: "analyst",
-            output: &revised,
-            input: Some(revision_json),
-            iteration: Some(iteration),
-            ledger: Some(ledger),
-        })
-        .await?;
-
-        Ok(Reviewed::Fix(Box::new(Correction {
-            prompt: replan(&revised, &blocking),
-            revised: Some(revised),
-            found,
-        })))
-    }
-}
-
-impl Review {
-    /// Ask the analyst to look at the plan when the iteration budget is spent.
-    ///
-    /// The evidence for doing this rather than recording another failed attempt: on the run that
-    /// prompted it, three passes found three *different* defects, each one existing because of the
-    /// fix for the one before, with severity climbing P2 → P2 → P1. A fourth attempt at the same
-    /// plan had nothing left to find. What was wrong was a decision made before any of it.
-    ///
-    /// Every finding goes over, not just the plan-tagged ones — the whole point is that the
-    /// verifier called them execution faults one at a time and the pattern only shows in the set.
-    async fn replan_at_ceiling(
-        &self,
-        run: &Run<'_>,
-        plan: &AnalystOutput,
-        findings: &[verifier::Finding],
-        iteration: u32,
-    ) -> Result<Option<(AnalystOutput, String)>, PlanError> {
-        let &Run {
-            store,
-            run_id,
-            issue,
-            ledger,
-            ..
-        } = run;
-        let revision = analyst::AnalystInput {
-            issue: issue.to_string(),
-            scout: self.scout.clone(),
-            memory: self.memory.clone(),
-            brief: self.brief.clone(),
-            constraints: self.constraints.clone(),
-            previous: Some(Box::new(plan.clone())),
-            findings: findings.to_vec(),
-        };
-        let revision_json = serde_json::to_string(&revision)?;
-        let revised = match self
-            .analyst
-            .run(revision, &RunState::new(run_id, None))
-            .await
-        {
-            Ok(revised) => revised,
-            // Best-effort, like every other recovery here: a failed re-plan leaves the run
-            // recording what it already knew rather than losing the work as well.
-            Err(e) => {
-                tracing::warn!("the analyst could not re-plan at the ceiling: {e}");
-                return Ok(None);
-            }
-        };
-        record(Record {
-            store,
-            run_id,
-            node: "analyst",
-            output: &revised,
-            input: Some(revision_json),
-            iteration: Some(iteration),
-            ledger: Some(ledger),
-        })
-        .await?;
-        let borrowed: Vec<&verifier::Finding> = findings.iter().collect();
-        Ok(Some((revised.clone(), replan(&revised, &borrowed))))
-    }
-}
-
 /// What the implementer is told after the plan itself was amended.
 ///
 /// The revised requirements come first and the findings after, because the implementer's job is
@@ -2032,625 +1492,20 @@ fn replan(revised: &AnalystOutput, findings: &[&verifier::Finding]) -> String {
     s
 }
 
-async fn fork_and_converge(
-    run: &Run<'_>,
-    plan: &PlanOutcome,
-) -> Result<
-    (
-        RedTeamOutput,
-        ImplementerOutput,
-        WorktreePath,
-        RunStatus,
-        u32,
-    ),
-    PlanError,
-> {
-    let repo_path: PathBuf = std::env::current_dir()
-        .map_err(|e| PlanError::node("fork", NodeError::Failed(format!("cwd: {e}"))))?;
-    let acceptance = run.config.sandbox.acceptance(&plan.analyst.acceptance);
-    tracing::info!(
-        steps = ?acceptance.iter().map(|s| &s.name).collect::<Vec<_>>(),
-        "acceptance for this run"
-    );
-
-    // --- build agents ---
-    let (red_team, implementer) = build_converge_agents(run, plan, &repo_path, acceptance)?;
-    let mut review = build_reviewers(run, plan)?;
-
-    // --- fork worktree ---
-    let worktree = fork_worktree(&implementer).await?;
-
-    // --- root review ---
-    root_reviewers(&mut review, &worktree);
-
-    // --- red-team baseline ---
-    let red_team_out = red_team_baseline(&red_team, &worktree, run.issue, plan).await?;
-
-    // --- first implementer attempt ---
-    let impl_out = first_implementer_attempt(&implementer, &worktree).await?;
-    record_initial_attempt(run, plan, &red_team_out, &impl_out).await?;
-    validate_baseline(&red_team_out)?;
-
-    // --- converge ---
-    let (impl_out, status, iterations) = converge(ConvergeInput {
-        run,
-        plan,
-        repo_path: &repo_path,
-        implementer: &implementer,
-        worktree: &worktree,
-        red_team_out: &red_team_out,
-        impl_out,
-        review: review.as_ref(),
-    })
-    .await?;
-
-    // --- final commit ---
-    commit_run(run, &implementer, &worktree, &impl_out).await;
-    Ok((red_team_out, impl_out, worktree, status, iterations))
-}
-
-/// Build the red-team and implementer agents used by the fork.
-pub(crate) fn build_converge_agents(
-    run: &Run<'_>,
-    plan: &PlanOutcome,
-    repo_path: &Path,
-    acceptance: Vec<ratatoskr_core::AcceptanceStep>,
-) -> Result<(RedTeamNode, ImplementerNode), PlanError> {
-    let &Run {
-        client,
-        config,
-        run_id,
-        issue,
-        engine,
-        clarifier,
-        ledger,
-        context,
-        ..
-    } = run;
-    let short: String = run_id.chars().take(8).collect();
-    let conventions = repo_conventions(repo_path);
-    let red_team = RedTeamNode {
-        repo_path: repo_path.to_path_buf(),
-        worktree_root: config.worktree.root.clone(),
-        baseline_branch: format!("ratatoskr/{short}-baseline"),
-        sandbox: config.sandbox.clone(),
-        name: format!("ratatoskr-redteam-{short}"),
-        acceptance: acceptance.clone(),
-        characterizer: build_characterizer(
-            engine,
-            config,
-            context,
-            client.map(|c| c.offer()),
-            Some(Arc::clone(ledger)),
-        )?,
-        classifier: match classifier_enabled(engine, config) {
-            true => {
-                let mut plugins_redteam = context.for_node("redteam");
-                let cfg = stage_agent_config(
-                    engine,
-                    config,
-                    context.pool_for("redteam", client.map(|c| c.offer())),
-                    "redteam",
-                    redteam::CLASSIFIER_TOOLS,
-                    &mut plugins_redteam,
-                )?;
-                let mut tools = cfg.tools;
-                tools.add_local(clarify::ask_tool());
-                Some(redteam::RedTeamClassifier {
-                    route: cfg.route,
-                    tools,
-                    policy: cfg.policy,
-                    max_turns: cfg.max_turns,
-                    clarifier: Some(clarifier.as_dyn()),
-                    system_prompt: cfg.system_prompt,
-                    plugins: plugins_redteam,
-                    files: cfg.files,
-                    ledger: Some(Arc::clone(ledger)),
-                })
-            }
-            false => None,
-        },
-        author: match classifier_enabled(engine, config) {
-            true => {
-                let mut plugins = context.for_node("redteam");
-                let mut tools = context.pool_for("redteam", client.map(|c| c.offer()));
-                tools
-                    .local()
-                    .tools
-                    .extend(ratatoskr_agent::files::edit_declarations());
-                let cfg = plugins::redteam_author_agent_config(
-                    engine,
-                    config,
-                    tools,
-                    redteam::AUTHOR_TOOLS,
-                    &mut plugins,
-                )?;
-                Some(redteam::TestAuthor {
-                    route: cfg.route,
-                    tools: cfg.tools,
-                    policy: cfg.policy,
-                    max_turns: cfg.max_turns,
-                    system_prompt: cfg.system_prompt,
-                    conventions: conventions.clone(),
-                    plugins,
-                    ledger: Some(Arc::clone(ledger)),
-                })
-            }
-            false => None,
-        },
-    };
-    let (impl_cfg, impl_plugins) =
-        build_implementer_agent(engine, config, context, client.map(|c| c.offer()))?;
-    let implementer = ImplementerNode {
-        clarifier: Some(clarifier.as_dyn()),
-        repo_path: repo_path.to_path_buf(),
-        worktree_root: config.worktree.root.clone(),
-        sandbox: config.sandbox.clone(),
-        route: impl_cfg.route,
-        tools: impl_cfg.tools,
-        policy: impl_cfg.policy,
-        max_turns: impl_cfg.max_turns,
-        system_prompt: impl_cfg.system_prompt,
-        conventions,
-        plugins: impl_plugins,
-        ledger: Some(Arc::clone(ledger)),
-        run_id: run_id.to_string(),
-        issue: issue.to_string(),
-        analyst: plan.analyst.clone(),
-        acceptance,
-        characterizer: build_characterizer(
-            engine,
-            config,
-            context,
-            client.map(|c| c.offer()),
-            Some(Arc::clone(ledger)),
-        )?,
-    };
-    Ok((red_team, implementer))
-}
-
-/// Build the optional reviewer before work is spent in the fork.
-pub(crate) fn build_reviewers(
-    run: &Run<'_>,
-    plan: &PlanOutcome,
-) -> Result<Option<Review>, PlanError> {
-    Review::build(run, plan)
-}
-
-/// Create the worktree that the red team and implementer share.
-pub(crate) async fn fork_worktree(
-    implementer: &ImplementerNode,
-) -> Result<WorktreePath, PlanError> {
-    implementer
-        .prepare()
-        .await
-        .map_err(|e| PlanError::node("implementer", e))
-}
-
-/// Point the diff reader at the newly-created worktree.
-pub(crate) fn root_reviewers(review: &mut Option<Review>, worktree: &WorktreePath) {
-    if let Some(review) = review.as_mut() {
-        review.rooted_at(worktree.as_path());
-    }
-}
-
-/// Characterize the baseline and author any tests before the implementer opens the tree.
-pub(crate) async fn red_team_baseline(
-    red_team: &RedTeamNode,
-    worktree: &WorktreePath,
+pub(crate) async fn commit_worktree(
+    config: &RatatoskrConfig,
     issue: &str,
-    plan: &PlanOutcome,
-) -> Result<RedTeamOutput, PlanError> {
-    red_team
-        .run_and_author(worktree.as_path(), issue, &plan.analyst.interface)
-        .await
-        .map_err(|e| PlanError::node("red_team", e))
-}
-
-/// Run the first implementation attempt, discarding its worktree on failure.
-pub(crate) async fn first_implementer_attempt(
-    implementer: &ImplementerNode,
     worktree: &WorktreePath,
-) -> Result<ImplementerOutput, PlanError> {
-    match implementer.work(worktree).await {
-        Ok(out) => Ok(out),
-        Err(e) => {
-            implementer.discard(worktree).await;
-            Err(PlanError::node("implementer", e))
-        }
-    }
-}
-
-/// Record the baseline and first implementation at their original ledger iteration.
-pub(crate) async fn record_initial_attempt(
-    run: &Run<'_>,
-    plan: &PlanOutcome,
-    red_team_out: &RedTeamOutput,
-    impl_out: &ImplementerOutput,
-) -> Result<(), PlanError> {
-    record(Record {
-        store: run.store,
-        run_id: run.run_id,
-        node: "red_team",
-        output: red_team_out,
-        input: None,
-        iteration: Some(1),
-        ledger: Some(run.ledger),
-    })
-    .await?;
-    record(Record {
-        store: run.store,
-        run_id: run.run_id,
-        node: "implementer",
-        output: impl_out,
-        input: Some(serde_json::to_string(&plan.analyst)?),
-        iteration: Some(1),
-        ledger: Some(run.ledger),
-    })
-    .await
-}
-
-/// Reject a baseline that did not produce any acceptance result.
-pub(crate) fn validate_baseline(red_team_out: &RedTeamOutput) -> Result<(), PlanError> {
-    if converge::test_command_ran(
-        &red_team_out.failing_tests,
-        red_team_out.passed_tests,
-        red_team_out.exit_code,
-    ) {
-        return Ok(());
-    }
-    Err(PlanError::node(
-        "red_team",
-        NodeError::Failed(format!(
-            "the baseline acceptance run produced no checks (exit {}); \
-             check the analyst's acceptance, [sandbox] test_command and the sandbox backend",
-            red_team_out.exit_code
-        )),
-    ))
-}
-
-/// The live context needed only when a clean test result reaches review.
-pub(crate) struct ReviewRequest<'a, 'run> {
-    review: &'a Review,
-    run: &'a Run<'run>,
-    plan: &'a AnalystOutput,
-    worktree: &'a WorktreePath,
-    iteration: u32,
-    findings: &'a [verifier::Finding],
-}
-
-/// Apply the referee, test, and verifier gates in that order.
-pub(crate) async fn decide_correction(
-    referee_violations: &[referee::Violation],
-    red_team_out: &RedTeamOutput,
-    impl_out: &ImplementerOutput,
-    authored: &[String],
-    review: Option<ReviewRequest<'_, '_>>,
-) -> Result<Reviewed, PlanError> {
-    if !referee_violations.is_empty() {
-        tracing::warn!(violations = ?referee_violations, "iteration weakened the referee; not accepting it");
-        return Ok(Reviewed::Fix(Box::new(Correction {
-            prompt: referee::correction(referee_violations),
-            revised: None,
-            found: Vec::new(),
-        })));
-    }
-
-    let post_ran = converge::test_command_ran(
-        &impl_out.failing_tests,
-        impl_out.passed_tests,
-        impl_out.exit_code,
-    );
-    let unsatisfied = converge::unsatisfied(authored, &impl_out.failing_tests);
-    let tests_clean = post_ran
-        && unsatisfied.is_empty()
-        && converge::is_converged(&red_team_out.failing_tests, &impl_out.failing_tests);
-    if !tests_clean {
-        let prompt = if !post_ran {
-            format!(
-                "The test command did not run to completion (exit {}) — your change likely \
-                 does not compile. Fix it so the tests run and pass.",
-                impl_out.exit_code
-            )
-        } else if !unsatisfied.is_empty() {
-            format!(
-                "These tests were written for this change, from the interface, before any code \
-                 existed to satisfy them — making them pass is what the change is for, and \
-                 they are still failing: {}. They are not yours to edit; implement what they \
-                 describe. If one of them is wrong about the contract rather than about your \
-                 code, say so in your summary and implement the rest.",
-                unsatisfied.join(", ")
-            )
-        } else {
-            let new_failures = converge::newly_introduced_failures(
-                &red_team_out.failing_tests,
-                &impl_out.failing_tests,
-            );
-            format!(
-                "Your change introduced NEW failing tests not present in the baseline: {}. \
-                 Fix them without breaking other tests.",
-                new_failures.join(", ")
-            )
-        };
-        return Ok(Reviewed::Fix(Box::new(Correction {
-            prompt,
-            revised: None,
-            found: Vec::new(),
-        })));
-    }
-
-    match review {
-        Some(review) => {
-            review
-                .review
-                .review(
-                    review.run,
-                    review.plan,
-                    impl_out,
-                    review.worktree,
-                    review.iteration,
-                    review.findings,
-                )
-                .await
-        }
-        None => Ok(Reviewed::Clean),
-    }
-}
-
-/// The decision reached when the iteration budget has been spent.
-pub(crate) enum CeilingDecision {
-    Stop(RunStatus),
-    Replan(Box<Correction>),
-}
-
-/// Optionally escalate the accumulated findings once, after the budget is spent.
-pub(crate) async fn at_ceiling(
-    iterations: u32,
-    max_iterations: u32,
-    replanned: bool,
-    findings: &[verifier::Finding],
-    review: Option<ReviewRequest<'_, '_>>,
-) -> Result<CeilingDecision, PlanError> {
-    debug_assert!(iterations >= max_iterations);
-    if replanned || findings.is_empty() {
-        return Ok(CeilingDecision::Stop(RunStatus::MaxIterationsReached));
-    }
-    let Some(review) = review else {
-        return Ok(CeilingDecision::Stop(RunStatus::MaxIterationsReached));
-    };
-    tracing::warn!(
-        iterations,
-        findings = findings.len(),
-        "the iteration budget is spent; asking the analyst to look at the plan rather than recording another failed attempt"
-    );
-    match review
-        .review
-        .replan_at_ceiling(review.run, review.plan, findings, iterations)
-        .await?
-    {
-        Some((revised, prompt)) => Ok(CeilingDecision::Replan(Box::new(Correction {
-            prompt,
-            revised: Some(revised),
-            found: Vec::new(),
-        }))),
-        None => Ok(CeilingDecision::Stop(RunStatus::MaxIterationsReached)),
-    }
-}
-
-/// Record one corrective implementer attempt.
-pub(crate) async fn record_iteration(
-    run: &Run<'_>,
-    impl_out: &ImplementerOutput,
-    input: String,
-    iteration: u32,
-) -> Result<(), PlanError> {
-    record(Record {
-        store: run.store,
-        run_id: run.run_id,
-        node: "implementer",
-        output: impl_out,
-        input: Some(input),
-        iteration: Some(iteration),
-        ledger: Some(run.ledger),
-    })
-    .await
-}
-
-/// Everything the convergence loop carries between its named decision stages.
-pub(crate) struct ConvergeInput<'a, 'run> {
-    run: &'a Run<'run>,
-    plan: &'a PlanOutcome,
-    repo_path: &'a Path,
-    implementer: &'a ImplementerNode,
-    worktree: &'a WorktreePath,
-    red_team_out: &'a RedTeamOutput,
-    impl_out: ImplementerOutput,
-    review: Option<&'a Review>,
-}
-
-/// Iterate until the referee, tests, and review accept the current work.
-pub(crate) async fn converge(
-    input: ConvergeInput<'_, '_>,
-) -> Result<(ImplementerOutput, RunStatus, u32), PlanError> {
-    let ConvergeInput {
-        run,
-        plan,
-        repo_path,
-        implementer,
-        worktree,
-        red_team_out,
-        mut impl_out,
-        review,
-    } = input;
-    let mut in_force = plan.analyst.clone();
-    let mut iterations = 1u32;
-    let mut found_so_far: Vec<verifier::Finding> = Vec::new();
-    let mut replanned = false;
-
-    let status = loop {
-        let referee_violations = match referee::judge(
-            run.engine,
-            run.config,
-            run.ledger,
-            run.issue,
-            &in_force.requirements,
-            &impl_out,
-            worktree,
-        )
-        .await
-        {
-            Ok(Some(violations)) => {
-                if let Err(error) = record(Record {
-                    store: run.store,
-                    run_id: run.run_id,
-                    node: "referee",
-                    output: &referee::RefereeOutput {
-                        violations: violations.clone(),
-                    },
-                    input: None,
-                    iteration: Some(iterations),
-                    ledger: Some(run.ledger),
-                })
-                .await
-                {
-                    tracing::warn!("failed to record referee judgement: {error}");
-                }
-                violations
-            }
-            Ok(None) => Vec::new(),
-            Err(error) => {
-                tracing::warn!(
-                    "the referee could not judge this change; trusting test results: {error}"
-                );
-                if let Err(record_error) = record(Record {
-                    store: run.store,
-                    run_id: run.run_id,
-                    node: "referee",
-                    output: &serde_json::json!({ "error": error.to_string() }),
-                    input: None,
-                    iteration: Some(iterations),
-                    ledger: Some(run.ledger),
-                })
-                .await
-                {
-                    tracing::warn!("failed to record referee failure: {record_error}");
-                }
-                Vec::new()
-            }
-        };
-        let authored = red_team_out
-            .authored
-            .as_ref()
-            .map(|a| a.tests.as_slice())
-            .unwrap_or_default();
-        let review_request = review.map(|review| ReviewRequest {
-            review,
-            run,
-            plan: &in_force,
-            worktree,
-            iteration: iterations,
-            findings: &found_so_far,
-        });
-        let correction = match decide_correction(
-            &referee_violations,
-            red_team_out,
-            &impl_out,
-            authored,
-            review_request,
-        )
-        .await?
-        {
-            Reviewed::Clean => break RunStatus::Converged,
-            Reviewed::Unavailable => break RunStatus::Unreviewed,
-            Reviewed::Fix(correction) => *correction,
-        };
-        found_so_far.extend(correction.found.iter().cloned());
-        if let Some(revised) = correction.revised.as_ref() {
-            in_force = revised.clone();
-            replanned = true;
-        }
-        if iterations >= run.config.implementer.max_iterations {
-            let ceiling_review = review.map(|review| ReviewRequest {
-                review,
-                run,
-                plan: &in_force,
-                worktree,
-                iteration: iterations,
-                findings: &found_so_far,
-            });
-            match at_ceiling(
-                iterations,
-                run.config.implementer.max_iterations,
-                replanned,
-                &found_so_far,
-                ceiling_review,
-            )
-            .await?
-            {
-                CeilingDecision::Stop(status) => break status,
-                CeilingDecision::Replan(correction) => {
-                    let revised = correction
-                        .revised
-                        .expect("ceiling replans carry a revision");
-                    in_force = revised;
-                    replanned = true;
-                    iterations += 1;
-                    impl_out = match implementer.iterate(worktree, &correction.prompt).await {
-                        Ok(out) => out,
-                        Err(e) => {
-                            if let Err(rm) = remove_worktree(repo_path, worktree).await {
-                                tracing::warn!("failed to clean up worktree: {rm}");
-                            }
-                            return Err(PlanError::node("implementer", e));
-                        }
-                    };
-                    record_iteration(
-                        run,
-                        &impl_out,
-                        serde_json::to_string(&in_force)?,
-                        iterations,
-                    )
-                    .await?;
-                    continue;
-                }
-            }
-        }
-        impl_out = match implementer.iterate(worktree, &correction.prompt).await {
-            Ok(out) => out,
-            Err(e) => {
-                if let Err(rm) = remove_worktree(repo_path, worktree).await {
-                    tracing::warn!("failed to clean up worktree after converge error: {rm}");
-                }
-                return Err(PlanError::node("implementer", e));
-            }
-        };
-        record_iteration(
-            run,
-            &impl_out,
-            serde_json::to_string(&correction.prompt)?,
-            iterations + 1,
-        )
-        .await?;
-        iterations += 1;
-    };
-    Ok((impl_out, status, iterations))
-}
-
-/// Commit the run branch regardless of the settled outcome.
-pub(crate) async fn commit_run(
-    run: &Run<'_>,
-    implementer: &ImplementerNode,
-    worktree: &WorktreePath,
+    branch: &str,
     impl_out: &ImplementerOutput,
 ) {
-    let branch = implementer.branch();
     match ratatoskr_exec::commit_all(
         worktree,
-        &branch,
-        &commit_message(&run.config.publish, run.issue, impl_out),
+        branch,
+        &commit_message(&config.publish, issue, impl_out),
         ratatoskr_exec::Committer {
-            name: &run.config.publish.committer_name,
-            email: &run.config.publish.committer_email,
+            name: &config.publish.committer_name,
+            email: &config.publish.committer_email,
         },
     )
     .await
@@ -3156,7 +2011,7 @@ mod agent_config_tests {
             &config,
             ToolSet::default(),
             "analyst",
-            analyst::ANALYST_TOOLS,
+            &["impact_surface", "symbol_lookup", "semantic_search"],
             &mut NodePlugins::default(),
         )
         .unwrap();
@@ -3300,7 +2155,7 @@ mod agent_config_tests {
             &RatatoskrConfig::default(),
             ToolSet::default(),
             "analyst",
-            analyst::ANALYST_TOOLS,
+            &["impact_surface", "symbol_lookup", "semantic_search"],
             &mut NodePlugins::default(),
         )
         .unwrap();
@@ -3362,6 +2217,21 @@ mod agent_config_tests {
         let with_rules = graph_fingerprint(&root);
         std::fs::write(root.join(".ratatoskr/workflow.ts"), "x").unwrap();
         assert_ne!(with_rules, graph_fingerprint(&root));
+
+        // A prompt compiled into a workflow is part of that graph too. Otherwise two runs with
+        // different model instructions would claim the same provenance merely because the small
+        // TypeScript wrapper was unchanged.
+        let workflows = root.join(WORKFLOW_DIR);
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(workflows.join("prompt.md"), "first prompt").unwrap();
+        std::fs::write(
+            workflows.join("review.ts"),
+            "defineWorkflow({ name: 'review', stages: [stage('reviewer', { agent: 'reason', instructions: LOAD('prompt.md') })] });",
+        )
+        .unwrap();
+        let with_loaded_prompt = graph_fingerprint(&root);
+        std::fs::write(workflows.join("prompt.md"), "second prompt").unwrap();
+        assert_ne!(with_loaded_prompt, graph_fingerprint(&root));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3609,6 +2479,33 @@ mod agent_config_tests {
     }
 
     #[tokio::test]
+    async fn the_default_standard_stage_registry_has_unique_identifiers() {
+        validate_configured_stages(&RatatoskrConfig::default())
+            .await
+            .expect("the bundled standard declarations replace legacy terminal placeholders");
+    }
+
+    #[test]
+    fn configured_registry_allows_governance_by_another_declared_stage() {
+        let template = built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        let mut policy = template.clone();
+        policy.id = "shared_policy".to_string();
+        let mut consumer = template;
+        consumer.id = "custom_plan".to_string();
+        consumer.governed_by = Some(policy.id.clone());
+
+        validate_configured_stage_registry(
+            &RatatoskrConfig::default(),
+            &[],
+            vec![policy, consumer],
+        )
+        .expect("resolved declared stage IDs are permitted governance identities");
+    }
+
+    #[tokio::test]
     async fn a_workflow_can_add_to_the_nodes_a_ruleset_may_govern() {
         let built_in = Workflow::BuiltIn;
         // The built-in adds none: it governs exactly the standard set.
@@ -3638,24 +2535,19 @@ mod agent_config_tests {
         assert!(BUILT_IN_NODES.contains(&"implementer"));
     }
 
-    /// Whether `choose` would spend a model call, given what the repo defines and what was asked.
-    fn would_consult(defined: usize, named: bool, configured: bool) -> bool {
-        !named && defined > 1 && configured
-    }
-
     #[test]
     fn the_overseer_is_consulted_only_when_there_is_a_real_choice() {
         // A caller that named a workflow said which shape it wanted and is not asking to be
         // second-guessed.
-        assert!(!would_consult(3, true, true));
+        assert!(!should_consult_overseer(3, true, true));
         // One or none resolves without a model call: paying for a decision with one answer is
         // waste, and the built-in is what a repo defining nothing gets.
-        assert!(!would_consult(1, false, true));
-        assert!(!would_consult(0, false, true));
+        assert!(!should_consult_overseer(1, false, true));
+        assert!(!should_consult_overseer(0, false, true));
         // Unconfigured, the run refuses to guess rather than picking for itself.
-        assert!(!would_consult(3, false, false));
+        assert!(!should_consult_overseer(3, false, false));
         // The only case worth a call.
-        assert!(would_consult(2, false, true));
+        assert!(should_consult_overseer(2, false, true));
     }
 
     #[tokio::test]
@@ -3670,12 +2562,34 @@ mod agent_config_tests {
         let mut registry = vec![Workflow::BuiltIn];
         registry.extend(found.into_iter().map(Workflow::Scripted));
 
-        let err = match select(registry, Some("invented")) {
+        let store = Store::open_in_memory().unwrap();
+        let ledger = Arc::new(RunLedger::default());
+        let err = match select_and_record_overseer(OverseerDecision {
+            store: &store,
+            run_id: "run-invalid-overseer-choice",
+            found: registry,
+            decided: OverseerOutput {
+                workflow: "invented".to_string(),
+                reasoning: "the model invented a route".to_string(),
+            },
+            input_json: r#"{"issue":"choose","choices":[]}"#.to_string(),
+            ledger: &ledger,
+        })
+        .await
+        {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a name that is not in the registry must not select anything"),
         };
         assert!(err.contains("no workflow named `invented`"), "{err}");
         assert!(err.contains("research"), "{err}");
+        assert!(
+            store
+                .checkpoints_for_run("run-invalid-overseer-choice")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a rejected workflow name must not look like a valid overseer checkpoint"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3885,280 +2799,6 @@ mod repo_conventions_tests {
 }
 
 #[cfg(test)]
-mod converge_stage_tests {
-    use super::*;
-
-    // Contract reading (#198): `fork_and_converge` is split into the named stages its comments
-    // already describe, two of which are the decisions the loop used to keep inline. The issue
-    // names them "per the existing comments, e.g." — pinned here at the crate root, next to
-    // `fork_and_converge`, as:
-    //
-    //   pub(crate) async fn decide_correction(
-    //       violations: &[referee::Violation],
-    //       red_team_out: &RedTeamOutput,
-    //       impl_out: &ImplementerOutput,
-    //       authored: &[String],
-    //       review: Option<&Review>,
-    //   ) -> Result<Reviewed, PlanError>
-    //
-    // — the contract's input list in its order (referee violations, the two outputs, the
-    // authored test list, the review handle). Async and fallible because the tests-clean +
-    // review-configured branch must await the review; with `review: None` it is pure data, which
-    // is the half these tests exercise.
-    //
-    //   pub(crate) enum CeilingDecision { Stop(RunStatus), Replan(Correction) }
-    //
-    //   pub(crate) async fn at_ceiling(
-    //       iterations: u32,
-    //       max_iterations: u32,
-    //       replanned: bool,
-    //       findings: &[verifier::Finding],
-    //       review: Option<&Review>,
-    //   ) -> Result<CeilingDecision, PlanError>
-    //
-    // — the contract's "enum of the form { Stop(RunStatus) | Replan(Correction) }", with the
-    // once-per-run escalation decidable without a loop. Same async/Result reading: the Replan
-    // branch awaits the analyst, the Stop branches never do.
-    //
-    // What these tests deliberately do not pin: the loop's translation of a stage output into a
-    // terminal status (Clean → Converged, Unavailable → Unreviewed), the replanned/in-force
-    // bookkeeping, and the worktree cleanup on an implementer error. Those live in the loop body
-    // `fork_and_converge` still owns, are not separately callable under the contract, and are
-    // covered by the requirement that the existing converge tests pass unedited.
-
-    fn red(failing: &[&str], passed: usize, exit: i32) -> RedTeamOutput {
-        RedTeamOutput {
-            authored: None,
-            failing_tests: failing.iter().map(|s| s.to_string()).collect(),
-            passed_tests: passed,
-            exit_code: exit,
-            classifications: vec![],
-        }
-    }
-
-    fn imp(failing: &[&str], passed: usize, exit: i32) -> ImplementerOutput {
-        ImplementerOutput {
-            worktree_path: "/wt".to_string(),
-            branch: "ratatoskr/test".into(),
-            diff_summary: String::new(),
-            touched_files: vec![],
-            rewritten_files: Vec::new(),
-            failing_tests: failing.iter().map(|s| s.to_string()).collect(),
-            passed_tests: passed,
-            exit_code: exit,
-            narrative: None,
-            commit_kind: String::new(),
-            commit_scope: String::new(),
-            commit_subject: String::new(),
-        }
-    }
-
-    fn violation(file: &str, reason: &str) -> referee::Violation {
-        referee::Violation {
-            file: file.into(),
-            reason: reason.into(),
-        }
-    }
-
-    fn finding() -> verifier::Finding {
-        verifier::Finding {
-            severity: verifier::Severity::P2,
-            kind: verifier::FindingKind::Execution,
-            file: "a.rs".into(),
-            line: None,
-            summary: "s".into(),
-            failure_scenario: "f".into(),
-        }
-    }
-
-    /// Unwrap a `Reviewed::Fix` into its correction, failing loudly on any other verdict.
-    fn correction_of(reviewed: Reviewed) -> Correction {
-        match reviewed {
-            Reviewed::Fix(correction) => *correction,
-            Reviewed::Clean => panic!("expected a correction, got Reviewed::Clean"),
-            Reviewed::Unavailable => panic!("expected a correction, got Reviewed::Unavailable"),
-        }
-    }
-
-    #[tokio::test]
-    async fn the_referee_correction_wins_and_the_tests_are_never_consulted() {
-        // The two gates in order, referee first: violations are non-empty AND the test outcome
-        // is as bad as it gets — the post-change run never completed (exit 101, nothing parsed)
-        // and an authored test still fails. The prompt must come back byte-equal to
-        // `referee::correction(&violations)`: no test-derived prompt can be that string, so
-        // equality is what proves the test result was never consulted.
-        let violations = vec![violation(
-            "crates/foo/src/lib.rs",
-            "deleted the module's #[cfg(test)] characterisation",
-        )];
-        let baseline = red(&["crate::authored_test"], 3, 1);
-        let post = imp(&["crate::authored_test"], 0, 101);
-        let authored = vec!["crate::authored_test".to_string()];
-
-        let reviewed = decide_correction(&violations, &baseline, &post, &authored, None)
-            .await
-            .expect("the referee branch spends no model call");
-        let correction = correction_of(reviewed);
-        assert_eq!(correction.prompt, referee::correction(&violations));
-        // A deterministic correction carries no review state: nothing found, no revised plan.
-        assert!(correction.found.is_empty());
-        assert!(correction.revised.is_none());
-    }
-
-    #[tokio::test]
-    async fn a_test_run_that_did_not_complete_says_so_and_names_the_exit_code() {
-        // Zero tests parsed and a non-zero exit: the change likely does not compile. Reporting
-        // "no new failures" here would be the false-convergence reading this branch exists to
-        // refuse — the prompt states the command did not run to completion, with the exit code.
-        let baseline = red(&["a::pre_existing"], 10, 1);
-        let post = imp(&[], 0, 101);
-
-        let reviewed = decide_correction(&[], &baseline, &post, &[], None)
-            .await
-            .expect("pure data with no review configured");
-        let prompt = correction_of(reviewed).prompt;
-        assert!(
-            prompt.contains("did not run to completion"),
-            "the run's failure to complete is said, not hidden: {prompt}"
-        );
-        assert!(
-            prompt.contains("101"),
-            "the exit code is named so the implementer can see how it died: {prompt}"
-        );
-    }
-
-    #[tokio::test]
-    async fn authored_tests_still_failing_are_named_in_the_correction() {
-        // Written for this change before any code existed, they fail in the baseline as a matter
-        // of course — so *nothing is newly failing* here, and `is_converged` alone would wave
-        // the change through. The unsatisfied gate is what refuses, and the prompt names exactly
-        // the authored tests that still fail.
-        let baseline = red(
-            &["tests::writes_a_row", "tests::rejects_an_empty_name"],
-            4,
-            1,
-        );
-        // The run completed (tests parsed, so exit 1 is a real test result), one authored test
-        // now passes, the other still fails.
-        let post = imp(&["tests::rejects_an_empty_name"], 8, 1);
-        let authored = vec![
-            "tests::writes_a_row".to_string(),
-            "tests::rejects_an_empty_name".to_string(),
-        ];
-
-        let reviewed = decide_correction(&[], &baseline, &post, &authored, None)
-            .await
-            .expect("pure data with no review configured");
-        let prompt = correction_of(reviewed).prompt;
-        assert!(
-            prompt.contains("tests::rejects_an_empty_name"),
-            "the unsatisfied test is named: {prompt}"
-        );
-        assert!(
-            !prompt.contains("tests::writes_a_row"),
-            "the authored test that now passes is not named: {prompt}"
-        );
-    }
-
-    #[tokio::test]
-    async fn newly_introduced_failures_are_named_and_pre_existing_ones_are_not() {
-        // The regression branch: the run completed, no authored tests are outstanding, but the
-        // change broke tests the baseline had green. The prompt names those and only those —
-        // naming a pre-existing failure would send the implementer chasing a failure it did not
-        // cause.
-        let baseline = red(&["a::pre_existing"], 10, 1);
-        let post = imp(&["a::pre_existing", "b::broke", "c::also_broke"], 9, 1);
-
-        let reviewed = decide_correction(&[], &baseline, &post, &[], None)
-            .await
-            .expect("pure data with no review configured");
-        let prompt = correction_of(reviewed).prompt;
-        assert!(prompt.contains("b::broke"), "{prompt}");
-        assert!(prompt.contains("c::also_broke"), "{prompt}");
-        assert!(
-            !prompt.contains("a::pre_existing"),
-            "the pre-existing failure is not the implementer's problem: {prompt}"
-        );
-    }
-
-    #[tokio::test]
-    async fn clean_tests_and_no_review_is_clean() {
-        // Every deterministic gate passes — the run completed, no authored test is outstanding,
-        // nothing newly failing — and there is no verifier configured: the stage's verdict is
-        // Reviewed::Clean, which the loop then translates to RunStatus::Converged. (The
-        // translation is the loop's, not the stage's; the stage's half is returning Clean.)
-        let baseline = red(&["a::pre_existing"], 10, 1);
-        let post = imp(&["a::pre_existing"], 12, 0);
-        let reviewed = decide_correction(&[], &baseline, &post, &[], None)
-            .await
-            .expect("pure data with no review configured");
-        assert!(
-            matches!(reviewed, Reviewed::Clean),
-            "clean tests with nobody to ask converge as Clean"
-        );
-
-        // The all-green spelling of the same thing: empty baseline, everything passing.
-        let reviewed = decide_correction(&[], &red(&[], 285, 0), &imp(&[], 300, 0), &[], None)
-            .await
-            .expect("pure data with no review configured");
-        assert!(matches!(reviewed, Reviewed::Clean));
-    }
-
-    #[tokio::test]
-    async fn a_spent_budget_with_nothing_found_stops_without_asking_the_analyst() {
-        // Budget spent, no prior replan, but `found_so_far` is empty: there is no evidence to
-        // hand the analyst, so the run stops at the wall rather than spending a replan on
-        // nothing. No review handle is passed — with no findings the analyst must not be
-        // reached even when there is one.
-        let decision = at_ceiling(3, 3, false, &[], None)
-            .await
-            .expect("stopping spends no model call");
-        assert!(
-            matches!(
-                decision,
-                CeilingDecision::Stop(RunStatus::MaxIterationsReached)
-            ),
-            "an empty evidence base records the wall, not a replan"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_spent_budget_after_a_replan_stops_for_real() {
-        // The escalation is once per run: `replanned` stops the run even with findings standing,
-        // because a second replan would be the same escalation on the same evidence.
-        let findings = vec![finding()];
-        let decision = at_ceiling(4, 3, true, &findings, None)
-            .await
-            .expect("stopping spends no model call");
-        assert!(
-            matches!(
-                decision,
-                CeilingDecision::Stop(RunStatus::MaxIterationsReached)
-            ),
-            "the second time at the ceiling is the wall, not another escalation"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_spent_budget_without_a_review_stops_at_the_wall() {
-        // Findings stand and the budget is spent, but with no review configured there is no
-        // analyst re-entry either: the escalation goes through the review handle. Its absence is
-        // MaxIterationsReached — never an error, and never a silently extended budget.
-        let findings = vec![finding()];
-        let decision = at_ceiling(3, 3, false, &findings, None)
-            .await
-            .expect("no review configured stops cleanly");
-        assert!(
-            matches!(
-                decision,
-                CeilingDecision::Stop(RunStatus::MaxIterationsReached)
-            ),
-            "with nobody to escalate to, the ceiling is the wall"
-        );
-    }
-}
-
-#[cfg(test)]
 mod referee_governance_tests {
     use super::*;
 
@@ -4312,7 +2952,7 @@ mod referee_governance_tests {
         let found = WorkflowRuntime::discover(&dir).await.unwrap();
         assert_eq!(found[0].meta().nodes, ["referee"]);
         assert!(
-            !governable_from(found).iter().any(|name| name == "referee"),
+            !governable_from(&found).iter().any(|name| name == "referee"),
             "a workflow declaration cannot make the internal judge governable"
         );
         let _ = std::fs::remove_dir_all(&dir);

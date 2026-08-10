@@ -15,7 +15,7 @@ import {
   type Node,
   type NodeProps,
 } from "@xyflow/react";
-import { Brain, Infinity as InfinityIcon, Wrench } from "lucide-react";
+import { Brain, Infinity as InfinityIcon, Repeat, Wrench } from "lucide-react";
 import { TOOL_GROUPS } from "../ui/tools";
 import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode } from "../api";
 
@@ -96,6 +96,7 @@ function NodeFacts({
   const thinking = telemetry?.thinking ?? live?.facts?.thinking ?? planned?.thinking ?? false;
   const reuses =
     telemetry?.reuses_session ?? live?.facts?.reuses_session ?? planned?.reuses_session ?? false;
+  const session = planned?.session ?? (reuses ? "reuse" : "fresh");
   const cycles = telemetry?.turns ?? live?.cycles ?? null;
   const groups = TOOL_GROUPS.filter((g) => tools.some(g.match));
   const ungrouped = tools.filter((t) => !TOOL_GROUPS.some((g) => g.match(t)));
@@ -125,13 +126,20 @@ function NodeFacts({
       </div>
       <div className="node-icons">
         {/* Lucide takes no `title`, and a wrapper is the better hover target anyway. */}
-        {reuses && (
+        {session === "reuse" && (
           <span
             className="node-icon"
-            /* Not a setting — this says the session was actually carried over. */
-            data-tip="Compounding: this node keeps its memory when it is re-entered, so a later attempt continues the earlier one"
+            data-tip="Endpoint continuation: this node keeps its endpoint session when it is re-entered"
           >
             <InfinityIcon size={13} aria-label="compounding" />
+          </span>
+        )}
+        {session === "compacted" && (
+          <span
+            className="node-icon"
+            data-tip="Compacted continuation: a re-entered node receives a local summary of its previous attempt"
+          >
+            <Repeat size={13} aria-label="compacted continuation" />
           </span>
         )}
         {thinking && (

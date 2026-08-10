@@ -1,15 +1,9 @@
 //! Scout: search the tracker papertrail and code for context related to the issue.
 
-use ratatoskr_core::{ModelRoute, RunState};
-use ratatoskr_graph::{Node, NodeError, parse_validated};
-use ratatoskr_mcp::ToolSet;
+#[cfg(test)]
+use ratatoskr_graph::{NodeError, parse_validated};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-
-/// rag-rat tools the scout is allowed to use — a focused subset keeps a fast model reliable.
-pub const SCOUT_TOOLS: &[&str] = &["papertrail_issue_search", "semantic_search"];
-
-const PREAMBLE: &str = include_str!("../prompts/scout.md");
 
 /// One tracker item (or code area) the scout judged relevant. Fields are optional (the agent's
 /// output is best-effort) — the gate enforces the object shape and types, and the essential
@@ -42,72 +36,6 @@ pub struct ScoutOutput {
     pub related_items: Vec<RelatedItem>,
     /// Free-text context for the analyst node — the essential, always-required output.
     pub papertrail_summary: String,
-}
-
-/// The scout node: a fast agent restricted to search tools.
-pub struct ScoutNode {
-    pub route: ModelRoute,
-    pub tools: ToolSet,
-    pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
-    pub max_turns: Option<usize>,
-    pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
-    /// Ruleset `systemPrompt`; replaces [`PREAMBLE`] when set.
-    pub system_prompt: Option<String>,
-    /// What the plugins this node binds contribute to it.
-    pub plugins: crate::NodePlugins,
-    /// Where this node reports what its turn cost, for the checkpoint the executor writes.
-    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
-    /// The repository its built-in file tools read within.
-    pub files: Option<std::path::PathBuf>,
-}
-
-impl Node for ScoutNode {
-    type Input = String;
-    type Output = ScoutOutput;
-
-    fn name(&self) -> &'static str {
-        "scout"
-    }
-
-    async fn run(&self, issue: String, _run_state: &RunState) -> Result<ScoutOutput, NodeError> {
-        let raw = ratatoskr_agent::run_structured(ratatoskr_agent::NodeRun {
-            node: "scout",
-            route: &self.route,
-            preamble: &crate::effective_preamble_with_profile(
-                "scout",
-                PREAMBLE,
-                self.plugins.profile_prompt.as_str(),
-                self.system_prompt.as_deref(),
-                self.plugins.context.as_deref(),
-                &self.plugins.skills,
-            ),
-            question: &issue,
-            tools: self.tools.clone(),
-            output_schema: schemars::schema_for!(ScoutOutput),
-            policy: self.policy.clone(),
-            max_turns: self.max_turns,
-            clarifier: self.clarifier.clone(),
-            observer: self.plugins.observer.clone(),
-            skills: crate::skills::loaded(&self.plugins.skills, "scout"),
-            files: self.files.clone(),
-            // Reads and edits, but runs nothing.
-            shell: None,
-            push: None,
-            conversation: None,
-            ledger: self.ledger.clone(),
-            produces: Some(
-                "a papertrail summary of what the tracker and history say about this task, plus the related items found",
-            ),
-        })
-        .await
-        .map_err(|e| NodeError::Failed(format!("scout agent failed: {e}")))?;
-
-        let mut out = parse_validated::<ScoutOutput>(&raw)?;
-        // Drop empty placeholder items so the checkpoint, the analyst's input, and the CLI summary
-        // stay clean.
-        out.related_items.retain(RelatedItem::is_meaningful);
-        Ok(out)
-    }
 }
 
 #[cfg(test)]

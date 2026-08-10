@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use ratatoskr_core::{AgentProfileConfig, Capability, ModelRoute, ToolPolicy};
+use ratatoskr_core::{AgentProfileConfig, Capability, ModelRoute, SessionScope, ToolPolicy};
 
 /// Reusable model and authority defaults. A profile is not a checkpoint identity; [`Stage`] is.
 #[derive(Clone)]
@@ -37,6 +37,8 @@ impl AgentProfile {
 pub struct Stage {
     pub id: String,
     pub agent: String,
+    /// Stable route/rules/plugin identity. Defaults to [`Self::id`].
+    pub governed_by: Option<String>,
     pub input_contract: String,
     pub output_contract: String,
     /// JSON Schema for [`Self::output_contract`] on user-declared stages.
@@ -45,18 +47,43 @@ pub struct Stage {
     pub context: String,
     /// A stage may only narrow its profile's ceiling.
     pub capabilities: Vec<Capability>,
+    /// Default tools offered before repository rules narrow or replace the list.
+    pub tools: Vec<String>,
+    /// Overrides the selected route's attempt-continuation policy when present.
+    pub session: Option<SessionScope>,
+    /// Pure TypeScript source that renders structured runtime input into this stage's question.
+    pub question_renderer: Option<String>,
+    /// Generic output cleanup performed after schema validation.
+    pub array_normalization: Vec<ArrayNormalization>,
     pub delegation: Option<Delegation>,
     /// Built-ins append repository guidance; user-defined stages may replace their prompt.
     pub append_repository_guidance: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrayNormalization {
+    pub field: String,
+    pub default_empty: bool,
+    pub retain_when_any_non_blank: Vec<String>,
+}
+
 impl Stage {
+    pub fn governance_id(&self) -> &str {
+        self.governed_by.as_deref().unwrap_or(&self.id)
+    }
+
     pub fn effective_ceiling(&self, profile: &AgentProfile) -> Option<Capability> {
         match (profile.ceiling(), Capability::ceiling(&self.capabilities)) {
             (Some(profile), Some(stage)) => Some(profile.min(stage)),
             (profile, None) => profile,
             (None, Some(_)) => None,
         }
+    }
+
+    /// The attempt-continuation policy for this stage. An omitted declaration preserves the
+    /// selected route, which keeps legacy `[models.<stage>]` configuration authoritative.
+    pub fn session_scope(&self, route_default: SessionScope) -> SessionScope {
+        self.session.unwrap_or(route_default)
     }
 
     /// Compose a stage prompt in authority-independent, stable order.
@@ -110,6 +137,14 @@ pub fn built_in_agents() -> Vec<AgentProfile> {
             model: None,
             base_prompt: String::new(),
             capabilities: vec![Capability::Read],
+            tool_policy: None,
+            max_turns: None,
+        },
+        AgentProfile {
+            id: "transcribe".into(),
+            model: None,
+            base_prompt: String::new(),
+            capabilities: Vec::new(),
             tool_policy: None,
             max_turns: None,
         },
@@ -170,12 +205,25 @@ pub fn stages_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> 
         .map(|stage| Stage {
             id: stage.id.clone(),
             agent: stage.agent.clone(),
+            governed_by: stage.governed_by.clone(),
             input_contract: stage.input_contract.clone(),
             output_contract: stage.output_contract.clone(),
             output_schema: stage.output_schema.clone(),
             instructions: stage.instructions.clone(),
             context: stage.context.clone(),
             capabilities: stage.capabilities.clone(),
+            tools: stage.tools.clone(),
+            session: stage.session,
+            question_renderer: stage.question_renderer.clone(),
+            array_normalization: stage
+                .array_normalization
+                .iter()
+                .map(|normalization| ArrayNormalization {
+                    field: normalization.field.clone(),
+                    default_empty: normalization.default_empty,
+                    retain_when_any_non_blank: normalization.retain_when_any_non_blank.clone(),
+                })
+                .collect(),
             delegation: stage.delegation.as_ref().map(|delegation| Delegation {
                 target: delegation.target.clone(),
                 evidence_contract: delegation.evidence_contract.clone(),
@@ -196,7 +244,7 @@ pub fn built_in_stages() -> Vec<Stage> {
         ("verifier", "explore", "VerifierInput", "VerifierOutput"),
         (
             "characterizer",
-            "reason",
+            "transcribe",
             "CharacterizerInput",
             "CharacterizerOutput",
         ),
@@ -214,14 +262,64 @@ pub fn built_in_stages() -> Vec<Stage> {
     .map(|(id, agent, input_contract, output_contract)| Stage {
         id: id.into(),
         agent: agent.into(),
+        governed_by: None,
         input_contract: input_contract.into(),
         output_contract: output_contract.into(),
         output_schema: None,
         instructions: String::new(),
         context: String::new(),
         capabilities: Vec::new(),
+        tools: Vec::new(),
+        session: None,
+        question_renderer: None,
+        array_normalization: Vec::new(),
         delegation: None,
         append_repository_guidance: true,
     })
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workflow_stage_session_overrides_a_route_and_built_ins_preserve_it() {
+        let workflow = ratatoskr_script::workflow::WorkflowMeta {
+            name: "custom".to_string(),
+            purpose: String::new(),
+            when_to_use: Vec::new(),
+            nodes: Vec::new(),
+            stages: vec![ratatoskr_script::workflow::WorkflowStage {
+                id: "review".to_string(),
+                agent: "reason".to_string(),
+                governed_by: None,
+                input_contract: "ReviewInput".to_string(),
+                output_contract: "ReviewOutput".to_string(),
+                output_schema: Some(serde_json::json!({ "type": "object" })),
+                instructions: String::new(),
+                context: String::new(),
+                capabilities: vec![Capability::Read],
+                tools: Vec::new(),
+                session: Some(SessionScope::Compacted),
+                question_renderer: None,
+                array_normalization: Vec::new(),
+                delegation: None,
+                append_repository_guidance: true,
+            }],
+        };
+
+        let stages = stages_from_workflow(&workflow);
+        assert_eq!(
+            stages[0].session_scope(SessionScope::Fresh),
+            SessionScope::Compacted
+        );
+        assert_eq!(stages[0].governance_id(), "review");
+        assert!(
+            built_in_stages()
+                .iter()
+                .all(|stage| stage.session_scope(SessionScope::Reuse) == SessionScope::Reuse),
+            "legacy stages keep their TOML route session without an explicit workflow override"
+        );
+    }
 }
