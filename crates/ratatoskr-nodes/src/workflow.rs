@@ -240,6 +240,64 @@ async fn count_checkpoints(store: &Store, run_id: &str, node: &str) -> Result<u3
     Ok(checkpoints.iter().filter(|c| c.node_name == node).count() as u32)
 }
 
+fn same_json<T: serde::Serialize, U: serde::Serialize>(left: &T, right: &U) -> bool {
+    match (serde_json::to_value(left), serde_json::to_value(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn previous_verifier_findings(
+    checkpoints: &[ratatoskr_store::Checkpoint],
+    threshold: verifier::Severity,
+) -> Vec<verifier::Finding> {
+    checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.node_name == "verifier")
+        .filter_map(|checkpoint| {
+            serde_json::from_str::<verifier::VerifierOutput>(&checkpoint.output_json).ok()
+        })
+        // This is the same history the built-in loop carries: a clean or below-threshold review
+        // does not produce a correction, so it is not part of a later correction chain.
+        .filter(|output| !output.blocking(threshold).is_empty())
+        .flat_map(|output| output.findings)
+        .collect()
+}
+
+enum ScriptedReview {
+    NotRun,
+    Available(verifier::VerifierOutput),
+    Unavailable,
+}
+
+fn scripted_review(checkpoints: &[ratatoskr_store::Checkpoint]) -> ScriptedReview {
+    let Some(checkpoint) = checkpoints
+        .iter()
+        .rev()
+        .find(|checkpoint| checkpoint.node_name == "verifier")
+    else {
+        return ScriptedReview::NotRun;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&checkpoint.output_json) else {
+        return ScriptedReview::Unavailable;
+    };
+    if value.get("error").is_some() {
+        return ScriptedReview::Unavailable;
+    }
+    match serde_json::from_value(value) {
+        Ok(output) => ScriptedReview::Available(output),
+        Err(_) => ScriptedReview::Unavailable,
+    }
+}
+
+fn status_with_review_availability(status: RunStatus, review: &ScriptedReview) -> RunStatus {
+    if status == RunStatus::Converged && matches!(review, ScriptedReview::Unavailable) {
+        RunStatus::Unreviewed
+    } else {
+        status
+    }
+}
+
 /// Terminal status, inferred from the baseline, final implementer output, and the async referee
 /// judgement — never trusted from the script. The exemption is applied before the judgement runs,
 /// so this pure function only decides whether its violations block the test result.
@@ -661,8 +719,104 @@ async fn referee_judgement(
     violations
 }
 
-async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String, String> {
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct IterateArg {
+    /// The result returned by `verify()`, when review rather than tests caused this correction.
+    /// It is only a correlation token: the host recomputes it from the checkpoint before use.
+    #[serde(default)]
+    review: Option<VerifyResult>,
+}
+
+fn review_correction(
+    checkpoints: &[ratatoskr_store::Checkpoint],
+    supplied: &VerifyResult,
+    threshold: verifier::Severity,
+) -> Result<String, String> {
+    let implementer_position = checkpoints
+        .iter()
+        .rposition(|checkpoint| checkpoint.node_name == "implementer")
+        .ok_or_else(|| "iterate() called before implement()".to_string())?;
+    let (review_position, checkpoint) = checkpoints
+        .iter()
+        .enumerate()
+        .skip(implementer_position + 1)
+        .rev()
+        .find(|(_, checkpoint)| checkpoint.node_name == "verifier")
+        .ok_or_else(|| {
+            "iterate() received a review that was not checkpointed after the current implementation"
+                .to_string()
+        })?;
+    let output_value: serde_json::Value = serde_json::from_str(&checkpoint.output_json)
+        .map_err(|_| "iterate() cannot correct an unavailable verifier result".to_string())?;
+    if output_value.get("error").is_some() {
+        return Err("iterate() cannot correct an unavailable verifier result".to_string());
+    }
+    let output: verifier::VerifierOutput = serde_json::from_value(output_value)
+        .map_err(|_| "iterate() cannot correct an unavailable verifier result".to_string())?;
+    let expected = verification_result(output.clone(), threshold);
+    if !same_json(supplied, &expected) {
+        return Err(
+            "iterate() review does not match the latest Rust-validated verifier checkpoint"
+                .to_string(),
+        );
+    }
+
+    let blocking = output.blocking(threshold);
+    if blocking.is_empty() {
+        return Err("iterate() review has no blocking findings to correct".to_string());
+    }
+    let plan_faults: Vec<verifier::Finding> = blocking
+        .iter()
+        .filter(|finding| finding.kind == verifier::FindingKind::Plan)
+        .map(|finding| (*finding).clone())
+        .collect();
+    if plan_faults.is_empty() {
+        return Ok(verifier::correction(&blocking));
+    }
+
+    // A workflow drives the declared analyst stage explicitly, but a plan finding is usable only
+    // when that turn happened after this review and was actually a revision of the reviewed plan
+    // for the blocking plan findings. This keeps routing compositional without trusting the script.
+    let revision_checkpoint = checkpoints
+        .iter()
+        .skip(review_position + 1)
+        .rev()
+        .find(|checkpoint| checkpoint.node_name == "analyst")
+        .ok_or_else(|| {
+            "iterate() must run analyst() after a blocking plan finding before implementation"
+                .to_string()
+        })?;
+    let revision_input: crate::analyst::AnalystInput = revision_checkpoint
+        .input_json
+        .as_deref()
+        .ok_or_else(|| "the analyst revision checkpoint has no input".to_string())
+        .and_then(|input| serde_json::from_str(input).map_err(|error| error.to_string()))?;
+    let verifier_input: verifier::VerifierInput = checkpoint
+        .input_json
+        .as_deref()
+        .ok_or_else(|| "the verifier checkpoint has no input".to_string())
+        .and_then(|input| serde_json::from_str(input).map_err(|error| error.to_string()))?;
+    if revision_input
+        .previous
+        .as_deref()
+        .is_none_or(|previous| !same_json(previous, &verifier_input.analyst))
+        || !same_json(&revision_input.findings, &plan_faults)
+    {
+        return Err(
+            "the analyst checkpoint after review is not a revision of the reviewed plan and findings"
+                .to_string(),
+        );
+    }
+    let revised: AnalystOutput = serde_json::from_str(&revision_checkpoint.output_json)
+        .map_err(|error| error.to_string())?;
+    Ok(crate::replan(&revised, &blocking))
+}
+
+async fn iterate_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
     ctx.guard()?;
+    let input: IterateArg =
+        serde_json::from_str(&arg).map_err(|error| format!("iterate arg: {error}"))?;
     // One iterate at a time — reject overlapping calls (e.g. `Promise.all([iterate(), iterate()])`)
     // that would drive two implementers against the same worktree. Held for the whole call.
     let _iterate = ctx
@@ -700,6 +854,12 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String,
     let referee = referee_judgement(&ctx, &worktree, &analyst, &prev).await;
     // Referee first, same as the built-in loop: a moved referee makes the test sets meaningless,
     // so reverting it is what this iteration has to be told to do.
+    let authored = red_team
+        .authored
+        .as_ref()
+        .map(|authored| authored.tests.as_slice())
+        .unwrap_or_default();
+    let unsatisfied = converge::unsatisfied(authored, &prev.failing_tests);
     let diagnostic = if !referee.is_empty() {
         referee::correction(&referee)
     } else if !post_ran {
@@ -708,7 +868,16 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String,
              compile. Fix it so the tests run and pass.",
             prev.exit_code
         )
-    } else {
+    } else if !unsatisfied.is_empty() {
+        format!(
+            "These tests were written for this change, from the interface, before any code existed \
+             to satisfy them — making them pass is what the change is for, and they are still \
+             failing: {}. They are not yours to edit; implement what they describe. If one of \
+             them is wrong about the contract rather than about your code, say so in your summary \
+             and implement the rest.",
+            unsatisfied.join(", ")
+        )
+    } else if !converge::is_converged(&red_team.failing_tests, &prev.failing_tests) {
         let new_failures =
             converge::newly_introduced_failures(&red_team.failing_tests, &prev.failing_tests);
         format!(
@@ -716,6 +885,22 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String,
              without breaking other tests.",
             new_failures.join(", ")
         )
+    } else if let Some(review) = input.review.as_ref() {
+        let checkpoints = ctx
+            .store
+            .checkpoints_for_run(&ctx.run_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        review_correction(
+            &checkpoints,
+            review,
+            crate::parse_threshold(&ctx.config.implementer.verify_threshold),
+        )?
+    } else {
+        return Err(
+            "iterate() has no referee, test, or checkpointed review correction to apply"
+                .to_string(),
+        );
     };
 
     let node = build_implementer(&ctx, analyst).map_err(|e| e.to_string())?;
@@ -755,8 +940,8 @@ async fn newly_introduced_host(_ctx: Arc<WorkflowContext>, arg: String) -> Resul
 /// `blocking` is the part that matters and the part the script does not get to compute: Rust reads
 /// `[implementer] verify_threshold` and decides what clears it. A workflow chooses *whether* to
 /// review and what to do about findings; it cannot decide that a P1 is not a P1.
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct VerifyResult {
     /// False when no `[models.verifier]` route is configured — the run is unreviewed and the
     /// script should be able to tell that apart from a clean review.
@@ -835,11 +1020,22 @@ async fn verify_host(
     let diff = ratatoskr_exec::diff_text(&worktree)
         .await
         .unwrap_or_default();
+    let checkpoints = ctx
+        .store
+        .checkpoints_for_run(&ctx.run_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let threshold = crate::parse_threshold(&ctx.config.implementer.verify_threshold);
+    let checkpointed_analyst: AnalystOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "analyst")
+        .await
+        .map_err(|error| error.to_string())?;
+    if !same_json(&input.analyst, &checkpointed_analyst) {
+        return Err("verify() analyst does not match the latest analyst checkpoint".to_string());
+    }
     let verifier_input = verifier::VerifierInput {
-        // The scripted path reviews once per call and keeps no history of its own.
-        previous_findings: Vec::new(),
+        previous_findings: previous_verifier_findings(&checkpoints, threshold),
         issue: ctx.issue.clone(),
-        analyst: input.analyst,
+        analyst: checkpointed_analyst,
         diff,
         touched_files: implementer.touched_files.clone(),
     };
@@ -891,7 +1087,6 @@ async fn verify_host(
     };
     let out: verifier::VerifierOutput = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
 
-    let threshold = crate::parse_threshold(&ctx.config.implementer.verify_threshold);
     serde_json::to_string(&verification_result(out, threshold)).map_err(|e| e.to_string())
 }
 
@@ -1817,18 +2012,20 @@ async fn finish_full(ctx: &Arc<WorkflowContext>) -> Result<RunOutcome, PlanError
     // The last review, if the script ran one. Absent is not the same as clean: a workflow that
     // never verified simply has no verifier checkpoint, and the warning at run start already said
     // the change would be accepted on its tests alone.
-    let review: Option<verifier::VerifierOutput> =
-        latest_checkpoint(&ctx.store, &ctx.run_id, "verifier")
-            .await
-            .ok();
+    let checkpoints = ctx.store.checkpoints_for_run(&ctx.run_id).await?;
+    let review = scripted_review(&checkpoints);
     let referee = referee_judgement(ctx, &worktree, &plan.analyst, &implementer).await;
     let status = infer_status(
         &red_team,
         &implementer,
         &referee,
-        review.as_ref(),
+        match &review {
+            ScriptedReview::Available(output) => Some(output),
+            ScriptedReview::NotRun | ScriptedReview::Unavailable => None,
+        },
         crate::parse_threshold(&ctx.config.implementer.verify_threshold),
     );
+    let status = status_with_review_availability(status, &review);
     ctx.store
         .upsert_run(&ctx.run_id, None, status.as_str())
         .await?;
@@ -5638,6 +5835,239 @@ mod tests {
         );
     }
 
+    fn review_checkpoint<T: serde::Serialize>(
+        node_name: &str,
+        output: &T,
+        input: Option<&impl serde::Serialize>,
+    ) -> ratatoskr_store::Checkpoint {
+        ratatoskr_store::Checkpoint {
+            node_name: node_name.to_string(),
+            output_json: serde_json::to_string(output).unwrap(),
+            input_json: input.map(|input| serde_json::to_string(input).unwrap()),
+            ..Default::default()
+        }
+    }
+
+    fn review_plan() -> AnalystOutput {
+        AnalystOutput {
+            impact_summary: "keep the correction path Rust-owned".to_string(),
+            touched: vec!["workflow.rs".to_string()],
+            risks: Vec::new(),
+            requirements: vec!["validate review causality".to_string()],
+            residual_risk: String::new(),
+            changes_code: true,
+            acceptance: Vec::new(),
+            interface: Vec::new(),
+        }
+    }
+
+    fn review_finding(kind: verifier::FindingKind, summary: &str) -> verifier::Finding {
+        verifier::Finding {
+            severity: verifier::Severity::P1,
+            kind,
+            file: "workflow.rs".to_string(),
+            line: Some(1),
+            summary: summary.to_string(),
+            failure_scenario: "a workflow retries the wrong thing".to_string(),
+        }
+    }
+
+    #[test]
+    fn iterate_uses_only_the_checkpointed_review_for_execution_corrections() {
+        let plan = review_plan();
+        let verifier_input = verifier::VerifierInput {
+            issue: "preserve convergence".to_string(),
+            analyst: plan,
+            diff: "+change".to_string(),
+            touched_files: vec!["workflow.rs".to_string()],
+            previous_findings: Vec::new(),
+        };
+        let output = verifier::VerifierOutput {
+            findings: vec![review_finding(
+                verifier::FindingKind::Execution,
+                "the retry omits the review",
+            )],
+            assessment: "the code needs correction".to_string(),
+        };
+        let checkpoints = vec![
+            review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
+            review_checkpoint("verifier", &output, Some(&verifier_input)),
+        ];
+        let supplied = verification_result(output.clone(), verifier::Severity::P2);
+
+        assert_eq!(
+            review_correction(&checkpoints, &supplied, verifier::Severity::P2).unwrap(),
+            verifier::correction(&output.blocking(verifier::Severity::P2))
+        );
+
+        let fabricated = VerifyResult {
+            configured: true,
+            unavailable: false,
+            findings: Vec::new(),
+            blocking: Vec::new(),
+            needs_replan: false,
+        };
+        let error =
+            review_correction(&checkpoints, &fabricated, verifier::Severity::P2).unwrap_err();
+        assert!(error.contains("does not match"), "{error}");
+    }
+
+    #[test]
+    fn plan_review_requires_a_causal_analyst_revision() {
+        let plan = review_plan();
+        let finding = review_finding(
+            verifier::FindingKind::Plan,
+            "the requirement routes the wrong correction",
+        );
+        let verifier_input = verifier::VerifierInput {
+            issue: "preserve convergence".to_string(),
+            analyst: plan.clone(),
+            diff: "+change".to_string(),
+            touched_files: vec!["workflow.rs".to_string()],
+            previous_findings: Vec::new(),
+        };
+        let output = verifier::VerifierOutput {
+            findings: vec![finding.clone()],
+            assessment: "the plan needs revision".to_string(),
+        };
+        let supplied = verification_result(output.clone(), verifier::Severity::P2);
+        let mut checkpoints = vec![
+            review_checkpoint("analyst", &plan, None::<&&str>),
+            review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
+            review_checkpoint("verifier", &output, Some(&verifier_input)),
+        ];
+
+        let error = review_correction(&checkpoints, &supplied, verifier::Severity::P2).unwrap_err();
+        assert!(error.contains("must run analyst() after"), "{error}");
+
+        let mut revised = plan.clone();
+        revised.requirements = vec!["route review evidence through the host".to_string()];
+        let revision_input = crate::analyst::AnalystInput {
+            issue: verifier_input.issue.clone(),
+            scout: crate::ScoutOutput {
+                related_items: Vec::new(),
+                papertrail_summary: String::new(),
+            },
+            memory: Default::default(),
+            brief: String::new(),
+            constraints: Vec::new(),
+            previous: Some(Box::new(plan)),
+            findings: vec![finding],
+        };
+        checkpoints.push(review_checkpoint(
+            "analyst",
+            &revised,
+            Some(&revision_input),
+        ));
+
+        assert_eq!(
+            review_correction(&checkpoints, &supplied, verifier::Severity::P2).unwrap(),
+            crate::replan(&revised, &output.blocking(verifier::Severity::P2))
+        );
+    }
+
+    #[test]
+    fn verifier_history_contains_only_prior_blocking_review_chains() {
+        let blocking = verifier::VerifierOutput {
+            findings: vec![review_finding(
+                verifier::FindingKind::Execution,
+                "first blocking defect",
+            )],
+            assessment: String::new(),
+        };
+        let below_threshold = verifier::VerifierOutput {
+            findings: vec![verifier::Finding {
+                severity: verifier::Severity::P3,
+                ..review_finding(verifier::FindingKind::Execution, "cosmetic nit")
+            }],
+            assessment: String::new(),
+        };
+        let checkpoints = vec![
+            review_checkpoint("verifier", &blocking, None::<&&str>),
+            review_checkpoint("verifier", &below_threshold, None::<&&str>),
+            review_checkpoint(
+                "verifier",
+                &serde_json::json!({ "error": "offline" }),
+                None::<&&str>,
+            ),
+        ];
+
+        let findings = previous_verifier_findings(&checkpoints, verifier::Severity::P2);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].summary, "first blocking defect");
+    }
+
+    #[tokio::test]
+    async fn scripted_verify_returns_rust_routing_and_carries_findings_to_the_next_pass() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-scripted-verify-parity-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = init_test_repo(&dir).await;
+        std::fs::write(repo.join("tracked.txt"), "changed\n").unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let run_id = "scripted-verify-parity";
+        store
+            .upsert_run(run_id, None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let plan = review_plan();
+        checkpoint(&store, run_id, "analyst", &plan).await.unwrap();
+        checkpoint(&store, run_id, "implementer", &imp(&[], &["a"], 0))
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("verifier".to_string(), model_route());
+        let mut ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            run_id,
+            "preserve scripted review parity",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut ctx).unwrap().repo_path = repo.clone();
+        *ctx.worktree.lock().unwrap() = Some(WorktreePath(repo));
+        let finding = review_finding(
+            verifier::FindingKind::Execution,
+            "the current attempt misses a correction",
+        );
+        let turn = Arc::new(RecordingStageTurn {
+            output: serde_json::to_string(&verifier::VerifierOutput {
+                findings: vec![finding.clone()],
+                assessment: "the attempt needs correction".to_string(),
+            })
+            .unwrap(),
+            ..Default::default()
+        });
+        let stages = standard_stages().await.unwrap();
+        let mut hosts =
+            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        let verify = hosts.remove("verify").unwrap();
+        let arg = json!({ "analyst": plan }).to_string();
+
+        let first: VerifyResult =
+            serde_json::from_str(&verify(arg.clone()).await.unwrap()).unwrap();
+        assert!(first.configured);
+        assert!(!first.unavailable);
+        assert_eq!(first.blocking.len(), 1);
+        assert!(!first.needs_replan);
+        let second: VerifyResult = serde_json::from_str(&verify(arg).await.unwrap()).unwrap();
+        assert_eq!(second.blocking.len(), 1);
+
+        let checkpoints = store.checkpoints_for_run(run_id).await.unwrap();
+        let input: verifier::VerifierInput =
+            serde_json::from_str(checkpoints.last().unwrap().input_json.as_deref().unwrap())
+                .unwrap();
+        assert_eq!(input.previous_findings.len(), 1);
+        assert_eq!(input.previous_findings[0].summary, finding.summary);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn status_is_converged_only_when_post_ran_with_no_new_failures() {
         let baseline = red(&["a"], &["b"], 1);
@@ -5674,6 +6104,34 @@ mod tests {
                 verifier::Severity::P2
             ),
             RunStatus::MaxIterationsReached
+        );
+    }
+
+    #[test]
+    fn unavailable_scripted_review_is_unreviewed_without_hiding_other_failed_gates() {
+        let unavailable = [ratatoskr_store::Checkpoint {
+            node_name: "verifier".to_string(),
+            output_json: json!({ "error": "provider offline" }).to_string(),
+            ..Default::default()
+        }];
+        let review = scripted_review(&unavailable);
+        assert!(matches!(review, ScriptedReview::Unavailable));
+        assert_eq!(
+            status_with_review_availability(RunStatus::Converged, &review),
+            RunStatus::Unreviewed
+        );
+        assert_eq!(
+            status_with_review_availability(RunStatus::MaxIterationsReached, &review),
+            RunStatus::MaxIterationsReached,
+            "review availability must not hide a failed deterministic gate"
+        );
+
+        let not_run = scripted_review(&[]);
+        assert!(matches!(not_run, ScriptedReview::NotRun));
+        assert_eq!(
+            status_with_review_availability(RunStatus::Converged, &not_run),
+            RunStatus::Converged,
+            "a workflow that never requested review keeps the documented test-only result"
         );
     }
 

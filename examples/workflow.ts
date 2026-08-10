@@ -14,13 +14,14 @@
 //   analyst({issue, scout, memory}) -> AnalystOutput
 //   redTeam() -> RedTeamOutput                     // prepares the tree; baseline + authored tests
 //   implement({analyst}) -> ImplementerOutput      // edits the prepared worktree (once)
-//   iterate({}) -> ImplementerOutput               // re-drives the CLI on that worktree
+//   iterate({ review? }) -> ImplementerOutput       // applies Rust-derived test/review correction
 //   verify({analyst}) -> VerifyResult              // reviews the diff against the plan
 //
 // `verify()` returns { configured, unavailable, findings, blocking, needsReplan }. Rust applies
 // `[implementer] verify_threshold` — a script decides *whether* to review and what to do about
 // findings, never what counts as blocking. `needsReplan` means a blocking finding faults the PLAN,
-// so the useful response is `analyst({...., previous, findings})` before `iterate()`, rather than
+// so the useful response is `analyst({...., previous, findings})` before
+// `iterate({ review })`, rather than
 // re-driving the implementer at a requirement already shown to be wrong.
 //
 // A run that calls verify() and returns with blocking findings standing does NOT converge: the
@@ -88,19 +89,37 @@ async function run(input: { issue: string; maxIterations: number }) {
     issue: input.issue,
     context: `${scoutOut.papertrail_summary}\n\nRequirements:\n${requirementsOut.summary}`,
   });
-  const analystOut = await analyst({ issue: input.issue, scout: scoutOut, memory: memoryOut });
+  let analystOut = await analyst({ issue: input.issue, scout: scoutOut, memory: memoryOut });
 
   // Red-team authoring finishes before implementation so the implementer meets independently
   // authored tests and the two model turns never write the same tree concurrently.
   const redTeamOut = await redTeam();
   const first = await implement({ analyst: analystOut });
 
-  // Converge: iterate the implementer until it introduces no new failures, or the budget runs out.
+  // Converge: tests and the referee are checked by iterate(), then verify the clean attempt. A
+  // plan finding is explicitly re-analysed before the host accepts the review as a correction.
   // (`maxIterations` is also hard-enforced inside `iterate` — this loop just stops first.)
   let impl = first;
   let iterations = 1;
   while (true) {
-    if (testCommandRan(impl) && isConverged({ baseline: redTeamOut, post: impl })) break;
+    const testsClean = testCommandRan(impl) && isConverged({ baseline: redTeamOut, post: impl });
+    if (testsClean) {
+      const review = await verify({ analyst: analystOut });
+      if (!review.configured || review.unavailable || review.blocking.length === 0) break;
+      if (iterations >= input.maxIterations) break;
+      if (review.needsReplan) {
+        analystOut = await analyst({
+          issue: input.issue,
+          scout: scoutOut,
+          memory: memoryOut,
+          previous: analystOut,
+          findings: review.blocking,
+        });
+      }
+      impl = await iterate({ review });
+      iterations += 1;
+      continue;
+    }
     if (iterations >= input.maxIterations) break;
     impl = await iterate({});
     iterations += 1;
