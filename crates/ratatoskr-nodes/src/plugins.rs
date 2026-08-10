@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use ratatoskr_core::{Capability, RatatoskrConfig, ToolDecision, ToolPolicy};
 use ratatoskr_graph::NodeError;
-use ratatoskr_mcp::{Connection, ServerProvenance, ServerTools, ToolSet};
+use ratatoskr_mcp::{Connection, ServerProvenance, ServerTools, SpawnEnvironment, ToolSet};
 use ratatoskr_script::ScriptEngine;
 
 use crate::stage::stage_profile;
@@ -255,6 +255,7 @@ impl PluginContext {
                     &plugins,
                     cwd,
                     config.mcp.servers.keys().map(String::as_str),
+                    &protected_env,
                 )
                 .await,
             ),
@@ -382,10 +383,21 @@ async fn connect_plugin_servers(
     plugins: &[ratatoskr_plugin::Plugin],
     cwd: &std::path::Path,
     configured: impl IntoIterator<Item = &str>,
+    protected_env: &[String],
 ) -> Vec<PluginServer> {
     let mut connected = Vec::new();
     for (plugin, spec) in servers_to_start_with_configured(plugins, configured) {
-        match Connection::spawn(&spec.name, &spec.command, &spec.env, Some(cwd)).await {
+        match Connection::spawn(
+            &spec.name,
+            &spec.command,
+            SpawnEnvironment {
+                set: &spec.env,
+                remove: protected_env,
+            },
+            Some(cwd),
+        )
+        .await
+        {
             Ok(connection) => connected.push(PluginServer {
                 plugin: plugin.to_string(),
                 connection,

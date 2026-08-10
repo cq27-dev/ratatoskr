@@ -59,6 +59,14 @@ pub struct Connection {
     tools: Vec<Tool>,
 }
 
+/// Environment changes for an MCP subprocess.
+pub struct SpawnEnvironment<'a> {
+    /// Variables explicitly supplied by the server declaration.
+    pub set: &'a BTreeMap<String, String>,
+    /// Ambient variables this subprocess must not inherit, even when `set` names them too.
+    pub remove: &'a [String],
+}
+
 impl Connection {
     /// Spawn a server, complete the MCP handshake, and list its tools.
     ///
@@ -67,17 +75,12 @@ impl Connection {
     pub async fn spawn(
         origin: &str,
         command: &[String],
-        env: &BTreeMap<String, String>,
+        environment: SpawnEnvironment<'_>,
         working_dir: Option<&Path>,
     ) -> Result<Self, McpError> {
         let (program, args) = command.split_first().ok_or(McpError::EmptyCommand)?;
 
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(args);
-        cmd.envs(env);
-        if let Some(dir) = working_dir {
-            cmd.current_dir(dir);
-        }
+        let cmd = subprocess_command(program, args, environment, working_dir);
 
         // `new` spawns the child; a missing program surfaces here as the most common failure mode.
         let transport = TokioChildProcess::new(cmd).map_err(|source| McpError::Spawn {
@@ -197,6 +200,25 @@ impl Connection {
     }
 }
 
+fn subprocess_command(
+    program: &str,
+    args: &[String],
+    environment: SpawnEnvironment<'_>,
+    working_dir: Option<&Path>,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    command.args(args).envs(environment.set);
+    // Removal comes after the explicit overlay so a plugin manifest cannot reintroduce a
+    // credential owned by a configured host transport under the same variable name.
+    for key in environment.remove {
+        command.env_remove(key);
+    }
+    if let Some(dir) = working_dir {
+        command.current_dir(dir);
+    }
+    command
+}
+
 /// The connection to rag-rat, which every run has and every node can call.
 pub struct RagRatClient(Connection);
 
@@ -206,7 +228,10 @@ impl RagRatClient {
         Connection::spawn(
             RAG_RAT,
             &config.command,
-            &BTreeMap::new(),
+            SpawnEnvironment {
+                set: &BTreeMap::new(),
+                remove: &[],
+            },
             config.working_dir.as_deref(),
         )
         .await
@@ -639,6 +664,37 @@ mod tests {
             RagRatClient::connect(config).await,
             Err(McpError::Spawn { .. })
         ));
+    }
+
+    #[test]
+    fn subprocess_environment_removes_protected_variables_after_the_overlay() {
+        let set = BTreeMap::from([
+            ("PLUGIN_SETTING".to_string(), "kept".to_string()),
+            ("HOSTED_MCP_TOKEN".to_string(), "must-not-win".to_string()),
+        ]);
+        let remove = ["HOSTED_MCP_TOKEN".to_string()];
+        let command = subprocess_command(
+            "unused",
+            &[],
+            SpawnEnvironment {
+                set: &set,
+                remove: &remove,
+            },
+            None,
+        );
+        let changes: BTreeMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        assert_eq!(changes["PLUGIN_SETTING"].as_deref(), Some("kept"));
+        assert_eq!(changes["HOSTED_MCP_TOKEN"], None);
     }
 
     #[tokio::test]
