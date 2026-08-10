@@ -5,28 +5,27 @@
 //! policy guarantee (schema-validated handoffs, a checkpoint after every node, nothing skipped)
 //! with nothing to get wrong. The real executor arrives in Phase 3 when fork/join needs one.
 
-pub mod analyst;
 pub mod bookkeeper;
 pub mod child;
 pub mod clarify;
-pub mod context;
+pub mod contracts;
 pub mod control;
 pub mod converge;
 pub mod implementer;
 pub mod issue;
 pub mod memory;
-pub mod overseer;
 pub mod plugins;
 pub mod publisher;
 pub mod redteam;
 pub mod referee;
-pub mod scout;
 pub mod skills;
 pub mod stage;
 pub mod testrun;
 pub mod validate;
 pub mod verifier;
 pub mod workflow;
+
+pub use contracts::{analyst, context, overseer, scout};
 
 pub(crate) use plugins::stage_agent_config;
 pub use plugins::{NodePlugins, PluginContext};
@@ -883,7 +882,7 @@ mod migrated_stage_path_tests {
             );
         }
 
-        let context = include_str!("context.rs");
+        let context = include_str!("contracts/context.rs");
         assert!(
             !context.contains(concat!("Context", "Node")),
             "context must not retain an obsolete direct wrapper"
@@ -906,7 +905,7 @@ mod migrated_stage_path_tests {
         for (component, source, wrapper) in [
             (
                 "analyst",
-                include_str!("analyst.rs"),
+                include_str!("contracts/analyst.rs"),
                 concat!("Analyst", "Node"),
             ),
             (
@@ -916,7 +915,7 @@ mod migrated_stage_path_tests {
             ),
             (
                 "overseer",
-                include_str!("overseer.rs"),
+                include_str!("contracts/overseer.rs"),
                 concat!("Overseer", "Node"),
             ),
             (
@@ -924,7 +923,11 @@ mod migrated_stage_path_tests {
                 include_str!("publisher.rs"),
                 concat!("Publisher", "Node"),
             ),
-            ("scout", include_str!("scout.rs"), concat!("Scout", "Node")),
+            (
+                "scout",
+                include_str!("contracts/scout.rs"),
+                concat!("Scout", "Node"),
+            ),
             (
                 "verifier",
                 include_str!("verifier.rs"),
