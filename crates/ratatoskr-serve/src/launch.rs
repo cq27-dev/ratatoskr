@@ -10,8 +10,9 @@
 //!   second implementation of it.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use ratatoskr_store::provider_pause::{ProviderPauseKey, ProviderPauseStore};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
@@ -41,6 +42,9 @@ pub struct Launcher {
     /// Which project the run belongs to. A run id is only unique *within* a project — an
     /// operator-chosen `--run-id` can repeat across them — so questions are scoped by both.
     project: String,
+    /// The instance-owned lifecycle ledger is attached after all projects have opened. Keeping it
+    /// optional preserves the launcher's construction boundary for callers that do not run serve.
+    provider_pauses: Arc<Mutex<Option<ProviderPauseStore>>>,
     permits: Arc<Semaphore>,
     max: usize,
 }
@@ -53,6 +57,7 @@ impl Launcher {
             config: config.to_path_buf(),
             dashboard: dashboard.to_string(),
             project: project.to_string(),
+            provider_pauses: Arc::new(Mutex::new(None)),
             permits: Arc::new(Semaphore::new(max)),
             max,
         }
@@ -71,6 +76,14 @@ impl Launcher {
     /// apart by its status.
     pub fn in_flight(&self) -> usize {
         self.max.saturating_sub(self.permits.available_permits())
+    }
+
+    /// Give this launcher the durable instance lifecycle ledger after the dashboard opens it.
+    pub fn set_provider_pause_store(&self, pauses: ProviderPauseStore) {
+        *self
+            .provider_pauses
+            .lock()
+            .expect("provider pause store mutex poisoned") = Some(pauses);
     }
 
     pub fn spawn(&self, issue: &str) -> Result<String, LaunchError> {
@@ -114,19 +127,45 @@ impl Launcher {
 
         // Hold the permit until the child exits, and reap it so it doesn't linger as a zombie.
         let id = run_id.clone();
+        let project = self.project.clone();
+        let provider_pauses = Arc::clone(&self.provider_pauses);
         tokio::spawn(async move {
             // `run_id` as a field, not just in the message: these are emitted in the server
             // process, outside the child's `run` span, so the field is all a consumer has to
             // attribute them by.
-            match child.wait().await {
+            let result = child.wait().await;
+            let exited = child_exit_confirmed(&result);
+            match result {
                 Ok(status) if status.success() => {
-                    tracing::info!(kind = "run_finished", run_id = %id, "run finished")
+                    tracing::info!(kind = "run_finished", run_id = %id, "run finished");
                 }
                 Ok(status) => {
-                    tracing::warn!(kind = "run_failed", run_id = %id, %status, "run exited")
+                    tracing::warn!(kind = "run_failed", run_id = %id, %status, "run exited");
                 }
                 Err(e) => {
-                    tracing::warn!(kind = "run_failed", run_id = %id, error = %e, "run not reaped")
+                    tracing::warn!(kind = "run_failed", run_id = %id, error = %e, "run not reaped");
+                }
+            }
+            // Process exit, not checkpoint status, owns this instance-level lifecycle transition.
+            // The child may crash before it writes the project store; fencing it here also rejects
+            // a pause request that was already in flight when the process exited.
+            if exited {
+                let pauses = provider_pauses
+                    .lock()
+                    .expect("provider pause store mutex poisoned")
+                    .clone();
+                if let Some(pauses) = pauses
+                    && let Err(error) = pauses
+                        .record_exit(&ProviderPauseKey::new(project.clone(), id.clone()))
+                        .await
+                {
+                    tracing::error!(
+                        kind = "run_exit_fence_failed",
+                        project,
+                        run_id = %id,
+                        %error,
+                        "could not persist confirmed child exit"
+                    );
                 }
             }
             drop(permit);
@@ -134,6 +173,11 @@ impl Launcher {
 
         Ok(run_id)
     }
+}
+
+/// Only a returned exit status proves that a child is dead.
+fn child_exit_confirmed(result: &std::io::Result<std::process::ExitStatus>) -> bool {
+    result.is_ok()
 }
 
 #[cfg(test)]
@@ -176,5 +220,12 @@ mod tests {
     #[test]
     fn a_zero_cap_is_clamped_rather_than_deadlocking() {
         assert_eq!(launcher(0).max, 1);
+    }
+
+    #[test]
+    fn a_wait_error_does_not_claim_the_child_exited() {
+        assert!(!child_exit_confirmed(&Err(std::io::Error::other(
+            "process status was unavailable"
+        ))));
     }
 }

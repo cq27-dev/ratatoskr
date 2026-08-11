@@ -157,15 +157,28 @@ fn is_image_digest(image: &str) -> bool {
 /// local image may be built after configuration is read. The returned `sha256:` ID is suitable for
 /// the same Docker/Podman `run` argv as the configured selector.
 pub async fn resolve_container_image(image: &str) -> Result<String, SandboxError> {
+    let runtime = container_runtime().map(|runtime| (runtime, Path::new(runtime)));
+    resolve_container_image_with_runtime(image, runtime).await
+}
+
+/// Resolve an image using the runtime executable selected by the caller.
+///
+/// The production entry point discovers the executable from `PATH`; keeping that lookup outside
+/// the protocol means tests can use a private fake without mutating the process environment that
+/// concurrent worktree fixtures use to spawn `git`.
+async fn resolve_container_image_with_runtime(
+    image: &str,
+    runtime: Option<(&'static str, &Path)>,
+) -> Result<String, SandboxError> {
     if image.trim().is_empty() || image.starts_with("sha256:") && !is_image_digest(image) {
         return Err(SandboxError::InvalidContainerImage(image.to_string()));
     }
 
-    let runtime = container_runtime().ok_or(SandboxError::NoContainerRuntime)?;
+    let (runtime, executable) = runtime.ok_or(SandboxError::NoContainerRuntime)?;
     if is_image_digest(image) {
         return Ok(image.to_string());
     }
-    let output = Command::new(runtime)
+    let output = Command::new(executable)
         .args(["image", "inspect", "--format", "{{.Id}}", image])
         .kill_on_drop(true)
         .output()
@@ -1155,45 +1168,6 @@ mod tests {
 
     // --- container image resolution ------------------------------------------
 
-    /// Restores `PATH` on drop. Prepending is safe for tests running alongside; replacing is not
-    /// (a concurrent test spawning `git` would not find it), so the replaced window is kept to a
-    /// single resolution call.
-    struct PathGuard(Option<std::ffi::OsString>);
-
-    impl PathGuard {
-        fn prepended(dir: &Path) -> Self {
-            let old = std::env::var_os("PATH");
-            let mut paths = vec![dir.to_path_buf()];
-            if let Some(old) = &old {
-                paths.extend(std::env::split_paths(old));
-            }
-            // SAFETY: process-environment mutation races with other tests, but this only adds a
-            // directory — every lookup that resolved before still resolves — and drop restores.
-            unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
-            Self(old)
-        }
-
-        fn replaced_with(dir: &Path) -> Self {
-            let old = std::env::var_os("PATH");
-            // SAFETY: races with concurrent tests' subprocess spawns for the guard's lifetime;
-            // kept to the one call that must see a runtime-less PATH, and drop restores.
-            unsafe { std::env::set_var("PATH", dir) };
-            Self(old)
-        }
-    }
-
-    impl Drop for PathGuard {
-        fn drop(&mut self) {
-            // SAFETY: restores exactly what the guard found.
-            unsafe {
-                match &self.0 {
-                    Some(value) => std::env::set_var("PATH", value),
-                    None => std::env::remove_var("PATH"),
-                }
-            }
-        }
-    }
-
     static FAKE_RUNTIME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     /// A directory posing as a container-runtime installation: an executable `docker` whose
@@ -1250,11 +1224,12 @@ mod tests {
         // path, which is where the contract puts it.
         let want = digest("ab");
         let dir = fake_runtime_reporting(&want);
-        let _path = PathGuard::prepended(&dir);
+        let runtime = dir.join("docker");
 
-        let resolved = crate::resolve_container_image("ratatoskr-checks")
-            .await
-            .unwrap();
+        let resolved =
+            resolve_container_image_with_runtime("ratatoskr-checks", Some(("docker", &runtime)))
+                .await
+                .unwrap();
         assert_eq!(resolved, want);
 
         let _ = std::fs::remove_dir_all(dir);
@@ -1265,18 +1240,9 @@ mod tests {
         // Selecting `container` on a host without Docker or Podman is an error that says so —
         // never an implicit downgrade to landlock, which would silently trade the isolation
         // the config asked for (no host root) for the weakest rung while reporting success.
-        let dir = std::env::temp_dir().join(format!(
-            "ratatoskr-no-runtime-{}-{}",
-            std::process::id(),
-            FAKE_RUNTIME_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let err = {
-            let _path = PathGuard::replaced_with(&dir);
-            crate::resolve_container_image("ratatoskr-checks")
-                .await
-                .unwrap_err()
-        };
+        let err = resolve_container_image_with_runtime("ratatoskr-checks", None)
+            .await
+            .unwrap_err();
         // "Names that a container runtime is required" — the variant this crate already has for
         // exactly this, or a message carrying the same words.
         assert!(
@@ -1284,8 +1250,6 @@ mod tests {
                 || err.to_string().contains("container runtime"),
             "{err}"
         );
-
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1293,11 +1257,12 @@ mod tests {
         // An image that is not there must fail the sandboxed phase — running the mutable tag
         // instead would pin nothing and record provenance for an image that did not run.
         let dir = fake_runtime_without_the_image();
-        let _path = PathGuard::prepended(&dir);
+        let runtime = dir.join("docker");
 
-        let err = crate::resolve_container_image("ratatoskr-checks")
-            .await
-            .unwrap_err();
+        let err =
+            resolve_container_image_with_runtime("ratatoskr-checks", Some(("docker", &runtime)))
+                .await
+                .unwrap_err();
         assert!(!err.to_string().is_empty(), "{err}");
 
         let _ = std::fs::remove_dir_all(dir);
@@ -1309,11 +1274,12 @@ mod tests {
         // `sha256:` identifier. Recording that as provenance would claim a pin that does not
         // exist; the phase fails instead.
         let dir = fake_runtime_reporting("ratatoskr-checks:latest");
-        let _path = PathGuard::prepended(&dir);
+        let runtime = dir.join("docker");
 
-        let err = crate::resolve_container_image("ratatoskr-checks")
-            .await
-            .unwrap_err();
+        let err =
+            resolve_container_image_with_runtime("ratatoskr-checks", Some(("docker", &runtime)))
+                .await
+                .unwrap_err();
         assert!(!err.to_string().is_empty(), "{err}");
 
         let _ = std::fs::remove_dir_all(dir);

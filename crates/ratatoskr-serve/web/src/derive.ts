@@ -143,6 +143,25 @@ export function nodesFromEvents(events: readonly LiveEvent[]): Map<string, Deriv
 }
 
 /**
+ * Nodes a current control can reach.
+ *
+ * The event stream records the process's active attempt, including the concurrent delivery
+ * stages after convergence. The stored pipeline is only a fallback before the first node event:
+ * it cannot distinguish a completed implementer from a publisher or bookkeeper now making a
+ * provider request.
+ */
+export function workingNodeNames(
+  nodes: readonly NodeView[],
+  events: readonly LiveEvent[],
+): string[] {
+  const active = [...nodesFromEvents(events)]
+    .filter(([, node]) => node.state === "working")
+    .map(([name]) => name);
+  if (events.some((event) => event.kind === "node_start")) return active;
+  return nodes.filter((node) => node.state === "working").map((node) => node.name);
+}
+
+/**
  * The pipeline's shape from the server, with every per-moment fact taken from the stream.
  *
  * Call this only when the stream has something to say (`derived.size > 0`); then it is the

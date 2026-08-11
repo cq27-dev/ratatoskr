@@ -775,6 +775,21 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_pause_keeps_its_reason_in_the_activity_feed() {
+        let record = serde_json::json!({
+            "timestamp": "t",
+            "kind": "run_paused",
+            "node": "analyst",
+            "message": "run paused: the API key has reached its usage limit; continue after adding capacity",
+            "spans": [{"run_id": "r1"}],
+        });
+        let event = to_event(&record);
+        assert_eq!(event.kind, "run_paused");
+        assert_eq!(event.node.as_deref(), Some("analyst"));
+        assert!(event.detail.contains("usage limit"));
+    }
+
+    #[test]
     fn an_enormous_record_is_truncated_not_forwarded_whole() {
         let huge = serde_json::json!({"kind": "model_text", "text": "x".repeat(9000)});
         let event = to_event(&huge);

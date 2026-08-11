@@ -161,8 +161,15 @@ impl RunControl {
 /// names nodes the way its checkpoints do. Comparing literally would make its stop button a
 /// no-op — the command would sit waiting for a node that never asks by that name.
 fn same_node(a: &str, b: &str) -> bool {
-    let bare = |s: &str| s.replace('_', "").to_ascii_lowercase();
-    bare(a) == bare(b)
+    normalized_node_name(a) == normalized_node_name(b)
+}
+
+/// The stable identity shared by every control delivery path for a node.
+///
+/// The red team runs as `redteam` but checkpoints as `red_team`, so underscores cannot be part of
+/// a control target's identity. The durable provider-pause ledger uses the same spelling rule.
+pub fn normalized_node_name(node: &str) -> String {
+    node.replace('_', "").to_ascii_lowercase()
 }
 
 #[cfg(test)]

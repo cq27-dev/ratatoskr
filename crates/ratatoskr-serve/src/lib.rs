@@ -18,10 +18,11 @@ pub mod launch;
 pub mod pipeline;
 pub mod project;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::{FromRef, Path as AxumPath, State};
 use axum::http::StatusCode;
@@ -33,6 +34,9 @@ use ratatoskr_core::auth::{Access, Role};
 use ratatoskr_core::{Command, Control, ControlView, RunControl};
 use ratatoskr_store::Checkpoint;
 use ratatoskr_store::auth::AuthStore;
+use ratatoskr_store::provider_pause::{
+    ProviderPauseDisposition, ProviderPauseKey, ProviderPauseRegistration, ProviderPauseStore,
+};
 use serde::Serialize;
 use tokio_stream::StreamExt as _;
 use tower_http::services::{ServeDir, ServeFile};
@@ -47,6 +51,8 @@ use crate::project::{Project, ProjectError, ProjectView};
 /// Errors starting the server.
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
+    #[error("internal address must be loopback, got {0}")]
+    InternalAddressNotLoopback(SocketAddr),
     #[error(transparent)]
     Project(#[from] ProjectError),
     #[error("store error: {0}")]
@@ -58,16 +64,18 @@ pub enum ServeError {
 #[derive(Clone)]
 struct AppState {
     projects: Arc<BTreeMap<String, Project>>,
-    /// Questions from runs waiting on a human, and who is watching. Shared across projects: run
-    /// ids are unique, so a question needs no further scoping.
+    /// Questions from runs waiting on a human, and who is watching. Questions have their own
+    /// unique ids; [`Desk`] scopes viewer attendance by project and run id.
     desk: Arc<Desk>,
-    /// What operators have asked of the runs in flight, keyed by run id.
+    /// What operators have asked of the runs in flight, keyed by project and run id.
     ///
-    /// In memory, and deliberately: a command is advice to a process that is running right now, so
-    /// it is worth exactly as long as that process. Persisting it would resurrect a pause for a run
-    /// that is long finished. It also cannot go in a project's store, which only a run process
-    /// writes.
-    control: Arc<Mutex<HashMap<String, RunControl>>>,
+    /// This remains in memory: a command is advice to a process that is running right now, so
+    /// persisting it would resurrect a pause for a run that is long finished. A child waiting on a
+    /// provider pause lives in `provider_pauses` instead, because its resume tombstone must survive
+    /// dashboard restart. Neither belongs in a project's store, which only a run process writes.
+    control: Arc<Mutex<HashMap<RunKey, RunControlState>>>,
+    /// Durable, idempotent delivery records for provider pauses in the instance database.
+    provider_pauses: ProviderPauseStore,
     /// Who may use this instance. Instance-wide, not per project — see `ratatoskr_store::auth`.
     auth: AuthStore,
     /// Failed sign-ins, so a password cannot be guessed at network speed.
@@ -81,6 +89,41 @@ struct AppState {
     /// for anything reachable over TLS. Not derived from the request, because a reverse proxy
     /// terminates TLS and the request arrives here over plain HTTP either way.
     secure_cookies: bool,
+}
+
+/// Volatile control needs the same scope as the durable provider-pause ledger: a run id is only
+/// unique within a project.
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct RunKey {
+    project: String,
+    run_id: String,
+}
+
+impl RunKey {
+    fn new(project: impl Into<String>, run_id: impl Into<String>) -> Self {
+        Self {
+            project: project.into(),
+            run_id: run_id.into(),
+        }
+    }
+}
+
+/// The dashboard's volatile controls for one run.
+///
+/// Volatile operator control for one run.
+#[derive(Default)]
+struct RunControlState {
+    control: RunControl,
+}
+
+impl RunControlState {
+    fn poll(&mut self, node: &str) -> Control {
+        self.control.poll(node)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.control.is_empty()
+    }
 }
 
 /// So `Caller` can be extracted: the extractor needs the identity database and nothing else.
@@ -149,13 +192,27 @@ pub struct ServeOptions {
     pub projects: Vec<ProjectSpec>,
     /// How many runs may be in flight at once, per project.
     pub max_runs: usize,
-    /// The instance's identity database. Created on first use.
+    /// The instance database for identities and durable provider-pause delivery. Created on first
+    /// use.
     pub auth_db: PathBuf,
     /// Whether this instance is reached over TLS, which decides the session cookie's attributes.
     /// See [`AppState::secure_cookies`].
     pub secure_cookies: bool,
     /// The GitHub integration, if this instance has one.
     pub github: Option<github::GitHubConfig>,
+}
+
+/// Keep the unauthenticated child rendezvous unreachable from the network.
+///
+/// Reaching the internal listener is the child's credential for clarification and control
+/// requests. The listener must therefore reject wildcard and routable addresses before the public
+/// listener is opened.
+fn require_loopback_internal_address(address: SocketAddr) -> Result<(), ServeError> {
+    if address.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(ServeError::InternalAddressNotLoopback(address))
+    }
 }
 
 /// Serve the dashboard for one or more projects.
@@ -169,6 +226,7 @@ pub async fn serve(opts: ServeOptions) -> Result<(), ServeError> {
         secure_cookies,
         github,
     } = opts;
+    require_loopback_internal_address(internal_addr)?;
     // Bind before opening the projects: a spawned run is told where to reach this server, and with
     // port 0 the real port isn't known until the listener exists.
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -185,6 +243,13 @@ pub async fn serve(opts: ServeOptions) -> Result<(), ServeError> {
     let desk = Arc::new(Desk::default());
     let web = web_dir();
     let auth = AuthStore::open(&auth_db)?;
+    let provider_pauses = ProviderPauseStore::open(&auth_db)?;
+    for project in projects.values() {
+        project
+            .launcher
+            .set_provider_pause_store(provider_pauses.clone());
+    }
+    report_unresponsive_provider_pauses(provider_pauses.clone());
     if auth.is_empty().await? {
         // Not fatal: an instance with no principals still serves its public projects, and the
         // loopback case that needs no accounts at all is the common one. Said once, loudly,
@@ -220,6 +285,7 @@ pub async fn serve(opts: ServeOptions) -> Result<(), ServeError> {
         projects: Arc::clone(&projects),
         desk,
         control: Arc::default(),
+        provider_pauses,
         auth,
         throttle: Arc::new(auth::LoginThrottle::default()),
         secure_cookies,
@@ -254,6 +320,43 @@ pub async fn serve(opts: ServeOptions) -> Result<(), ServeError> {
         result = private => result?,
     }
     Ok(())
+}
+
+/// A child waiting for an operator proves liveness through paused polls and acknowledgements.
+///
+/// Heartbeats cannot prove death: a suspended host can pause both the child and dashboard longer
+/// than the grace period. Report an unresponsive pause once, but retain it until the launcher
+/// observes a real child exit and records the only irreversible lifecycle fence.
+fn report_unresponsive_provider_pauses(pauses: ProviderPauseStore) {
+    const RECONNECT_GRACE: Duration = Duration::from_secs(30);
+    const RECONCILE_EVERY: Duration = Duration::from_secs(5);
+    tokio::spawn(async move {
+        tokio::time::sleep(RECONNECT_GRACE).await;
+        let mut interval = tokio::time::interval(RECONCILE_EVERY);
+        let mut reported = HashSet::new();
+        loop {
+            interval.tick().await;
+            match pauses.list_unresponsive_for(RECONNECT_GRACE).await {
+                Ok(keys) => {
+                    let current: HashSet<_> = keys.into_iter().collect();
+                    for key in current.difference(&reported) {
+                        tracing::warn!(
+                            kind = "run_pause_suspect",
+                            project = key.project(),
+                            run_id = key.run_id(),
+                            "provider-paused child has not renewed its heartbeat; retaining pause until confirmed exit"
+                        );
+                    }
+                    reported = current;
+                }
+                Err(error) => tracing::error!(
+                    kind = "provider_pause_reconcile_failed",
+                    %error,
+                    "could not reconcile provider pause liveness"
+                ),
+            }
+        }
+    });
 }
 
 /// Where a spawned run should reach this server.
@@ -343,14 +446,111 @@ fn internal_router(state: AppState) -> Router {
     Router::new()
         .route("/internal/clarifications", post(await_answer))
         .route("/internal/control", post(node_control))
+        .route("/internal/control/pause", post(pause_run))
+        .route(
+            "/internal/control/pause/ack",
+            post(acknowledge_provider_pause),
+        )
         .with_state(state)
 }
 
 /// What a run process asks for: which node, of which run.
 #[derive(serde::Deserialize)]
 struct ControlAsk {
+    project: String,
     run_id: String,
     node: String,
+    /// A provider-paused child includes its stable waiter identity on every wait poll. If the
+    /// dashboard restarted, each returning child re-establishes its own acknowledged hold without
+    /// making ordinary turn-boundary polls hang.
+    #[serde(default)]
+    provider_pause_waiter: Option<String>,
+    /// The newest provider pause generation this child has acknowledged. It lets a subsequent
+    /// provider failure start a new pause while an older concurrent waiter is still acknowledging.
+    #[serde(default)]
+    known_provider_resume_generation: Option<i64>,
+}
+
+/// What a run process needs to record an automatic, run-wide pause.
+#[derive(serde::Deserialize)]
+struct PauseAsk {
+    project: String,
+    run_id: String,
+    node: String,
+    provider_pause_waiter: String,
+    #[serde(default)]
+    known_provider_resume_generation: Option<i64>,
+}
+
+/// The durable disposition of a provider pause registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ProviderPauseReply {
+    directive: ProviderPauseDirective,
+    generation: i64,
+}
+
+/// The durable directive that remains in force when a child retries an acknowledgement.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProviderPauseAcknowledgementReply {
+    directive: ProviderPauseDirective,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderPauseDirective {
+    Hold,
+    Continue,
+    Stop,
+}
+
+impl From<ProviderPauseRegistration> for ProviderPauseReply {
+    fn from(registration: ProviderPauseRegistration) -> Self {
+        let directive = match registration.disposition {
+            ProviderPauseDisposition::Hold => ProviderPauseDirective::Hold,
+            ProviderPauseDisposition::Continue => ProviderPauseDirective::Continue,
+            ProviderPauseDisposition::Stop | ProviderPauseDisposition::Exited => {
+                ProviderPauseDirective::Stop
+            }
+        };
+        Self {
+            directive,
+            generation: registration.generation,
+        }
+    }
+}
+
+impl From<ProviderPauseDisposition> for ProviderPauseAcknowledgementReply {
+    fn from(disposition: ProviderPauseDisposition) -> Self {
+        let directive = match disposition {
+            ProviderPauseDisposition::Continue => ProviderPauseDirective::Continue,
+            ProviderPauseDisposition::Stop | ProviderPauseDisposition::Exited => {
+                ProviderPauseDirective::Stop
+            }
+            ProviderPauseDisposition::Hold => {
+                unreachable!("a provider pause acknowledgement cannot retain a hold")
+            }
+        };
+        Self { directive }
+    }
+}
+
+/// One internal control reply, including a paused waiter's server-assigned generation.
+#[derive(serde::Serialize)]
+struct ProviderControlReply {
+    #[serde(flatten)]
+    control: Control,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_pause_generation: Option<i64>,
+}
+
+/// Acknowledge one delivery against the exact generation that produced it.
+#[derive(serde::Deserialize)]
+struct PauseAcknowledgement {
+    project: String,
+    run_id: String,
+    node: String,
+    provider_pause_waiter: String,
+    provider_pause_generation: i64,
 }
 
 /// Answer one node's "what should I do now?".
@@ -359,12 +559,132 @@ struct ControlAsk {
 /// reason: reaching this port is the credential. It takes the operator's text with it, so a reply
 /// is delivered exactly once — a message re-read on every poll would be the operator saying it
 /// again on every turn.
-async fn node_control(State(state): State<AppState>, Json(ask): Json<ControlAsk>) -> Json<Control> {
-    let mut control = state.control.lock().expect("control mutex poisoned");
-    let Some(run) = control.get_mut(&ask.run_id) else {
-        return Json(Control::carry_on());
+async fn node_control(
+    State(state): State<AppState>,
+    Json(ask): Json<ControlAsk>,
+) -> Json<ProviderControlReply> {
+    let key = ProviderPauseKey::new(&ask.project, &ask.run_id);
+    let provider_registration = match ask.provider_pause_waiter.as_deref() {
+        Some(waiter) => state
+            .provider_pauses
+            .register_for_node(
+                &key,
+                waiter,
+                &ask.node,
+                ask.known_provider_resume_generation,
+            )
+            .await
+            .map(Some),
+        None => Ok(None),
     };
-    Json(run.poll(&ask.node))
+    let (provider_holding, provider_stopped, provider_exited, provider_pause_generation) =
+        match provider_registration {
+            Ok(Some(registration)) => (
+                registration.disposition == ProviderPauseDisposition::Hold,
+                registration.disposition == ProviderPauseDisposition::Stop,
+                registration.disposition == ProviderPauseDisposition::Exited,
+                Some(registration.generation),
+            ),
+            Ok(None) => match state.provider_pauses.is_exited(&key).await {
+                Ok(true) => (false, false, true, None),
+                Ok(false) => match state.provider_pauses.is_node_stopped(&key, &ask.node).await {
+                    Ok(true) => (false, true, false, None),
+                    Ok(false) => match state.provider_pauses.is_holding(&key).await {
+                        Ok(holding) => (holding, false, false, None),
+                        Err(error) => {
+                            tracing::warn!(project = ask.project, run_id = ask.run_id, %error, "could not read provider pause delivery state");
+                            // A durable pause we cannot read must never become an implicit provider retry.
+                            (true, false, false, None)
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(project = ask.project, run_id = ask.run_id, %error, "could not read durable node stop state");
+                        // An ordinary poll remains available when a Stop that was never written
+                        // cannot be queried. A paused waiter uses the fail-closed branch above.
+                        (false, false, false, None)
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(project = ask.project, run_id = ask.run_id, %error, "could not read provider pause lifecycle state");
+                    // A durable pause we cannot read must never become an implicit provider retry.
+                    (true, false, false, None)
+                }
+            },
+            Err(error) => {
+                tracing::warn!(project = ask.project, run_id = ask.run_id, %error, "could not read provider pause delivery state");
+                // A durable pause we cannot read must never become an implicit provider retry.
+                (true, false, false, None)
+            }
+        };
+
+    let mut control = state.control.lock().expect("control mutex poisoned");
+    let run_key = RunKey::new(&ask.project, &ask.run_id);
+    let mut reply = control
+        .get_mut(&run_key)
+        .map(|run| run.poll(&ask.node))
+        .unwrap_or_else(Control::carry_on);
+    if provider_stopped || provider_exited {
+        reply.directive = ratatoskr_core::Directive::Stop;
+    } else if provider_holding && reply.directive == ratatoskr_core::Directive::Continue {
+        reply.directive = ratatoskr_core::Directive::Hold;
+    }
+    if control.get(&run_key).is_some_and(RunControlState::is_empty) {
+        control.remove(&run_key);
+    }
+    Json(ProviderControlReply {
+        control: reply,
+        provider_pause_generation,
+    })
+}
+
+/// Persist a provider pause before a run waits for an operator.
+///
+/// Loopback-only like [`node_control`]. The narrow endpoint deliberately accepts no command or
+/// text: an untrusted provider failure may only put its own run on hold, never stop another node
+/// or inject content into a model conversation.
+async fn pause_run(
+    State(state): State<AppState>,
+    Json(ask): Json<PauseAsk>,
+) -> Result<Json<ProviderPauseReply>, StatusCode> {
+    let key = ProviderPauseKey::new(&ask.project, &ask.run_id);
+    state
+        .provider_pauses
+        .register_for_node(
+            &key,
+            &ask.provider_pause_waiter,
+            &ask.node,
+            ask.known_provider_resume_generation,
+        )
+        .await
+        .map(ProviderPauseReply::from)
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(project = ask.project, run_id = ask.run_id, %error, "could not persist provider pause");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Acknowledge a provider pause delivery before the child resumes or stops.
+async fn acknowledge_provider_pause(
+    State(state): State<AppState>,
+    Json(ask): Json<PauseAcknowledgement>,
+) -> Result<Json<ProviderPauseAcknowledgementReply>, StatusCode> {
+    let key = ProviderPauseKey::new(&ask.project, &ask.run_id);
+    state
+        .provider_pauses
+        .acknowledge(
+            &key,
+            ask.provider_pause_generation,
+            &ask.provider_pause_waiter,
+            &ask.node,
+        )
+        .await
+        .map(ProviderPauseAcknowledgementReply::from)
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(project = ask.project, run_id = ask.run_id, %error, "could not acknowledge provider pause");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 /// Pause, resume, stop, start or steer a run in flight.
@@ -379,20 +699,56 @@ async fn control_run(
     AxumPath((project, run_id)): AxumPath<(String, String)>,
     Json(command): Json<Command>,
 ) -> Result<Json<ControlView>, ApiError> {
-    let (_, run_id) = state
+    let (found, run_id) = state
         .project_and_run(&project, &run_id, &caller, Access::Act)
         .await?;
-    let mut control = state.control.lock().expect("control mutex poisoned");
-    let run = control.entry(run_id.clone()).or_default();
-    tracing::info!(run_id, ?command, "operator control");
-    run.apply(command);
-    let view = run.view();
-    // Nothing asked for and nothing outstanding: drop the entry rather than accumulate one per run
-    // this instance has ever watched.
-    if run.is_empty() {
-        control.remove(&run_id);
+    let provider_key = ProviderPauseKey::new(&found.slug, &run_id);
+    let run_key = RunKey::new(&found.slug, &run_id);
+    if state.provider_pauses.is_exited(&provider_key).await? {
+        state
+            .control
+            .lock()
+            .expect("control mutex poisoned")
+            .remove(&run_key);
+        return Ok(Json(ControlView::default()));
     }
+    match &command {
+        Command::Resume => state.provider_pauses.release(&provider_key).await?,
+        Command::Stop { node } => state.provider_pauses.stop(&provider_key, node).await?,
+        Command::Start { node } => {
+            state
+                .provider_pauses
+                .clear_stop(&provider_key, node)
+                .await?
+        }
+        Command::Pause | Command::Steer { .. } => {}
+    }
+    let mut view = {
+        let mut control = state.control.lock().expect("control mutex poisoned");
+        let run = control.entry(run_key.clone()).or_default();
+        tracing::info!(project = found.slug, run_id, ?command, "operator control");
+        run.control.apply(command);
+        let view = run.control.view();
+        // Nothing asked for and nothing outstanding: drop the entry rather than accumulate one per
+        // run this instance has ever watched.
+        if run.is_empty() {
+            control.remove(&run_key);
+        }
+        view
+    };
+    view.paused |= state.provider_pauses.is_holding(&provider_key).await?;
+    append_durable_stops(
+        &mut view,
+        state.provider_pauses.stopped_nodes(&provider_key).await?,
+    );
     Ok(Json(view))
+}
+
+/// Merge durable provider-pause Stops with ordinary in-memory controls for one dashboard view.
+fn append_durable_stops(view: &mut ControlView, stopped: Vec<String>) {
+    view.stopped.extend(stopped);
+    view.stopped.sort_unstable();
+    view.stopped.dedup();
 }
 
 /// Start a run because someone mentioned the bot in an issue.
@@ -722,13 +1078,30 @@ async fn run_detail(
         .max()
         .map(str::to_string);
 
-    let control = state
+    let provider_key = ProviderPauseKey::new(&found.slug, &run_id);
+    let run_key = RunKey::new(&found.slug, &run_id);
+    let exited = state.provider_pauses.is_exited(&provider_key).await?;
+    let mut control = state
         .control
         .lock()
         .expect("control mutex poisoned")
-        .get(&run_id)
-        .map(RunControl::view)
+        .get(&run_key)
+        .map(|state| state.control.view())
         .unwrap_or_default();
+    if exited {
+        state
+            .control
+            .lock()
+            .expect("control mutex poisoned")
+            .remove(&run_key);
+        control = ControlView::default();
+    } else {
+        control.paused |= state.provider_pauses.is_holding(&provider_key).await?;
+        append_durable_stops(
+            &mut control,
+            state.provider_pauses.stopped_nodes(&provider_key).await?,
+        );
+    }
 
     Ok(Json(RunDetail {
         control,
@@ -1061,6 +1434,28 @@ mod access_tests {
     use ratatoskr_store::auth::AuthStore;
     use tower::ServiceExt as _;
 
+    #[test]
+    fn the_internal_listener_requires_a_loopback_address() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let address: SocketAddr = address.parse().expect("a socket address");
+            assert!(
+                require_loopback_internal_address(address).is_ok(),
+                "{address} is loopback"
+            );
+        }
+
+        for address in ["0.0.0.0:0", "[::]:0", "192.0.2.1:0"] {
+            let address: SocketAddr = address.parse().expect("a socket address");
+            assert!(
+                matches!(
+                    require_loopback_internal_address(address),
+                    Err(ServeError::InternalAddressNotLoopback(found)) if found == address
+                ),
+                "{address} must not expose unauthenticated control"
+            );
+        }
+    }
+
     /// One project of each visibility, and an empty identity database.
     async fn state() -> AppState {
         let mut projects = BTreeMap::new();
@@ -1089,6 +1484,8 @@ mod access_tests {
             projects: Arc::new(projects),
             desk: Arc::new(Desk::default()),
             control: Arc::default(),
+            provider_pauses: ProviderPauseStore::open_in_memory()
+                .expect("in-memory provider pause store"),
             auth: AuthStore::open_in_memory().expect("in-memory identity database"),
             throttle: Arc::new(auth::LoginThrottle::default()),
             secure_cookies: false,
@@ -1147,9 +1544,20 @@ mod access_tests {
     mod control {
         use super::*;
 
+        const PROJECT: &str = "open";
+
         /// Ask the internal rendezvous what a node should do, the way a run process does.
         async fn ask(state: AppState, run_id: &str, node: &str) -> Control {
-            let body = serde_json::json!({ "run_id": run_id, "node": node }).to_string();
+            ask_for(state, PROJECT, run_id, node).await
+        }
+
+        async fn ask_for(state: AppState, project: &str, run_id: &str, node: &str) -> Control {
+            let body = serde_json::json!({
+                "project": project,
+                "run_id": run_id,
+                "node": node,
+            })
+            .to_string();
             let response = internal_router(state)
                 .oneshot(post("/internal/control", &body, None))
                 .await
@@ -1160,11 +1568,130 @@ mod access_tests {
             serde_json::from_slice(&bytes).expect("a control")
         }
 
+        /// Ask while the child has already persisted a provider pause. Its stable identity lets a
+        /// restarted dashboard reconstruct every concurrent hold without changing ordinary polls.
+        async fn ask_while_provider_paused(
+            state: AppState,
+            run_id: &str,
+            node: &str,
+            waiter: &str,
+        ) -> Control {
+            let body = serde_json::json!({
+                "project": PROJECT,
+                "run_id": run_id,
+                "node": node,
+                "provider_pause_waiter": waiter,
+            })
+            .to_string();
+            let response = internal_router(state)
+                .oneshot(post("/internal/control", &body, None))
+                .await
+                .expect("the rendezvous to answer");
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("a body");
+            serde_json::from_slice(&bytes).expect("a control")
+        }
+
+        /// A fresh process against the same projects. Unlike `Clone`, it discards every volatile
+        /// rendezvous map while retaining the store handles and identity database a real restart
+        /// reopens.
+        fn restarted(state: &AppState) -> AppState {
+            AppState {
+                projects: Arc::clone(&state.projects),
+                desk: Arc::new(Desk::default()),
+                control: Arc::default(),
+                provider_pauses: state.provider_pauses.clone(),
+                auth: state.auth.clone(),
+                throttle: Arc::clone(&state.throttle),
+                github: state.github.clone(),
+                secure_cookies: state.secure_cookies,
+            }
+        }
+
+        /// Record the automatic pause a run asks for after a provider failure.
+        async fn automatic_pause(
+            state: AppState,
+            run_id: &str,
+            waiter: &str,
+        ) -> ProviderPauseDirective {
+            automatic_pause_reply(state, run_id, waiter, None)
+                .await
+                .directive
+        }
+
+        /// Record a provider pause with the latest resume generation this child acknowledged.
+        async fn automatic_pause_reply(
+            state: AppState,
+            run_id: &str,
+            waiter: &str,
+            known_provider_resume_generation: Option<i64>,
+        ) -> ProviderPauseReply {
+            let body = serde_json::json!({
+                "project": PROJECT,
+                "run_id": run_id,
+                "node": waiter,
+                "provider_pause_waiter": waiter,
+                "known_provider_resume_generation": known_provider_resume_generation,
+            })
+            .to_string();
+            let response = internal_router(state)
+                .oneshot(post("/internal/control/pause", &body, None))
+                .await
+                .expect("the rendezvous to accept the pause");
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("a body");
+            serde_json::from_slice(&bytes).expect("a provider pause reply")
+        }
+
+        /// Confirm a received provider pause delivery, as the child does before it resumes.
+        async fn acknowledge(
+            state: AppState,
+            run_id: &str,
+            generation: i64,
+            waiter: &str,
+        ) -> ProviderPauseDirective {
+            let body = serde_json::json!({
+                "project": PROJECT,
+                "run_id": run_id,
+                "node": waiter,
+                "provider_pause_waiter": waiter,
+                "provider_pause_generation": generation,
+            })
+            .to_string();
+            let response = internal_router(state)
+                .oneshot(post("/internal/control/pause/ack", &body, None))
+                .await
+                .expect("the rendezvous to accept the acknowledgement");
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("an acknowledgement reply body");
+            serde_json::from_slice::<ProviderPauseAcknowledgementReply>(&bytes)
+                .expect("a provider pause acknowledgement reply")
+                .directive
+        }
+
         /// Issue a command as an operator.
         async fn command(state: AppState, cookie: &str, json: &str) -> StatusCode {
+            command_for(state, cookie, PROJECT, json).await
+        }
+
+        async fn command_for(
+            state: AppState,
+            cookie: &str,
+            project: &str,
+            json: &str,
+        ) -> StatusCode {
             send(
                 state,
-                post("/api/projects/open/runs/r1/control", json, Some(cookie)),
+                post(
+                    &format!("/api/projects/{project}/runs/r1/control"),
+                    json,
+                    Some(cookie),
+                ),
             )
             .await
         }
@@ -1186,6 +1713,491 @@ mod access_tests {
             assert_eq!(
                 ask(state, "r1", "analyst").await.directive,
                 ratatoskr_core::Directive::Continue
+            );
+        }
+
+        #[tokio::test]
+        async fn an_automatic_pause_uses_the_same_continue_control_as_the_dashboard() {
+            let state = state().await;
+            let cookie = signed_in(&state, Role::Operator).await;
+            assert_eq!(
+                automatic_pause(state.clone(), "r1", "analyst").await,
+                ProviderPauseDirective::Hold
+            );
+            assert_eq!(
+                ask_while_provider_paused(state.clone(), "r1", "analyst", "analyst")
+                    .await
+                    .directive,
+                ratatoskr_core::Directive::Hold
+            );
+
+            // The public control is the button's path. Once it continues, the automatic hold is
+            // gone too, so its icon and its next internal poll cannot disagree.
+            assert_eq!(
+                command(state.clone(), &cookie, r#"{"command":"resume"}"#).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                ask_while_provider_paused(state.clone(), "r1", "analyst", "analyst")
+                    .await
+                    .directive,
+                ratatoskr_core::Directive::Continue
+            );
+            assert_eq!(
+                acknowledge(state, "r1", 1, "analyst").await,
+                ProviderPauseDirective::Continue
+            );
+        }
+
+        #[tokio::test]
+        async fn a_stop_that_precedes_provider_pause_registration_remains_durable() {
+            let state = state().await;
+            let cookie = signed_in(&state, Role::Operator).await;
+
+            assert_eq!(
+                command(
+                    state.clone(),
+                    &cookie,
+                    r#"{"command":"stop","node":"analyst"}"#
+                )
+                .await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                automatic_pause(state.clone(), "r1", "analyst").await,
+                ProviderPauseDirective::Stop,
+                "a provider waiter arriving after Stop must not register as Hold"
+            );
+            assert_eq!(
+                acknowledge(state, "r1", 1, "analyst").await,
+                ProviderPauseDirective::Stop,
+                "the acknowledgement keeps Stop authoritative over provider retry"
+            );
+        }
+
+        #[tokio::test]
+        async fn one_resume_releases_every_concurrent_provider_pause() {
+            let state = state().await;
+            let cookie = signed_in(&state, Role::Operator).await;
+            // `RedTeam::run_and_author` joins two provider calls. They can both pause before the
+            // dashboard is next observed, and each needs the same one resume.
+            assert_eq!(
+                automatic_pause(state.clone(), "r1", "red-team").await,
+                ProviderPauseDirective::Hold
+            );
+            assert_eq!(
+                automatic_pause(state.clone(), "r1", "author").await,
+                ProviderPauseDirective::Hold
+            );
+            assert_eq!(
+                command(state.clone(), &cookie, r#"{"command":"resume"}"#).await,
+                StatusCode::OK
+            );
+
+            assert_eq!(
+                ask_while_provider_paused(state.clone(), "r1", "red_team", "red-team")
+                    .await
+                    .directive,
+                ratatoskr_core::Directive::Continue
+            );
+            assert_eq!(
+                acknowledge(state.clone(), "r1", 1, "red-team").await,
+                ProviderPauseDirective::Continue
+            );
+            assert_eq!(
+                ask_while_provider_paused(state.clone(), "r1", "redteam", "author")
+                    .await
+                    .directive,
+                ratatoskr_core::Directive::Continue,
+                "the second provider waiter consumes the same resume, not a new hold"
+            );
+            assert_eq!(
+                acknowledge(state, "r1", 1, "author").await,
+                ProviderPauseDirective::Continue
+            );
+        }
+
+        #[tokio::test]
+        async fn a_provider_pause_survives_a_dashboard_restart_until_an_operator_resumes() {
+            let before_restart = state().await;
+            let cookie = signed_in(&before_restart, Role::Operator).await;
+            assert_eq!(
+                automatic_pause(before_restart.clone(), "r1", "analyst").await,
+                ProviderPauseDirective::Hold
+            );
+
+            let after_restart = restarted(&before_restart);
+            assert_eq!(
+                ask_while_provider_paused(after_restart.clone(), "r1", "analyst", "analyst")
+                    .await
+                    .directive,
+                ratatoskr_core::Directive::Hold,
+                "a waiting child re-establishes its acknowledged provider pause"
+            );
+
+            assert_eq!(
+                command(after_restart.clone(), &cookie, r#"{"command":"resume"}"#).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                ask_while_provider_paused(after_restart.clone(), "r1", "analyst", "analyst")
+                    .await
+                    .directive,
+                ratatoskr_core::Directive::Continue,
+                "only the operator's resume releases the reconstructed hold"
+            );
+            assert_eq!(
+                acknowledge(after_restart, "r1", 1, "analyst").await,
+                ProviderPauseDirective::Continue
+            );
+        }
+
+        #[tokio::test]
+        async fn a_provider_stop_survives_a_dashboard_restart_until_acknowledged() {
+            let before_restart = state().await;
+            let cookie = signed_in(&before_restart, Role::Operator).await;
+            assert_eq!(
+                automatic_pause(before_restart.clone(), "r1", "analyst").await,
+                ProviderPauseDirective::Hold
+            );
+            assert_eq!(
+                command(
+                    before_restart.clone(),
+                    &cookie,
+                    r#"{"command":"stop","node":"analyst"}"#
+                )
+                .await,
+                StatusCode::OK
+            );
+
+            let after_restart = restarted(&before_restart);
+            assert_eq!(
+                ask_while_provider_paused(after_restart.clone(), "r1", "analyst", "analyst")
+                    .await
+                    .directive,
+                ratatoskr_core::Directive::Stop,
+                "a restarted dashboard delivers the selected node's durable Stop"
+            );
+            assert_eq!(
+                acknowledge(after_restart.clone(), "r1", 1, "analyst").await,
+                ProviderPauseDirective::Stop
+            );
+            assert_eq!(
+                ask(after_restart.clone(), "r1", "analyst").await.directive,
+                ratatoskr_core::Directive::Stop,
+                "the parked node keeps receiving its durable Stop after acknowledging it"
+            );
+            assert_eq!(
+                command(
+                    after_restart.clone(),
+                    &cookie,
+                    r#"{"command":"start","node":"analyst"}"#
+                )
+                .await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                ask(after_restart, "r1", "analyst").await.directive,
+                ratatoskr_core::Directive::Continue,
+                "only Start clears the durable Stop"
+            );
+        }
+
+        #[tokio::test]
+        async fn one_resume_releases_every_provider_waiter_reconstructed_after_a_restart() {
+            let before_restart = state().await;
+            let cookie = signed_in(&before_restart, Role::Operator).await;
+            assert_eq!(
+                automatic_pause(before_restart.clone(), "r1", "red-team").await,
+                ProviderPauseDirective::Hold
+            );
+            assert_eq!(
+                automatic_pause(before_restart.clone(), "r1", "author").await,
+                ProviderPauseDirective::Hold
+            );
+
+            let after_restart = restarted(&before_restart);
+            for (node, waiter) in [("red_team", "red-team"), ("author", "author")] {
+                assert_eq!(
+                    ask_while_provider_paused(after_restart.clone(), "r1", node, waiter)
+                        .await
+                        .directive,
+                    ratatoskr_core::Directive::Hold,
+                    "each returning child re-establishes its own pause claim"
+                );
+            }
+
+            assert_eq!(
+                command(after_restart.clone(), &cookie, r#"{"command":"resume"}"#).await,
+                StatusCode::OK
+            );
+            for (node, waiter) in [("red_team", "red-team"), ("author", "author")] {
+                assert_eq!(
+                    ask_while_provider_paused(after_restart.clone(), "r1", node, waiter)
+                        .await
+                        .directive,
+                    ratatoskr_core::Directive::Continue,
+                    "one resume reaches every provider waiter reconstructed after the restart"
+                );
+                assert_eq!(
+                    acknowledge(after_restart.clone(), "r1", 1, waiter).await,
+                    ProviderPauseDirective::Continue
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_lost_continue_reply_cannot_rearm_a_provider_pause_after_a_restart() {
+            let before_reply_loss = state().await;
+            let cookie = signed_in(&before_reply_loss, Role::Operator).await;
+            assert_eq!(
+                automatic_pause(before_reply_loss.clone(), "r1", "analyst").await,
+                ProviderPauseDirective::Hold
+            );
+            assert_eq!(
+                command(
+                    before_reply_loss.clone(),
+                    &cookie,
+                    r#"{"command":"resume"}"#
+                )
+                .await,
+                StatusCode::OK
+            );
+
+            // The dashboard processed this reply, but the child never received it and therefore
+            // cannot acknowledge it yet.
+            assert_eq!(
+                ask_while_provider_paused(before_reply_loss.clone(), "r1", "analyst", "analyst")
+                    .await
+                    .directive,
+                ratatoskr_core::Directive::Continue
+            );
+
+            let after_restart = restarted(&before_reply_loss);
+            assert_eq!(
+                ask_while_provider_paused(after_restart.clone(), "r1", "analyst", "analyst")
+                    .await
+                    .directive,
+                ratatoskr_core::Directive::Continue,
+                "the durable resume tombstone survives until this child acknowledges it"
+            );
+            assert_eq!(
+                acknowledge(after_restart.clone(), "r1", 1, "analyst").await,
+                ProviderPauseDirective::Continue
+            );
+            assert_eq!(
+                automatic_pause_reply(after_restart, "r1", "next", Some(1))
+                    .await
+                    .directive,
+                ProviderPauseDirective::Hold,
+                "a child that received the acknowledgement records its generation before a later provider failure pauses anew"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_stop_after_a_lost_acknowledgement_reply_is_returned_by_the_retry() {
+            let state = state().await;
+            let cookie = signed_in(&state, Role::Operator).await;
+            assert_eq!(
+                automatic_pause(state.clone(), "r1", "analyst").await,
+                ProviderPauseDirective::Hold
+            );
+            assert_eq!(
+                command(state.clone(), &cookie, r#"{"command":"resume"}"#).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                ask_while_provider_paused(state.clone(), "r1", "analyst", "analyst")
+                    .await
+                    .directive,
+                ratatoskr_core::Directive::Continue
+            );
+
+            assert_eq!(
+                acknowledge(state.clone(), "r1", 1, "analyst").await,
+                ProviderPauseDirective::Continue,
+                "the child loses this committed acknowledgement reply"
+            );
+            assert_eq!(
+                command(
+                    state.clone(),
+                    &cookie,
+                    r#"{"command":"stop","node":"analyst"}"#
+                )
+                .await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                acknowledge(state, "r1", 1, "analyst").await,
+                ProviderPauseDirective::Stop,
+                "retrying the lost acknowledgement delivers the intervening Stop"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_late_provider_waiter_consumes_the_existing_resume_tombstone() {
+            let state = state().await;
+            let cookie = signed_in(&state, Role::Operator).await;
+            assert_eq!(
+                automatic_pause(state.clone(), "r1", "first").await,
+                ProviderPauseDirective::Hold
+            );
+            assert_eq!(
+                command(state.clone(), &cookie, r#"{"command":"resume"}"#).await,
+                StatusCode::OK
+            );
+
+            assert_eq!(
+                automatic_pause(state.clone(), "r1", "late").await,
+                ProviderPauseDirective::Continue,
+                "a concurrent pause request that arrives after Resume must not re-arm Hold"
+            );
+            for (node, waiter) in [("first", "first"), ("late", "late")] {
+                assert_eq!(
+                    ask_while_provider_paused(state.clone(), "r1", node, waiter)
+                        .await
+                        .directive,
+                    ratatoskr_core::Directive::Continue
+                );
+                assert_eq!(
+                    acknowledge(state.clone(), "r1", 1, waiter).await,
+                    ProviderPauseDirective::Continue
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_new_provider_failure_after_acknowledgement_uses_a_fresh_generation() {
+            let state = state().await;
+            let cookie = signed_in(&state, Role::Operator).await;
+            assert_eq!(
+                automatic_pause(state.clone(), "r1", "first").await,
+                ProviderPauseDirective::Hold
+            );
+            assert_eq!(
+                automatic_pause(state.clone(), "r1", "second").await,
+                ProviderPauseDirective::Hold
+            );
+            assert_eq!(
+                command(state.clone(), &cookie, r#"{"command":"resume"}"#).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                ask_while_provider_paused(state.clone(), "r1", "first", "first")
+                    .await
+                    .directive,
+                ratatoskr_core::Directive::Continue
+            );
+            assert_eq!(
+                acknowledge(state.clone(), "r1", 1, "first").await,
+                ProviderPauseDirective::Continue
+            );
+
+            assert_eq!(
+                automatic_pause_reply(state.clone(), "r1", "fresh", Some(1)).await,
+                ProviderPauseReply {
+                    directive: ProviderPauseDirective::Hold,
+                    generation: 2,
+                },
+                "a fresh failure after generation one was acknowledged needs its own resume"
+            );
+            assert_eq!(
+                ask_while_provider_paused(state.clone(), "r1", "second", "second")
+                    .await
+                    .directive,
+                ratatoskr_core::Directive::Continue,
+                "a late generation-one waiter still receives the prior resume"
+            );
+            assert_eq!(
+                acknowledge(state.clone(), "r1", 1, "second").await,
+                ProviderPauseDirective::Continue
+            );
+            assert_eq!(
+                ask_while_provider_paused(state.clone(), "r1", "fresh", "fresh")
+                    .await
+                    .directive,
+                ratatoskr_core::Directive::Hold
+            );
+        }
+
+        #[tokio::test]
+        async fn a_stopped_provider_waiter_keeps_the_other_nodes_held_until_acknowledged() {
+            let state = state().await;
+            let cookie = signed_in(&state, Role::Operator).await;
+            assert_eq!(
+                automatic_pause(state.clone(), "r1", "analyst").await,
+                ProviderPauseDirective::Hold
+            );
+            assert_eq!(
+                command(
+                    state.clone(),
+                    &cookie,
+                    r#"{"command":"stop","node":"analyst"}"#
+                )
+                .await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                ask_while_provider_paused(state.clone(), "r1", "analyst", "analyst")
+                    .await
+                    .directive,
+                ratatoskr_core::Directive::Stop
+            );
+            assert_eq!(
+                ask(state.clone(), "r1", "implementer").await.directive,
+                ratatoskr_core::Directive::Hold,
+                "Stop has not yet been acknowledged by the waiting child"
+            );
+            assert_eq!(
+                acknowledge(state.clone(), "r1", 1, "analyst").await,
+                ProviderPauseDirective::Stop
+            );
+            assert_eq!(
+                ask(state, "r1", "implementer").await.directive,
+                ratatoskr_core::Directive::Continue
+            );
+        }
+
+        #[tokio::test]
+        async fn a_confirmed_exit_clears_an_unacknowledged_provider_pause() {
+            let state = state().await;
+            assert_eq!(
+                automatic_pause(state.clone(), "r1", "analyst").await,
+                ProviderPauseDirective::Hold
+            );
+            let key = ProviderPauseKey::new(PROJECT, "r1");
+            assert!(state.provider_pauses.is_holding(&key).await.unwrap());
+            state.provider_pauses.record_exit(&key).await.unwrap();
+
+            assert_eq!(
+                automatic_pause(state.clone(), "r1", "late").await,
+                ProviderPauseDirective::Stop,
+                "a late pause request after confirmed process exit cannot recreate a hold"
+            );
+            assert!(
+                !state.provider_pauses.is_holding(&key).await.unwrap(),
+                "a confirmed child exit clears its outstanding provider delivery"
+            );
+        }
+
+        #[tokio::test]
+        async fn controls_with_matching_run_ids_do_not_cross_projects() {
+            let state = state().await;
+            let cookie = signed_in(&state, Role::Operator).await;
+            assert_eq!(
+                command_for(state.clone(), &cookie, "open", r#"{"command":"pause"}"#).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                ask_for(state.clone(), "open", "r1", "analyst")
+                    .await
+                    .directive,
+                ratatoskr_core::Directive::Hold
+            );
+            assert_eq!(
+                ask_for(state, "shut", "r1", "analyst").await.directive,
+                ratatoskr_core::Directive::Continue,
+                "volatile control uses the same project/run identity as durable pause delivery"
             );
         }
 

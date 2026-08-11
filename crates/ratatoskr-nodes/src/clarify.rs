@@ -2,11 +2,12 @@
 //! (`ratatoskr_agent::ASK_TOOL_NAME`); `ratatoskr_agent`'s clarification hook routes the call here.
 //! [`NodeClarifier::answer`] runs the target node ONCE against its checkpointed context and returns a
 //! text answer, which the hook hands back as the tool's result — so the asking node's conversation
-//! (and its prompt cache) continue in place, no re-run.
+//! (and its prompt cache) continue in place, no re-run. An operator Stop is the sole exception: it
+//! terminates the asking turn instead of becoming a synthetic answer.
 //!
 //! Design notes: the answerer gets no `ask` tool, so recursion is impossible (nesting depth is always
-//! 1). Answers are always text (a failure becomes best-effort guidance, never an error that breaks
-//! the asker). A per-run [`ASK_BUDGET`] backstops a runaway asker. Every exchange is recorded for
+//! 1). Ordinary failures become best-effort guidance, never an error that breaks the asker. A
+//! per-run [`ASK_BUDGET`] backstops a runaway asker. Completed exchanges are recorded for
 //! `RunState.clarifications` and written as a `clarification` checkpoint (inert to replay, which is
 //! name-keyed on the node checkpoints).
 
@@ -17,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ratatoskr_agent::Clarifier;
+use ratatoskr_agent::{ClarificationAnswer, Clarifier, RuntimeControl};
 use ratatoskr_core::RatatoskrConfig;
 use ratatoskr_mcp::ToolSet;
 use ratatoskr_script::ScriptEngine;
@@ -43,6 +44,12 @@ const CONTEXT_LIMIT: usize = 4000;
 /// timeout is shorter); this only stops a wedged connection from blocking a node indefinitely,
 /// and stays well under the prompt-cache TTL that the block-the-node design depends on.
 const USER_ANSWER_CEILING: Duration = Duration::from_secs(150);
+
+enum UserAnswer {
+    Text(String),
+    Unavailable,
+    Stopped,
+}
 
 /// The synthetic `ask` tool declaration, injected into an asker node's tool list. Like the
 /// structured-output tool, it's a system capability — not a rag-rat tool subject to a ruleset's
@@ -145,8 +152,15 @@ impl NodeClarifier {
     /// Offer the question to a human, if this run was started by a dashboard and somebody is
     /// watching it. `None` means nobody answered — for any reason — and the caller falls through
     /// to the node path, which is exactly what an unattended run does today.
-    async fn ask_the_user(&self, from: &str, question: &str) -> Option<String> {
-        let dashboard = std::env::var("RATATOSKR_DASHBOARD").ok()?;
+    async fn ask_the_user(
+        &self,
+        from: &str,
+        question: &str,
+        control: Option<&RuntimeControl>,
+    ) -> UserAnswer {
+        let Ok(dashboard) = std::env::var("RATATOSKR_DASHBOARD") else {
+            return UserAnswer::Unavailable;
+        };
         let question_id = uuid::Uuid::new_v4().to_string();
 
         // Emit before waiting: the dashboard learns about the question by tailing this, so it has
@@ -159,7 +173,16 @@ impl NodeClarifier {
             "waiting on the user"
         );
 
-        let answer = self.await_user_answer(&dashboard, &question_id).await;
+        let controlled_answer = match control {
+            Some(control) => {
+                control
+                    .wait_for_stop_or(self.await_user_answer(&dashboard, &question_id))
+                    .await
+            }
+            None => Some(self.await_user_answer(&dashboard, &question_id).await),
+        };
+        let stopped = controlled_answer.is_none();
+        let answer = controlled_answer.flatten();
 
         // Always announce the outcome, including the ordinary one where nobody answered. The
         // dashboard clears its prompt on this event, so without it a viewer is left staring at a
@@ -170,7 +193,13 @@ impl NodeClarifier {
             answered = answer.is_some(),
             "question resolved"
         );
-        answer
+        if stopped {
+            UserAnswer::Stopped
+        } else if let Some(answer) = answer {
+            UserAnswer::Text(answer)
+        } else {
+            UserAnswer::Unavailable
+        }
     }
 
     /// The blocking half. Any failure — unreachable dashboard, malformed reply, nobody watching,
@@ -196,13 +225,23 @@ impl NodeClarifier {
         reply.get("answer")?.as_str().map(str::to_string)
     }
 
-    async fn answer_inner(&self, from: &str, to: &str, question: &str) -> String {
+    async fn answer_inner(
+        &self,
+        from: &str,
+        to: &str,
+        question: &str,
+        control: Option<RuntimeControl>,
+    ) -> ClarificationAnswer {
         // A question addressed to the user goes to a human first; everything else keeps its
         // existing routing, because a peer node holds answers a person doesn't.
-        if to.trim() == "user"
-            && let Some(answer) = self.ask_the_user(from, question).await
-        {
-            return format!("Answer from the user:\n{answer}");
+        if to.trim() == "user" {
+            match self.ask_the_user(from, question, control.as_ref()).await {
+                UserAnswer::Text(answer) => {
+                    return ClarificationAnswer::Text(format!("Answer from the user:\n{answer}"));
+                }
+                UserAnswer::Stopped => return ClarificationAnswer::Stopped,
+                UserAnswer::Unavailable => {}
+            }
         }
 
         let (answerer, checkpoint_name) = resolve_target(to);
@@ -230,10 +269,10 @@ impl NodeClarifier {
         ) {
             Ok(cfg) => (cfg.route, cfg.system_prompt),
             Err(_) => {
-                return format!(
+                return ClarificationAnswer::Text(format!(
                     "Could not reach `{answerer}`: no model route is configured for it. Proceed with \
                      your best assumption and flag it as a residual risk."
-                );
+                ));
             }
         };
 
@@ -256,24 +295,45 @@ impl NodeClarifier {
         let prompt = format!("A peer node (`{from}`) asks:\n{question}\n\nContext:\n{context}");
 
         let span = tracing::info_span!("clarify", from, answerer);
-        let body = match ratatoskr_agent::ask(
+        let answer = ratatoskr_agent::ask(
             &route,
             &preamble,
             &prompt,
             ToolSet::default(),
             Some(ANSWER_MAX_TURNS),
+            control.clone(),
         )
-        .instrument(span)
-        .await
-        {
-            Ok(text) => text,
-            Err(e) => {
-                tracing::warn!("clarify: `{answerer}` could not answer: {e}");
-                format!("could not answer ({e}); proceed with your best assumption")
-            }
+        .instrument(span);
+        let response = match control.as_ref() {
+            Some(control) => match control.wait_for_stop_or(answer).await {
+                Some(response) => response,
+                None => return ClarificationAnswer::Stopped,
+            },
+            None => answer.await,
         };
-        format!("Answer from `{answerer}`:\n{body}")
+        let stopped = control.as_ref().is_some_and(RuntimeControl::is_stopped);
+        answer_after_model(answerer, stopped, response)
     }
+}
+
+/// Keep ordinary clarification failures as guidance, but let an operator Stop terminate the
+/// asker's turn before it sends a further provider request.
+fn answer_after_model(
+    answerer: &str,
+    stopped: bool,
+    response: Result<String, ratatoskr_agent::AgentError>,
+) -> ClarificationAnswer {
+    if stopped {
+        return ClarificationAnswer::Stopped;
+    }
+    let body = match response {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::warn!("clarify: `{answerer}` could not answer: {e}");
+            format!("could not answer ({e}); proceed with your best assumption")
+        }
+    };
+    ClarificationAnswer::Text(format!("Answer from `{answerer}`:\n{body}"))
 }
 
 impl Clarifier for NodeClarifier {
@@ -282,17 +342,22 @@ impl Clarifier for NodeClarifier {
         from: &'a str,
         to: &'a str,
         question: &'a str,
-    ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+        control: Option<RuntimeControl>,
+    ) -> Pin<Box<dyn Future<Output = ClarificationAnswer> + Send + 'a>> {
         Box::pin(async move {
-            // Charge the budget; the exhausted case is still recorded (every exchange is).
+            // Charge the budget; each completed exchange, including an exhausted one, is recorded.
             let answer = if self.budget.fetch_add(1, Ordering::SeqCst) >= ASK_BUDGET {
-                "The clarification budget for this run is exhausted. Proceed with your best \
-                 assumption and note it as a residual risk."
-                    .to_string()
+                ClarificationAnswer::Text(
+                    "The clarification budget for this run is exhausted. Proceed with your best \
+                     assumption and note it as a residual risk."
+                        .to_string(),
+                )
             } else {
-                self.answer_inner(from, to, question).await
+                self.answer_inner(from, to, question, control).await
             };
-            self.record(from, to, question, &answer).await;
+            if let ClarificationAnswer::Text(answer) = &answer {
+                self.record(from, to, question, answer).await;
+            }
             answer
         })
     }
@@ -339,5 +404,17 @@ mod tests {
         let t = ask_tool();
         assert_eq!(t.name, ratatoskr_agent::ASK_TOOL_NAME);
         assert!(t.input_schema.contains_key("properties"));
+    }
+
+    #[test]
+    fn a_stopped_nested_answer_terminates_the_asker() {
+        let answer = answer_after_model(
+            "analyst",
+            true,
+            Err(ratatoskr_agent::AgentError::Prompt(
+                "the operator stopped this node".to_string(),
+            )),
+        );
+        assert_eq!(answer, ClarificationAnswer::Stopped);
     }
 }

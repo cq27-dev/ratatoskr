@@ -24,6 +24,7 @@ import {
   Info,
   MessageSquare,
   Pencil,
+  Pause,
   Play,
   Search,
   Send,
@@ -125,6 +126,8 @@ export const KINDS: Record<string, { label: string; icon: typeof FileText }> = {
   // like an alert a hundred times over stops meaning anything when one genuinely is.
   event: { label: "event", icon: Info },
   node_start: { label: "start", icon: Play },
+  run_paused: { label: "paused", icon: Pause },
+  run_resumed: { label: "continued", icon: Play },
   checkpoint: { label: "checkpoint", icon: Flag },
   acceptance_step: { label: "check", icon: FlaskConical },
   authored_tests: { label: "tests written", icon: ClipboardCheck },
