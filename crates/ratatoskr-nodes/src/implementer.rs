@@ -261,6 +261,7 @@ impl ImplementerNode {
             input_json,
             crate::workflow::StandardStageResources {
                 resource_root: worktree.as_path().to_path_buf(),
+                rag_rat_worktree: Some(worktree.as_path().to_path_buf()),
                 shell: Some(self.shell_access(worktree)),
                 publish: None,
                 clarifier: self.clarifier.clone(),

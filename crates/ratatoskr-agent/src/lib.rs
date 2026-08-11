@@ -13,6 +13,7 @@ use compaction::CompactedSession;
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -23,7 +24,7 @@ use bytes::Bytes;
 use ratatoskr_core::{
     Control, Directive, ModelRoute, NodeTelemetry, TokenUsage, ToolDecision, ToolPolicy,
 };
-use ratatoskr_mcp::ToolSet;
+use ratatoskr_mcp::{self, ToolSet};
 use rig_agent::AgentBuilder;
 use rig_agent::agent::{
     Agent, AgentHook, CompletionResponseEvent, HookContext, ModelTurnAction, ModelTurnFinished,
@@ -405,7 +406,7 @@ where
     M: CompletionModel + 'static,
 {
     let (builder, meter) = metered("ask", model, preamble, max_turns, Request::of(route), calls);
-    let agent = bind_tools(builder, &tools, None, None, None);
+    let agent = bind_tools(builder, &tools, None, None, None, None);
 
     let answer = agent.prompt(question).await;
     // No store to checkpoint to here, so it goes to the log. A one-shot question whose cost is
@@ -1226,7 +1227,8 @@ impl AgentHook for ObservabilityHook {
 fn bind_tools<M: CompletionModel + 'static>(
     builder: AgentBuilder<M, NoToolConfig>,
     tools: &ToolSet,
-    files: Option<&std::path::Path>,
+    files: Option<&Path>,
+    rag_rat_worktree: Option<&Path>,
     shell: Option<&shell::ShellAccess>,
     push: Option<&publish::PushAccess>,
 ) -> Agent<M> {
@@ -1238,13 +1240,29 @@ fn bind_tools<M: CompletionModel + 'static>(
             .tools
             .iter()
             .any(|tool| group.display_name(tool) != tool.name.as_ref());
-        bound = match (&group.sink, renamed) {
+        bound = match (&group.sink, renamed, rag_rat_worktree) {
+            // rag-rat runs once from the repository root. A linked-worktree stage needs its
+            // overlay selected by this host, after the model has made its call: the path must not
+            // appear in the model-visible schema or be supplied by the model.
+            (Some(sink), _, Some(worktree)) if group.origin == ratatoskr_mcp::RAG_RAT => bound
+                .dynamic_tools(
+                    group
+                        .offered()
+                        .into_iter()
+                        .map(|(tool, wire)| match worktree_scoped_schema(&tool) {
+                            Some(schema) => {
+                                worktree_scoped_tool(tool, wire, sink.clone(), schema, worktree)
+                            }
+                            None => renamed_tool(tool, wire, sink.clone()),
+                        })
+                        .collect(),
+                ),
             // Named as the server names them: rig's own adapter, which sends the tool's name
             // straight back to the server as the call's method.
-            (Some(sink), false) => bound.rmcp_tools(group.tools.clone(), sink.clone()),
+            (Some(sink), false, _) => bound.rmcp_tools(group.tools.clone(), sink.clone()),
             // Named differently from the server's wire name. `DynamicTool` takes a runtime name
             // and a closure, so a prefix and a per-tool vocabulary rewrite both dispatch safely.
-            (Some(sink), true) => bound.dynamic_tools(
+            (Some(sink), true, _) => bound.dynamic_tools(
                 group
                     .offered()
                     .into_iter()
@@ -1253,7 +1271,7 @@ fn bind_tools<M: CompletionModel + 'static>(
             ),
             // Answered by this host: a built-in it implements, or a synthetic one a hook
             // intercepts before dispatch — for which the implementation is never reached.
-            (None, _) => bound.dynamic_tools(
+            (None, _, _) => bound.dynamic_tools(
                 group
                     .tools
                     .iter()
@@ -1277,7 +1295,7 @@ fn prefixed(text: &str, context: Option<String>) -> String {
 /// answers in-conversation — a stand-in that says so if it is ever actually dispatched.
 fn local_tool(
     tool: &Tool,
-    files: Option<&std::path::Path>,
+    files: Option<&Path>,
     shell: Option<&shell::ShellAccess>,
     push: Option<&publish::PushAccess>,
 ) -> DynamicTool {
@@ -1315,16 +1333,63 @@ fn local_tool(
 /// reported error that stays an error, and a result converted whole.
 fn renamed_tool(tool: Tool, wire: String, sink: ServerSink) -> DynamicTool {
     let schema = serde_json::Value::Object((*tool.input_schema).clone());
+    remote_tool(tool, wire, sink, schema, None)
+}
+
+/// Bind a rag-rat tool whose `worktree` argument is selected by the host.
+///
+/// The schema passed to the model omits the host-only argument. The call wrapper inserts the
+/// active worktree even if an untrusted model payload still tries to provide one.
+fn worktree_scoped_tool(
+    tool: Tool,
+    wire: String,
+    sink: ServerSink,
+    schema: serde_json::Value,
+    worktree: &Path,
+) -> DynamicTool {
+    remote_tool(tool, wire, sink, schema, Some(worktree.to_path_buf()))
+}
+
+/// The direct-schema form used by rag-rat's source and graph tools, without the host-only scope.
+///
+/// Only advertised `worktree` properties are removed. Older rag-rat versions and unrelated MCP
+/// servers retain their normal declarations and dispatch path.
+fn worktree_scoped_schema(tool: &Tool) -> Option<serde_json::Value> {
+    let mut schema = (*tool.input_schema).clone();
+    let properties = schema.get_mut("properties")?.as_object_mut()?;
+    properties.remove("worktree")?;
+    if let Some(required) = schema
+        .get_mut("required")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        required.retain(|name| name != "worktree");
+    }
+    Some(serde_json::Value::Object(schema))
+}
+
+/// Bind one remote MCP tool, optionally adding a host-selected worktree after argument parsing.
+fn remote_tool(
+    tool: Tool,
+    wire: String,
+    sink: ServerSink,
+    schema: serde_json::Value,
+    worktree: Option<std::path::PathBuf>,
+) -> DynamicTool {
     let description = tool.description.clone().unwrap_or_default().to_string();
     let shown = tool.name.to_string();
 
     DynamicTool::new(shown.clone(), description, schema, move |_ctx, args| {
-        let (sink, wire, shown) = (sink.clone(), wire.clone(), shown.clone());
+        let (sink, wire, shown, worktree) =
+            (sink.clone(), wire.clone(), shown.clone(), worktree.clone());
         Box::pin(async move {
             // Checked before the server is contacted. Quietly turning an array or a scalar into a
             // no-argument call can run a different operation than the model asked for.
             let mut params = CallToolRequestParams::new(wire);
-            if let Some(arguments) = arguments(args, &shown)? {
+            let arguments = match worktree {
+                Some(worktree) => Some(arguments_in_worktree(args, &shown, &worktree)?),
+                None => arguments(args, &shown)?,
+            };
+            if let Some(arguments) = arguments {
                 params = params.with_arguments(arguments);
             }
             interpret(&call_tool(&sink, params, &shown).await?, &shown)
@@ -1348,6 +1413,20 @@ fn arguments(
             json_kind(&other)
         ))),
     }
+}
+
+/// Parse model arguments, then replace the scope with the worktree this host granted the stage.
+fn arguments_in_worktree(
+    args: serde_json::Value,
+    shown: &str,
+    worktree: &Path,
+) -> Result<rmcp::model::JsonObject, ToolExecutionError> {
+    let mut arguments = arguments(args, shown)?.unwrap_or_default();
+    arguments.insert(
+        "worktree".to_string(),
+        serde_json::Value::String(worktree.display().to_string()),
+    );
+    Ok(arguments)
 }
 
 /// What a finished call means: the presentation, or a failure carrying it.
@@ -1897,6 +1976,11 @@ pub struct NodeRun<'a> {
     pub skills: Vec<Skill>,
     /// The repository the node's built-in file tools read within; `None` when it has none.
     pub files: Option<std::path::PathBuf>,
+    /// The linked worktree a rag-rat source query is scoped to; `None` for the indexed checkout.
+    ///
+    /// This is host-owned rather than a model tool argument: the agent binding hides it from the
+    /// model and inserts it only for rag-rat tools whose advertised schema supports it.
+    pub rag_rat_worktree: Option<std::path::PathBuf>,
     /// A key naming this node's conversation within the run, when the route continues it across
     /// attempts.
     ///
@@ -1975,6 +2059,7 @@ where
         observer,
         skills,
         files,
+        rag_rat_worktree,
         shell,
         push,
         conversation,
@@ -2079,6 +2164,7 @@ where
         builder,
         &tools,
         files.as_deref(),
+        rag_rat_worktree.as_deref(),
         shell.as_ref(),
         push.as_ref(),
     );
@@ -2608,6 +2694,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rag_rat_worktree_scope_is_host_owned_and_hidden_from_the_model() {
+        let mut tool = Tool::default();
+        tool.name = "impact_surface".to_string().into();
+        tool.input_schema = std::sync::Arc::new(
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "symbol": { "type": "string" },
+                    "worktree": { "type": "string" },
+                },
+                "required": ["symbol", "worktree"],
+            })
+            .as_object()
+            .expect("schema literal")
+            .clone(),
+        );
+
+        let schema = worktree_scoped_schema(&tool).expect("the tool supports worktree scope");
+        assert!(schema["properties"].get("worktree").is_none());
+        assert_eq!(schema["required"], serde_json::json!(["symbol"]));
+
+        let arguments = arguments_in_worktree(
+            serde_json::json!({
+                "symbol": "Run",
+                "worktree": "/an-untrusted-sibling",
+            }),
+            "impact_surface",
+            std::path::Path::new("/host/active-worktree"),
+        )
+        .expect("object arguments");
+        assert_eq!(arguments["symbol"], "Run");
+        assert_eq!(arguments["worktree"], "/host/active-worktree");
+    }
+
+    #[test]
+    fn rag_rat_tools_without_a_worktree_argument_keep_their_declaration() {
+        let mut tool = Tool::default();
+        tool.name = "repo_brief".to_string().into();
+        tool.input_schema = std::sync::Arc::new(
+            serde_json::json!({
+                "type": "object",
+                "properties": { "mode": { "type": "string" } },
+            })
+            .as_object()
+            .expect("schema literal")
+            .clone(),
+        );
+
+        assert!(worktree_scoped_schema(&tool).is_none());
+    }
+
     /// CI-safe: an unrecognized provider is rejected before any client init or network call.
     #[test]
     fn unknown_provider_is_rejected() {
@@ -2917,6 +3055,7 @@ mod tests {
             observer: None,
             skills: Vec::new(),
             files: Some(root.clone()),
+            rag_rat_worktree: None,
             shell: None,
             push: None,
             conversation: None,
@@ -2985,6 +3124,7 @@ mod tests {
             observer: None,
             skills: Vec::new(),
             files: None,
+            rag_rat_worktree: None,
             shell: None,
             push: None,
             conversation: None,
@@ -3045,6 +3185,7 @@ mod tests {
                 observer: None,
                 skills: Vec::new(),
                 files: None,
+                rag_rat_worktree: None,
                 shell: None,
                 push: None,
                 conversation,
