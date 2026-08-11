@@ -1,0 +1,4 @@
+[env]
+# microsandbox's build script otherwise falls back to $HOME/.microsandbox; sandboxed builds may
+# set HOME=/, which is not writable. Keep its optional runtime cache inside this workspace instead.
+MSB_HOME = { value = "target/microsandbox", relative = true }

@@ -129,6 +129,8 @@ pub struct WorkflowContext {
     /// the plan could move the bar it is judged against mid-run. Whichever binding runs acceptance
     /// first decides it; everything after gets that.
     acceptance: Mutex<Option<Vec<ratatoskr_core::AcceptanceStep>>>,
+    /// OCI image identity frozen when this run first executes container-backed work.
+    container_image: tokio::sync::OnceCell<Option<String>>,
 }
 
 pub(crate) struct WorkflowContextParams<'a> {
@@ -188,6 +190,7 @@ impl WorkflowContext {
             ledger,
             clarifier,
             acceptance: Mutex::new(None),
+            container_image: tokio::sync::OnceCell::new(),
             plugin_context,
             config: config.clone(),
             store: store.clone(),
@@ -221,6 +224,35 @@ impl WorkflowContext {
         let mut slot = self.acceptance.lock().expect("acceptance mutex poisoned");
         slot.get_or_insert_with(|| self.config.sandbox.acceptance(proposed))
             .clone()
+    }
+
+    /// Resolve the container tag once, only when the full run actually reaches sandboxed work.
+    /// Landlock and MicroVM runs retain their configured image behavior and require no OCI runtime.
+    pub(crate) async fn resolved_container_image(&self) -> Result<Option<String>, String> {
+        if self.config.sandbox.backend != "container" {
+            return Ok(None);
+        }
+        self.container_image
+            .get_or_try_init(|| async {
+                let image = ratatoskr_exec::resolve_container_image(&self.config.sandbox.image)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                self.store
+                    .record_run_provenance(&self.run_id, None, None, None, None, Some(&image))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(image))
+            })
+            .await
+            .cloned()
+    }
+
+    fn sandbox_config(&self) -> ratatoskr_core::SandboxConfig {
+        let mut sandbox = self.config.sandbox.clone();
+        if let Some(Some(image)) = self.container_image.get() {
+            sandbox.image.clone_from(image);
+        }
+        sandbox
     }
 
     /// Count one node-running binding call and refuse past the ceiling.
@@ -535,7 +567,7 @@ fn build_red_team(
         repo_path: ctx.repo_path.clone(),
         worktree_root: ctx.config.worktree.root.clone(),
         baseline_branch: format!("ratatoskr/{short}-baseline"),
-        sandbox: ctx.config.sandbox.clone(),
+        sandbox: ctx.sandbox_config(),
         name: format!("ratatoskr-redteam-{short}"),
         classifier,
     })
@@ -591,6 +623,7 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
     let analyst = latest_checkpoint::<AnalystOutput>(&ctx.store, &ctx.run_id, "analyst")
         .await
         .map_err(|error| error.to_string())?;
+    ctx.resolved_container_image().await?;
     let acceptance = ctx.acceptance(&analyst.acceptance);
     let implementer = build_implementer(&ctx, analyst.clone()).map_err(|e| e.to_string())?;
     let worktree = implementer.prepare().await.map_err(|e| e.to_string())?;
@@ -638,7 +671,7 @@ fn build_implementer(
         .flatten(),
         repo_path: ctx.repo_path.clone(),
         worktree_root: ctx.config.worktree.root.clone(),
-        sandbox: ctx.config.sandbox.clone(),
+        sandbox: ctx.sandbox_config(),
         route: cfg.route,
         tools: cfg.tools,
         policy: cfg.policy,
@@ -673,6 +706,7 @@ async fn implement_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String
     }
     let input: ImplementArg =
         serde_json::from_str(&arg).map_err(|e| format!("implement arg: {e}"))?;
+    ctx.resolved_container_image().await?;
     let node = build_implementer(&ctx, input.analyst).map_err(|e| e.to_string())?;
     let prepared = { ctx.worktree.lock().unwrap().clone() };
     let worktree = match prepared {
@@ -930,6 +964,7 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
         );
     };
 
+    ctx.resolved_container_image().await?;
     let node = build_implementer(&ctx, analyst).map_err(|e| e.to_string())?;
     let out = node
         .iterate(&worktree, &diagnostic)
@@ -1187,6 +1222,7 @@ impl CeilingRecovery for LiveCeilingRecovery {
         revised: &AnalystOutput,
         diagnostic: &str,
     ) -> Result<ImplementerOutput, String> {
+        ctx.resolved_container_image().await?;
         build_implementer(ctx, revised.clone())
             .map_err(|error| error.to_string())?
             .iterate(worktree, diagnostic)
@@ -8772,5 +8808,243 @@ mod tests {
             infer_status(&baseline, &plain, &[], None, verifier::Severity::P2),
             RunStatus::Converged
         );
+    }
+
+    // --- the run's one resolved container image (#149) -------------------------
+    //
+    // Contract reading: WorkflowContext holds the run's one resolved container image and hands
+    // it out through `resolved_container_image` — `Ok(Some(digest))` for a container-backed run,
+    // `Ok(None)` for a backend with no image. The contract names no accessor; what is pinned
+    // here is the behaviour it states: resolution happens once, every sandbox the run builds
+    // uses that identifier, a retag after resolution cannot move it, and selecting `container`
+    // without a runtime is an error rather than a downgrade to landlock.
+
+    /// Restores `PATH` on drop. Prepending is safe for tests running alongside (every lookup
+    /// that resolved before still resolves); replacing is not, so the replaced window is kept
+    /// to a single resolution call.
+    struct PathGuard(Option<std::ffi::OsString>);
+
+    impl PathGuard {
+        fn prepended(dir: &std::path::Path) -> Self {
+            let old = std::env::var_os("PATH");
+            let mut paths = vec![dir.to_path_buf()];
+            if let Some(old) = &old {
+                paths.extend(std::env::split_paths(old));
+            }
+            // SAFETY: process-environment mutation races with other tests; this only adds a
+            // directory, and drop restores.
+            unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
+            Self(old)
+        }
+
+        fn replaced_with(dir: &std::path::Path) -> Self {
+            let old = std::env::var_os("PATH");
+            // SAFETY: races with concurrent tests' subprocess spawns for the guard's lifetime;
+            // kept to the one call that must see a runtime-less PATH, and drop restores.
+            unsafe { std::env::set_var("PATH", dir) };
+            Self(old)
+        }
+    }
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            // SAFETY: restores exactly what the guard found.
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("PATH", value),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    /// A directory posing as a container-runtime installation: an executable `docker` whose
+    /// `inspect` answers with `digest` — raw when asked with `--format`, as a JSON array
+    /// otherwise, because which of the two a correct implementation uses is its own business —
+    /// and which appends to `<dir>/inspections` every time it is asked, so a test can count.
+    fn fake_container_runtime(digest: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-fake-runtime-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let docker = dir.join("docker");
+        write_fake_runtime(&docker, &dir.join("inspections"), digest);
+        dir
+    }
+
+    fn write_fake_runtime(docker: &std::path::Path, inspections: &std::path::Path, digest: &str) {
+        // One long format string rather than line continuations: the script's own indentation
+        // is significant enough that eating it with Rust's `\`-newline would be a quiet bug.
+        let script = format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *\" inspect \"*)\n    echo ask >> '{}'\n    case \" $* \" in\n      *\" --format \"*) echo '{digest}' ;;\n      *) printf '[{{\"Id\":\"{digest}\"}}]\\n' ;;\n    esac ;;\n  *) exit 1 ;;\nesac\n",
+            inspections.display()
+        );
+        std::fs::write(docker, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_runs_container_image_is_resolved_once_and_a_retag_cannot_move_it() {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-image-freeze-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.sandbox.backend = "container".to_string();
+        config.sandbox.image = "ratatoskr-checks".to_string();
+        config
+            .models
+            .insert("implementer".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-image-freeze",
+            "pin the execution environment",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+
+        let first_digest = format!("sha256:{}", "ab".repeat(32));
+        let runtime_dir = fake_container_runtime(&first_digest);
+        let _path = PathGuard::prepended(&runtime_dir);
+
+        let first = ctx.resolved_container_image().await.unwrap();
+        assert_eq!(first.as_deref(), Some(first_digest.as_str()));
+
+        // The tag moves underneath the run — a new build pushed under the same name.
+        let later_digest = format!("sha256:{}", "cd".repeat(32));
+        write_fake_runtime(
+            &runtime_dir.join("docker"),
+            &runtime_dir.join("inspections"),
+            &later_digest,
+        );
+
+        // A later sandbox construction in the same run gets the first identifier, not the new
+        // one — a run is one immutable execution environment.
+        let second = ctx.resolved_container_image().await.unwrap();
+        assert_eq!(
+            second.as_deref(),
+            Some(first_digest.as_str()),
+            "a retag after resolution changed the image a later step would run"
+        );
+        let inspections =
+            std::fs::read_to_string(runtime_dir.join("inspections")).unwrap_or_default();
+        assert_eq!(
+            inspections.lines().count(),
+            1,
+            "the image was inspected more than once in one run: {inspections}"
+        );
+
+        // And what was resolved is what the implementer's sandbox is built from — the digest,
+        // not the mutable tag the config named.
+        let implementer = build_implementer(&ctx, review_plan()).unwrap();
+        let red_team = build_red_team(&ctx, Vec::new()).unwrap();
+        assert_eq!(implementer.sandbox.image, first_digest);
+        assert_eq!(red_team.sandbox.image, first_digest);
+
+        let _ = std::fs::remove_dir_all(runtime_dir);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_landlock_backend_attempts_no_image_resolution() {
+        // The configured fallback keeps its existing behaviour: no OCI inspection is attempted,
+        // and there is no image digest provenance to record.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-image-landlock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.sandbox.backend = "landlock".to_string();
+        config
+            .models
+            .insert("implementer".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-image-landlock",
+            "keep the fallback unchanged",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+
+        let runtime_dir = fake_container_runtime(&format!("sha256:{}", "ab".repeat(32)));
+        let _path = PathGuard::prepended(&runtime_dir);
+
+        let resolved = ctx.resolved_container_image().await.unwrap();
+        assert!(
+            resolved.is_none(),
+            "a backend with no image has no digest to resolve"
+        );
+        assert!(
+            !runtime_dir.join("inspections").exists(),
+            "the landlock backend attempted an OCI inspection"
+        );
+
+        // The sandbox the run builds is untouched: the host root and the host's toolchain,
+        // exactly as configured.
+        let implementer = build_implementer(&ctx, review_plan()).unwrap();
+        assert_eq!(implementer.sandbox.backend, "landlock");
+        assert_eq!(implementer.sandbox.image, config.sandbox.image);
+
+        let _ = std::fs::remove_dir_all(runtime_dir);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_container_run_without_a_runtime_fails_resolution_instead_of_downgrading() {
+        // Selecting `container` on a host with neither Docker nor Podman fails before any
+        // sandboxed step starts, naming that a container runtime is required. The one thing it
+        // must not do is run landlock instead: the config asked for no host root, and the
+        // fallback's exposure is exactly that.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-image-no-runtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.sandbox.backend = "container".to_string();
+        config.sandbox.image = "ratatoskr-checks".to_string();
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-image-no-runtime",
+            "fail rather than downgrade",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+
+        let empty = dir.join("no-runtime-here");
+        std::fs::create_dir_all(&empty).unwrap();
+        let err = {
+            let _path = PathGuard::replaced_with(&empty);
+            ctx.resolved_container_image()
+                .await
+                .expect_err("resolution without a runtime must fail")
+        };
+        assert!(
+            err.to_string().contains("container runtime"),
+            "the failure must name what is required: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

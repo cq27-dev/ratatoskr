@@ -5,7 +5,9 @@
 pub mod sandbox;
 pub mod worktree;
 
-pub use sandbox::{ExecOutput, Mount, SandboxError, SandboxSpec, run as sandbox_run};
+pub use sandbox::{
+    ExecOutput, Mount, SandboxError, SandboxSpec, resolve_container_image, run as sandbox_run,
+};
 pub use worktree::{
     Committer, ManagedWorktree, WorktreePath, WorktreeSurvey, commit_all,
     create as create_worktree, delete_branch as delete_worktree_branch, diff_text, full_diff_text,

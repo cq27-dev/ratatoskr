@@ -298,10 +298,14 @@ worktrees, the dashboard, clarification, plugins, skills, publishing.
 backend and test command, and the implementer's per-attempt turn and iteration budgets. It is validated on load,
 so a bad backend or an empty test command fails immediately rather than deep inside a run.
 
-The sandbox backend is `landlock` (bubblewrap + Landlock — the default; no image, builds offline)
-or `microsandbox` (a MicroVM, needs KVM). microsandbox sits behind a Cargo feature because its
-build script downloads a helper binary, which fails in the network-less test sandbox; enable it
-with `cargo build --features ratatoskr-exec/microsandbox`.
+The sandbox backend has three explicit rungs. `container` uses Docker or Podman to run the resolved
+OCI image: only declared mounts are visible from the host and its toolchain comes from that image.
+`landlock` is the weaker bubblewrap fallback (and default): it read-mounts the host root and uses the
+host toolchain, so choose it only when that exposure is acceptable. `microsandbox` is a MicroVM that
+needs KVM and the `ratatoskr-exec/microsandbox` Cargo feature; its image identity is not yet recorded
+like the container backend's digest. Container image tags are resolved once when sandboxed work begins
+and the resulting `sha256:` identity is kept in run provenance. The bwrap/landlock `--clearenv`
+passlist still matters: it limits inherited environment variables but does not hide the host filesystem.
 
 ### Model providers
 
