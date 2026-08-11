@@ -69,6 +69,7 @@ pub enum StoreError {
 
 pub mod auth;
 pub mod bundle;
+pub mod provider_pause;
 
 /// A per-node checkpoint snapshot read back from the `checkpoints` table.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

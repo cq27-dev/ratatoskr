@@ -152,7 +152,7 @@ impl NodeTelemetryView {
 /// enum: a status that is absent, or one written by a newer build than this one, reads as still
 /// executing — the safe direction, since it shows a stale run rather than declaring a live one
 /// finished.
-fn is_terminal(status: Option<&str>) -> bool {
+pub(crate) fn is_terminal(status: Option<&str>) -> bool {
     status
         .and_then(|s| s.parse::<ratatoskr_core::RunStatus>().ok())
         .is_some_and(|s| s.is_terminal())
@@ -164,11 +164,11 @@ fn is_terminal(status: Option<&str>) -> bool {
 /// - **The implementer re-runs.** Converge checkpoints it once per iteration, so "has a
 ///   checkpoint" does not mean finished — while the run is live it is still converging, and the
 ///   fork stage is not complete no matter how many checkpoints it has.
-/// - **The bookkeeper runs after the terminal status is written**, and a bookkeeping failure is
-///   only logged. So it can never be the cause of a `failed` run, and it is never reported
-///   `Failed`. A terminal run with no bookkeeper checkpoint is genuinely ambiguous — in flight,
-///   silently failed, or never applicable — and is reported `Idle` rather than guessed at. Pair
-///   it with the run's `last_activity` to judge.
+/// - **The bookkeeper runs before the terminal status is written**, so it remains working while
+///   its provider request can be paused and resumed. A bookkeeping failure is only logged, so it
+///   can never cause a `failed` run or be reported `Failed`. A terminal run with no bookkeeper
+///   checkpoint is either silently failed or never applicable, and is reported `Idle` rather than
+///   guessed at. Pair it with the run's `last_activity` to judge.
 /// - **A `failed` run that reached the fork died in converge.** Since the only step after the
 ///   fork is bookkeeping and that cannot fail the run, the implementer is where it stopped, even
 ///   though it has checkpoints from earlier iterations.

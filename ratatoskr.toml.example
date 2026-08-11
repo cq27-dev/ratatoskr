@@ -144,6 +144,9 @@ model = "gpt-5.6-terra"
 # Planning errors multiply across every implementation and review turn. Keep the analyst on the
 # stronger reasoning route, while compacting before OpenAI's whole-request pricing cliff.
 context_window = 272000
+# Responses counts high-effort reasoning against this cap. Leave room for the analysis and the
+# required output tool call; the 8k default can end on a reasoning item with no verdict.
+max_tokens = 65536
 session = "compacted"
 
 [models.analyst.params.reasoning]

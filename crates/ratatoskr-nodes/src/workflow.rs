@@ -2483,13 +2483,6 @@ async fn finish_full<A: FullTerminalActions>(
     let plan = reconstruct_plan(&ctx.store, &ctx.run_id).await?;
     if !crate::fork_is_needed(&plan.analyst, &ctx.config) {
         let status = RunStatus::NoCodeChange;
-        if let Err(error) = ctx
-            .store
-            .upsert_run(&ctx.run_id, None, status.as_str())
-            .await
-        {
-            tracing::warn!("failed to record the run's final status: {error}");
-        }
         let published = actions
             .publish(
                 ctx,
@@ -2505,6 +2498,15 @@ async fn finish_full<A: FullTerminalActions>(
                 None,
             )
             .await;
+        // Publishing may pause for a provider. Do not advertise completion until that last stage
+        // returns, or the dashboard would hide the control that can resume the still-live child.
+        if let Err(error) = ctx
+            .store
+            .upsert_run(&ctx.run_id, None, status.as_str())
+            .await
+        {
+            tracing::warn!("failed to record the run's final status: {error}");
+        }
         let mut state = plan.state.clone();
         state.status = status;
         state.clarifications.extend(ctx.clarifier.drain());
@@ -2555,13 +2557,6 @@ async fn finish_full<A: FullTerminalActions>(
     );
     let status = status_with_review_availability(status, &review);
     actions.commit(ctx, &worktree, &implementer).await;
-    if let Err(error) = ctx
-        .store
-        .upsert_run(&ctx.run_id, None, status.as_str())
-        .await
-    {
-        tracing::warn!("failed to record final run status: {error}");
-    }
 
     let terminal = matches!(
         status,
@@ -2600,6 +2595,16 @@ async fn finish_full<A: FullTerminalActions>(
             Some(&worktree),
         )
     );
+
+    // Publisher and bookkeeper can each make provider requests. The terminal status only means
+    // the child has finished every such stage, so keep the stored run resumable until both return.
+    if let Err(error) = ctx
+        .store
+        .upsert_run(&ctx.run_id, None, status.as_str())
+        .await
+    {
+        tracing::warn!("failed to record final run status: {error}");
+    }
 
     let mut state = plan.state.clone();
     state.red_team = Some(serde_json::to_value(&red_team)?);
@@ -2793,6 +2798,7 @@ mod tests {
     struct RecordingTerminalActions {
         calls: Mutex<Vec<TerminalCall>>,
         publisher_worktrees: Mutex<Vec<Option<PathBuf>>>,
+        delivery_statuses: Mutex<Vec<Option<String>>>,
         published: Option<PublisherOutput>,
         bookkeeper: Option<BookkeeperOutput>,
     }
@@ -2802,6 +2808,7 @@ mod tests {
             Self {
                 calls: Mutex::new(Vec::new()),
                 publisher_worktrees: Mutex::new(Vec::new()),
+                delivery_statuses: Mutex::new(Vec::new()),
                 published: publish.then(|| PublisherOutput {
                     action: crate::publisher::PublisherAction::Comment,
                     pull_request_url: String::new(),
@@ -2831,6 +2838,13 @@ mod tests {
                 .expect("terminal calls mutex poisoned")
                 .clone()
         }
+
+        fn delivery_statuses(&self) -> Vec<Option<String>> {
+            self.delivery_statuses
+                .lock()
+                .expect("terminal delivery statuses mutex poisoned")
+                .clone()
+        }
     }
 
     impl FullTerminalActions for RecordingTerminalActions {
@@ -2851,11 +2865,20 @@ mod tests {
 
         async fn publish(
             &self,
-            _ctx: &Arc<WorkflowContext>,
+            ctx: &Arc<WorkflowContext>,
             input: PublisherInput,
             terminal: bool,
             worktree: Option<&WorktreePath>,
         ) -> Option<PublisherOutput> {
+            let stored_status = ctx
+                .store
+                .run_status(&ctx.run_id)
+                .await
+                .expect("terminal run status");
+            self.delivery_statuses
+                .lock()
+                .expect("terminal delivery statuses mutex poisoned")
+                .push(stored_status);
             self.publisher_worktrees
                 .lock()
                 .expect("terminal publisher worktree mutex poisoned")
@@ -2875,9 +2898,18 @@ mod tests {
 
         async fn bookkeep(
             &self,
-            _ctx: &Arc<WorkflowContext>,
+            ctx: &Arc<WorkflowContext>,
             input: BookkeeperInput,
         ) -> Option<BookkeeperOutput> {
+            let stored_status = ctx
+                .store
+                .run_status(&ctx.run_id)
+                .await
+                .expect("terminal run status");
+            self.delivery_statuses
+                .lock()
+                .expect("terminal delivery statuses mutex poisoned")
+                .push(stored_status);
             self.calls
                 .lock()
                 .expect("terminal calls mutex poisoned")
@@ -3954,6 +3986,7 @@ mod tests {
                 "implementer",
                 "analyst",
                 "Which invariant controls this change?",
+                None,
             )
             .await;
 
@@ -3982,8 +4015,12 @@ mod tests {
             _from: &'a str,
             _to: &'a str,
             _question: &'a str,
-        ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
-            Box::pin(async { "static answer".to_string() })
+            _control: Option<ratatoskr_agent::RuntimeControl>,
+        ) -> Pin<Box<dyn Future<Output = ratatoskr_agent::ClarificationAnswer> + Send + 'a>>
+        {
+            Box::pin(async {
+                ratatoskr_agent::ClarificationAnswer::Text("static answer".to_string())
+            })
         }
     }
 
@@ -8515,6 +8552,11 @@ mod tests {
             Some(RunStatus::NoCodeChange.as_str())
         );
         assert_eq!(
+            actions.delivery_statuses(),
+            [Some(RunStatus::Running.as_str().to_string())],
+            "publisher remains resumable until it has finished"
+        );
+        assert_eq!(
             actions.calls(),
             [TerminalCall::Publish {
                 status: RunStatus::NoCodeChange.as_str().to_string(),
@@ -8528,7 +8570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scripted_terminal_commits_before_delivery_and_bookkeeps_unreviewed_work() {
+    async fn scripted_terminal_delivery_keeps_the_run_resumable_until_every_stage_finishes() {
         let dir = std::env::temp_dir().join(format!(
             "ratatoskr-scripted-terminal-parity-{}",
             std::process::id()
@@ -8579,6 +8621,14 @@ mod tests {
         assert_eq!(
             store.run_status(run_id).await.unwrap().as_deref(),
             Some(RunStatus::Unreviewed.as_str())
+        );
+        assert_eq!(
+            actions.delivery_statuses(),
+            [
+                Some(RunStatus::Running.as_str().to_string()),
+                Some(RunStatus::Running.as_str().to_string()),
+            ],
+            "publisher and bookkeeper both run while the dashboard can resume a provider pause"
         );
         let calls = actions.calls();
         assert_eq!(

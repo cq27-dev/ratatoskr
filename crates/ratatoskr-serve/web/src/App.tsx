@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryState } from "nuqs";
-import { applyDerived, nodesFromEvents } from "./derive";
+import { applyDerived, nodesFromEvents, workingNodeNames } from "./derive";
+import { pendingQuestions } from "./questions";
 import {
   elapsedAt,
   indexAtElapsed,
@@ -396,8 +397,8 @@ export default function App() {
    * would stop a node that finished ten minutes ago.
    */
   const workingNodes = useMemo(
-    () => (detail?.nodes ?? []).filter((n) => n.state === "working").map((n) => n.name),
-    [detail],
+    () => workingNodeNames(detail?.nodes ?? [], timeline),
+    [detail, timeline],
   );
 
   /**
@@ -542,23 +543,7 @@ export default function App() {
     };
   }, [runId, node, project]);
 
-  // Every question stands until its *own* resolution arrives — during the fork two nodes run
-  // concurrently and can both be waiting, and resolving one must not hide the other. A viewer who
-  // attaches mid-wait still sees them, because the stream replays history on connect.
-  const open = new Map<string, LiveEvent>();
-  for (const event of events) {
-    if (!event.question_id) {
-      // A run ending resolves anything still outstanding.
-      if (event.kind.startsWith("run_")) open.clear();
-      continue;
-    }
-    if (event.kind === "question") open.set(event.question_id, event);
-    if (event.kind === "question_answered") open.delete(event.question_id);
-  }
-  // Answered in this tab: clear immediately rather than waiting for the run's event to come back
-  // round through the log.
-  for (const id of answered) open.delete(id);
-  const pending = [...open.values()];
+  const pending = pendingQuestions(events, answered);
 
   return (
     <div className="shell">

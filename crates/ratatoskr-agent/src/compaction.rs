@@ -84,9 +84,17 @@ const MAX_TOOL_RESULT_CHARS: usize = 16 * 1024;
 #[derive(Clone, Default)]
 pub struct CompactedSession {
     memory: Arc<Mutex<Option<Arc<dyn ConversationMemory>>>>,
+    // The compactor itself is cached, so it retains the first attempt's RuntimeControl. Every
+    // re-entry of this run-local session must therefore share this pending state with that control.
+    pending: Arc<crate::Pending>,
 }
 
 impl CompactedSession {
+    /// Return the operator state shared by every attempt that re-enters this local continuation.
+    pub(crate) fn pending(&self) -> Arc<crate::Pending> {
+        Arc::clone(&self.pending)
+    }
+
     /// Return the one memory backend shared by every attempt of this node.
     pub(crate) fn memory<M>(
         &self,
@@ -95,6 +103,7 @@ impl CompactedSession {
         produces: &str,
         ledger: Option<Arc<crate::RunLedger>>,
         provider_calls: crate::ProviderCallQueue,
+        control: Option<crate::RuntimeControl>,
     ) -> Arc<dyn ConversationMemory>
     where
         M: CompletionModel + 'static,
@@ -117,6 +126,7 @@ impl CompactedSession {
             0,
             ledger,
             provider_calls,
+            control,
         ));
         *slot = Some(Arc::clone(&memory));
         memory
@@ -139,6 +149,9 @@ pub struct SummaryCompactor<M> {
     /// fire precisely when a session got long and expensive.
     ledger: Option<Arc<crate::RunLedger>>,
     provider_calls: crate::ProviderCallQueue,
+    /// Provider pauses must work while the conversation is being compacted too: the summary is
+    /// another model request in the node's same operator-controlled run.
+    control: Option<crate::RuntimeControl>,
     /// The node being compacted, and what it has to end up producing.
     ///
     /// Included in the instruction because "keep what matters" is unanswerable in the abstract: what
@@ -156,11 +169,13 @@ impl<M> SummaryCompactor<M> {
         produces: &str,
         ledger: Option<Arc<crate::RunLedger>>,
         provider_calls: crate::ProviderCallQueue,
+        control: Option<crate::RuntimeControl>,
     ) -> Self {
         SummaryCompactor {
             model: Arc::new(model),
             ledger,
             provider_calls,
+            control,
             node: node.to_string(),
             produces: produces.to_string(),
         }
@@ -212,6 +227,7 @@ where
                 None,
                 crate::Request::plain(),
                 Arc::clone(&self.provider_calls),
+                self.control.clone(),
             );
             let agent = builder.build();
             // The enclosing agent prompt owns the one no-verdict retry. Retrying here as well
@@ -333,6 +349,7 @@ pub(crate) fn compacting_memory<M>(
     budget: usize,
     ledger: Option<Arc<crate::RunLedger>>,
     provider_calls: crate::ProviderCallQueue,
+    control: Option<crate::RuntimeControl>,
 ) -> rig_memory::CompactingMemory<InMemoryConversationMemory, TokenWindowMemory, SummaryCompactor<M>>
 where
     M: CompletionModel + 'static,
@@ -340,7 +357,7 @@ where
     rig_memory::CompactingMemory::new(
         InMemoryConversationMemory::new(),
         TokenWindowMemory::new(budget, tokens_in),
-        SummaryCompactor::new(model, node, produces, ledger, provider_calls),
+        SummaryCompactor::new(model, node, produces, ledger, provider_calls, control),
     )
 }
 
@@ -352,13 +369,123 @@ pub fn default_budget() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use ratatoskr_core::Control;
     use rig_core::OneOrMany;
     use rig_core::completion::message::{ToolResult, ToolResultContent, UserContent};
+    use rig_core::completion::{CompletionError, CompletionRequest, CompletionResponse};
+    use rig_core::message::AssistantContent;
+    use rig_core::streaming::StreamingCompletionResponse;
 
     #[test]
     fn compaction_uses_the_shared_per_turn_retry_wrapper() {
         let source = include_str!("compaction.rs");
         assert!(source.contains("crate::metered("));
+    }
+
+    #[derive(Clone, Default)]
+    struct QuotaThenSummary {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl CompletionModel for QuotaThenSummary {
+        type Response = ();
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self::default()
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(CompletionError::ResponseError(
+                    "insufficient_quota".to_string(),
+                ));
+            }
+            Ok(CompletionResponse {
+                choice: OneOrMany::one(AssistantContent::text("the retained summary")),
+                usage: Default::default(),
+                raw_response: (),
+                message_id: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+            Err(CompletionError::ResponseError(
+                "unused streaming path".to_string(),
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct ResumingController {
+        paused: AtomicBool,
+    }
+
+    impl crate::Controller for ResumingController {
+        fn poll<'a>(
+            &'a self,
+            _node: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Control> + Send + 'a>> {
+            Box::pin(async { Control::carry_on() })
+        }
+
+        fn pause<'a>(
+            &'a self,
+            _node: &'a str,
+            _waiter: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::ProviderPauseRegistration> + Send + 'a>,
+        > {
+            self.paused.store(true, Ordering::SeqCst);
+            Box::pin(async { crate::ProviderPauseRegistration::Paused })
+        }
+
+        fn acknowledge_provider_pause<'a>(
+            &'a self,
+            _node: &'a str,
+            _waiter: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::ProviderPauseAcknowledgement> + Send + 'a>,
+        > {
+            Box::pin(async { crate::ProviderPauseAcknowledgement::Continue })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_quota_failure_while_compacting_pauses_then_retries_the_summary() {
+        let model = QuotaThenSummary::default();
+        let attempts = Arc::clone(&model.attempts);
+        let controller = Arc::new(ResumingController::default());
+        let control = crate::RuntimeControl {
+            node: "analyst".to_string(),
+            controller: controller.clone(),
+            pending: Arc::new(crate::Pending::default()),
+        };
+        let compactor = SummaryCompactor::new(
+            model,
+            "analyst",
+            "a complete analysis",
+            None,
+            crate::ProviderCallQueue::default(),
+            Some(control),
+        );
+
+        let summary = compactor
+            .compact("conversation", &[Message::user("preserve this fact")], None)
+            .await
+            .expect("the resumed summary should complete");
+        assert!(render(&summary).contains("the retained summary"));
+        assert!(controller.paused.load(Ordering::SeqCst));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -474,6 +601,7 @@ mod tests {
             "the requirements an implementation must satisfy",
             None,
             crate::ProviderCallQueue::default(),
+            None,
         );
 
         let evicted = vec![

@@ -113,8 +113,9 @@ enum Command {
         /// contents of every file its tools read. Starting runs still needs an operator.
         #[arg(long = "public")]
         public: Vec<String>,
-        /// Where this instance keeps its accounts and sessions. Not a project's store — one
-        /// instance can watch several projects, and identity belongs to none of them.
+        /// Where this instance keeps accounts, sessions, and provider-pause delivery state. Not a
+        /// project's store — one instance can watch several projects, and these records belong to
+        /// none of them.
         #[arg(long, default_value = ".ratatoskr/auth.sqlite3")]
         auth_db: PathBuf,
         /// Enable the GitHub integration under this trigger word, without any sigil.
@@ -516,6 +517,7 @@ async fn ask(question: &str, config_path: &Path) -> anyhow::Result<()> {
         ASK_PREAMBLE,
         question,
         ratatoskr_mcp::ToolSet::from_servers(client.iter().map(|c| c.offer()).collect()),
+        None,
         None,
     )
     .await;

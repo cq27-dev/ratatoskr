@@ -56,7 +56,8 @@ pub const BUILT_IN: &[Stage] = &[
     optional(&["verifier"]),
     // The run's two deliveries: one writes to the memory graph, the other to the tracker. Neither
     // needs the other's result, so `run_full` reaches them together. The publisher is opt-in; the
-    // bookkeeper always runs, but after the terminal status, so neither is ever reported working.
+    // bookkeeper always runs. Their in-flight activity comes from the live event stream rather
+    // than checkpoint-derived pipeline state, which only proves that an attempt finished.
     required(&["bookkeeper", "publisher"]),
 ];
 

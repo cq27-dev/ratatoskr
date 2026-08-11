@@ -17,9 +17,6 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use bytes::Bytes;
 use ratatoskr_core::{
     Control, Directive, ModelRoute, NodeTelemetry, TokenUsage, ToolDecision, ToolPolicy,
@@ -86,17 +83,27 @@ pub struct Skill {
     pub body: String,
 }
 
+/// What a nested `ask` returns to the asking node.
+///
+/// Most clarification failures become text so the asker can make a best-effort decision. An
+/// operator stop is different: it ends the asker's turn before it can send another provider
+/// request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClarificationAnswer {
+    Text(String),
+    Stopped,
+}
+
 /// Answers a node's `ask` call by running the target node against its stored context (implemented in
 /// `ratatoskr-nodes`). Lives here so [`ClarificationHook`] can hold it without a dependency cycle.
-/// Always yields text — a failure to answer becomes best-effort guidance, never an error that breaks
-/// the asking node's turn loop.
 pub trait Clarifier: Send + Sync {
     fn answer<'a>(
         &'a self,
         from: &'a str,
         to: &'a str,
         question: &'a str,
-    ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>;
+        control: Option<RuntimeControl>,
+    ) -> Pin<Box<dyn Future<Output = ClarificationAnswer> + Send + 'a>>;
 }
 
 /// Where a node asks what the operator watching it wants (implemented in `ratatoskr-nodes`, which
@@ -107,6 +114,86 @@ pub trait Clarifier: Send + Sync {
 /// answer can be acted on.
 pub trait Controller: Send + Sync {
     fn poll<'a>(&'a self, node: &'a str) -> Pin<Box<dyn Future<Output = Control> + Send + 'a>>;
+
+    /// Poll after a provider failure has already been persisted as a dashboard pause.
+    ///
+    /// Unlike an ordinary turn-boundary poll, losing contact here must not imply the operator
+    /// resumed the run: retrying could spend quota while the dashboard still shows it paused.
+    /// Controllers that cannot distinguish an unavailable control channel retain the ordinary
+    /// behavior by returning their next control response. `waiter` remains stable for this one
+    /// pause lifecycle, so a dashboard can distinguish concurrent waits after it restarts.
+    fn poll_while_paused<'a>(
+        &'a self,
+        node: &'a str,
+        _waiter: &'a str,
+    ) -> Pin<Box<dyn Future<Output = PausedPoll> + Send + 'a>> {
+        Box::pin(async move { PausedPoll::Response(self.poll(node).await) })
+    }
+
+    /// Record an automatic pause before a provider failure waits for the operator.
+    ///
+    /// This is separate from [`Self::poll`]: a poll only reads a decision already made, while a
+    /// provider failure has to make the dashboard show its paused state before the run can wait
+    /// for a person. Controllers that have nowhere durable to record that state decline the hold,
+    /// so a command-line run still returns the provider error instead of hanging unattended.
+    /// `waiter` identifies the later paused polls belonging to this provider request. An uncertain
+    /// response means the dashboard may already have persisted the pause, so callers keep
+    /// reconciling it through [`Self::poll_while_paused`] until the dashboard responds.
+    fn pause<'a>(
+        &'a self,
+        _node: &'a str,
+        _waiter: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ProviderPauseRegistration> + Send + 'a>> {
+        Box::pin(async { ProviderPauseRegistration::Unavailable })
+    }
+
+    /// Acknowledge that this child received a provider pause's `Continue` or `Stop` delivery.
+    ///
+    /// The acknowledgement is retried before the provider call continues, so a lost response can
+    /// never make a restarted dashboard forget an operator's one resume.
+    fn acknowledge_provider_pause<'a>(
+        &'a self,
+        _node: &'a str,
+        _waiter: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ProviderPauseAcknowledgement> + Send + 'a>> {
+        Box::pin(async { ProviderPauseAcknowledgement::Unavailable })
+    }
+}
+
+/// The result of asking a dashboard to resume a provider-paused run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PausedPoll {
+    /// The dashboard was reached and returned an operator control response.
+    Response(Control),
+    /// The dashboard could not be reached or returned an invalid response. Keep waiting.
+    Unavailable,
+}
+
+/// The durable result of registering an automatic provider pause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderPauseRegistration {
+    /// The dashboard durably recorded the pause and is waiting for an operator.
+    Paused,
+    /// The dashboard had already durably resumed this pause before the child received its reply.
+    Resumed,
+    /// The dashboard has durably fenced this run after confirmed process exit.
+    Stopped,
+    /// The request's response was lost or invalid; reconcile paused polls until one succeeds.
+    Uncertain,
+    /// No controller can persist a provider pause for this run.
+    Unavailable,
+}
+
+/// The durable directive returned when a provider-pause delivery is acknowledged.
+///
+/// This is deliberately not a bare acknowledgement success. A response can be lost after the
+/// server commits it; a retry must then report a Stop that arrived in that interval before the
+/// child is allowed to make another provider request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderPauseAcknowledgement {
+    Continue,
+    Stop,
+    Unavailable,
 }
 
 /// What a node's run reports to the plugins bound to it (implemented in `ratatoskr-nodes`, which
@@ -210,6 +297,12 @@ struct TelemetryHttp {
     response_usage: ResponseUsageCapture,
 }
 
+/// The useful, safe part of an OpenAI response Rig turns into the generic empty-response error.
+struct EmptyOpenAiResponse {
+    usage: TokenUsage,
+    reached_output_limit: bool,
+}
+
 fn record_provider_call(calls: &ProviderCallQueue) -> ProviderCall {
     let mut calls = calls.lock().expect("provider-call log poisoned");
     let call = ProviderCall {
@@ -244,12 +337,22 @@ impl HttpClientExt for TelemetryHttp {
             let body: http_client::LazyBody<U> = Box::pin(async move {
                 let bytes = body.await?;
                 if matches!(response_usage, ResponseUsageCapture::OpenAiResponses)
-                    && let Some(usage) = empty_openai_response_usage(&bytes)
+                    && let Some(empty) = empty_openai_response(&bytes)
                 {
+                    if empty.reached_output_limit {
+                        // Rig's conversion keeps only its generic empty-response message. The
+                        // raw response still gives us this actionable, non-sensitive diagnosis.
+                        tracing::warn!(
+                            kind = "provider_diagnostic",
+                            provider = "openai",
+                            diagnosis = "max_output_tokens",
+                            "OpenAI reached the output-token limit before returning a message or tool call"
+                        );
+                    }
                     *call
                         .empty_usage
                         .lock()
-                        .expect("provider-call usage mutex poisoned") = Some(usage);
+                        .expect("provider-call usage mutex poisoned") = Some(empty.usage);
                 }
                 Ok(U::from(bytes))
             });
@@ -282,7 +385,11 @@ impl HttpClientExt for TelemetryHttp {
     }
 }
 
-fn empty_openai_response_usage(body: &[u8]) -> Option<TokenUsage> {
+fn empty_openai_response(body: &[u8]) -> Option<EmptyOpenAiResponse> {
+    let raw: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let reached_output_limit = raw
+        .pointer("/incomplete_details/reason")
+        .and_then(|reason| (reason.as_str() == Some("max_output_tokens")).then_some(()));
     let response: openai::responses_api::CompletionResponse = serde_json::from_slice(body).ok()?;
     let usage = response.usage.as_ref()?.token_usage();
     let converted = CompletionResponse::try_from(response);
@@ -290,12 +397,15 @@ fn empty_openai_response_usage(body: &[u8]) -> Option<TokenUsage> {
     {
         return None;
     }
-    Some(TokenUsage {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cached_input_tokens: usage.cached_input_tokens,
-        cache_creation_input_tokens: usage.cache_creation_input_tokens,
-        reasoning_tokens: usage.reasoning_tokens,
+    Some(EmptyOpenAiResponse {
+        usage: TokenUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+        },
+        reached_output_limit: reached_output_limit.is_some(),
     })
 }
 
@@ -344,68 +454,102 @@ pub async fn ask(
     question: &str,
     tools: ToolSet,
     max_turns: Option<usize>,
+    control: Option<RuntimeControl>,
 ) -> Result<String, AgentError> {
+    let node = control
+        .as_ref()
+        .map_or_else(|| "ask".to_string(), |control| control.node.clone());
     match parse_provider(&route.provider)? {
         Provider::Anthropic => {
             let session = uuid::Uuid::new_v4().to_string();
             let (client, calls) = anthropic_client(Some(&session))?;
-            run(
-                caching(client.completion_model(&route.model)),
+            run(AskRun {
+                model: caching(client.completion_model(&route.model)),
+                node: &node,
                 preamble,
                 question,
                 tools,
                 max_turns,
                 route,
                 calls,
-            )
+                control,
+            })
             .await
         }
         Provider::OpenAi => {
             let (client, calls) = openai_client()?;
-            run(
-                client.completion_model(&route.model),
+            run(AskRun {
+                model: client.completion_model(&route.model),
+                node: &node,
                 preamble,
                 question,
                 tools,
                 max_turns,
                 route,
                 calls,
-            )
+                control,
+            })
             .await
         }
         Provider::Moonshot => {
             let (client, calls) = moonshot_client()?;
-            run(
+            run(AskRun {
                 // Not `caching`: the field exists on this provider's model too, but whether the
                 // endpoint honours an Anthropic `cache_control` is its business, and sending one
                 // it rejects would cost the call rather than the cache.
-                client.completion_model(&route.model),
+                model: client.completion_model(&route.model),
+                node: &node,
                 preamble,
                 question,
                 tools,
                 max_turns,
                 route,
                 calls,
-            )
+                control,
+            })
             .await
         }
     }
 }
 
-/// Provider-agnostic core: build the agent with the MCP tools bound, then prompt.
-async fn run<M>(
+/// The stable context that makes one free-form `ask` request.
+struct AskRun<'a, M> {
     model: M,
-    preamble: &str,
-    question: &str,
+    node: &'a str,
+    preamble: &'a str,
+    question: &'a str,
     tools: ToolSet,
     max_turns: Option<usize>,
-    route: &ModelRoute,
+    route: &'a ModelRoute,
     calls: ProviderCallQueue,
-) -> Result<String, AgentError>
+    control: Option<RuntimeControl>,
+}
+
+/// Provider-agnostic core: build the agent with the MCP tools bound, then prompt.
+async fn run<M>(run: AskRun<'_, M>) -> Result<String, AgentError>
 where
     M: CompletionModel + 'static,
 {
-    let (builder, meter) = metered("ask", model, preamble, max_turns, Request::of(route), calls);
+    let AskRun {
+        model,
+        node,
+        preamble,
+        question,
+        tools,
+        max_turns,
+        route,
+        calls,
+        control,
+    } = run;
+    let (builder, meter) = metered(
+        node,
+        model,
+        preamble,
+        max_turns,
+        Request::of(route),
+        calls,
+        control,
+    );
     let agent = bind_tools(builder, &tools, None, None, None, None);
 
     let answer = agent.prompt(question).await;
@@ -788,6 +932,67 @@ fn is_transport_error(message: &str) -> bool {
 
 const EMPTY_RESPONSE: &str = "Response contained no message or tool call (empty)";
 
+/// A provider failure which cannot improve until the person operating the run changes something.
+///
+/// Kept deliberately narrow. The provider client erases structured errors into strings, so a
+/// broad match here would turn a malformed request into an indefinite wait; only quota failures
+/// and service-side outages belong to the operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderPauseReason {
+    UsageLimit,
+    Outage,
+}
+
+impl ProviderPauseReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::UsageLimit => {
+                "the API key has reached its usage limit; continue after adding capacity"
+            }
+            Self::Outage => "the model provider is temporarily unavailable; continue to retry",
+        }
+    }
+
+    fn field(self) -> &'static str {
+        match self {
+            Self::UsageLimit => "usage_limit",
+            Self::Outage => "provider_outage",
+        }
+    }
+}
+
+fn provider_pause_reason(error: &CompletionError) -> Option<ProviderPauseReason> {
+    if error
+        .provider_response_status()
+        .is_some_and(|status| status.is_server_error())
+    {
+        return Some(ProviderPauseReason::Outage);
+    }
+
+    let message = error.to_string().to_ascii_lowercase();
+    const USAGE_LIMIT: [&str; 5] = [
+        "insufficient_quota",
+        "billing_hard_limit_reached",
+        "exceeded your current quota",
+        "usage limit reached",
+        "credit balance",
+    ];
+    const OUTAGE: [&str; 5] = [
+        "server_error",
+        "service unavailable",
+        "temporarily unavailable",
+        "provider is overloaded",
+        "service is overloaded",
+    ];
+    if USAGE_LIMIT.iter().any(|needle| message.contains(needle)) {
+        Some(ProviderPauseReason::UsageLimit)
+    } else if OUTAGE.iter().any(|needle| message.contains(needle)) {
+        Some(ProviderPauseReason::Outage)
+    } else {
+        None
+    }
+}
+
 fn model_retry_reason(message: &str) -> Option<&'static str> {
     if is_transport_error(message) {
         Some("transport")
@@ -798,31 +1003,356 @@ fn model_retry_reason(message: &str) -> Option<&'static str> {
     }
 }
 
-/// Retry one provider turn that produced no verdict, without turning a persistent failure into a
-/// loop.
-async fn retry_model_turn_once<T, F, Fut>(
+/// Runtime state the model wrapper shares with the node's control hook.
+///
+/// A provider error lands before rig reaches a hook boundary. Keeping the same pending state here
+/// means operator text sent while the run is paused is still delivered exactly once on its next
+/// safe boundary instead of being consumed by the wait.
+#[derive(Clone)]
+pub struct RuntimeControl {
+    // A nested `ask` is work for the node that issued it. Pausing a synthetic "ask" node would
+    // leave the dashboard unable to show or resume the actual stage.
+    node: String,
+    controller: Arc<dyn Controller>,
+    pending: Arc<Pending>,
+}
+
+impl RuntimeControl {
+    /// Whether an operator stopped this node during nested work.
+    pub fn is_stopped(&self) -> bool {
+        self.pending
+            .stopped
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Poll ordinary controls while nested work is in flight.
+    ///
+    /// A nested clarification has no outer hook boundary until it returns. It must therefore
+    /// observe Stop itself, while preserving steering for the parent node's next safe boundary.
+    /// Hold intentionally remains a boundary-only control: suspending a request or a human-answer
+    /// rendezvous mid-flight would leave its protocol half-complete.
+    pub async fn poll_for_stop(&self) -> bool {
+        if self.is_stopped() {
+            return true;
+        }
+        let control = self.controller.poll(&self.node).await;
+        if !control.steer.is_empty() {
+            self.pending
+                .steer
+                .lock()
+                .expect("steer poisoned")
+                .extend(control.steer);
+        }
+        // A provider-pause session can begin while this control request is in flight. Its durable
+        // Stop must be acknowledged by that session, so this observer leaves the response for the
+        // session to reconcile instead of cancelling the future that owns the waiter.
+        if control.directive == Directive::Stop && !self.provider_pause_is_active() {
+            self.pending
+                .stopped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            tracing::info!(kind = "control", node = %self.node, "stopped by the operator");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Await nested work while regularly observing whether its parent node was stopped.
+    ///
+    /// Dropping `work` on Stop cancels an in-flight provider request or human-answer wait before
+    /// the parent agent can send another provider turn.
+    pub async fn wait_for_stop_or<T>(&self, work: impl Future<Output = T>) -> Option<T> {
+        if self.poll_for_stop().await {
+            return None;
+        }
+
+        let mut work = Box::pin(work);
+        loop {
+            tokio::select! {
+                value = &mut work => {
+                    return (!self.poll_for_stop().await).then_some(value);
+                }
+                () = tokio::time::sleep(CONTROL_POLL) => {
+                    // A provider-pause session owns the paused operation's control delivery. A
+                    // second poll here could see Stop first and drop that session before it
+                    // acknowledges its durable waiter. The session polls promptly itself and
+                    // reports Stop through the shared pending state once cleanup is complete.
+                    if !self.provider_pause_is_active() && self.poll_for_stop().await {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn provider_pause_is_active(&self) -> bool {
+        self.pending
+            .provider_pause_sessions
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != 0
+    }
+}
+
+enum ProviderPauseWait {
+    Resumed,
+    Stopped,
+    Unavailable,
+}
+
+/// A delivered provider-pause directive that must be acknowledged before the waiter can finish.
+///
+/// Once a dashboard has delivered one of these, this request is in its acknowledgement phase. It
+/// must not poll or register again until the exact same waiter has acknowledged the delivery: the
+/// dashboard may have committed an acknowledgement whose HTTP response was lost.
+#[derive(Debug, Clone, Copy)]
+enum ProviderPauseDelivery {
+    Continue,
+    Stop,
+}
+
+/// The sole owner of one provider pause from registration through acknowledgement.
+///
+/// Nested callers may watch the enclosing work for an ordinary Stop, but while this session is
+/// active they leave provider-pause control delivery to it. That prevents cancellation from
+/// dropping a future that already owns a durable waiter.
+struct ProviderPauseSession<'a> {
+    node: &'a str,
+    control: &'a RuntimeControl,
+    reason: ProviderPauseReason,
+    waiter: String,
+}
+
+impl ProviderPauseSession<'_> {
+    fn start<'a>(
+        node: &'a str,
+        control: &'a RuntimeControl,
+        reason: ProviderPauseReason,
+    ) -> ProviderPauseSession<'a> {
+        control
+            .pending
+            .provider_pause_sessions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ProviderPauseSession {
+            node,
+            control,
+            reason,
+            waiter: provider_pause_waiter(),
+        }
+    }
+
+    async fn settle(self) -> ProviderPauseWait {
+        if self.control.is_stopped() {
+            return ProviderPauseWait::Stopped;
+        }
+
+        let registration = self.control.controller.pause(self.node, &self.waiter).await;
+        let mut pending_delivery = match registration {
+            ProviderPauseRegistration::Paused | ProviderPauseRegistration::Uncertain => None,
+            ProviderPauseRegistration::Resumed => Some(ProviderPauseDelivery::Continue),
+            ProviderPauseRegistration::Stopped => Some(ProviderPauseDelivery::Stop),
+            ProviderPauseRegistration::Unavailable => return ProviderPauseWait::Unavailable,
+        };
+        let mut dashboard_unavailable = false;
+        let mut pause_logged = false;
+        loop {
+            let _delivery = match pending_delivery.take() {
+                Some(delivery) => delivery,
+                None => match self
+                    .control
+                    .controller
+                    .poll_while_paused(self.node, &self.waiter)
+                    .await
+                {
+                    PausedPoll::Response(reply) => {
+                        if dashboard_unavailable {
+                            tracing::info!(
+                                kind = "run_pause_poll_recovered",
+                                node = self.node,
+                                pause_reason = self.reason.field(),
+                                "dashboard control recovered while the run remained paused"
+                            );
+                            dashboard_unavailable = false;
+                        }
+                        if !reply.steer.is_empty() {
+                            self.control
+                                .pending
+                                .steer
+                                .lock()
+                                .expect("steer poisoned")
+                                .extend(reply.steer);
+                        }
+                        match reply.directive {
+                            Directive::Continue => ProviderPauseDelivery::Continue,
+                            Directive::Stop => ProviderPauseDelivery::Stop,
+                            Directive::Hold => {
+                                if !pause_logged {
+                                    tracing::warn!(
+                                        kind = "run_paused",
+                                        node = self.node,
+                                        pause_reason = self.reason.field(),
+                                        "run paused: {}",
+                                        self.reason.message()
+                                    );
+                                    pause_logged = true;
+                                }
+                                tokio::time::sleep(CONTROL_POLL).await;
+                                continue;
+                            }
+                        }
+                    }
+                    PausedPoll::Unavailable => {
+                        if !dashboard_unavailable {
+                            tracing::warn!(
+                                kind = "run_pause_poll_unavailable",
+                                node = self.node,
+                                pause_reason = self.reason.field(),
+                                "dashboard control is unavailable; keeping the run paused"
+                            );
+                            dashboard_unavailable = true;
+                        }
+                        tokio::time::sleep(CONTROL_POLL).await;
+                        continue;
+                    }
+                },
+            };
+
+            // A delivery is terminal only after this exact waiter has acknowledged it. Retrying
+            // the ACK rather than polling prevents a lost response from registering a fresh Hold
+            // after a durable Continue or Stop has already been consumed. The acknowledgement's
+            // directive is authoritative: a Stop may have arrived after a committed ACK response
+            // was lost, and must still prevent this provider retry.
+            let acknowledgement = loop {
+                match self
+                    .control
+                    .controller
+                    .acknowledge_provider_pause(self.node, &self.waiter)
+                    .await
+                {
+                    ProviderPauseAcknowledgement::Continue => {
+                        break ProviderPauseAcknowledgement::Continue;
+                    }
+                    ProviderPauseAcknowledgement::Stop => {
+                        break ProviderPauseAcknowledgement::Stop;
+                    }
+                    ProviderPauseAcknowledgement::Unavailable => {
+                        if !dashboard_unavailable {
+                            tracing::warn!(
+                                kind = "run_pause_ack_unavailable",
+                                node = self.node,
+                                pause_reason = self.reason.field(),
+                                "dashboard acknowledgement is unavailable; keeping the run paused"
+                            );
+                            dashboard_unavailable = true;
+                        }
+                        tokio::time::sleep(CONTROL_POLL).await;
+                    }
+                }
+            };
+            if dashboard_unavailable {
+                tracing::info!(
+                    kind = "run_pause_ack_recovered",
+                    node = self.node,
+                    pause_reason = self.reason.field(),
+                    "dashboard acknowledgement recovered while the run remained paused"
+                );
+            }
+
+            match acknowledgement {
+                ProviderPauseAcknowledgement::Continue => {
+                    tracing::info!(
+                        kind = "run_resumed",
+                        node = self.node,
+                        pause_reason = self.reason.field(),
+                        "operator continued the run after a provider pause"
+                    );
+                    return ProviderPauseWait::Resumed;
+                }
+                ProviderPauseAcknowledgement::Stop => {
+                    self.control
+                        .pending
+                        .stopped
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return ProviderPauseWait::Stopped;
+                }
+                ProviderPauseAcknowledgement::Unavailable => unreachable!(
+                    "the acknowledgement loop returns only a durable provider-pause directive"
+                ),
+            }
+        }
+    }
+}
+
+impl Drop for ProviderPauseSession<'_> {
+    fn drop(&mut self) {
+        let sessions = self
+            .control
+            .pending
+            .provider_pause_sessions
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        debug_assert!(sessions > 0, "provider pause session count underflow");
+    }
+}
+
+fn provider_pause_waiter() -> String {
+    // A dashboard may outlive its child, and a later child must never reuse an old delivery key.
+    // The UUID also makes an acknowledgement safe to retry after either process restarted.
+    format!("provider-pause-{}", uuid::Uuid::new_v4())
+}
+
+/// Persist a provider-caused pause, then wait until the operator continues or stops this node.
+async fn wait_for_provider_resume(
     node: &str,
-    first: Result<T, CompletionError>,
-    retry: F,
+    control: &RuntimeControl,
+    reason: ProviderPauseReason,
+) -> ProviderPauseWait {
+    ProviderPauseSession::start(node, control, reason)
+        .settle()
+        .await
+}
+
+/// Retry a provider turn once for a transient no-verdict failure, while letting an operator
+/// explicitly continue after a quota or outage pause.
+async fn retry_model_turn<T, F, Fut>(
+    node: &str,
+    control: Option<&RuntimeControl>,
+    mut call: F,
 ) -> Result<T, CompletionError>
 where
-    F: FnOnce() -> Fut,
+    F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, CompletionError>>,
 {
-    let Err(error) = &first else {
-        return first;
-    };
-    let Some(reason) = model_retry_reason(&error.to_string()) else {
-        return first;
-    };
+    let mut retried = false;
+    loop {
+        let result = call().await;
+        let Err(error) = &result else {
+            return result;
+        };
 
-    tracing::warn!(
-        node,
-        retry_reason = reason,
-        error = %error,
-        "the provider turn produced no verdict; retrying once"
-    );
-    retry().await
+        if let Some(reason) = provider_pause_reason(error)
+            && let Some(control) = control
+        {
+            match wait_for_provider_resume(node, control, reason).await {
+                ProviderPauseWait::Resumed => continue,
+                // `run_typed` sees the shared flag and parks at its ordinary restart boundary.
+                ProviderPauseWait::Stopped => return result,
+                ProviderPauseWait::Unavailable => return result,
+            }
+        }
+
+        if retried {
+            return result;
+        }
+        let Some(reason) = model_retry_reason(&error.to_string()) else {
+            return result;
+        };
+        tracing::warn!(
+            node,
+            retry_reason = reason,
+            error = %error,
+            "the provider turn produced no verdict; retrying once"
+        );
+        retried = true;
+    }
 }
 
 /// Gives each provider request its own single retry.
@@ -835,6 +1365,7 @@ where
 struct RetryingModel<M> {
     inner: M,
     node: String,
+    control: Option<RuntimeControl>,
 }
 
 impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
@@ -846,6 +1377,7 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
         RetryingModel {
             inner: M::make(client, model),
             node: "agent".to_string(),
+            control: None,
         }
     }
 
@@ -853,9 +1385,10 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
-        let retry_request = request.clone();
-        let first = self.inner.completion(request).await;
-        retry_model_turn_once(&self.node, first, || self.inner.completion(retry_request)).await
+        retry_model_turn(&self.node, self.control.as_ref(), || {
+            self.inner.completion(request.clone())
+        })
+        .await
     }
 
     async fn stream(
@@ -865,9 +1398,10 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
         rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
         CompletionError,
     > {
-        let retry_request = request.clone();
-        let first = self.inner.stream(request).await;
-        retry_model_turn_once(&self.node, first, || self.inner.stream(retry_request)).await
+        retry_model_turn(&self.node, self.control.as_ref(), || {
+            self.inner.stream(request.clone())
+        })
+        .await
     }
 
     fn composes_native_output_with_tools(&self) -> bool {
@@ -948,6 +1482,7 @@ fn metered<M: CompletionModel + 'static>(
     max_turns: Option<usize>,
     request: Request,
     provider_calls: ProviderCallQueue,
+    control: Option<RuntimeControl>,
 ) -> (AgentBuilder<RetryingModel<M>, NoToolConfig>, Meter) {
     let preamble = &format!("{preamble}{TOOL_USE_GUIDANCE}");
     let first_call_id = provider_calls
@@ -966,6 +1501,7 @@ fn metered<M: CompletionModel + 'static>(
     let builder = AgentBuilder::new(RetryingModel {
         inner: model,
         node: node.to_string(),
+        control,
     })
     .preamble(preamble)
     .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
@@ -1560,6 +2096,22 @@ struct ClarificationHook {
     /// The asking node, for provenance in the answer + logs.
     node: String,
     clarifier: Arc<dyn Clarifier>,
+    control: Option<RuntimeControl>,
+}
+
+impl ClarificationHook {
+    async fn answer(&self, to: &str, question: &str) -> ClarificationAnswer {
+        self.clarifier
+            .answer(&self.node, to, question, self.control.clone())
+            .await
+    }
+
+    fn tool_action(answer: ClarificationAnswer) -> ToolCallAction {
+        match answer {
+            ClarificationAnswer::Text(answer) => ToolCallAction::Skip(answer),
+            ClarificationAnswer::Stopped => ToolCallAction::Stop(STOPPED_BY_OPERATOR.to_string()),
+        }
+    }
 }
 
 impl AgentHook for ClarificationHook {
@@ -1577,8 +2129,8 @@ impl AgentHook for ClarificationHook {
             }
         };
         // The clarifier labels the answer with the resolved answerer (which may differ from `to`).
-        let answer = self.clarifier.answer(&self.node, &to, &question).await;
-        ToolCallAction::Skip(answer)
+        let answer = self.answer(&to, &question).await;
+        Self::tool_action(answer)
     }
 }
 
@@ -1775,11 +2327,14 @@ const OPERATOR_NOTE: &str = "Message from the operator watching this run:";
 
 /// What one node's control state carries between the hook and the run that owns it.
 #[derive(Default)]
-struct Pending {
+pub(crate) struct Pending {
     /// Operator text taken from the dashboard but not yet put in front of the model.
     steer: Mutex<Vec<String>>,
     /// Set when the operator stopped this node, so the caller can tell a stop from a failure.
     stopped: std::sync::atomic::AtomicBool,
+    /// Provider-pause sessions currently responsible for a durable waiter. Nested cancellation
+    /// must defer to those sessions so each can settle its waiter before returning.
+    provider_pause_sessions: std::sync::atomic::AtomicUsize,
 }
 
 impl Pending {
@@ -1793,12 +2348,34 @@ impl Pending {
     }
 }
 
+/// Make a completed output revisable when operator steering arrived while its final provider turn
+/// was paused. Rig consumes the synthetic output tool before dispatching normal tool hooks, so
+/// this fresh prompt is the only boundary at which that steering can still change the answer.
+fn revise_final_output(question: &str, output: &str, steering: &str) -> String {
+    format!(
+        "{steering}\n\n\
+         Revise the completed output below to apply the operator's message. Keep every detail that \
+         remains true, and return the replacement by calling the output tool.\n\n\
+         === BEGIN COMPLETED OUTPUT ===\n{output}\n=== END COMPLETED OUTPUT ===\n\n\
+         === BEGIN ORIGINAL REQUEST ===\n{question}\n=== END ORIGINAL REQUEST ==="
+    )
+}
+
+/// The compactor is cached inside a compacted session, so the pending state inside its first
+/// `RuntimeControl` has to remain the one its later attempts observe.
+fn pending_for_attempt(compacted_session: Option<&CompactedSession>) -> Arc<Pending> {
+    compacted_session
+        .map(CompactedSession::pending)
+        .unwrap_or_default()
+}
+
 /// Applies the operator's pause, stop and steer to one node's turn loop.
 ///
 /// All three act at a turn boundary. Pause holds the loop there, which keeps the conversation and
 /// its prompt cache intact so resuming costs only the wait. Stop ends the loop. Steering rides to
 /// the model on the next tool result — the same channel a plugin's context uses — because rig
-/// refuses to retry a turn that made tool calls, and nearly every turn here makes one.
+/// refuses to retry a turn that made tool calls, and nearly every turn here makes one. The outer
+/// prompt loop separately revises a synthetic final output, which Rig consumes before tool hooks.
 struct ControlHook {
     node: String,
     controller: Arc<dyn Controller>,
@@ -2041,6 +2618,18 @@ async fn run_typed<M>(
 where
     M: CompletionModel + 'static,
 {
+    run_typed_with_control(model, run, provider_calls, CONTROL.get().cloned()).await
+}
+
+async fn run_typed_with_control<M>(
+    model: M,
+    run: NodeRun<'_>,
+    provider_calls: ProviderCallQueue,
+    control: Option<Arc<dyn Controller>>,
+) -> Result<String, AgentError>
+where
+    M: CompletionModel + 'static,
+{
     // The compactor summarises with the same model the node runs on. Cheaper would be tempting, but
     // a summary is the only record of the turns it replaces: the reader that has to reconstruct a
     // session from it is this model, and a weaker one deciding what that reader needs is a false
@@ -2066,7 +2655,6 @@ where
         ledger,
         produces,
     } = run;
-    let control = CONTROL.get();
     let model_name = format!("{}/{}", route.provider, route.model);
     // `SubagentStart` opens the node's conversation, `UserPromptSubmit` rides with the prompt —
     // where each lands in the format, and a cleaner place for a plugin to speak than a tool result.
@@ -2078,6 +2666,21 @@ where
         None => (preamble.to_string(), question.to_string()),
     };
 
+    // Resolve the local continuation before constructing control: a cached compactor retains its
+    // first RuntimeControl, so every attempt of this session must share that control's pending
+    // state. The controller itself is process-wide for this run and does not change between them.
+    let compacted_session_key = compacted_session_key(node, conversation, produces);
+    let compacted_session = ledger
+        .as_ref()
+        .and_then(|ledger| ledger.compacted_session(&compacted_session_key, route.session));
+    // Shared with both the control hook and the model wrapper: provider failures occur before a
+    // hook boundary, but operator text sent while they are paused must still reach the node.
+    let pending = pending_for_attempt(compacted_session.as_ref());
+    let runtime_control = control.as_ref().map(|controller| RuntimeControl {
+        node: node.to_string(),
+        controller: Arc::clone(controller),
+        pending: Arc::clone(&pending),
+    });
     let (builder, meter) = metered(
         node,
         model,
@@ -2085,6 +2688,7 @@ where
         max_turns,
         Request::of(route),
         Arc::clone(&provider_calls),
+        runtime_control.clone(),
     );
     // Kept for the validation below: the builder consumes the schema, and a node's answer has to
     // be checked against it here, where the agent that wrote it can still be asked to fix it.
@@ -2097,8 +2701,7 @@ where
         .output_mode(OutputMode::Tool);
     // First of the gates: what the operator asked for outranks anything the conversation is in the
     // middle of, and a node being stopped should not spend a turn on the hooks below it.
-    let pending = Arc::new(Pending::default());
-    if let Some(controller) = control {
+    if let Some(controller) = control.as_ref() {
         builder = builder.add_hook(ControlHook {
             node: node.to_string(),
             controller: Arc::clone(controller),
@@ -2111,6 +2714,7 @@ where
         builder = builder.add_hook(ClarificationHook {
             node: node.to_string(),
             clarifier,
+            control: runtime_control.clone(),
         });
     }
     // Before the ruleset gate, like `ask`: loading a skill a node was given is not a tool call to
@@ -2130,10 +2734,6 @@ where
     // Summarise the oldest turns rather than dropping them, once history outgrows the budget. A
     // plain window would evict exactly the turn that discovered a constraint — it is the oldest —
     // and the node would rediscover it, or retry the approach it ruled out.
-    let compacted_session_key = compacted_session_key(node, conversation, produces);
-    let compacted_session = ledger
-        .as_ref()
-        .and_then(|ledger| ledger.compacted_session(&compacted_session_key, route.session));
     if let (ratatoskr_core::SessionScope::Compacted, Some(session)) =
         (route.session, compacted_session.as_ref())
     {
@@ -2145,6 +2745,7 @@ where
                 produces,
                 ledger.clone(),
                 Arc::clone(&provider_calls),
+                runtime_control.clone(),
             ))
             .conversation(&compacted_session_key);
     } else if let Some(produces) = produces {
@@ -2155,6 +2756,7 @@ where
             compaction::budget_for(route.context_window),
             ledger.clone(),
             provider_calls,
+            runtime_control.clone(),
         ));
     }
     // Before the set is handed to the agent: what the model could call is part of what this turn
@@ -2200,60 +2802,67 @@ where
     // the one its checkpoints hold, so "start from checkpoint" is exactly what a new attempt is.
     // The wait is inside the node's own duration, because from the run's side that is what
     // happened: the node was still the thing in progress.
+    let mut prompt = question.to_string();
+    let mut may_correct_schema = true;
     let answer = loop {
-        let attempt = async { agent.prompt(&question).await }
+        let attempt = async { agent.prompt(&prompt).await }
             .instrument(span.clone())
             .await
             .map_err(|e| AgentError::Prompt(e.to_string()));
         let stopped = pending
             .stopped
             .swap(false, std::sync::atomic::Ordering::SeqCst);
-        match (control, stopped) {
-            (Some(controller), true) => {
-                tracing::info!(
-                    kind = "control",
-                    node,
-                    "parked; waiting to be started again"
-                );
-                let said = park(controller, node).await;
-                // Anything the operator said to the stopped node belongs to the attempt that
-                // replaces it — they were talking about this work, not the abandoned transcript.
-                pending.steer.lock().expect("steer poisoned").extend(
-                    said.into_iter().chain([
-                        "This node was stopped and started again. Its previous conversation is \
-                         gone; you are running from the beginning."
-                            .to_string(),
-                    ]),
-                );
-            }
-            _ => break attempt,
+        if let (Some(controller), true) = (control.as_ref(), stopped) {
+            tracing::info!(
+                kind = "control",
+                node,
+                "parked; waiting to be started again"
+            );
+            let said = park(controller, node).await;
+            // Anything the operator said to the stopped node belongs to the attempt that
+            // replaces it — they were talking about this work, not the abandoned transcript.
+            pending.steer.lock().expect("steer poisoned").extend(
+                said.into_iter().chain([
+                    "This node was stopped and started again. Its previous conversation is \
+                     gone; you are running from the beginning."
+                        .to_string(),
+                ]),
+            );
+            prompt = question.to_string();
+            may_correct_schema = true;
+            continue;
         }
-    };
 
-    // Give a malformed answer back to the agent that wrote it, once. The alternative is what a
-    // schema failure used to cost: the node's whole run discarded — every tool call, every file
-    // read, minutes of it — over a key in the wrong shape, which is the one kind of mistake a
-    // model corrects immediately when told. The correction is a fresh short prompt rather than a
-    // continuation, so the preamble and tools stay cached and the transcript does not grow.
-    let answer = match &answer {
-        Ok(raw) => match ratatoskr_graph::validate_raw(raw, &schema_value) {
-            Ok(_) => answer,
-            Err(invalid) => {
-                tracing::warn!(node, %invalid, "output failed its schema; asking for a correction");
-                let correction = format!(
-                    "Your answer did not match the schema you were given: {invalid}\n\n\
-                     Here is what you returned:\n{raw}\n\n\
-                     Return the same content corrected to match the schema. Change only what the \
-                     error names — keep every finding, do not shorten anything, and do not go and \
-                     look anything up again. Answer by calling the output tool.",
-                );
-                async { agent.prompt(&correction).await }
-                    .instrument(span.clone())
-                    .await
-                    .map_err(|e| AgentError::Prompt(e.to_string()))
-            }
-        },
-        Err(_) => answer,
+        let Ok(raw) = &attempt else {
+            break attempt;
+        };
+        if let Some(steering) = pending.take() {
+            tracing::info!(kind = "control", node, "steering the final output");
+            prompt = revise_final_output(&question, raw, &steering);
+            continue;
+        }
+
+        // Give a malformed answer back to the agent that wrote it, once. The alternative is what
+        // a schema failure used to cost: the node's whole run discarded — every tool call, every
+        // file read, minutes of it — over a key in the wrong shape, which is the one kind of
+        // mistake a model corrects immediately when told. The correction is a fresh short prompt
+        // rather than a continuation, so the preamble and tools stay cached and the transcript
+        // does not grow.
+        if may_correct_schema
+            && let Err(invalid) = ratatoskr_graph::validate_raw(raw, &schema_value)
+        {
+            may_correct_schema = false;
+            tracing::warn!(node, %invalid, "output failed its schema; asking for a correction");
+            prompt = format!(
+                "Your answer did not match the schema you were given: {invalid}\n\n\
+                 Here is what you returned:\n{raw}\n\n\
+                 Return the same content corrected to match the schema. Change only what the \
+                 error names — keep every finding, do not shorten anything, and do not go and \
+                 look anything up again. Answer by calling the output tool.",
+            );
+            continue;
+        }
+        break attempt;
     };
 
     let (usage, calls) = meter.read();
@@ -2312,6 +2921,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use rig_core::completion::CompletionRequest;
     use rig_core::streaming::StreamingCompletionResponse;
 
@@ -2437,12 +3048,97 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct InvalidCorrectionThenRestartedCorrection {
+        attempts: Arc<AtomicU64>,
+    }
+
+    impl CompletionModel for InvalidCorrectionThenRestartedCorrection {
+        type Response = ();
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self::default()
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            let answer = match self.attempts.fetch_add(1, Ordering::Relaxed) {
+                // The first invalid response consumes the ordinary correction allowance.
+                0 => "not valid JSON",
+                // The operator stops this correction attempt before its result is accepted.
+                1 => "abandoned correction",
+                // The fresh attempt must receive a new correction allowance.
+                2 => "still not valid JSON",
+                _ => r#"{"summary":"corrected after restart"}"#,
+            };
+            Ok(CompletionResponse {
+                choice: OneOrMany::one(AssistantContent::text(answer)),
+                usage: Default::default(),
+                raw_response: (),
+                message_id: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+            Err(CompletionError::ResponseError(EMPTY_RESPONSE.to_string()))
+        }
+    }
+
+    #[derive(Default)]
+    struct ControlRecordingClarifier {
+        received_node: Mutex<Option<String>>,
+    }
+
+    impl Clarifier for ControlRecordingClarifier {
+        fn answer<'a>(
+            &'a self,
+            _from: &'a str,
+            _to: &'a str,
+            _question: &'a str,
+            control: Option<RuntimeControl>,
+        ) -> Pin<Box<dyn Future<Output = ClarificationAnswer> + Send + 'a>> {
+            *self.received_node.lock().expect("clarifier mutex poisoned") =
+                control.map(|control| control.node);
+            Box::pin(async { ClarificationAnswer::Text("clarification".to_string()) })
+        }
+    }
+
+    struct RestartController {
+        controls: Mutex<std::vec::IntoIter<Control>>,
+    }
+
+    impl RestartController {
+        fn new(controls: Vec<Control>) -> Self {
+            Self {
+                controls: Mutex::new(controls.into_iter()),
+            }
+        }
+    }
+
+    impl Controller for RestartController {
+        fn poll<'a>(
+            &'a self,
+            _node: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Control> + Send + 'a>> {
+            let next = self.controls.lock().expect("control mutex poisoned").next();
+            Box::pin(async move { next.unwrap_or_else(Control::carry_on) })
+        }
+    }
+
     /// The operator controls, at the two points where this crate makes a decision of its own:
     /// waiting for a stopped node to be started, and holding what was said until the model can be
     /// told. The rules about what a command *means* are `ratatoskr_core::control`'s, and tested
     /// there.
     mod control {
         use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         use ratatoskr_core::{Control, Directive};
 
@@ -2467,11 +3163,512 @@ mod tests {
             }
         }
 
+        /// Simulates a provider-pause session registering while an ordinary control request is in
+        /// flight, then returning Stop to that stale observer.
+        struct StopAfterProviderPauseStarts {
+            pending: Arc<Pending>,
+        }
+
+        impl Controller for StopAfterProviderPauseStarts {
+            fn poll<'a>(
+                &'a self,
+                _node: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Control> + Send + 'a>> {
+                self.pending
+                    .provider_pause_sessions
+                    .fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { stop() })
+            }
+        }
+
+        /// A scripted controller which can persist an automatic pause. The boolean is the
+        /// dashboard's visible state in miniature: it must be set before the waiting loop polls.
+        struct PausingScripted {
+            paused: std::sync::atomic::AtomicBool,
+            controls: Mutex<std::vec::IntoIter<Control>>,
+        }
+
+        impl PausingScripted {
+            fn answering(answers: Vec<Control>) -> Arc<Self> {
+                Arc::new(Self {
+                    paused: std::sync::atomic::AtomicBool::new(false),
+                    controls: Mutex::new(answers.into_iter()),
+                })
+            }
+        }
+
+        impl Controller for PausingScripted {
+            fn poll<'a>(
+                &'a self,
+                _node: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Control> + Send + 'a>> {
+                let next = self.controls.lock().expect("script poisoned").next();
+                Box::pin(async move { next.unwrap_or_default() })
+            }
+
+            fn pause<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ProviderPauseRegistration> + Send + 'a>> {
+                self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { ProviderPauseRegistration::Paused })
+            }
+
+            fn acknowledge_provider_pause<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ProviderPauseAcknowledgement> + Send + 'a>>
+            {
+                Box::pin(async { ProviderPauseAcknowledgement::Continue })
+            }
+        }
+
+        /// The outer nested-work monitor would receive Stop on its second ordinary poll, while
+        /// the provider-pause session receives it on its second paused poll. The latter owns the
+        /// durable waiter and must settle it first.
+        struct NestedProviderPauseStop {
+            ordinary_polls: AtomicUsize,
+            paused_polls: AtomicUsize,
+            acknowledgement_attempts: AtomicUsize,
+        }
+
+        impl NestedProviderPauseStop {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    ordinary_polls: AtomicUsize::new(0),
+                    paused_polls: AtomicUsize::new(0),
+                    acknowledgement_attempts: AtomicUsize::new(0),
+                })
+            }
+        }
+
+        impl Controller for NestedProviderPauseStop {
+            fn poll<'a>(
+                &'a self,
+                _node: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Control> + Send + 'a>> {
+                let poll = self.ordinary_polls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if poll == 0 {
+                        Control::carry_on()
+                    } else {
+                        stop()
+                    }
+                })
+            }
+
+            fn poll_while_paused<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = PausedPoll> + Send + 'a>> {
+                let poll = self.paused_polls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if poll == 0 {
+                        PausedPoll::Response(Control {
+                            directive: Directive::Hold,
+                            steer: Vec::new(),
+                        })
+                    } else {
+                        PausedPoll::Response(stop())
+                    }
+                })
+            }
+
+            fn pause<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ProviderPauseRegistration> + Send + 'a>> {
+                Box::pin(async { ProviderPauseRegistration::Paused })
+            }
+
+            fn acknowledge_provider_pause<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ProviderPauseAcknowledgement> + Send + 'a>>
+            {
+                self.acknowledgement_attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { ProviderPauseAcknowledgement::Stop })
+            }
+        }
+
+        /// A dashboard that loses one poll after recording the pause, then returns a real
+        /// continue. The first outcome must not be mistaken for that continue.
+        struct UnavailableThenContinue {
+            paused: AtomicBool,
+            paused_polls: AtomicUsize,
+            acknowledgement_attempts: AtomicUsize,
+        }
+
+        impl UnavailableThenContinue {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    paused: AtomicBool::new(false),
+                    paused_polls: AtomicUsize::new(0),
+                    acknowledgement_attempts: AtomicUsize::new(0),
+                })
+            }
+        }
+
+        impl Controller for UnavailableThenContinue {
+            fn poll<'a>(
+                &'a self,
+                _node: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Control> + Send + 'a>> {
+                Box::pin(async { Control::carry_on() })
+            }
+
+            fn poll_while_paused<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = PausedPoll> + Send + 'a>> {
+                let poll = self.paused_polls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if poll == 0 {
+                        PausedPoll::Unavailable
+                    } else {
+                        PausedPoll::Response(Control::carry_on())
+                    }
+                })
+            }
+
+            fn pause<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ProviderPauseRegistration> + Send + 'a>> {
+                self.paused.store(true, Ordering::SeqCst);
+                Box::pin(async { ProviderPauseRegistration::Paused })
+            }
+
+            fn acknowledge_provider_pause<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ProviderPauseAcknowledgement> + Send + 'a>>
+            {
+                let attempt = self.acknowledgement_attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if attempt == 0 {
+                        ProviderPauseAcknowledgement::Unavailable
+                    } else {
+                        ProviderPauseAcknowledgement::Continue
+                    }
+                })
+            }
+        }
+
+        /// A dashboard which delivered Continue or Stop but lost the first acknowledgement
+        /// response. The child must retry that acknowledgement, not poll and register again.
+        struct LostAcknowledgement {
+            registration: ProviderPauseRegistration,
+            paused_polls: AtomicUsize,
+            acknowledgement_attempts: AtomicUsize,
+        }
+
+        impl LostAcknowledgement {
+            fn new(registration: ProviderPauseRegistration) -> Arc<Self> {
+                Arc::new(Self {
+                    registration,
+                    paused_polls: AtomicUsize::new(0),
+                    acknowledgement_attempts: AtomicUsize::new(0),
+                })
+            }
+        }
+
+        impl Controller for LostAcknowledgement {
+            fn poll<'a>(
+                &'a self,
+                _node: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Control> + Send + 'a>> {
+                Box::pin(async { Control::carry_on() })
+            }
+
+            fn poll_while_paused<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = PausedPoll> + Send + 'a>> {
+                self.paused_polls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { PausedPoll::Response(Control::carry_on()) })
+            }
+
+            fn pause<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ProviderPauseRegistration> + Send + 'a>> {
+                let registration = self.registration;
+                Box::pin(async move { registration })
+            }
+
+            fn acknowledge_provider_pause<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ProviderPauseAcknowledgement> + Send + 'a>>
+            {
+                let attempt = self.acknowledgement_attempts.fetch_add(1, Ordering::SeqCst);
+                let acknowledgement = match self.registration {
+                    ProviderPauseRegistration::Resumed => ProviderPauseAcknowledgement::Continue,
+                    ProviderPauseRegistration::Stopped => ProviderPauseAcknowledgement::Stop,
+                    ProviderPauseRegistration::Paused
+                    | ProviderPauseRegistration::Uncertain
+                    | ProviderPauseRegistration::Unavailable => {
+                        ProviderPauseAcknowledgement::Unavailable
+                    }
+                };
+                Box::pin(async move {
+                    if attempt == 0 {
+                        ProviderPauseAcknowledgement::Unavailable
+                    } else {
+                        acknowledgement
+                    }
+                })
+            }
+        }
+
+        /// A Continue acknowledgement whose first response is lost. An operator then stops the
+        /// node before the same acknowledgement is retried, so the retry must become Stop.
+        struct LostContinueAcknowledgementThenStop {
+            acknowledgement_attempts: AtomicUsize,
+        }
+
+        impl LostContinueAcknowledgementThenStop {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    acknowledgement_attempts: AtomicUsize::new(0),
+                })
+            }
+        }
+
+        impl Controller for LostContinueAcknowledgementThenStop {
+            fn poll<'a>(
+                &'a self,
+                _node: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Control> + Send + 'a>> {
+                Box::pin(async { Control::carry_on() })
+            }
+
+            fn pause<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ProviderPauseRegistration> + Send + 'a>> {
+                Box::pin(async { ProviderPauseRegistration::Resumed })
+            }
+
+            fn acknowledge_provider_pause<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ProviderPauseAcknowledgement> + Send + 'a>>
+            {
+                let attempt = self.acknowledgement_attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if attempt == 0 {
+                        ProviderPauseAcknowledgement::Unavailable
+                    } else {
+                        ProviderPauseAcknowledgement::Stop
+                    }
+                })
+            }
+        }
+
+        /// A pause request whose reply is lost after the dashboard persisted it. The dashboard is
+        /// briefly unavailable while the child first reconciles, so it must keep the same waiter
+        /// and try again rather than abandoning the possibly durable pause.
+        struct UncertainThenContinue {
+            paused_polls: AtomicUsize,
+        }
+
+        impl Controller for UncertainThenContinue {
+            fn poll<'a>(
+                &'a self,
+                _node: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Control> + Send + 'a>> {
+                Box::pin(async { Control::carry_on() })
+            }
+
+            fn poll_while_paused<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = PausedPoll> + Send + 'a>> {
+                let poll = self.paused_polls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if poll == 0 {
+                        PausedPoll::Unavailable
+                    } else {
+                        PausedPoll::Response(Control::carry_on())
+                    }
+                })
+            }
+
+            fn pause<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ProviderPauseRegistration> + Send + 'a>> {
+                Box::pin(async { ProviderPauseRegistration::Uncertain })
+            }
+
+            fn acknowledge_provider_pause<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ProviderPauseAcknowledgement> + Send + 'a>>
+            {
+                Box::pin(async { ProviderPauseAcknowledgement::Continue })
+            }
+        }
+
+        struct ExitFence;
+
+        impl Controller for ExitFence {
+            fn poll<'a>(
+                &'a self,
+                _node: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Control> + Send + 'a>> {
+                Box::pin(async { Control::carry_on() })
+            }
+
+            fn pause<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ProviderPauseRegistration> + Send + 'a>> {
+                Box::pin(async { ProviderPauseRegistration::Stopped })
+            }
+
+            fn acknowledge_provider_pause<'a>(
+                &'a self,
+                _node: &'a str,
+                _waiter: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ProviderPauseAcknowledgement> + Send + 'a>>
+            {
+                Box::pin(async { ProviderPauseAcknowledgement::Stop })
+            }
+        }
+
         fn stop() -> Control {
             Control {
                 directive: Directive::Stop,
                 steer: Vec::new(),
             }
+        }
+
+        #[tokio::test]
+        async fn a_nested_control_poll_stops_the_parent_and_keeps_steering() {
+            let pending = Arc::new(Pending::default());
+            let control = RuntimeControl {
+                node: "analyst".to_string(),
+                controller: Scripted::answering(vec![Control {
+                    directive: Directive::Stop,
+                    steer: vec!["preserve this note".to_string()],
+                }]),
+                pending: Arc::clone(&pending),
+            };
+
+            assert!(control.poll_for_stop().await);
+            assert!(control.is_stopped());
+            assert!(
+                pending
+                    .take()
+                    .is_some_and(|text| text.contains("preserve this note")),
+                "nested work must not discard steering while it observes Stop"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_in_flight_outer_stop_poll_defers_to_a_provider_pause_session() {
+            let pending = Arc::new(Pending::default());
+            let control = RuntimeControl {
+                node: "analyst".to_string(),
+                controller: Arc::new(StopAfterProviderPauseStarts {
+                    pending: Arc::clone(&pending),
+                }),
+                pending: Arc::clone(&pending),
+            };
+
+            assert!(
+                !control.poll_for_stop().await,
+                "the session, not this stale observer, must acknowledge the durable Stop"
+            );
+            assert!(!control.is_stopped());
+            pending
+                .provider_pause_sessions
+                .fetch_sub(1, Ordering::SeqCst);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn nested_work_is_dropped_when_a_later_poll_stops_its_parent() {
+            let pending = Arc::new(Pending::default());
+            let control = RuntimeControl {
+                node: "analyst".to_string(),
+                controller: Scripted::answering(vec![
+                    Control::carry_on(),
+                    Control {
+                        directive: Directive::Stop,
+                        steer: Vec::new(),
+                    },
+                ]),
+                pending: Arc::clone(&pending),
+            };
+
+            assert!(
+                control
+                    .wait_for_stop_or(tokio::time::sleep(std::time::Duration::from_secs(10)))
+                    .await
+                    .is_none(),
+                "the stop poll cancels nested work before its own completion"
+            );
+            assert!(control.is_stopped());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_nested_provider_pause_settles_its_waiter_before_the_outer_stop_monitor_returns()
+        {
+            let controller = NestedProviderPauseStop::new();
+            let pending = Arc::new(Pending::default());
+            let control = RuntimeControl {
+                node: "analyst".to_string(),
+                controller: controller.clone(),
+                pending: Arc::clone(&pending),
+            };
+
+            assert!(
+                control
+                    .wait_for_stop_or(wait_for_provider_resume(
+                        "analyst",
+                        &control,
+                        ProviderPauseReason::Outage,
+                    ))
+                    .await
+                    .is_none(),
+                "the nested answer returns only after its provider pause has delivered Stop"
+            );
+            assert!(pending.stopped.load(Ordering::SeqCst));
+            assert_eq!(
+                controller.ordinary_polls.load(Ordering::SeqCst),
+                1,
+                "the outer monitor defers its competing Stop poll while a pause session is active"
+            );
+            assert_eq!(controller.paused_polls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                controller.acknowledgement_attempts.load(Ordering::SeqCst),
+                1,
+                "the provider-pause session acknowledges Stop before nested cancellation returns"
+            );
+            assert!(
+                !control.provider_pause_is_active(),
+                "the session releases its ownership after settling the durable waiter"
+            );
         }
 
         #[tokio::test(start_paused = true)]
@@ -2501,6 +3698,180 @@ mod tests {
             );
         }
 
+        #[tokio::test(start_paused = true)]
+        async fn a_provider_outage_pauses_until_the_operator_continues() {
+            let controller = PausingScripted::answering(vec![
+                Control {
+                    directive: Directive::Hold,
+                    steer: vec!["try the alternate endpoint after continuing".to_string()],
+                },
+                Control::carry_on(),
+            ]);
+            let pending = Arc::new(Pending::default());
+            let control = RuntimeControl {
+                node: "analyst".to_string(),
+                controller: controller.clone(),
+                pending: Arc::clone(&pending),
+            };
+
+            assert!(matches!(
+                wait_for_provider_resume("analyst", &control, ProviderPauseReason::Outage).await,
+                ProviderPauseWait::Resumed
+            ));
+            assert!(
+                controller.paused.load(std::sync::atomic::Ordering::SeqCst),
+                "the pause is visible before the run starts waiting"
+            );
+            assert!(
+                pending
+                    .take()
+                    .is_some_and(|text| text.contains("alternate endpoint")),
+                "steering delivered while paused is kept for the next safe model boundary"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_unavailable_dashboard_poll_does_not_resume_a_provider_pause() {
+            let controller = UnavailableThenContinue::new();
+            let control = RuntimeControl {
+                node: "analyst".to_string(),
+                controller: controller.clone(),
+                pending: Arc::new(Pending::default()),
+            };
+
+            assert!(matches!(
+                wait_for_provider_resume("analyst", &control, ProviderPauseReason::Outage).await,
+                ProviderPauseWait::Resumed
+            ));
+            assert!(controller.paused.load(Ordering::SeqCst));
+            assert_eq!(
+                controller.paused_polls.load(Ordering::SeqCst),
+                2,
+                "a lost acknowledgement retries the received Continue instead of polling again"
+            );
+            assert_eq!(
+                controller.acknowledgement_attempts.load(Ordering::SeqCst),
+                2,
+                "the provider retry waits until the dashboard confirms receipt of Continue"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_lost_continue_acknowledgement_retries_without_polling_again() {
+            let controller = LostAcknowledgement::new(ProviderPauseRegistration::Resumed);
+            let control = RuntimeControl {
+                node: "analyst".to_string(),
+                controller: controller.clone(),
+                pending: Arc::new(Pending::default()),
+            };
+
+            assert!(matches!(
+                wait_for_provider_resume("analyst", &control, ProviderPauseReason::Outage).await,
+                ProviderPauseWait::Resumed
+            ));
+            assert_eq!(
+                controller.acknowledgement_attempts.load(Ordering::SeqCst),
+                2
+            );
+            assert_eq!(
+                controller.paused_polls.load(Ordering::SeqCst),
+                0,
+                "the delivered Continue stays acknowledgement-pending until its retry succeeds"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_stop_after_a_lost_continue_acknowledgement_prevents_the_provider_retry() {
+            let controller = LostContinueAcknowledgementThenStop::new();
+            let pending = Arc::new(Pending::default());
+            let control = RuntimeControl {
+                node: "analyst".to_string(),
+                controller: controller.clone(),
+                pending: Arc::clone(&pending),
+            };
+
+            assert!(matches!(
+                wait_for_provider_resume("analyst", &control, ProviderPauseReason::Outage).await,
+                ProviderPauseWait::Stopped
+            ));
+            assert_eq!(
+                controller.acknowledgement_attempts.load(Ordering::SeqCst),
+                2,
+                "the same acknowledgement is retried after its response is lost"
+            );
+            assert!(
+                pending.stopped.load(Ordering::SeqCst),
+                "the retry's durable Stop wins over the originally delivered Continue"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_stopped_registration_retries_its_acknowledgement_before_stopping() {
+            let controller = LostAcknowledgement::new(ProviderPauseRegistration::Stopped);
+            let pending = Arc::new(Pending::default());
+            let control = RuntimeControl {
+                node: "analyst".to_string(),
+                controller: controller.clone(),
+                pending: Arc::clone(&pending),
+            };
+
+            assert!(matches!(
+                wait_for_provider_resume("analyst", &control, ProviderPauseReason::Outage).await,
+                ProviderPauseWait::Stopped
+            ));
+            assert!(pending.stopped.load(Ordering::SeqCst));
+            assert_eq!(
+                controller.acknowledgement_attempts.load(Ordering::SeqCst),
+                2
+            );
+            assert_eq!(
+                controller.paused_polls.load(Ordering::SeqCst),
+                0,
+                "a direct Stop stays acknowledgement-pending instead of entering normal polling"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_uncertain_pause_registration_reconciles_until_the_dashboard_recovers() {
+            let controller = Arc::new(UncertainThenContinue {
+                paused_polls: AtomicUsize::new(0),
+            });
+            let control = RuntimeControl {
+                node: "analyst".to_string(),
+                controller: controller.clone(),
+                pending: Arc::new(Pending::default()),
+            };
+
+            assert!(matches!(
+                wait_for_provider_resume("analyst", &control, ProviderPauseReason::Outage).await,
+                ProviderPauseWait::Resumed
+            ));
+            assert_eq!(
+                controller.paused_polls.load(Ordering::SeqCst),
+                2,
+                "a brief restart cannot abandon a pause whose POST reply was lost"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_confirmed_exit_does_not_make_another_provider_request() {
+            let pending = Arc::new(Pending::default());
+            let control = RuntimeControl {
+                node: "analyst".to_string(),
+                controller: Arc::new(ExitFence),
+                pending: Arc::clone(&pending),
+            };
+
+            assert!(matches!(
+                wait_for_provider_resume("analyst", &control, ProviderPauseReason::Outage).await,
+                ProviderPauseWait::Stopped
+            ));
+            assert!(
+                pending.stopped.load(Ordering::SeqCst),
+                "the exit fence terminates the node before it can retry the provider"
+            );
+        }
+
         #[test]
         fn text_is_labelled_as_a_person_and_handed_over_once() {
             let pending = Pending::default();
@@ -2517,6 +3888,135 @@ mod tests {
             // result, reading as them saying it again and again.
             assert!(pending.take().is_none());
         }
+
+        #[test]
+        fn steering_that_arrives_before_a_final_output_becomes_the_next_prompt() {
+            // Rig accepts its synthetic output tool before it dispatches normal tool hooks. Keep
+            // this as a pure test because HookContext is created inside rig-agent; the prompt is
+            // the boundary that makes the otherwise terminal answer revisable.
+            let pending = Pending::default();
+            pending
+                .steer
+                .lock()
+                .expect("steer poisoned")
+                .push("include the migration risk".to_string());
+
+            let prompt = revise_final_output(
+                "Assess the migration.",
+                r#"{"summary":"safe"}"#,
+                &pending.take().expect("the operator message is pending"),
+            );
+
+            assert!(prompt.contains(OPERATOR_NOTE));
+            assert!(prompt.contains("include the migration risk"));
+            assert!(prompt.contains(r#"{"summary":"safe"}"#));
+            assert!(prompt.contains("Assess the migration."));
+            assert!(
+                pending.take().is_none(),
+                "the message is delivered exactly once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_clarification_receives_its_callers_runtime_control() {
+        let clarifier = Arc::new(ControlRecordingClarifier::default());
+        let hook = ClarificationHook {
+            node: "implementer".to_string(),
+            clarifier: clarifier.clone(),
+            control: Some(RuntimeControl {
+                node: "implementer".to_string(),
+                controller: Arc::new(RestartController::new(Vec::new())),
+                pending: Arc::default(),
+            }),
+        };
+
+        assert_eq!(
+            hook.answer("analyst", "Which invariant applies?").await,
+            ClarificationAnswer::Text("clarification".to_string())
+        );
+        assert_eq!(
+            clarifier
+                .received_node
+                .lock()
+                .expect("clarifier mutex poisoned")
+                .as_deref(),
+            Some("implementer"),
+        );
+    }
+
+    #[test]
+    fn a_stopped_clarification_ends_the_askers_turn() {
+        // A Stop from the nested answer must reach rig as a terminal tool action. Returning a
+        // text tool result would let the asking agent begin another provider turn first.
+        assert_eq!(
+            ClarificationHook::tool_action(ClarificationAnswer::Stopped),
+            ToolCallAction::Stop(STOPPED_BY_OPERATOR.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_node_can_correct_its_schema_again() {
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct Done {
+            summary: String,
+        }
+
+        let route = ModelRoute {
+            provider: "test".to_string(),
+            model: "test-model".to_string(),
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        };
+        let model = InvalidCorrectionThenRestartedCorrection::default();
+        let attempts = Arc::clone(&model.attempts);
+        let controller = Arc::new(RestartController::new(vec![
+            Control::carry_on(),
+            Control {
+                directive: Directive::Stop,
+                steer: Vec::new(),
+            },
+            Control::carry_on(),
+        ]));
+
+        let answer = run_typed_with_control(
+            model,
+            NodeRun {
+                node: "analyst",
+                route: &route,
+                preamble: "Return the requested summary.",
+                question: "Summarise the change.",
+                tools: ToolSet::default(),
+                output_schema: schemars::schema_for!(Done),
+                policy: None,
+                max_turns: Some(4),
+                clarifier: None,
+                observer: None,
+                skills: Vec::new(),
+                files: None,
+                rag_rat_worktree: None,
+                shell: None,
+                push: None,
+                conversation: None,
+                ledger: None,
+                produces: None,
+            },
+            ProviderCallQueue::default(),
+            Some(controller),
+        )
+        .await
+        .expect("the replacement attempt corrects its own invalid output");
+
+        let done: Done = serde_json::from_str(&answer).expect("the corrected output is valid");
+        assert_eq!(done.summary, "corrected after restart");
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            4,
+            "the fresh invalid output receives its own correction turn"
+        );
     }
 
     #[test]
@@ -2817,6 +4317,40 @@ mod tests {
     }
 
     #[test]
+    fn a_compacted_session_keeps_operator_state_across_attempts() {
+        let ledger = RunLedger::default();
+        let key = compacted_session_key("implementer", Some("run-7"), Some("a repository change"));
+        let first = ledger
+            .compacted_session(&key, ratatoskr_core::SessionScope::Compacted)
+            .expect("first compacted attempt");
+        let reentered = ledger
+            .compacted_session(&key, ratatoskr_core::SessionScope::Compacted)
+            .expect("later compacted attempt");
+
+        let original = pending_for_attempt(Some(&first));
+        let current = pending_for_attempt(Some(&reentered));
+        assert!(Arc::ptr_eq(&original, &current));
+
+        // A cached SummaryCompactor retains the original RuntimeControl. Its pause handling must
+        // write into the exact state that the re-entered run observes.
+        original
+            .steer
+            .lock()
+            .expect("steer poisoned")
+            .push("resume through the backup endpoint".to_string());
+        assert!(
+            current
+                .take()
+                .is_some_and(|text| text.contains("backup endpoint"))
+        );
+        original.stopped.store(true, Ordering::SeqCst);
+        assert!(current.stopped.swap(false, Ordering::SeqCst));
+
+        let fresh = pending_for_attempt(None);
+        assert!(!Arc::ptr_eq(&current, &fresh));
+    }
+
+    #[test]
     fn a_fresh_stage_clears_its_local_continuation() {
         let ledger = RunLedger::default();
         let key = compacted_session_key("implementer", None, Some("a repository change"));
@@ -2873,6 +4407,7 @@ mod tests {
             None,
             Request::plain(),
             Arc::clone(&provider_calls),
+            None,
         );
         let agent = builder.build();
         let answer = agent.prompt("question").await;
@@ -2910,6 +4445,7 @@ mod tests {
             None,
             Request::plain(),
             provider_calls,
+            None,
         );
         let agent = builder.build();
 
@@ -2936,6 +4472,7 @@ mod tests {
             None,
             Request::plain(),
             Arc::clone(&provider_calls),
+            None,
         );
         outer_builder
             .build()
@@ -2950,6 +4487,7 @@ mod tests {
             None,
             Request::plain(),
             Arc::clone(&provider_calls),
+            None,
         );
         nested_builder
             .build()
@@ -2983,11 +4521,19 @@ mod tests {
         });
         let body = serde_json::to_vec(&response).unwrap();
 
-        let usage = empty_openai_response_usage(&body).expect("the empty response carries usage");
-        assert_eq!(usage.input_tokens, 11);
-        assert_eq!(usage.output_tokens, 2);
-        assert_eq!(usage.cached_input_tokens, 4);
-        assert_eq!(usage.reasoning_tokens, 1);
+        let empty = empty_openai_response(&body).expect("the empty response carries usage");
+        assert_eq!(empty.usage.input_tokens, 11);
+        assert_eq!(empty.usage.output_tokens, 2);
+        assert_eq!(empty.usage.cached_input_tokens, 4);
+        assert_eq!(empty.usage.reasoning_tokens, 1);
+        assert!(!empty.reached_output_limit);
+
+        response["incomplete_details"] = serde_json::json!({ "reason": "max_output_tokens" });
+        assert!(
+            empty_openai_response(&serde_json::to_vec(&response).unwrap())
+                .expect("the raw diagnostic remains attached to the empty response")
+                .reached_output_limit
+        );
 
         response["output"] = serde_json::json!([{
             "type": "message",
@@ -3001,7 +4547,7 @@ mod tests {
             }]
         }]);
         assert!(
-            empty_openai_response_usage(&serde_json::to_vec(&response).unwrap()).is_none(),
+            empty_openai_response(&serde_json::to_vec(&response).unwrap()).is_none(),
             "ordinary response usage is already counted by the completion hook"
         );
     }
@@ -3268,6 +4814,32 @@ mod tests {
             ),
             Some("empty_response")
         );
+        assert_eq!(
+            provider_pause_reason(&CompletionError::ResponseError(
+                "Error code: 429 - insufficient_quota".to_string()
+            )),
+            Some(ProviderPauseReason::UsageLimit)
+        );
+        // Rig renders this status as `Invalid status code 529 …`, so matching the display text
+        // would miss Anthropic's ordinary overloaded response. The status survives in its typed
+        // completion error instead.
+        assert_eq!(
+            provider_pause_reason(&CompletionError::from_http_response(
+                http::StatusCode::from_u16(529).expect("529 is a valid HTTP status"),
+                "overloaded_error",
+            )),
+            Some(ProviderPauseReason::Outage)
+        );
+        // Rate limiting is not necessarily exhausted usage. The server may have supplied a
+        // retry-after value, so leaving it to its regular failure path is safer than requiring a
+        // person to resume every burst.
+        assert_eq!(
+            provider_pause_reason(&CompletionError::from_http_response(
+                http::StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_exceeded",
+            )),
+            None
+        );
 
         // And the ones that will answer the same way twice, where a retry spends a node's budget
         // to arrive back where it started.
@@ -3281,28 +4853,27 @@ mod tests {
 
     #[tokio::test]
     async fn a_provider_turn_that_produced_no_verdict_is_retried_exactly_once() {
-        let retries = std::cell::Cell::new(0);
-        let recovered = retry_model_turn_once(
-            "test",
-            Err::<&str, _>(CompletionError::ResponseError(EMPTY_RESPONSE.to_string())),
-            || async {
-                retries.set(retries.get() + 1);
-                Ok("a valid answer")
-            },
-        )
+        let attempts = std::cell::Cell::new(0);
+        let recovered = retry_model_turn("test", None, || {
+            let attempt = attempts.get();
+            attempts.set(attempt + 1);
+            async move {
+                if attempt == 0 {
+                    Err(CompletionError::ResponseError(EMPTY_RESPONSE.to_string()))
+                } else {
+                    Ok("a valid answer")
+                }
+            }
+        })
         .await;
         assert_eq!(recovered.unwrap(), "a valid answer");
-        assert_eq!(retries.get(), 1);
+        assert_eq!(attempts.get(), 2);
 
-        let retries = std::cell::Cell::new(0);
-        let still_empty = retry_model_turn_once(
-            "test",
-            Err::<(), _>(CompletionError::ResponseError(EMPTY_RESPONSE.to_string())),
-            || async {
-                retries.set(retries.get() + 1);
-                Err(CompletionError::ResponseError(EMPTY_RESPONSE.to_string()))
-            },
-        )
+        let attempts = std::cell::Cell::new(0);
+        let still_empty = retry_model_turn("test", None, || {
+            attempts.set(attempts.get() + 1);
+            async { Err::<(), _>(CompletionError::ResponseError(EMPTY_RESPONSE.to_string())) }
+        })
         .await;
         assert!(
             still_empty
@@ -3310,20 +4881,16 @@ mod tests {
                 .to_string()
                 .contains(EMPTY_RESPONSE)
         );
-        assert_eq!(retries.get(), 1, "the retry is never retried");
+        assert_eq!(attempts.get(), 2, "the retry is never retried");
 
-        let retries = std::cell::Cell::new(0);
-        let permanent = retry_model_turn_once(
-            "test",
-            Err::<(), _>(CompletionError::ResponseError("model refused".to_string())),
-            || async {
-                retries.set(retries.get() + 1);
-                Ok(())
-            },
-        )
+        let attempts = std::cell::Cell::new(0);
+        let permanent = retry_model_turn("test", None, || {
+            attempts.set(attempts.get() + 1);
+            async { Err::<(), _>(CompletionError::ResponseError("model refused".to_string())) }
+        })
         .await;
         assert!(permanent.unwrap_err().to_string().contains("model refused"));
-        assert_eq!(retries.get(), 0);
+        assert_eq!(attempts.get(), 1);
     }
 
     #[tokio::test]
@@ -3333,6 +4900,7 @@ mod tests {
         let model = RetryingModel {
             inner,
             node: "analyst".to_string(),
+            control: None,
         };
 
         model
