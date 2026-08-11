@@ -32,9 +32,12 @@ use rig_agent::tool::{DynamicTool, ToolExecutionError};
 use rig_core::OneOrMany;
 use rig_core::client::completion::CompletionClient;
 use rig_core::client::{ProviderClient, ProviderClientError};
-use rig_core::completion::CompletionModel;
+use rig_core::completion::{
+    CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
+};
 use rig_core::message::{AssistantContent, ImageMediaType, MimeType, ToolResultContent};
 use rig_core::providers::{anthropic, moonshot, openai};
+use rig_core::streaming::StreamingCompletionResponse;
 use rig_core::tool::ToolOutput;
 use rmcp::ServiceError;
 use rmcp::model::{
@@ -614,6 +617,7 @@ where
     tracing::warn!(
         node,
         retry_reason = reason,
+        usage_reported = false,
         error = %error,
         "the model call produced no verdict; retrying once"
     );
@@ -686,32 +690,77 @@ impl Request {
     }
 }
 
+#[derive(Clone)]
+struct CountingModel<M> {
+    inner: M,
+    calls: Arc<AtomicU64>,
+}
+
+impl<M: CompletionModel> CompletionModel for CountingModel<M> {
+    type Response = M::Response;
+    type StreamingResponse = M::StreamingResponse;
+    type Client = M::Client;
+
+    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
+        CountingModel {
+            inner: M::make(client, model),
+            calls: Arc::default(),
+        }
+    }
+
+    async fn completion(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+        // Count at the provider boundary: Rig can reject an empty response before any agent hook
+        // sees it, but the request was still made and may still have been billed.
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.completion(request).await
+    }
+
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.stream(request).await
+    }
+
+    fn composes_native_output_with_tools(&self) -> bool {
+        self.inner.composes_native_output_with_tools()
+    }
+}
+
 fn metered<M: CompletionModel + 'static>(
     model: M,
     preamble: &str,
     max_turns: Option<usize>,
     request: Request,
-) -> (AgentBuilder<M, NoToolConfig>, Meter) {
+) -> (AgentBuilder<CountingModel<M>, NoToolConfig>, Meter) {
     let preamble = &format!("{preamble}{TOOL_USE_GUIDANCE}");
+    let calls = Arc::new(AtomicU64::new(0));
     let usage = UsageHook::default();
     let observability = ObservabilityHook::default();
     let meter = Meter {
         total: Arc::clone(&usage.total),
-        calls: Arc::clone(&usage.calls),
+        calls: Arc::clone(&calls),
         used: Arc::clone(&observability.used),
     };
-    let builder = AgentBuilder::new(model)
-        .preamble(preamble)
-        .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
-        // Always set, never left to the provider client to infer from the model name: its table of
-        // known prefixes does not include models released after it was compiled, and a model that
-        // falls through it goes out with no cap at all — which Anthropic rejects outright, losing
-        // the run at that node's first call.
-        .max_tokens(request.max_tokens)
-        // Log tool calls + model text; added before the gates so it observes calls the
-        // clarification and ruleset hooks may skip.
-        .add_hook(observability)
-        .add_hook(usage);
+    let builder = AgentBuilder::new(CountingModel {
+        inner: model,
+        calls,
+    })
+    .preamble(preamble)
+    .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
+    // Always set, never left to the provider client to infer from the model name: its table of
+    // known prefixes does not include models released after it was compiled, and a model that
+    // falls through it goes out with no cap at all — which Anthropic rejects outright, losing
+    // the run at that node's first call.
+    .max_tokens(request.max_tokens)
+    // Log tool calls + model text; added before the gates so it observes calls the
+    // clarification and ruleset hooks may skip.
+    .add_hook(observability)
+    .add_hook(usage);
     // Left to the provider's default when the route says nothing, rather than given a default
     // here: "unset" is a position, and picking one for every node from one place would be picking
     // it for nodes nobody thought about.
@@ -757,29 +806,25 @@ impl Meter {
     }
 }
 
-/// Accumulates what the provider said each model call cost.
+/// Accumulates what the provider said each completed model turn cost.
 ///
-/// It counts on `on_completion_response`, not `on_model_turn_finished`, because a turn a hook later
-/// rejects and retries was still billed. Counting accepted turns only would report a number smaller
-/// than the invoice, which is the wrong direction for anything that decides whether to keep going.
+/// Calls are counted by [`CountingModel`] below Rig's response conversion, because an empty payload
+/// can become an error before any hook runs. This hook stays responsible only for provider-reported
+/// usage, which does not exist on that error path.
 ///
 /// The total is read back after the run, including when the run failed: the calls made before the
 /// failure cost the same as the ones before a success.
 #[derive(Default)]
 struct UsageHook {
     total: Arc<Mutex<TokenUsage>>,
-    calls: Arc<AtomicU64>,
 }
 
 impl AgentHook for UsageHook {
-    /// Counts model calls, including ones a later hook rejects and retries — all of them were
-    /// billed, so the call count is what says how much work a turn actually took.
     async fn on_completion_response(
         &self,
         _ctx: &HookContext,
         _event: CompletionResponseEvent<'_>,
     ) -> ObservationAction {
-        self.calls.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
             kind = "response_usage",
             input = _event.usage.input_tokens,
@@ -1933,6 +1978,48 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[derive(Clone, Default)]
+    struct EmptyThenAnswer {
+        attempts: Arc<AtomicU64>,
+    }
+
+    impl CompletionModel for EmptyThenAnswer {
+        type Response = ();
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self::default()
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            if self.attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Err(CompletionError::ResponseError(EMPTY_RESPONSE.to_string()));
+            }
+            Ok(CompletionResponse {
+                choice: OneOrMany::one(AssistantContent::text("a valid answer")),
+                usage: rig_core::completion::Usage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    total_tokens: 10,
+                    ..Default::default()
+                },
+                raw_response: (),
+                message_id: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+            Err(CompletionError::ResponseError(EMPTY_RESPONSE.to_string()))
+        }
+    }
+
     /// The operator controls, at the two points where this crate makes a decision of its own:
     /// waiting for a stopped node to be started, and holding what was said until the model can be
     /// told. The rules about what a command *means* are `ratatoskr_core::control`'s, and tested
@@ -2302,6 +2389,29 @@ mod tests {
         // Thinking accumulates like the rest: a turn that thought and called one tool spent most
         // of what it spent here, and a sum that drops it says the node was nearly free.
         assert_eq!(total.reasoning_tokens, 1_000);
+    }
+
+    #[tokio::test]
+    async fn an_empty_attempt_is_counted_even_when_rig_cannot_report_its_usage() {
+        let (builder, meter) = metered(
+            EmptyThenAnswer::default(),
+            "answer directly",
+            None,
+            Request::plain(),
+        );
+        let agent = builder.build();
+        let first = agent.prompt("question").await;
+        let answer =
+            retry_prompt_once("test", first, || async { agent.prompt("question").await }).await;
+
+        assert_eq!(answer.unwrap(), "a valid answer");
+        let (usage, calls) = meter.read();
+        assert_eq!(
+            calls, 2,
+            "both provider requests count, including the empty one"
+        );
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 3);
     }
 
     /// The whole write path against the real provider: declarations reach the model, it calls
