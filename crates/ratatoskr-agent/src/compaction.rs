@@ -88,12 +88,13 @@ pub struct CompactedSession {
 
 impl CompactedSession {
     /// Return the one memory backend shared by every attempt of this node.
-    pub fn memory<M>(
+    pub(crate) fn memory<M>(
         &self,
         model: M,
         node: &str,
         produces: &str,
         ledger: Option<Arc<crate::RunLedger>>,
+        provider_calls: crate::ProviderCallQueue,
     ) -> Arc<dyn ConversationMemory>
     where
         M: CompletionModel + 'static,
@@ -109,8 +110,14 @@ impl CompactedSession {
         // Each stored message costs at least one token, so this window carries no raw history into
         // a re-entry. CompactingMemory retains its rolling summary separately and includes it in
         // the following compaction, preserving facts from every earlier attempt.
-        let memory: Arc<dyn ConversationMemory> =
-            Arc::new(compacting_memory(model, node, produces, 0, ledger));
+        let memory: Arc<dyn ConversationMemory> = Arc::new(compacting_memory(
+            model,
+            node,
+            produces,
+            0,
+            ledger,
+            provider_calls,
+        ));
         *slot = Some(Arc::clone(&memory));
         memory
     }
@@ -131,6 +138,7 @@ pub struct SummaryCompactor<M> {
     /// a run's per-node totals would sum to less than the invoice — and these are the calls that
     /// fire precisely when a session got long and expensive.
     ledger: Option<Arc<crate::RunLedger>>,
+    provider_calls: crate::ProviderCallQueue,
     /// The node being compacted, and what it has to end up producing.
     ///
     /// Included in the instruction because "keep what matters" is unanswerable in the abstract: what
@@ -142,15 +150,17 @@ pub struct SummaryCompactor<M> {
 }
 
 impl<M> SummaryCompactor<M> {
-    pub fn new(
+    fn new(
         model: M,
         node: &str,
         produces: &str,
         ledger: Option<Arc<crate::RunLedger>>,
+        provider_calls: crate::ProviderCallQueue,
     ) -> Self {
         SummaryCompactor {
             model: Arc::new(model),
             ledger,
+            provider_calls,
             node: node.to_string(),
             produces: produces.to_string(),
         }
@@ -200,8 +210,12 @@ where
                 ),
                 None,
                 crate::Request::plain(),
+                Arc::clone(&self.provider_calls),
             );
-            let answer = builder.build().prompt(prompt.as_str()).await;
+            let agent = builder.build();
+            // The enclosing agent prompt owns the one no-verdict retry. Retrying here as well
+            // would let two empty summaries trigger two compactions on each outer attempt.
+            let answer = agent.prompt(prompt.as_str()).await;
             // Charged whether or not the summary came back: a compaction that failed still spent
             // what it spent, and dropping that would make the failure look free.
             if let Some(ledger) = &self.ledger {
@@ -311,12 +325,13 @@ fn tokens_in(message: &Message) -> usize {
 /// Dropping is what a plain window does, and for a coding session it is the wrong trade: the turn
 /// that discovered a constraint is exactly the one far enough back to be evicted, and losing it
 /// means rediscovering it — or, worse, retrying the approach it ruled out.
-pub fn compacting_memory<M>(
+pub(crate) fn compacting_memory<M>(
     model: M,
     node: &str,
     produces: &str,
     budget: usize,
     ledger: Option<Arc<crate::RunLedger>>,
+    provider_calls: crate::ProviderCallQueue,
 ) -> rig_memory::CompactingMemory<InMemoryConversationMemory, TokenWindowMemory, SummaryCompactor<M>>
 where
     M: CompletionModel + 'static,
@@ -324,7 +339,7 @@ where
     rig_memory::CompactingMemory::new(
         InMemoryConversationMemory::new(),
         TokenWindowMemory::new(budget, tokens_in),
-        SummaryCompactor::new(model, node, produces, ledger),
+        SummaryCompactor::new(model, node, produces, ledger, provider_calls),
     )
 }
 
@@ -338,6 +353,13 @@ mod tests {
     use super::*;
     use rig_core::OneOrMany;
     use rig_core::completion::message::{ToolResult, ToolResultContent, UserContent};
+
+    #[test]
+    fn compaction_leaves_retrying_to_the_enclosing_prompt() {
+        let source = include_str!("compaction.rs");
+        let retry_helper = ["retry_prompt", "_once"].concat();
+        assert!(!source.contains(&retry_helper));
+    }
 
     #[test]
     fn a_rendered_turn_keeps_the_tool_calls_and_their_results() {
@@ -451,6 +473,7 @@ mod tests {
             "analyst",
             "the requirements an implementation must satisfy",
             None,
+            crate::ProviderCallQueue::default(),
         );
 
         let evicted = vec![
