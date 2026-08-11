@@ -238,10 +238,13 @@ max_turns = 100
 
 # Phase 3: red-team and implementer run the repo's tests in a sandbox.
 [sandbox]
-backend = "landlock"                        # "landlock" (bwrap+Landlock, default), "container",
-                                            # or "microsandbox" (needs KVM AND a build with
-                                            # `--features microsandbox`)
-image = "docker.io/library/rust:1-slim"     # OCI image the container or microsandbox boots
+backend = "landlock"                        # "container" (OCI runtime, declared mounts only),
+                                            # "landlock" (bwrap fallback: host root + host tools),
+                                            # or "microsandbox" (KVM + feature build)
+image = "docker.io/library/rust:1-slim"     # OCI selector; container resolves its runtime image ID once
+# Container uses the resolved image's toolchain and never mounts the host root. Landlock is an
+# explicit weaker fallback: --clearenv limits inherited variables but it still reads the host root
+# and runs host tools. Microsandbox image identity is not yet recorded as a container digest.
 # Resource limits for each acceptance step and implementer Bash call. Container and microsandbox
 # enforce both; landlock logs once that bwrap cannot enforce them.
 cpus = 2

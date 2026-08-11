@@ -29,6 +29,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("runs", "config_json", "TEXT"),
     ("runs", "graph_hash", "TEXT"),
     ("runs", "repo_sha", "TEXT"),
+    ("runs", "image_digest", "TEXT"),
     ("checkpoints", "input_json", "TEXT"),
     ("checkpoints", "model", "TEXT"),
     ("checkpoints", "iteration", "INTEGER"),
@@ -112,6 +113,9 @@ pub struct Run {
     pub graph_hash: Option<String>,
     /// The commit the run started from.
     pub repo_sha: Option<String>,
+    /// Immutable OCI image ID used for this run's sandboxed work, when it had any.
+    #[serde(default)]
+    pub image_digest: Option<String>,
     /// Where this run came from, when it was not produced here. `None` for a local run.
     pub origin: Option<String>,
     /// The graph that ran, serialized. `None` for runs recorded before shapes were stored, which
@@ -225,7 +229,7 @@ impl Store {
             let conn = conn.lock().expect("store mutex poisoned");
             let run = conn
                 .query_row(
-                    "SELECT run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha, origin, shape_json FROM runs WHERE run_id = ?1",
+                    "SELECT run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha, image_digest, origin, shape_json FROM runs WHERE run_id = ?1",
                     params![run_id],
                     row_to_run,
                 )
@@ -278,7 +282,7 @@ impl Store {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().expect("store mutex poisoned");
             let mut stmt = conn.prepare(
-                "SELECT run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha, origin, shape_json FROM runs
+                "SELECT run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha, image_digest, origin, shape_json FROM runs
                  ORDER BY updated_at DESC, run_id DESC",
             )?;
             let rows = stmt
@@ -290,8 +294,9 @@ impl Store {
     }
 
     /// Record the provenance of a run: the config it started under, the graph that ran, and the
-    /// commit it ran against. Written once at run start, separately from [`Store::upsert_run`] —
-    /// that one fires on every status transition, and this is not something a transition knows.
+    /// commit it ran against. The image digest arrives when container-backed work first begins;
+    /// each fact is still write-once. This is separate from [`Store::upsert_run`] — that one fires
+    /// on every status transition, and this is not something a transition knows.
     pub async fn record_run_provenance(
         &self,
         run_id: &str,
@@ -299,14 +304,16 @@ impl Store {
         graph_hash: Option<&str>,
         repo_sha: Option<&str>,
         shape_json: Option<&str>,
+        image_digest: Option<&str>,
     ) -> Result<(), StoreError> {
         let conn = Arc::clone(&self.conn);
-        let (run_id, config_json, graph_hash, repo_sha, shape_json) = (
+        let (run_id, config_json, graph_hash, repo_sha, shape_json, image_digest) = (
             run_id.to_string(),
             config_json.map(str::to_string),
             graph_hash.map(str::to_string),
             repo_sha.map(str::to_string),
             shape_json.map(str::to_string),
+            image_digest.map(str::to_string),
         );
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().expect("store mutex poisoned");
@@ -317,9 +324,17 @@ impl Store {
                      config_json = COALESCE(config_json, ?2),
                      graph_hash  = COALESCE(graph_hash, ?3),
                      repo_sha    = COALESCE(repo_sha, ?4),
-                     shape_json  = COALESCE(shape_json, ?5)
+                     shape_json  = COALESCE(shape_json, ?5),
+                     image_digest = COALESCE(image_digest, ?6)
                  WHERE run_id = ?1",
-                params![run_id, config_json, graph_hash, repo_sha, shape_json],
+                params![
+                    run_id,
+                    config_json,
+                    graph_hash,
+                    repo_sha,
+                    shape_json,
+                    image_digest
+                ],
             )?;
             Ok::<_, StoreError>(())
         })
@@ -592,8 +607,8 @@ impl Store {
             let conn = conn.lock().expect("store mutex poisoned");
             conn.execute(
                 "INSERT INTO runs
-                   (run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha, origin, shape_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                   (run_id, issue_id, status, updated_at, config_json, graph_hash, repo_sha, image_digest, origin, shape_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     run.run_id,
                     run.issue_id,
@@ -602,6 +617,7 @@ impl Store {
                     run.config_json,
                     run.graph_hash,
                     run.repo_sha,
+                    run.image_digest,
                     // The bundle's own origin wins when it has one: a run that has already been
                     // passed along keeps saying where it started, not who forwarded it.
                     run.origin.clone().unwrap_or(origin),
@@ -657,8 +673,9 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         config_json: row.get(4)?,
         graph_hash: row.get(5)?,
         repo_sha: row.get(6)?,
-        origin: row.get(7)?,
-        shape_json: row.get(8)?,
+        image_digest: row.get(7)?,
+        origin: row.get(8)?,
+        shape_json: row.get(9)?,
         // Filled by the caller when it wants them: a join on every listing would cost every reader
         // for a column most of them do not look at.
         tags: Vec::new(),
@@ -1057,7 +1074,14 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_run("run-1", None, "running").await.unwrap();
         store
-            .record_run_provenance("run-1", Some("{}"), Some("deadbeef"), Some("abc123"), None)
+            .record_run_provenance(
+                "run-1",
+                Some("{}"),
+                Some("deadbeef"),
+                Some("abc123"),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1065,7 +1089,7 @@ mod tests {
         store.upsert_run("run-1", None, "converged").await.unwrap();
         // And a later provenance write that knows less must not erase what the first one knew.
         store
-            .record_run_provenance("run-1", None, None, None, None)
+            .record_run_provenance("run-1", None, None, None, None, None)
             .await
             .unwrap();
 
@@ -1074,6 +1098,113 @@ mod tests {
         assert_eq!(run.graph_hash.as_deref(), Some("deadbeef"));
         assert_eq!(run.repo_sha.as_deref(), Some("abc123"));
         assert_eq!(run.status, "converged");
+    }
+
+    #[tokio::test]
+    async fn a_runs_image_digest_is_recorded_with_the_rest_of_its_provenance() {
+        // A container-backed run pins its execution environment by digest, and that pin is part
+        // of the provenance every reader sees — the single-row read and the listing alike.
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("run-1", None, "running").await.unwrap();
+        store
+            .record_run_provenance(
+                "run-1",
+                Some("{}"),
+                Some("deadbeef"),
+                Some("abc123"),
+                None,
+                Some("sha256:aaa"),
+            )
+            .await
+            .unwrap();
+
+        let run = store.run("run-1").await.unwrap().unwrap();
+        assert_eq!(run.image_digest.as_deref(), Some("sha256:aaa"));
+        assert_eq!(run.config_json.as_deref(), Some("{}"));
+        assert_eq!(run.graph_hash.as_deref(), Some("deadbeef"));
+        let listed = store.list_runs().await.unwrap();
+        assert_eq!(listed[0].image_digest.as_deref(), Some("sha256:aaa"));
+    }
+
+    #[tokio::test]
+    async fn an_image_digest_cannot_be_erased_or_overwritten_once_recorded() {
+        // One run is one immutable execution environment. A later provenance write that knows
+        // less must not erase the digest, and a later resolution that disagrees must not move
+        // it — either would record provenance for an image that did not run.
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("run-1", None, "running").await.unwrap();
+        store
+            .record_run_provenance("run-1", None, None, None, None, Some("sha256:first"))
+            .await
+            .unwrap();
+
+        store
+            .record_run_provenance("run-1", Some("{}"), None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .record_run_provenance("run-1", None, None, None, None, Some("sha256:second"))
+            .await
+            .unwrap();
+
+        let run = store.run("run-1").await.unwrap().unwrap();
+        assert_eq!(run.image_digest.as_deref(), Some("sha256:first"));
+        assert_eq!(run.config_json.as_deref(), Some("{}"));
+    }
+
+    #[tokio::test]
+    async fn a_run_without_a_container_image_records_no_digest() {
+        // The landlock path: no image is inspected, so no digest is recorded, and the run reads
+        // as `None` rather than as some placeholder that would imitate a pin.
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("run-1", None, "running").await.unwrap();
+        store
+            .record_run_provenance("run-1", Some("{}"), Some("deadbeef"), None, None, None)
+            .await
+            .unwrap();
+
+        let run = store.run("run-1").await.unwrap().unwrap();
+        assert!(run.image_digest.is_none());
+        assert_eq!(run.graph_hash.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn a_database_from_before_image_digests_reads_them_as_absent() {
+        // The narrow shape a store created before the column existed has. Migration adds it
+        // nullable, an old row reads as "no image was pinned", and a widened write against the
+        // migrated table works.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (
+                 run_id TEXT PRIMARY KEY, issue_id TEXT, status TEXT NOT NULL,
+                 updated_at TEXT NOT NULL);
+             CREATE TABLE checkpoints (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id),
+                 node_name TEXT NOT NULL, output_json TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')));
+             INSERT INTO runs (run_id, status, updated_at) VALUES ('old', 'converged', 'then');",
+        )
+        .unwrap();
+
+        let store = Store::from_connection(conn).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        let run = rt.block_on(store.run("old")).unwrap().unwrap();
+        assert!(run.image_digest.is_none());
+
+        rt.block_on(store.record_run_provenance(
+            "old",
+            None,
+            None,
+            None,
+            None,
+            Some("sha256:late"),
+        ))
+        .unwrap();
+        let run = rt.block_on(store.run("old")).unwrap().unwrap();
+        assert_eq!(run.image_digest.as_deref(), Some("sha256:late"));
     }
 
     #[test]

@@ -271,6 +271,7 @@ async fn record_provenance(store: &Store, run_id: &str, config: &RatatoskrConfig
             serde_json::to_string(&ratatoskr_core::shape::built_in())
                 .ok()
                 .as_deref(),
+            None,
         )
         .await
     {

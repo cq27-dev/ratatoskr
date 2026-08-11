@@ -1607,6 +1607,30 @@ mod tests {
     }
 
     #[test]
+    fn the_container_backend_takes_a_plain_tag_and_asks_for_nothing_new() {
+        // The configuration surface the isolation contract ships: `backend = "container"` plus
+        // an ordinary OCI selector, resolved to a digest at execution time rather than pinned
+        // here. Selecting it must not require any key a landlock config does not already have.
+        let cfg = RatatoskrConfig::from_toml_str(
+            r#"
+            [store]
+            path = "s"
+            [worktree]
+            root = "w"
+            [sandbox]
+            backend = "container"
+            image = "ratatoskr-checks"
+            test_command = ["cargo", "test"]
+            "#,
+        )
+        .unwrap();
+        cfg.validate()
+            .expect("a container backend with a plain tag is valid");
+        assert_eq!(cfg.sandbox.backend, "container");
+        assert_eq!(cfg.sandbox.image, "ratatoskr-checks");
+    }
+
+    #[test]
     fn default_config_serializes_and_reparses() {
         let toml_str = toml::to_string(&RatatoskrConfig::default()).unwrap();
         let reparsed = RatatoskrConfig::from_toml_str(&toml_str).unwrap();

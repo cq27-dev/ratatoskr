@@ -7,7 +7,9 @@ CREATE TABLE IF NOT EXISTS runs (
     -- experiment: the resolved config, the graph that ran, and the tree it ran against.
     config_json TEXT,
     graph_hash TEXT,
-    repo_sha TEXT
+    repo_sha TEXT,
+    -- Immutable OCI image ID when this run executed container-backed sandbox work.
+    image_digest TEXT
 );
 
 -- Per-node checkpoint snapshots: what a node was given, what it produced, what it cost, and which

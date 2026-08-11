@@ -12,8 +12,8 @@
 //!   environment has to be cleared by hand.
 //! - `container` — an **OCI container**, so the toolchain comes from an image and the mounts are
 //!   the only host filesystem there is. Needs an ordinary container runtime and nothing else. This
-//!   is the rung that removes the host root without requiring KVM, and it is where a run that
-//!   installs anything belongs.
+//!   is the rung that removes the host root without requiring KVM; its toolchain and dependencies
+//!   come from the image and prepared read-only caches, never an acceptance-time install.
 //! - `microsandbox` — a **MicroVM**, adding a VM boundary on top of the image. Needs KVM, and is
 //!   behind `--features microsandbox` because its build script needs the network.
 
@@ -98,6 +98,14 @@ pub enum SandboxError {
         runtime: &'static str,
         source: std::io::Error,
     },
+    #[error("container image {0:?} is not an immutable sha256 identifier")]
+    InvalidContainerImage(String),
+    #[error("{runtime} could not inspect container image {image:?}: {detail}")]
+    ContainerInspect {
+        runtime: &'static str,
+        image: String,
+        detail: String,
+    },
 }
 
 /// Run `spec.command` in a sandbox, returning its captured output. Dispatches on `spec.backend`.
@@ -132,6 +140,51 @@ fn container_runtime() -> Option<&'static str> {
             .map(|path| std::env::split_paths(&path).any(|dir| dir.join(runtime).is_file()))
             .unwrap_or(false)
     })
+}
+
+fn is_image_digest(image: &str) -> bool {
+    image.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
+}
+
+/// Resolve an OCI image selector to the immutable local image ID the chosen runtime executes.
+///
+/// Tags are deliberately resolved here, at execution time, rather than when TOML is loaded: a
+/// local image may be built after configuration is read. The returned `sha256:` ID is suitable for
+/// the same Docker/Podman `run` argv as the configured selector.
+pub async fn resolve_container_image(image: &str) -> Result<String, SandboxError> {
+    if image.trim().is_empty() || image.starts_with("sha256:") && !is_image_digest(image) {
+        return Err(SandboxError::InvalidContainerImage(image.to_string()));
+    }
+
+    let runtime = container_runtime().ok_or(SandboxError::NoContainerRuntime)?;
+    if is_image_digest(image) {
+        return Ok(image.to_string());
+    }
+    let output = Command::new(runtime)
+        .args(["image", "inspect", "--format", "{{.Id}}", image])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|source| SandboxError::Container { runtime, source })?;
+    let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || !is_image_digest(&identity) {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(SandboxError::ContainerInspect {
+            runtime,
+            image: image.to_string(),
+            detail: if detail.is_empty() {
+                format!("returned {identity:?}")
+            } else {
+                detail
+            },
+        });
+    }
+    Ok(identity)
 }
 
 /// The uid:gid a container should run its command as.
@@ -1098,5 +1151,214 @@ mod tests {
             .build()
             .unwrap()
             .block_on(f)
+    }
+
+    // --- container image resolution ------------------------------------------
+
+    /// Restores `PATH` on drop. Prepending is safe for tests running alongside; replacing is not
+    /// (a concurrent test spawning `git` would not find it), so the replaced window is kept to a
+    /// single resolution call.
+    struct PathGuard(Option<std::ffi::OsString>);
+
+    impl PathGuard {
+        fn prepended(dir: &Path) -> Self {
+            let old = std::env::var_os("PATH");
+            let mut paths = vec![dir.to_path_buf()];
+            if let Some(old) = &old {
+                paths.extend(std::env::split_paths(old));
+            }
+            // SAFETY: process-environment mutation races with other tests, but this only adds a
+            // directory — every lookup that resolved before still resolves — and drop restores.
+            unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
+            Self(old)
+        }
+
+        fn replaced_with(dir: &Path) -> Self {
+            let old = std::env::var_os("PATH");
+            // SAFETY: races with concurrent tests' subprocess spawns for the guard's lifetime;
+            // kept to the one call that must see a runtime-less PATH, and drop restores.
+            unsafe { std::env::set_var("PATH", dir) };
+            Self(old)
+        }
+    }
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            // SAFETY: restores exactly what the guard found.
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("PATH", value),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    static FAKE_RUNTIME_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A directory posing as a container-runtime installation: an executable `docker` whose
+    /// `inspect` answers with `digest` — raw when asked with `--format`, as a JSON array
+    /// otherwise, because which of the two a correct implementation uses is its own business —
+    /// and which logs every inspection to `<dir>/inspections` so a test can count them.
+    fn fake_runtime_reporting(digest: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-fake-runtime-{}-{}",
+            std::process::id(),
+            FAKE_RUNTIME_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inspections = dir.join("inspections");
+        // One long format string rather than line continuations: the script's own indentation
+        // is significant enough that eating it with Rust's `\`-newline would be a quiet bug.
+        let script = format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *\" inspect \"*)\n    echo ask >> '{}'\n    case \" $* \" in\n      *\" --format \"*) echo '{digest}' ;;\n      *) printf '[{{\"Id\":\"{digest}\"}}]\\n' ;;\n    esac ;;\n  *) exit 1 ;;\nesac\n",
+            inspections.display()
+        );
+        let docker = dir.join("docker");
+        std::fs::write(&docker, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    /// A fake runtime whose `inspect` fails the way it does for an image that is not there.
+    fn fake_runtime_without_the_image() -> PathBuf {
+        let dir = fake_runtime_reporting("sha256:unused");
+        let script = "#!/bin/sh\ncase \" $* \" in\n  *\" inspect \"*) echo 'Error: no such image' >&2; exit 1 ;;\n  *) exit 1 ;;\nesac\n";
+        std::fs::write(dir.join("docker"), script).unwrap();
+        dir
+    }
+
+    fn digest(seed: &str) -> String {
+        // A realistic immutable id: `sha256:` plus 64 hex chars.
+        format!("sha256:{}", seed.repeat(64 / seed.len()))
+    }
+
+    #[test]
+    fn image_digests_must_be_canonical_sha256_hex() {
+        assert!(is_image_digest(&digest("ab")));
+        assert!(!is_image_digest("sha256:abc"));
+        assert!(!is_image_digest(&format!("sha256:{}", "A".repeat(64))));
+    }
+
+    #[tokio::test]
+    async fn an_image_tag_resolves_to_the_immutable_digest_the_runtime_reports() {
+        // The contract's happy path: config names a mutable tag, the run executes and records
+        // the immutable identifier the runtime reports for it. Exercised through the crate-root
+        // path, which is where the contract puts it.
+        let want = digest("ab");
+        let dir = fake_runtime_reporting(&want);
+        let _path = PathGuard::prepended(&dir);
+
+        let resolved = crate::resolve_container_image("ratatoskr-checks")
+            .await
+            .unwrap();
+        assert_eq!(resolved, want);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn image_resolution_fails_when_no_container_runtime_is_available() {
+        // Selecting `container` on a host without Docker or Podman is an error that says so —
+        // never an implicit downgrade to landlock, which would silently trade the isolation
+        // the config asked for (no host root) for the weakest rung while reporting success.
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-no-runtime-{}-{}",
+            std::process::id(),
+            FAKE_RUNTIME_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = {
+            let _path = PathGuard::replaced_with(&dir);
+            crate::resolve_container_image("ratatoskr-checks")
+                .await
+                .unwrap_err()
+        };
+        // "Names that a container runtime is required" — the variant this crate already has for
+        // exactly this, or a message carrying the same words.
+        assert!(
+            matches!(err, SandboxError::NoContainerRuntime)
+                || err.to_string().contains("container runtime"),
+            "{err}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn image_resolution_fails_when_the_runtime_cannot_inspect_the_image() {
+        // An image that is not there must fail the sandboxed phase — running the mutable tag
+        // instead would pin nothing and record provenance for an image that did not run.
+        let dir = fake_runtime_without_the_image();
+        let _path = PathGuard::prepended(&dir);
+
+        let err = crate::resolve_container_image("ratatoskr-checks")
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().is_empty(), "{err}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn image_resolution_refuses_an_inspect_result_that_is_not_an_immutable_digest() {
+        // `image inspect` answered but what it returned is another mutable reference, not a
+        // `sha256:` identifier. Recording that as provenance would claim a pin that does not
+        // exist; the phase fails instead.
+        let dir = fake_runtime_reporting("ratatoskr-checks:latest");
+        let _path = PathGuard::prepended(&dir);
+
+        let err = crate::resolve_container_image("ratatoskr-checks")
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().is_empty(), "{err}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a container runtime and the alpine image; run with --ignored"]
+    async fn a_resolved_digest_runs_in_place_of_the_tag() {
+        // End to end against a real runtime: the tag resolves to a digest, and the digest — not
+        // the tag — is what the sandbox boots.
+        let resolved = crate::resolve_container_image("docker.io/library/alpine:3")
+            .await
+            .unwrap();
+        assert!(resolved.starts_with("sha256:"), "{resolved}");
+
+        let out = run(SandboxSpec {
+            image: resolved,
+            ..container_spec(&["true"])
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    }
+
+    #[test]
+    fn the_readme_states_what_each_sandbox_rung_exposes() {
+        // The fallback's exposure is stated, not implied: a reader choosing `landlock` is
+        // choosing the host root read-only and the host's toolchain, and "sandboxed" reads as
+        // "isolated" unless the documentation says otherwise. Likewise the container rung is
+        // documented as mounts-only with a pinned image — not asserted here as exact prose,
+        // which would make a wording edit a test failure, but as the facts being present.
+        let readme = include_str!("../../../README.md");
+        let paragraph = readme
+            .split("\n\n")
+            .find(|p| p.contains("sandbox") && p.contains("landlock"))
+            .expect("the README documents the sandbox backends");
+        assert!(
+            paragraph.contains("container"),
+            "the README names the container backend: {paragraph}"
+        );
+        assert!(
+            paragraph.contains("host root")
+                || paragraph.contains("host's toolchain")
+                || paragraph.contains("host toolchain"),
+            "the README states that landlock exposes the host root and toolchain: {paragraph}"
+        );
     }
 }
