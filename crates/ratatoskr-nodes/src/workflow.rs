@@ -1080,6 +1080,7 @@ async fn verify_host(
             input_json.clone(),
             StandardStageInvocation {
                 resource_root: Some(worktree.0.clone()),
+                rag_rat_worktree: Some(worktree.0.clone()),
                 shell: None,
                 publish: None,
                 clarifier: None,
@@ -1157,6 +1158,7 @@ impl CeilingRecovery for LiveCeilingRecovery {
             input_json,
             StandardStageInvocation {
                 resource_root: None,
+                rag_rat_worktree: None,
                 shell: None,
                 publish: None,
                 clarifier: None,
@@ -1379,6 +1381,7 @@ async fn context_host(
         input_json,
         StandardStageInvocation {
             resource_root: None,
+            rag_rat_worktree: None,
             shell: None,
             publish: None,
             clarifier: None,
@@ -1531,6 +1534,7 @@ struct StageInvocation {
     input_json: String,
     rendered_question: Option<String>,
     resource_root: Option<PathBuf>,
+    rag_rat_worktree: Option<PathBuf>,
     shell: Option<ratatoskr_agent::shell::ShellAccess>,
     publish: Option<StandardStagePublishResources>,
     clarifier: Option<Arc<dyn ratatoskr_agent::Clarifier>>,
@@ -1559,6 +1563,7 @@ fn stage_invocation(stage: Stage, host_input_json: String) -> Result<StageInvoca
             input_json: host_input_json,
             rendered_question: None,
             resource_root: None,
+            rag_rat_worktree: None,
             shell: None,
             publish: None,
             clarifier: None,
@@ -1574,6 +1579,7 @@ fn stage_invocation(stage: Stage, host_input_json: String) -> Result<StageInvoca
             .map_err(|error| error.to_string())?,
         rendered_question: Some(envelope.rendered.question),
         resource_root: None,
+        rag_rat_worktree: None,
         shell: None,
         publish: None,
         clarifier: None,
@@ -1628,6 +1634,7 @@ impl StageExecutor {
             input_json,
             rendered_question,
             resource_root,
+            rag_rat_worktree,
             shell,
             publish,
             clarifier,
@@ -1722,6 +1729,7 @@ impl StageExecutor {
                 input_json: serde_json::to_string(&task.input).map_err(|e| e.to_string())?,
                 rendered_question: None,
                 resource_root: resource_root.clone(),
+                rag_rat_worktree: rag_rat_worktree.clone(),
                 shell: None,
                 publish: None,
                 clarifier: None,
@@ -1788,6 +1796,7 @@ impl StageExecutor {
                 observer: plugins.observer.clone(),
                 skills: crate::skills::loaded(&plugins.skills, &governance_id),
                 files: resource_root.or(cfg.files),
+                rag_rat_worktree,
                 shell,
                 push: publish.and_then(|publish| publish.push),
                 conversation: Some(&conversation),
@@ -1983,6 +1992,7 @@ pub(crate) async fn evaluate_standard_stage_at(
         stage_id,
         input_json,
         StandardStageResources {
+            rag_rat_worktree: Some(resource_root.clone()),
             resource_root,
             shell: None,
             publish: None,
@@ -2001,6 +2011,11 @@ pub(crate) async fn evaluate_standard_stage_at(
 #[derive(Clone)]
 pub(crate) struct StandardStageResources {
     pub resource_root: PathBuf,
+    /// A linked worktree that rag-rat queries must see as an overlay over the base index.
+    ///
+    /// This is deliberately separate from the file-tool root: a Rust host selects the worktree
+    /// and the agent binding keeps the absolute path out of model-visible tool arguments.
+    pub rag_rat_worktree: Option<PathBuf>,
     pub shell: Option<ratatoskr_agent::shell::ShellAccess>,
     pub publish: Option<StandardStagePublishResources>,
     pub clarifier: Option<Arc<dyn ratatoskr_agent::Clarifier>>,
@@ -2019,6 +2034,7 @@ pub(crate) struct StandardStagePublishResources {
 #[derive(Clone)]
 struct StandardStageInvocation {
     resource_root: Option<PathBuf>,
+    rag_rat_worktree: Option<PathBuf>,
     shell: Option<ratatoskr_agent::shell::ShellAccess>,
     publish: Option<StandardStagePublishResources>,
     clarifier: Option<Arc<dyn ratatoskr_agent::Clarifier>>,
@@ -2044,6 +2060,7 @@ async fn execute_standard_stage(
         Box::pin(async move {
             let mut invocation = stage_invocation(stage, rendered_input)?;
             invocation.resource_root = settings.resource_root;
+            invocation.rag_rat_worktree = settings.rag_rat_worktree;
             invocation.shell = settings.shell;
             invocation.publish = settings.publish;
             invocation.clarifier = settings.clarifier;
@@ -2121,16 +2138,18 @@ async fn evaluate_standard_stage_with_turn_and_resources(
     resources: Option<StandardStageResources>,
     turn: Arc<dyn StageTurn>,
 ) -> Result<String, String> {
-    let (resource_root, shell, publish, clarifier, invocation_guidance) = match resources {
-        Some(resources) => (
-            Some(resources.resource_root),
-            resources.shell,
-            resources.publish,
-            resources.clarifier,
-            resources.guidance,
-        ),
-        None => (None, None, None, None, None),
-    };
+    let (resource_root, rag_rat_worktree, shell, publish, clarifier, invocation_guidance) =
+        match resources {
+            Some(resources) => (
+                Some(resources.resource_root),
+                resources.rag_rat_worktree,
+                resources.shell,
+                resources.publish,
+                resources.clarifier,
+                resources.guidance,
+            ),
+            None => (None, None, None, None, None, None),
+        };
     let stages = Arc::new(standard_stages().await.map_err(|error| error.to_string())?);
     let stage = stages
         .iter()
@@ -2144,6 +2163,7 @@ async fn evaluate_standard_stage_with_turn_and_resources(
         input_json,
         StandardStageInvocation {
             resource_root,
+            rag_rat_worktree,
             shell,
             publish,
             clarifier,
@@ -2585,6 +2605,7 @@ async fn bookkeep_scripted(
             input_json,
             StandardStageResources {
                 resource_root: ctx.repo_path.clone(),
+                rag_rat_worktree: None,
                 shell: None,
                 publish: None,
                 clarifier: None,
@@ -2976,6 +2997,7 @@ mod tests {
         ledger_ids: Mutex<Vec<Option<usize>>>,
         tools: Mutex<Vec<Vec<String>>>,
         files: Mutex<Vec<Option<std::path::PathBuf>>>,
+        rag_rat_worktrees: Mutex<Vec<Option<std::path::PathBuf>>>,
         has_shell: Mutex<Vec<bool>>,
         has_push: Mutex<Vec<bool>>,
         has_clarifier: Mutex<Vec<bool>>,
@@ -2994,6 +3016,7 @@ mod tests {
                 ledger_ids: Mutex::new(Vec::new()),
                 tools: Mutex::new(Vec::new()),
                 files: Mutex::new(Vec::new()),
+                rag_rat_worktrees: Mutex::new(Vec::new()),
                 has_shell: Mutex::new(Vec::new()),
                 has_push: Mutex::new(Vec::new()),
                 has_clarifier: Mutex::new(Vec::new()),
@@ -3039,6 +3062,10 @@ mod tests {
                 .lock()
                 .expect("recording runner mutex poisoned")
                 .push(run.files.clone());
+            self.rag_rat_worktrees
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(run.rag_rat_worktree.clone());
             self.has_shell
                 .lock()
                 .expect("recording runner mutex poisoned")
@@ -3971,6 +3998,7 @@ mod tests {
                 input_json: "{}".to_string(),
                 rendered_question: None,
                 resource_root: None,
+                rag_rat_worktree: None,
                 shell: None,
                 publish: None,
                 clarifier: None,
@@ -5117,6 +5145,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("compose a memory".to_string()),
             resource_root: Some(dir.clone()),
+            rag_rat_worktree: None,
             shell: None,
             publish: None,
             clarifier: None,
@@ -5322,6 +5351,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("do not publish".to_string()),
             resource_root: Some(dir.clone()),
+            rag_rat_worktree: None,
             shell: None,
             publish: None,
             clarifier: None,
@@ -5359,6 +5389,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("publish".to_string()),
             resource_root: Some(dir.clone()),
+            rag_rat_worktree: None,
             shell: None,
             publish: Some(StandardStagePublishResources {
                 push: Some(ratatoskr_agent::publish::PushAccess {
@@ -5452,6 +5483,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("deliver the run".to_string()),
             resource_root: Some(dir.clone()),
+            rag_rat_worktree: None,
             shell: None,
             publish: Some(StandardStagePublishResources {
                 push: Some(ratatoskr_agent::publish::PushAccess {
@@ -5555,6 +5587,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("deliver the run".to_string()),
             resource_root: Some(dir.clone()),
+            rag_rat_worktree: None,
             shell: None,
             publish: Some(StandardStagePublishResources { push: None }),
             clarifier: None,
@@ -5642,6 +5675,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("deliver the run".to_string()),
             resource_root: Some(dir.clone()),
+            rag_rat_worktree: None,
             shell: None,
             publish: None,
             clarifier: None,
@@ -6602,6 +6636,7 @@ mod tests {
             serde_json::to_string(&author).unwrap(),
             StandardStageResources {
                 resource_root: author_root.clone(),
+                rag_rat_worktree: Some(author_root.clone()),
                 shell: None,
                 publish: None,
                 clarifier: None,
@@ -6652,7 +6687,15 @@ mod tests {
         }
         assert_eq!(
             turn.files.lock().expect("recording runner mutex poisoned")[0],
-            Some(author_root)
+            Some(author_root.clone())
+        );
+        assert_eq!(
+            *turn
+                .rag_rat_worktrees
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            [Some(author_root), None],
+            "the author uses its host-selected worktree; the base classifier uses the index"
         );
         assert!(
             !tools[1]
@@ -6739,6 +6782,7 @@ mod tests {
             serde_json::to_string(&author).unwrap(),
             StandardStageResources {
                 resource_root: author_root.clone(),
+                rag_rat_worktree: None,
                 shell: None,
                 publish: None,
                 clarifier: None,
@@ -6901,6 +6945,7 @@ mod tests {
                 serde_json::to_string(input).unwrap(),
                 StandardStageResources {
                     resource_root: dir.clone(),
+                    rag_rat_worktree: None,
                     shell: None,
                     publish: None,
                     clarifier: None,
@@ -7045,6 +7090,7 @@ mod tests {
             serde_json::to_string(&input).unwrap(),
             StandardStageResources {
                 resource_root: worktree.clone(),
+                rag_rat_worktree: Some(worktree.clone()),
                 shell: Some(shell.clone()),
                 publish: None,
                 clarifier: Some(Arc::new(StaticClarifier)),
@@ -7056,6 +7102,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             turn.files.lock().expect("recording runner mutex poisoned")[0],
+            Some(worktree.clone())
+        );
+        assert_eq!(
+            turn.rag_rat_worktrees
+                .lock()
+                .expect("recording runner mutex poisoned")[0],
             Some(worktree)
         );
         assert!(
@@ -7085,6 +7137,7 @@ mod tests {
             serde_json::to_string(&input).unwrap(),
             StandardStageResources {
                 resource_root: dir.clone(),
+                rag_rat_worktree: None,
                 shell: Some(shell),
                 publish: None,
                 clarifier: None,

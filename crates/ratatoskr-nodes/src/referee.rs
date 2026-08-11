@@ -160,6 +160,7 @@ impl RefereeNode {
                 observer: None,
                 skills: Vec::new(),
                 files: self.files.clone(),
+                rag_rat_worktree: self.files.clone(),
                 shell: None,
                 push: None,
                 conversation: None,

@@ -1153,6 +1153,7 @@ async fn publish_and_checkpoint(
         input_json,
         workflow::StandardStageResources {
             resource_root: repo_root,
+            rag_rat_worktree: worktree.map(|worktree| worktree.as_path().to_path_buf()),
             shell: None,
             publish: Some(workflow::StandardStagePublishResources { push }),
             clarifier: None,
@@ -1228,6 +1229,7 @@ async fn bookkeep_and_checkpoint(
             input_json.clone(),
             workflow::StandardStageResources {
                 resource_root: repo_root,
+                rag_rat_worktree: None,
                 shell: None,
                 publish: None,
                 clarifier: Some(clarifier.as_dyn()),
