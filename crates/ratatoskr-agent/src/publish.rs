@@ -218,7 +218,7 @@ async fn run(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecut
     // in it, and argv is where quoting bugs and injected arguments both live.
     let body_file = match args.get("body").and_then(|v| v.as_str()) {
         Some(body) if !body.trim().is_empty() => {
-            let path = body_path(root);
+            let path = body_path();
             std::fs::write(&path, body)
                 .map_err(|e| ToolExecutionError::other(format!("could not stage the body: {e}")))?;
             argv.push("--body-file".to_string());
@@ -255,17 +255,21 @@ async fn run(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecut
         Ok(Ok(output)) => output,
     };
 
-    let stdout = truncate(&String::from_utf8_lossy(&output.stdout));
-    let stderr = truncate(&String::from_utf8_lossy(&output.stderr));
+    let stdout = truncate(&redact_credentials(&String::from_utf8_lossy(
+        &output.stdout,
+    )));
+    let stderr = truncate(&redact_credentials(&String::from_utf8_lossy(
+        &output.stderr,
+    )));
     if !output.status.success() {
         // Returned as an error so the model sees a failure as a failure. `gh` writes its
         // diagnostics to stderr, and they are usually actionable — "no pull requests found",
         // "already exists".
-        return Err(ToolExecutionError::other(format!(
-            "`gh {}` failed (exit {}): {stderr}",
-            argv.join(" "),
-            output.status.code().unwrap_or(-1)
-        )));
+        return Err(gh_failed(
+            &argv,
+            output.status.code().unwrap_or(-1),
+            &stderr,
+        ));
     }
     Ok(match stdout.trim().is_empty() {
         true => format!("done. {stderr}").trim().to_string(),
@@ -273,10 +277,55 @@ async fn run(root: &Path, args: &serde_json::Value) -> Result<String, ToolExecut
     })
 }
 
-/// Where a body is staged. Inside the repository so it is on the same filesystem, and named so a
-/// leftover is identifiable rather than mysterious.
-fn body_path(root: &Path) -> PathBuf {
-    root.join(format!(".ratatoskr-gh-body-{}", std::process::id()))
+/// Where a body is staged. Publishing must not leave temporary content in the checkout it reads.
+fn body_path() -> PathBuf {
+    std::env::temp_dir().join(format!("ratatoskr-gh-body-{}", uuid::Uuid::new_v4()))
+}
+
+/// Replace configured GitHub credentials and credential-bearing URLs before a subprocess result
+/// reaches the model or logs.
+fn redact_credentials(text: &str) -> String {
+    let mut redacted = text.to_string();
+    for name in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ] {
+        if let Some(value) = std::env::var_os(name).and_then(|value| value.into_string().ok())
+            && !value.is_empty()
+        {
+            redacted = redacted.replace(&value, "[REDACTED]");
+        }
+    }
+    let mut start = 0;
+    while let Some(scheme) = redacted[start..].find("://") {
+        let credentials_start = start + scheme + 3;
+        let Some((end, delimiter)) =
+            redacted[credentials_start..]
+                .char_indices()
+                .find(|(_, character)| {
+                    *character == '@' || *character == '/' || character.is_whitespace()
+                })
+        else {
+            break;
+        };
+        let end = credentials_start + end;
+        if delimiter != '@' {
+            start = end + delimiter.len_utf8();
+            continue;
+        }
+        redacted.replace_range(credentials_start..end, "[REDACTED]");
+        start = credentials_start + "[REDACTED]@".len();
+    }
+    redacted
+}
+
+fn gh_failed(argv: &[String], exit: i32, stderr: &str) -> ToolExecutionError {
+    ToolExecutionError::other(format!(
+        "`gh {}` failed (exit {exit}): {stderr}",
+        redact_credentials(&argv.join(" "))
+    ))
 }
 
 fn truncate(s: &str) -> String {
@@ -294,8 +343,8 @@ fn truncate(s: &str) -> String {
 /// acceptable; there is no supplied string to decide about.
 #[derive(Debug, Clone)]
 pub struct PushAccess {
-    /// Where `git` runs. Worktrees share the main checkout's refs, so the repository root can push
-    /// a branch that is checked out in a linked worktree.
+    /// Where `git` runs: the committed run worktree. Linked worktrees share the repository's Git
+    /// metadata, so this still has the refs needed to push the run branch.
     pub repo_root: PathBuf,
     /// The branch this run authored. Must be one this repository manages.
     pub branch: String,
@@ -521,8 +570,8 @@ async fn push(access: &PushAccess, kind: &str, slug: &str) -> Result<String, Too
     .map_err(|_| ToolExecutionError::other("git push timed out"))?
     .map_err(|e| ToolExecutionError::other(format!("git push failed to start: {e}")))?;
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = redact_credentials(&String::from_utf8_lossy(&out.stdout));
+    let stderr = redact_credentials(&String::from_utf8_lossy(&out.stderr));
     if out.status.success() {
         // git reports a push on stderr, so both streams carry the answer.
         Ok(truncate(&format!(
@@ -582,6 +631,72 @@ mod tests {
         assert!(
             format!("{err}").contains("only the branch it authored"),
             "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_diagnostics_never_carry_the_remote_url_credential() {
+        // A credential embedded in the remote URL is git's classic leak: its diagnostics echo the
+        // URL, and everything `push` returns is model-visible and logged. The push here must fail
+        // — the port is closed — but the credential value must not come back in the failure.
+        let root =
+            std::env::temp_dir().join(format!("ratatoskr-push-credential-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let secret = "ghp_pushdiagnosticsunittestsecret";
+        let remote = format!("http://publisher:{secret}@127.0.0.1:9/o/r.git");
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "test@example.com"],
+            &["config", "user.name", "Test"],
+            &["commit", "-q", "--allow-empty", "-m", "initial"],
+            &["checkout", "-qb", "ratatoskr/credential-check"],
+            &["remote", "add", "origin", remote.as_str()],
+        ] {
+            let output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        }
+        let access = PushAccess {
+            repo_root: root.clone(),
+            branch: "ratatoskr/credential-check".to_string(),
+            issue: None,
+        };
+        let out = push(&access, "fix", "scrub the credential")
+            .await
+            .expect("a refused push is reported as output, not an error");
+        assert!(
+            out.contains("push failed"),
+            "the diagnostics path was not exercised: {out}"
+        );
+        assert!(
+            !out.contains(secret),
+            "the credential came back in the push output: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_gh_command_redacts_credentials_in_model_supplied_arguments() {
+        let secret = "ghp_commanddiagnosticsunittestsecret";
+        let error = gh_failed(
+            &[
+                "pr".to_string(),
+                "view".to_string(),
+                "--repo".to_string(),
+                format!("https://user:{secret}@example.invalid/o/r"),
+            ],
+            1,
+            "gh rejected the request",
+        );
+        assert!(
+            !error.to_string().contains(secret),
+            "the model-visible command line leaked its credential: {error}"
         );
     }
 

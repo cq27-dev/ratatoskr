@@ -60,6 +60,17 @@ to the built-in workflow and converges on its test result alone.
    *made*: a pull request, a comment on the issue it was given, both, or neither. One writes to the
    memory graph and the other to the tracker, so they run concurrently.
 
+### Publisher boundary
+
+Publisher models can read only the committed run worktree (or the repository root captured when a
+run changed no code). They have no `Write`, `Edit`, or shell tool. `gh` and `git_push` are the only
+networked host actions: Rust fixes their subcommands and the run branch, stages publication bodies
+outside the checkout, and redacts GitHub credentials from their results and logs. Git metadata and
+host credentials stay host-side; no home directory or credentials are forwarded to a model sandbox.
+A fully sandboxed publisher is deliberately deferred: it needs an explicit sandbox environment,
+credentials, networking, and linked-worktree metadata contract without improving this no-shell
+boundary.
+
 Converge only believes a test run the change did not referee. An iteration that touches the tests,
 their runner config (`conftest.py`, `pytest.ini`, `jest.config.*`, `Cargo.toml`, `package.json`, …)
 or a file the runner auto-loads is sent back to revert it, named file by name — passing by editing

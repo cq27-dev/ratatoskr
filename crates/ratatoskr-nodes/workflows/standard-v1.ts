@@ -643,8 +643,7 @@ defineWorkflow({
           return question;
         }
 
-        question += `BRANCH: ${implementer.branch}\n`;
-        question += `WORKTREE: ${implementer.worktree_path}\n\n`;
+        question += `BRANCH: ${implementer.branch}\n\n`;
         if (implementer.touched_files.length > 0) {
           question += `FILES CHANGED: ${implementer.touched_files.join(", ")}\n`;
         }

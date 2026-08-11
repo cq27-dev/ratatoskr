@@ -49,7 +49,7 @@ pub use stage::{
 pub use validate::validate;
 pub use verifier::{Finding, FindingKind, Severity, VerifierOutput};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ratatoskr_core::{RatatoskrConfig, RunState, RunStatus, ToolPolicy};
@@ -1076,11 +1076,14 @@ async fn publish_if_enabled(
     run: &Run<'_>,
     input: publisher::PublisherInput,
     terminal: bool,
+    repository_root: &Path,
+    worktree: Option<&WorktreePath>,
+    turn: Arc<dyn workflow::StageTurn>,
 ) -> Option<PublisherOutput> {
     if !terminal || !run.config.publish.enabled {
         return None;
     }
-    match publish_and_checkpoint(run, input).await {
+    match publish_and_checkpoint(run, input, repository_root, worktree, turn).await {
         Ok(out) => Some(out),
         Err(e) => {
             tracing::warn!("publishing failed: {e}");
@@ -1093,6 +1096,9 @@ async fn publish_if_enabled(
 async fn publish_and_checkpoint(
     run: &Run<'_>,
     input: publisher::PublisherInput,
+    repository_root: &Path,
+    worktree: Option<&WorktreePath>,
+    turn: Arc<dyn workflow::StageTurn>,
 ) -> Result<PublisherOutput, PlanError> {
     let &Run {
         client,
@@ -1106,7 +1112,13 @@ async fn publish_and_checkpoint(
         ledger,
         ..
     } = run;
-    let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // The terminal flow owns the worktree handle. A publisher sees the committed run worktree,
+    // never its model-visible path or the terminal process's ambient directory. No-code delivery
+    // keeps the run context's captured repository root only for the constrained `gh` action.
+    let repo_root = worktree
+        .map(WorktreePath::as_path)
+        .unwrap_or(repository_root)
+        .to_path_buf();
     // Push is offered only when there is a branch to push, and only ever THAT branch: the access
     // carries it, and what the tool takes is a name's parts, never a ref. A run with no fork has
     // nothing to publish and is not given the tool at all.
@@ -1135,7 +1147,7 @@ async fn publish_and_checkpoint(
             plugin_context: context.clone(),
             ledger: Arc::clone(ledger),
         })?;
-    let raw = workflow::evaluate_standard_stage_with_resources(
+    let raw = workflow::evaluate_standard_stage_with_resources_and_turn(
         declared_context,
         "publisher",
         input_json,
@@ -1146,6 +1158,7 @@ async fn publish_and_checkpoint(
             clarifier: None,
             guidance: None,
         },
+        turn,
     )
     .await
     .map_err(|error| PlanError::node("publisher", NodeError::Failed(error)))?;
