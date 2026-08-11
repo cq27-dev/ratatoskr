@@ -928,6 +928,12 @@ body {
   stroke: var(--rule);
   stroke-width: 1;
 }
+/* A loop back through the pipeline carries the hue of the node it returns to, at rest as well as
+   live: three can be drawn at once, and the hue is what says which box each one lands on. Kept
+   ahead of `.is-live`, which has the same specificity and has to win when an edge is both. */
+.react-flow__edge.is-loop .react-flow__edge-path {
+  stroke: var(--tint, var(--rule));
+}
 /* A live edge carries the hue of the node it belongs to, not one shared "active" green. Which node
    is running is the question the graph is being asked, and a colour every live thing shares cannot
    answer it. Falls back to the green where an edge sets no tint. */

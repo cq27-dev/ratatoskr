@@ -50,3 +50,24 @@ jobs:
       # opt-in path compiling. Runs on CI, which has network to fetch the helper binary.
       - name: check microsandbox feature
         run: cargo clippy -p ratatoskr-exec --all-targets --features microsandbox -- -D warnings
+
+  # The dashboard has its own toolchain and its own tests, which `check` installs nothing to run.
+  # A separate job so a frontend failure reads as one rather than as a Rust break.
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/ratatoskr-serve/web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: install
+        run: bun install --frozen-lockfile
+
+      - name: test
+        run: bun test
+
+      - name: typecheck
+        run: bun run typecheck

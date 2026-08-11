@@ -50,8 +50,10 @@ src/
   to the last of them.
 - `panels/PipelineGraph.tsx` — the run graph. The pipeline's shape is fixed and known ahead of
   time, so the layout is hand-authored rather than run through `elkjs`/`dagre`: those exist for
-  graphs whose shape isn't known until runtime. The converge loop is a real self-edge, not an
-  annotation.
+  graphs whose shape isn't known until runtime. The implementer's loops are real edges, not
+  annotations: a retry self-edge on the implementer, and back-edges from the verifier to the
+  implementer (a direct fix) and to the analyst (a replan). Each is drawn only if `convergeLoops`
+  counted that route in the events shown, so a run that never looped draws no loop.
 - `panels/` — `Rail` (projects, new run, run list), `RunMeta` (the run header), `Scrubber`,
   `Feed` (the activity log and the `rows()` that builds it), `Detail` (a node's checkpoints),
   `Question` (a blocked node's clarification).
