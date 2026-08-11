@@ -203,6 +203,7 @@ where
             );
 
             let (builder, meter) = crate::metered(
+                &self.node,
                 (*self.model).clone(),
                 &format!(
                     "{PREAMBLE}\n\nTHIS SESSION: the `{}` node. It must finish by producing: {}",
@@ -355,10 +356,9 @@ mod tests {
     use rig_core::completion::message::{ToolResult, ToolResultContent, UserContent};
 
     #[test]
-    fn compaction_leaves_retrying_to_the_enclosing_prompt() {
+    fn compaction_uses_the_shared_per_turn_retry_wrapper() {
         let source = include_str!("compaction.rs");
-        let retry_helper = ["retry_prompt", "_once"].concat();
-        assert!(!source.contains(&retry_helper));
+        assert!(source.contains("crate::metered("));
     }
 
     #[test]

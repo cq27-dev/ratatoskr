@@ -35,7 +35,9 @@ use rig_agent::tool::{DynamicTool, ToolExecutionError};
 use rig_core::OneOrMany;
 use rig_core::client::ProviderClientError;
 use rig_core::client::completion::CompletionClient;
-use rig_core::completion::{CompletionError, CompletionModel, CompletionResponse, GetTokenUsage};
+use rig_core::completion::{
+    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage,
+};
 use rig_core::http_client::{self, HttpClientExt};
 use rig_core::message::{AssistantContent, ImageMediaType, MimeType, ToolResultContent};
 use rig_core::providers::{anthropic, moonshot, openai};
@@ -402,11 +404,10 @@ async fn run<M>(
 where
     M: CompletionModel + 'static,
 {
-    let (builder, meter) = metered(model, preamble, max_turns, Request::of(route), calls);
+    let (builder, meter) = metered("ask", model, preamble, max_turns, Request::of(route), calls);
     let agent = bind_tools(builder, &tools, None, None, None);
 
     let answer = agent.prompt(question).await;
-    let answer = retry_prompt_once("ask", answer, || async { agent.prompt(question).await }).await;
     // No store to checkpoint to here, so it goes to the log. A one-shot question whose cost is
     // unknowable is the same defect as an uncounted node, in a smaller place.
     let (usage, calls) = meter.read();
@@ -786,7 +787,7 @@ fn is_transport_error(message: &str) -> bool {
 
 const EMPTY_RESPONSE: &str = "Response contained no message or tool call (empty)";
 
-fn prompt_retry_reason(message: &str) -> Option<&'static str> {
+fn model_retry_reason(message: &str) -> Option<&'static str> {
     if is_transport_error(message) {
         Some("transport")
     } else if message.contains(EMPTY_RESPONSE) {
@@ -796,17 +797,21 @@ fn prompt_retry_reason(message: &str) -> Option<&'static str> {
     }
 }
 
-/// Retry one prompt that produced no verdict, without turning a persistent failure into a loop.
-async fn retry_prompt_once<T, E, F, Fut>(node: &str, first: Result<T, E>, retry: F) -> Result<T, E>
+/// Retry one provider turn that produced no verdict, without turning a persistent failure into a
+/// loop.
+async fn retry_model_turn_once<T, F, Fut>(
+    node: &str,
+    first: Result<T, CompletionError>,
+    retry: F,
+) -> Result<T, CompletionError>
 where
-    E: std::fmt::Display,
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T, E>>,
+    Fut: std::future::Future<Output = Result<T, CompletionError>>,
 {
     let Err(error) = &first else {
         return first;
     };
-    let Some(reason) = prompt_retry_reason(&error.to_string()) else {
+    let Some(reason) = model_retry_reason(&error.to_string()) else {
         return first;
     };
 
@@ -814,9 +819,59 @@ where
         node,
         retry_reason = reason,
         error = %error,
-        "the model call produced no verdict; retrying once"
+        "the provider turn produced no verdict; retrying once"
     );
     retry().await
+}
+
+/// Gives each provider request its own single retry.
+///
+/// An agent prompt can contain many provider turns separated by tool calls. Retrying the entire
+/// prompt makes an early transient failure consume the retry budget for a later one and discards
+/// completed work; this wrapper instead resends only the request that failed, against the same
+/// history and tool declarations.
+#[derive(Clone)]
+struct RetryingModel<M> {
+    inner: M,
+    node: String,
+}
+
+impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
+    type Response = M::Response;
+    type StreamingResponse = M::StreamingResponse;
+    type Client = M::Client;
+
+    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
+        RetryingModel {
+            inner: M::make(client, model),
+            node: "agent".to_string(),
+        }
+    }
+
+    async fn completion(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+        let retry_request = request.clone();
+        let first = self.inner.completion(request).await;
+        retry_model_turn_once(&self.node, first, || self.inner.completion(retry_request)).await
+    }
+
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<
+        rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+        CompletionError,
+    > {
+        let retry_request = request.clone();
+        let first = self.inner.stream(request).await;
+        retry_model_turn_once(&self.node, first, || self.inner.stream(retry_request)).await
+    }
+
+    fn composes_native_output_with_tools(&self) -> bool {
+        self.inner.composes_native_output_with_tools()
+    }
 }
 
 /// Anthropic prompt caching, which rig leaves off entirely.
@@ -886,12 +941,13 @@ impl Request {
 }
 
 fn metered<M: CompletionModel + 'static>(
+    node: &str,
     model: M,
     preamble: &str,
     max_turns: Option<usize>,
     request: Request,
     provider_calls: ProviderCallQueue,
-) -> (AgentBuilder<M, NoToolConfig>, Meter) {
+) -> (AgentBuilder<RetryingModel<M>, NoToolConfig>, Meter) {
     let preamble = &format!("{preamble}{TOOL_USE_GUIDANCE}");
     let first_call_id = provider_calls
         .lock()
@@ -906,18 +962,21 @@ fn metered<M: CompletionModel + 'static>(
         first_call_id,
         claimed_provider_calls: Mutex::new(ClaimedProviderCalls::default()),
     };
-    let builder = AgentBuilder::new(model)
-        .preamble(preamble)
-        .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
-        // Always set, never left to the provider client to infer from the model name: its table of
-        // known prefixes does not include models released after it was compiled, and a model that
-        // falls through it goes out with no cap at all — which Anthropic rejects outright, losing
-        // the run at that node's first call.
-        .max_tokens(request.max_tokens)
-        // Log tool calls + model text; added before the gates so it observes calls the
-        // clarification and ruleset hooks may skip.
-        .add_hook(observability)
-        .add_hook(usage);
+    let builder = AgentBuilder::new(RetryingModel {
+        inner: model,
+        node: node.to_string(),
+    })
+    .preamble(preamble)
+    .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
+    // Always set, never left to the provider client to infer from the model name: its table of
+    // known prefixes does not include models released after it was compiled, and a model that
+    // falls through it goes out with no cap at all — which Anthropic rejects outright, losing
+    // the run at that node's first call.
+    .max_tokens(request.max_tokens)
+    // Log tool calls + model text; added before the gates so it observes calls the
+    // clarification and ruleset hooks may skip.
+    .add_hook(observability)
+    .add_hook(usage);
     // Left to the provider's default when the route says nothing, rather than given a default
     // here: "unset" is a position, and picking one for every node from one place would be picking
     // it for nodes nobody thought about.
@@ -1935,6 +1994,7 @@ where
     };
 
     let (builder, meter) = metered(
+        node,
         model,
         &preamble,
         max_turns,
@@ -2084,23 +2144,6 @@ where
         }
     };
 
-    // One retry when the call never reached a verdict. A dropped connection is not an answer, and
-    // it cost a live run twenty minutes of implementer work at the last node before the diff: the
-    // request went out, the proxy in front of the API closed it, and the run failed holding a
-    // worktree full of finished edits. Retrying costs another attempt; not retrying costs all of
-    // the attempt already made.
-    //
-    // Transport and the provider's exact empty-response error only. A refusal, a bad request or an
-    // exhausted turn budget will answer the same way twice, and retrying those spends a node's
-    // budget to arrive back where it started.
-    let answer = retry_prompt_once(node, answer, || async {
-        async { agent.prompt(&question).await }
-            .instrument(span.clone())
-            .await
-            .map_err(|e| AgentError::Prompt(e.to_string()))
-    })
-    .await;
-
     // Give a malformed answer back to the agent that wrote it, once. The alternative is what a
     // schema failure used to cost: the node's whole run discarded — every tool call, every file
     // read, minutes of it — over a key in the wrong shape, which is the one kind of mistake a
@@ -2118,17 +2161,10 @@ where
                      error names — keep every finding, do not shorten anything, and do not go and \
                      look anything up again. Answer by calling the output tool.",
                 );
-                let corrected = async { agent.prompt(&correction).await }
+                async { agent.prompt(&correction).await }
                     .instrument(span.clone())
                     .await
-                    .map_err(|e| AgentError::Prompt(e.to_string()));
-                retry_prompt_once(node, corrected, || async {
-                    async { agent.prompt(&correction).await }
-                        .instrument(span)
-                        .await
-                        .map_err(|e| AgentError::Prompt(e.to_string()))
-                })
-                .await
+                    .map_err(|e| AgentError::Prompt(e.to_string()))
             }
         },
         Err(_) => answer,
@@ -2236,6 +2272,82 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
             Err(CompletionError::ResponseError(EMPTY_RESPONSE.to_string()))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct AnswerThenEmptyThenAnswer {
+        attempts: Arc<AtomicU64>,
+    }
+
+    impl CompletionModel for AnswerThenEmptyThenAnswer {
+        type Response = ();
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self::default()
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            let answer = match self.attempts.fetch_add(1, Ordering::Relaxed) {
+                0 => "first accepted turn",
+                1 => return Err(CompletionError::ResponseError(EMPTY_RESPONSE.to_string())),
+                _ => "retried later turn",
+            };
+            Ok(CompletionResponse {
+                choice: OneOrMany::one(AssistantContent::text(answer)),
+                usage: Default::default(),
+                raw_response: (),
+                message_id: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<
+            rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+            CompletionError,
+        > {
+            Err(CompletionError::ResponseError(EMPTY_RESPONSE.to_string()))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct LocallyRejected;
+
+    impl CompletionModel for LocallyRejected {
+        type Response = ();
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            Err(CompletionError::RequestError(Box::new(
+                std::io::Error::other("invalid additional_params"),
+            )))
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<
+            rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+            CompletionError,
+        > {
+            Err(CompletionError::RequestError(Box::new(
+                std::io::Error::other("invalid additional_params"),
+            )))
         }
     }
 
@@ -2614,6 +2726,7 @@ mod tests {
     async fn an_empty_attempt_is_counted_even_when_rig_cannot_report_its_usage() {
         let provider_calls = ProviderCallQueue::default();
         let (builder, meter) = metered(
+            "test",
             EmptyThenAnswer {
                 provider_calls: Some(Arc::clone(&provider_calls)),
                 ..Default::default()
@@ -2624,9 +2737,7 @@ mod tests {
             Arc::clone(&provider_calls),
         );
         let agent = builder.build();
-        let first = agent.prompt("question").await;
-        let answer =
-            retry_prompt_once("test", first, || async { agent.prompt("question").await }).await;
+        let answer = agent.prompt("question").await;
 
         assert_eq!(answer.unwrap(), "a valid answer");
         let first_call = provider_calls
@@ -2655,7 +2766,8 @@ mod tests {
     async fn a_request_rejected_before_the_http_boundary_is_not_counted() {
         let provider_calls = ProviderCallQueue::default();
         let (builder, meter) = metered(
-            EmptyThenAnswer::default(),
+            "test",
+            LocallyRejected,
             "answer directly",
             None,
             Request::plain(),
@@ -2668,7 +2780,7 @@ mod tests {
             .await
             .expect_err("locally rejected");
 
-        assert!(error.to_string().contains(EMPTY_RESPONSE));
+        assert!(error.to_string().contains("invalid additional_params"));
         assert_eq!(meter.read().1, 0, "no transport method was invoked");
     }
 
@@ -2680,6 +2792,7 @@ mod tests {
             ..Default::default()
         };
         let (outer_builder, outer_meter) = metered(
+            "outer",
             model(),
             "outer",
             None,
@@ -2690,9 +2803,10 @@ mod tests {
             .build()
             .prompt("question")
             .await
-            .expect_err("first outer response is empty");
+            .expect("the outer provider turn retries");
 
         let (nested_builder, nested_meter) = metered(
+            "nested",
             model(),
             "nested",
             None,
@@ -2703,12 +2817,12 @@ mod tests {
             .build()
             .prompt("summary")
             .await
-            .expect_err("first nested response is empty");
+            .expect("the nested provider turn retries");
 
-        assert_eq!(nested_meter.read().1, 1, "the nested call is charged once");
-        assert_eq!(outer_meter.read().1, 1, "the earlier outer call remains");
-        assert_eq!(nested_meter.read().1, 1, "nested reads stay stable");
-        assert_eq!(outer_meter.read().1, 1, "outer reads stay stable");
+        assert_eq!(nested_meter.read().1, 2, "the nested retry is charged once");
+        assert_eq!(outer_meter.read().1, 2, "the earlier outer retry remains");
+        assert_eq!(nested_meter.read().1, 2, "nested reads stay stable");
+        assert_eq!(outer_meter.read().1, 2, "outer reads stay stable");
     }
 
     #[test]
@@ -2994,7 +3108,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_call_that_produced_no_verdict_is_worth_retrying() {
+    fn only_a_provider_turn_that_produced_no_verdict_is_worth_retrying() {
         // The one that cost a live run: the request went out, the proxy in front of the API closed
         // it, and the node failed holding a worktree full of finished edits.
         assert!(is_transport_error(
@@ -3003,11 +3117,11 @@ mod tests {
         ));
         assert!(is_transport_error("connection reset by peer"));
         assert_eq!(
-            prompt_retry_reason("connection reset by peer"),
+            model_retry_reason("connection reset by peer"),
             Some("transport")
         );
         assert_eq!(
-            prompt_retry_reason(
+            model_retry_reason(
                 "CompletionError: ResponseError: Response contained no message or tool call \
                  (empty)"
             ),
@@ -3021,37 +3135,79 @@ mod tests {
             "ProviderError: invalid_request_error: max_tokens is too large"
         ));
         assert!(!is_transport_error("output failed schema validation"));
-        assert_eq!(prompt_retry_reason("model refused the request"), None);
+        assert_eq!(model_retry_reason("model refused the request"), None);
     }
 
     #[tokio::test]
-    async fn a_prompt_that_produced_no_verdict_is_retried_exactly_once() {
+    async fn a_provider_turn_that_produced_no_verdict_is_retried_exactly_once() {
         let retries = std::cell::Cell::new(0);
-        let recovered = retry_prompt_once("test", Err::<&str, _>(EMPTY_RESPONSE), || async {
-            retries.set(retries.get() + 1);
-            Ok("a valid answer")
-        })
+        let recovered = retry_model_turn_once(
+            "test",
+            Err::<&str, _>(CompletionError::ResponseError(EMPTY_RESPONSE.to_string())),
+            || async {
+                retries.set(retries.get() + 1);
+                Ok("a valid answer")
+            },
+        )
         .await;
-        assert_eq!(recovered, Ok("a valid answer"));
+        assert_eq!(recovered.unwrap(), "a valid answer");
         assert_eq!(retries.get(), 1);
 
         let retries = std::cell::Cell::new(0);
-        let still_empty = retry_prompt_once("test", Err::<(), _>(EMPTY_RESPONSE), || async {
-            retries.set(retries.get() + 1);
-            Err(EMPTY_RESPONSE)
-        })
+        let still_empty = retry_model_turn_once(
+            "test",
+            Err::<(), _>(CompletionError::ResponseError(EMPTY_RESPONSE.to_string())),
+            || async {
+                retries.set(retries.get() + 1);
+                Err(CompletionError::ResponseError(EMPTY_RESPONSE.to_string()))
+            },
+        )
         .await;
-        assert_eq!(still_empty, Err(EMPTY_RESPONSE));
+        assert!(
+            still_empty
+                .unwrap_err()
+                .to_string()
+                .contains(EMPTY_RESPONSE)
+        );
         assert_eq!(retries.get(), 1, "the retry is never retried");
 
         let retries = std::cell::Cell::new(0);
-        let permanent = retry_prompt_once("test", Err::<(), _>("model refused"), || async {
-            retries.set(retries.get() + 1);
-            Ok(())
-        })
+        let permanent = retry_model_turn_once(
+            "test",
+            Err::<(), _>(CompletionError::ResponseError("model refused".to_string())),
+            || async {
+                retries.set(retries.get() + 1);
+                Ok(())
+            },
+        )
         .await;
-        assert_eq!(permanent, Err("model refused"));
+        assert!(permanent.unwrap_err().to_string().contains("model refused"));
         assert_eq!(retries.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_later_empty_provider_turn_retries_without_restarting_earlier_turns() {
+        let inner = AnswerThenEmptyThenAnswer::default();
+        let attempts = Arc::clone(&inner.attempts);
+        let model = RetryingModel {
+            inner,
+            node: "analyst".to_string(),
+        };
+
+        model
+            .completion(model.completion_request("first").build())
+            .await
+            .expect("the first provider turn succeeds");
+        model
+            .completion(model.completion_request("later").build())
+            .await
+            .expect("the later empty turn retries in place");
+
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            3,
+            "the accepted first turn was not replayed"
+        );
     }
 
     #[test]
