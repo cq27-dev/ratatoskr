@@ -94,6 +94,7 @@ impl CompactedSession {
         node: &str,
         produces: &str,
         ledger: Option<Arc<crate::RunLedger>>,
+        empty_usage: Option<crate::EmptyUsageQueue>,
     ) -> Arc<dyn ConversationMemory>
     where
         M: CompletionModel + 'static,
@@ -109,8 +110,14 @@ impl CompactedSession {
         // Each stored message costs at least one token, so this window carries no raw history into
         // a re-entry. CompactingMemory retains its rolling summary separately and includes it in
         // the following compaction, preserving facts from every earlier attempt.
-        let memory: Arc<dyn ConversationMemory> =
-            Arc::new(compacting_memory(model, node, produces, 0, ledger));
+        let memory: Arc<dyn ConversationMemory> = Arc::new(compacting_memory(
+            model,
+            node,
+            produces,
+            0,
+            ledger,
+            empty_usage,
+        ));
         *slot = Some(Arc::clone(&memory));
         memory
     }
@@ -131,6 +138,7 @@ pub struct SummaryCompactor<M> {
     /// a run's per-node totals would sum to less than the invoice — and these are the calls that
     /// fire precisely when a session got long and expensive.
     ledger: Option<Arc<crate::RunLedger>>,
+    empty_usage: Option<crate::EmptyUsageQueue>,
     /// The node being compacted, and what it has to end up producing.
     ///
     /// Included in the instruction because "keep what matters" is unanswerable in the abstract: what
@@ -147,10 +155,12 @@ impl<M> SummaryCompactor<M> {
         node: &str,
         produces: &str,
         ledger: Option<Arc<crate::RunLedger>>,
+        empty_usage: Option<crate::EmptyUsageQueue>,
     ) -> Self {
         SummaryCompactor {
             model: Arc::new(model),
             ledger,
+            empty_usage,
             node: node.to_string(),
             produces: produces.to_string(),
         }
@@ -200,13 +210,12 @@ where
                 ),
                 None,
                 crate::Request::plain(),
+                self.empty_usage.clone(),
             );
             let agent = builder.build();
+            // The enclosing agent prompt owns the one no-verdict retry. Retrying here as well
+            // would let two empty summaries trigger two compactions on each outer attempt.
             let answer = agent.prompt(prompt.as_str()).await;
-            let answer = crate::retry_prompt_once(&self.node, answer, || async {
-                agent.prompt(prompt.as_str()).await
-            })
-            .await;
             // Charged whether or not the summary came back: a compaction that failed still spent
             // what it spent, and dropping that would make the failure look free.
             if let Some(ledger) = &self.ledger {
@@ -322,6 +331,7 @@ pub fn compacting_memory<M>(
     produces: &str,
     budget: usize,
     ledger: Option<Arc<crate::RunLedger>>,
+    empty_usage: Option<crate::EmptyUsageQueue>,
 ) -> rig_memory::CompactingMemory<InMemoryConversationMemory, TokenWindowMemory, SummaryCompactor<M>>
 where
     M: CompletionModel + 'static,
@@ -329,7 +339,7 @@ where
     rig_memory::CompactingMemory::new(
         InMemoryConversationMemory::new(),
         TokenWindowMemory::new(budget, tokens_in),
-        SummaryCompactor::new(model, node, produces, ledger),
+        SummaryCompactor::new(model, node, produces, ledger, empty_usage),
     )
 }
 
@@ -343,6 +353,13 @@ mod tests {
     use super::*;
     use rig_core::OneOrMany;
     use rig_core::completion::message::{ToolResult, ToolResultContent, UserContent};
+
+    #[test]
+    fn compaction_leaves_retrying_to_the_enclosing_prompt() {
+        let source = include_str!("compaction.rs");
+        let retry_helper = ["retry_prompt", "_once"].concat();
+        assert!(!source.contains(&retry_helper));
+    }
 
     #[test]
     fn a_rendered_turn_keeps_the_tool_calls_and_their_results() {
@@ -455,6 +472,7 @@ mod tests {
             client.completion_model("claude-haiku-4-5-20251001"),
             "analyst",
             "the requirements an implementation must satisfy",
+            None,
             None,
         );
 

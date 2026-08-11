@@ -51,6 +51,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 clap = { version = "4.6", features = ["derive"] }
 tracing = "0.1"
 futures = "0.3"
+bytes = "1"
 glob = "0.3"
 regex = "1"
 walkdir = "2"

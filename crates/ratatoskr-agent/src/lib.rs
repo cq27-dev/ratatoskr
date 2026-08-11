@@ -11,12 +11,13 @@ pub mod shell;
 
 use compaction::CompactedSession;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use ratatoskr_core::{
     Control, Directive, ModelRoute, NodeTelemetry, TokenUsage, ToolDecision, ToolPolicy,
 };
@@ -33,12 +34,14 @@ use rig_core::OneOrMany;
 use rig_core::client::completion::CompletionClient;
 use rig_core::client::{ProviderClient, ProviderClientError};
 use rig_core::completion::{
-    CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
+    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage,
 };
+use rig_core::http_client::{self, HttpClientExt};
 use rig_core::message::{AssistantContent, ImageMediaType, MimeType, ToolResultContent};
 use rig_core::providers::{anthropic, moonshot, openai};
 use rig_core::streaming::StreamingCompletionResponse;
 use rig_core::tool::ToolOutput;
+use rig_core::wasm_compat::WasmCompatSend;
 use rmcp::ServiceError;
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, ContentBlock,
@@ -174,11 +177,116 @@ fn parse_provider(name: &str) -> Result<Provider, AgentError> {
 /// Responses is rig's default surface for this provider and the right one for a reasoning model: a
 /// reasoning item round-trips across the agent's tool-calling turns, where chat completions drops
 /// it and the model re-derives its thinking on every turn.
-fn openai_client() -> Result<openai::Client, AgentError> {
-    openai::Client::from_env().map_err(|source| AgentError::Provider {
-        provider: "openai".to_string(),
-        source,
+type EmptyUsageQueue = Arc<Mutex<VecDeque<TokenUsage>>>;
+
+#[derive(Clone, Debug, Default)]
+struct UsageCapturingHttp {
+    inner: http_client::ReqwestClient,
+    empty_usage: EmptyUsageQueue,
+}
+
+impl HttpClientExt for UsageCapturingHttp {
+    fn send<T, U>(
+        &self,
+        request: http_client::Request<T>,
+    ) -> impl Future<Output = http_client::Result<http_client::Response<http_client::LazyBody<U>>>>
+    + WasmCompatSend
+    + 'static
+    where
+        T: Into<Bytes> + WasmCompatSend,
+        U: From<Bytes> + WasmCompatSend + 'static,
+    {
+        let response = self.inner.send::<T, Bytes>(request);
+        let empty_usage = Arc::clone(&self.empty_usage);
+        async move {
+            let response = response.await?;
+            let (parts, body) = response.into_parts();
+            let body: http_client::LazyBody<U> = Box::pin(async move {
+                let bytes = body.await?;
+                if let Some(usage) = empty_openai_response_usage(&bytes) {
+                    empty_usage
+                        .lock()
+                        .expect("empty-usage queue poisoned")
+                        .push_back(usage);
+                }
+                Ok(U::from(bytes))
+            });
+            Ok(http_client::Response::from_parts(parts, body))
+        }
+    }
+
+    fn send_multipart<U>(
+        &self,
+        request: http_client::Request<http_client::MultipartForm>,
+    ) -> impl Future<Output = http_client::Result<http_client::Response<http_client::LazyBody<U>>>>
+    + WasmCompatSend
+    + 'static
+    where
+        U: From<Bytes> + WasmCompatSend + 'static,
+    {
+        self.inner.send_multipart(request)
+    }
+
+    fn send_streaming<T>(
+        &self,
+        request: http_client::Request<T>,
+    ) -> impl Future<Output = http_client::Result<http_client::StreamingResponse>> + WasmCompatSend
+    where
+        T: Into<Bytes> + WasmCompatSend,
+    {
+        self.inner.send_streaming(request)
+    }
+}
+
+fn empty_openai_response_usage(body: &[u8]) -> Option<TokenUsage> {
+    let response: openai::responses_api::CompletionResponse = serde_json::from_slice(body).ok()?;
+    let usage = response.usage.as_ref()?.token_usage();
+    let converted = CompletionResponse::try_from(response);
+    if !matches!(converted, Err(CompletionError::ResponseError(ref message)) if message == EMPTY_RESPONSE)
+    {
+        return None;
+    }
+    Some(TokenUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
     })
+}
+
+fn openai_client() -> Result<(openai::Client<UsageCapturingHttp>, EmptyUsageQueue), AgentError> {
+    let api_key = rig_core::client::required_env_var("OPENAI_API_KEY").map_err(|source| {
+        AgentError::Provider {
+            provider: "openai".to_string(),
+            source,
+        }
+    })?;
+    let base_url = rig_core::client::optional_env_var("OPENAI_BASE_URL").map_err(|source| {
+        AgentError::Provider {
+            provider: "openai".to_string(),
+            source,
+        }
+    })?;
+    let empty_usage = EmptyUsageQueue::default();
+    let http = UsageCapturingHttp {
+        inner: http_client::ReqwestClient::default(),
+        empty_usage: Arc::clone(&empty_usage),
+    };
+    let mut builder = openai::Client::builder()
+        .api_key(&api_key)
+        .http_client(http);
+    if let Some(base_url) = base_url {
+        builder = builder.base_url(base_url);
+    }
+    let client = builder
+        .build()
+        .map_err(ProviderClientError::from)
+        .map_err(|source| AgentError::Provider {
+            provider: "openai".to_string(),
+            source,
+        })?;
+    Ok((client, empty_usage))
 }
 
 /// Ask one question, letting the agent call `tools` to answer.
@@ -203,17 +311,20 @@ pub async fn ask(
                 tools,
                 max_turns,
                 route,
+                None,
             )
             .await
         }
         Provider::OpenAi => {
+            let (client, empty_usage) = openai_client()?;
             run(
-                openai_client()?.completion_model(&route.model),
+                client.completion_model(&route.model),
                 preamble,
                 question,
                 tools,
                 max_turns,
                 route,
+                Some(empty_usage),
             )
             .await
         }
@@ -232,6 +343,7 @@ pub async fn ask(
                 tools,
                 max_turns,
                 route,
+                None,
             )
             .await
         }
@@ -246,11 +358,12 @@ async fn run<M>(
     tools: ToolSet,
     max_turns: Option<usize>,
     route: &ModelRoute,
+    empty_usage: Option<EmptyUsageQueue>,
 ) -> Result<String, AgentError>
 where
     M: CompletionModel + 'static,
 {
-    let (builder, meter) = metered(model, preamble, max_turns, Request::of(route));
+    let (builder, meter) = metered(model, preamble, max_turns, Request::of(route), empty_usage);
     let agent = bind_tools(builder, &tools, None, None, None);
 
     let answer = agent.prompt(question).await;
@@ -617,7 +730,6 @@ where
     tracing::warn!(
         node,
         retry_reason = reason,
-        usage_reported = false,
         error = %error,
         "the model call produced no verdict; retrying once"
     );
@@ -736,6 +848,7 @@ fn metered<M: CompletionModel + 'static>(
     preamble: &str,
     max_turns: Option<usize>,
     request: Request,
+    empty_usage: Option<EmptyUsageQueue>,
 ) -> (AgentBuilder<CountingModel<M>, NoToolConfig>, Meter) {
     let preamble = &format!("{preamble}{TOOL_USE_GUIDANCE}");
     let calls = Arc::new(AtomicU64::new(0));
@@ -745,6 +858,8 @@ fn metered<M: CompletionModel + 'static>(
         total: Arc::clone(&usage.total),
         calls: Arc::clone(&calls),
         used: Arc::clone(&observability.used),
+        empty_usage,
+        claimed_empty_usage: Mutex::new(TokenUsage::default()),
     };
     let builder = AgentBuilder::new(CountingModel {
         inner: model,
@@ -783,16 +898,31 @@ pub struct Meter {
     /// Which tools the node actually called, as distinct from which it could have. Ordered, so a
     /// reader sees the same list twice for the same run.
     used: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// Provider-reported usage from empty OpenAI responses, captured before Rig converts them to
+    /// errors and drops their response value.
+    empty_usage: Option<EmptyUsageQueue>,
+    /// What this meter already claimed, so repeated reads are stable and a nested compaction meter
+    /// does not leave its empty response for the enclosing node to count again.
+    claimed_empty_usage: Mutex<TokenUsage>,
 }
 
 impl Meter {
     /// The usage so far. Read after the prompt returns — including on the error path, where the
     /// calls made before the failure cost exactly what they cost.
     pub fn read(&self) -> (TokenUsage, u64) {
-        (
-            *self.total.lock().expect("usage mutex poisoned"),
-            self.calls.load(Ordering::Relaxed),
-        )
+        let mut total = *self.total.lock().expect("usage mutex poisoned");
+        let mut claimed = self
+            .claimed_empty_usage
+            .lock()
+            .expect("claimed empty-usage mutex poisoned");
+        if let Some(empty_usage) = &self.empty_usage {
+            let mut pending = empty_usage.lock().expect("empty-usage queue poisoned");
+            while let Some(usage) = pending.pop_front() {
+                claimed.add(usage);
+            }
+        }
+        total.add(*claimed);
+        (total, self.calls.load(Ordering::Relaxed))
     }
 
     /// The tools the node called, in name order.
@@ -810,7 +940,8 @@ impl Meter {
 ///
 /// Calls are counted by [`CountingModel`] below Rig's response conversion, because an empty payload
 /// can become an error before any hook runs. This hook stays responsible only for provider-reported
-/// usage, which does not exist on that error path.
+/// usage from completed turns; [`UsageCapturingHttp`] preserves the OpenAI usage that otherwise
+/// disappears on that error path.
 ///
 /// The total is read back after the run, including when the run failed: the calls made before the
 /// failure cost the same as the ones before a success.
@@ -1677,11 +1808,12 @@ pub async fn run_structured(run: NodeRun<'_>) -> Result<String, AgentError> {
             let session = session_id(&run);
             let client = anthropic_client(session.as_deref())?;
             let model = caching(client.completion_model(&run.route.model));
-            run_typed(model, run).await
+            run_typed(model, run, None).await
         }
         Provider::OpenAi => {
-            let model = openai_client()?.completion_model(&run.route.model);
-            run_typed(model, run).await
+            let (client, empty_usage) = openai_client()?;
+            let model = client.completion_model(&run.route.model);
+            run_typed(model, run, Some(empty_usage)).await
         }
         Provider::Moonshot => {
             let client = moonshot::Client::from_env().map_err(|source| AgentError::Provider {
@@ -1689,13 +1821,17 @@ pub async fn run_structured(run: NodeRun<'_>) -> Result<String, AgentError> {
                 source,
             })?;
             let model = client.completion_model(&run.route.model);
-            run_typed(model, run).await
+            run_typed(model, run, None).await
         }
     }
 }
 
 /// Provider-resolved half of [`run_structured`].
-async fn run_typed<M>(model: M, run: NodeRun<'_>) -> Result<String, AgentError>
+async fn run_typed<M>(
+    model: M,
+    run: NodeRun<'_>,
+    empty_usage: Option<EmptyUsageQueue>,
+) -> Result<String, AgentError>
 where
     M: CompletionModel + 'static,
 {
@@ -1735,7 +1871,13 @@ where
         None => (preamble.to_string(), question.to_string()),
     };
 
-    let (builder, meter) = metered(model, &preamble, max_turns, Request::of(route));
+    let (builder, meter) = metered(
+        model,
+        &preamble,
+        max_turns,
+        Request::of(route),
+        empty_usage.clone(),
+    );
     // Kept for the validation below: the builder consumes the schema, and a node's answer has to
     // be checked against it here, where the agent that wrote it can still be asked to fix it.
     let schema_value = serde_json::to_value(&output_schema).unwrap_or(serde_json::Value::Null);
@@ -1789,7 +1931,13 @@ where
     {
         let produces = produces.unwrap_or("its declared structured output");
         builder = builder
-            .memory(session.memory(for_compaction, node, produces, ledger.clone()))
+            .memory(session.memory(
+                for_compaction,
+                node,
+                produces,
+                ledger.clone(),
+                empty_usage.clone(),
+            ))
             .conversation(&compacted_session_key);
     } else if let Some(produces) = produces {
         builder = builder.memory(compaction::compacting_memory(
@@ -1798,6 +1946,7 @@ where
             produces,
             compaction::budget_for(route.context_window),
             ledger.clone(),
+            empty_usage,
         ));
     }
     // Before the set is handed to the agent: what the model could call is part of what this turn
@@ -2393,11 +2542,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_attempt_is_counted_even_when_rig_cannot_report_its_usage() {
+        let empty_usage = EmptyUsageQueue::default();
         let (builder, meter) = metered(
             EmptyThenAnswer::default(),
             "answer directly",
             None,
             Request::plain(),
+            Some(Arc::clone(&empty_usage)),
         );
         let agent = builder.build();
         let first = agent.prompt("question").await;
@@ -2405,13 +2556,62 @@ mod tests {
             retry_prompt_once("test", first, || async { agent.prompt("question").await }).await;
 
         assert_eq!(answer.unwrap(), "a valid answer");
+        empty_usage.lock().unwrap().push_back(TokenUsage {
+            input_tokens: 5,
+            output_tokens: 1,
+            ..Default::default()
+        });
         let (usage, calls) = meter.read();
         assert_eq!(
             calls, 2,
             "both provider requests count, including the empty one"
         );
-        assert_eq!(usage.input_tokens, 7);
-        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 4);
+        assert_eq!(meter.read(), (usage, calls), "a second read stays stable");
+    }
+
+    #[test]
+    fn an_empty_openai_response_keeps_its_usage_before_rig_discards_the_response() {
+        let mut response = serde_json::json!({
+            "id": "resp_empty",
+            "object": "response",
+            "created_at": 0,
+            "status": "completed",
+            "model": "gpt-test",
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 2,
+                "total_tokens": 13,
+                "input_tokens_details": { "cached_tokens": 4 },
+                "output_tokens_details": { "reasoning_tokens": 1 }
+            },
+            "output": [],
+            "tools": []
+        });
+        let body = serde_json::to_vec(&response).unwrap();
+
+        let usage = empty_openai_response_usage(&body).expect("the empty response carries usage");
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 2);
+        assert_eq!(usage.cached_input_tokens, 4);
+        assert_eq!(usage.reasoning_tokens, 1);
+
+        response["output"] = serde_json::json!([{
+            "type": "message",
+            "id": "msg_answer",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{
+                "type": "output_text",
+                "text": "answer",
+                "annotations": []
+            }]
+        }]);
+        assert!(
+            empty_openai_response_usage(&serde_json::to_vec(&response).unwrap()).is_none(),
+            "ordinary response usage is already counted by the completion hook"
+        );
     }
 
     /// The whole write path against the real provider: declarations reach the model, it calls
