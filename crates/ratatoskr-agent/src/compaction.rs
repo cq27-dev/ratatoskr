@@ -201,7 +201,12 @@ where
                 None,
                 crate::Request::plain(),
             );
-            let answer = builder.build().prompt(prompt.as_str()).await;
+            let agent = builder.build();
+            let answer = agent.prompt(prompt.as_str()).await;
+            let answer = crate::retry_prompt_once(&self.node, answer, || async {
+                agent.prompt(prompt.as_str()).await
+            })
+            .await;
             // Charged whether or not the summary came back: a compaction that failed still spent
             // what it spent, and dropping that would make the failure look free.
             if let Some(ledger) = &self.ledger {

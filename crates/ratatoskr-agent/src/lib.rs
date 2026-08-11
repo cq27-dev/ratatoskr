@@ -235,7 +235,7 @@ pub async fn ask(
     }
 }
 
-/// Provider-agnostic core: build the agent with the MCP tools bound, then prompt once.
+/// Provider-agnostic core: build the agent with the MCP tools bound, then prompt.
 async fn run<M>(
     model: M,
     preamble: &str,
@@ -251,6 +251,7 @@ where
     let agent = bind_tools(builder, &tools, None, None, None);
 
     let answer = agent.prompt(question).await;
+    let answer = retry_prompt_once("ask", answer, || async { agent.prompt(question).await }).await;
     // No store to checkpoint to here, so it goes to the log. A one-shot question whose cost is
     // unknowable is the same defect as an uncounted node, in a smaller place.
     let (usage, calls) = meter.read();
@@ -582,6 +583,41 @@ fn is_transport_error(message: &str) -> bool {
         "timed out",
     ];
     TRANSPORT.iter().any(|m| message.contains(m))
+}
+
+const EMPTY_RESPONSE: &str = "Response contained no message or tool call (empty)";
+
+fn prompt_retry_reason(message: &str) -> Option<&'static str> {
+    if is_transport_error(message) {
+        Some("transport")
+    } else if message.contains(EMPTY_RESPONSE) {
+        Some("empty_response")
+    } else {
+        None
+    }
+}
+
+/// Retry one prompt that produced no verdict, without turning a persistent failure into a loop.
+async fn retry_prompt_once<T, E, F, Fut>(node: &str, first: Result<T, E>, retry: F) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let Err(error) = &first else {
+        return first;
+    };
+    let Some(reason) = prompt_retry_reason(&error.to_string()) else {
+        return first;
+    };
+
+    tracing::warn!(
+        node,
+        retry_reason = reason,
+        error = %error,
+        "the model call produced no verdict; retrying once"
+    );
+    retry().await
 }
 
 /// Anthropic prompt caching, which rig leaves off entirely.
@@ -1761,7 +1797,7 @@ where
     // the one its checkpoints hold, so "start from checkpoint" is exactly what a new attempt is.
     // The wait is inside the node's own duration, because from the run's side that is what
     // happened: the node was still the thing in progress.
-    let mut answer = loop {
+    let answer = loop {
         let attempt = async { agent.prompt(&question).await }
             .instrument(span.clone())
             .await
@@ -1797,21 +1833,16 @@ where
     // worktree full of finished edits. Retrying costs another attempt; not retrying costs all of
     // the attempt already made.
     //
-    // Transport only. A refusal, a bad request or an exhausted turn budget will answer the same
-    // way twice, and retrying those spends a node's budget to arrive back where it started.
-    if let Err(e) = &answer
-        && is_transport_error(&e.to_string())
-    {
-        tracing::warn!(
-            node,
-            "the model call failed in transport, retrying once: {e}"
-        );
-        answer = async { agent.prompt(&question).await }
+    // Transport and the provider's exact empty-response error only. A refusal, a bad request or an
+    // exhausted turn budget will answer the same way twice, and retrying those spends a node's
+    // budget to arrive back where it started.
+    let answer = retry_prompt_once(node, answer, || async {
+        async { agent.prompt(&question).await }
             .instrument(span.clone())
             .await
-            .map_err(|e| AgentError::Prompt(e.to_string()));
-    }
-    let answer = answer;
+            .map_err(|e| AgentError::Prompt(e.to_string()))
+    })
+    .await;
 
     // Give a malformed answer back to the agent that wrote it, once. The alternative is what a
     // schema failure used to cost: the node's whole run discarded — every tool call, every file
@@ -1830,10 +1861,17 @@ where
                      error names — keep every finding, do not shorten anything, and do not go and \
                      look anything up again. Answer by calling the output tool.",
                 );
-                async { agent.prompt(&correction).await }
-                    .instrument(span)
+                let corrected = async { agent.prompt(&correction).await }
+                    .instrument(span.clone())
                     .await
-                    .map_err(|e| AgentError::Prompt(e.to_string()))
+                    .map_err(|e| AgentError::Prompt(e.to_string()));
+                retry_prompt_once(node, corrected, || async {
+                    async { agent.prompt(&correction).await }
+                        .instrument(span)
+                        .await
+                        .map_err(|e| AgentError::Prompt(e.to_string()))
+                })
+                .await
             }
         },
         Err(_) => answer,
@@ -2506,7 +2544,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_call_that_never_landed_is_worth_retrying() {
+    fn only_a_call_that_produced_no_verdict_is_worth_retrying() {
         // The one that cost a live run: the request went out, the proxy in front of the API closed
         // it, and the node failed holding a worktree full of finished edits.
         assert!(is_transport_error(
@@ -2514,6 +2552,17 @@ mod tests {
              (http://127.0.0.1:3456/v1/messages)"
         ));
         assert!(is_transport_error("connection reset by peer"));
+        assert_eq!(
+            prompt_retry_reason("connection reset by peer"),
+            Some("transport")
+        );
+        assert_eq!(
+            prompt_retry_reason(
+                "CompletionError: ResponseError: Response contained no message or tool call \
+                 (empty)"
+            ),
+            Some("empty_response")
+        );
 
         // And the ones that will answer the same way twice, where a retry spends a node's budget
         // to arrive back where it started.
@@ -2522,6 +2571,37 @@ mod tests {
             "ProviderError: invalid_request_error: max_tokens is too large"
         ));
         assert!(!is_transport_error("output failed schema validation"));
+        assert_eq!(prompt_retry_reason("model refused the request"), None);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_that_produced_no_verdict_is_retried_exactly_once() {
+        let retries = std::cell::Cell::new(0);
+        let recovered = retry_prompt_once("test", Err::<&str, _>(EMPTY_RESPONSE), || async {
+            retries.set(retries.get() + 1);
+            Ok("a valid answer")
+        })
+        .await;
+        assert_eq!(recovered, Ok("a valid answer"));
+        assert_eq!(retries.get(), 1);
+
+        let retries = std::cell::Cell::new(0);
+        let still_empty = retry_prompt_once("test", Err::<(), _>(EMPTY_RESPONSE), || async {
+            retries.set(retries.get() + 1);
+            Err(EMPTY_RESPONSE)
+        })
+        .await;
+        assert_eq!(still_empty, Err(EMPTY_RESPONSE));
+        assert_eq!(retries.get(), 1, "the retry is never retried");
+
+        let retries = std::cell::Cell::new(0);
+        let permanent = retry_prompt_once("test", Err::<(), _>("model refused"), || async {
+            retries.set(retries.get() + 1);
+            Ok(())
+        })
+        .await;
+        assert_eq!(permanent, Err("model refused"));
+        assert_eq!(retries.get(), 0);
     }
 
     #[test]
