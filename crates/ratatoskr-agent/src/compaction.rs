@@ -88,13 +88,13 @@ pub struct CompactedSession {
 
 impl CompactedSession {
     /// Return the one memory backend shared by every attempt of this node.
-    pub fn memory<M>(
+    pub(crate) fn memory<M>(
         &self,
         model: M,
         node: &str,
         produces: &str,
         ledger: Option<Arc<crate::RunLedger>>,
-        empty_usage: Option<crate::EmptyUsageQueue>,
+        provider_calls: crate::ProviderCallQueue,
     ) -> Arc<dyn ConversationMemory>
     where
         M: CompletionModel + 'static,
@@ -116,7 +116,7 @@ impl CompactedSession {
             produces,
             0,
             ledger,
-            empty_usage,
+            provider_calls,
         ));
         *slot = Some(Arc::clone(&memory));
         memory
@@ -138,7 +138,7 @@ pub struct SummaryCompactor<M> {
     /// a run's per-node totals would sum to less than the invoice — and these are the calls that
     /// fire precisely when a session got long and expensive.
     ledger: Option<Arc<crate::RunLedger>>,
-    empty_usage: Option<crate::EmptyUsageQueue>,
+    provider_calls: crate::ProviderCallQueue,
     /// The node being compacted, and what it has to end up producing.
     ///
     /// Included in the instruction because "keep what matters" is unanswerable in the abstract: what
@@ -150,17 +150,17 @@ pub struct SummaryCompactor<M> {
 }
 
 impl<M> SummaryCompactor<M> {
-    pub fn new(
+    fn new(
         model: M,
         node: &str,
         produces: &str,
         ledger: Option<Arc<crate::RunLedger>>,
-        empty_usage: Option<crate::EmptyUsageQueue>,
+        provider_calls: crate::ProviderCallQueue,
     ) -> Self {
         SummaryCompactor {
             model: Arc::new(model),
             ledger,
-            empty_usage,
+            provider_calls,
             node: node.to_string(),
             produces: produces.to_string(),
         }
@@ -210,7 +210,7 @@ where
                 ),
                 None,
                 crate::Request::plain(),
-                self.empty_usage.clone(),
+                Arc::clone(&self.provider_calls),
             );
             let agent = builder.build();
             // The enclosing agent prompt owns the one no-verdict retry. Retrying here as well
@@ -325,13 +325,13 @@ fn tokens_in(message: &Message) -> usize {
 /// Dropping is what a plain window does, and for a coding session it is the wrong trade: the turn
 /// that discovered a constraint is exactly the one far enough back to be evicted, and losing it
 /// means rediscovering it — or, worse, retrying the approach it ruled out.
-pub fn compacting_memory<M>(
+pub(crate) fn compacting_memory<M>(
     model: M,
     node: &str,
     produces: &str,
     budget: usize,
     ledger: Option<Arc<crate::RunLedger>>,
-    empty_usage: Option<crate::EmptyUsageQueue>,
+    provider_calls: crate::ProviderCallQueue,
 ) -> rig_memory::CompactingMemory<InMemoryConversationMemory, TokenWindowMemory, SummaryCompactor<M>>
 where
     M: CompletionModel + 'static,
@@ -339,7 +339,7 @@ where
     rig_memory::CompactingMemory::new(
         InMemoryConversationMemory::new(),
         TokenWindowMemory::new(budget, tokens_in),
-        SummaryCompactor::new(model, node, produces, ledger, empty_usage),
+        SummaryCompactor::new(model, node, produces, ledger, provider_calls),
     )
 }
 
@@ -473,7 +473,7 @@ mod tests {
             "analyst",
             "the requirements an implementation must satisfy",
             None,
-            None,
+            crate::ProviderCallQueue::default(),
         );
 
         let evicted = vec![
