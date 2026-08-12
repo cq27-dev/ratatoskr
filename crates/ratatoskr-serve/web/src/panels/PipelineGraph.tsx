@@ -18,6 +18,7 @@ import {
 import { Brain, Infinity as InfinityIcon, Repeat, Wrench } from "lucide-react";
 import { TOOL_GROUPS } from "../ui/tools";
 import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode } from "../api";
+import type { ConvergeLoops } from "../derive";
 
 /*
  * Positions are computed from the `stage` and `lane` the server sends with each node, not from a
@@ -301,6 +302,77 @@ function ConvergeEdge({ id, sourceX, sourceY, label, markerEnd, style }: EdgePro
 }
 
 /**
+ * How far apart the loop shelves sit under the deepest row of boxes.
+ *
+ * Half a lane gap, which is what `ConvergeEdge` already drops its self-loop by — so the three
+ * loops are evenly spaced whether or not the self-loop is drawn, and the spacing follows the
+ * layout constants rather than being a number that has to be re-measured when they change.
+ */
+const LOOP_SHELF_STEP = LANE_GAP / 2;
+
+/** What a back-edge needs beyond its endpoints: its caption, its shelf, and its riser's offset. */
+type BackLoopData = { label: string; shelfY: number; takeoff: number };
+type BackLoopEdgeType = Edge<BackLoopData, "backloop">;
+
+/**
+ * A loop back to an earlier stage: down out of the source, along a shelf, and up into the target.
+ *
+ * Its own component rather than a stock edge type because the shelf is the whole point — two of
+ * these leave the same handle, and left to route themselves they would trace the same line. The
+ * caller assigns each a fixed shelf and a riser offset, so the geometry is deterministic and the
+ * two never double-stroke.
+ */
+function BackLoopEdge({
+  id,
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  data,
+  markerEnd,
+  style,
+}: EdgeProps<BackLoopEdgeType>) {
+  const { label, shelfY, takeoff } = data ?? { label: "", shelfY: sourceY, takeoff: 0 };
+  // Matches `ConvergeEdge`'s corners, which match the stage edges' rounding.
+  const r = 14;
+  const sx = sourceX + takeoff;
+  // Which way the shelf runs. A loop goes backwards, so the target is normally to the left — but a
+  // workflow is free to declare its stages in another order, and a hardcoded direction would turn
+  // the corners inside out rather than simply looking odd.
+  const dir = targetX < sx ? 1 : -1;
+  const path = [
+    `M ${sx},${sourceY}`,
+    `L ${sx},${shelfY - r}`,
+    `Q ${sx},${shelfY} ${sx - r * dir},${shelfY}`,
+    `L ${targetX + r * dir},${shelfY}`,
+    `Q ${targetX},${shelfY} ${targetX},${shelfY - r}`,
+    `L ${targetX},${targetY}`,
+  ].join(" ");
+
+  return (
+    <>
+      {/* `style` carries `--tint` and nothing else does — dropping it here loses the colour with
+          no type error to say so. See the note in `ConvergeEdge` on `interactionWidth`. */}
+      <BaseEdge
+        id={id}
+        path={path}
+        interactionWidth={0}
+        {...(style ? { style } : {})}
+        {...(markerEnd ? { markerEnd } : {})}
+      />
+      <text
+        className="react-flow__edge-text"
+        x={(sx + targetX) / 2}
+        y={shelfY + 12}
+        textAnchor="middle"
+      >
+        {label}
+      </text>
+    </>
+  );
+}
+
+/**
  * Centre the map once its boxes are measured, and again if the pane itself changes size.
  *
  * Two things defeat the `fitView` prop here. It fits at init, and at init there is nothing to fit:
@@ -372,7 +444,7 @@ function FitToPane({ count, moved }: { count: number; moved: boolean }) {
 }
 
 const nodeTypes = { pipeline: PipelineNode };
-const edgeTypes = { converge: ConvergeEdge };
+const edgeTypes = { converge: ConvergeEdge, backloop: BackLoopEdge };
 
 /** What a node has said about itself so far, before it has checkpointed anything. */
 export interface LiveNode {
@@ -388,12 +460,14 @@ interface Props {
   live: Map<string, LiveNode>;
   /** Every node working right now — more than one late in a run, when nodes run in parallel. */
   active: ReadonlySet<string>;
+  /** Implementer re-entries so far, by route. Folded from the same event prefix as `nodes`. */
+  loops: ConvergeLoops;
   selected: string | null;
   /** `null` clears the selection, which returns the lower pane to the combined feed. */
   onSelect: (name: string | null) => void;
 }
 
-export default function PipelineGraph({ nodes, live, active, selected, onSelect }: Props) {
+export default function PipelineGraph({ nodes, live, active, loops, selected, onSelect }: Props) {
 
   /*
    * The pipeline as it actually stands, from two sources each authoritative for a different half.
@@ -457,29 +531,86 @@ export default function PipelineGraph({ nodes, live, active, selected, onSelect 
       ),
     );
 
-    // The converge loop only exists once the implementer has actually run.
+    /*
+     * The three ways the implementer is re-entered, each drawn only if it actually happened.
+     *
+     * Gated on the derived count, never on a checkpoint total: a traversal is a re-entry, so the
+     * implementer's rows are one more than its loops and every straight-through run used to be
+     * captioned `×1` for a loop it never made. And gated on the participating boxes existing, so a
+     * workflow that declares no verifier draws nothing rather than an edge to nowhere.
+     *
+     * Tinted by the node each returns TO — the hue says *who*, matching the box the loop lands on,
+     * its name in the feed, and its stretch of the scrubber. Left as a variable so the idle stroke
+     * stays with the rest of the wiring; `.is-loop` is what makes it show at rest as well as live.
+     */
     const impl = byName.get("implementer");
-    if (impl && impl.checkpoints > 0) {
+    const verifier = byName.get("verifier");
+    const analyst = byName.get("analyst");
+    // The shelves hang under the whole layout, not under one box, so two of them cannot cross a
+    // node in a deeper lane. Measured off the positions actually being drawn.
+    const maxLanes = Math.max(1, ...columns.map((c) => c.length));
+    const rowBottom =
+      Math.max(
+        0,
+        ...columns.flatMap((lanes) => lanes.map((n) => position(n, lanes.length, maxLanes).y)),
+      ) + NODE_SIZE.height;
+    const loop = (target: string): Partial<Edge> => ({
+      sourceHandle: "loop-out",
+      targetHandle: "loop-in",
+      style: { "--tint": accent(target) } as React.CSSProperties,
+    });
+
+    // The suite never went clean, so the implementer ran again on its own. Its own box is both
+    // ends of it, which is the self-loop the graph has always drawn.
+    if (impl && loops.retry > 0) {
       edges.push({
-        id: "converge",
+        ...loop("implementer"),
+        id: "loop-retry",
         source: "implementer",
         target: "implementer",
         type: "converge",
-        sourceHandle: "loop-out",
-        targetHandle: "loop-in",
-        label: `CONVERGE ×${impl.checkpoints}`,
-        // The loop is the implementer's, so a live one lights in the implementer's hue. Green said
-        // only "something is happening", which the graph says already; the hue says *who*, and
-        // matches the box the loop hangs off, its name in the feed, and its stretch of the
-        // scrubber. Kept as a variable so the idle stroke stays with the rest of the wiring.
-        style: { "--tint": accent("implementer") } as React.CSSProperties,
-        ...(impl.state === "working" ? { className: "is-live" } : {}),
+        label: `RETRY ×${loops.retry}`,
+        // Composed, never assigned: `is-live` is what lights the loop while the implementer works,
+        // and overwriting `className` with one of the two silently drops the other.
+        className: ["is-loop", impl.state === "working" ? "is-live" : ""].filter(Boolean).join(" "),
+      });
+    }
+
+    if (impl && verifier && loops.fix > 0) {
+      edges.push({
+        ...loop("implementer"),
+        id: "loop-fix",
+        source: "verifier",
+        target: "implementer",
+        type: "backloop",
+        className: "is-loop",
+        // Both back-edges leave the verifier's single bottom handle, so their risers are offset
+        // apart; without that the two vertical segments sit on the same line and double-stroke.
+        data: { label: `FIX ×${loops.fix}`, shelfY: rowBottom + 2 * LOOP_SHELF_STEP, takeoff: -10 },
+      });
+    }
+
+    // The finding faulted the plan, so the analyst ran again first. The return leg
+    // `analyst -> implementer` is already drawn as a forward stage edge.
+    if (verifier && analyst && loops.replan > 0) {
+      edges.push({
+        ...loop("analyst"),
+        id: "loop-replan",
+        source: "verifier",
+        target: "analyst",
+        type: "backloop",
+        className: "is-loop",
+        data: {
+          label: `REPLAN ×${loops.replan}`,
+          shelfY: rowBottom + 3 * LOOP_SHELF_STEP,
+          takeoff: 10,
+        },
       });
     }
     // Not clickable, and not focusable by tab: an edge here states a relation between two nodes and
     // has nothing to show when you pick it. See the note in `ConvergeEdge` on the hit path.
     return edges.map((e) => ({ ...e, selectable: false, focusable: false, interactionWidth: 0 }));
-  }, [byName]);
+  }, [byName, columns, loops]);
 
   /*
    * React Flow is a controlled component: it owns node measurement and writes the result back

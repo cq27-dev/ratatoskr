@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryState } from "nuqs";
-import { applyDerived, nodesFromEvents, workingNodeNames } from "./derive";
+import { applyDerived, convergeLoops, nodesFromEvents, workingNodeNames } from "./derive";
 import { pendingQuestions } from "./questions";
 import {
   elapsedAt,
@@ -481,6 +481,17 @@ export default function App() {
     return working;
   }, [shownEvents]);
 
+  /**
+   * How many times the implementer was re-entered, split by the route that brought it back.
+   *
+   * Folded from the same prefix the boxes are folded from, and for the same reason: edge state
+   * taken from anywhere else drifts out of step with the nodes beside it, which is how the
+   * converge loop came to glow while a different node was working. Never from checkpoint counts —
+   * a traversal is a re-entry, so counting the implementer's rows overstates it by the initial
+   * `implement()` call.
+   */
+  const loops = useMemo(() => convergeLoops(shownEvents), [shownEvents]);
+
   /*
    * Leaving a run drops everything read for it.
    *
@@ -607,6 +618,7 @@ export default function App() {
                 nodes={graphNodes}
                 live={live}
                 active={active}
+                loops={loops}
                 selected={node}
                 onSelect={setNode}
               />
