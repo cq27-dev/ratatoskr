@@ -260,12 +260,6 @@ fn expand_home(path: &Path) -> PathBuf {
 pub struct ImplementerConfig {
     /// How many times converge may re-run the implementer before giving up.
     pub max_iterations: u32,
-    /// Maximum model turns each implementer attempt may use.
-    ///
-    /// This bounds an initial attempt and every convergence retry independently. A ruleset's
-    /// `maxTurns` remains the more-specific override when it is set.
-    #[serde(default = "default_implementer_max_turns")]
-    pub max_turns: usize,
     /// The least severe review finding that sends the change back to be fixed.
     ///
     /// `"P1"` blocks only on must-fix defects, `"P2"` (the default) also on should-fix ones, and
@@ -291,16 +285,10 @@ impl Default for ImplementerConfig {
     fn default() -> Self {
         ImplementerConfig {
             max_iterations: 3,
-            max_turns: default_implementer_max_turns(),
             verify_threshold: default_verify_threshold(),
             always_fork: false,
         }
     }
-}
-
-/// Matches the agent's historical cap when a config did not name one.
-fn default_implementer_max_turns() -> usize {
-    100
 }
 
 fn default_verify_threshold() -> String {
@@ -839,11 +827,6 @@ impl RatatoskrConfig {
         if self.implementer.max_iterations == 0 {
             return Err(ConfigError::Invalid(
                 "implementer.max_iterations must be >= 1".to_string(),
-            ));
-        }
-        if self.implementer.max_turns == 0 {
-            return Err(ConfigError::Invalid(
-                "implementer.max_turns must be >= 1".to_string(),
             ));
         }
         for (name, server) in &self.mcp.servers {
@@ -1459,7 +1442,6 @@ mod tests {
         invalid(|c| c.sandbox.test_command.clear());
         invalid(|c| c.sandbox.backend = "docker".to_string());
         invalid(|c| c.implementer.max_iterations = 0);
-        invalid(|c| c.implementer.max_turns = 0);
     }
 
     #[test]
@@ -1651,13 +1633,11 @@ mod tests {
             root = ".ratatoskr/worktrees"
             [implementer]
             max_iterations = 5
-            max_turns = 250
             verify_threshold = "P1"
             "#,
         )
         .unwrap();
         assert_eq!(config.implementer.max_iterations, 5);
-        assert_eq!(config.implementer.max_turns, 250);
         assert_eq!(config.implementer.verify_threshold, "P1");
         // Omitted keys keep their defaults rather than failing.
         assert!(!config.implementer.always_fork);
@@ -1676,6 +1656,25 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("verify_treshold"), "{err}");
+
+        // The implementer's turn cap belongs to the profile its stage runs under, so a config
+        // naming it here is refused rather than read and ignored. Silence would be the failure
+        // this section exists to prevent: a cap that reads as configured and bounds nothing.
+        let moved = r#"
+            [rag_rat]
+            command = ["rag-rat", "mcp"]
+            [store]
+            path = ".ratatoskr/state.sqlite3"
+            [worktree]
+            root = ".ratatoskr/worktrees"
+            [implementer]
+            max_iterations = 5
+            max_turns = 250
+        "#;
+        let err = toml::from_str::<RatatoskrConfig>(moved)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_turns"), "{err}");
     }
 
     #[test]
