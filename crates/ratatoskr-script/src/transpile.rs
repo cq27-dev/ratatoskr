@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use swc_core::common::sync::Lrc;
 use swc_core::common::{FileName, GLOBALS, Mark, SourceMap, Span, Spanned};
 use swc_core::ecma::ast::{
-    Callee, Decl, Expr, FnDecl, Lit, ModuleDecl, ModuleItem, Program, Stmt, Str,
+    Callee, Decl, Expr, Lit, ModuleDecl, ModuleItem, Program, Stmt, Str, VarDeclKind,
 };
 use swc_core::ecma::codegen::text_writer::JsWriter;
 use swc_core::ecma::codegen::{Config as CodegenConfig, Emitter};
@@ -185,16 +185,13 @@ fn transpile_with_loads(
 /// Names of the functions a source declares at its top level. Ambient `declare function` is skipped
 /// — it emits nothing to assign.
 fn top_level_function_names(program: &Program) -> Vec<String> {
-    let declarations: Vec<&FnDecl> = match program {
+    let declarations: Vec<&Decl> = match program {
         Program::Module(module) => module
             .body
             .iter()
             .filter_map(|item| match item {
-                ModuleItem::Stmt(Stmt::Decl(Decl::Fn(declaration))) => Some(declaration),
-                ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match &export.decl {
-                    Decl::Fn(declaration) => Some(declaration),
-                    _ => None,
-                },
+                ModuleItem::Stmt(Stmt::Decl(declaration)) => Some(declaration),
+                ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => Some(&export.decl),
                 _ => None,
             })
             .collect(),
@@ -202,16 +199,32 @@ fn top_level_function_names(program: &Program) -> Vec<String> {
             .body
             .iter()
             .filter_map(|statement| match statement {
-                Stmt::Decl(Decl::Fn(declaration)) => Some(declaration),
+                Stmt::Decl(declaration) => Some(declaration),
                 _ => None,
             })
             .collect(),
     };
-    declarations
-        .into_iter()
-        .filter(|declaration| !declaration.declare)
-        .map(|declaration| declaration.ident.sym.to_string())
-        .collect()
+    declarations.into_iter().flat_map(published_names).collect()
+}
+
+/// The names a top-level declaration would have put on `globalThis` under script evaluation.
+///
+/// A function declaration, and a `var` bound to a plain identifier. Not `let` or `const`: those are
+/// lexical even at a script's top level and never became properties of the global object, so a
+/// workflow could not reach them through `globalThis` before this engine evaluated modules either.
+/// Keeping the same set is the point — module scoping would otherwise silently narrow what a
+/// workflow may be written as, and an entry the runtime cannot find is a confusing way to learn it.
+fn published_names(declaration: &Decl) -> Vec<String> {
+    match declaration {
+        Decl::Fn(function) if !function.declare => vec![function.ident.sym.to_string()],
+        Decl::Var(variable) if !variable.declare && variable.kind == VarDeclKind::Var => variable
+            .decls
+            .iter()
+            .filter_map(|declarator| declarator.name.as_ident())
+            .map(|identifier| identifier.id.sym.to_string())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 struct ParsedProgram {
@@ -391,6 +404,24 @@ mod tests {
                 .unwrap()
                 .contains("globalThis"),
         );
+    }
+
+    #[test]
+    fn the_published_set_is_the_one_script_evaluation_gave() {
+        // `var` hoisted onto the global object when a workflow was a script, so an entry written
+        // that way has to keep resolving; `let` and `const` are lexical and never did, so publishing
+        // them now would invent reach a workflow never had.
+        let js = transpile_with_includes(
+            "w",
+            "var plan = async function (i: string) { return i; };\n\
+             let helper = () => {};\n\
+             const other = 1;",
+            &[],
+        )
+        .unwrap();
+        assert!(js.contains("globalThis.plan = plan;"), "got: {js}");
+        assert!(!js.contains("globalThis.helper"), "got: {js}");
+        assert!(!js.contains("globalThis.other"), "got: {js}");
     }
 
     #[test]
