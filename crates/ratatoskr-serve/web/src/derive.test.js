@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { convergeLoops, workingNodeNames } from "./derive";
+import { convergeLoops, forkHandoff, workingNodeNames } from "./derive";
 
 function node(name, state) {
   return { name, state, checkpoints: 0, stage: 0, lane: 0 };
@@ -177,4 +177,26 @@ test("events belonging to no node are skipped", () => {
     start("implementer"),
   ];
   expect(convergeLoops(events)).toEqual({ fix: 1, replan: 0, retry: 0 });
+});
+
+// The implementer cannot start before the red team has finished (`implement_host` in
+// ratatoskr-nodes/src/workflow.rs refuses to), so both boxes having started is the whole test.
+test("both the red team and the implementer having started draws the hand-off", () => {
+  expect(forkHandoff([node("red_team", "done"), node("implementer", "working")])).toBe(true);
+});
+
+test("a started red team alone draws no hand-off, because nothing has received the tree", () => {
+  expect(forkHandoff([node("red_team", "working"), node("implementer", "idle")])).toBe(false);
+});
+
+test("neither node having started draws no hand-off", () => {
+  expect(forkHandoff([node("red_team", "idle"), node("implementer", "idle")])).toBe(false);
+});
+
+test("a workflow with no red team at all draws no hand-off from nothing", () => {
+  expect(forkHandoff([node("analyst", "done"), node("implementer", "working")])).toBe(false);
+});
+
+test("a failed red team still handed the tree over, so the hand-off is drawn", () => {
+  expect(forkHandoff([node("red_team", "failed"), node("implementer", "working")])).toBe(true);
 });
