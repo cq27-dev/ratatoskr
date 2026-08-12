@@ -8,6 +8,12 @@ const INTERNAL_GATES: &[&str] = &["referee"];
 // These names are kept for existing workflow.ts scripts. They are hosts, not stages: accepting
 // one as a declared stage would replace its declared binding with the legacy host below it.
 const LEGACY_HOST_ALIASES: &[&str] = &["memory", "implement", "iterate", "verify"];
+// The run writes checkpoints under these names itself — `issue` for the task it was given,
+// `clarification` for a completed question exchange — and readers identify those records by name
+// alone: `issue_text` in ratatoskr-serve, the clarification-history check in this crate's workflow
+// module, and the caller resolution the shape API does for a node it cannot place. A declared stage
+// sharing a name would land its own output in the same column and be read as one of those records.
+const RESERVED_RECORD_NAMES: &[&str] = &["issue", "clarification"];
 
 /// Reject invalid stage references before a workflow can start a model call.
 pub fn validate(
@@ -50,6 +56,12 @@ pub fn validate(
         if LEGACY_HOST_ALIASES.contains(&stage.id.as_str()) {
             return Err(PlanError::Configuration(format!(
                 "stage `{}` conflicts with a legacy workflow host alias; choose a different stage identifier",
+                stage.id
+            )));
+        }
+        if RESERVED_RECORD_NAMES.contains(&stage.id.as_str()) {
+            return Err(PlanError::Configuration(format!(
+                "stage `{}` conflicts with a checkpoint the run writes itself; choose a different stage identifier",
                 stage.id
             )));
         }
@@ -225,6 +237,28 @@ mod tests {
         // edge or make two independently useful stages incompatible.
         assert!(validate_declared_contracts(&stages).is_ok());
         assert!(validate(&stages, &crate::built_in_agents(), &permitted_for(&stages)).is_ok());
+    }
+
+    #[test]
+    fn a_stage_may_not_take_the_name_of_a_record_the_run_writes_itself() {
+        // `issue` and `clarification` are written by the run, and readers identify them by name
+        // alone — so a declared stage under either name would put its own output where a reader
+        // expects the run's, and the shape API would report its `from` field as a node caller.
+        for reserved in ["issue", "clarification"] {
+            let mut stage = crate::built_in_stages()
+                .into_iter()
+                .find(|stage| stage.id == "analyst")
+                .unwrap();
+            stage.id = reserved.to_string();
+            stage.governed_by = None;
+
+            let err = validate(&[stage], &crate::built_in_agents(), &[])
+                .expect_err("a reserved record name must not be accepted as a stage");
+            assert!(
+                format!("{err}").contains("a checkpoint the run writes itself"),
+                "`{reserved}` was rejected for the wrong reason: {err}"
+            );
+        }
     }
 
     #[test]

@@ -18,6 +18,12 @@ pub const ISSUE_NODE: &str = "issue";
 
 /// Node names whose caller [`caller_of`] can resolve. Each has its own rule and its own evidence;
 /// the names are matched exactly, so a foreign node a custom workflow checkpoints claims no caller.
+///
+/// Both names are refused as declared stage identifiers — `referee` as an internal gate,
+/// `clarification` as a record the run writes itself (`validate.rs`). That is what lets these arms
+/// read a checkpoint's contents as a record of known shape rather than a stage's own output: without
+/// it, a workflow could declare a `clarification` stage whose ordinary output carried a `from`
+/// meaning a branch, and the API would report it as a caller.
 const REFEREE_NODE: &str = "referee";
 const CLARIFICATION_NODE: &str = "clarification";
 const IMPLEMENTER_NODE: &str = "implementer";
