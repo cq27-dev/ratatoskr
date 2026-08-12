@@ -2015,6 +2015,8 @@ pub(crate) fn standard_definitions() -> Result<String, PlanError> {
         STANDARD_DEFINITIONS_MODULE,
         STANDARD_DEFINITIONS,
         STANDARD_WORKFLOW_INCLUDES,
+        // The definitions module is the leaf of the import graph: it imports nothing.
+        &[],
     )
     .map_err(|error| PlanError::node("workflow", NodeError::Failed(error.to_string())))
 }

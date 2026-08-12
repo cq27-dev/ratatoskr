@@ -7,8 +7,8 @@ use std::path::{Component, Path, PathBuf};
 use swc_core::common::sync::Lrc;
 use swc_core::common::{FileName, GLOBALS, Mark, SourceMap, Span, Spanned};
 use swc_core::ecma::ast::{
-    ArrowExpr, Callee, Class, Decl, Expr, Function, Lit, ModuleDecl, ModuleItem, ObjectPatProp,
-    Pat, Program, Stmt, Str, VarDecl, VarDeclKind,
+    ArrowExpr, Callee, Class, Decl, Expr, Function, ImportDecl, Lit, ModuleDecl, ModuleItem,
+    ObjectPatProp, Pat, Program, Stmt, Str, VarDecl, VarDeclKind,
 };
 use swc_core::ecma::codegen::text_writer::JsWriter;
 use swc_core::ecma::codegen::{Config as CodegenConfig, Emitter};
@@ -35,8 +35,13 @@ struct LoadedText {
     content: String,
 }
 
-/// Transpile a repository workflow, replacing literal `LOAD` calls before JavaScript exists.
-pub(crate) fn transpile_workflow(path: &Path, src: &str) -> Result<WorkflowSource, ScriptError> {
+/// Transpile a repository workflow, replacing literal `LOAD` calls before JavaScript exists and
+/// refusing any `import` specifier outside `permitted`.
+pub(crate) fn transpile_workflow(
+    path: &Path,
+    src: &str,
+    permitted: &[&str],
+) -> Result<WorkflowSource, ScriptError> {
     let workflow_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let canonical_dir = workflow_dir
         .canonicalize()
@@ -62,8 +67,13 @@ pub(crate) fn transpile_workflow(path: &Path, src: &str) -> Result<WorkflowSourc
         dependencies.push(canonical_target.clone());
         Ok(LoadedText { content })
     };
-    let javascript =
-        transpile_with_loads(src, FileName::Real(path.to_path_buf()), path, &mut load)?;
+    let javascript = transpile_with_loads(
+        src,
+        FileName::Real(path.to_path_buf()),
+        path,
+        permitted,
+        &mut load,
+    )?;
     dependencies.sort();
     dependencies.dedup();
     Ok(WorkflowSource {
@@ -82,6 +92,7 @@ pub fn transpile_with_includes(
     name: &str,
     src: &str,
     includes: &[(&str, &str)],
+    permitted: &[&str],
 ) -> Result<String, ScriptError> {
     let mut load = |requested: &str| {
         let normalized = normalize_bundled_target(requested)?;
@@ -96,6 +107,7 @@ pub fn transpile_with_includes(
         src,
         FileName::Custom(name.to_string()),
         Path::new(name),
+        permitted,
         &mut load,
     )
 }
@@ -157,6 +169,7 @@ fn transpile_with_loads(
     src: &str,
     file_name: FileName,
     display_path: &Path,
+    permitted: &[&str],
     load: &mut dyn FnMut(&str) -> Result<LoadedText, String>,
 ) -> Result<String, ScriptError> {
     let mut entries = Vec::new();
@@ -164,6 +177,7 @@ fn transpile_with_loads(
         let mut rewriter = LoadRewriter {
             source_map: Lrc::clone(&parsed.source_map),
             display_path,
+            permitted,
             load,
             error: None,
         };
@@ -352,18 +366,26 @@ fn transpile(
 struct LoadRewriter<'a> {
     source_map: Lrc<SourceMap>,
     display_path: &'a Path,
+    /// Specifiers the host offers this workflow. Resolution is from this set alone, so anything
+    /// else is a typo that can be caught here — with the import's span — instead of at evaluation,
+    /// where the engine's own resolution error names no line.
+    permitted: &'a [&'a str],
     load: &'a mut dyn FnMut(&str) -> Result<LoadedText, String>,
     error: Option<ScriptError>,
 }
 
 impl LoadRewriter<'_> {
     fn fail(&mut self, span: Span, target: &str, message: impl std::fmt::Display) {
+        self.fail_at(span, format_args!("LOAD target `{target}`: {message}"));
+    }
+
+    fn fail_at(&mut self, span: Span, message: impl std::fmt::Display) {
         if self.error.is_some() {
             return;
         }
         let location = self.source_map.lookup_char_pos(span.lo());
         self.error = Some(ScriptError::Transpile(format!(
-            "{}:{}:{}: LOAD target `{target}`: {message}",
+            "{}:{}:{}: {message}",
             self.display_path.display(),
             location.line,
             location.col_display + 1,
@@ -372,6 +394,27 @@ impl LoadRewriter<'_> {
 }
 
 impl VisitMut for LoadRewriter<'_> {
+    // A type-only import is erased before any module is resolved, so it names nothing the host has
+    // to offer. Every other specifier must be in the permitted set: there is no filesystem
+    // resolver behind it, so an unknown one can only fail, and failing here buys the call site.
+    fn visit_mut_import_decl(&mut self, import: &mut ImportDecl) {
+        if import.type_only {
+            return;
+        }
+        let requested = import.src.value.to_string_lossy();
+        if self.permitted.contains(&requested.as_ref()) {
+            return;
+        }
+        let available = match self.permitted {
+            [] => "this workflow may import nothing".to_string(),
+            names => format!("available: {}", names.join(", ")),
+        };
+        self.fail_at(
+            import.span,
+            format_args!("import `{requested}`: no such module; {available}"),
+        );
+    }
+
     fn visit_mut_expr(&mut self, expression: &mut Expr) {
         expression.visit_mut_children_with(self);
         if self.error.is_some() {
@@ -448,6 +491,7 @@ mod tests {
             "w",
             "async function plan(i: string) { return i; }\nexport function helper() {}",
             &[],
+            &[],
         )
         .unwrap();
         assert!(js.contains("globalThis.plan = plan;"), "got: {js}");
@@ -471,6 +515,7 @@ mod tests {
              let helper = () => {};\n\
              const other = 1;",
             &[],
+            &[],
         )
         .unwrap();
         assert!(js.contains("globalThis.plan = plan;"), "got: {js}");
@@ -491,6 +536,7 @@ mod tests {
              var [first, ...rest] = list;\n\
              function outer() { var inside = 1; return inside; }\n\
              const shape = { method() { var buried = 2; return buried; } };",
+            &[],
             &[],
         )
         .unwrap();

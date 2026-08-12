@@ -303,8 +303,12 @@ fn graph_fingerprint(repo: &std::path::Path) -> String {
     // graph *is* now, and two runs cannot be compared across a registry that changed under them.
     let mut workflows = scripts_in(repo.join(WORKFLOW_DIR));
     workflows.push(repo.join(LEGACY_WORKFLOW));
+    // The same module map a run gives a workflow, so one that legitimately imports the standard
+    // definitions still reports its `LOAD` dependencies instead of failing to transpile.
+    let definitions = workflow::standard_definitions().unwrap_or_default();
+    let modules = [(workflow::STANDARD_DEFINITIONS_MODULE, definitions.as_str())];
     for workflow in &workflows {
-        if let Ok(dependencies) = ratatoskr_script::workflow::dependencies(workflow) {
+        if let Ok(dependencies) = ratatoskr_script::workflow::dependencies(workflow, &modules) {
             sources.extend(dependencies);
         }
     }

@@ -44,13 +44,25 @@ pub type HostFn =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = HostResult> + Send>> + Send + Sync>;
 
 /// Canonical files compiled into a repository workflow through literal `LOAD` calls.
-pub fn dependencies(path: &Path) -> Result<Vec<std::path::PathBuf>, ScriptError> {
+///
+/// `modules` is what the workflow would run with: transpiling refuses an import the host does not
+/// offer, so a caller passing a narrower map than the run uses would lose this workflow's
+/// dependencies to an error rather than reading them.
+pub fn dependencies(
+    path: &Path,
+    modules: Modules<'_>,
+) -> Result<Vec<std::path::PathBuf>, ScriptError> {
     if !path.is_file() {
         return Ok(Vec::new());
     }
     let src = std::fs::read_to_string(path)
         .map_err(|error| ScriptError::Io(path.display().to_string(), error))?;
-    Ok(transpile::transpile_workflow(path, &src)?.dependencies)
+    Ok(transpile::transpile_workflow(path, &src, &specifiers(modules))?.dependencies)
+}
+
+/// The specifiers a module map offers — the permitted import set the transpiler checks against.
+fn specifiers<'a>(modules: Modules<'a>) -> Vec<&'a str> {
+    modules.iter().map(|(name, _)| *name).collect()
 }
 
 /// JS prelude: wrap each raw host (`__name`, taking/returning JSON strings) as an ergonomic
@@ -299,7 +311,7 @@ impl WorkflowRuntime {
         includes: &[(&str, &str)],
         modules: Modules<'_>,
     ) -> Result<Self, ScriptError> {
-        let source = transpile::transpile_with_includes(name, src, includes)?;
+        let source = transpile::transpile_with_includes(name, src, includes, &specifiers(modules))?;
         let (runtime, context) = engine(modules).await?;
         let meta = Self::declared(&context, name, &source)
             .await?
@@ -325,7 +337,7 @@ impl WorkflowRuntime {
         }
         let src = std::fs::read_to_string(path)
             .map_err(|e| ScriptError::Io(path.display().to_string(), e))?;
-        let loaded = transpile::transpile_workflow(path, &src)?;
+        let loaded = transpile::transpile_workflow(path, &src, &specifiers(modules))?;
 
         let (runtime, context) = engine(modules).await?;
         let module_name = path.display().to_string();
@@ -1061,6 +1073,7 @@ mod tests {
                  tools: ["semantic_search"],
                };"#,
             &[("prompt.md", "shared guidance\n")],
+            &[],
         )
         .unwrap()
     }
@@ -1120,15 +1133,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unresolvable_import_names_the_specifier_and_the_workflow() {
-        // The same discipline `LOAD` errors keep: a typo must say what could not be found and which
-        // file asked for it, not just fail to evaluate.
+    async fn an_unresolvable_import_names_its_call_site_and_what_was_available() {
+        // The same discipline `LOAD` errors keep: a typo must say what could not be found, which
+        // file asked for it and *where*, not just fail to evaluate.
         let dir = scratch("import-unresolved");
         let path = dir.join("typo.ts");
         std::fs::write(
             &path,
-            r#"import { reviewer } from "ratatoskr/noeds";
-               defineWorkflow({ name: "typo", stages: [stage("reviewer", reviewer)] });"#,
+            "import { reviewer } from \"ratatoskr/noeds\";\n\
+             defineWorkflow({ name: \"typo\", stages: [stage(\"reviewer\", reviewer)] });",
         )
         .unwrap();
 
@@ -1137,8 +1150,58 @@ mod tests {
             Err(error) => error.to_string(),
             Ok(_) => panic!("an unresolvable import must be refused"),
         };
+        assert!(error.contains("typo.ts:1:1:"), "{error}");
+        assert!(
+            error.contains("import `ratatoskr/noeds`: no such module"),
+            "{error}"
+        );
+        // The set the host offered, so the fix is legible without opening another file.
+        assert!(error.contains("available: ratatoskr/nodes"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_import_points_at_its_own_line_not_the_file_start() {
+        // With several imports, a position that always said 1:1 would name the file and no more —
+        // which is the manual search this error exists to remove.
+        let dir = scratch("import-unresolved-later");
+        let path = dir.join("later.ts");
+        std::fs::write(
+            &path,
+            "import { reviewer } from \"ratatoskr/nodes\";\n\
+             import type { Thing } from \"ratatoskr/types\";\n\
+             \n\
+             import { missing } from \"ratatoskr/noeds\";\n\
+             defineWorkflow({ name: \"later\", stages: [stage(\"reviewer\", reviewer)] });",
+        )
+        .unwrap();
+
+        let module = definitions_module();
+        let error = match WorkflowRuntime::load(&path, &[("ratatoskr/nodes", &module)]).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("an unresolvable import must be refused"),
+        };
+        assert!(error.contains("later.ts:4:1:"), "{error}");
         assert!(error.contains("ratatoskr/noeds"), "{error}");
-        assert!(error.contains("typo.ts"), "{error}");
+        // A type-only import is erased before resolution, so it is not held to the permitted set.
+        assert!(!error.contains("ratatoskr/types"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_workflow_offered_nothing_is_told_so_by_an_import() {
+        let dir = scratch("import-none-offered");
+        let path = dir.join("lonely.ts");
+        std::fs::write(&path, "import { x } from \"ratatoskr/nodes\";").unwrap();
+        let error = match WorkflowRuntime::load(&path, &[]).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("an import must be refused when the host offers no modules"),
+        };
+        assert!(error.contains("lonely.ts:1:1:"), "{error}");
+        assert!(
+            error.contains("this workflow may import nothing"),
+            "{error}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
