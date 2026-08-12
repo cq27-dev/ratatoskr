@@ -16,6 +16,12 @@ const CANNOT_FAIL_THE_RUN: &[&str] = &["bookkeeper", "publisher"];
 /// not a node — it's the run's input, and it's the only record of the run's subject.
 pub const ISSUE_NODE: &str = "issue";
 
+/// Node names whose caller [`caller_of`] can resolve. Each has its own rule and its own evidence;
+/// the names are matched exactly, so a foreign node a custom workflow checkpoints claims no caller.
+const REFEREE_NODE: &str = "referee";
+const CLARIFICATION_NODE: &str = "clarification";
+const IMPLEMENTER_NODE: &str = "implementer";
+
 /// What a node is doing, as far as the store can honestly say.
 ///
 /// The qualifier is load-bearing. This is inferred from checkpoints, which are durable and prove
@@ -333,34 +339,41 @@ fn append_unknown(
 
 /// Which node ran the checkpoint at `index`, as far as the checkpoint log can say.
 ///
-/// Two rules, in this order:
+/// Each rule belongs to ONE node name and is dispatched on it. Neither signal generalises, and
+/// `append_unknown` appends any foreign name a custom workflow checkpoints, so applying either rule
+/// to an unrecognised node would invent parentage that #248 then draws:
 ///
-/// 1. **The checkpoint names its own asker.** `clarify.rs` writes `output_json.from` from the hook's
-///    node — the node that called the synthetic `ask` tool — so a node that records its caller is
-///    authoritative and wins. The text is model-authored, so a parse failure is expected and falls
-///    through rather than panicking.
-/// 2. **Otherwise the nearest preceding `implementer` checkpoint.** This is the referee rule, and it
-///    is structural rather than statistical: every `referee_judgement` call site in `workflow.rs`
-///    judges `latest_checkpoint(store, run_id, "implementer")`, fetched immediately before, so the
-///    nearest preceding implementer checkpoint is literally the output being judged. `"implementer"`
-///    is hardcoded because only the orchestrator knows what the referee judges — a run's `stage` and
-///    `lane` are declarative layout, not evidence of invocation, so this cannot be generalised from
-///    them.
+/// * A `from` field is only known to mean "the node that asked" in a clarification record. Another
+///   node's output may carry a `from` meaning a branch, a revision, or a date.
+/// * "Preceded by an implementer checkpoint" is true of most things a run does late; it identifies a
+///   caller only for the referee, which judges that very checkpoint.
 ///
-/// A checkpoint that satisfies neither — legacy data, or a referee row with no implementer before it
-/// — resolves to `None`. The caller is unknown, not guessed at.
+/// [`CLARIFICATION_NODE`]: `clarify.rs` writes `output_json.from` from the hook's node — the node
+/// that called the synthetic `ask` tool — so the record names its own caller. The text is
+/// model-adjacent, so a parse failure falls through rather than panicking.
+///
+/// [`REFEREE_NODE`]: the nearest preceding `implementer` checkpoint. Structural rather than
+/// statistical: every `referee_judgement` call site in `workflow.rs` judges
+/// `latest_checkpoint(store, run_id, "implementer")`, fetched immediately before, so the nearest
+/// preceding implementer checkpoint is literally the output being judged. `"implementer"` is
+/// hardcoded because only the orchestrator knows what the referee judges — a run's `stage` and
+/// `lane` are declarative layout, not evidence of invocation.
+///
+/// Anything else resolves to `None`: unknown, not guessed at. A new rule here needs its own
+/// evidence that the signal means a caller for that node, not a name that happens to fit.
 fn caller_of(checkpoints: &[Checkpoint], index: usize) -> Option<String> {
     let c = checkpoints.get(index)?;
-    let asker = serde_json::from_str::<serde_json::Value>(&c.output_json)
-        .ok()
-        .and_then(|v| v.get("from")?.as_str().map(str::to_string));
-    asker.or_else(|| {
-        checkpoints[..index]
+    match c.node_name.as_str() {
+        CLARIFICATION_NODE => serde_json::from_str::<serde_json::Value>(&c.output_json)
+            .ok()
+            .and_then(|v| v.get("from")?.as_str().map(str::to_string)),
+        REFEREE_NODE => checkpoints[..index]
             .iter()
             .rev()
-            .find(|c| c.node_name == "implementer")
-            .map(|c| c.node_name.clone())
-    })
+            .find(|c| c.node_name == IMPLEMENTER_NODE)
+            .map(|c| c.node_name.clone()),
+        _ => None,
+    }
 }
 
 /// Group a shape's nodes into stages, indexed by column.
@@ -755,6 +768,40 @@ mod tests {
     }
 
     #[test]
+    fn a_node_the_rules_were_not_written_for_claims_no_caller() {
+        // `append_unknown` appends whatever a custom workflow checkpoints, so both rules are
+        // dispatched on the node name rather than tried on everything. Neither signal generalises:
+        // being preceded by an implementer is true of most late work, and another node's `from` may
+        // mean a branch or a revision. Guessing here would put false parentage in the API, which
+        // #248 draws.
+        let after_implementer = derive(
+            Some("converged"),
+            &[
+                cp("implementer", "t1"),
+                cp("deploy", "t2"),
+                cp("smoke_test", "t3"),
+            ],
+        );
+        assert_eq!(caller_of_view(&after_implementer, "deploy"), None);
+        assert_eq!(caller_of_view(&after_implementer, "smoke_test"), None);
+
+        // A `from` on a foreign node means whatever that node meant by it.
+        let own_from = derive(
+            Some("converged"),
+            &[
+                cp("implementer", "t1"),
+                Checkpoint {
+                    node_name: "backport".to_string(),
+                    output_json: r#"{"from":"release-1.2"}"#.to_string(),
+                    created_at: "t2".to_string(),
+                    ..Default::default()
+                },
+            ],
+        );
+        assert_eq!(caller_of_view(&own_from, "backport"), None);
+    }
+
+    #[test]
     fn a_referee_with_no_implementer_before_it_has_an_unknown_caller() {
         // Legacy or pathological data. Unknown is reported as unknown, and nothing panics.
         let views = derive(
@@ -786,9 +833,11 @@ mod tests {
     }
 
     #[test]
-    fn output_that_does_not_name_an_asker_falls_through_to_the_scan() {
-        // `output_json` is model-authored text: unparseable, missing `from`, or a `from` that isn't
-        // a string all have to fall through rather than panic.
+    fn a_clarification_that_does_not_name_its_asker_has_an_unknown_caller() {
+        // Unparseable, missing `from`, or a `from` that isn't a string: the record does not say who
+        // asked, so neither does the API. There is deliberately no fall-back to the nearest
+        // implementer here — the clarification rule is the `from` field and nothing else, and an
+        // implementer that happens to precede it is not evidence it was the asker.
         for output in [
             "not json at all",
             r#"{"question":"which one?"}"#,
@@ -803,19 +852,9 @@ mod tests {
                 ],
             );
             assert_eq!(
-                caller_of_view(&with_implementer, "clarification").as_deref(),
-                Some("implementer"),
-                "`{output}` should fall through to the backward scan"
-            );
-
-            let alone = derive(
-                Some("awaiting_clarification"),
-                &[cp_from("clarification", "t1", output)],
-            );
-            assert_eq!(
-                caller_of_view(&alone, "clarification"),
+                caller_of_view(&with_implementer, "clarification"),
                 None,
-                "`{output}` with nothing to scan back to resolves to no caller"
+                "`{output}` names no asker, and a preceding implementer must not stand in for one"
             );
         }
     }
