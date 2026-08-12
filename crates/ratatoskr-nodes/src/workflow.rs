@@ -1727,17 +1727,27 @@ impl StageExecutor {
             .ctx
             .plugin_context
             .pool_for(&governance_id, &self.ctx.servers);
-        if stage.tools.iter().any(|tool| {
-            tool == ratatoskr_agent::files::WRITE || tool == ratatoskr_agent::files::EDIT
-        }) && ratatoskr_core::Capability::ceiling(&stage.capabilities)
-            .is_some_and(|ceiling| ceiling.permits(ratatoskr_core::Capability::Write))
+        // A file-mutation tool is offered only against the root Rust supplied for this invocation,
+        // never on the strength of the declaration alone. A declared stage host owns no worktree
+        // lifecycle, and its file root otherwise falls back to the process's working directory —
+        // the operator's checkout — so a stage that declared `Write` would be editing that.
+        if resource_root.is_some()
+            && stage.tools.iter().any(|tool| {
+                tool == ratatoskr_agent::files::WRITE || tool == ratatoskr_agent::files::EDIT
+            })
+            && ratatoskr_core::Capability::ceiling(&stage.capabilities)
+                .is_some_and(|ceiling| ceiling.permits(ratatoskr_core::Capability::Write))
         {
             offered.add_local_tools(ratatoskr_agent::files::edit_declarations());
         }
-        if stage
-            .tools
-            .iter()
-            .any(|tool| tool == ratatoskr_agent::shell::BASH)
+        // The grant is what puts an implementation behind `Bash`, exactly as `gh` needs its
+        // publish grant. Offered without one it is a tool whose every call is refused, and the
+        // model spends turns discovering that.
+        if shell.is_some()
+            && stage
+                .tools
+                .iter()
+                .any(|tool| tool == ratatoskr_agent::shell::BASH)
         {
             offered.add_local(ratatoskr_agent::shell::declaration());
         }
@@ -4158,6 +4168,95 @@ mod tests {
             vec![ratatoskr_core::SessionScope::Compacted],
             "the declared stage must override its route before NodeRun reaches the agent"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_declared_stage_gets_file_mutation_tools_only_against_a_supplied_root() {
+        // A declared stage host owns no worktree lifecycle. Without a root from Rust its file tools
+        // would resolve against the process's working directory — the operator's own checkout — so
+        // the declaration alone must not put `Write` or `Edit` on the table.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-declared-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "leak".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-declared-write",
+            "write something",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let mut stage = crate::built_in_stages().pop().unwrap();
+        stage.id = "leak".to_string();
+        stage.agent = "build".to_string();
+        stage.governed_by = None;
+        stage.output_contract = "LeakOutput".to_string();
+        stage.output_schema = Some(json!({ "type": "object" }));
+        stage.capabilities = vec![ratatoskr_core::Capability::Write];
+        stage.tools = ["Read", "Write", "Edit", "Bash"]
+            .map(str::to_string)
+            .to_vec();
+        stage.question_renderer = None;
+        let stages = Arc::new(vec![stage.clone()]);
+        let turn = Arc::new(RecordingStageTurn::default());
+        let executor = StageExecutor::new(ctx, stages, Arc::clone(&turn) as Arc<dyn StageTurn>);
+
+        for resource_root in [None, Some(dir.clone())] {
+            executor
+                .execute(StageInvocation {
+                    stage: stage.clone(),
+                    input_json: "{}".to_string(),
+                    rendered_question: None,
+                    resource_root,
+                    rag_rat_worktree: None,
+                    shell: None,
+                    publish: None,
+                    clarifier: None,
+                    invocation_guidance: None,
+                    output: StageOutput::Evidence,
+                })
+                .await
+                .unwrap();
+        }
+
+        let offered = turn.tools.lock().expect("recording runner mutex poisoned");
+        for tool in ["Write", "Edit"] {
+            assert!(
+                !offered[0].iter().any(|offered| offered == tool),
+                "{tool} was offered to a stage Rust gave no root"
+            );
+            assert!(
+                offered[1].iter().any(|offered| offered == tool),
+                "{tool} must still be offered against a supplied root"
+            );
+        }
+        // The same rule for the shell, which neither invocation was granted.
+        assert!(
+            !offered.iter().any(|run| run.iter().any(|t| t == "Bash")),
+            "Bash was offered without a shell grant"
+        );
+        // Reading is not gated on the root, and never was.
+        assert!(offered[0].iter().any(|tool| tool == "Read"));
+        drop(offered);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -7472,12 +7571,19 @@ mod tests {
             .expect("recording runner mutex poisoned")
             .iter()
         {
-            for expected in ["Read", "Grep", "Glob", "Write", "Edit", "Bash", "ask"] {
+            // The root Rust supplied is what puts the file-mutation tools on the table.
+            for expected in ["Read", "Grep", "Glob", "Write", "Edit", "ask"] {
                 assert!(
                     offered.iter().any(|tool| tool == expected),
                     "missing {expected}"
                 );
             }
+            // These invocations were granted no shell, so `Bash` has nothing behind it and is not
+            // offered — a tool whose every call is refused only spends turns.
+            assert!(
+                !offered.iter().any(|tool| tool == "Bash"),
+                "Bash was offered without a shell grant"
+            );
         }
         let checkpoints = store
             .checkpoints_for_run("run-standard-implementer")
