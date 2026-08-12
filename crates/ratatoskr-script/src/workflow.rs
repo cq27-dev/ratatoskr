@@ -624,6 +624,19 @@ impl WorkflowRuntime {
 }
 
 /// Refuse a question-renderer source that is anything other than one function expression.
+/// What a runtime frame from a workflow module is named.
+///
+/// A frame carries a line and column, and they belong to the *emitted* JavaScript: type stripping
+/// and `LOAD` inclusion move everything. Naming the author's file alongside them claims a position
+/// in a real file that is not the one that threw — a worse error than an obviously internal one —
+/// so the name says the position is in generated code. Source maps (#267) are what would let the
+/// path carry a position honestly; everything that reports a *source* position (unresolvable
+/// imports, `LOAD` failures, the time and memory budgets, a missing entry export) computes it from
+/// the TypeScript and names the path directly.
+fn generated_name(module_name: &str) -> String {
+    format!("<generated from {module_name}>")
+}
+
 /// Say where a rejected workflow declaration is, in terms the author can act on.
 ///
 /// The declaration round-trips through JSON before it is typed, so serde's position — `at line 1
@@ -872,8 +885,8 @@ async fn engine(
 /// concatenated into the module text would not exist yet when an imported definition calls
 /// `stage(..)`. `BOOTSTRAP` is therefore its own script, evaluated first.
 ///
-/// The module name is the workflow's own path, so an unresolved specifier reports the file an
-/// author would go and edit rather than a placeholder.
+/// The engine sees [`generated_name`] rather than the path: a frame's line and column are the
+/// emitted JavaScript's, and until a source map exists (#267) nothing can map them back.
 async fn evaluate<'js>(
     ctx: &Ctx<'js>,
     module_name: &str,
@@ -881,7 +894,7 @@ async fn evaluate<'js>(
 ) -> Result<Module<'js, Evaluated>, ScriptError> {
     let fail = |e: rquickjs::CaughtError| ScriptError::Eval(format!("{e}"));
     ctx.eval::<(), _>(BOOTSTRAP).catch(ctx).map_err(fail)?;
-    let (module, promise) = Module::declare(ctx.clone(), module_name, source)
+    let (module, promise) = Module::declare(ctx.clone(), generated_name(module_name), source)
         .catch(ctx)
         .map_err(fail)?
         .eval()
@@ -1635,6 +1648,44 @@ export async function plan(i) { return { entryRan: true }; }
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&out).unwrap()["ok"],
             true
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_runtime_frame_never_claims_a_line_in_the_authors_file() {
+        // The engine sees the emitted JavaScript, whose lines are not the TypeScript's: type
+        // stripping and `LOAD` inclusion move everything. A frame stamped with the author's path
+        // and the emitted line points at a real file's wrong line, which reads as a fact rather
+        // than as the engine's own position.
+        let dir = scratch("frame-position");
+        let path = dir.join("throws.ts");
+        let mut source = String::from("type Unused = { a: string };\n");
+        for index in 0..40 {
+            source.push_str(&format!("const spacer{index}: number = {index};\n"));
+        }
+        source.push_str(
+            "export async function plan(input: any) {\n  throw new Error('deliberate');\n}\n",
+        );
+        std::fs::write(&path, &source).unwrap();
+
+        let runtime = WorkflowRuntime::load(&path, &[]).await.unwrap().unwrap();
+        let error = runtime
+            .run("plan", "{}".to_string(), HashMap::new())
+            .await
+            .expect_err("the entry throws")
+            .to_string();
+
+        assert!(error.contains("deliberate"), "{error}");
+        // The path appears — an author still has to know which workflow threw — but only inside a
+        // marker that says the position beside it belongs to generated code.
+        assert!(
+            error.contains(&format!("<generated from {}>", path.display())),
+            "{error}"
+        );
+        assert!(
+            !error.contains(&format!("{}:", path.display())),
+            "a bare `file:line` claims a position in the author's source: {error}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
