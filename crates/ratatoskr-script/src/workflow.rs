@@ -172,7 +172,6 @@ globalThis.defineWorkflow = function (meta) {
             // an expression until it is given the `function` prefix.
             if (source.indexOf("renderQuestion(") === 0) source = "function " + source;
             declared.questionRenderer = source;
-            globalThis.__stageQuestionRenderers[stage.id] = stage.renderQuestion;
         }
         return declared;
     });
@@ -455,6 +454,10 @@ impl WorkflowRuntime {
     /// Register `hosts` and invoke the workflow's exported `entry` function with `input_json` (a
     /// JSON string), returning the entry's result as JSON. Any thrown error (host `Err`, or a bug in
     /// the workflow) surfaces as [`ScriptError::Eval`].
+    ///
+    /// No question renderers: every stage host receives its structured input. A caller that wants
+    /// declared renderers passes them to [`Self::run_with_question_renderers`], which owns the
+    /// whole table.
     pub async fn run(
         &self,
         entry: &str,
@@ -465,11 +468,17 @@ impl WorkflowRuntime {
             .await
     }
 
-    /// Invoke one entry with declared stage question renderers installed before host wrappers.
+    /// Invoke one entry with `question_renderers` as the run's entire renderer table.
     ///
     /// A renderer runs synchronously in JavaScript before its Rust host. It receives the original
     /// structured input and may return only a string; the host still owns the model call, output
     /// validation, checkpointing, telemetry and every workflow gate.
+    ///
+    /// The map is installed exactly: a stage absent from it runs with no renderer and receives its
+    /// structured input. Anything else would let a renderer left over from an earlier call — the
+    /// bundled workflow is evaluated afresh on every adapter invocation — answer for a stage whose
+    /// override dropped `renderQuestion`, and hand a replacement stage a prompt written for the
+    /// shape it replaced.
     pub async fn run_with_question_renderers(
         &self,
         entry: &str,
@@ -493,6 +502,12 @@ impl WorkflowRuntime {
                          a workflow's entries are its exported functions"
                     ))
                 })?;
+
+                // Cleared, not merged into: the context outlives one call and module evaluation is
+                // free to declare renderers of its own.
+                ctx.eval::<(), _>("globalThis.__stageQuestionRenderers = {};")
+                    .catch(&ctx)
+                    .map_err(|e| ScriptError::Eval(format!("{e}")))?;
 
                 for (name, source) in question_renderers {
                     let install = format!(
@@ -918,11 +933,13 @@ mod tests {
             }),
         );
 
+        let renderer = runtime.meta().stages[0].question_renderer.clone().unwrap();
         let error = runtime
-            .run(
+            .run_with_question_renderers(
                 "plan",
                 serde_json::json!({ "issue": "x" }).to_string(),
                 hosts,
+                HashMap::from([("reviewer".to_string(), renderer)]),
             )
             .await
             .unwrap_err()

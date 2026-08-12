@@ -286,7 +286,9 @@ impl WorkflowContext {
     /// `install_execution_stages` puts the running workflow's overlaid registry here before the
     /// first host call. A context that never runs a workflow — the overseer's selection turn, and
     /// the terminal bookkeeper/publisher adapters, both of which run outside one — falls back to the
-    /// bundled standard registry, which is what those turns are defined against.
+    /// bundled standard registry, which is what those turns are defined against. Every stage that
+    /// can reach this fallback is refused to workflows at the load-time gate, so the fallback can
+    /// never stand in for a declaration someone made and expected to run.
     pub(crate) async fn stages(&self) -> Result<Arc<Vec<Stage>>, PlanError> {
         self.stages
             .get_or_try_init(|| async { Ok(Arc::new(standard_stages().await?)) })
@@ -1983,6 +1985,12 @@ const INTERNAL_WRITE_STAGE_IDS: &[&str] = &["redteam_author", "implementer_attem
 // where a stage becomes a repository-JS global, rather than out of the registry — the adapters still
 // have to resolve them, and a filter applied before an overlay is a filter an override walks past.
 pub(crate) const TERMINAL_STAGE_IDS: &[&str] = &["bookkeeper", "publisher"];
+
+// Selection runs before a workflow has been chosen, in its own pre-selection context: this turn
+// picks *between* workflows, so no workflow can be the one that configures it. The load-time gate
+// refuses the declaration for that reason — `choose` would otherwise run the bundled stage and the
+// declaration would sit in the registry, valid and never reached.
+pub(crate) const SELECTION_STAGE_ID: &str = "overseer";
 
 fn build_declared_stage_hosts(executor: &Arc<StageExecutor>) -> HashMap<String, HostFn> {
     executor
@@ -5259,6 +5267,109 @@ mod tests {
                 questions[0]
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_override_that_omits_render_question_gets_no_renderer_at_all() {
+        // An override restates only what it changes, so omitting `renderQuestion` is how a stage
+        // says it wants its structured input. The bundled workflow is evaluated on every adapter
+        // call and registers the standard renderers as it goes; installing the run's renderers over
+        // that left the bundled one answering for a stage that had dropped it, and a replacement
+        // that also changed its input contract got a prompt written for the shape it replaced.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-omitted-renderer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"defineWorkflow({
+                 name: "ours",
+                 stages: [
+                   stage("implementer_attempt", {
+                     agent: "build",
+                     governedBy: "implementer",
+                     instructions: "OVERRIDDEN IMPLEMENTER",
+                     inputContract: "OurImplementerInput",
+                     outputContract: "OurReport",
+                     outputSchema: { type: "object" },
+                   }),
+                   stage("redteam_author", {
+                     agent: "build",
+                     governedBy: "redteam",
+                     instructions: "OVERRIDDEN AUTHOR",
+                     inputContract: "OurAuthorInput",
+                     outputContract: "OurTests",
+                     outputSchema: { type: "object" },
+                     renderQuestion(input: any) { return `AUTHOR: ${input.note}`; },
+                   }),
+                 ],
+               });
+               export async function run(input) { return input; }"#,
+        )
+        .unwrap();
+        let definitions = standard_definitions().unwrap();
+        let runtime = WorkflowRuntime::load(
+            &workflow_path,
+            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("redteam".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-omitted-renderer",
+            "drop a bundled renderer",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        install_execution_stages(&ctx, &runtime).await.unwrap();
+
+        // The bundled `implementer_attempt` renderer reads `input.analyst.impact_summary`; this
+        // input is the override's own shape and has no such field.
+        let input = json!({ "note": "the shape this override declares" }).to_string();
+        let turn = Arc::new(RecordingStageTurn::default());
+        evaluate_standard_stage_with_turn(
+            Arc::clone(&ctx),
+            "implementer_attempt",
+            input.clone(),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await
+        .unwrap();
+        // And a stage that did restate `renderQuestion` still gets it: installing the run's table
+        // exactly must not swing into installing nothing.
+        evaluate_standard_stage_with_turn(
+            Arc::clone(&ctx),
+            "redteam_author",
+            input.clone(),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await
+        .unwrap();
+
+        let questions = turn
+            .questions
+            .lock()
+            .expect("recording runner mutex poisoned");
+        assert_eq!(
+            questions[0],
+            format!("Input contract: OurImplementerInput\nOutput contract: OurReport\n\n{input}"),
+            "the stage that dropped renderQuestion must receive its structured input"
+        );
+        assert_eq!(
+            questions[1],
+            "Input contract: OurAuthorInput\nOutput contract: OurTests\n\n\
+             AUTHOR: the shape this override declares"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

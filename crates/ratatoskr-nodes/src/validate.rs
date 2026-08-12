@@ -39,6 +39,14 @@ pub fn validate_declarations(stages: &[Stage], workflow: &str) -> Result<(), Pla
                 stage.id
             )));
         }
+        // Selection happens before a workflow is chosen, so a workflow cannot configure it: there
+        // is no answer to which workflow's overseer picks among workflows.
+        if stage.id == crate::workflow::SELECTION_STAGE_ID {
+            return Err(PlanError::Configuration(format!(
+                "workflow `{workflow}` declares stage `{}`, which selects between workflows and so cannot be declared by one",
+                stage.id
+            )));
+        }
         // Operation hosts are installed under their own names. A declared stage sharing one would
         // be overwritten by the operation and never run — at the first host call, long after the
         // run row and the `issue` checkpoint are written.

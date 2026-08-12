@@ -717,9 +717,13 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
         plugin_context,
         ledger: Arc::new(RunLedger::default()),
     })?;
-    let raw = workflow::evaluate_standard_stage(Arc::clone(&ctx), "overseer", input_json.clone())
-        .await
-        .map_err(|error| PlanError::node("overseer", NodeError::Failed(error)))?;
+    let raw = workflow::evaluate_standard_stage(
+        Arc::clone(&ctx),
+        workflow::SELECTION_STAGE_ID,
+        input_json.clone(),
+    )
+    .await
+    .map_err(|error| PlanError::node("overseer", NodeError::Failed(error)))?;
     let decided: OverseerOutput = serde_json::from_str(&raw)?;
 
     // Its own ledger: the overseer runs before the run's, and its cost is still a cost. Drained
@@ -3194,6 +3198,9 @@ mod referee_governance_tests {
             ("context", "Rust-owned workflow operation"),
             ("bookkeeper", "terminal adapter"),
             ("publisher", "terminal adapter"),
+            // Selection runs in its own pre-selection context, before any workflow runtime exists,
+            // so a declaration of it could never reach the routing turn it appears to configure.
+            ("overseer", "selects between workflows"),
         ];
         for (declared, expected) in cases {
             let (dir, found) = workflows_in(
