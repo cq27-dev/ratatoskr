@@ -209,13 +209,23 @@ pub fn profile_for(
     stages: &[Stage],
     node: &str,
 ) -> Option<AgentProfile> {
-    let stage = stages
-        .iter()
-        .find(|stage| stage.id == node)
-        .or_else(|| stages.iter().find(|stage| stage.governance_id() == node))?;
+    let stage = for_node(stages, node)?;
     agent_profiles(config)
         .into_iter()
         .find(|profile| profile.id == stage.agent)
+}
+
+/// The stage that runs when `node` is asked for, by the resolution [`profile_for`] documents.
+///
+/// Separate from [`profile_for`] because a route decision needs the stage itself, not its profile:
+/// a stage's ruleset and `[models.*]` route are keyed by [`Stage::governance_id`], and looking those
+/// up under the caller's name while the profile came from here is how the two halves of one decision
+/// came to disagree.
+pub fn for_node<'a>(stages: &'a [Stage], node: &str) -> Option<&'a Stage> {
+    stages
+        .iter()
+        .find(|stage| stage.id == node)
+        .or_else(|| stages.iter().find(|stage| stage.governance_id() == node))
 }
 
 /// Resolve a workflow's script metadata into the registry type validated by the execution layer.

@@ -1434,14 +1434,27 @@ pub(crate) fn build_characterizer(
 ///
 /// `stages` is the registry the run executes, so an override's profile — not the imported stage's —
 /// decides where the node runs and therefore whether it runs at all.
+///
+/// Every lookup is keyed by the resolved stage's [`Stage::governance_id`], because that is the
+/// identity the turn itself runs under: `declared_stage_agent_config` reads the ruleset and the
+/// `[models.*]` route under it. Asking for `verifier` while the run's verifier declares
+/// `governedBy: "review"` must therefore find `[models.review]` — resolving the profile through the
+/// registry but the route under the caller's name made one decision out of two disagreeing answers,
+/// which disabled a configured verifier or enabled one whose turn then had nowhere to run.
+///
+/// An un-overridden stage governs itself, so its governance id is its own id and this resolves
+/// exactly as a lookup under the caller's name did.
 fn node_route(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     stages: &[Stage],
     node: &str,
 ) -> Option<ratatoskr_core::ModelRoute> {
+    // The profile keeps the caller's name: it is resolved from the stage this finds, and re-entering
+    // the registry under a governance id could land on an unrelated stage that happens to bear it.
+    let identity = stage::for_node(stages, node).map_or(node, Stage::governance_id);
     engine
-        .ruleset(node)
+        .ruleset(identity)
         .and_then(|ruleset| ruleset.config().model.clone())
         .map(|model| ratatoskr_core::ModelRoute {
             provider: model.provider,
@@ -1453,7 +1466,7 @@ fn node_route(
             session: Default::default(),
         })
         .or_else(|| stage::profile_for(config, stages, node).and_then(|profile| profile.model))
-        .or_else(|| config.models.get(node).cloned())
+        .or_else(|| config.models.get(identity).cloned())
 }
 
 /// The referee accepts only its TOML route, then falls back to the verifier's route. Its fixed
@@ -2260,6 +2273,43 @@ mod agent_config_tests {
             },
         );
         assert!(classifier_enabled(&engine, &config, &stages));
+    }
+
+    #[tokio::test]
+    async fn a_stage_governed_by_another_identity_is_enabled_by_that_identitys_route() {
+        // `stage("verifier", { ...nodes.verifier, governedBy: "review" })` — startup accepts it,
+        // because `review` is a repository-owned identity with no reservation of its own.
+        let engine = engine("governed-route").await;
+        let mut stages = workflow::standard_stages().await.unwrap();
+        stages
+            .iter_mut()
+            .find(|stage| stage.id == "verifier")
+            .expect("the standard registry declares the verifier")
+            .governed_by = Some("review".to_string());
+        let route = || ratatoskr_core::ModelRoute {
+            context_window: None,
+            provider: "openai".to_string(),
+            model: "gpt-5".to_string(),
+            max_tokens: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        };
+
+        // `review` is what the turn resolves its route under, so a route there is somewhere to run.
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("review".to_string(), route());
+        assert!(verifier_enabled(&engine, &config, &stages));
+
+        // A route left behind under the stage id is not: the turn would ask for `review`, find
+        // nothing, and the review the gate promised would be reported as unavailable instead.
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("verifier".to_string(), route());
+        assert!(!verifier_enabled(&engine, &config, &stages));
+
+        // A stage that governs itself — every stage in an unmodified registry — is unaffected.
+        let stages = workflow::standard_stages().await.unwrap();
+        assert!(verifier_enabled(&engine, &config, &stages));
     }
 
     #[test]
