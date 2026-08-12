@@ -234,6 +234,22 @@ pub fn stages_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> 
         .collect()
 }
 
+/// Lay a workflow's own declarations over a base registry: a declaration whose id is already there
+/// *replaces* that stage in place, a new id is appended.
+///
+/// Importing `ratatoskr/nodes` and changing one field of a standard stage is the point of the
+/// import, so the result has to be that one stage rather than two competing definitions of it.
+/// Replacing in place also keeps the override where the standard stage sat, so the lookups that
+/// resolve a stage by scanning the vec — delegation targets among them — find the override.
+pub fn overlay(base: &mut Vec<Stage>, declared: Vec<Stage>) {
+    for stage in declared {
+        match base.iter_mut().find(|existing| existing.id == stage.id) {
+            Some(existing) => *existing = stage,
+            None => base.push(stage),
+        }
+    }
+}
+
 /// Built-in stage identities are intentionally the historic checkpoint names.
 pub fn built_in_stages() -> Vec<Stage> {
     [

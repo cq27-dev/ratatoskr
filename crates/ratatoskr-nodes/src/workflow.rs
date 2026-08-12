@@ -2238,11 +2238,18 @@ async fn execution_stages(runtime: &WorkflowRuntime) -> Result<Vec<Stage>, PlanE
     // Delivery is terminal external I/O, not a workflow operation. These declarations are
     // executed only by their Rust terminal adapters, after Rust has accepted the run outcome.
     stages.retain(|stage| !matches!(stage.id.as_str(), "bookkeeper" | "publisher"));
-    // The bundled runtime declares the base stages themselves. Repository workflows add only
-    // their own declarations; appending standard-v1 to itself would duplicate every model host and
-    // reintroduce the terminal declarations filtered above.
+    // The bundled runtime declares the base stages themselves. Repository workflows lay only their
+    // own declarations over these; appending standard-v1 to itself would duplicate every model host
+    // and reintroduce the terminal declarations filtered above.
+    //
+    // Laid over, not appended: a workflow that imports `analyst` and changes one field declares
+    // *that* stage. Appending would leave the standard definition earlier in the vec, where the
+    // by-id scans — delegation resolution among them — would keep finding the original.
     if runtime.meta().name != STANDARD_WORKFLOW_NAME {
-        stages.extend(crate::stage::stages_from_workflow(runtime.meta()));
+        crate::stage::overlay(
+            &mut stages,
+            crate::stage::stages_from_workflow(runtime.meta()),
+        );
     }
     Ok(stages)
 }
@@ -5062,6 +5069,69 @@ mod tests {
                 .find(|stage| stage.id == "scout")
                 .is_some_and(|stage| stage.question_renderer.is_none())
         );
+    }
+
+    #[tokio::test]
+    async fn an_overridden_standard_stage_is_the_one_a_run_executes() {
+        // The registry a run actually executes from. The override keeps the id `analyst`, so the
+        // standard definition must be gone rather than sitting ahead of it — the by-id scan that
+        // picks a stage to execute and resolves a delegation target takes the first match.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-exec-override-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"import * as nodes from "ratatoskr/nodes";
+               defineWorkflow({
+                 name: "ours",
+                 stages: [
+                   stage("analyst", { ...nodes.analyst, instructions: "our own analysis" }),
+                   stage("reviewer", {
+                     agent: "reason",
+                     instructions: "review",
+                     delegation: { target: "analyst", evidenceContract: "AnalystOutput" },
+                   }),
+                 ],
+               });
+               export async function plan(input) { return input; }"#,
+        )
+        .unwrap();
+        let definitions = standard_definitions().unwrap();
+        let runtime = WorkflowRuntime::load(
+            &workflow_path,
+            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let stages = execution_stages(&runtime).await.unwrap();
+        assert_eq!(
+            stages.iter().filter(|stage| stage.id == "analyst").count(),
+            1,
+            "the override replaces the imported stage instead of joining it"
+        );
+        let resolved = stages.iter().find(|stage| stage.id == "analyst").unwrap();
+        assert_eq!(resolved.instructions, "our own analysis");
+        // Everything the override did not restate is still the standard definition's.
+        let standard = standard_stages().await.unwrap();
+        let imported = standard.iter().find(|stage| stage.id == "analyst").unwrap();
+        assert_ne!(imported.instructions, resolved.instructions);
+        assert_eq!(resolved.output_schema, imported.output_schema);
+        // And the delegation target resolves through the same scan.
+        let reviewer = stages.iter().find(|stage| stage.id == "reviewer").unwrap();
+        let target = reviewer.delegation.as_ref().unwrap().target.clone();
+        assert_eq!(
+            stages
+                .iter()
+                .find(|stage| stage.id == target)
+                .unwrap()
+                .instructions,
+            "our own analysis"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

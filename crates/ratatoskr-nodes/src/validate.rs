@@ -15,6 +15,24 @@ const LEGACY_HOST_ALIASES: &[&str] = &["memory", "implement", "iterate", "verify
 // sharing a name would land its own output in the same column and be read as one of those records.
 const RESERVED_RECORD_NAMES: &[&str] = &["issue", "clarification"];
 
+/// Reject a workflow that declares the same stage identifier twice.
+///
+/// A workflow may reuse a *standard* identifier — that is an override, and the overlay replaces the
+/// imported stage with it. Declaring the same id twice in one workflow is not an override of
+/// anything: the overlay would silently keep only the last, so it is refused here instead.
+pub fn validate_unique_declarations(stages: &[Stage], workflow: &str) -> Result<(), PlanError> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for stage in stages {
+        if !seen.insert(stage.id.as_str()) {
+            return Err(PlanError::Configuration(format!(
+                "workflow `{workflow}` declares stage `{}` more than once",
+                stage.id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Reject invalid stage references before a workflow can start a model call.
 pub fn validate(
     stages: &[Stage],

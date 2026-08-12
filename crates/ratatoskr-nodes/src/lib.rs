@@ -287,6 +287,12 @@ async fn record_provenance(store: &Store, run_id: &str, config: &RatatoskrConfig
 /// neither, so a stored value would silently stop matching on a toolchain bump; FNV-1a is fixed
 /// because it is written here.
 fn graph_fingerprint(repo: &std::path::Path) -> String {
+    graph_fingerprint_of(repo, &workflow::standard_definitions().unwrap_or_default())
+}
+
+/// `graph_fingerprint` against explicit standard definitions, so the contribution of the embedded
+/// module is testable without rebuilding the binary.
+fn graph_fingerprint_of(repo: &std::path::Path, definitions: &str) -> String {
     let scripts_in = |dir: PathBuf| -> Vec<PathBuf> {
         std::fs::read_dir(dir)
             .map(|entries| {
@@ -305,8 +311,7 @@ fn graph_fingerprint(repo: &std::path::Path) -> String {
     workflows.push(repo.join(LEGACY_WORKFLOW));
     // The same module map a run gives a workflow, so one that legitimately imports the standard
     // definitions still reports its `LOAD` dependencies instead of failing to transpile.
-    let definitions = workflow::standard_definitions().unwrap_or_default();
-    let modules = [(workflow::STANDARD_DEFINITIONS_MODULE, definitions.as_str())];
+    let modules = [(workflow::STANDARD_DEFINITIONS_MODULE, definitions)];
     for workflow in &workflows {
         if let Ok(dependencies) = ratatoskr_script::workflow::dependencies(workflow, &modules) {
             sources.extend(dependencies);
@@ -319,20 +324,27 @@ fn graph_fingerprint(repo: &std::path::Path) -> String {
     sources.dedup();
 
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for path in sources {
-        // A missing file still contributes its name, so adding a `workflow.ts` changes the
-        // fingerprint even if it is empty.
-        for byte in path
-            .strip_prefix(repo)
-            .unwrap_or(&path)
-            .as_os_str()
-            .as_encoded_bytes()
-            .iter()
-            .chain(std::fs::read(&path).unwrap_or_default().iter())
-        {
+    let mut fold = |bytes: &[u8]| {
+        for byte in bytes {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
+    };
+    // The standard definitions are compiled into the binary rather than checked into the repo, so
+    // no dependency walk can reach them — yet they carry the stages every workflow imports, with
+    // their `LOAD`ed prompts already inlined by the transpile. Without this, two builds that run
+    // demonstrably different graphs would report the same hash.
+    fold(definitions.as_bytes());
+    for path in sources {
+        // A missing file still contributes its name, so adding a `workflow.ts` changes the
+        // fingerprint even if it is empty.
+        fold(
+            path.strip_prefix(repo)
+                .unwrap_or(&path)
+                .as_os_str()
+                .as_encoded_bytes(),
+        );
+        fold(&std::fs::read(&path).unwrap_or_default());
     }
     format!("{hash:016x}")
 }
@@ -530,9 +542,8 @@ fn validate_configured_stage_registry(
     standard_stages: Vec<Stage>,
 ) -> Result<(), PlanError> {
     let profiles = agent_profiles(config);
-    let mut permitted_governance = governable_from(workflows);
-    let mut stages = built_in_stages();
-    stages.retain(|stage| {
+    let mut base = built_in_stages();
+    base.retain(|stage| {
         !matches!(
             stage.id.as_str(),
             "overseer"
@@ -544,16 +555,31 @@ fn validate_configured_stage_registry(
                 | "publisher"
         )
     });
-    stages.extend(standard_stages);
-    for workflow in workflows {
-        let workflow_stages = stage::stages_from_workflow(workflow.meta());
-        validate::validate_declared_contracts(&workflow_stages)?;
-        stages.extend(workflow_stages);
+    base.extend(standard_stages);
+
+    // Each workflow is judged against its *own* registry — the base with its declarations laid over
+    // it — not against one pool of everything configured. Pooling rejects the documented case of a
+    // workflow overriding `analyst`, and rejects it twice over when two workflows each override the
+    // same standard id: a run only ever executes one workflow, so they never meet.
+    let judge = |declared: Vec<Stage>, mut permitted: Vec<String>| -> Result<(), PlanError> {
+        let mut stages = base.clone();
+        stage::overlay(&mut stages, declared);
+        permitted.extend(stages.iter().map(|stage| stage.id.clone()));
+        permitted.sort();
+        permitted.dedup();
+        validate::validate(&stages, &profiles, &permitted)
+    };
+
+    if workflows.is_empty() {
+        return judge(Vec::new(), governable_from(std::iter::empty()));
     }
-    permitted_governance.extend(stages.iter().map(|stage| stage.id.clone()));
-    permitted_governance.sort();
-    permitted_governance.dedup();
-    validate::validate(&stages, &profiles, &permitted_governance)
+    for workflow in workflows {
+        let declared = stage::stages_from_workflow(workflow.meta());
+        validate::validate_declared_contracts(&declared)?;
+        validate::validate_unique_declarations(&declared, &workflow.meta().name)?;
+        judge(declared, governable_from([workflow]))?;
+    }
+    Ok(())
 }
 
 /// Pick the workflow a run should use.
@@ -2287,6 +2313,20 @@ mod agent_config_tests {
         std::fs::write(workflows.join("prompt.md"), "second prompt").unwrap();
         assert_ne!(with_loaded_prompt, graph_fingerprint(&root));
 
+        // The standard definitions are the graph every workflow imports, and they ship inside the
+        // binary — no file in the repo to walk. Two builds whose `nodes.ts` or whose `LOAD`ed
+        // prompts differ must not report the same provenance. (The transpiled source already has
+        // the prompts inlined, so hashing it covers both.)
+        assert_ne!(
+            graph_fingerprint_of(&root, "export const analyst = { instructions: 'first' };"),
+            graph_fingerprint_of(&root, "export const analyst = { instructions: 'second' };"),
+        );
+        assert_eq!(
+            graph_fingerprint(&root),
+            graph_fingerprint_of(&root, &workflow::standard_definitions().unwrap()),
+            "the fingerprint is the one taken over this build's definitions"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3028,6 +3068,120 @@ mod referee_governance_tests {
         assert_eq!(ours.tools, theirs.tools);
         assert_eq!(ours.output_schema, theirs.output_schema);
         assert_eq!(ours.question_renderer, theirs.question_renderer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write one workflow per source and discover them the way a checkout does.
+    async fn workflows_in(tag: &str, sources: &[(&str, &str)]) -> (PathBuf, Vec<WorkflowRuntime>) {
+        let dir = std::env::temp_dir().join(format!("ratatoskr-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, source) in sources {
+            std::fs::write(dir.join(format!("{name}.ts")), source).unwrap();
+        }
+        let found = defined_in(&dir, &dir.join("absent.ts")).await.unwrap();
+        (dir, found)
+    }
+
+    #[tokio::test]
+    async fn an_overridden_standard_stage_passes_startup_validation() {
+        // The headline case, through the registry validation `validate_configured_stages` runs
+        // before any node starts: the override keeps the id `analyst`, so pooling it alongside the
+        // standard definition would reject the repo at startup as a duplicate identifier.
+        let (dir, found) = workflows_in(
+            "override-validate",
+            &[(
+                "ours",
+                r#"import * as nodes from "ratatoskr/nodes";
+                   defineWorkflow({
+                     name: "ours",
+                     stages: [stage("analyst", { ...nodes.analyst, instructions: "ours" })],
+                   });
+                   export async function plan(input) { return input; }"#,
+            )],
+        )
+        .await;
+        let standard = workflow::standard_stages().await.unwrap();
+        validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
+            .expect("a workflow overriding `analyst` is a valid configuration");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn two_workflows_may_each_override_the_same_standard_stage() {
+        // A run executes one workflow, so two overrides of `analyst` never meet. Validating them
+        // against one pooled registry would make each repo's second workflow illegal.
+        let ours = |name: &str, instructions: &str| {
+            format!(
+                r#"import * as nodes from "ratatoskr/nodes";
+                   defineWorkflow({{
+                     name: "{name}",
+                     stages: [stage("analyst", {{ ...nodes.analyst, instructions: "{instructions}" }})],
+                   }});
+                   export async function plan(input) {{ return input; }}"#
+            )
+        };
+        let (dir, found) = workflows_in(
+            "override-twice",
+            &[
+                ("first", ours("first", "one").as_str()),
+                ("second", ours("second", "two").as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(found.len(), 2, "both workflows were discovered");
+        let standard = workflow::standard_stages().await.unwrap();
+        validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
+            .expect("two workflows may each override `analyst`");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_new_stage_id_validates_and_a_repeated_one_within_a_workflow_does_not() {
+        // Overlay semantics must not swallow the case it looks like: an id declared twice by the
+        // same workflow overrides nothing, it is a workflow that cannot say which one it meant.
+        let (dir, found) = workflows_in(
+            "new-stage-id",
+            &[(
+                "ours",
+                r#"defineWorkflow({
+                     name: "ours",
+                     stages: [stage("reviewer", { agent: "reason", instructions: "review" })],
+                   });
+                   export async function plan(input) { return input; }"#,
+            )],
+        )
+        .await;
+        let standard = workflow::standard_stages().await.unwrap();
+        validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
+            .expect("a genuinely new stage id is still added");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (dir, found) = workflows_in(
+            "repeated-stage-id",
+            &[(
+                "ours",
+                r#"defineWorkflow({
+                     name: "ours",
+                     stages: [
+                       stage("reviewer", { agent: "reason", instructions: "one" }),
+                       stage("reviewer", { agent: "reason", instructions: "two" }),
+                     ],
+                   });
+                   export async function plan(input) { return input; }"#,
+            )],
+        )
+        .await;
+        let standard = workflow::standard_stages().await.unwrap();
+        let error =
+            validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
+                .expect_err("a workflow may not declare one id twice");
+        assert!(
+            error
+                .to_string()
+                .contains("declares stage `reviewer` more than once"),
+            "unexpected error: {error}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
