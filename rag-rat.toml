@@ -38,6 +38,18 @@ backend = "infinity"
 model = "jinaai/jina-embeddings-v2-base-code" # server-side HF model id
 concurrency = 1                               # connect-safe
 
+[llm.dream]
+enabled = true
+
+# Ephemeral Modal GPU for the opt-in memory verification and compaction passes. A zero-work
+# guard skips provisioning when no memories are pending, and the box is torn down after each run.
+[llm.dream.remote]
+cookbook = "@rag-rat/cookbook modal"
+backend = "vllm"
+model = "Qwen/Qwen3-4B-Instruct-2507"
+gpu = "L4"
+request_timeout_s = 900
+
 # Embedding runtime tuning (defaults shown; uncomment to override).
 # [llm.embedding.runtime]
 # batch_size = 64
