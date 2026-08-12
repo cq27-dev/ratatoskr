@@ -1766,10 +1766,14 @@ impl StageExecutor {
         {
             offered.add_local(ratatoskr_agent::shell::declaration());
         }
-        if stage
-            .tools
-            .iter()
-            .any(|tool| tool == ratatoskr_agent::ASK_TOOL_NAME)
+        // Same rule again: without the clarifier grant, `ask` reaches a stub that errors on every
+        // call. JS-host invocations pass none, so a repository stage that declares `ask` would hold
+        // a tool it can only discover is broken.
+        if clarifier.is_some()
+            && stage
+                .tools
+                .iter()
+                .any(|tool| tool == ratatoskr_agent::ASK_TOOL_NAME)
         {
             offered.add_local(crate::clarify::ask_tool());
         }
@@ -2726,7 +2730,9 @@ async fn bookkeep_scripted(
                 rag_rat_worktree: None,
                 shell: None,
                 publish: None,
-                clarifier: None,
+                // The bundled bookkeeper declares `ask`, and this run's clarifier is right here —
+                // the same one whose exchanges this path already drains into the run state.
+                clarifier: Some(ctx.clarifier.as_dyn()),
                 guidance: None,
             },
         )
@@ -4219,9 +4225,15 @@ mod tests {
         stage.output_contract = "LeakOutput".to_string();
         stage.output_schema = Some(json!({ "type": "object" }));
         stage.capabilities = vec![ratatoskr_core::Capability::Write];
-        stage.tools = ["Read", "Write", "Edit", "Bash"]
-            .map(str::to_string)
-            .to_vec();
+        stage.tools = [
+            "Read",
+            "Write",
+            "Edit",
+            "Bash",
+            ratatoskr_agent::ASK_TOOL_NAME,
+        ]
+        .map(str::to_string)
+        .to_vec();
         stage.question_renderer = None;
         let stages = Arc::new(vec![stage.clone()]);
         let turn = Arc::new(RecordingStageTurn::default());
@@ -4231,10 +4243,15 @@ mod tests {
         // a `write` ceiling may mutate. The read-only grant is `verify_host`'s: a review turn is
         // handed the implementer's worktree to read, and a `capabilities: ["write"]` override of
         // the verifier must not turn that root into Edit/Write in the tree it judges.
-        for (resource_root, ceiling) in [
-            (None, ratatoskr_core::Capability::Write),
-            (Some(dir.clone()), ratatoskr_core::Capability::Read),
-            (Some(dir.clone()), ratatoskr_core::Capability::Write),
+        let clarifier: Arc<dyn ratatoskr_agent::Clarifier> = Arc::new(StaticClarifier);
+        for (resource_root, ceiling, clarifier) in [
+            (None, ratatoskr_core::Capability::Write, None),
+            (Some(dir.clone()), ratatoskr_core::Capability::Read, None),
+            (
+                Some(dir.clone()),
+                ratatoskr_core::Capability::Write,
+                Some(Arc::clone(&clarifier)),
+            ),
         ] {
             executor
                 .execute(StageInvocation {
@@ -4246,7 +4263,7 @@ mod tests {
                     rag_rat_worktree: None,
                     shell: None,
                     publish: None,
-                    clarifier: None,
+                    clarifier,
                     invocation_guidance: None,
                     output: StageOutput::Evidence,
                 })
@@ -4269,10 +4286,25 @@ mod tests {
                 "{tool} must still be offered against a supplied root and a `write` grant"
             );
         }
-        // The same rule for the shell, which neither invocation was granted.
+        // The same rule for the shell, which no invocation was granted.
         assert!(
             !offered.iter().any(|run| run.iter().any(|t| t == "Bash")),
             "Bash was offered without a shell grant"
+        );
+        // And for `ask`: without a clarifier the call reaches a stub that errors every time, so the
+        // only thing an offer buys is turns spent discovering that.
+        for run in &offered[..2] {
+            assert!(
+                !run.iter()
+                    .any(|tool| tool == ratatoskr_agent::ASK_TOOL_NAME),
+                "`ask` was offered without a clarifier to answer it"
+            );
+        }
+        assert!(
+            offered[2]
+                .iter()
+                .any(|tool| tool == ratatoskr_agent::ASK_TOOL_NAME),
+            "`ask` must still be offered where Rust wired a clarifier"
         );
         // Reading is not gated on the root, and never was.
         assert!(offered[0].iter().any(|tool| tool == "Read"));
@@ -7763,7 +7795,9 @@ mod tests {
                     rag_rat_worktree: None,
                     shell: None,
                     publish: None,
-                    clarifier: None,
+                    // As the implementer adapter wires it — `ask` is offered on this grant, not on
+                    // the declaration.
+                    clarifier: Some(Arc::new(StaticClarifier)),
                     guidance: None,
                 },
                 Arc::clone(&turn) as Arc<dyn StageTurn>,
