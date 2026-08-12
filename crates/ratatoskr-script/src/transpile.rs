@@ -7,14 +7,15 @@ use std::path::{Component, Path, PathBuf};
 use swc_core::common::sync::Lrc;
 use swc_core::common::{FileName, GLOBALS, Mark, SourceMap, Span, Spanned};
 use swc_core::ecma::ast::{
-    Callee, Decl, Expr, Lit, ModuleDecl, ModuleItem, Program, Stmt, Str, VarDeclKind,
+    ArrowExpr, Callee, Class, Decl, Expr, Function, Lit, ModuleDecl, ModuleItem, ObjectPatProp,
+    Pat, Program, Stmt, Str, VarDecl, VarDeclKind,
 };
 use swc_core::ecma::codegen::text_writer::JsWriter;
 use swc_core::ecma::codegen::{Config as CodegenConfig, Emitter};
 use swc_core::ecma::parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 use swc_core::ecma::transforms::base::resolver;
 use swc_core::ecma::transforms::typescript::strip;
-use swc_core::ecma::visit::{VisitMut, VisitMutWith};
+use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use crate::ScriptError;
 
@@ -167,7 +168,7 @@ fn transpile_with_loads(
             error: None,
         };
         parsed.program.visit_mut_with(&mut rewriter);
-        entries = top_level_function_names(&parsed.program);
+        entries = published_global_names(&parsed.program);
         match rewriter.error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -182,10 +183,38 @@ fn transpile_with_loads(
     Ok(javascript)
 }
 
-/// Names of the functions a source declares at its top level. Ambient `declare function` is skipped
-/// — it emits nothing to assign.
-fn top_level_function_names(program: &Program) -> Vec<String> {
-    let declarations: Vec<&Decl> = match program {
+/// The names a source would have put on `globalThis` when a workflow was evaluated as a script.
+///
+/// Two kinds reached the global object and must keep reaching it, or module scoping silently narrows
+/// what a workflow may be written as — and an entry the runtime cannot find is a confusing way to
+/// learn that:
+///
+/// * a top-level function declaration (ambient `declare function` emits nothing to assign, so it is
+///   skipped);
+/// * every binding a `var` introduces, wherever it sits. `var` hoists out of blocks, branches and
+///   loops to its enclosing function, which at a script's top level is the global object, and it
+///   binds through destructuring — `var { plan } = ..` published `plan`.
+///
+/// Not `let` or `const`: those are lexical even at a script's top level and never became properties
+/// of the global object, so publishing them would invent reach a workflow never had.
+fn published_global_names(program: &Program) -> Vec<String> {
+    let mut names = Vec::new();
+    for declaration in top_level_declarations(program) {
+        if let Decl::Fn(function) = declaration
+            && !function.declare
+        {
+            names.push(function.ident.sym.to_string());
+        }
+    }
+    let mut hoisted = HoistedVars { names: Vec::new() };
+    program.visit_with(&mut hoisted);
+    names.extend(hoisted.names);
+    names.dedup();
+    names
+}
+
+fn top_level_declarations(program: &Program) -> Vec<&Decl> {
+    match program {
         Program::Module(module) => module
             .body
             .iter()
@@ -203,27 +232,52 @@ fn top_level_function_names(program: &Program) -> Vec<String> {
                 _ => None,
             })
             .collect(),
-    };
-    declarations.into_iter().flat_map(published_names).collect()
+    }
 }
 
-/// The names a top-level declaration would have put on `globalThis` under script evaluation.
-///
-/// A function declaration, and a `var` bound to a plain identifier. Not `let` or `const`: those are
-/// lexical even at a script's top level and never became properties of the global object, so a
-/// workflow could not reach them through `globalThis` before this engine evaluated modules either.
-/// Keeping the same set is the point — module scoping would otherwise silently narrow what a
-/// workflow may be written as, and an entry the runtime cannot find is a confusing way to learn it.
-fn published_names(declaration: &Decl) -> Vec<String> {
-    match declaration {
-        Decl::Fn(function) if !function.declare => vec![function.ident.sym.to_string()],
-        Decl::Var(variable) if !variable.declare && variable.kind == VarDeclKind::Var => variable
-            .decls
+/// Collects the bindings of every `var` in the global statement scope.
+struct HoistedVars {
+    names: Vec<String>,
+}
+
+impl Visit for HoistedVars {
+    fn visit_var_decl(&mut self, declaration: &VarDecl) {
+        if declaration.kind == VarDeclKind::Var && !declaration.declare {
+            for declarator in &declaration.decls {
+                binding_names(&declarator.name, &mut self.names);
+            }
+        }
+        declaration.visit_children_with(self);
+    }
+
+    // A `var` inside a function or a class body belongs to that scope, not to the global object, so
+    // the walk stops at those boundaries rather than hoisting their locals into the global set.
+    fn visit_function(&mut self, _: &Function) {}
+    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+    fn visit_class(&mut self, _: &Class) {}
+}
+
+/// Every identifier a binding pattern introduces, including through destructuring.
+fn binding_names(pattern: &Pat, out: &mut Vec<String>) {
+    match pattern {
+        Pat::Ident(identifier) => out.push(identifier.id.sym.to_string()),
+        Pat::Array(array) => array
+            .elems
             .iter()
-            .filter_map(|declarator| declarator.name.as_ident())
-            .map(|identifier| identifier.id.sym.to_string())
-            .collect(),
-        _ => Vec::new(),
+            .flatten()
+            .for_each(|element| binding_names(element, out)),
+        Pat::Object(object) => {
+            for property in &object.props {
+                match property {
+                    ObjectPatProp::KeyValue(entry) => binding_names(&entry.value, out),
+                    ObjectPatProp::Assign(entry) => out.push(entry.key.id.sym.to_string()),
+                    ObjectPatProp::Rest(rest) => binding_names(&rest.arg, out),
+                }
+            }
+        }
+        Pat::Assign(assign) => binding_names(&assign.left, out),
+        Pat::Rest(rest) => binding_names(&rest.arg, out),
+        Pat::Expr(_) | Pat::Invalid(_) => {}
     }
 }
 
@@ -422,6 +476,33 @@ mod tests {
         assert!(js.contains("globalThis.plan = plan;"), "got: {js}");
         assert!(!js.contains("globalThis.helper"), "got: {js}");
         assert!(!js.contains("globalThis.other"), "got: {js}");
+    }
+
+    #[test]
+    fn a_var_publishes_wherever_it_sits_and_however_it_binds() {
+        // `var` hoists out of blocks to the enclosing function — at a script's top level, the global
+        // object — and binds through destructuring. Both reached `globalThis` before this engine
+        // evaluated modules, so an entry written either way has to keep resolving.
+        let js = transpile_with_includes(
+            "w",
+            "if (ready) { var branched = async (i) => i; }\n\
+             for (var counted = 0; counted < 1; counted++) {}\n\
+             var { plan, missing = 1 } = parts;\n\
+             var [first, ...rest] = list;\n\
+             function outer() { var inside = 1; return inside; }\n\
+             const shape = { method() { var buried = 2; return buried; } };",
+            &[],
+        )
+        .unwrap();
+        for published in ["branched", "counted", "plan", "missing", "first", "rest"] {
+            assert!(
+                js.contains(&format!("globalThis.{published} = {published};")),
+                "`{published}` should be published, got: {js}"
+            );
+        }
+        // A `var` inside a function or a method belongs to that scope, not the global object.
+        assert!(!js.contains("globalThis.inside"), "got: {js}");
+        assert!(!js.contains("globalThis.buried"), "got: {js}");
     }
 
     #[test]
