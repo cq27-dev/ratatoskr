@@ -303,7 +303,9 @@ pub struct WorkflowDelegation {
 
 /// A loaded workflow script: the resident JS context plus the transpiled source.
 pub struct WorkflowRuntime {
-    _runtime: AsyncRuntime,
+    /// Kept alive with the context, and read when an error must be told apart from the engine's
+    /// own memory limit — the allocator's count is the one signal a workflow cannot forge.
+    runtime: AsyncRuntime,
     context: AsyncContext,
     /// Kept alive with the runtime whose interrupt handler reads it.
     budget: Arc<Budget>,
@@ -345,13 +347,13 @@ impl WorkflowRuntime {
     ) -> Result<Self, ScriptError> {
         let source = transpile::transpile_with_includes(name, src, includes, &specifiers(modules))?;
         let (runtime, context, budget) = engine(modules).await?;
-        let meta = Self::declared(&context, &budget, name, &source)
+        let meta = Self::declared(&runtime, &context, &budget, name, &source)
             .await?
             .ok_or_else(|| {
                 ScriptError::Eval(format!("bundled workflow `{name}` has no declaration"))
             })?;
         Ok(Self {
-            _runtime: runtime,
+            runtime,
             context,
             budget,
             rendering: Arc::default(),
@@ -383,7 +385,14 @@ impl WorkflowRuntime {
         // Evaluated once here to read what the script declares about itself. `run` evaluates it
         // again in the same context, which re-runs `defineWorkflow` — an idempotent assignment, and
         // the price of keeping the two paths independent.
-        let declared = Self::declared(&context, &budget, &module_name, &loaded.javascript).await?;
+        let declared = Self::declared(
+            &runtime,
+            &context,
+            &budget,
+            &module_name,
+            &loaded.javascript,
+        )
+        .await?;
         let meta = declared.unwrap_or_else(|| WorkflowMeta {
             // A workflow that declares nothing is still usable and is named after its file, so
             // `defineWorkflow` stays optional for a workflow that only exports entries.
@@ -398,7 +407,7 @@ impl WorkflowRuntime {
         });
 
         Ok(Some(WorkflowRuntime {
-            _runtime: runtime,
+            runtime,
             context,
             budget,
             rendering: Arc::default(),
@@ -429,6 +438,7 @@ impl WorkflowRuntime {
 
     /// Read the script's `defineWorkflow` call, if it makes one.
     async fn declared(
+        runtime: &AsyncRuntime,
         context: &AsyncContext,
         budget: &Budget,
         module_name: &str,
@@ -439,6 +449,7 @@ impl WorkflowRuntime {
         let source = source.to_string();
         let meta: Option<WorkflowMeta> = within(
             module_name,
+            runtime,
             budget,
             LOAD_BUDGET,
             LOAD_BUDGET,
@@ -555,6 +566,7 @@ impl WorkflowRuntime {
 
         within(
             &self.module_name,
+            &self.runtime,
             &self.budget,
             self.run_span,
             self.run_total,
@@ -943,6 +955,7 @@ async fn idle_spent(budget: &Budget) {
 /// load must say which workflow, or the operator is left bisecting their workflows directory.
 async fn within<T>(
     workflow: &str,
+    runtime: &AsyncRuntime,
     budget: &Budget,
     span: Duration,
     total: Duration,
@@ -990,16 +1003,32 @@ async fn within<T>(
         () = idle_spent(budget) => Err(overran()),
     };
     budget.disarm_idle();
-    outcome.map_err(|error| {
-        if error.to_string().contains("out of memory") {
-            ScriptError::Eval(format!(
-                "workflow `{workflow}` exceeded its {} MiB memory limit",
-                MEMORY_LIMIT / (1024 * 1024)
-            ))
-        } else {
-            error
-        }
-    })
+    match outcome {
+        Ok(value) => Ok(value),
+        // The engine reports its own allocation failure by throwing `out of memory`, which a
+        // workflow can throw verbatim itself — and `InternalError`, the class the engine uses, is a
+        // constructible global too. What a script cannot forge is the allocator's own count, so the
+        // limit is only named when the heap is still against it: a genuine failure leaves the heap
+        // within a percent of the ceiling, a forged one leaves it near empty.
+        Err(error) => Err(
+            if error.to_string().contains("out of memory") && at_memory_limit(runtime).await {
+                ScriptError::Eval(format!(
+                    "workflow `{workflow}` exceeded its {} MiB memory limit",
+                    MEMORY_LIMIT / (1024 * 1024)
+                ))
+            } else {
+                error
+            },
+        ),
+    }
+}
+
+/// Whether the engine's heap is at its ceiling right now.
+async fn at_memory_limit(runtime: &AsyncRuntime) -> bool {
+    let used = runtime.memory_usage().await.malloc_size.max(0) as usize;
+    // A tenth of slack: the throw unwinds through some frees, and the question is "at the ceiling",
+    // not "at the exact byte".
+    used >= MEMORY_LIMIT - MEMORY_LIMIT / 10
 }
 
 /// A JS runtime whose only importable modules are the ones the host supplied, plus a context on it.
@@ -1776,6 +1805,27 @@ export async function plan(i) { return { entryRan: true }; }
         };
         assert!(error.contains("hog.ts"), "{error}");
         assert!(error.contains("memory limit"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_workflow_throwing_about_memory_keeps_its_own_message() {
+        // `out of memory` is what the engine's own limit throws, and it is also a string a
+        // workflow can throw itself. Only the allocator's count says which happened, so a forged
+        // one must arrive as what it is.
+        let dir = scratch("forged-oom");
+        let path = dir.join("forge.ts");
+        std::fs::write(
+            &path,
+            "throw new Error('out of memory: disk quota exceeded');",
+        )
+        .unwrap();
+        let error = match WorkflowRuntime::load(&path, &[]).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a throwing module body must fail the load"),
+        };
+        assert!(error.contains("disk quota exceeded"), "{error}");
+        assert!(!error.contains("memory limit"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
