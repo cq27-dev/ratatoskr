@@ -15,6 +15,7 @@ pub mod implementer;
 pub mod issue;
 pub mod memory;
 pub mod plugins;
+mod policy;
 pub mod publisher;
 pub mod redteam;
 pub mod referee;
@@ -456,9 +457,6 @@ impl Workflow {
 /// The single-script path, still honoured so a repo that has one keeps working untouched.
 const LEGACY_WORKFLOW: &str = ".ratatoskr/workflow.ts";
 
-/// Checkpointed internal gates that never become configurable workflow stages.
-const INTERNAL_GATES: &[&str] = &["referee"];
-
 /// Every node any workflow in this repo may govern: the built-in set plus what each declares.
 ///
 /// The union across all of them, not just the one a run selects, because rulesets are loaded
@@ -471,7 +469,7 @@ fn governable_from<'a>(workflows: impl IntoIterator<Item = &'a WorkflowRuntime>)
         names.extend(workflow.meta().nodes.iter().cloned());
         names.extend(workflow.meta().stages.iter().map(|stage| stage.id.clone()));
     }
-    names.retain(|name| !INTERNAL_GATES.contains(&name.as_str()));
+    names.retain(|name| policy::reserved(name) != Some(policy::Reserved::InternalGate));
     names.sort();
     names.dedup();
     names
@@ -542,20 +540,11 @@ fn validate_configured_stage_registry(
     standard_stages: Vec<Stage>,
 ) -> Result<(), PlanError> {
     let profiles = agent_profiles(config);
-    let mut base = built_in_stages();
-    base.retain(|stage| {
-        !matches!(
-            stage.id.as_str(),
-            "overseer"
-                | "scout"
-                | "analyst"
-                | "verifier"
-                | "characterizer"
-                | "bookkeeper"
-                | "publisher"
-        )
-    });
-    base.extend(standard_stages);
+    // The registry the run will execute, and nothing else. `overlaid_stages` builds its base from
+    // exactly this expression, so what validates here is what runs. A base carrying extra built-in
+    // stages validated ghosts — `governedBy: "red_team"` passed startup against a stage the run
+    // never registers, and was then refused by `governable_nodes()` when a ruleset appeared.
+    let base = standard_stages;
 
     // Each workflow is judged against its *own* registry — the base with its declarations laid over
     // it — not against one pool of everything configured. Pooling rejects the documented case of a
@@ -623,8 +612,12 @@ pub fn select(found: Vec<Workflow>, wanted: Option<&str>) -> Result<Workflow, Pl
 }
 
 /// The overseer is opt-in on having somewhere to run, like the verifier and the characterizer.
-fn overseer_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> bool {
-    node_route(engine, config, "overseer").is_some()
+fn overseer_enabled(
+    engine: &Arc<ScriptEngine>,
+    config: &RatatoskrConfig,
+    stages: &[Stage],
+) -> bool {
+    node_route(engine, config, stages, "overseer").is_some()
 }
 
 fn should_consult_overseer(
@@ -682,11 +675,17 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
         .iter()
         .filter(|workflow| !matches!(workflow, Workflow::BuiltIn))
         .count();
-    if !should_consult_overseer(
-        defined_workflows,
-        request.workflow.is_some(),
-        overseer_enabled(request.engine, request.config),
-    ) {
+    // The choice comes first and the configuration second, so a run with nothing to choose between
+    // does not evaluate the bundled registry to find that out.
+    let consult = should_consult_overseer(defined_workflows, request.workflow.is_some(), true)
+        // Selection runs before a workflow exists, so the bundled registry is the only one there
+        // is — and `overseer` is reserved against declaration, so no override could change it.
+        && overseer_enabled(
+            request.engine,
+            request.config,
+            &workflow::standard_stages().await?,
+        );
+    if !consult {
         return select(found, request.workflow);
     }
 
@@ -773,8 +772,12 @@ fn route(config: &RatatoskrConfig, name: &str) -> Result<ratatoskr_core::ModelRo
 
 /// The red-team classifier is opt-in: it runs only when redteam has a model route to run on,
 /// whether that comes from `[models.redteam]` or from its ruleset.
-fn classifier_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> bool {
-    node_route(engine, config, "redteam").is_some()
+fn classifier_enabled(
+    engine: &Arc<ScriptEngine>,
+    config: &RatatoskrConfig,
+    stages: &[Stage],
+) -> bool {
+    node_route(engine, config, stages, "redteam").is_some()
 }
 
 /// The resolved agent settings for one stage: profile defaults plus stage ruleset overrides.
@@ -1399,12 +1402,13 @@ pub async fn run_bookkeeper(
 pub(crate) fn build_characterizer(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
+    stages: &[Stage],
     context: &PluginContext,
     configured: Vec<ServerTools>,
     ledger: Option<Arc<RunLedger>>,
     declared_context: Option<Arc<workflow::WorkflowContext>>,
 ) -> Result<Option<testrun::Characterizer>, PlanError> {
-    if node_route(engine, config, "characterizer").is_none() {
+    if node_route(engine, config, stages, "characterizer").is_none() {
         return Ok(None);
     }
     // No skills either, and this is the seam that enforces it: `node_agent_config` grants the
@@ -1498,9 +1502,13 @@ fn implementer_default_tools() -> Vec<&'static str> {
 }
 
 /// Resolve a node's model from its ruleset first, then its TOML route.
+///
+/// `stages` is the registry the run executes, so an override's profile — not the imported stage's —
+/// decides where the node runs and therefore whether it runs at all.
 fn node_route(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
+    stages: &[Stage],
     node: &str,
 ) -> Option<ratatoskr_core::ModelRoute> {
     engine
@@ -1515,7 +1523,7 @@ fn node_route(
             params: None,
             session: Default::default(),
         })
-        .or_else(|| stage::stage_profile(config, node).and_then(|profile| profile.model))
+        .or_else(|| stage::profile_for(config, stages, node).and_then(|profile| profile.model))
         .or_else(|| config.models.get(node).cloned())
 }
 
@@ -1524,17 +1532,22 @@ fn node_route(
 pub fn referee_route(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
+    stages: &[Stage],
 ) -> Option<ratatoskr_core::ModelRoute> {
     config
         .models
         .get("referee")
         .cloned()
-        .or_else(|| node_route(engine, config, "verifier"))
+        .or_else(|| node_route(engine, config, stages, "verifier"))
 }
 
 /// The verifier is opt-in on having somewhere to run, the same way the red-team classifier is.
-fn verifier_enabled(engine: &Arc<ScriptEngine>, config: &RatatoskrConfig) -> bool {
-    node_route(engine, config, "verifier").is_some()
+fn verifier_enabled(
+    engine: &Arc<ScriptEngine>,
+    config: &RatatoskrConfig,
+    stages: &[Stage],
+) -> bool {
+    node_route(engine, config, stages, "verifier").is_some()
 }
 
 /// Read `[implementer] verify_threshold`. An unrecognised value is a typo, and a typo must not
@@ -2249,8 +2262,9 @@ mod agent_config_tests {
     #[tokio::test]
     async fn redteam_classifier_opts_in_on_either_route_source() {
         let engine = engine("redteam-optin").await;
+        let stages = workflow::standard_stages().await.unwrap();
         let mut config = RatatoskrConfig::default();
-        assert!(!classifier_enabled(&engine, &config));
+        assert!(!classifier_enabled(&engine, &config, &stages));
         config.models.insert(
             "redteam".to_string(),
             ratatoskr_core::ModelRoute {
@@ -2263,7 +2277,7 @@ mod agent_config_tests {
                 session: Default::default(),
             },
         );
-        assert!(classifier_enabled(&engine, &config));
+        assert!(classifier_enabled(&engine, &config, &stages));
     }
 
     #[test]
@@ -2736,7 +2750,8 @@ mod agent_config_tests {
         // has said it wants that kind of check.
         let verifier = toml_route("anthropic", "claude-sonnet-4-6");
         config.models.insert("verifier".to_string(), verifier);
-        let route = referee_route(&engine, &config).expect("the verifier route is the fallback");
+        let route = referee_route(&engine, &config, &built_in_stages())
+            .expect("the verifier route is the fallback");
         assert_eq!(route.provider, "anthropic");
         assert_eq!(route.model, "claude-sonnet-4-6");
 
@@ -2747,7 +2762,8 @@ mod agent_config_tests {
         )
         .await;
         let config = RatatoskrConfig::default();
-        let route = referee_route(&ruleset, &config).expect("ruleset verifier is the fallback");
+        let route = referee_route(&ruleset, &config, &built_in_stages())
+            .expect("ruleset verifier is the fallback");
         assert_eq!(route.provider, "openai");
         assert_eq!(route.model, "gpt-5");
     }
@@ -2760,7 +2776,8 @@ mod agent_config_tests {
         config.models.insert("verifier".to_string(), verifier);
         let own = toml_route("openai", "gpt-5");
         config.models.insert("referee".to_string(), own);
-        let route = referee_route(&engine, &config).expect("a referee route is configured");
+        let route = referee_route(&engine, &config, &built_in_stages())
+            .expect("a referee route is configured");
         assert_eq!(
             route.model, "gpt-5",
             "[models.referee] beats [models.verifier]"
@@ -2772,7 +2789,8 @@ mod agent_config_tests {
             r#"defineAgent("referee", { model: { provider: "moonshot", model: "kimi-k2.5" } });"#,
         )
         .await;
-        let route = referee_route(&ruleset, &config).expect("TOML referee route still wins");
+        let route = referee_route(&ruleset, &config, &built_in_stages())
+            .expect("TOML referee route still wins");
         assert_eq!(route.provider, "openai");
         assert_eq!(route.model, "gpt-5");
     }
@@ -2784,7 +2802,7 @@ mod agent_config_tests {
         // rulesets bind neither either.
         let config = RatatoskrConfig::default();
         assert!(
-            referee_route(&engine, &config).is_none(),
+            referee_route(&engine, &config, &built_in_stages()).is_none(),
             "with no route there is no judgement: converge trusts the test result alone, and says so"
         );
     }
@@ -3265,7 +3283,7 @@ mod referee_governance_tests {
         .await;
         let config = RatatoskrConfig::default();
         assert!(
-            referee_route(&engine, &config).is_none(),
+            referee_route(&engine, &config, &built_in_stages()).is_none(),
             "a referee ruleset is never consulted for a route"
         );
     }
@@ -3292,7 +3310,8 @@ mod referee_governance_tests {
             route("anthropic", "claude-haiku-4-5-20251001"),
         );
 
-        let resolved = referee_route(&engine, &config).expect("[models.referee] is configured");
+        let resolved = referee_route(&engine, &config, &built_in_stages())
+            .expect("[models.referee] is configured");
         assert_eq!(resolved.provider, "anthropic");
         assert_eq!(resolved.model, "claude-haiku-4-5-20251001");
         assert_ne!(
@@ -3319,7 +3338,8 @@ mod referee_governance_tests {
             "verifier".to_string(),
             route("anthropic", "claude-sonnet-4-6"),
         );
-        let resolved = referee_route(&engine, &config).expect("the verifier route is the fallback");
+        let resolved = referee_route(&engine, &config, &built_in_stages())
+            .expect("the verifier route is the fallback");
         assert_eq!(resolved.provider, "anthropic");
         assert_eq!(resolved.model, "claude-sonnet-4-6");
     }

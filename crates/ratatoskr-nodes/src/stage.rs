@@ -190,9 +190,29 @@ pub fn stage_profile(
     } else {
         stage_id
     };
-    let stage = built_in_stages()
-        .into_iter()
-        .find(|stage| stage.id == stage_id)?;
+    profile_for(config, &built_in_stages(), stage_id)
+}
+
+/// Resolve the profile of the stage that runs under `node` in `stages`.
+///
+/// The registry is a parameter because a route or an enablement decision is about the stage that
+/// will actually run, and a workflow may have overridden it. Resolving against a fixed table
+/// instead is how `stage("verifier", { ...nodes.verifier, agent: "reason" })` came to report the
+/// *built-in* verifier's agent, find no model for it, and disable review with no mention of it.
+///
+/// By stage id first — the standard stages are named after their identities — then by `governedBy`,
+/// which is how the Rust-owned operations name the stage that runs for them: `implementer` resolves
+/// to `implementer_attempt`, `redteam` to `redteam_classifier`, `context` to
+/// `context_distillation`.
+pub fn profile_for(
+    config: &ratatoskr_core::RatatoskrConfig,
+    stages: &[Stage],
+    node: &str,
+) -> Option<AgentProfile> {
+    let stage = stages
+        .iter()
+        .find(|stage| stage.id == node)
+        .or_else(|| stages.iter().find(|stage| stage.governance_id() == node))?;
     agent_profiles(config)
         .into_iter()
         .find(|profile| profile.id == stage.agent)

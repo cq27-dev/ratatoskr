@@ -536,12 +536,13 @@ where
 /// `acceptance` is passed in rather than read here because the baseline and the post-change run
 /// must execute the same steps — a red team that resolved its own would drift from the implementer
 /// the moment a plan proposed anything.
-fn build_red_team(
+async fn build_red_team(
     ctx: &Arc<WorkflowContext>,
     acceptance: Vec<ratatoskr_core::AcceptanceStep>,
 ) -> Result<RedTeamNode, PlanError> {
     let short: String = ctx.run_id.chars().take(8).collect();
-    let enabled = crate::classifier_enabled(&ctx.engine, &ctx.config);
+    let stages = ctx.stages().await?;
+    let enabled = crate::classifier_enabled(&ctx.engine, &ctx.config, &stages);
     let classifier = match enabled {
         true => {
             let mut plugins = ctx.plugin_context.for_node("redteam");
@@ -600,6 +601,7 @@ fn build_red_team(
         characterizer: crate::build_characterizer(
             &ctx.engine,
             &ctx.config,
+            &stages,
             &ctx.plugin_context,
             ctx.servers.clone(),
             Some(Arc::clone(&ctx.ledger)),
@@ -666,10 +668,14 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
         .map_err(|error| error.to_string())?;
     ctx.resolved_container_image().await?;
     let acceptance = ctx.acceptance(&analyst.acceptance);
-    let implementer = build_implementer(&ctx, analyst.clone()).map_err(|e| e.to_string())?;
+    let implementer = build_implementer(&ctx, analyst.clone())
+        .await
+        .map_err(|e| e.to_string())?;
     let worktree = implementer.prepare().await.map_err(|e| e.to_string())?;
     *ctx.worktree.lock().unwrap() = Some(worktree.clone());
-    let node = build_red_team(&ctx, acceptance).map_err(|e| e.to_string())?;
+    let node = build_red_team(&ctx, acceptance)
+        .await
+        .map_err(|e| e.to_string())?;
     let out = node
         .run_and_author(worktree.as_path(), &ctx.issue, &analyst.interface)
         .await
@@ -687,10 +693,11 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
-fn build_implementer(
+async fn build_implementer(
     ctx: &Arc<WorkflowContext>,
     analyst: AnalystOutput,
 ) -> Result<ImplementerNode, PlanError> {
+    let stages = ctx.stages().await?;
     let (cfg, plugins) = crate::build_implementer_agent_with_servers(
         &ctx.engine,
         &ctx.config,
@@ -703,6 +710,7 @@ fn build_implementer(
         characterizer: crate::build_characterizer(
             &ctx.engine,
             &ctx.config,
+            &stages,
             &ctx.plugin_context,
             ctx.servers.clone(),
             Some(Arc::clone(&ctx.ledger)),
@@ -748,7 +756,9 @@ async fn implement_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String
     let input: ImplementArg =
         serde_json::from_str(&arg).map_err(|e| format!("implement arg: {e}"))?;
     ctx.resolved_container_image().await?;
-    let node = build_implementer(&ctx, input.analyst).map_err(|e| e.to_string())?;
+    let node = build_implementer(&ctx, input.analyst)
+        .await
+        .map_err(|e| e.to_string())?;
     let prepared = { ctx.worktree.lock().unwrap().clone() };
     let worktree = match prepared {
         Some(worktree) => worktree,
@@ -776,15 +786,23 @@ async fn referee_judgement(
     analyst: &AnalystOutput,
     implementer: &ImplementerOutput,
 ) -> Vec<referee::Violation> {
-    let violations = match referee::judge(
-        &ctx.engine,
-        &ctx.config,
-        &ctx.ledger,
-        &ctx.issue,
-        &analyst.requirements,
+    let stages = match ctx.stages().await {
+        Ok(stages) => stages,
+        Err(error) => {
+            tracing::warn!("the referee could not resolve this run's stages: {error}");
+            return Vec::new();
+        }
+    };
+    let violations = match referee::judge(referee::Judgement {
+        engine: &ctx.engine,
+        config: &ctx.config,
+        stages: &stages,
+        ledger: &ctx.ledger,
+        issue: &ctx.issue,
+        requirements: &analyst.requirements,
         implementer,
         worktree,
-    )
+    })
     .await
     {
         Ok(Some(violations)) => violations,
@@ -1006,7 +1024,9 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
     };
 
     ctx.resolved_container_image().await?;
-    let node = build_implementer(&ctx, analyst).map_err(|e| e.to_string())?;
+    let node = build_implementer(&ctx, analyst)
+        .await
+        .map_err(|e| e.to_string())?;
     let out = node
         .iterate(&worktree, &diagnostic)
         .await
@@ -1098,7 +1118,7 @@ async fn verify_host(
         })
         .map_err(|e| e.to_string())
     };
-    if !crate::verifier_enabled(&ctx.engine, &ctx.config) {
+    if !crate::verifier_enabled(&ctx.engine, &ctx.config, executor.stages.as_slice()) {
         return none(false, false);
     }
     let worktree = ctx
@@ -1265,6 +1285,7 @@ impl CeilingRecovery for LiveCeilingRecovery {
     ) -> Result<ImplementerOutput, String> {
         ctx.resolved_container_image().await?;
         build_implementer(ctx, revised.clone())
+            .await
             .map_err(|error| error.to_string())?
             .iterate(worktree, diagnostic)
             .await
@@ -1984,32 +2005,19 @@ fn build_operation_hosts(
         .collect()
 }
 
-// These model turns need write authority only inside Rust-owned lifecycle adapters that provide
-// the prepared worktree and, for implementation, the sandbox and clarification rendezvous. The
-// declarations stay in `StageExecutor` for those adapters, but must never become repository-JS
-// globals: a generic host has no worktree lifecycle from which to derive a safe resource root.
-const INTERNAL_WRITE_STAGE_IDS: &[&str] = &["redteam_author", "implementer_attempt"];
+pub(crate) use crate::policy::SELECTION_STAGE_ID;
 
-// Delivery is terminal external I/O, not a workflow operation: these stages run only from their
-// Rust terminal adapters, after Rust has accepted the run outcome. Filtered here, at the one place
-// where a stage becomes a repository-JS global, rather than out of the registry — the adapters still
-// have to resolve them, and a filter applied before an overlay is a filter an override walks past.
-pub(crate) const TERMINAL_STAGE_IDS: &[&str] = &["bookkeeper", "publisher"];
-
-// Selection runs before a workflow has been chosen, in its own pre-selection context: this turn
-// picks *between* workflows, so no workflow can be the one that configures it. The load-time gate
-// refuses the declaration for that reason — `choose` would otherwise run the bundled stage and the
-// declaration would sit in the registry, valid and never reached.
-pub(crate) const SELECTION_STAGE_ID: &str = "overseer";
-
+/// The stages a workflow can call, as globals under their own ids.
+///
+/// [`crate::policy::is_js_host`] decides, so the filter is the classification rather than a list
+/// beside it. Filtered here, at the one place where a stage becomes a repository-JS global, rather
+/// than out of the registry — the Rust adapters still have to resolve these stages, and a filter
+/// applied before an overlay is a filter an override walks past.
 fn build_declared_stage_hosts(executor: &Arc<StageExecutor>) -> HashMap<String, HostFn> {
     executor
         .stages
         .iter()
-        .filter(|stage| {
-            !INTERNAL_WRITE_STAGE_IDS.contains(&stage.id.as_str())
-                && !TERMINAL_STAGE_IDS.contains(&stage.id.as_str())
-        })
+        .filter(|stage| crate::policy::is_js_host(&stage.id))
         .map(|stage| (stage.id.clone(), executor.host(stage.clone())))
         .collect()
 }
@@ -4055,7 +4063,7 @@ mod tests {
             crate::PluginContext::default(),
         )
         .unwrap();
-        let implementer = build_implementer(&ctx, analyst).unwrap();
+        let implementer = build_implementer(&ctx, analyst).await.unwrap();
         let clarifier = implementer
             .clarifier
             .expect("the native implementer receives the run clarifier");
@@ -4599,10 +4607,10 @@ mod tests {
         )
         .unwrap();
         let stages = install_execution_stages(&ctx, &runtime).await.unwrap();
-        for stage_id in INTERNAL_WRITE_STAGE_IDS {
+        for stage_id in ["redteam_author", "implementer_attempt"] {
             let stage = stages
                 .iter()
-                .find(|stage| stage.id == *stage_id)
+                .find(|stage| stage.id == stage_id)
                 .expect("internal stage remains available to Rust adapters");
             assert_eq!(stage.capabilities, [ratatoskr_core::Capability::Write]);
         }
@@ -4611,8 +4619,8 @@ mod tests {
             build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
         assert!(hosts.contains_key("redTeam"));
         assert!(hosts.contains_key("implement"));
-        for stage_id in INTERNAL_WRITE_STAGE_IDS {
-            assert!(!hosts.contains_key(*stage_id));
+        for stage_id in ["redteam_author", "implementer_attempt"] {
+            assert!(!hosts.contains_key(stage_id));
             let error = runtime
                 .run_with_question_renderers(
                     "plan",
@@ -5209,6 +5217,120 @@ mod tests {
                 .find(|stage| stage.id == "scout")
                 .is_some_and(|stage| stage.question_renderer.is_none())
         );
+    }
+
+    #[tokio::test]
+    async fn an_overridden_verifier_agent_is_what_decides_whether_review_runs() {
+        // Enablement asked a fixed table which agent the verifier used, so moving it to a
+        // configured profile made `verifier_enabled` resolve through the *imported* stage, find no
+        // model, and report `{configured:false}` — a run that converged with no review at all and
+        // said nothing about it.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-verifier-agent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"import * as nodes from "ratatoskr/nodes";
+               defineWorkflow({
+                 name: "ours",
+                 stages: [stage("verifier", { ...nodes.verifier, agent: "reason" })],
+               });
+               export async function plan(input) { return input; }"#,
+        )
+        .unwrap();
+        let definitions = standard_definitions().unwrap();
+        let runtime = WorkflowRuntime::load(
+            &workflow_path,
+            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let rules_dir = dir.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        let engine = ScriptEngine::load(&rules_dir).await.unwrap();
+        // Only `reason` has a model: no `[models.verifier]`, and `explore` — the agent the
+        // imported verifier uses — has none.
+        let mut config = RatatoskrConfig::default();
+        config.agents.insert(
+            "reason".to_string(),
+            ratatoskr_core::AgentProfileConfig {
+                model: Some(ratatoskr_core::ModelRoute {
+                    provider: "anthropic".to_string(),
+                    model: "test-model".to_string(),
+                    max_tokens: None,
+                    context_window: None,
+                    temperature: None,
+                    params: None,
+                    session: Default::default(),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let standard = standard_stages().await.unwrap();
+        assert!(
+            !crate::verifier_enabled(&engine, &config, &standard),
+            "without the override there is nowhere for the verifier to run"
+        );
+        let stages = overlaid_stages(&runtime).await.unwrap();
+        assert_eq!(
+            stages
+                .iter()
+                .find(|stage| stage.id == "verifier")
+                .map(|stage| stage.agent.as_str()),
+            Some("reason")
+        );
+        assert!(
+            crate::verifier_enabled(&engine, &config, &stages),
+            "the registry the run executes decides, so the override's profile enables review"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn selection_and_review_are_not_callable_from_a_workflow() {
+        // `scripted_review` reads the *last* `verifier` checkpoint, so a workflow that could call
+        // `verifier({..})` after `verify()` would answer the gate that judges it. `overseer` is
+        // refused as a declaration; installing it as a host anyway would let a workflow burn the
+        // `[models.overseer]` route and overwrite the recorded routing decision.
+        let store = Store::open_in_memory().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-no-gate-host-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let ctx = WorkflowContext::new(
+            None,
+            &RatatoskrConfig::default(),
+            &store,
+            "run-no-gate-host",
+            "try to answer the gate",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = standard_stages().await.unwrap();
+        let hosts = build_hosts_with_turn(
+            &ctx,
+            &stages,
+            Arc::new(RecordingStageTurn::default()) as Arc<dyn StageTurn>,
+        )
+        .unwrap();
+        for gate in ["verifier", "overseer"] {
+            assert!(
+                stages.iter().any(|stage| stage.id == gate),
+                "`{gate}` must stay in the registry for the Rust adapter that runs it"
+            );
+            assert!(
+                !hosts.contains_key(gate),
+                "`{gate}` must not be reachable from a workflow"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -7001,7 +7123,7 @@ mod tests {
         Arc::get_mut(&mut ctx).unwrap().repo_path = repo.clone();
         *ctx.acceptance.lock().unwrap() = Some(Vec::new());
 
-        let configured = build_red_team(&ctx, Vec::new()).unwrap();
+        let configured = build_red_team(&ctx, Vec::new()).await.unwrap();
         let author_tools = configured.author.as_ref().unwrap().tools.names();
         assert!(author_tools.iter().any(|tool| tool == "Write"));
         assert!(author_tools.iter().any(|tool| tool == "Edit"));
@@ -7036,6 +7158,7 @@ mod tests {
         // Both flows use `run_and_author`: the scripted checkpoint must carry the same
         // deterministic evidence as a built-in invocation on the retained pre-change tree.
         let built_in = build_red_team(&ctx, Vec::new())
+            .await
             .unwrap()
             .run_and_author(worktree.as_path(), &ctx.issue, &analyst.interface)
             .await
@@ -8167,17 +8290,48 @@ mod tests {
             .to_string(),
             ..Default::default()
         });
+        // Selection is Rust-invoked. `overseer` is never a workflow global, so the dispatch under
+        // test is the adapter's — a script asking for it finds nothing there.
         let hosts =
             build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
-        runtime
-            .run_with_question_renderers(
-                "plan",
-                serde_json::to_string(&input).unwrap(),
-                hosts,
-                stage_question_renderers(&stages),
-            )
-            .await
-            .unwrap();
+        assert!(!hosts.contains_key("overseer"));
+        assert!(
+            runtime
+                .run_with_question_renderers(
+                    "plan",
+                    serde_json::to_string(&input).unwrap(),
+                    hosts,
+                    stage_question_renderers(&stages),
+                )
+                .await
+                .is_err()
+        );
+        let executor = StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::new(stages.clone()),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        );
+        execute_standard_stage(
+            &executor,
+            stages
+                .iter()
+                .find(|stage| stage.id == "overseer")
+                .cloned()
+                .unwrap(),
+            serde_json::to_string(&input).unwrap(),
+            StandardStageInvocation {
+                resource_root: None,
+                rag_rat_worktree: None,
+                shell: None,
+                publish: None,
+                clarifier: None,
+                invocation_guidance: None,
+                output: StageOutput::Checkpoint,
+                after_guard: true,
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             *turn.nodes.lock().expect("recording runner mutex poisoned"),
@@ -8262,8 +8416,11 @@ mod tests {
             output: json!({ "workflow": "research" }).to_string(),
             ..Default::default()
         });
-        let mut hosts =
-            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        let executor = StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::new(stages.clone()),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        );
         let envelope = json!({
             "__ratatoskrRenderedQuestion": {
                 "input": {
@@ -8278,9 +8435,16 @@ mod tests {
             }
         })
         .to_string();
-        let error = hosts.remove("overseer").unwrap()(envelope)
-            .await
-            .unwrap_err();
+        // Reached through the executor, not a global: overseer is Rust-invoked.
+        let error = executor.host(
+            stages
+                .iter()
+                .find(|stage| stage.id == "overseer")
+                .cloned()
+                .unwrap(),
+        )(envelope)
+        .await
+        .unwrap_err();
         assert!(error.contains("invalid `OverseerOutput` output"), "{error}");
         assert!(error.contains("reasoning"), "{error}");
         assert!(
@@ -8391,17 +8555,48 @@ mod tests {
             .to_string(),
             ..Default::default()
         });
+        // Review is Rust-invoked. `verifier` is never a workflow global — `scripted_review` reads
+        // the *last* `verifier` checkpoint, so a script able to call it could answer its own gate.
         let hosts =
             build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
-        runtime
-            .run_with_question_renderers(
-                "plan",
-                input_value.to_string(),
-                hosts,
-                stage_question_renderers(&stages),
-            )
-            .await
-            .unwrap();
+        assert!(!hosts.contains_key("verifier"));
+        assert!(
+            runtime
+                .run_with_question_renderers(
+                    "plan",
+                    input_value.to_string(),
+                    hosts,
+                    stage_question_renderers(&stages),
+                )
+                .await
+                .is_err()
+        );
+        let executor = StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::new(stages.clone()),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        );
+        execute_standard_stage(
+            &executor,
+            stages
+                .iter()
+                .find(|stage| stage.id == "verifier")
+                .cloned()
+                .unwrap(),
+            input_value.to_string(),
+            StandardStageInvocation {
+                resource_root: None,
+                rag_rat_worktree: None,
+                shell: None,
+                publish: None,
+                clarifier: None,
+                invocation_guidance: None,
+                output: StageOutput::Checkpoint,
+                after_guard: true,
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             *turn.nodes.lock().expect("recording runner mutex poisoned"),
@@ -8508,8 +8703,11 @@ mod tests {
             .to_string(),
             ..Default::default()
         });
-        let mut hosts =
-            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        let executor = StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::new(stages.clone()),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        );
         let envelope = json!({
             "__ratatoskrRenderedQuestion": {
                 "input": {
@@ -8523,9 +8721,16 @@ mod tests {
             }
         })
         .to_string();
-        let error = hosts.remove("verifier").unwrap()(envelope)
-            .await
-            .unwrap_err();
+        // Reached through the executor, not a global: verifier is Rust-invoked.
+        let error = executor.host(
+            stages
+                .iter()
+                .find(|stage| stage.id == "verifier")
+                .cloned()
+                .unwrap(),
+        )(envelope)
+        .await
+        .unwrap_err();
         assert!(error.contains("invalid `VerifierOutput` output"), "{error}");
         assert!(error.contains("failure_scenario"), "{error}");
         assert!(
@@ -9632,8 +9837,8 @@ mod tests {
 
         // And what was resolved is what the implementer's sandbox is built from — the digest,
         // not the mutable tag the config named.
-        let implementer = build_implementer(&ctx, review_plan()).unwrap();
-        let red_team = build_red_team(&ctx, Vec::new()).unwrap();
+        let implementer = build_implementer(&ctx, review_plan()).await.unwrap();
+        let red_team = build_red_team(&ctx, Vec::new()).await.unwrap();
         assert_eq!(implementer.sandbox.image, first_digest);
         assert_eq!(red_team.sandbox.image, first_digest);
 
@@ -9682,7 +9887,7 @@ mod tests {
 
         // The sandbox the run builds is untouched: the host root and the host's toolchain,
         // exactly as configured.
-        let implementer = build_implementer(&ctx, review_plan()).unwrap();
+        let implementer = build_implementer(&ctx, review_plan()).await.unwrap();
         assert_eq!(implementer.sandbox.backend, "landlock");
         assert_eq!(implementer.sandbox.image, config.sandbox.image);
 

@@ -2,6 +2,24 @@
 // `stage(id, def)` call takes, so a workflow uses one as it is — `stage("analyst", nodes.analyst)` —
 // or changes part of it by spread: `stage("analyst", { ...nodes.analyst, agent: "explore" })`.
 //
+// Not every export is yours to declare. The run owns some of these identities, and declaring one is
+// refused when the workflow loads:
+//
+//   declarable — scout, analyst, characterizer, redteam_classifier, redteam_author,
+//     implementer_attempt, context_distillation, verifier. Declaring one under its own id overrides
+//     the standard stage. `outputContract` is the exception: the run deserializes each of these
+//     into a concrete type, so an override has to keep the contract it found.
+//
+//   bundled-only — overseer, bookkeeper, publisher. Exported because the bundled workflow declares
+//     them, and readable as the reference for what those turns are, but a repository workflow that
+//     declares one is refused. Selection runs before a workflow is chosen; bookkeeping and delivery
+//     run from Rust adapters after the run outcome is accepted, holding a push grant and the
+//     committed worktree that no workflow operation has.
+//
+// Two of the declarable stages — verifier, and the two write-authority ones — run only from their
+// Rust adapters, so overriding one changes what that adapter runs but does not make it callable
+// from a workflow.
+//
 // Import these as a namespace (`import * as nodes from "ratatoskr/nodes"`), or alias a named
 // import: a stage's host binding is installed as a global under the stage's own id, so a bare
 // `import { analyst }` shadows the `analyst(..)` host an entry function calls.
