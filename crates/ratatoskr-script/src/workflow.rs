@@ -1172,7 +1172,7 @@ mod tests {
              import type { Thing } from \"ratatoskr/types\";\n\
              \n\
              import { missing } from \"ratatoskr/noeds\";\n\
-             defineWorkflow({ name: \"later\", stages: [stage(\"reviewer\", reviewer)] });",
+             defineWorkflow({ name: \"later\", stages: [stage(\"reviewer\", reviewer), stage(\"missing\", missing)] });",
         )
         .unwrap();
 
@@ -1192,7 +1192,12 @@ mod tests {
     async fn a_workflow_offered_nothing_is_told_so_by_an_import() {
         let dir = scratch("import-none-offered");
         let path = dir.join("lonely.ts");
-        std::fs::write(&path, "import { x } from \"ratatoskr/nodes\";").unwrap();
+        std::fs::write(
+            &path,
+            "import { x } from \"ratatoskr/nodes\";\n\
+             defineWorkflow({ name: \"lonely\", stages: [stage(\"x\", x)] });",
+        )
+        .unwrap();
         let error = match WorkflowRuntime::load(&path, &[]).await {
             Err(error) => error.to_string(),
             Ok(_) => panic!("an import must be refused when the host offers no modules"),
@@ -1202,6 +1207,29 @@ mod tests {
             error.contains("this workflow may import nothing"),
             "{error}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_namespace_loads_and_reaches_its_entry() {
+        // swc lowers a namespace member to a property of the namespace object, so `helper` is not a
+        // binding of its own. Publishing the name the source wrote would emit
+        // `globalThis.helper = helper;` against nothing and the workflow would throw before its
+        // first entry ran — a workflow broken by the publishing, not by anything it did.
+        let dir = scratch("namespace");
+        let path = dir.join("ns.ts");
+        std::fs::write(
+            &path,
+            "namespace N { export var helper = 7; }\n\
+             async function plan(i) { return N.helper; }",
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::load(&path, &[]).await.unwrap().unwrap();
+        let out = runtime
+            .run("plan", "null".to_string(), HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(out, "7");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
