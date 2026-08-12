@@ -6,6 +6,10 @@
 //! only the JS↔Rust plumbing: transpile, register hosts, invoke the script's entry function, and
 //! hand back JSON.
 //!
+//! A workflow is evaluated as an ES module, so it can `import` definitions — stage declarations it
+//! would otherwise have to restate — from the map the host supplies. Nothing else changes: hosts and
+//! the prelude stay on `globalThis`, which module scope reads normally.
+//!
 //! Concurrency: a host function is exposed to JS as a promise-returning function backed by a spawned
 //! Rust future, so `await Promise.all([a(), b()])` in a script genuinely forks (proven ~concurrent
 //! under one `AsyncContext` — see the fork Decision memory), matching `tokio::join!`.
@@ -17,11 +21,18 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use ratatoskr_core::{Capability, SessionScope};
+use rquickjs::loader::{BuiltinLoader, BuiltinResolver};
 use rquickjs::promise::{Promise, Promised};
-use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Function};
+use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Ctx, Function, Module};
 
 use crate::ScriptError;
-use crate::transpile::{self, transpile_ts};
+use crate::transpile;
+
+/// Modules a workflow may `import`, as `(specifier, JavaScript)`.
+///
+/// Resolution is from this map alone — never the filesystem. A workflow runs with the repository's
+/// tools, so its imports are bounded by what the host offers, the same trust model `LOAD` uses.
+pub type Modules<'a> = &'a [(&'a str, &'a str)];
 
 /// A host function's result: `Ok(json)` — a JSON-encoded return value — or `Err(message)`, which the
 /// script sees as a thrown `Error`.
@@ -269,41 +280,16 @@ pub struct WorkflowDelegation {
 pub struct WorkflowRuntime {
     _runtime: AsyncRuntime,
     context: AsyncContext,
+    /// The name the workflow module is declared under — its path, or the bundled workflow's name.
+    /// It is what an unresolved `import` names as the importing module, so it has to be the thing
+    /// the author would go and edit.
+    module_name: Box<str>,
     source: Box<str>,
     meta: Box<WorkflowMeta>,
     dependencies: Box<[std::path::PathBuf]>,
 }
 
 impl WorkflowRuntime {
-    /// Parse a declaration bundled into the binary without registering it as a selectable
-    /// repository workflow. Standard stage metadata uses the same TypeScript boundary as a
-    /// repository declaration, while the repository script remains the thing that sequences it.
-    pub async fn bundled_meta(name: &str, src: &str) -> Result<WorkflowMeta, ScriptError> {
-        let source = transpile_ts(src)?;
-        let runtime = AsyncRuntime::new().map_err(|e| ScriptError::Eval(e.to_string()))?;
-        let context = AsyncContext::full(&runtime)
-            .await
-            .map_err(|e| ScriptError::Eval(e.to_string()))?;
-        Self::declared(&context, &source).await?.ok_or_else(|| {
-            ScriptError::Eval(format!("bundled workflow `{name}` has no declaration"))
-        })
-    }
-
-    /// Parse a bundled declaration whose `LOAD` targets were embedded by the owning crate.
-    ///
-    /// An installed binary cannot assume its source checkout exists. The explicit map keeps
-    /// bundled prompts compile-time assets while repository workflows remain directory-confined.
-    pub async fn bundled_meta_with_includes(
-        name: &str,
-        src: &str,
-        includes: &[(&str, &str)],
-    ) -> Result<WorkflowMeta, ScriptError> {
-        Ok(Self::bundled_with_includes(name, src, includes)
-            .await?
-            .meta()
-            .clone())
-    }
-
     /// Load an executable workflow bundled into the binary, with explicit compile-time `LOAD`
     /// assets. Bundled workflows have no filesystem dependencies: their source and includes are
     /// part of the owning binary rather than files watched in a repository.
@@ -311,28 +297,29 @@ impl WorkflowRuntime {
         name: &str,
         src: &str,
         includes: &[(&str, &str)],
+        modules: Modules<'_>,
     ) -> Result<Self, ScriptError> {
-        let source = transpile::transpile_bundled_workflow(name, src, includes)?;
-        let runtime = AsyncRuntime::new().map_err(|e| ScriptError::Eval(e.to_string()))?;
-        let context = AsyncContext::full(&runtime)
-            .await
-            .map_err(|e| ScriptError::Eval(e.to_string()))?;
-        let meta = Self::declared(&context, &source).await?.ok_or_else(|| {
-            ScriptError::Eval(format!("bundled workflow `{name}` has no declaration"))
-        })?;
+        let source = transpile::transpile_with_includes(name, src, includes)?;
+        let (runtime, context) = engine(modules).await?;
+        let meta = Self::declared(&context, name, &source)
+            .await?
+            .ok_or_else(|| {
+                ScriptError::Eval(format!("bundled workflow `{name}` has no declaration"))
+            })?;
         Ok(Self {
             _runtime: runtime,
             context,
+            module_name: name.into(),
             source: source.into_boxed_str(),
             meta: Box::new(meta),
             dependencies: Box::new([]),
         })
     }
 
-    /// Load and transpile `path` (`.ratatoskr/workflow.ts`). `Ok(None)` if the file is absent —
-    /// the caller then runs the built-in Rust flow, exactly as the ruleset engine treats a missing
-    /// rules dir.
-    pub async fn load(path: &Path) -> Result<Option<Self>, ScriptError> {
+    /// Load and transpile `path` (`.ratatoskr/workflow.ts`), resolving its imports from `modules`.
+    /// `Ok(None)` if the file is absent — the caller then runs the built-in Rust flow, exactly as
+    /// the ruleset engine treats a missing rules dir.
+    pub async fn load(path: &Path, modules: Modules<'_>) -> Result<Option<Self>, ScriptError> {
         if !path.is_file() {
             return Ok(None);
         }
@@ -340,15 +327,13 @@ impl WorkflowRuntime {
             .map_err(|e| ScriptError::Io(path.display().to_string(), e))?;
         let loaded = transpile::transpile_workflow(path, &src)?;
 
-        let runtime = AsyncRuntime::new().map_err(|e| ScriptError::Eval(e.to_string()))?;
-        let context = AsyncContext::full(&runtime)
-            .await
-            .map_err(|e| ScriptError::Eval(e.to_string()))?;
+        let (runtime, context) = engine(modules).await?;
+        let module_name = path.display().to_string();
 
         // Evaluated once here to read what the script declares about itself. `run` evaluates it
         // again in the same context, which re-runs `defineWorkflow` — an idempotent assignment, and
         // the price of keeping the two paths independent.
-        let declared = Self::declared(&context, &loaded.javascript).await?;
+        let declared = Self::declared(&context, &module_name, &loaded.javascript).await?;
         let meta = declared.unwrap_or_else(|| WorkflowMeta {
             // A script that declares nothing is still usable and is named after its file. This is
             // what keeps a repo's existing `workflow.ts` working with no edit.
@@ -365,6 +350,7 @@ impl WorkflowRuntime {
         Ok(Some(WorkflowRuntime {
             _runtime: runtime,
             context,
+            module_name: module_name.into(),
             source: loaded.javascript.into_boxed_str(),
             meta: Box::new(meta),
             dependencies: loaded.dependencies.into_boxed_slice(),
@@ -384,14 +370,14 @@ impl WorkflowRuntime {
     /// Read the script's `defineWorkflow` call, if it makes one.
     async fn declared(
         context: &AsyncContext,
+        module_name: &str,
         source: &str,
     ) -> Result<Option<WorkflowMeta>, ScriptError> {
-        let program = format!("{BOOTSTRAP}\n{source}");
+        let module_name = module_name.to_string();
+        let source = source.to_string();
         context
             .async_with(async move |ctx| {
-                ctx.eval::<(), _>(program)
-                    .catch(&ctx)
-                    .map_err(|e| ScriptError::Eval(format!("{e}")))?;
+                evaluate(&ctx, &module_name, &source).await?;
                 let get: Function = ctx
                     .globals()
                     .get("__workflowMeta")
@@ -414,7 +400,7 @@ impl WorkflowRuntime {
     ///
     /// Sorted by name, and a duplicate name is refused rather than resolved — two workflows
     /// answering to one name means whichever the filesystem listed first wins, silently.
-    pub async fn discover(dir: &Path) -> Result<Vec<Self>, ScriptError> {
+    pub async fn discover(dir: &Path, modules: Modules<'_>) -> Result<Vec<Self>, ScriptError> {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return Ok(Vec::new());
         };
@@ -427,7 +413,7 @@ impl WorkflowRuntime {
 
         let mut found: Vec<Self> = Vec::new();
         for path in paths {
-            let Some(workflow) = Self::load(&path).await? else {
+            let Some(workflow) = Self::load(&path, modules).await? else {
                 continue;
             };
             if let Some(clash) = found.iter().find(|w| w.meta.name == workflow.meta.name) {
@@ -468,14 +454,13 @@ impl WorkflowRuntime {
         hosts: HashMap<String, HostFn>,
         question_renderers: HashMap<String, String>,
     ) -> Result<String, ScriptError> {
-        let program = format!("{BOOTSTRAP}\n{}", self.source);
+        let module_name = self.module_name.to_string();
+        let source = self.source.to_string();
         let entry = entry.to_string();
 
         self.context
             .async_with(async move |ctx| {
-                ctx.eval::<(), _>(program)
-                    .catch(&ctx)
-                    .map_err(|e| ScriptError::Eval(format!("{e}")))?;
+                evaluate(&ctx, &module_name, &source).await?;
 
                 for (name, source) in question_renderers {
                     let install = format!(
@@ -534,6 +519,48 @@ impl WorkflowRuntime {
     }
 }
 
+/// A JS runtime whose only importable modules are the ones the host supplied, plus a context on it.
+async fn engine(modules: Modules<'_>) -> Result<(AsyncRuntime, AsyncContext), ScriptError> {
+    let runtime = AsyncRuntime::new().map_err(|e| ScriptError::Eval(e.to_string()))?;
+    if !modules.is_empty() {
+        let mut resolver = BuiltinResolver::default();
+        let mut loader = BuiltinLoader::default();
+        for (name, source) in modules {
+            resolver.add_module(*name);
+            loader.add_module(*name, *source);
+        }
+        // No `FileResolver`: an import reaches the host's map or it fails to resolve.
+        runtime.set_loader(resolver, loader).await;
+    }
+    let context = AsyncContext::full(&runtime)
+        .await
+        .map_err(|e| ScriptError::Eval(e.to_string()))?;
+    Ok((runtime, context))
+}
+
+/// Install the prelude, then evaluate the workflow as an ES module named after its source.
+///
+/// The order is load-bearing. Every statically imported module is fully evaluated before the
+/// importing module's first top-level statement, whatever the textual order, so a prelude
+/// concatenated into the module text would not exist yet when an imported definition calls
+/// `stage(..)`. `BOOTSTRAP` is therefore its own script, evaluated first.
+///
+/// The module name is the workflow's own path, so an unresolved specifier reports the file an
+/// author would go and edit rather than a placeholder.
+async fn evaluate(ctx: &Ctx<'_>, module_name: &str, source: &str) -> Result<(), ScriptError> {
+    let fail = |e: rquickjs::CaughtError| ScriptError::Eval(format!("{e}"));
+    ctx.eval::<(), _>(BOOTSTRAP).catch(ctx).map_err(fail)?;
+    let (_module, promise) = Module::declare(ctx.clone(), module_name, source)
+        .catch(ctx)
+        .map_err(fail)?
+        .eval()
+        .catch(ctx)
+        .map_err(fail)?;
+    // A module body's exception — an unresolvable import, a throwing `defineWorkflow` — surfaces
+    // through the promise, not through `eval`, and top-level await resolves here too.
+    promise.into_future::<()>().await.catch(ctx).map_err(fail)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,7 +577,7 @@ mod tests {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join("workflow.ts");
         std::fs::write(&path, ts).unwrap();
-        WorkflowRuntime::load(&path).await.unwrap().unwrap()
+        WorkflowRuntime::load(&path, &[]).await.unwrap().unwrap()
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -641,7 +668,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn missing_file_is_none() {
         let path = std::env::temp_dir().join("ratatoskr-workflow-absent/workflow.ts");
-        assert!(WorkflowRuntime::load(&path).await.unwrap().is_none());
+        assert!(WorkflowRuntime::load(&path, &[]).await.unwrap().is_none());
     }
 
     fn scratch(case: &str) -> std::path::PathBuf {
@@ -665,7 +692,7 @@ mod tests {
         )
         .unwrap();
 
-        let found = WorkflowRuntime::discover(&dir).await.unwrap();
+        let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
         assert_eq!(found.len(), 1);
         let meta = found[0].meta();
         assert_eq!(meta.name, "research");
@@ -688,6 +715,7 @@ mod tests {
                });
                async function plan(input) { return await probe(input); }"#,
             &[("prompt.md", "bundled guidance\n")],
+            &[],
         )
         .await
         .unwrap();
@@ -714,7 +742,7 @@ mod tests {
     async fn reference_workflow_declares_a_schema_checked_stage() {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/workflow.ts");
-        let runtime = WorkflowRuntime::load(&path).await.unwrap().unwrap();
+        let runtime = WorkflowRuntime::load(&path, &[]).await.unwrap().unwrap();
         let meta = runtime.meta();
 
         assert_eq!(meta.name, "standard");
@@ -745,7 +773,7 @@ mod tests {
         )
         .unwrap();
 
-        let found = WorkflowRuntime::discover(&dir).await.unwrap();
+        let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
         assert_eq!(
             found[0].meta().stages[0].session,
             Some(SessionScope::Compacted)
@@ -944,7 +972,7 @@ mod tests {
             "const prompt = 'prompt.md';\ndefineWorkflow({ name: 'bad', stages: [stage('bad', { agent: 'reason', instructions: LOAD(prompt) })] });",
         )
         .unwrap();
-        let error = match WorkflowRuntime::load(&path).await {
+        let error = match WorkflowRuntime::load(&path, &[]).await {
             Err(error) => error.to_string(),
             Ok(_) => panic!("a dynamic LOAD target must be rejected"),
         };
@@ -966,7 +994,7 @@ mod tests {
             "defineWorkflow({ name: 'bad', stages: [stage('bad', { agent: 'reason', instructions: LOAD('../secret.md') })] });",
         )
         .unwrap();
-        let error = match WorkflowRuntime::load(&path).await {
+        let error = match WorkflowRuntime::load(&path, &[]).await {
             Err(error) => error.to_string(),
             Ok(_) => panic!("a LOAD target outside the workflow directory must be rejected"),
         };
@@ -991,7 +1019,7 @@ mod tests {
             "defineWorkflow({ name: 'bad', stages: [stage('bad', { agent: 'reason', instructions: LOAD('prompt.md') })] });",
         )
         .unwrap();
-        let error = match WorkflowRuntime::load(&path).await {
+        let error = match WorkflowRuntime::load(&path, &[]).await {
             Err(error) => error.to_string(),
             Ok(_) => panic!("a symlink outside the workflow directory must be rejected"),
         };
@@ -1010,7 +1038,7 @@ mod tests {
             "defineWorkflow({ name: 'bad', stages: [stage('bad', { agent: 'reason', instructions: LOAD('prompt.md') })] });",
         )
         .unwrap();
-        let error = match WorkflowRuntime::load(&path).await {
+        let error = match WorkflowRuntime::load(&path, &[]).await {
             Err(error) => error.to_string(),
             Ok(_) => panic!("an oversized LOAD target must be rejected"),
         };
@@ -1018,6 +1046,100 @@ mod tests {
         assert!(error.contains("16385 bytes"), "{error}");
         assert!(error.contains("16384 bytes"), "{error}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A definitions module of the shape a host publishes: plain values, with `LOAD` for prompt
+    /// text, transpiled through the include-resolving entry.
+    fn definitions_module() -> String {
+        transpile::transpile_with_includes(
+            "ratatoskr/nodes",
+            r#"export const reviewer = {
+                 agent: "reason",
+                 outputContract: "Review",
+                 instructions: LOAD("prompt.md").trim(),
+                 capabilities: ["read"],
+                 tools: ["semantic_search"],
+               };"#,
+            &[("prompt.md", "shared guidance\n")],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_imported_definition_is_used_whole_or_changed_in_part() {
+        let dir = scratch("import-definition");
+        std::fs::write(
+            dir.join("importing.ts"),
+            r#"import { reviewer } from "ratatoskr/nodes";
+               defineWorkflow({
+                 name: "importing",
+                 stages: [
+                   stage("reviewer", reviewer),
+                   stage("second_opinion", { ...reviewer, agent: "explore" }),
+                 ],
+               });
+               async function plan(input) { return await reviewer_host(input); }"#,
+        )
+        .unwrap();
+
+        let module = definitions_module();
+        let found = WorkflowRuntime::discover(&dir, &[("ratatoskr/nodes", &module)])
+            .await
+            .unwrap();
+        let stages = &found[0].meta().stages;
+
+        // Used whole: every field is the definition's, including the prompt its `LOAD` resolved —
+        // proof the module went through the include-resolving transpile rather than `transpile_ts`.
+        assert_eq!(stages[0].id, "reviewer");
+        assert_eq!(stages[0].agent, "reason");
+        assert_eq!(stages[0].output_contract, "Review");
+        assert_eq!(stages[0].instructions, "shared guidance");
+        assert_eq!(stages[0].capabilities, [Capability::Read]);
+        assert_eq!(stages[0].tools, ["semantic_search"]);
+        // Changed in part: the override wins and nothing else is restated.
+        assert_eq!(stages[1].agent, "explore");
+        assert_eq!(stages[1].instructions, "shared guidance");
+        assert_eq!(stages[1].tools, ["semantic_search"]);
+
+        // And an importing workflow still reaches its hosts, which are installed after the module
+        // body has run.
+        let mut hosts = HashMap::new();
+        hosts.insert(
+            "reviewer_host".to_string(),
+            host(|arg| async move { Ok(arg) }),
+        );
+        let out = found[0]
+            .run("plan", serde_json::json!({ "ok": true }).to_string(), hosts)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out).unwrap()["ok"],
+            true
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_import_names_the_specifier_and_the_workflow() {
+        // The same discipline `LOAD` errors keep: a typo must say what could not be found and which
+        // file asked for it, not just fail to evaluate.
+        let dir = scratch("import-unresolved");
+        let path = dir.join("typo.ts");
+        std::fs::write(
+            &path,
+            r#"import { reviewer } from "ratatoskr/noeds";
+               defineWorkflow({ name: "typo", stages: [stage("reviewer", reviewer)] });"#,
+        )
+        .unwrap();
+
+        let module = definitions_module();
+        let error = match WorkflowRuntime::load(&path, &[("ratatoskr/nodes", &module)]).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("an unresolvable import must be refused"),
+        };
+        assert!(error.contains("ratatoskr/noeds"), "{error}");
+        assert!(error.contains("typo.ts"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1029,7 +1151,7 @@ mod tests {
             "async function plan(i) { return i; }",
         )
         .unwrap();
-        let found = WorkflowRuntime::discover(&dir).await.unwrap();
+        let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
         assert_eq!(found[0].meta().name, "legacy");
         assert!(found[0].meta().purpose.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1047,7 +1169,7 @@ mod tests {
             )
             .unwrap();
         }
-        let err = match WorkflowRuntime::discover(&dir).await {
+        let err = match WorkflowRuntime::discover(&dir, &[]).await {
             Err(e) => e.to_string(),
             Ok(_) => panic!("this must be refused"),
         };
@@ -1065,7 +1187,7 @@ mod tests {
             r#"defineWorkflow({ name: "w", whenToUser: ["x"] });"#,
         )
         .unwrap();
-        let err = match WorkflowRuntime::discover(&dir).await {
+        let err = match WorkflowRuntime::discover(&dir, &[]).await {
             Err(e) => e.to_string(),
             Ok(_) => panic!("this must be refused"),
         };
@@ -1073,7 +1195,7 @@ mod tests {
 
         // And a declaration with no name at all.
         std::fs::write(dir.join("w.ts"), r#"defineWorkflow({ purpose: "x" });"#).unwrap();
-        assert!(WorkflowRuntime::discover(&dir).await.is_err());
+        assert!(WorkflowRuntime::discover(&dir, &[]).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1087,13 +1209,15 @@ mod tests {
             )
             .unwrap();
         }
-        let found = WorkflowRuntime::discover(&dir).await.unwrap();
+        let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
         // By path, so two checkouts of the same files agree regardless of `read_dir` order.
         assert_eq!(found[0].meta().name, "alpha");
         assert_eq!(found[1].meta().name, "zeta");
 
         // A repo that defines no workflows is the common case, not an error.
-        let missing = WorkflowRuntime::discover(&dir.join("nope")).await.unwrap();
+        let missing = WorkflowRuntime::discover(&dir.join("nope"), &[])
+            .await
+            .unwrap();
         assert!(missing.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

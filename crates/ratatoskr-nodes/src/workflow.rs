@@ -47,6 +47,9 @@ const INVOCATION_CEILING: usize = 500;
 
 const STANDARD_WORKFLOW_NAME: &str = "ratatoskr-standard-v1";
 const STANDARD_WORKFLOW_V1: &str = include_str!("../workflows/standard-v1.ts");
+/// What a workflow imports the standard node definitions from.
+pub(crate) const STANDARD_DEFINITIONS_MODULE: &str = "ratatoskr/nodes";
+const STANDARD_DEFINITIONS: &str = include_str!("../workflows/nodes.ts");
 const STANDARD_WORKFLOW_INCLUDES: &[(&str, &str)] = &[
     ("prompts/analyst.md", include_str!("../prompts/analyst.md")),
     (
@@ -1990,12 +1993,29 @@ pub(crate) async fn standard_stages() -> Result<Vec<Stage>, PlanError> {
 }
 
 pub(crate) async fn standard_runtime() -> Result<WorkflowRuntime, PlanError> {
+    let definitions = standard_definitions()?;
     WorkflowRuntime::bundled_with_includes(
         STANDARD_WORKFLOW_NAME,
         STANDARD_WORKFLOW_V1,
         STANDARD_WORKFLOW_INCLUDES,
+        &[(STANDARD_DEFINITIONS_MODULE, &definitions)],
     )
     .await
+    .map_err(|error| PlanError::node("workflow", NodeError::Failed(error.to_string())))
+}
+
+/// The standard node definitions as importable JavaScript.
+///
+/// Transpiled through the include-resolving entry rather than plain type stripping: the definitions
+/// carry `LOAD("prompts/..")` calls, which are compile-time inclusions with no runtime equivalent.
+/// Every workflow gets the same map — a repository's own workflow imports these exactly as the
+/// bundled one does.
+pub(crate) fn standard_definitions() -> Result<String, PlanError> {
+    ratatoskr_script::transpile_with_includes(
+        STANDARD_DEFINITIONS_MODULE,
+        STANDARD_DEFINITIONS,
+        STANDARD_WORKFLOW_INCLUDES,
+    )
     .map_err(|error| PlanError::node("workflow", NodeError::Failed(error.to_string())))
 }
 
@@ -3370,6 +3390,7 @@ mod tests {
             r#"defineWorkflow({ name: "incomplete-standard-plan" });
                async function plan(input) { return input; }"#,
             &[],
+            &[],
         )
         .await
         .unwrap();
@@ -4349,7 +4370,7 @@ mod tests {
                }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -4412,7 +4433,7 @@ mod tests {
                }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -4616,7 +4637,7 @@ mod tests {
                }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -4948,7 +4969,7 @@ mod tests {
         let source = format!(
             "defineWorkflow({{ name: \"renderer-parity\" }}); async function run(input) {{ {calls} return true; }}"
         );
-        let runtime = WorkflowRuntime::bundled_with_includes("renderer-parity", &source, &[])
+        let runtime = WorkflowRuntime::bundled_with_includes("renderer-parity", &source, &[], &[])
             .await
             .unwrap();
         let captured = Arc::new(Mutex::new(HashMap::<String, Vec<serde_json::Value>>::new()));
@@ -5055,7 +5076,7 @@ mod tests {
             "async function run(input) { return await bookkeeper(input); }",
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -5263,7 +5284,7 @@ mod tests {
             "async function run(input) { return await publisher(input); }",
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -6138,7 +6159,7 @@ mod tests {
             r#"async function plan(input) { return await context_distillation(input); }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -6383,7 +6404,7 @@ mod tests {
             r#"async function plan(input) { return await context(input.issue); }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -6634,7 +6655,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -7308,7 +7329,7 @@ mod tests {
             r#"async function plan(input) { return await characterizer(input); }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -7606,7 +7627,7 @@ mod tests {
             r#"async function plan(input) { return await overseer(input); }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -7816,7 +7837,7 @@ mod tests {
             r#"async function plan(input) { return await verifier(input); }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -8667,7 +8688,7 @@ mod tests {
             "async function run() { throw new Error('terminal failure'); }",
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();

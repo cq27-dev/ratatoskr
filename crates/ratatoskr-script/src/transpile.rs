@@ -6,7 +6,9 @@ use std::path::{Component, Path, PathBuf};
 
 use swc_core::common::sync::Lrc;
 use swc_core::common::{FileName, GLOBALS, Mark, SourceMap, Span, Spanned};
-use swc_core::ecma::ast::{Callee, Expr, Lit, Program, Str};
+use swc_core::ecma::ast::{
+    Callee, Decl, Expr, FnDecl, Lit, ModuleDecl, ModuleItem, Program, Stmt, Str,
+};
 use swc_core::ecma::codegen::text_writer::JsWriter;
 use swc_core::ecma::codegen::{Config as CodegenConfig, Emitter};
 use swc_core::ecma::parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
@@ -69,8 +71,13 @@ pub(crate) fn transpile_workflow(path: &Path, src: &str) -> Result<WorkflowSourc
     })
 }
 
-/// Transpile a bundled workflow using sources embedded in the binary by its owning crate.
-pub(crate) fn transpile_bundled_workflow(
+/// Transpile a named source embedded in the binary by its owning crate, resolving its `LOAD` calls
+/// against `includes`.
+///
+/// Public because a definitions module a workflow imports carries `LOAD` calls of its own, and only
+/// this path resolves them: `transpile_ts` leaves `LOAD(..)` in the emitted JavaScript, where no
+/// such function exists.
+pub fn transpile_with_includes(
     name: &str,
     src: &str,
     includes: &[(&str, &str)],
@@ -151,7 +158,8 @@ fn transpile_with_loads(
     display_path: &Path,
     load: &mut dyn FnMut(&str) -> Result<LoadedText, String>,
 ) -> Result<String, ScriptError> {
-    transpile(src, file_name, |parsed| {
+    let mut entries = Vec::new();
+    let mut javascript = transpile(src, file_name, |parsed| {
         let mut rewriter = LoadRewriter {
             source_map: Lrc::clone(&parsed.source_map),
             display_path,
@@ -159,11 +167,51 @@ fn transpile_with_loads(
             error: None,
         };
         parsed.program.visit_mut_with(&mut rewriter);
+        entries = top_level_function_names(&parsed.program);
         match rewriter.error {
             Some(error) => Err(error),
             None => Ok(()),
         }
-    })
+    })?;
+    // A workflow is evaluated as an ES module, so `async function plan(..)` is module-scoped and
+    // invisible to the entry invoker, which looks entries up on `globalThis`. Publishing them keeps
+    // a workflow an ordinary file of functions instead of demanding `export` on every entry.
+    for entry in entries {
+        javascript.push_str(&format!("\nglobalThis.{entry} = {entry};"));
+    }
+    Ok(javascript)
+}
+
+/// Names of the functions a source declares at its top level. Ambient `declare function` is skipped
+/// — it emits nothing to assign.
+fn top_level_function_names(program: &Program) -> Vec<String> {
+    let declarations: Vec<&FnDecl> = match program {
+        Program::Module(module) => module
+            .body
+            .iter()
+            .filter_map(|item| match item {
+                ModuleItem::Stmt(Stmt::Decl(Decl::Fn(declaration))) => Some(declaration),
+                ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match &export.decl {
+                    Decl::Fn(declaration) => Some(declaration),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect(),
+        Program::Script(script) => script
+            .body
+            .iter()
+            .filter_map(|statement| match statement {
+                Stmt::Decl(Decl::Fn(declaration)) => Some(declaration),
+                _ => None,
+            })
+            .collect(),
+    };
+    declarations
+        .into_iter()
+        .filter(|declaration| !declaration.declare)
+        .map(|declaration| declaration.ident.sym.to_string())
+        .collect()
 }
 
 struct ParsedProgram {
@@ -323,6 +371,26 @@ mod tests {
         // not a silently half-parsed program.
         let err = transpile_ts("const = ;").unwrap_err();
         assert!(matches!(err, ScriptError::Transpile(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn a_workflow_publishes_its_top_level_functions_as_globals() {
+        // The entry invoker looks entries up on `globalThis`, and a workflow is evaluated as an ES
+        // module, where a top-level `function` is module-scoped.
+        let js = transpile_with_includes(
+            "w",
+            "async function plan(i: string) { return i; }\nexport function helper() {}",
+            &[],
+        )
+        .unwrap();
+        assert!(js.contains("globalThis.plan = plan;"), "got: {js}");
+        assert!(js.contains("globalThis.helper = helper;"), "got: {js}");
+        // Rulesets are plain scripts and get no such rewriting.
+        assert!(
+            !transpile_ts("async function plan(i) { return i; }")
+                .unwrap()
+                .contains("globalThis"),
+        );
     }
 
     #[test]

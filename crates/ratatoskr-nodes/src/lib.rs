@@ -478,13 +478,29 @@ pub async fn registry() -> Result<Vec<Workflow>, PlanError> {
 /// rather than one superseding the other: a repo that has the old file gets it as an ordinary
 /// entry in the registry rather than a migration to perform before anything runs.
 pub async fn defined() -> Result<Vec<WorkflowRuntime>, PlanError> {
+    defined_in(
+        std::path::Path::new(WORKFLOW_DIR),
+        std::path::Path::new(LEGACY_WORKFLOW),
+    )
+    .await
+}
+
+/// `defined()` against explicit paths, so the import wiring is testable without a fixed cwd.
+async fn defined_in(
+    dir: &std::path::Path,
+    legacy_path: &std::path::Path,
+) -> Result<Vec<WorkflowRuntime>, PlanError> {
     let fail = |e: ratatoskr_script::ScriptError| {
         PlanError::node("workflow", NodeError::Failed(e.to_string()))
     };
-    let mut found = WorkflowRuntime::discover(std::path::Path::new(WORKFLOW_DIR))
+    // A repository's own workflow imports the standard definitions exactly as the bundled workflow
+    // does — otherwise a repo could only restate the stages it wanted to reuse.
+    let definitions = workflow::standard_definitions()?;
+    let modules = [(workflow::STANDARD_DEFINITIONS_MODULE, definitions.as_str())];
+    let mut found = WorkflowRuntime::discover(dir, &modules)
         .await
         .map_err(fail)?;
-    if let Some(legacy) = WorkflowRuntime::load(std::path::Path::new(LEGACY_WORKFLOW))
+    if let Some(legacy) = WorkflowRuntime::load(legacy_path, &modules)
         .await
         .map_err(fail)?
     {
@@ -2453,7 +2469,7 @@ mod agent_config_tests {
             )
             .unwrap();
         }
-        let found = WorkflowRuntime::discover(&dir).await.unwrap();
+        let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         let mut all = vec![Workflow::BuiltIn];
         all.extend(found.into_iter().map(Workflow::Scripted));
@@ -2554,7 +2570,7 @@ mod agent_config_tests {
             r#"defineWorkflow({ name: "deep", nodes: ["reviewer2", "triager"] });"#,
         )
         .unwrap();
-        let found = WorkflowRuntime::discover(&dir).await.unwrap();
+        let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
         let declared = Workflow::Scripted(found.into_iter().next().unwrap());
         assert_eq!(declared.nodes(), ["reviewer2", "triager"]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2592,7 +2608,7 @@ mod agent_config_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.ts"), r#"defineWorkflow({ name: "research" });"#).unwrap();
-        let found = WorkflowRuntime::discover(&dir).await.unwrap();
+        let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
         let mut registry = vec![Workflow::BuiltIn];
         registry.extend(found.into_iter().map(Workflow::Scripted));
 
@@ -2971,6 +2987,47 @@ mod referee_governance_tests {
     }
 
     #[tokio::test]
+    async fn a_repository_workflow_imports_a_standard_definition_and_changes_one_part() {
+        // The acceptance criterion: a repo takes a standard stage and changes part of it without
+        // restating the rest, through the same `defined()` path a real checkout uses.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-import-nodes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ours.ts"),
+            r#"import * as nodes from "ratatoskr/nodes";
+               defineWorkflow({
+                 name: "ours",
+                 stages: [stage("analyst", { ...nodes.analyst, agent: "explore" })],
+               });
+               async function plan(input) { return input; }"#,
+        )
+        .unwrap();
+
+        let found = defined_in(&dir, &dir.join("absent.ts")).await.unwrap();
+        let ours = &found[0].meta().stages[0];
+        let standard = workflow::standard_runtime().await.unwrap();
+        let theirs = standard
+            .meta()
+            .stages
+            .iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+
+        assert_eq!(ours.agent, "explore");
+        assert_ne!(theirs.agent, "explore");
+        // Everything not overridden is the standard definition's, including the instructions its
+        // `LOAD` resolved and the question renderer it declares.
+        assert!(!ours.instructions.is_empty());
+        assert_eq!(ours.instructions, theirs.instructions);
+        assert_eq!(ours.tools, theirs.tools);
+        assert_eq!(ours.output_schema, theirs.output_schema);
+        assert_eq!(ours.question_renderer, theirs.question_renderer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn workflow_declaration_cannot_re_enter_internal_referee() {
         // A workflow may declare arbitrary governable nodes, except the internal referee: that
         // name is a fixed capability boundary rather than a scriptable agent.
@@ -2983,7 +3040,7 @@ mod referee_governance_tests {
             r#"defineWorkflow({ name: "deep", nodes: ["referee"] });"#,
         )
         .unwrap();
-        let found = WorkflowRuntime::discover(&dir).await.unwrap();
+        let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
         assert_eq!(found[0].meta().nodes, ["referee"]);
         assert!(
             !governable_from(&found).iter().any(|name| name == "referee"),
