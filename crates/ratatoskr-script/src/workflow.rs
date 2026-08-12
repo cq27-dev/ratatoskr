@@ -64,8 +64,7 @@ pub fn dependencies(
     if !path.is_file() {
         return Ok(Vec::new());
     }
-    let src = std::fs::read_to_string(path)
-        .map_err(|error| ScriptError::Io(path.display().to_string(), error))?;
+    let src = transpile::read_script_source(path)?;
     Ok(transpile::transpile_workflow(path, &src, &specifiers(modules))?.dependencies)
 }
 
@@ -373,8 +372,9 @@ impl WorkflowRuntime {
         if !path.is_file() {
             return Ok(None);
         }
-        let src = std::fs::read_to_string(path)
-            .map_err(|e| ScriptError::Io(path.display().to_string(), e))?;
+        // Read and transpiled under their own ceilings, before `engine` exists: QuickJS's limits
+        // bound evaluation, and cannot see a source that never gets that far.
+        let src = transpile::read_script_source(path)?;
         let loaded = transpile::transpile_workflow(path, &src, &specifiers(modules))?;
 
         let (runtime, context, budget) = engine(modules).await?;
@@ -1004,8 +1004,12 @@ async fn within<T>(
 
 /// A JS runtime whose only importable modules are the ones the host supplied, plus a context on it.
 ///
-/// Bounded before it is handed anything to run: a workflow is repository-authored code the harness
-/// must evaluate before it can know whether it terminates.
+/// The memory, stack and interrupt ceilings are installed here, before the runtime is handed
+/// anything to run: a workflow is repository-authored code the harness must evaluate before it can
+/// know whether it terminates. They bound **evaluation only**. Reading and transpiling the source
+/// happens before this function is reached and is bounded there instead, by
+/// `transpile::MAX_SCRIPT_BYTES` and the pre-parse nesting check — a source that overruns the
+/// parser never reaches an engine whose limits could have caught it.
 async fn engine(
     modules: Modules<'_>,
 ) -> Result<(AsyncRuntime, AsyncContext, Arc<Budget>), ScriptError> {
@@ -1772,6 +1776,28 @@ export async function plan(i) { return { entryRan: true }; }
         };
         assert!(error.contains("hog.ts"), "{error}");
         assert!(error.contains("memory limit"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_workflow_source_past_the_byte_ceiling_is_refused() {
+        let dir = scratch("oversize-source");
+        let path = dir.join("huge.ts");
+        std::fs::write(&path, "/".repeat(transpile::MAX_SCRIPT_BYTES as usize + 1)).unwrap();
+        let error = match WorkflowRuntime::load(&path, &[]).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a workflow past the source ceiling must be refused"),
+        };
+        assert!(error.contains("huge.ts"), "{error}");
+        assert!(error.contains("source limit"), "{error}");
+        // The same read backs dependency discovery, so it is bounded by the same ceiling.
+        assert!(
+            dependencies(&path, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("source limit"),
+            "dependency discovery read an oversize workflow"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

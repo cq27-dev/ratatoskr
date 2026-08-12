@@ -30,6 +30,71 @@ pub fn transpile_ts(src: &str) -> Result<String, ScriptError> {
 
 const MAX_LOAD_BYTES: usize = 16 * 1024;
 
+/// Bytes of TypeScript this module will read from the repository.
+///
+/// A workflow or a ruleset is composition — declarations and glue, with prompt text arriving
+/// through `LOAD` at 16 KiB a target — so 256 KiB is thousands of lines past anything honest. The
+/// ceiling exists because parsing is where the cost is: swc builds an AST several times the
+/// source's size, and 100 MB of small statements takes ~3 GB of resident memory and aborts the
+/// process before any engine limit has been installed. Checked against the file's metadata, so an
+/// oversize source is refused without being read.
+pub(crate) const MAX_SCRIPT_BYTES: u64 = 256 * 1024;
+
+/// Bracket nesting a source may reach, counted on the raw text before it is parsed.
+///
+/// A byte ceiling does not cover this: nesting is a *stack* cost, not a heap one, and 150 levels of
+/// parentheses is a 300-byte file. `swc_ecma_parser` grows the stack for its own recursion, but the
+/// passes that run after it here — the `LOAD` rewrite, `resolver`, `strip`, `fixer`, codegen — are
+/// plain recursive walks with no such guard, so past a depth this module cannot ask the parser to
+/// bound, they overflow the thread's stack and abort the process. Measured: depth 150 aborts a
+/// debug build on a 2 MiB thread stack; depth 100 does not.
+///
+/// 64 sits under that and far above real code — the deepest file in this repository, prose
+/// included, nests 19. The scan is deliberately dumb, counting brackets inside strings and comments
+/// too, which a limit several times above honest sources can afford.
+const MAX_NESTING_DEPTH: usize = 64;
+
+/// Read repository TypeScript, refusing a file past [`MAX_SCRIPT_BYTES`] before reading it.
+pub(crate) fn read_script_source(path: &Path) -> Result<String, ScriptError> {
+    let display = path.display().to_string();
+    let metadata = path
+        .metadata()
+        .map_err(|error| ScriptError::Io(display.clone(), error))?;
+    if metadata.len() > MAX_SCRIPT_BYTES {
+        return Err(ScriptError::Transpile(format!(
+            "{display} is {} bytes; source limit is {MAX_SCRIPT_BYTES} bytes",
+            metadata.len()
+        )));
+    }
+    std::fs::read_to_string(path).map_err(|error| ScriptError::Io(display, error))
+}
+
+/// Refuse a source whose brackets nest past [`MAX_NESTING_DEPTH`], naming where it happened.
+fn check_nesting(file_name: &FileName, src: &str) -> Result<(), ScriptError> {
+    let (mut depth, mut line, mut line_start) = (0usize, 1usize, 0usize);
+    for (offset, character) in src.char_indices() {
+        match character {
+            '\n' => {
+                line += 1;
+                line_start = offset + 1;
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                if depth > MAX_NESTING_DEPTH {
+                    return Err(ScriptError::Transpile(format!(
+                        "{file_name}:{line}:{}: nesting limit is {MAX_NESTING_DEPTH} brackets, and \
+                         parsing deeper than that overflows the stack",
+                        offset - line_start + 1,
+                    )));
+                }
+            }
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct WorkflowSource {
     pub javascript: String,
     pub dependencies: Vec<PathBuf>,
@@ -226,6 +291,8 @@ fn transpile(
     rewrite: impl FnOnce(&mut ParsedProgram) -> Result<(), ScriptError>,
     emitted: impl FnOnce(&ParsedProgram) -> Result<(), ScriptError>,
 ) -> Result<String, ScriptError> {
+    // Before the parser, because the AST this builds is what cannot survive deep nesting.
+    check_nesting(&file_name, src)?;
     GLOBALS.set(&Default::default(), || {
         let cm: Lrc<SourceMap> = Default::default();
         let fm = cm.new_source_file(Lrc::new(file_name), src.to_string());
@@ -607,6 +674,53 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("statically known"), "{error}");
+    }
+
+    #[test]
+    fn nesting_past_the_limit_is_refused_before_anything_parses_it() {
+        // 150 levels of parentheses is a 300-byte source, and every pass this module runs after
+        // parsing — the LOAD rewrite, resolver, strip, fixer, codegen — is unguarded recursion:
+        // reaching the parser with this aborts the process with a stack overflow. So the refusal
+        // has to come from the pre-parse scan, and nothing in this test may reach swc.
+        let source = format!("const x = {}1{};", "(".repeat(150), ")".repeat(150));
+        let error = transpile_with_includes("w", &source, &[], &[])
+            .unwrap_err()
+            .to_string();
+        // Positioned at the bracket that crossed the limit, like every other refusal here.
+        assert!(error.starts_with("transpile error: w:1:"), "{error}");
+        assert!(
+            error.contains(&format!("nesting limit is {MAX_NESTING_DEPTH}")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn nesting_a_real_source_reaches_still_transpiles() {
+        // The deepest file in this repository, prose included, nests 19 brackets. A limit that
+        // refused that would be a worse bug than the one it fixes.
+        let source = format!("export const x = {}1{};", "[".repeat(19), "]".repeat(19));
+        transpile_with_includes("w", &source, &[], &[]).unwrap();
+    }
+
+    #[test]
+    fn a_source_past_the_byte_ceiling_is_refused_without_being_read() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-transpile-oversize-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("workflow.ts");
+        std::fs::write(&path, "/".repeat(MAX_SCRIPT_BYTES as usize + 1)).unwrap();
+        let error = match read_script_source(&path) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a source past the ceiling must be refused, not read"),
+        };
+        assert!(error.contains("workflow.ts"), "{error}");
+        assert!(
+            error.contains(&format!("source limit is {MAX_SCRIPT_BYTES} bytes")),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

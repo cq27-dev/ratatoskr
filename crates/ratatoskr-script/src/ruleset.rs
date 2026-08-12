@@ -203,8 +203,9 @@ impl ScriptEngine {
                 .collect();
             paths.sort();
             for path in paths {
-                let src = std::fs::read_to_string(&path)
-                    .map_err(|e| ScriptError::Io(path.display().to_string(), e))?;
+                // A rules file is repository TypeScript through the same parser a workflow uses, so
+                // it is held to the same source ceiling.
+                let src = crate::transpile::read_script_source(&path)?;
                 program.push('\n');
                 program.push_str(&transpile_ts(&src)?);
             }
