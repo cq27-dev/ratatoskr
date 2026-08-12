@@ -46,7 +46,7 @@ use crate::{
 const INVOCATION_CEILING: usize = 500;
 
 const STANDARD_WORKFLOW_NAME: &str = "ratatoskr-standard-v1";
-const STANDARD_WORKFLOW_V1: &str = include_str!("../workflows/standard-v1.ts");
+pub(crate) const STANDARD_WORKFLOW_V1: &str = include_str!("../workflows/standard-v1.ts");
 /// What a workflow imports the standard node definitions from.
 pub(crate) const STANDARD_DEFINITIONS_MODULE: &str = "ratatoskr/nodes";
 const STANDARD_DEFINITIONS: &str = include_str!("../workflows/nodes.ts");

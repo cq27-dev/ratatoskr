@@ -288,12 +288,16 @@ async fn record_provenance(store: &Store, run_id: &str, config: &RatatoskrConfig
 /// neither, so a stored value would silently stop matching on a toolchain bump; FNV-1a is fixed
 /// because it is written here.
 fn graph_fingerprint(repo: &std::path::Path) -> String {
-    graph_fingerprint_of(repo, &workflow::standard_definitions().unwrap_or_default())
+    graph_fingerprint_of(
+        repo,
+        workflow::STANDARD_WORKFLOW_V1,
+        &workflow::standard_definitions().unwrap_or_default(),
+    )
 }
 
-/// `graph_fingerprint` against explicit standard definitions, so the contribution of the embedded
-/// module is testable without rebuilding the binary.
-fn graph_fingerprint_of(repo: &std::path::Path, definitions: &str) -> String {
+/// `graph_fingerprint` against an explicit bundled orchestration and standard definitions, so the
+/// contribution of the embedded sources is testable without rebuilding the binary.
+fn graph_fingerprint_of(repo: &std::path::Path, orchestration: &str, definitions: &str) -> String {
     let scripts_in = |dir: PathBuf| -> Vec<PathBuf> {
         std::fs::read_dir(dir)
             .map(|entries| {
@@ -336,6 +340,12 @@ fn graph_fingerprint_of(repo: &std::path::Path, definitions: &str) -> String {
     // their `LOAD`ed prompts already inlined by the transpile. Without this, two builds that run
     // demonstrably different graphs would report the same hash.
     fold(definitions.as_bytes());
+    // And the orchestration that sequences them, which ships in the binary the same way. It is the
+    // stage order, the branching, the convergence checks and the gates — change any of them and the
+    // graph that ran is a different one, with no file in the repository to say so. Folded raw
+    // rather than transpiled because it carries no `LOAD` of its own: the prompts are inlined into
+    // the definitions above, which is why *those* have to be the transpiled form.
+    fold(orchestration.as_bytes());
     for path in sources {
         // A missing file still contributes its name, so adding a `workflow.ts` changes the
         // fingerprint even if it is empty.
@@ -2367,13 +2377,37 @@ mod agent_config_tests {
         // binary — no file in the repo to walk. Two builds whose `nodes.ts` or whose `LOAD`ed
         // prompts differ must not report the same provenance. (The transpiled source already has
         // the prompts inlined, so hashing it covers both.)
+        let definitions = workflow::standard_definitions().unwrap();
         assert_ne!(
-            graph_fingerprint_of(&root, "export const analyst = { instructions: 'first' };"),
-            graph_fingerprint_of(&root, "export const analyst = { instructions: 'second' };"),
+            graph_fingerprint_of(
+                &root,
+                workflow::STANDARD_WORKFLOW_V1,
+                "export const analyst = { instructions: 'first' };"
+            ),
+            graph_fingerprint_of(
+                &root,
+                workflow::STANDARD_WORKFLOW_V1,
+                "export const analyst = { instructions: 'second' };"
+            ),
+        );
+
+        // The bundled orchestration ships the same way and is just as much the graph: it is the
+        // stage order, the branching and the gates. Editing `standard-v1.ts` changed what ran and
+        // left the hash where it was.
+        assert_ne!(
+            graph_fingerprint_of(&root, workflow::STANDARD_WORKFLOW_V1, &definitions),
+            graph_fingerprint_of(
+                &root,
+                &format!(
+                    "{}\n// a different orchestration\n",
+                    workflow::STANDARD_WORKFLOW_V1
+                ),
+                &definitions
+            ),
         );
         assert_eq!(
             graph_fingerprint(&root),
-            graph_fingerprint_of(&root, &workflow::standard_definitions().unwrap()),
+            graph_fingerprint_of(&root, workflow::STANDARD_WORKFLOW_V1, &definitions),
             "the fingerprint is the one taken over this build's definitions"
         );
 
