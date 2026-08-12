@@ -524,6 +524,20 @@ async fn defined_in(
             found.push(legacy);
         }
     }
+    // The bundled workflow is always in the registry, so a repository workflow answering to its
+    // name puts two rows with one name in `ratatoskr workflows` and makes `--workflow built-in`
+    // resolve to whichever the registry listed first. Two *scripted* workflows sharing a name are
+    // already refused; the bundled one is a name just as taken.
+    if found.iter().any(|w| w.meta().name == BUILT_IN) {
+        return Err(PlanError::node(
+            "workflow",
+            NodeError::Failed(format!(
+                "a workflow in this repository is named `{BUILT_IN}`, which is the bundled \
+                 workflow's name; the bundled workflow is always in the registry, so that name is \
+                 taken — rename it in its `defineWorkflow` call"
+            )),
+        ));
+    }
     Ok(found)
 }
 
@@ -3103,6 +3117,31 @@ mod referee_governance_tests {
         }
         let found = defined_in(&dir, &dir.join("absent.ts")).await.unwrap();
         (dir, found)
+    }
+
+    #[tokio::test]
+    async fn a_repository_workflow_cannot_take_the_bundled_workflows_name() {
+        // The bundled workflow is always in the registry, so a second row under its name makes
+        // `ratatoskr workflows` list two `built-in`s and `--workflow built-in` resolve to whichever
+        // came first. Two scripted workflows sharing a name are already refused; so is this.
+        let dir = std::env::temp_dir().join(format!("ratatoskr-name-clash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ours.ts"),
+            format!(
+                r#"defineWorkflow({{ name: "{BUILT_IN}" }});
+                   export async function plan(input) {{ return input; }}"#
+            ),
+        )
+        .unwrap();
+
+        let error = match defined_in(&dir, &dir.join("absent.ts")).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("the bundled workflow's name is taken"),
+        };
+        assert!(error.contains(BUILT_IN), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
