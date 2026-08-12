@@ -3005,7 +3005,7 @@ mod referee_governance_tests {
                  name: "ours",
                  stages: [stage("analyst", { ...nodes.analyst, agent: "explore" })],
                });
-               async function plan(input) { return input; }"#,
+               export async function plan(input) { return input; }"#,
         )
         .unwrap();
 

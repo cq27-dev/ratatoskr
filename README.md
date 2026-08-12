@@ -91,8 +91,14 @@ defineWorkflow({
   purpose: "Answer a question about the repository without changing it.",
   whenToUse: ["the task asks what or why", "no code change is expected"],
 });
-async function plan(input) { /* compose the node bindings */ }
+export async function plan(input) { /* compose the node bindings */ }
 ```
+
+A workflow is an ES module, so its entries are the functions it **exports** — a `plan` or `run`
+declared without `export` is module-scoped and the run fails saying so. That is also what lets a
+workflow `import` shared stage definitions instead of restating them; imports resolve only from
+what the host offers (`ratatoskr/nodes`), never from the filesystem, and a specifier that is not a
+string literal is refused when the workflow is loaded.
 
 A workflow that introduces a node of its own lists it in `nodes`, so `.ratatoskr/rules/<node>.ts`
 is accepted rather than rejected as targeting something that does not exist. A node's preamble is
@@ -108,8 +114,8 @@ With one defined it is used; with several, name one with `--workflow <name>` —
 `[models.overseer]` route and one is chosen per task from the declared purposes and cases, with the
 choice and its reasoning checkpointed. Without either, a repo with several workflows is asked to
 name one rather than guessed at: choosing the alphabetically-first would look like a decision while
-being an accident. With none, the built-in flow above runs. A single `.ratatoskr/workflow.ts` still
-works and is registered under its filename.
+being an accident. With none, the built-in flow above runs. A single `.ratatoskr/workflow.ts` is
+also read, and is registered under its filename.
 
 Every node's output is validated against its JSON Schema and checkpointed before the next node
 runs, so a failure stops the run with `status = failed` attributed to the node that failed, and the

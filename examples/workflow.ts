@@ -2,7 +2,13 @@
 // a declared requirements stage. Copy it to `.ratatoskr/workflow.ts` and edit to customize how a
 // run is sequenced. It expects the `requirements` profile from `examples/agent-profiles.toml`.
 //
-// The script only *composes* the node bindings. Every gate stays Rust-enforced no matter what the
+// A workflow is an ES module. Its entries are the functions it **exports** — `plan` and `run`
+// below — so a declaration without `export` is module-scoped and the run fails saying so.
+// `import` resolves only from what the host offers (`ratatoskr/nodes`), never from the filesystem,
+// and only from a string literal; the prelude (`defineWorkflow`, `stage`, `str`/`obj`/…) and the
+// node bindings are globals, which module scope reads normally. Top-level `this` is `undefined`.
+//
+// The module only *composes* the node bindings. Every gate stays Rust-enforced no matter what the
 // script does: `context()` owns deterministic evidence collection; `redTeam()` owns its fresh
 // baseline and test-author worktree; `implement()`/`iterate()` own the sandbox and acceptance;
 // `verify()` owns diff collection and review thresholds; and terminal status and effects are
@@ -105,13 +111,13 @@ async function gatherPlan(input: { issue: string }) {
 }
 
 // `plan`: context -> requirements -> analyst. Rust reconstructs the PlanOutcome from checkpoints.
-async function plan(input: { issue: string }) {
+export async function plan(input: { issue: string }) {
   const { gathered, requirementsOut, analysis } = await gatherPlan(input);
   return { context: gathered, requirements: requirementsOut, analyst: analysis };
 }
 
 // `run`: plan, optional fork, sequential red-team -> implementation, then bounded convergence.
-async function run(input: { issue: string; maxIterations: number; alwaysFork: boolean }) {
+export async function run(input: { issue: string; maxIterations: number; alwaysFork: boolean }) {
   const planned = await gatherPlan(input);
   let analystOut = planned.analysis;
 

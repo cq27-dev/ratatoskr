@@ -1,5 +1,10 @@
 //! TypeScript → JavaScript via swc (type stripping): parse → optional workflow rewrites → resolver
 //! → strip → fixer → optional inspection of the emitted program → codegen.
+//!
+//! A ruleset is a script and a workflow is an ES module, but only their surrounding checks differ:
+//! this pass emits the same JavaScript for both and never rewrites a workflow's shape. A workflow's
+//! entries are the functions it exports, which the runtime reads off the evaluated module, so
+//! nothing here has to make module-scoped declarations reachable from somewhere else.
 
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
@@ -7,9 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use swc_core::common::sync::Lrc;
 use swc_core::common::{FileName, GLOBALS, Mark, SourceMap, Span, Spanned};
 use swc_core::ecma::ast::{
-    ArrowExpr, CallExpr, Callee, Class, Decl, ExportAll, Expr, Function, ImportDecl, Lit,
-    ModuleDecl, ModuleItem, NamedExport, ObjectPatProp, Pat, Program, Stmt, Str, VarDecl,
-    VarDeclKind,
+    CallExpr, Callee, ExportAll, Expr, ImportDecl, Lit, NamedExport, Program, Str,
 };
 use swc_core::ecma::codegen::text_writer::JsWriter;
 use swc_core::ecma::codegen::{Config as CodegenConfig, Emitter};
@@ -173,8 +176,7 @@ fn transpile_with_loads(
     permitted: &[&str],
     load: &mut dyn FnMut(&str) -> Result<LoadedText, String>,
 ) -> Result<String, ScriptError> {
-    let mut entries = Vec::new();
-    let mut javascript = transpile(
+    transpile(
         src,
         file_name,
         |parsed| {
@@ -191,7 +193,6 @@ fn transpile_with_loads(
             }
         },
         |parsed| {
-            entries = published_global_names(&parsed.program);
             let mut refs = ModuleRefs {
                 source_map: &parsed.source_map,
                 display_path,
@@ -204,117 +205,7 @@ fn transpile_with_loads(
                 None => Ok(()),
             }
         },
-    )?;
-    // A workflow is evaluated as an ES module, so `async function plan(..)` is module-scoped and
-    // invisible to the entry invoker, which looks entries up on `globalThis`. Publishing them keeps
-    // a workflow an ordinary file of functions instead of demanding `export` on every entry.
-    for entry in entries {
-        javascript.push_str(&format!("\nglobalThis.{entry} = {entry};"));
-    }
-    Ok(javascript)
-}
-
-/// The names a source would have put on `globalThis` when a workflow was evaluated as a script.
-///
-/// Runs on the emitted program, after type stripping, so it reads the declarations that actually
-/// exist at runtime. A TypeScript construct that lowers to something else is therefore seen as what
-/// it lowers to: `namespace N { export var helper = 1 }` publishes the `var N` the lowering creates
-/// and not `helper`, which the lowering turned into a property of `N` with no binding of its own.
-///
-/// Two kinds reached the global object and must keep reaching it, or module scoping silently narrows
-/// what a workflow may be written as — and an entry the runtime cannot find is a confusing way to
-/// learn that:
-///
-/// * a top-level function declaration (ambient `declare function` emits nothing to assign, so it is
-///   skipped);
-/// * every binding a `var` introduces, wherever it sits. `var` hoists out of blocks, branches and
-///   loops to its enclosing function, which at a script's top level is the global object, and it
-///   binds through destructuring — `var { plan } = ..` published `plan`.
-///
-/// Not `let` or `const`: those are lexical even at a script's top level and never became properties
-/// of the global object, so publishing them would invent reach a workflow never had.
-fn published_global_names(program: &Program) -> Vec<String> {
-    let mut names = Vec::new();
-    for declaration in top_level_declarations(program) {
-        if let Decl::Fn(function) = declaration
-            && !function.declare
-        {
-            names.push(function.ident.sym.to_string());
-        }
-    }
-    let mut hoisted = HoistedVars { names: Vec::new() };
-    program.visit_with(&mut hoisted);
-    names.extend(hoisted.names);
-    names.dedup();
-    names
-}
-
-fn top_level_declarations(program: &Program) -> Vec<&Decl> {
-    match program {
-        Program::Module(module) => module
-            .body
-            .iter()
-            .filter_map(|item| match item {
-                ModuleItem::Stmt(Stmt::Decl(declaration)) => Some(declaration),
-                ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => Some(&export.decl),
-                _ => None,
-            })
-            .collect(),
-        Program::Script(script) => script
-            .body
-            .iter()
-            .filter_map(|statement| match statement {
-                Stmt::Decl(declaration) => Some(declaration),
-                _ => None,
-            })
-            .collect(),
-    }
-}
-
-/// Collects the bindings of every `var` in the global statement scope.
-struct HoistedVars {
-    names: Vec<String>,
-}
-
-impl Visit for HoistedVars {
-    fn visit_var_decl(&mut self, declaration: &VarDecl) {
-        if declaration.kind == VarDeclKind::Var && !declaration.declare {
-            for declarator in &declaration.decls {
-                binding_names(&declarator.name, &mut self.names);
-            }
-        }
-        declaration.visit_children_with(self);
-    }
-
-    // A `var` inside a function or a class body belongs to that scope, not to the global object, so
-    // the walk stops at those boundaries rather than hoisting their locals into the global set.
-    fn visit_function(&mut self, _: &Function) {}
-    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
-    fn visit_class(&mut self, _: &Class) {}
-}
-
-/// Every identifier a binding pattern introduces, including through destructuring.
-fn binding_names(pattern: &Pat, out: &mut Vec<String>) {
-    match pattern {
-        Pat::Ident(identifier) => out.push(identifier.id.sym.to_string()),
-        Pat::Array(array) => array
-            .elems
-            .iter()
-            .flatten()
-            .for_each(|element| binding_names(element, out)),
-        Pat::Object(object) => {
-            for property in &object.props {
-                match property {
-                    ObjectPatProp::KeyValue(entry) => binding_names(&entry.value, out),
-                    ObjectPatProp::Assign(entry) => out.push(entry.key.id.sym.to_string()),
-                    ObjectPatProp::Rest(rest) => binding_names(&rest.arg, out),
-                }
-            }
-        }
-        Pat::Assign(assign) => binding_names(&assign.left, out),
-        Pat::Rest(rest) => binding_names(&rest.arg, out),
-        Pat::Expr(_) | Pat::Invalid(_) => {}
-    }
+    )
 }
 
 struct ParsedProgram {
@@ -450,6 +341,18 @@ impl ModuleRefs<'_> {
             format_args!("import `{requested}`: no such module; {available}"),
         ));
     }
+
+    fn reject_computed(&mut self, span: Span) {
+        if self.error.is_some() {
+            return;
+        }
+        self.error = Some(error_at(
+            self.source_map,
+            self.display_path,
+            span,
+            "import(..) with a computed specifier: a workflow's imports must be statically known",
+        ));
+    }
 }
 
 impl Visit for ModuleRefs<'_> {
@@ -468,16 +371,26 @@ impl Visit for ModuleRefs<'_> {
         self.check(export.span, &export.src.value.to_string_lossy());
     }
 
-    // A dynamic `import(..)` goes through the same resolver. Only a literal specifier can be judged
-    // before evaluation; a computed one is left to the engine.
+    // A dynamic `import(..)` goes through the same resolver, so it is held to the same permitted
+    // set. A computed specifier cannot be judged before evaluation, and letting it through would
+    // leave one module reference reported by the engine with no line or column — so it is refused
+    // here instead, at its own position.
     fn visit_call_expr(&mut self, call: &CallExpr) {
         call.visit_children_with(self);
-        if matches!(call.callee, Callee::Import(_))
-            && let Some(argument) = call.args.first()
-            && argument.spread.is_none()
-            && let Expr::Lit(Lit::Str(requested)) = argument.expr.as_ref()
-        {
-            self.check(call.span, &requested.value.to_string_lossy());
+        if !matches!(call.callee, Callee::Import(_)) {
+            return;
+        }
+        let literal = call
+            .args
+            .first()
+            .filter(|a| a.spread.is_none())
+            .and_then(|argument| match argument.expr.as_ref() {
+                Expr::Lit(Lit::Str(requested)) => Some(requested),
+                _ => None,
+            });
+        match literal {
+            Some(requested) => self.check(call.span, &requested.value.to_string_lossy()),
+            None => self.reject_computed(call.span),
         }
     }
 }
@@ -573,86 +486,6 @@ mod tests {
     }
 
     #[test]
-    fn a_workflow_publishes_its_top_level_functions_as_globals() {
-        // The entry invoker looks entries up on `globalThis`, and a workflow is evaluated as an ES
-        // module, where a top-level `function` is module-scoped.
-        let js = transpile_with_includes(
-            "w",
-            "async function plan(i: string) { return i; }\nexport function helper() {}",
-            &[],
-            &[],
-        )
-        .unwrap();
-        assert!(js.contains("globalThis.plan = plan;"), "got: {js}");
-        assert!(js.contains("globalThis.helper = helper;"), "got: {js}");
-        // Rulesets are plain scripts and get no such rewriting.
-        assert!(
-            !transpile_ts("async function plan(i) { return i; }")
-                .unwrap()
-                .contains("globalThis"),
-        );
-    }
-
-    #[test]
-    fn the_published_set_is_the_one_script_evaluation_gave() {
-        // `var` hoisted onto the global object when a workflow was a script, so an entry written
-        // that way has to keep resolving; `let` and `const` are lexical and never did, so publishing
-        // them now would invent reach a workflow never had.
-        let js = transpile_with_includes(
-            "w",
-            "var plan = async function (i: string) { return i; };\n\
-             let helper = () => {};\n\
-             const other = 1;",
-            &[],
-            &[],
-        )
-        .unwrap();
-        assert!(js.contains("globalThis.plan = plan;"), "got: {js}");
-        assert!(!js.contains("globalThis.helper"), "got: {js}");
-        assert!(!js.contains("globalThis.other"), "got: {js}");
-    }
-
-    #[test]
-    fn a_var_publishes_wherever_it_sits_and_however_it_binds() {
-        // `var` hoists out of blocks to the enclosing function — at a script's top level, the global
-        // object — and binds through destructuring. Both reached `globalThis` before this engine
-        // evaluated modules, so an entry written either way has to keep resolving.
-        let js = transpile_with_includes(
-            "w",
-            "if (ready) { var branched = async (i) => i; }\n\
-             for (var counted = 0; counted < 1; counted++) {}\n\
-             var { plan, missing = 1 } = parts;\n\
-             var [first, ...rest] = list;\n\
-             function outer() { var inside = 1; return inside; }\n\
-             const shape = { method() { var buried = 2; return buried; } };",
-            &[],
-            &[],
-        )
-        .unwrap();
-        for published in ["branched", "counted", "plan", "missing", "first", "rest"] {
-            assert!(
-                js.contains(&format!("globalThis.{published} = {published};")),
-                "`{published}` should be published, got: {js}"
-            );
-        }
-        // A `var` inside a function or a method belongs to that scope, not the global object.
-        assert!(!js.contains("globalThis.inside"), "got: {js}");
-        assert!(!js.contains("globalThis.buried"), "got: {js}");
-    }
-
-    #[test]
-    fn a_namespace_publishes_the_binding_its_lowering_leaves_behind() {
-        // A namespace member is not a binding of its own: swc lowers `helper` to a property of `N`.
-        // Publishing the name the source wrote would emit `globalThis.helper = helper;` against
-        // nothing, and the workflow would throw at load. Collecting after the lowering sees only
-        // `var N`, which is a real global and the one an entry could be reached through.
-        let js = transpile_with_includes("w", "namespace N { export var helper = 1; }", &[], &[])
-            .unwrap();
-        assert!(!js.contains("globalThis.helper"), "got: {js}");
-        assert!(js.contains("globalThis.N = N;"), "got: {js}");
-    }
-
-    #[test]
     fn an_import_erased_before_codegen_is_not_held_to_the_permitted_set() {
         // Each of these leaves no module reference in the emitted JavaScript, so there is nothing
         // for the engine to resolve and nothing for the permitted set to judge — including the ones
@@ -710,6 +543,28 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn a_computed_dynamic_import_is_refused_where_it_is_written() {
+        // Nothing can judge it before evaluation, and leaving it to the engine is the one module
+        // reference that would fail with no line or column — the thing every other check here
+        // exists to avoid.
+        let error = transpile_with_includes(
+            "w",
+            "const which = \"ratatoskr/nodes\";\n\
+             export async function plan() {\n  return await import(which);\n}",
+            &[],
+            &["ratatoskr/nodes"],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("w:3:16:"), "{error}");
+        assert!(
+            error.contains("import(..) with a computed specifier"),
+            "{error}"
+        );
+        assert!(error.contains("statically known"), "{error}");
     }
 
     #[test]

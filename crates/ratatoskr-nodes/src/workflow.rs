@@ -3390,7 +3390,7 @@ mod tests {
         let runtime = WorkflowRuntime::bundled_with_includes(
             "incomplete-standard-plan",
             r#"defineWorkflow({ name: "incomplete-standard-plan" });
-               async function plan(input) { return input; }"#,
+               export async function plan(input) { return input; }"#,
             &[],
             &[],
         )
@@ -4365,7 +4365,7 @@ mod tests {
         std::fs::write(
             &workflow_path,
             r#"defineWorkflow({ name: "terminal-probe" });
-               async function plan(input) {
+               export async function plan(input) {
                  return input.target === "publisher"
                    ? await publisher(input)
                    : await bookkeeper(input);
@@ -4428,7 +4428,7 @@ mod tests {
         std::fs::write(
             &workflow_path,
             r#"defineWorkflow({ name: "write-stage-probe" });
-               async function plan(input) {
+               export async function plan(input) {
                  return input.target === "redteam_author"
                    ? await redteam_author(input)
                    : await implementer_attempt(input);
@@ -4633,7 +4633,7 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            r#"async function plan(input) {
+            r#"export async function plan(input) {
                  await analyst(input.fresh);
                  return await analyst(input.revision);
                }"#,
@@ -4969,7 +4969,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let source = format!(
-            "defineWorkflow({{ name: \"renderer-parity\" }}); async function run(input) {{ {calls} return true; }}"
+            "defineWorkflow({{ name: \"renderer-parity\" }}); export async function run(input) {{ {calls} return true; }}"
         );
         let runtime = WorkflowRuntime::bundled_with_includes("renderer-parity", &source, &[], &[])
             .await
@@ -5075,7 +5075,7 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            "async function run(input) { return await bookkeeper(input); }",
+            "export async function run(input) { return await bookkeeper(input); }",
         )
         .unwrap();
         let runtime = WorkflowRuntime::load(&workflow_path, &[])
@@ -5283,7 +5283,7 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            "async function run(input) { return await publisher(input); }",
+            "export async function run(input) { return await publisher(input); }",
         )
         .unwrap();
         let runtime = WorkflowRuntime::load(&workflow_path, &[])
@@ -6158,14 +6158,14 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            r#"async function plan(input) { return await context_distillation(input); }"#,
+            r#"export async function plan(input) { return await context_distillation(input); }"#,
         )
         .unwrap();
         let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
-        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
         let store = Store::open_in_memory().unwrap();
         store
             .upsert_run(
@@ -6403,14 +6403,14 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            r#"async function plan(input) { return await context(input.issue); }"#,
+            r#"export async function plan(input) { return await context(input.issue); }"#,
         )
         .unwrap();
         let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
-        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
         let store = Store::open_in_memory().unwrap();
         store
             .upsert_run("run-context-no-rag", None, RunStatus::Running.as_str())
@@ -6652,7 +6652,7 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            r#"async function plan(input) {
+            r#"export async function plan(input) {
                 return await redteam_classifier(input.classifier);
             }"#,
         )
@@ -6661,7 +6661,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
         let store = Store::open_in_memory().unwrap();
         store
             .upsert_run("run-standard-redteam", None, RunStatus::Running.as_str())
@@ -7328,14 +7328,14 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            r#"async function plan(input) { return await characterizer(input); }"#,
+            r#"export async function plan(input) { return await characterizer(input); }"#,
         )
         .unwrap();
         let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
-        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
         let store = Store::open_in_memory().unwrap();
         store
             .upsert_run(
@@ -7626,7 +7626,7 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            r#"async function plan(input) { return await overseer(input); }"#,
+            r#"export async function plan(input) { return await overseer(input); }"#,
         )
         .unwrap();
         let runtime = WorkflowRuntime::load(&workflow_path, &[])
@@ -7836,7 +7836,7 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            r#"async function plan(input) { return await verifier(input); }"#,
+            r#"export async function plan(input) { return await verifier(input); }"#,
         )
         .unwrap();
         let runtime = WorkflowRuntime::load(&workflow_path, &[])
@@ -8687,7 +8687,7 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            "async function run() { throw new Error('terminal failure'); }",
+            "export async function run() { throw new Error('terminal failure'); }",
         )
         .unwrap();
         let runtime = WorkflowRuntime::load(&workflow_path, &[])

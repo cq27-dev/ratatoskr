@@ -3,12 +3,15 @@
 //! This is the node-agnostic seam. `ratatoskr-script` depends only on `ratatoskr-core`, so it can't
 //! call the concrete nodes; instead the caller (`ratatoskr-nodes`) registers named async **host
 //! functions**, each wrapping one node call site, and the script composes them. The runtime handles
-//! only the JS↔Rust plumbing: transpile, register hosts, invoke the script's entry function, and
-//! hand back JSON.
+//! only the JS↔Rust plumbing: transpile, register hosts, invoke the workflow's exported entry
+//! function, and hand back JSON.
 //!
-//! A workflow is evaluated as an ES module, so it can `import` definitions — stage declarations it
-//! would otherwise have to restate — from the map the host supplies. Nothing else changes: hosts and
-//! the prelude stay on `globalThis`, which module scope reads normally.
+//! A workflow is an ES module. It can `import` definitions — stage declarations it would otherwise
+//! have to restate — from the map the host supplies, and only from there: there is no filesystem
+//! behind the resolver, and an unoffered or computed specifier is refused at transpile time. Its
+//! **entries are its exported functions**: `export async function plan(..)`, read off the evaluated
+//! module rather than looked up on the global object. Hosts and the prelude do stay on `globalThis`,
+//! which module scope reads normally, and top-level `this` is `undefined` as in any module.
 //!
 //! Concurrency: a host function is exposed to JS as a promise-returning function backed by a spawned
 //! Rust future, so `await Promise.all([a(), b()])` in a script genuinely forks (proven ~concurrent
@@ -22,6 +25,7 @@ use std::sync::Arc;
 
 use ratatoskr_core::{Capability, SessionScope};
 use rquickjs::loader::{BuiltinLoader, BuiltinResolver};
+use rquickjs::module::Evaluated;
 use rquickjs::promise::{Promise, Promised};
 use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Ctx, Function, Module};
 
@@ -183,11 +187,7 @@ globalThis.defineWorkflow = function (meta) {
 globalThis.__workflowMeta = function () {
     return JSON.stringify(globalThis.__workflow);
 };
-globalThis.__runEntry = async function (entry, inputJson) {
-    var fn = globalThis[entry];
-    if (typeof fn !== "function") {
-        throw new Error("workflow.ts does not define a `" + entry + "` function");
-    }
+globalThis.__runEntry = async function (fn, inputJson) {
     var out = await fn(JSON.parse(inputJson));
     return JSON.stringify(out === undefined ? null : out);
 };
@@ -347,8 +347,8 @@ impl WorkflowRuntime {
         // the price of keeping the two paths independent.
         let declared = Self::declared(&context, &module_name, &loaded.javascript).await?;
         let meta = declared.unwrap_or_else(|| WorkflowMeta {
-            // A script that declares nothing is still usable and is named after its file. This is
-            // what keeps a repo's existing `workflow.ts` working with no edit.
+            // A workflow that declares nothing is still usable and is named after its file, so
+            // `defineWorkflow` stays optional for a workflow that only exports entries.
             name: path
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -441,9 +441,9 @@ impl WorkflowRuntime {
         Ok(found)
     }
 
-    /// Register `hosts` and invoke the script's `entry` function with `input_json` (a JSON string),
-    /// returning the entry's result as JSON. Any thrown error (host `Err`, or a bug in the script)
-    /// surfaces as [`ScriptError::Eval`].
+    /// Register `hosts` and invoke the workflow's exported `entry` function with `input_json` (a
+    /// JSON string), returning the entry's result as JSON. Any thrown error (host `Err`, or a bug in
+    /// the workflow) surfaces as [`ScriptError::Eval`].
     pub async fn run(
         &self,
         entry: &str,
@@ -472,7 +472,16 @@ impl WorkflowRuntime {
 
         self.context
             .async_with(async move |ctx| {
-                evaluate(&ctx, &module_name, &source).await?;
+                // The entry is read from the evaluated module, so it has to be resolved inside this
+                // closure: `Module<Evaluated>` borrows the context's `'js` lifetime and cannot
+                // outlive it.
+                let module = evaluate(&ctx, &module_name, &source).await?;
+                let entry_fn: Function = module.get(entry.as_str()).map_err(|_| {
+                    ScriptError::Eval(format!(
+                        "{module_name} does not export a `{entry}` function; \
+                         a workflow's entries are its exported functions"
+                    ))
+                })?;
 
                 for (name, source) in question_renderers {
                     let install = format!(
@@ -518,7 +527,7 @@ impl WorkflowRuntime {
                     .catch(&ctx)
                     .map_err(|e| ScriptError::Eval(format!("{e}")))?;
                 let promise: Promise = run_entry
-                    .call((entry, input_json))
+                    .call((entry_fn, input_json))
                     .catch(&ctx)
                     .map_err(|e| ScriptError::Eval(format!("{e}")))?;
                 promise
@@ -550,7 +559,8 @@ async fn engine(modules: Modules<'_>) -> Result<(AsyncRuntime, AsyncContext), Sc
     Ok((runtime, context))
 }
 
-/// Install the prelude, then evaluate the workflow as an ES module named after its source.
+/// Install the prelude, then evaluate the workflow as an ES module named after its source,
+/// returning the evaluated module so a caller can read what it exports.
 ///
 /// The order is load-bearing. Every statically imported module is fully evaluated before the
 /// importing module's first top-level statement, whatever the textual order, so a prelude
@@ -559,10 +569,14 @@ async fn engine(modules: Modules<'_>) -> Result<(AsyncRuntime, AsyncContext), Sc
 ///
 /// The module name is the workflow's own path, so an unresolved specifier reports the file an
 /// author would go and edit rather than a placeholder.
-async fn evaluate(ctx: &Ctx<'_>, module_name: &str, source: &str) -> Result<(), ScriptError> {
+async fn evaluate<'js>(
+    ctx: &Ctx<'js>,
+    module_name: &str,
+    source: &str,
+) -> Result<Module<'js, Evaluated>, ScriptError> {
     let fail = |e: rquickjs::CaughtError| ScriptError::Eval(format!("{e}"));
     ctx.eval::<(), _>(BOOTSTRAP).catch(ctx).map_err(fail)?;
-    let (_module, promise) = Module::declare(ctx.clone(), module_name, source)
+    let (module, promise) = Module::declare(ctx.clone(), module_name, source)
         .catch(ctx)
         .map_err(fail)?
         .eval()
@@ -570,7 +584,8 @@ async fn evaluate(ctx: &Ctx<'_>, module_name: &str, source: &str) -> Result<(), 
         .map_err(fail)?;
     // A module body's exception — an unresolvable import, a throwing `defineWorkflow` — surfaces
     // through the promise, not through `eval`, and top-level await resolves here too.
-    promise.into_future::<()>().await.catch(ctx).map_err(fail)
+    promise.into_future::<()>().await.catch(ctx).map_err(fail)?;
+    Ok(module)
 }
 
 #[cfg(test)]
@@ -599,7 +614,7 @@ mod tests {
         let rt = load(
             &dir,
             r#"
-            async function run(input: { x: number }) {
+            export async function run(input: { x: number }) {
                 const [a, b] = await Promise.all([slow(input.x), fast(input.x)]);
                 const c = await combine({ a, b });
                 return { a, b, c };
@@ -660,7 +675,7 @@ mod tests {
         ));
         let rt = load(
             &dir,
-            "async function run(input) { return await boom(input); }",
+            "export async function run(input) { return await boom(input); }",
         )
         .await;
 
@@ -700,7 +715,7 @@ mod tests {
                  purpose: "Answer a question about the repository without changing it.",
                  whenToUse: ["the task asks what or why", "no code change is expected"],
                });
-               async function plan(issue) { return issue; }"#,
+               export async function plan(issue) { return issue; }"#,
         )
         .unwrap();
 
@@ -725,7 +740,7 @@ mod tests {
                    instructions: LOAD("prompt.md").trim(),
                  })],
                });
-               async function plan(input) { return await probe(input); }"#,
+               export async function plan(input) { return await probe(input); }"#,
             &[("prompt.md", "bundled guidance\n")],
             &[],
         )
@@ -781,7 +796,7 @@ mod tests {
                    session: "compacted",
                  }],
                });
-               async function plan(issue) { return issue; }"#,
+               export async function plan(issue) { return issue; }"#,
         )
         .unwrap();
 
@@ -814,7 +829,7 @@ mod tests {
                    },
                  }],
                });
-               async function plan(input) {
+               export async function plan(input) {
                  await reviewer(input);
                  return await reviewer({ ...input, previous: "plan-v1" });
                }"#,
@@ -878,7 +893,7 @@ mod tests {
                    renderQuestion(input) { return { issue: input.issue }; },
                  }],
                });
-               async function plan(input) { return await reviewer(input); }"#,
+               export async function plan(input) { return await reviewer(input); }"#,
         )
         .await;
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -933,7 +948,7 @@ mod tests {
                    instructions: LOAD("prompt.md").trim(),
                  })],
                });
-               async function plan(input) { return input; }"#,
+               export async function plan(input) { return input; }"#,
         )
         .await;
 
@@ -1091,7 +1106,7 @@ mod tests {
                    stage("second_opinion", { ...reviewer, agent: "explore" }),
                  ],
                });
-               async function plan(input) { return await reviewer_host(input); }"#,
+               export async function plan(input) { return await reviewer_host(input); }"#,
         )
         .unwrap();
 
@@ -1211,17 +1226,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn an_entry_that_is_declared_but_not_exported_says_so() {
+        // A module-scoped `async function plan` is invisible outside the module, so the entry is
+        // genuinely absent — and "define it" would send an author looking at a function they can
+        // already see. The message has to name the missing `export`.
+        let dir = scratch("unexported-entry");
+        let path = dir.join("shy.ts");
+        std::fs::write(&path, "async function plan(i) { return i; }").unwrap();
+        let runtime = WorkflowRuntime::load(&path, &[]).await.unwrap().unwrap();
+        let error = runtime
+            .run("plan", "null".to_string(), HashMap::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("shy.ts"), "{error}");
+        assert!(
+            error.contains("does not export a `plan` function"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn a_namespace_loads_and_reaches_its_entry() {
         // swc lowers a namespace member to a property of the namespace object, so `helper` is not a
-        // binding of its own. Publishing the name the source wrote would emit
-        // `globalThis.helper = helper;` against nothing and the workflow would throw before its
-        // first entry ran — a workflow broken by the publishing, not by anything it did.
+        // binding of its own. The workflow reaches it through the namespace object the lowering
+        // leaves behind, which module scope reads exactly as a script's would have.
         let dir = scratch("namespace");
         let path = dir.join("ns.ts");
         std::fs::write(
             &path,
             "namespace N { export var helper = 7; }\n\
-             async function plan(i) { return N.helper; }",
+             export async function plan(i) { return N.helper; }",
         )
         .unwrap();
         let runtime = WorkflowRuntime::load(&path, &[]).await.unwrap().unwrap();
@@ -1235,11 +1271,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_script_that_declares_nothing_is_named_after_its_file() {
-        // What keeps a repo's existing `workflow.ts` working with no edit.
+        // `defineWorkflow` is optional: a workflow that only exports entries is still discoverable.
         let dir = scratch("undeclared");
         std::fs::write(
             dir.join("legacy.ts"),
-            "async function plan(i) { return i; }",
+            "export async function plan(i) { return i; }",
         )
         .unwrap();
         let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
@@ -1256,7 +1292,7 @@ mod tests {
         for file in ["a.ts", "b.ts"] {
             std::fs::write(
                 dir.join(file),
-                r#"defineWorkflow({ name: "same" }); async function plan(i) { return i; }"#,
+                r#"defineWorkflow({ name: "same" }); export async function plan(i) { return i; }"#,
             )
             .unwrap();
         }

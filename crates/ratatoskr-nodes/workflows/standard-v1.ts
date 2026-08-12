@@ -23,7 +23,7 @@ defineWorkflow({
 // deterministic evidence baseline and checkpoints the merged result; `analyst` is the declared
 // model stage and checkpoints the exact structured input below. Rust reconstructs the returned
 // PlanOutcome from those checkpoints, so this function's return value is informational only.
-async function plan(input: { issue: string }) {
+export async function plan(input: { issue: string }) {
   const gathered = await context(input.issue);
   // The initial built-in hand-off is AnalystInput::fresh. Rust retains the brief and constraints
   // in PlanOutcome and supplies them if review later asks the analyst to revise the plan.
@@ -114,7 +114,7 @@ async function full(input: {
   return { context: gathered, analyst: analysis, iterations };
 }
 
-async function run(input: {
+export async function run(input: {
   issue: string;
   maxIterations: number;
   alwaysFork: boolean;
@@ -125,7 +125,7 @@ async function run(input: {
 // Rust lifecycle adapters enter standard model stages here. The adapter supplies only the one
 // stage host it is authorized to run, while this bundled runtime applies that stage's declared
 // renderQuestion before the generic executor receives it.
-async function standardStageTurn(input: { stage: string; input: any }) {
+export async function standardStageTurn(input: { stage: string; input: any }) {
   switch (input.stage) {
     case "overseer": return await overseer(input.input);
     case "characterizer": return await characterizer(input.input);
