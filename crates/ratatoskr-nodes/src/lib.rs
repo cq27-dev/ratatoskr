@@ -1231,6 +1231,7 @@ async fn publish_and_checkpoint(
         input_json,
         workflow::StandardStageResources {
             resource_root: repo_root,
+            capability_ceiling: ratatoskr_core::Capability::Publish,
             rag_rat_worktree: worktree.map(|worktree| worktree.as_path().to_path_buf()),
             shell: None,
             publish: Some(workflow::StandardStagePublishResources { push }),
@@ -1307,6 +1308,7 @@ async fn bookkeep_and_checkpoint(
             input_json.clone(),
             workflow::StandardStageResources {
                 resource_root: repo_root,
+                capability_ceiling: ratatoskr_core::Capability::Read,
                 rag_rat_worktree: None,
                 shell: None,
                 publish: None,

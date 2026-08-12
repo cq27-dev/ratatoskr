@@ -225,6 +225,7 @@ impl ImplementerNode {
             input_json,
             crate::workflow::StandardStageResources {
                 resource_root: worktree.as_path().to_path_buf(),
+                capability_ceiling: ratatoskr_core::Capability::Write,
                 rag_rat_worktree: Some(worktree.as_path().to_path_buf()),
                 shell: Some(self.shell_access(worktree)),
                 publish: None,

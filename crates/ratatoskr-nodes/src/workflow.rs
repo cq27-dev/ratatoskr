@@ -1114,6 +1114,9 @@ async fn verify_host(
             input_json.clone(),
             StandardStageInvocation {
                 resource_root: Some(worktree.0.clone()),
+                // The review reads the change in place; it never gets to be the last writer in the
+                // tree it judges, whatever a workflow declares for the `verifier` stage.
+                capability_ceiling: ratatoskr_core::Capability::Read,
                 rag_rat_worktree: Some(worktree.0.clone()),
                 shell: None,
                 publish: None,
@@ -1192,6 +1195,7 @@ impl CeilingRecovery for LiveCeilingRecovery {
             input_json,
             StandardStageInvocation {
                 resource_root: None,
+                capability_ceiling: ratatoskr_core::Capability::Read,
                 rag_rat_worktree: None,
                 shell: None,
                 publish: None,
@@ -1417,6 +1421,7 @@ async fn context_host(
         input_json,
         StandardStageInvocation {
             resource_root: None,
+            capability_ceiling: ratatoskr_core::Capability::Read,
             rag_rat_worktree: None,
             shell: None,
             publish: None,
@@ -1576,6 +1581,13 @@ struct StageInvocation {
     input_json: String,
     rendered_question: Option<String>,
     resource_root: Option<PathBuf>,
+    /// What Rust grants THIS invocation, independent of where its file tools resolve.
+    ///
+    /// `resource_root` answers "where", never "may mutate": `verify_host` hands the review turn the
+    /// implementer's worktree so it can read the change, and a workflow is free to override the
+    /// verifier's declared capabilities. The offer takes the lower of this and the stage's own
+    /// ceiling, so an override can only ever narrow what the caller granted.
+    capability_ceiling: ratatoskr_core::Capability,
     rag_rat_worktree: Option<PathBuf>,
     shell: Option<ratatoskr_agent::shell::ShellAccess>,
     publish: Option<StandardStagePublishResources>,
@@ -1605,6 +1617,7 @@ fn stage_invocation(stage: Stage, host_input_json: String) -> Result<StageInvoca
             input_json: host_input_json,
             rendered_question: None,
             resource_root: None,
+            capability_ceiling: ratatoskr_core::Capability::Read,
             rag_rat_worktree: None,
             shell: None,
             publish: None,
@@ -1621,6 +1634,7 @@ fn stage_invocation(stage: Stage, host_input_json: String) -> Result<StageInvoca
             .map_err(|error| error.to_string())?,
         rendered_question: Some(envelope.rendered.question),
         resource_root: None,
+        capability_ceiling: ratatoskr_core::Capability::Read,
         rag_rat_worktree: None,
         shell: None,
         publish: None,
@@ -1676,6 +1690,7 @@ impl StageExecutor {
             input_json,
             rendered_question,
             resource_root,
+            capability_ceiling,
             rag_rat_worktree,
             shell,
             publish,
@@ -1696,12 +1711,18 @@ impl StageExecutor {
         // never on the strength of the declaration alone. A declared stage host owns no worktree
         // lifecycle, and its file root otherwise falls back to the process's working directory —
         // the operator's checkout — so a stage that declared `Write` would be editing that.
+        //
+        // The root says *where* the file tools resolve and nothing more: the caller's ceiling says
+        // whether this invocation may mutate there. Reading the two out of one field is what let a
+        // `capabilities: ["write"]` override of the read-only `verifier` hold Edit/Write inside the
+        // implementer's worktree — as the last writer after every gate had already passed.
+        let granted = ratatoskr_core::Capability::ceiling(&stage.capabilities)
+            .map(|declared| declared.min(capability_ceiling));
         if resource_root.is_some()
             && stage.tools.iter().any(|tool| {
                 tool == ratatoskr_agent::files::WRITE || tool == ratatoskr_agent::files::EDIT
             })
-            && ratatoskr_core::Capability::ceiling(&stage.capabilities)
-                .is_some_and(|ceiling| ceiling.permits(ratatoskr_core::Capability::Write))
+            && granted.is_some_and(|granted| granted.permits(ratatoskr_core::Capability::Write))
         {
             offered.add_local_tools(ratatoskr_agent::files::edit_declarations());
         }
@@ -1781,6 +1802,7 @@ impl StageExecutor {
                 input_json: serde_json::to_string(&task.input).map_err(|e| e.to_string())?,
                 rendered_question: None,
                 resource_root: resource_root.clone(),
+                capability_ceiling,
                 rag_rat_worktree: rag_rat_worktree.clone(),
                 shell: None,
                 publish: None,
@@ -2053,33 +2075,6 @@ pub(crate) async fn evaluate_standard_stage(
     evaluate_standard_stage_with_turn(ctx, stage_id, input_json, Arc::new(LiveStageTurn)).await
 }
 
-/// Evaluate a bundled standard stage with its file tools rooted at a Rust-owned resource.
-///
-/// The caller retains ownership of that resource's lifecycle. In particular, the red-team author
-/// may write into the implementer's pre-change worktree without giving a declared stage authority
-/// to create, select, retain, or remove worktrees.
-pub(crate) async fn evaluate_standard_stage_at(
-    ctx: Arc<WorkflowContext>,
-    stage_id: &str,
-    input_json: String,
-    resource_root: std::path::PathBuf,
-) -> Result<String, String> {
-    evaluate_standard_stage_with_resources(
-        ctx,
-        stage_id,
-        input_json,
-        StandardStageResources {
-            rag_rat_worktree: Some(resource_root.clone()),
-            resource_root,
-            shell: None,
-            publish: None,
-            clarifier: None,
-            guidance: None,
-        },
-    )
-    .await
-}
-
 /// Rust-owned resources granted to one bundled evidence turn.
 ///
 /// A stage may use these resources but cannot create, replace, retain, or clean them up. That
@@ -2088,6 +2083,8 @@ pub(crate) async fn evaluate_standard_stage_at(
 #[derive(Clone)]
 pub(crate) struct StandardStageResources {
     pub resource_root: PathBuf,
+    /// What this invocation may do in `resource_root`. See [`StageInvocation::capability_ceiling`].
+    pub capability_ceiling: ratatoskr_core::Capability,
     /// A linked worktree that rag-rat queries must see as an overlay over the base index.
     ///
     /// This is deliberately separate from the file-tool root: a Rust host selects the worktree
@@ -2111,6 +2108,9 @@ pub(crate) struct StandardStagePublishResources {
 #[derive(Clone)]
 struct StandardStageInvocation {
     resource_root: Option<PathBuf>,
+    /// See [`StageInvocation::capability_ceiling`]: the mutation grant is per invocation, not a
+    /// second meaning read out of `resource_root`.
+    capability_ceiling: ratatoskr_core::Capability,
     rag_rat_worktree: Option<PathBuf>,
     shell: Option<ratatoskr_agent::shell::ShellAccess>,
     publish: Option<StandardStagePublishResources>,
@@ -2137,6 +2137,7 @@ async fn execute_standard_stage(
         Box::pin(async move {
             let mut invocation = stage_invocation(stage, rendered_input)?;
             invocation.resource_root = settings.resource_root;
+            invocation.capability_ceiling = settings.capability_ceiling;
             invocation.rag_rat_worktree = settings.rag_rat_worktree;
             invocation.shell = settings.shell;
             invocation.publish = settings.publish;
@@ -2215,18 +2216,34 @@ async fn evaluate_standard_stage_with_turn_and_resources(
     resources: Option<StandardStageResources>,
     turn: Arc<dyn StageTurn>,
 ) -> Result<String, String> {
-    let (resource_root, rag_rat_worktree, shell, publish, clarifier, invocation_guidance) =
-        match resources {
-            Some(resources) => (
-                Some(resources.resource_root),
-                resources.rag_rat_worktree,
-                resources.shell,
-                resources.publish,
-                resources.clarifier,
-                resources.guidance,
-            ),
-            None => (None, None, None, None, None, None),
-        };
+    let (
+        resource_root,
+        capability_ceiling,
+        rag_rat_worktree,
+        shell,
+        publish,
+        clarifier,
+        invocation_guidance,
+    ) = match resources {
+        Some(resources) => (
+            Some(resources.resource_root),
+            resources.capability_ceiling,
+            resources.rag_rat_worktree,
+            resources.shell,
+            resources.publish,
+            resources.clarifier,
+            resources.guidance,
+        ),
+        None => (
+            None,
+            ratatoskr_core::Capability::Read,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    };
     // The run's registry, not a fresh standard one: a workflow that overrides `implementer_attempt`
     // (or any other adapter-invoked stage) must have that override be what this turn runs.
     let stages = ctx.stages().await.map_err(|error| error.to_string())?;
@@ -2242,6 +2259,7 @@ async fn evaluate_standard_stage_with_turn_and_resources(
         input_json,
         StandardStageInvocation {
             resource_root,
+            capability_ceiling,
             rag_rat_worktree,
             shell,
             publish,
@@ -2675,6 +2693,7 @@ async fn bookkeep_scripted(
             input_json,
             StandardStageResources {
                 resource_root: ctx.repo_path.clone(),
+                capability_ceiling: ratatoskr_core::Capability::Read,
                 rag_rat_worktree: None,
                 shell: None,
                 publish: None,
@@ -4107,6 +4126,7 @@ mod tests {
                 input_json: "{}".to_string(),
                 rendered_question: None,
                 resource_root: None,
+                capability_ceiling: ratatoskr_core::Capability::Read,
                 rag_rat_worktree: None,
                 shell: None,
                 publish: None,
@@ -4178,13 +4198,22 @@ mod tests {
         let turn = Arc::new(RecordingStageTurn::default());
         let executor = StageExecutor::new(ctx, stages, Arc::clone(&turn) as Arc<dyn StageTurn>);
 
-        for resource_root in [None, Some(dir.clone())] {
+        // Root alone, ceiling alone, and both: only the invocation that was granted BOTH a root and
+        // a `write` ceiling may mutate. The read-only grant is `verify_host`'s: a review turn is
+        // handed the implementer's worktree to read, and a `capabilities: ["write"]` override of
+        // the verifier must not turn that root into Edit/Write in the tree it judges.
+        for (resource_root, ceiling) in [
+            (None, ratatoskr_core::Capability::Write),
+            (Some(dir.clone()), ratatoskr_core::Capability::Read),
+            (Some(dir.clone()), ratatoskr_core::Capability::Write),
+        ] {
             executor
                 .execute(StageInvocation {
                     stage: stage.clone(),
                     input_json: "{}".to_string(),
                     rendered_question: None,
                     resource_root,
+                    capability_ceiling: ceiling,
                     rag_rat_worktree: None,
                     shell: None,
                     publish: None,
@@ -4203,8 +4232,12 @@ mod tests {
                 "{tool} was offered to a stage Rust gave no root"
             );
             assert!(
-                offered[1].iter().any(|offered| offered == tool),
-                "{tool} must still be offered against a supplied root"
+                !offered[1].iter().any(|offered| offered == tool),
+                "{tool} was offered to a stage Rust granted only `read` in the supplied root"
+            );
+            assert!(
+                offered[2].iter().any(|offered| offered == tool),
+                "{tool} must still be offered against a supplied root and a `write` grant"
             );
         }
         // The same rule for the shell, which neither invocation was granted.
@@ -5892,6 +5925,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("compose a memory".to_string()),
             resource_root: Some(dir.clone()),
+            capability_ceiling: ratatoskr_core::Capability::Read,
             rag_rat_worktree: None,
             shell: None,
             publish: None,
@@ -6098,6 +6132,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("do not publish".to_string()),
             resource_root: Some(dir.clone()),
+            capability_ceiling: ratatoskr_core::Capability::Publish,
             rag_rat_worktree: None,
             shell: None,
             publish: None,
@@ -6136,6 +6171,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("publish".to_string()),
             resource_root: Some(dir.clone()),
+            capability_ceiling: ratatoskr_core::Capability::Publish,
             rag_rat_worktree: None,
             shell: None,
             publish: Some(StandardStagePublishResources {
@@ -6230,6 +6266,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("deliver the run".to_string()),
             resource_root: Some(dir.clone()),
+            capability_ceiling: ratatoskr_core::Capability::Publish,
             rag_rat_worktree: None,
             shell: None,
             publish: Some(StandardStagePublishResources {
@@ -6334,6 +6371,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("deliver the run".to_string()),
             resource_root: Some(dir.clone()),
+            capability_ceiling: ratatoskr_core::Capability::Publish,
             rag_rat_worktree: None,
             shell: None,
             publish: Some(StandardStagePublishResources { push: None }),
@@ -6422,6 +6460,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("deliver the run".to_string()),
             resource_root: Some(dir.clone()),
+            capability_ceiling: ratatoskr_core::Capability::Publish,
             rag_rat_worktree: None,
             shell: None,
             publish: None,
@@ -7380,6 +7419,7 @@ mod tests {
             serde_json::to_string(&author).unwrap(),
             StandardStageResources {
                 resource_root: author_root.clone(),
+                capability_ceiling: ratatoskr_core::Capability::Write,
                 rag_rat_worktree: Some(author_root.clone()),
                 shell: None,
                 publish: None,
@@ -7526,6 +7566,7 @@ mod tests {
             serde_json::to_string(&author).unwrap(),
             StandardStageResources {
                 resource_root: author_root.clone(),
+                capability_ceiling: ratatoskr_core::Capability::Write,
                 rag_rat_worktree: None,
                 shell: None,
                 publish: None,
@@ -7689,6 +7730,7 @@ mod tests {
                 serde_json::to_string(input).unwrap(),
                 StandardStageResources {
                     resource_root: dir.clone(),
+                    capability_ceiling: ratatoskr_core::Capability::Write,
                     rag_rat_worktree: None,
                     shell: None,
                     publish: None,
@@ -7841,6 +7883,7 @@ mod tests {
             serde_json::to_string(&input).unwrap(),
             StandardStageResources {
                 resource_root: worktree.clone(),
+                capability_ceiling: ratatoskr_core::Capability::Write,
                 rag_rat_worktree: Some(worktree.clone()),
                 shell: Some(shell.clone()),
                 publish: None,
@@ -7888,6 +7931,7 @@ mod tests {
             serde_json::to_string(&input).unwrap(),
             StandardStageResources {
                 resource_root: dir.clone(),
+                capability_ceiling: ratatoskr_core::Capability::Write,
                 rag_rat_worktree: None,
                 shell: Some(shell),
                 publish: None,
@@ -8385,6 +8429,7 @@ mod tests {
             serde_json::to_string(&input).unwrap(),
             StandardStageInvocation {
                 resource_root: None,
+                capability_ceiling: ratatoskr_core::Capability::Read,
                 rag_rat_worktree: None,
                 shell: None,
                 publish: None,
@@ -8650,6 +8695,7 @@ mod tests {
             input_value.to_string(),
             StandardStageInvocation {
                 resource_root: None,
+                capability_ceiling: ratatoskr_core::Capability::Read,
                 rag_rat_worktree: None,
                 shell: None,
                 publish: None,

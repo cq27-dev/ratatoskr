@@ -150,11 +150,22 @@ impl TestAuthor {
         };
         let input_json = serde_json::to_string(&input)
             .map_err(|error| NodeError::Failed(format!("test author input: {error}")))?;
-        let raw = crate::workflow::evaluate_standard_stage_at(
+        // The author is the one red-team half that mutates: it writes failing tests into the
+        // implementer's pre-change worktree. The grant is stated here rather than inferred from the
+        // root, so the classifier's read-only half — and any override of either — cannot borrow it.
+        let raw = crate::workflow::evaluate_standard_stage_with_resources(
             std::sync::Arc::clone(&self.declared_context),
             "redteam_author",
             input_json,
-            worktree.to_path_buf(),
+            crate::workflow::StandardStageResources {
+                resource_root: worktree.to_path_buf(),
+                capability_ceiling: ratatoskr_core::Capability::Write,
+                rag_rat_worktree: Some(worktree.to_path_buf()),
+                shell: None,
+                publish: None,
+                clarifier: None,
+                guidance: None,
+            },
         )
         .await
         .map_err(|error| NodeError::Failed(format!("test author failed: {error}")))?;
