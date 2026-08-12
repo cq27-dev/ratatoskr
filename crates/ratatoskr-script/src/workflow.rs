@@ -299,6 +299,10 @@ pub struct WorkflowRuntime {
     source: Box<str>,
     meta: Box<WorkflowMeta>,
     dependencies: Box<[std::path::PathBuf]>,
+    /// Compiled into the binary rather than loaded from the repository. Tracked here because a
+    /// repository workflow may legitimately take any name, including the bundled one, so provenance
+    /// is not something a caller can recover by comparing `meta().name`.
+    bundled: bool,
 }
 
 impl WorkflowRuntime {
@@ -325,6 +329,7 @@ impl WorkflowRuntime {
             source: source.into_boxed_str(),
             meta: Box::new(meta),
             dependencies: Box::new([]),
+            bundled: true,
         })
     }
 
@@ -366,12 +371,18 @@ impl WorkflowRuntime {
             source: loaded.javascript.into_boxed_str(),
             meta: Box::new(meta),
             dependencies: loaded.dependencies.into_boxed_slice(),
+            bundled: false,
         }))
     }
 
     /// What this workflow says about itself.
     pub fn meta(&self) -> &WorkflowMeta {
         &self.meta
+    }
+
+    /// Whether this runtime is the one compiled into the binary.
+    pub fn is_bundled(&self) -> bool {
+        self.bundled
     }
 
     /// Canonical files whose text was compiled into this workflow through `LOAD`.

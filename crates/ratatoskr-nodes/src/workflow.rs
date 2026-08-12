@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use ratatoskr_core::{RatatoskrConfig, RunState, RunStatus};
 use ratatoskr_exec::{WorktreePath, remove_worktree};
-use ratatoskr_graph::{Node, NodeError};
+use ratatoskr_graph::NodeError;
 use ratatoskr_mcp::{RagRatClient, ServerTools};
 use ratatoskr_script::{HostFn, ScriptEngine, WorkflowRuntime};
 use ratatoskr_store::Store;
@@ -34,8 +34,8 @@ use serde_json::json;
 
 use crate::{
     AnalystOutput, BookkeeperInput, BookkeeperOutput, ChildTask, ImplementerNode,
-    ImplementerOutput, MemoryNode, MemoryOutput, PlanError, PlanOutcome, RedTeamNode,
-    RedTeamOutput, RunOutcome, ScoutOutput, Stage, bookkeeper, checkpoint, converge, memory,
+    ImplementerOutput, MemoryOutput, PlanError, PlanOutcome, RedTeamNode, RedTeamOutput,
+    RunOutcome, ScoutOutput, Stage, bookkeeper, checkpoint, converge,
     publisher::{PublisherInput, PublisherOutput},
     redteam, referee, stage_agent_config, verifier,
 };
@@ -134,6 +134,14 @@ pub struct WorkflowContext {
     acceptance: Mutex<Option<Vec<ratatoskr_core::AcceptanceStep>>>,
     /// OCI image identity frozen when this run first executes container-backed work.
     container_image: tokio::sync::OnceCell<Option<String>>,
+    /// The one stage registry this run executes: the standard stages with the running workflow's
+    /// declarations laid over them.
+    ///
+    /// Every consumer reads it from here — the JavaScript host table *and* the Rust-owned lifecycle
+    /// adapters that run `implementer_attempt`, `redteam_author`, `redteam_classifier` and
+    /// `characterizer`. Rebuilding it per path is what let an override validate at startup and then
+    /// be ignored by the model turn that actually ran.
+    stages: tokio::sync::OnceCell<Arc<Vec<Stage>>>,
 }
 
 pub(crate) struct WorkflowContextParams<'a> {
@@ -195,6 +203,7 @@ impl WorkflowContext {
             acceptance: Mutex::new(None),
             container_image: tokio::sync::OnceCell::new(),
             plugin_context,
+            stages: tokio::sync::OnceCell::new(),
             config: config.clone(),
             store: store.clone(),
             engine: Arc::clone(engine),
@@ -271,6 +280,48 @@ impl WorkflowContext {
     pub(crate) fn ledger(&self) -> &Arc<ratatoskr_agent::RunLedger> {
         &self.ledger
     }
+
+    /// This run's stage registry.
+    ///
+    /// `install_execution_stages` puts the running workflow's overlaid registry here before the
+    /// first host call. A context that never runs a workflow — the overseer's selection turn, and
+    /// the terminal bookkeeper/publisher adapters, both of which run outside one — falls back to the
+    /// bundled standard registry, which is what those turns are defined against.
+    pub(crate) async fn stages(&self) -> Result<Arc<Vec<Stage>>, PlanError> {
+        self.stages
+            .get_or_try_init(|| async { Ok(Arc::new(standard_stages().await?)) })
+            .await
+            .cloned()
+    }
+}
+
+/// Resolve the registry this run executes and install it on the context, once.
+///
+/// The workflow's declarations are laid over the standard stages rather than appended: an override
+/// replaces the standard stage where it sat, so the by-id scans (delegation resolution among them)
+/// find the override and not the original.
+async fn install_execution_stages(
+    ctx: &WorkflowContext,
+    runtime: &WorkflowRuntime,
+) -> Result<Arc<Vec<Stage>>, PlanError> {
+    ctx.stages
+        .get_or_try_init(|| async { Ok(Arc::new(overlaid_stages(runtime).await?)) })
+        .await
+        .cloned()
+}
+
+async fn overlaid_stages(runtime: &WorkflowRuntime) -> Result<Vec<Stage>, PlanError> {
+    let mut stages = standard_stages().await?;
+    // The bundled runtime declares the base stages itself; laying them over themselves would be a
+    // no-op with a duplicate-work cost. Decided by provenance, not by name: a repository workflow
+    // may take any name, including the bundled one, and its declarations still have to be honored.
+    if !runtime.is_bundled() {
+        crate::stage::overlay(
+            &mut stages,
+            crate::stage::stages_from_workflow(runtime.meta()),
+        );
+    }
+    Ok(stages)
 }
 
 // --- reconstruction helpers -------------------------------------------------
@@ -478,21 +529,6 @@ where
         Box::pin(async move { f(ctx, arg).await })
             as std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
     })
-}
-
-async fn memory_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
-    ctx.guard()?;
-    let input: memory::MemoryInput =
-        serde_json::from_str(&arg).map_err(|e| format!("memory arg: {e}"))?;
-    let node = MemoryNode {
-        sink: ctx.sink.clone(),
-    };
-    let out = node
-        .run(input, &RunState::new(&ctx.run_id, None))
-        .await
-        .map_err(|e| e.to_string())?;
-    note(&ctx, "memory", &out, Some(arg)).await?;
-    serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
 /// `acceptance` is passed in rather than read here because the baseline and the post-change run
@@ -1391,8 +1427,8 @@ async fn replan_at_ceiling_with<R: CeilingRecovery>(
 
 /// `context(issue)` — the merged gather step: distilled findings plus the memories unmodified.
 ///
-/// `scout()` and `memory()` remain for a script that composes them itself. This is the one that
-/// guarantees the ranked memory search happened.
+/// The one operation that guarantees the ranked memory search happened, so it is what both bundled
+/// entries call before anything reasons about the issue.
 async fn context_host(
     ctx: Arc<WorkflowContext>,
     executor: Arc<StageExecutor>,
@@ -1855,12 +1891,15 @@ impl StageExecutor {
     }
 }
 
-/// Compatibility adapter for scripted operations that still own Rust-only workflow state or
-/// gates. Migrating one means replacing this entry with a standard declarative stage.
+/// A Rust-owned operation a workflow calls as a bare host.
+///
+/// These are not stages and are not migrating away: each owns run state or a gate a declared stage
+/// cannot hold — the worktree lifecycle, the iteration ceiling, the acceptance baseline, the
+/// deterministic memory search behind `context`. The bundled `plan` and `full` entries call every
+/// one of them, and so may a repository workflow.
 #[derive(Clone, Copy)]
-enum TemporaryOperation {
+pub(crate) enum OperationHost {
     Context,
-    Memory,
     RedTeam,
     Implement,
     Iterate,
@@ -1870,7 +1909,7 @@ enum TemporaryOperation {
     TestCommandRan,
 }
 
-impl TemporaryOperation {
+impl OperationHost {
     fn host(self, ctx: &Arc<WorkflowContext>, executor: &Arc<StageExecutor>) -> HostFn {
         match self {
             Self::Context => {
@@ -1882,7 +1921,6 @@ impl TemporaryOperation {
                     Box::pin(async move { context_host(ctx, executor, arg).await })
                 })
             }
-            Self::Memory => binding(Arc::clone(ctx), memory_host),
             Self::RedTeam => binding(Arc::clone(ctx), red_team_host),
             Self::Implement => binding(Arc::clone(ctx), implement_host),
             Self::Iterate => binding(Arc::clone(ctx), iterate_host),
@@ -1910,23 +1948,25 @@ impl TemporaryOperation {
     }
 }
 
-const TEMPORARY_OPERATIONS: &[(&str, TemporaryOperation)] = &[
-    ("context", TemporaryOperation::Context),
-    ("memory", TemporaryOperation::Memory),
-    ("redTeam", TemporaryOperation::RedTeam),
-    ("implement", TemporaryOperation::Implement),
-    ("iterate", TemporaryOperation::Iterate),
-    ("replanAtCeiling", TemporaryOperation::ReplanAtCeiling),
-    ("verify", TemporaryOperation::Verify),
-    ("isConverged", TemporaryOperation::IsConverged),
-    ("testCommandRan", TemporaryOperation::TestCommandRan),
+/// The one authority on which names are operation hosts. Both the host table below and the
+/// startup check that reserves these names against stage declarations read this list, so a host
+/// added here cannot be silently shadowed by a declared stage of the same name.
+pub(crate) const OPERATION_HOSTS: &[(&str, OperationHost)] = &[
+    ("context", OperationHost::Context),
+    ("redTeam", OperationHost::RedTeam),
+    ("implement", OperationHost::Implement),
+    ("iterate", OperationHost::Iterate),
+    ("replanAtCeiling", OperationHost::ReplanAtCeiling),
+    ("verify", OperationHost::Verify),
+    ("isConverged", OperationHost::IsConverged),
+    ("testCommandRan", OperationHost::TestCommandRan),
 ];
 
-fn build_legacy_operation_hosts(
+fn build_operation_hosts(
     ctx: &Arc<WorkflowContext>,
     executor: &Arc<StageExecutor>,
 ) -> HashMap<String, HostFn> {
-    TEMPORARY_OPERATIONS
+    OPERATION_HOSTS
         .iter()
         .map(|(name, operation)| ((*name).to_string(), operation.host(ctx, executor)))
         .collect()
@@ -1938,11 +1978,20 @@ fn build_legacy_operation_hosts(
 // globals: a generic host has no worktree lifecycle from which to derive a safe resource root.
 const INTERNAL_WRITE_STAGE_IDS: &[&str] = &["redteam_author", "implementer_attempt"];
 
+// Delivery is terminal external I/O, not a workflow operation: these stages run only from their
+// Rust terminal adapters, after Rust has accepted the run outcome. Filtered here, at the one place
+// where a stage becomes a repository-JS global, rather than out of the registry — the adapters still
+// have to resolve them, and a filter applied before an overlay is a filter an override walks past.
+pub(crate) const TERMINAL_STAGE_IDS: &[&str] = &["bookkeeper", "publisher"];
+
 fn build_declared_stage_hosts(executor: &Arc<StageExecutor>) -> HashMap<String, HostFn> {
     executor
         .stages
         .iter()
-        .filter(|stage| !INTERNAL_WRITE_STAGE_IDS.contains(&stage.id.as_str()))
+        .filter(|stage| {
+            !INTERNAL_WRITE_STAGE_IDS.contains(&stage.id.as_str())
+                && !TERMINAL_STAGE_IDS.contains(&stage.id.as_str())
+        })
         .map(|stage| (stage.id.clone(), executor.host(stage.clone())))
         .collect()
 }
@@ -1955,10 +2004,10 @@ fn build_hosts_with_turn(
     let stages = Arc::new(stages.to_vec());
     let executor = StageExecutor::new(Arc::clone(ctx), Arc::clone(&stages), turn);
     let declared = build_declared_stage_hosts(&executor);
-    let mut hosts = build_legacy_operation_hosts(ctx, &executor);
+    let mut hosts = build_operation_hosts(ctx, &executor);
     if let Some(stage) = stages.iter().find(|stage| hosts.contains_key(&stage.id)) {
         return Err(PlanError::Configuration(format!(
-            "stage `{}` conflicts with a legacy workflow operation",
+            "stage `{}` conflicts with a workflow operation host",
             stage.id
         )));
     }
@@ -2208,7 +2257,9 @@ async fn evaluate_standard_stage_with_turn_and_resources(
             ),
             None => (None, None, None, None, None, None),
         };
-    let stages = Arc::new(standard_stages().await.map_err(|error| error.to_string())?);
+    // The run's registry, not a fresh standard one: a workflow that overrides `implementer_attempt`
+    // (or any other adapter-invoked stage) must have that override be what this turn runs.
+    let stages = ctx.stages().await.map_err(|error| error.to_string())?;
     let stage = stages
         .iter()
         .find(|stage| stage.id == stage_id)
@@ -2231,27 +2282,6 @@ async fn evaluate_standard_stage_with_turn_and_resources(
         },
     )
     .await
-}
-
-async fn execution_stages(runtime: &WorkflowRuntime) -> Result<Vec<Stage>, PlanError> {
-    let mut stages = standard_stages().await?;
-    // Delivery is terminal external I/O, not a workflow operation. These declarations are
-    // executed only by their Rust terminal adapters, after Rust has accepted the run outcome.
-    stages.retain(|stage| !matches!(stage.id.as_str(), "bookkeeper" | "publisher"));
-    // The bundled runtime declares the base stages themselves. Repository workflows lay only their
-    // own declarations over these; appending standard-v1 to itself would duplicate every model host
-    // and reintroduce the terminal declarations filtered above.
-    //
-    // Laid over, not appended: a workflow that imports `analyst` and changes one field declares
-    // *that* stage. Appending would leave the standard definition earlier in the vec, where the
-    // by-id scans — delegation resolution among them — would keep finding the original.
-    if runtime.meta().name != STANDARD_WORKFLOW_NAME {
-        crate::stage::overlay(
-            &mut stages,
-            crate::stage::stages_from_workflow(runtime.meta()),
-        );
-    }
-    Ok(stages)
 }
 
 // --- wrappers (own every status write, gate, and cleanup) -------------------
@@ -2284,7 +2314,7 @@ async fn run_plan_scripted_with_turn(
     )
     .await?;
 
-    let stages = execution_stages(&runtime).await?;
+    let stages = install_execution_stages(&ctx, &runtime).await?;
     let hosts = build_hosts_with_turn(&ctx, &stages, turn)?;
     let input = json!({ "issue": ctx.issue }).to_string();
     let result = runtime
@@ -2344,7 +2374,7 @@ async fn run_full_scripted_with_actions<A: FullTerminalActions>(
     )
     .await?;
 
-    let stages = execution_stages(&runtime).await?;
+    let stages = install_execution_stages(&ctx, &runtime).await?;
     let hosts = build_hosts(&ctx, &stages)?;
     let input = json!({
         "issue": ctx.issue,
@@ -3489,7 +3519,7 @@ mod tests {
         });
         let turn = Arc::new(SequencedStageTurn::new([initial, revised]));
         let runtime = standard_runtime().await.unwrap();
-        let stages = execution_stages(&runtime).await.unwrap();
+        let stages = install_execution_stages(&ctx, &runtime).await.unwrap();
         let mut hosts =
             build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
         assert!(!hosts.contains_key("publisher"));
@@ -3918,7 +3948,7 @@ mod tests {
             "changes_code": false
         })]));
         let runtime = standard_runtime().await.unwrap();
-        let stages = execution_stages(&runtime).await.unwrap();
+        let stages = install_execution_stages(&ctx, &runtime).await.unwrap();
         let mut hosts =
             build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
         let context_out = crate::ContextOutput {
@@ -4284,7 +4314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn temporary_operation_adapters_remain_registered_and_guarded() {
+    async fn operation_host_adapters_remain_registered_and_guarded() {
         let dir = std::env::temp_dir().join(format!(
             "ratatoskr-temporary-operations-{}",
             std::process::id()
@@ -4306,17 +4336,20 @@ mod tests {
         let hosts =
             build_hosts_with_turn(&ctx, &[], Arc::new(RecordingStageTurn::default())).unwrap();
 
-        for (name, _) in TEMPORARY_OPERATIONS {
+        for (name, _) in OPERATION_HOSTS {
             assert!(
                 hosts.contains_key(*name),
                 "missing operation adapter `{name}`"
             );
         }
-        assert!(
-            hosts.contains_key("memory"),
-            "repository workflows still use the deterministic memory adapter"
-        );
-        for removed in ["red_team", "implementer", "newlyIntroducedFailures"] {
+        // `memory` was superseded by the composite `context` operation, which is what guarantees
+        // the ranked search happened. Nothing calls it, so it is not a host.
+        for removed in [
+            "memory",
+            "red_team",
+            "implementer",
+            "newlyIntroducedFailures",
+        ] {
             assert!(
                 !hosts.contains_key(removed),
                 "obsolete operation alias `{removed}` was re-registered"
@@ -4337,11 +4370,11 @@ mod tests {
         let error = hosts["verify"]("{}".to_string()).await.unwrap_err();
         assert!(
             error.contains("verify arg"),
-            "legacy alias changed: {error}"
+            "operation host argument check changed: {error}"
         );
 
         ctx.invocations.store(INVOCATION_CEILING, Ordering::Relaxed);
-        let error = hosts["memory"]("{}".to_string()).await.unwrap_err();
+        let error = hosts["iterate"]("{}".to_string()).await.unwrap_err();
         assert!(error.contains("runaway loop"));
 
         let context = crate::built_in_stages()
@@ -4353,10 +4386,10 @@ mod tests {
             &[context],
             Arc::new(RecordingStageTurn::default()),
         ) {
-            Ok(_) => panic!("a declared stage replaced a temporary operation adapter"),
+            Ok(_) => panic!("a declared stage replaced an operation host"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("legacy workflow operation"));
+        assert!(error.to_string().contains("workflow operation host"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4395,7 +4428,7 @@ mod tests {
             crate::PluginContext::default(),
         )
         .unwrap();
-        let stages = execution_stages(&runtime).await.unwrap();
+        let stages = install_execution_stages(&ctx, &runtime).await.unwrap();
         let hosts = build_hosts(&ctx, &stages).unwrap();
         assert!(!hosts.contains_key("publisher"));
         assert!(!hosts.contains_key("bookkeeper"));
@@ -4458,7 +4491,7 @@ mod tests {
             crate::PluginContext::default(),
         )
         .unwrap();
-        let stages = execution_stages(&runtime).await.unwrap();
+        let stages = install_execution_stages(&ctx, &runtime).await.unwrap();
         for stage_id in INTERNAL_WRITE_STAGE_IDS {
             let stage = stages
                 .iter()
@@ -5107,7 +5140,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let stages = execution_stages(&runtime).await.unwrap();
+        let stages = overlaid_stages(&runtime).await.unwrap();
         assert_eq!(
             stages.iter().filter(|stage| stage.id == "analyst").count(),
             1,
@@ -5135,6 +5168,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_override_of_an_adapter_invoked_stage_is_what_the_model_turn_runs() {
+        // `implementer_attempt` and `redteam_author` never appear in the JavaScript host table:
+        // they run from Rust lifecycle adapters. Those adapters used to build a registry of their
+        // own, so an override of either validated at startup and was then ignored by the turn that
+        // actually ran. Asserted through the adapter entry point, not the registry.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-adapter-override-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"defineWorkflow({
+                 name: "ours",
+                 stages: [
+                   stage("implementer_attempt", {
+                     agent: "build",
+                     governedBy: "implementer",
+                     instructions: "OVERRIDDEN IMPLEMENTER",
+                     outputSchema: { type: "object" },
+                     renderQuestion(input: any) { return "OVERRIDDEN IMPLEMENTER QUESTION"; },
+                   }),
+                   stage("redteam_author", {
+                     agent: "build",
+                     governedBy: "redteam",
+                     instructions: "OVERRIDDEN AUTHOR",
+                     outputSchema: { type: "object" },
+                     renderQuestion(input: any) { return "OVERRIDDEN AUTHOR QUESTION"; },
+                   }),
+                 ],
+               });
+               export async function run(input) { return input; }"#,
+        )
+        .unwrap();
+        let definitions = standard_definitions().unwrap();
+        let runtime = WorkflowRuntime::load(
+            &workflow_path,
+            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("redteam".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-adapter-override",
+            "override an adapter-invoked stage",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        install_execution_stages(&ctx, &runtime).await.unwrap();
+
+        for (stage_id, sentinel) in [
+            ("implementer_attempt", "OVERRIDDEN IMPLEMENTER"),
+            ("redteam_author", "OVERRIDDEN AUTHOR"),
+        ] {
+            let turn = Arc::new(RecordingStageTurn::default());
+            evaluate_standard_stage_with_turn(
+                Arc::clone(&ctx),
+                stage_id,
+                "{}".to_string(),
+                Arc::clone(&turn) as Arc<dyn StageTurn>,
+            )
+            .await
+            .unwrap();
+            let preambles = turn
+                .preambles
+                .lock()
+                .expect("recording runner mutex poisoned");
+            let questions = turn
+                .questions
+                .lock()
+                .expect("recording runner mutex poisoned");
+            assert_eq!(preambles.len(), 1, "`{stage_id}` ran once");
+            assert!(
+                preambles[0].contains(sentinel),
+                "the adapter ran the standard `{stage_id}` instead of the override: {}",
+                preambles[0]
+            );
+            assert!(
+                questions[0].ends_with(&format!("{sentinel} QUESTION")),
+                "the override's renderQuestion is not the one that composed the turn: {}",
+                questions[0]
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_repository_workflow_may_take_the_bundled_name() {
+        // Provenance is a property of the runtime, not of its declared name. Comparing against
+        // `ratatoskr-standard-v1` made a repository workflow that chose that name lose every
+        // declaration it made — its own stages and its overrides both.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-bundled-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"import * as nodes from "ratatoskr/nodes";
+               defineWorkflow({
+                 name: "ratatoskr-standard-v1",
+                 stages: [
+                   stage("analyst", { ...nodes.analyst, instructions: "our own analysis" }),
+                   stage("reviewer", { agent: "reason", instructions: "review" }),
+                 ],
+               });
+               export async function plan(input) { return input; }"#,
+        )
+        .unwrap();
+        let definitions = standard_definitions().unwrap();
+        let runtime = WorkflowRuntime::load(
+            &workflow_path,
+            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!runtime.is_bundled());
+        assert!(standard_runtime().await.unwrap().is_bundled());
+
+        let stages = overlaid_stages(&runtime).await.unwrap();
+        assert_eq!(
+            stages
+                .iter()
+                .find(|stage| stage.id == "analyst")
+                .unwrap()
+                .instructions,
+            "our own analysis"
+        );
+        assert!(
+            stages.iter().any(|stage| stage.id == "reviewer"),
+            "a workflow's own stages must survive its choice of name"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn bookkeeper_declaration_matches_its_typed_schema_and_rust_question() {
         let dir = std::env::temp_dir().join(format!(
             "ratatoskr-bookkeeper-renderer-{}",
@@ -5153,13 +5331,16 @@ mod tests {
             .unwrap()
             .unwrap();
         let stages = standard_stages().await.unwrap();
+        // The declaration stays in the run's registry — the Rust terminal adapter resolves it
+        // there. What a repository workflow never gets is a host to call it with, which
+        // `repository_workflows_cannot_invoke_terminal_stages` holds.
         assert!(
-            execution_stages(&runtime)
+            overlaid_stages(&runtime)
                 .await
                 .unwrap()
                 .iter()
-                .all(|stage| stage.id != "bookkeeper"),
-            "repository workflows must not manufacture terminal bookkeeping"
+                .any(|stage| stage.id == "bookkeeper"),
+            "the terminal adapter must still be able to resolve its declaration"
         );
         let bookkeeper = stages
             .iter()
@@ -5362,12 +5543,12 @@ mod tests {
             .unwrap();
         let stages = standard_stages().await.unwrap();
         assert!(
-            execution_stages(&runtime)
+            overlaid_stages(&runtime)
                 .await
                 .unwrap()
                 .iter()
-                .all(|stage| stage.id != "publisher"),
-            "repository workflows must not acquire terminal publish authority"
+                .any(|stage| stage.id == "publisher"),
+            "the terminal adapter must still be able to resolve its declaration"
         );
         let publisher = stages.iter().find(|stage| stage.id == "publisher").unwrap();
         assert_eq!(publisher.agent, "publish");

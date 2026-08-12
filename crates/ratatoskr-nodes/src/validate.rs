@@ -5,9 +5,6 @@ use std::collections::BTreeSet;
 use crate::{AgentProfile, PlanError, Stage};
 
 const INTERNAL_GATES: &[&str] = &["referee"];
-// These names are kept for existing workflow.ts scripts. They are hosts, not stages: accepting
-// one as a declared stage would replace its declared binding with the legacy host below it.
-const LEGACY_HOST_ALIASES: &[&str] = &["memory", "implement", "iterate", "verify"];
 // The run writes checkpoints under these names itself — `issue` for the task it was given,
 // `clarification` for a completed question exchange — and readers identify those records by name
 // alone: `issue_text` in ratatoskr-serve, the clarification-history check in this crate's workflow
@@ -15,17 +12,42 @@ const LEGACY_HOST_ALIASES: &[&str] = &["memory", "implement", "iterate", "verify
 // sharing a name would land its own output in the same column and be read as one of those records.
 const RESERVED_RECORD_NAMES: &[&str] = &["issue", "clarification"];
 
-/// Reject a workflow that declares the same stage identifier twice.
+/// Judge what one workflow declares, before its declarations are laid over the standard registry.
 ///
 /// A workflow may reuse a *standard* identifier — that is an override, and the overlay replaces the
-/// imported stage with it. Declaring the same id twice in one workflow is not an override of
-/// anything: the overlay would silently keep only the last, so it is refused here instead.
-pub fn validate_unique_declarations(stages: &[Stage], workflow: &str) -> Result<(), PlanError> {
+/// imported stage with it. What it may not do is take a name the run itself owns. Every case is
+/// refused here, at load, rather than filtered afterwards: silently dropping a declaration is how an
+/// override comes to validate at startup and then not run.
+pub fn validate_declarations(stages: &[Stage], workflow: &str) -> Result<(), PlanError> {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for stage in stages {
+        // Declaring the same id twice is not an override of anything: the overlay would silently
+        // keep only the last.
         if !seen.insert(stage.id.as_str()) {
             return Err(PlanError::Configuration(format!(
                 "workflow `{workflow}` declares stage `{}` more than once",
+                stage.id
+            )));
+        }
+        // Bookkeeping and delivery run from Rust terminal adapters after the run outcome is
+        // accepted, with resources — a push grant, the committed worktree — that no workflow
+        // operation holds. Overriding one would mean declaring a stage that the workflow can
+        // neither call nor change the invocation of.
+        if crate::workflow::TERMINAL_STAGE_IDS.contains(&stage.id.as_str()) {
+            return Err(PlanError::Configuration(format!(
+                "workflow `{workflow}` declares stage `{}`, which is a terminal adapter owned by the run rather than a workflow operation",
+                stage.id
+            )));
+        }
+        // Operation hosts are installed under their own names. A declared stage sharing one would
+        // be overwritten by the operation and never run — at the first host call, long after the
+        // run row and the `issue` checkpoint are written.
+        if crate::workflow::OPERATION_HOSTS
+            .iter()
+            .any(|(name, _)| *name == stage.id)
+        {
+            return Err(PlanError::Configuration(format!(
+                "workflow `{workflow}` declares stage `{}`, which is the name of a Rust-owned workflow operation; choose a different stage identifier",
                 stage.id
             )));
         }
@@ -69,12 +91,6 @@ pub fn validate(
                     .copied()
                     .collect::<Vec<_>>()
                     .join(", ")
-            )));
-        }
-        if LEGACY_HOST_ALIASES.contains(&stage.id.as_str()) {
-            return Err(PlanError::Configuration(format!(
-                "stage `{}` conflicts with a legacy workflow host alias; choose a different stage identifier",
-                stage.id
             )));
         }
         if RESERVED_RECORD_NAMES.contains(&stage.id.as_str()) {
@@ -364,25 +380,57 @@ mod tests {
     }
 
     #[test]
-    fn declared_stages_cannot_shadow_legacy_workflow_hosts() {
+    fn declared_stages_cannot_shadow_a_workflow_operation_host() {
+        // Reserved from the host table itself, so a host added there cannot pick up a validation
+        // gap. `context` is the case that used to slip through: it is an operation the bundled
+        // `plan` and `full` both call, and a declaration of it failed only once the run was already
+        // writing checkpoints.
         let template = crate::built_in_stages()
             .into_iter()
             .find(|stage| stage.id == "analyst")
             .unwrap();
-        let profiles = crate::built_in_agents();
 
-        for alias in LEGACY_HOST_ALIASES {
+        for (name, _) in crate::workflow::OPERATION_HOSTS {
             let mut stage = template.clone();
-            stage.id = (*alias).to_string();
-            let stages = [stage];
-            let error = validate(&stages, &profiles, &permitted_for(&stages))
+            stage.id = (*name).to_string();
+            let error = validate_declarations(&[stage], "repo-workflow")
                 .unwrap_err()
                 .to_string();
             assert!(
-                error.contains("legacy workflow host alias"),
-                "{alias} must be reserved: {error}"
+                error.contains("Rust-owned workflow operation"),
+                "`{name}` must be reserved: {error}"
             );
+            assert!(error.contains(name), "{error}");
         }
+    }
+
+    #[test]
+    fn declared_stages_cannot_take_a_terminal_adapter_name() {
+        let template = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+
+        for terminal in ["bookkeeper", "publisher"] {
+            let mut stage = template.clone();
+            stage.id = terminal.to_string();
+            let error = validate_declarations(&[stage], "repo-workflow")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("terminal adapter"), "{error}");
+            assert!(error.contains(terminal), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_standard_stage_may_still_be_overridden() {
+        let mut stage = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        stage.id = "implementer_attempt".to_string();
+
+        assert!(validate_declarations(&[stage], "repo-workflow").is_ok());
     }
 
     #[test]

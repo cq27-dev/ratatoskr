@@ -576,7 +576,7 @@ fn validate_configured_stage_registry(
     for workflow in workflows {
         let declared = stage::stages_from_workflow(workflow.meta());
         validate::validate_declared_contracts(&declared)?;
-        validate::validate_unique_declarations(&declared, &workflow.meta().name)?;
+        validate::validate_declarations(&declared, &workflow.meta().name)?;
         judge(declared, governable_from([workflow]))?;
     }
     Ok(())
@@ -3183,6 +3183,45 @@ mod referee_governance_tests {
             "unexpected error: {error}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_reserved_name_is_refused_by_the_startup_gate() {
+        // `validate_configured_stages` is the first statement of `run_plan` and `run_full`, before
+        // the run row and the `issue` checkpoint. A name conflict that only surfaced when the host
+        // table was built killed the run mid-flight, with checkpoints already written.
+        let cases = [
+            ("context", "Rust-owned workflow operation"),
+            ("bookkeeper", "terminal adapter"),
+            ("publisher", "terminal adapter"),
+        ];
+        for (declared, expected) in cases {
+            let (dir, found) = workflows_in(
+                &format!("reserved-{declared}"),
+                &[(
+                    "ours",
+                    &format!(
+                        r#"defineWorkflow({{
+                             name: "ours",
+                             stages: [stage("{declared}", {{ agent: "reason", instructions: "x" }})],
+                           }});
+                           export async function plan(input) {{ return input; }}"#
+                    ),
+                )],
+            )
+            .await;
+            let standard = workflow::standard_stages().await.unwrap();
+            let error =
+                validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
+                    .expect_err("a reserved name must be refused at load");
+            let error = error.to_string();
+            assert!(error.contains(expected), "unexpected error: {error}");
+            assert!(
+                error.contains(declared),
+                "the error must name the stage: {error}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[tokio::test]
