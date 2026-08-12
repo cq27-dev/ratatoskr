@@ -13,10 +13,7 @@ use ratatoskr_graph::NodeError;
 use ratatoskr_mcp::{Connection, ServerProvenance, ServerTools, SpawnEnvironment, ToolSet};
 use ratatoskr_script::ScriptEngine;
 
-use crate::stage::stage_profile;
-use crate::{
-    AgentProfile, NodeAgentConfig, PlanError, Stage, agent_profiles, built_in_stages, route, skills,
-};
+use crate::{AgentProfile, NodeAgentConfig, PlanError, Stage, agent_profiles, route, skills};
 
 /// What each plugin contributed for this run.
 ///
@@ -679,41 +676,6 @@ fn node_agent_config(
     })
 }
 
-/// Resolve a built-in stage through its selected reusable profile.
-pub(crate) fn stage_agent_config(
-    engine: &Arc<ScriptEngine>,
-    config: &RatatoskrConfig,
-    tools: ToolSet,
-    node: &str,
-    default_tools: &[&str],
-    plugins: &mut NodePlugins,
-) -> Result<NodeAgentConfig, PlanError> {
-    let stages = built_in_stages();
-    let stage_id = if node == "redteam" { "red_team" } else { node };
-    let stage = stages.iter().find(|stage| stage.id == stage_id);
-    let profile = stage_profile(config, node);
-    plugins.profile_prompt = profile
-        .as_ref()
-        .map_or_else(String::new, |profile| profile.base_prompt.clone());
-    let ceiling = match (stage, profile.as_ref()) {
-        (Some(stage), Some(profile)) => stage.effective_ceiling(profile),
-        _ => Some(Capability::Read),
-    };
-    let capabilities = ceiling.into_iter().collect::<Vec<_>>();
-    node_agent_config(
-        engine,
-        config,
-        tools,
-        node,
-        default_tools,
-        plugins,
-        AgentSettings {
-            capabilities: &capabilities,
-            profile,
-        },
-    )
-}
-
 /// Resolve a declared workflow stage through the profile it names.
 pub(crate) fn declared_stage_agent_config(
     engine: &Arc<ScriptEngine>,
@@ -766,6 +728,16 @@ pub(crate) fn default_allow(built_in: &[&str], from_plugins: Vec<String>) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The analyst as the standard registry declares it — the stage a run would resolve.
+    async fn analyst_stage() -> Stage {
+        crate::workflow::standard_stages()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .expect("the standard registry declares the analyst")
+    }
 
     /// A ruleset directory built for one test.
     async fn binding_engine(case: &str, source: &str) -> Arc<ScriptEngine> {
@@ -821,15 +793,16 @@ mod tests {
         let config = RatatoskrConfig::default();
 
         let default_engine = binding_engine("exa-default-denied", "").await;
-        let default = stage_agent_config(
+        let default = declared_stage_agent_config(
             &default_engine,
             &config,
             tools.clone(),
-            "analyst",
+            &analyst_stage().await,
             &["semantic_search"],
-            &mut NodePlugins::default(),
+            &NodePlugins::default(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(
             !default
                 .tools
@@ -850,15 +823,16 @@ mod tests {
             r#"defineAgent("analyst", { tools: { allow: ["semantic_search"] } });"#,
         )
         .await;
-        let explicit = stage_agent_config(
+        let explicit = declared_stage_agent_config(
             &explicit_engine,
             &config,
             tools,
-            "analyst",
+            &analyst_stage().await,
             &["semantic_search"],
-            &mut NodePlugins::default(),
+            &NodePlugins::default(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(explicit.tools.names(), vec!["semantic_search"]);
     }
 
@@ -883,15 +857,16 @@ mod tests {
         let config = RatatoskrConfig::default();
         let engine = binding_engine("configured-read-collision", "").await;
 
-        let configured = stage_agent_config(
+        let configured = declared_stage_agent_config(
             &engine,
             &config,
             tools,
-            "analyst",
+            &analyst_stage().await,
             &[ratatoskr_agent::files::READ],
-            &mut NodePlugins::default(),
+            &NodePlugins::default(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
 
         assert_eq!(
             configured

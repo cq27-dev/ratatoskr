@@ -180,19 +180,6 @@ pub fn agent_profiles(config: &ratatoskr_core::RatatoskrConfig) -> Vec<AgentProf
     profiles
 }
 
-/// Resolve the profile selected by a built-in stage.
-pub fn stage_profile(
-    config: &ratatoskr_core::RatatoskrConfig,
-    stage_id: &str,
-) -> Option<AgentProfile> {
-    let stage_id = if stage_id == "redteam" {
-        "red_team"
-    } else {
-        stage_id
-    };
-    profile_for(config, &built_in_stages(), stage_id)
-}
-
 /// Resolve the profile of the stage that runs under `node` in `stages`.
 ///
 /// The registry is a parameter because a route or an enablement decision is about the stage that

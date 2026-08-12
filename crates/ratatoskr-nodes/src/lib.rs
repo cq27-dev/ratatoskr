@@ -28,7 +28,6 @@ pub mod workflow;
 
 pub use contracts::{analyst, context, overseer, scout};
 
-pub(crate) use plugins::stage_agent_config;
 pub use plugins::{NodePlugins, PluginContext};
 #[cfg(test)]
 use plugins::{default_allow, servers_to_start};
@@ -1392,7 +1391,9 @@ pub async fn run_bookkeeper(
         store.run_status(run_id).await?.as_deref() == Some(RunStatus::Converged.as_str());
 
     // Build the clarifier before `issue` is moved into the input (it clones the issue internally).
-    let clarifier = NodeClarifier::new(config, store, engine, run_id, &issue);
+    // A replay runs no workflow, so this resolves to the bundled standard registry — the one the
+    // terminal bookkeeper adapter is itself defined against.
+    let clarifier = NodeClarifier::new(config, store, engine, run_id, &issue, Arc::default());
     let input = BookkeeperInput {
         issue,
         analyst,
@@ -1698,6 +1699,15 @@ mod agent_config_tests {
     /// The fixture directory is unique per test *and* per process: these tests run concurrently,
     /// and `fs::write` truncates before writing, so a shared path lets one test's engine load
     /// another's half-written file and see a ruleset that is missing agents.
+    /// The stage that runs for `node`, resolved from the standard registry exactly as a run
+    /// resolves it — by id, then by `governedBy`.
+    async fn standard_stage(node: &str) -> Stage {
+        let stages = workflow::standard_stages().await.unwrap();
+        stage::for_node(&stages, node)
+            .expect("the standard registry declares this stage")
+            .clone()
+    }
+
     async fn engine(case: &str) -> Arc<ScriptEngine> {
         let dir = std::env::temp_dir().join(format!(
             "ratatoskr-nodes-agent-config-{}-{case}",
@@ -2022,15 +2032,16 @@ mod agent_config_tests {
         // The whole point: no `[models.scout]` entry at all.
         config.models.remove("scout");
 
-        let cfg = stage_agent_config(
+        let cfg = plugins::declared_stage_agent_config(
             &engine,
             &config,
             ToolSet::default(),
-            "scout",
+            &standard_stage("scout").await,
             &[],
-            &mut NodePlugins::default(),
+            &NodePlugins::default(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(cfg.route.provider, "openai");
         assert_eq!(cfg.route.model, "gpt-5");
         assert_eq!(cfg.system_prompt.as_deref(), Some("Be brief."));
@@ -2056,15 +2067,16 @@ mod agent_config_tests {
             },
         );
 
-        let none = stage_agent_config(
+        let none = plugins::declared_stage_agent_config(
             &engine,
             &config,
             ToolSet::default(),
-            "characterizer",
+            &standard_stage("characterizer").await,
             &[],
-            &mut NodePlugins::default(),
+            &NodePlugins::default(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(none.tools.names().is_empty(), "{:?}", none.tools.names());
         // The root is still set, and that is not a capability: with no file tools offered there is
         // nothing to resolve against it. Gating the root on this list instead is what left the
@@ -2074,15 +2086,16 @@ mod agent_config_tests {
 
         // A node that does declare reach still gets them — this is the reading half of the
         // pipeline, not an exception for one node.
-        let some = stage_agent_config(
+        let some = plugins::declared_stage_agent_config(
             &engine,
             &config,
             ToolSet::default(),
-            "analyst",
+            &standard_stage("analyst").await,
             &["impact_surface", "symbol_lookup", "semantic_search"],
-            &mut NodePlugins::default(),
+            &NodePlugins::default(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(some.files.is_some());
         assert!(some.tools.names().iter().any(|n| n == "Read"));
     }
@@ -2115,15 +2128,16 @@ mod agent_config_tests {
         let engine = engine("toml-fallback").await;
         let config = RatatoskrConfig::default();
 
-        let cfg = stage_agent_config(
+        let cfg = plugins::declared_stage_agent_config(
             &engine,
             &config,
             ToolSet::default(),
-            "bookkeeper",
+            &standard_stage("bookkeeper").await,
             &[],
-            &mut NodePlugins::default(),
+            &NodePlugins::default(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(cfg.route.provider, config.models["bookkeeper"].provider);
         assert_eq!(cfg.route.model, config.models["bookkeeper"].model);
         assert!(cfg.system_prompt.is_none());
@@ -2186,13 +2200,13 @@ mod agent_config_tests {
         config.models.remove("analyst");
 
         assert!(matches!(
-            stage_agent_config(
+            plugins::declared_stage_agent_config(
                 &engine,
                 &config,
                 ToolSet::default(),
-                "analyst",
+                &standard_stage("analyst").await,
                 &[],
-                &mut NodePlugins::default(),
+                &NodePlugins::default(),
             ),
             Err(PlanError::MissingRoute(n)) if n == "analyst"
         ));
@@ -2254,15 +2268,16 @@ mod agent_config_tests {
             r#"defineAgent("analyst", { tools: { allow: ["Write"] } });"#,
         )
         .await;
-        let cfg = stage_agent_config(
+        let cfg = plugins::declared_stage_agent_config(
             &engine,
             &RatatoskrConfig::default(),
             ToolSet::default(),
-            "analyst",
+            &standard_stage("analyst").await,
             &["impact_surface", "symbol_lookup", "semantic_search"],
-            &mut NodePlugins::default(),
+            &NodePlugins::default(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(cfg.tools.is_empty());
     }
 

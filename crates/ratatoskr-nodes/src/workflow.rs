@@ -141,7 +141,26 @@ pub struct WorkflowContext {
     /// adapters that run `implementer_attempt`, `redteam_author`, `redteam_classifier` and
     /// `characterizer`. Rebuilding it per path is what let an override validate at startup and then
     /// be ignored by the model turn that actually ran.
-    stages: tokio::sync::OnceCell<Arc<Vec<Stage>>>,
+    stages: ExecutionStages,
+}
+
+/// The one stage registry a run executes, resolved once and shared by everything that has to answer
+/// *about* that run — the executor, and the clarifier that speaks for a stage without running it.
+///
+/// Shared rather than re-derived: a second resolution is a second answer, and the clarifier
+/// answering out of the compiled-in table while the executor ran the overlaid registry is exactly
+/// how one run came to route the same node two different ways.
+pub(crate) type ExecutionStages = Arc<tokio::sync::OnceCell<Arc<Vec<Stage>>>>;
+
+/// This run's registry, falling back to the bundled standard one. See [`WorkflowContext::stages`]
+/// for when that fallback is the right answer.
+pub(crate) async fn execution_stages(
+    stages: &ExecutionStages,
+) -> Result<Arc<Vec<Stage>>, PlanError> {
+    stages
+        .get_or_try_init(|| async { Ok(Arc::new(standard_stages().await?)) })
+        .await
+        .cloned()
 }
 
 pub(crate) struct WorkflowContextParams<'a> {
@@ -195,7 +214,17 @@ impl WorkflowContext {
         } = params;
         let repo_path = std::env::current_dir()
             .map_err(|e| PlanError::node("workflow", NodeError::Failed(format!("cwd: {e}"))))?;
-        let clarifier = crate::clarify::NodeClarifier::new(config, store, engine, run_id, issue);
+        // One registry cell, shared with the clarifier: it must answer for the stage this run
+        // executes, not for the compiled-in stage of the same name.
+        let stages: ExecutionStages = Arc::default();
+        let clarifier = crate::clarify::NodeClarifier::new(
+            config,
+            store,
+            engine,
+            run_id,
+            issue,
+            Arc::clone(&stages),
+        );
         let configured_servers = configured.to_vec();
         Ok(Arc::new(Self {
             ledger,
@@ -203,7 +232,7 @@ impl WorkflowContext {
             acceptance: Mutex::new(None),
             container_image: tokio::sync::OnceCell::new(),
             plugin_context,
-            stages: tokio::sync::OnceCell::new(),
+            stages,
             config: config.clone(),
             store: store.clone(),
             engine: Arc::clone(engine),
@@ -290,10 +319,7 @@ impl WorkflowContext {
     /// can reach this fallback is refused to workflows at the load-time gate, so the fallback can
     /// never stand in for a declaration someone made and expected to run.
     pub(crate) async fn stages(&self) -> Result<Arc<Vec<Stage>>, PlanError> {
-        self.stages
-            .get_or_try_init(|| async { Ok(Arc::new(standard_stages().await?)) })
-            .await
-            .cloned()
+        execution_stages(&self.stages).await
     }
 }
 
