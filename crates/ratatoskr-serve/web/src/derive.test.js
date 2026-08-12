@@ -127,20 +127,27 @@ test("nodes outside the loop shape do not change the classification", () => {
   expect(convergeLoops(events)).toEqual({ fix: 1, replan: 0, retry: 1 });
 });
 
-test("a run shaped like 414fb163 counts a fix and a replan separately", () => {
+test("a run shaped like 414fb163 counts one of each, retry included", () => {
+  // The real run's three segments, in order: the tests never went clean and the
+  // implementer ran again with only the referee in between; then a verifier fix;
+  // then a verifier finding that faulted the plan and went back through the analyst.
   const events = [
     start("scout"),
     start("analyst"),
     start("implementer"),
+    start("characterizer"),
+    start("referee"),
+    start("implementer"),
+    start("referee"),
     start("verifier"),
     start("implementer"),
+    start("referee"),
     start("verifier"),
     start("analyst"),
     start("implementer"),
-    start("verifier"),
     start("publisher"),
   ];
-  expect(convergeLoops(events)).toEqual({ fix: 1, replan: 1, retry: 0 });
+  expect(convergeLoops(events)).toEqual({ fix: 1, replan: 1, retry: 1 });
 });
 
 test("counts are those of the prefix given, never the run's final totals", () => {
