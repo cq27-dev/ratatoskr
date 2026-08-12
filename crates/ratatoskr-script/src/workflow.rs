@@ -23,6 +23,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use ratatoskr_core::{Capability, SessionScope};
@@ -324,6 +325,11 @@ pub struct WorkflowRuntime {
     /// repository workflow may legitimately take any name, including the bundled one, so provenance
     /// is not something a caller can recover by comparing `meta().name`.
     bundled: bool,
+    /// The ceiling one entry call runs under: [`RUN_BUDGET`] per stretch of JavaScript. A field
+    /// rather than the constant read at the call site so the test that proves the ceiling holds can
+    /// use a fraction of a second instead of adding a real half-minute to every future run of the
+    /// suite.
+    run_span: Duration,
 }
 
 impl WorkflowRuntime {
@@ -352,6 +358,7 @@ impl WorkflowRuntime {
             meta: Box::new(meta),
             dependencies: Box::new([]),
             bundled: true,
+            run_span: RUN_BUDGET,
         })
     }
 
@@ -395,6 +402,7 @@ impl WorkflowRuntime {
             meta: Box::new(meta),
             dependencies: loaded.dependencies.into_boxed_slice(),
             bundled: false,
+            run_span: RUN_BUDGET,
         }))
     }
 
@@ -539,7 +547,7 @@ impl WorkflowRuntime {
         within(
             &self.module_name,
             &self.budget,
-            RUN_BUDGET,
+            self.run_span,
             self.context.async_with(async move |ctx| {
                 // The entry is read from the evaluated module, so it has to be resolved inside this
                 // closure: `Module<Evaluated>` borrows the context's `'js` lifetime and cannot
@@ -711,11 +719,11 @@ const MAX_STACK_SIZE: usize = 1024 * 1024;
 /// milliseconds — so five seconds is already three orders of magnitude of slack.
 const LOAD_BUDGET: Duration = Duration::from_secs(5);
 
-/// Wall clock a workflow's own JavaScript may run while no host call is outstanding.
+/// Wall clock a workflow's own JavaScript may run in one uninterrupted stretch.
 ///
 /// Composition between stages is bookkeeping: pick a branch, reshape a value, render a question.
-/// Thirty seconds of that without calling a host is a spin, not a workflow. A host call suspends
-/// the clock entirely, so a stage that thinks for an hour is unaffected.
+/// Thirty seconds of that without yielding is a spin, not a workflow. Waiting on a host does not
+/// count — the interpreter is parked then — so a stage that thinks for an hour is unaffected.
 const RUN_BUDGET: Duration = Duration::from_secs(30);
 
 /// The zero the deadline is measured from. Wall-clock instants do not fit in an atomic; elapsed
@@ -723,19 +731,33 @@ const RUN_BUDGET: Duration = Duration::from_secs(30);
 /// call without taking a lock.
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-/// Deadline shared by the engine's interrupt handler and the async watchdog.
+/// The two clocks that bound a workflow. They measure different things, so they are two deadlines:
+/// one shared field would let either mechanism disarm the other.
 ///
-/// The two together are what bounds a workflow: the handler stops JavaScript that never yields
-/// (`while (true) {}`), the watchdog stops JavaScript that yields and never resumes (`await new
-/// Promise(() => {})`). Neither alone catches both.
+/// * [`Budget::running`] bounds one **contiguous stretch of JavaScript**. The engine's interrupt
+///   handler reads it between bytecodes and is the only thing that can stop `while (true) {}`. It
+///   is armed for each poll of the JavaScript-driving future and cleared when that poll returns,
+///   because a poll *is* one such stretch: between polls the interpreter is parked and the handler
+///   cannot fire anyway. Re-arming per poll is what lets an hour-long host call resume onto a full
+///   span rather than onto a deadline that passed while Rust was working.
+/// * [`Budget::idle`] bounds **not resuming**: JavaScript that yields and never comes back (`await
+///   new Promise(() => {})`) parks the future, where no interrupt reaches it. This is the clock a
+///   host call suspends, because waiting an hour for a model is the ordinary case.
 ///
-/// The clock is suspended while a host call is outstanding, because the ceiling is on *JavaScript*
-/// and waiting an hour for a model is the ordinary case.
+/// A host call must **not** touch `running`. Being inside a host says nothing about whether the
+/// interpreter is spinning, and `__wrap` invokes the host *before* awaiting it, so
+/// `const p = never(x); while (true) {}` would otherwise disarm the one mechanism that can see the
+/// spin — and the spin, never yielding, would never let the host's future be driven to completion
+/// either. Nothing would re-arm anything: a deadlock the ceilings exist to prevent.
 struct Budget {
-    /// Milliseconds since [`START`], or `NO_DEADLINE` when nothing is being timed.
-    deadline: AtomicU64,
-    /// What to re-arm with when the last outstanding host call returns.
-    span_ms: AtomicU64,
+    /// Deadline for the stretch of JavaScript executing right now, in milliseconds since [`START`],
+    /// or `NO_DEADLINE` while the interpreter is parked.
+    running: AtomicU64,
+    /// Deadline for resuming, in milliseconds since [`START`], or `NO_DEADLINE` while a host call
+    /// is outstanding.
+    idle: AtomicU64,
+    /// What to re-arm [`Budget::idle`] with when the last outstanding host call returns.
+    idle_span_ms: AtomicU64,
     outstanding: AtomicUsize,
 }
 
@@ -744,8 +766,9 @@ const NO_DEADLINE: u64 = u64::MAX;
 impl Budget {
     fn new() -> Self {
         Self {
-            deadline: AtomicU64::new(NO_DEADLINE),
-            span_ms: AtomicU64::new(0),
+            running: AtomicU64::new(NO_DEADLINE),
+            idle: AtomicU64::new(NO_DEADLINE),
+            idle_span_ms: AtomicU64::new(0),
             outstanding: AtomicUsize::new(0),
         }
     }
@@ -754,40 +777,53 @@ impl Budget {
         START.elapsed().as_millis() as u64
     }
 
-    fn arm(&self, span: Duration) {
-        let span_ms = span.as_millis() as u64;
-        self.span_ms.store(span_ms, Ordering::Relaxed);
-        self.deadline
-            .store(Self::now_ms() + span_ms, Ordering::Relaxed);
+    /// Start timing a stretch of JavaScript. Called before every poll of the driving future.
+    fn enter_js(&self, span: Duration) {
+        self.running
+            .store(Self::now_ms() + span.as_millis() as u64, Ordering::Relaxed);
     }
 
-    fn disarm(&self) {
-        self.deadline.store(NO_DEADLINE, Ordering::Relaxed);
+    /// Stop timing it, reporting whether the deadline passed — which is how an opaque `interrupted`
+    /// is told apart from a workflow that threw one of its own.
+    fn leave_js(&self) -> bool {
+        let deadline = self.running.swap(NO_DEADLINE, Ordering::Relaxed);
+        Self::now_ms() >= deadline
+    }
+
+    /// What the interrupt handler asks on every check.
+    fn expired(&self) -> bool {
+        Self::now_ms() >= self.running.load(Ordering::Relaxed)
+    }
+
+    fn arm_idle(&self, span: Duration) {
+        let span_ms = span.as_millis() as u64;
+        self.idle_span_ms.store(span_ms, Ordering::Relaxed);
+        self.idle.store(Self::now_ms() + span_ms, Ordering::Relaxed);
+    }
+
+    fn disarm_idle(&self) {
+        self.idle.store(NO_DEADLINE, Ordering::Relaxed);
     }
 
     fn enter_host(&self) {
         self.outstanding.fetch_add(1, Ordering::Relaxed);
-        self.disarm();
+        self.disarm_idle();
     }
 
     /// Re-arm once nothing is outstanding. With several hosts in flight the clock stays suspended
     /// until the last one returns, so concurrent stages are not held to one stage's budget.
     fn leave_host(&self) {
         if self.outstanding.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.deadline.store(
-                Self::now_ms() + self.span_ms.load(Ordering::Relaxed),
+            self.idle.store(
+                Self::now_ms() + self.idle_span_ms.load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
         }
     }
 
-    fn expired(&self) -> bool {
-        Self::now_ms() >= self.deadline.load(Ordering::Relaxed)
-    }
-
-    /// `None` while nothing is being timed.
-    fn remaining(&self) -> Option<Duration> {
-        match self.deadline.load(Ordering::Relaxed) {
+    /// `None` while the idle clock is suspended.
+    fn idle_remaining(&self) -> Option<Duration> {
+        match self.idle.load(Ordering::Relaxed) {
             NO_DEADLINE => None,
             deadline => Some(Duration::from_millis(
                 deadline.saturating_sub(Self::now_ms()),
@@ -796,10 +832,10 @@ impl Budget {
     }
 }
 
-/// Resolves once the budget is spent, re-reading it because a returning host call moves it.
-async fn spent(budget: &Budget) {
+/// Resolves once the idle clock runs out, re-reading it because a returning host call moves it.
+async fn idle_spent(budget: &Budget) {
     loop {
-        match budget.remaining() {
+        match budget.idle_remaining() {
             None => tokio::time::sleep(Duration::from_millis(100)).await,
             Some(left) if left.is_zero() => return,
             Some(left) => tokio::time::sleep(left).await,
@@ -808,6 +844,10 @@ async fn spent(budget: &Budget) {
 }
 
 /// Run one JavaScript operation under `span`, naming `workflow` in whichever limit it hits.
+///
+/// Both clocks are driven from here because both are about *this* operation: `span` is armed around
+/// each poll, one poll being one stretch of contiguous JavaScript (see [`Budget`]). Time the
+/// operation spends parked — waiting on a host — is in neither, which is the whole point.
 ///
 /// An engine limit surfaces as an opaque `interrupted` or `out of memory`; a workflow that will not
 /// load must say which workflow, or the operator is left bisecting their workflows directory.
@@ -819,23 +859,38 @@ async fn within<T>(
 ) -> Result<T, ScriptError> {
     let overran = || {
         ScriptError::Eval(format!(
-            "workflow `{workflow}` ran more than {}s of JavaScript without progress",
-            span.as_secs()
+            "workflow `{workflow}` ran more than {span:?} of JavaScript without progress"
         ))
     };
-    budget.arm(span);
+
+    let mut operation = Box::pin(operation);
+    let driven = std::future::poll_fn(|cx| {
+        budget.enter_js(span);
+        let polled = operation.as_mut().poll(cx);
+        let out_of_time = budget.leave_js();
+        match polled {
+            // The engine reports its own interrupt as an opaque throw, so the deadline is what says
+            // whose interrupt it was.
+            Poll::Ready(Err(error)) => Poll::Ready(Err(
+                if out_of_time && error.to_string().contains("interrupted") {
+                    overran()
+                } else {
+                    error
+                },
+            )),
+            other => other,
+        }
+    });
+
+    budget.arm_idle(span);
     let outcome = tokio::select! {
         biased;
-        result = operation => result,
-        () = spent(budget) => Err(overran()),
+        result = driven => result,
+        () = idle_spent(budget) => Err(overran()),
     };
-    let out_of_time = budget.expired();
-    budget.disarm();
+    budget.disarm_idle();
     outcome.map_err(|error| {
-        let text = error.to_string();
-        if out_of_time && text.contains("interrupted") {
-            overran()
-        } else if text.contains("out of memory") {
+        if error.to_string().contains("out of memory") {
             ScriptError::Eval(format!(
                 "workflow `{workflow}` exceeded its {} MiB memory limit",
                 MEMORY_LIMIT / (1024 * 1024)
@@ -1410,6 +1465,55 @@ export async function plan(i) { return { entryRan: true }; }
         assert!(error.contains("hang.ts"), "{error}");
         assert!(error.contains("without progress"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_workflow_that_spins_while_a_host_is_outstanding_is_stopped_and_named() {
+        // The host is *called* and never awaited, so its promise is outstanding for the whole spin.
+        // Nothing will drive that promise while JavaScript refuses to yield, so if entering the
+        // host disarmed the interrupt deadline nothing would ever re-arm it: the run wedges with no
+        // error and no return. Hence its own thread and runtime, and a timeout on the receiver — a
+        // regression here must fail this test, not hang the suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = tx.send(rt.block_on(async {
+                let dir = scratch("spin-with-host-outstanding");
+                let path = dir.join("spinner.ts");
+                std::fs::write(
+                    &path,
+                    "export async function plan(input) {\n\
+                     \x20   const outstanding = slow(input);\n\
+                     \x20   while (true) {}\n\
+                     }",
+                )
+                .unwrap();
+                let mut runtime = WorkflowRuntime::load(&path, &[]).await.unwrap().unwrap();
+                runtime.run_span = Duration::from_millis(300);
+
+                let mut hosts = HashMap::new();
+                hosts.insert(
+                    "slow".to_string(),
+                    host(|arg| async move {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                        Ok(arg)
+                    }),
+                );
+                let outcome = runtime.run("plan", "null".to_string(), hosts).await;
+                let _ = std::fs::remove_dir_all(&dir);
+                outcome.map(|_| ()).map_err(|error| error.to_string())
+            }));
+        });
+
+        let error = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a spin with a host outstanding wedged the runtime")
+            .expect_err("a spin with a host outstanding must be stopped");
+        assert!(error.contains("spinner.ts"), "{error}");
+        assert!(error.contains("without progress"), "{error}");
     }
 
     #[tokio::test(flavor = "current_thread")]
