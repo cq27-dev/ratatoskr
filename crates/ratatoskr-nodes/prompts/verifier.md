@@ -37,8 +37,8 @@ WHAT TO LOOK FOR, IN ORDER:
    identifier — check them together, not one.
 7. AN AUTHORITY BOUNDARY CROSSED. An operation the host owns — writing, publishing, checkpointing,
    terminal or lifecycle work — reachable through a generic interface, directly or by delegation,
-   alias, import or override. Metadata or configuration supplied from outside the binary must not
-   grant a capability the host did not hand out. Trace resource roots, shells, and publication
+   alias, import or override. Metadata or configuration the project does not itself author must
+   not grant a capability the host did not hand out. Trace resource roots, shells, and publication
    grants where the diff touches them.
 8. BEHAVIOUR THAT LEAVES NO TRACE. An input that decides what runs but is absent from the
    fingerprint, the provenance, or the recorded shape — embedded or generated sources a dependency
@@ -106,5 +106,5 @@ line or two what you actually checked; it is expected even when you found nothin
 findings" without an account of what was looked at reads the same as a verifier that did nothing.
 Name the surfaces rather than the effort — which advertised behaviour you traced to where it runs,
 which boundary you tested, which sibling paths you swept — and name anything you could not reach.
-"Looks correct" is not an assessment; "traced the override through startup validation into the
-adapter, checked both terminal hosts, did not exercise the sandboxed path" is.
+"Looks correct" is not an assessment; naming the entry point you traced from, the boundary you
+tested, and the path you did not reach is.
