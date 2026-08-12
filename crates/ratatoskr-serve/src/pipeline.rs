@@ -59,6 +59,10 @@ pub struct NodeView {
     /// pipeline says what it is going to do rather than staying blank until it does it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub planned: Option<PlannedNode>,
+    /// The node that ran this one, for a node the shape does not place — see [`caller_of`]. A node
+    /// the shape does place needs no attribution: its position already says what preceded it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<String>,
 }
 
 /// A node's configured route: what it will run on, and the two choices that change how it behaves.
@@ -268,6 +272,8 @@ pub fn derive_with(
                 checkpoints: times.len(),
                 first_at: times.first().map(|s| s.to_string()),
                 last_at: times.last().map(|s| s.to_string()),
+                // A shaped node's caller is its position: the stage before it ran it.
+                caller: None,
             });
         }
     }
@@ -293,21 +299,26 @@ fn append_unknown(
 ) {
     let known: std::collections::HashSet<&str> = out.iter().map(|n| n.name.as_str()).collect();
     let mut seen = std::collections::HashSet::new();
-    let mut extra: Vec<&str> = Vec::new();
-    for c in checkpoints {
+    // Each out-of-shape name with the position of its FIRST checkpoint, which is what its caller is
+    // resolved from. One row aggregates every checkpoint of that name, so a run whose
+    // `clarification` rows were asked for by different nodes cannot express all of them in one
+    // `caller`. Splitting a row per caller belongs to the placement work (#248), which owns layout.
+    let mut extra: Vec<(&str, usize)> = Vec::new();
+    for (idx, c) in checkpoints.iter().enumerate() {
         let name = c.node_name.as_str();
         // The issue pseudo-node writes a checkpoint and is deliberately not a pipeline node: it
         // records what the run was asked to do, which is not a stage of doing it.
         if name != ISSUE_NODE && !known.contains(name) && seen.insert(name) {
-            extra.push(name);
+            extra.push((name, idx));
         }
     }
     let base = out.iter().map(|n| n.stage).max().map_or(0, |s| s + 1);
-    for (i, name) in extra.into_iter().enumerate() {
+    for (i, (name, first)) in extra.into_iter().enumerate() {
         let times = node_times(checkpoints, name);
         out.push(NodeView {
             telemetry: NodeTelemetryView::latest(checkpoints, name),
             planned: PlannedNode::of(config, name),
+            caller: caller_of(checkpoints, first),
             name: name.to_string(),
             // A foreign node that wrote a checkpoint has run; nothing here can say more than that.
             state: NodeState::Done,
@@ -318,6 +329,38 @@ fn append_unknown(
             last_at: times.last().map(|s| s.to_string()),
         });
     }
+}
+
+/// Which node ran the checkpoint at `index`, as far as the checkpoint log can say.
+///
+/// Two rules, in this order:
+///
+/// 1. **The checkpoint names its own asker.** `clarify.rs` writes `output_json.from` from the hook's
+///    node — the node that called the synthetic `ask` tool — so a node that records its caller is
+///    authoritative and wins. The text is model-authored, so a parse failure is expected and falls
+///    through rather than panicking.
+/// 2. **Otherwise the nearest preceding `implementer` checkpoint.** This is the referee rule, and it
+///    is structural rather than statistical: every `referee_judgement` call site in `workflow.rs`
+///    judges `latest_checkpoint(store, run_id, "implementer")`, fetched immediately before, so the
+///    nearest preceding implementer checkpoint is literally the output being judged. `"implementer"`
+///    is hardcoded because only the orchestrator knows what the referee judges — a run's `stage` and
+///    `lane` are declarative layout, not evidence of invocation, so this cannot be generalised from
+///    them.
+///
+/// A checkpoint that satisfies neither — legacy data, or a referee row with no implementer before it
+/// — resolves to `None`. The caller is unknown, not guessed at.
+fn caller_of(checkpoints: &[Checkpoint], index: usize) -> Option<String> {
+    let c = checkpoints.get(index)?;
+    let asker = serde_json::from_str::<serde_json::Value>(&c.output_json)
+        .ok()
+        .and_then(|v| v.get("from")?.as_str().map(str::to_string));
+    asker.or_else(|| {
+        checkpoints[..index]
+            .iter()
+            .rev()
+            .find(|c| c.node_name == "implementer")
+            .map(|c| c.node_name.clone())
+    })
 }
 
 /// Group a shape's nodes into stages, indexed by column.
@@ -363,6 +406,23 @@ mod tests {
 
     fn state_of(views: &[NodeView], name: &str) -> NodeState {
         views.iter().find(|v| v.name == name).unwrap().state
+    }
+
+    fn caller_of_view(views: &[NodeView], name: &str) -> Option<String> {
+        views
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap()
+            .caller
+            .clone()
+    }
+
+    /// A checkpoint whose output records who asked for it, as `clarify.rs` writes it.
+    fn cp_from(node: &str, at: &str, output_json: &str) -> Checkpoint {
+        Checkpoint {
+            output_json: output_json.to_string(),
+            ..cp(node, at)
+        }
     }
 
     #[test]
@@ -643,6 +703,158 @@ mod tests {
         let views = derive(Some("no_code_change"), &[cp("analyst", "t")]);
         assert_ne!(state_of(&views, "analyst"), NodeState::Working);
         assert_ne!(state_of(&views, "implementer"), NodeState::Working);
+    }
+
+    #[test]
+    fn a_referee_checkpoint_is_attributed_to_the_implementer_it_judged() {
+        // The referee is excluded from the shape, so it arrives through `append_unknown` with no
+        // position to explain what ran it. `referee_judgement` judges the latest implementer
+        // checkpoint, so the nearest preceding one is the output it looked at.
+        let views = derive(
+            Some("converged"),
+            &[
+                cp("context", "t1"),
+                cp("analyst", "t2"),
+                cp("red_team", "t3"),
+                cp("implementer", "t4"),
+                cp("referee", "t5"),
+            ],
+        );
+        assert_eq!(
+            caller_of_view(&views, "referee").as_deref(),
+            Some("implementer")
+        );
+    }
+
+    #[test]
+    fn only_implementer_checkpoints_before_the_referee_can_have_been_judged() {
+        // The scan runs backward from the referee's own checkpoint. An implementer row written
+        // afterwards is a later iteration the referee never saw, so it must not be claimed as the
+        // caller — the resolved name is the same either way, which is exactly why the direction has
+        // to be pinned by a case where a wrong direction changes the answer.
+        let after = derive(
+            Some("running"),
+            &[cp("referee", "t1"), cp("implementer", "t2")],
+        );
+        assert_eq!(caller_of_view(&after, "referee"), None);
+
+        // With implementer checkpoints on both sides, the ones before it resolve it.
+        let both = derive(
+            Some("running"),
+            &[
+                cp("implementer", "t1"),
+                cp("implementer", "t2"),
+                cp("referee", "t3"),
+                cp("implementer", "t4"),
+            ],
+        );
+        assert_eq!(
+            caller_of_view(&both, "referee").as_deref(),
+            Some("implementer")
+        );
+    }
+
+    #[test]
+    fn a_referee_with_no_implementer_before_it_has_an_unknown_caller() {
+        // Legacy or pathological data. Unknown is reported as unknown, and nothing panics.
+        let views = derive(
+            Some("converged"),
+            &[cp("context", "t1"), cp("referee", "t2")],
+        );
+        assert_eq!(caller_of_view(&views, "referee"), None);
+    }
+
+    #[test]
+    fn a_node_that_records_its_own_asker_is_believed_over_the_scan() {
+        // `clarify.rs` writes `output_json.from` from the node that called the `ask` tool. That is
+        // first-hand, so it wins even with an implementer checkpoint sitting right before it.
+        let views = derive(
+            Some("awaiting_clarification"),
+            &[
+                cp("implementer", "t1"),
+                cp_from(
+                    "clarification",
+                    "t2",
+                    r#"{"from":"analyst","question":"which one?"}"#,
+                ),
+            ],
+        );
+        assert_eq!(
+            caller_of_view(&views, "clarification").as_deref(),
+            Some("analyst")
+        );
+    }
+
+    #[test]
+    fn output_that_does_not_name_an_asker_falls_through_to_the_scan() {
+        // `output_json` is model-authored text: unparseable, missing `from`, or a `from` that isn't
+        // a string all have to fall through rather than panic.
+        for output in [
+            "not json at all",
+            r#"{"question":"which one?"}"#,
+            r#"{"from":{"node":"analyst"}}"#,
+            r#"{"from":null}"#,
+        ] {
+            let with_implementer = derive(
+                Some("awaiting_clarification"),
+                &[
+                    cp("implementer", "t1"),
+                    cp_from("clarification", "t2", output),
+                ],
+            );
+            assert_eq!(
+                caller_of_view(&with_implementer, "clarification").as_deref(),
+                Some("implementer"),
+                "`{output}` should fall through to the backward scan"
+            );
+
+            let alone = derive(
+                Some("awaiting_clarification"),
+                &[cp_from("clarification", "t1", output)],
+            );
+            assert_eq!(
+                caller_of_view(&alone, "clarification"),
+                None,
+                "`{output}` with nothing to scan back to resolves to no caller"
+            );
+        }
+    }
+
+    #[test]
+    fn attributing_a_caller_does_not_move_the_node() {
+        // The field ships before anything reads it. Placement stays the trailing-stage rule until
+        // #248 consumes the attribution.
+        let checkpoints = [
+            cp("context", "t1"),
+            cp("analyst", "t2"),
+            cp("red_team", "t3"),
+            cp("implementer", "t4"),
+            cp("referee", "t5"),
+        ];
+        let views = derive(Some("converged"), &checkpoints);
+        let trailing = views.iter().map(|v| v.stage).max().unwrap();
+        let referee = views.iter().find(|v| v.name == "referee").unwrap();
+        assert_eq!(referee.stage, trailing, "still appended after the shape");
+        assert_eq!(referee.lane, 0);
+        assert_eq!(referee.state, NodeState::Done);
+        assert_eq!(referee.checkpoints, 1);
+        assert_eq!(referee.caller.as_deref(), Some("implementer"));
+    }
+
+    #[test]
+    fn a_node_the_shape_places_claims_no_caller() {
+        // Its position is the answer; a name there would be a second, driftable source for it.
+        let views = derive(
+            Some("converged"),
+            &[
+                cp("context", "t1"),
+                cp("implementer", "t2"),
+                cp("referee", "t3"),
+            ],
+        );
+        for v in views.iter().filter(|v| v.name != "referee") {
+            assert_eq!(v.caller, None, "`{}` is placed by the shape", v.name);
+        }
     }
 
     #[test]

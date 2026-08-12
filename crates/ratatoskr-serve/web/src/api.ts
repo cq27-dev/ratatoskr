@@ -31,6 +31,9 @@ export interface NodeView {
   telemetry?: NodeTelemetry;
   /** What the node *would* run on, from config. Present before it has run. */
   planned?: PlannedNode;
+  /** The node that ran this one. Only present for a node the shape does not place — a placed node's
+   *  position already says what preceded it. */
+  caller?: string;
 }
 
 /** Mirrors `pipeline::NodeTelemetryView`. */
