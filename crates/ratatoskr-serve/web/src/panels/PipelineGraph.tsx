@@ -18,7 +18,7 @@ import {
 import { Brain, Infinity as InfinityIcon, Repeat, Wrench } from "lucide-react";
 import { TOOL_GROUPS } from "../ui/tools";
 import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode } from "../api";
-import type { ConvergeLoops } from "../derive";
+import { forkHandoff, type ConvergeLoops } from "../derive";
 
 /*
  * Positions are computed from the `stage` and `lane` the server sends with each node, not from a
@@ -227,10 +227,13 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
         } as React.CSSProperties
       }
     >
-      {/* Named, all four of them: with more than one handle per type an edge that names none is
+      {/* Named, all five of them: with more than one handle per type an edge that names none is
           resolved by whichever registered without an id, and that ordering is not ours to rely on.
           Unnamed, the stage edges vanished intermittently on re-render. */}
       <Handle type="target" id="in" position={Position.Left} isConnectable={false} />
+      {/* Where a hand-off from the lane above lands. Its own handle because `in` is on the left,
+          where the stage edges arrive, and a step down a lane comes in from the top. */}
+      <Handle type="target" id="lane-in" position={Position.Top} isConnectable={false} />
       <div className="node-name">
         <span>{stageLabel(node.name)}</span>
         <span className="dot" aria-hidden="true" />
@@ -532,6 +535,29 @@ export default function PipelineGraph({ nodes, live, active, loops, selected, on
     );
 
     /*
+     * The one sequenced pair inside a stage: the implementer receives a tree whose tests the red
+     * team has already written, and cannot start before it has. Stage edges only ever join one
+     * stage to the next, so without this the two read as a fork.
+     *
+     * Both names are hardcoded, and that is not an oversight to generalise from `stage`/`lane`:
+     * only the orchestrator knows which pair within a stage is sequenced, and the shape does not
+     * express it — its stage and lane numbers are declarative layout and prove nothing about
+     * ordering or concurrency. `forkHandoff` needs both boxes present in this list, so a workflow
+     * without a red team draws nothing. A short vertical line down the lane gap, unlabelled and
+     * untinted: it is a forward hand-off and should look like the other forward edges.
+     */
+    if (forkHandoff(view)) {
+      edges.push({
+        id: "red_team-implementer",
+        source: "red_team",
+        target: "implementer",
+        sourceHandle: "loop-out",
+        targetHandle: "lane-in",
+        type: "straight",
+      });
+    }
+
+    /*
      * The three ways the implementer is re-entered, each drawn only if it actually happened.
      *
      * Gated on the derived count, never on a checkpoint total: a traversal is a re-entry, so the
@@ -610,7 +636,7 @@ export default function PipelineGraph({ nodes, live, active, loops, selected, on
     // Not clickable, and not focusable by tab: an edge here states a relation between two nodes and
     // has nothing to show when you pick it. See the note in `ConvergeEdge` on the hit path.
     return edges.map((e) => ({ ...e, selectable: false, focusable: false, interactionWidth: 0 }));
-  }, [byName, columns, loops]);
+  }, [byName, columns, loops, view]);
 
   /*
    * React Flow is a controlled component: it owns node measurement and writes the result back

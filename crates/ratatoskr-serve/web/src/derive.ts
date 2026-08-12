@@ -204,6 +204,29 @@ export function convergeLoops(events: readonly LiveEvent[]): ConvergeLoops {
 }
 
 /**
+ * Whether the red team has handed the tree over to the implementer.
+ *
+ * The two share a stage, so no forward stage edge connects them and the graph reads as a fork —
+ * which it is not. `implement()` cannot start until `redTeam()` has finished: `implement_host`
+ * (`ratatoskr-nodes/src/workflow.rs`) errors with "implement() cannot start until the awaited
+ * redTeam() call has finished" unless `red_team_completed` is set, and `red_team_host` sets that
+ * flag only after its checkpoint write succeeds. Both boxes having left `idle` is therefore
+ * complete proof the hand-off happened, and no ordering check is needed — nor wanted: `at` is
+ * wall-clock text of unconfirmed precision, and historical runs batch-write their checkpoints, so
+ * a missing upstream checkpoint says nothing about whether the stage completed.
+ *
+ * A failed red team still counts. The hand-off is what this answers; whether the stage went well
+ * is the box's business.
+ *
+ * Takes the same event-corrected list the boxes are drawn from, so it cannot drift out of step
+ * with them — an edge reading a different source than its endpoints is exactly the bug in c9b5e13.
+ */
+export function forkHandoff(nodes: readonly NodeView[]): boolean {
+  const started = (name: string) => nodes.some((n) => n.name === name && n.state !== "idle");
+  return started("red_team") && started("implementer");
+}
+
+/**
  * Nodes a current control can reach.
  *
  * The event stream records the process's active attempt, including the concurrent delivery
