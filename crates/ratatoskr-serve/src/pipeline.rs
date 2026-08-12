@@ -16,16 +16,14 @@ const CANNOT_FAIL_THE_RUN: &[&str] = &["bookkeeper", "publisher"];
 /// not a node — it's the run's input, and it's the only record of the run's subject.
 pub const ISSUE_NODE: &str = "issue";
 
-/// Node names whose caller [`caller_of`] can resolve. Each has its own rule and its own evidence;
-/// the names are matched exactly, so a foreign node a custom workflow checkpoints claims no caller.
+/// The one node whose caller [`caller_of`] resolves, and the node it resolves to.
 ///
-/// Both names are refused as declared stage identifiers — `referee` as an internal gate,
-/// `clarification` as a record the run writes itself (`validate.rs`). That is what lets these arms
-/// read a checkpoint's contents as a record of known shape rather than a stage's own output: without
-/// it, a workflow could declare a `clarification` stage whose ordinary output carried a `from`
-/// meaning a branch, and the API would report it as a caller.
+/// `referee` qualifies because what the resolution needs is guaranteed rather than inferred: it is a
+/// fixed internal gate that `validate.rs` refuses as a declared stage identifier, so the name cannot
+/// belong to anything else; it is not routed under a governance alias, so the name in the record is
+/// its own; and every instance of it in a run resolves to the same caller, so collapsing a run's
+/// referee checkpoints into one node loses nothing.
 const REFEREE_NODE: &str = "referee";
-const CLARIFICATION_NODE: &str = "clarification";
 const IMPLEMENTER_NODE: &str = "implementer";
 
 /// What a node is doing, as far as the store can honestly say.
@@ -343,63 +341,39 @@ fn append_unknown(
     }
 }
 
-/// Which node ran the checkpoint at `index`, as far as the checkpoint log can say.
+/// Which node ran the checkpoint at `index`, when the log can say so without guessing.
 ///
-/// Each rule belongs to ONE node name and is dispatched on it. Neither signal generalises, and
-/// `append_unknown` appends any foreign name a custom workflow checkpoints, so applying either rule
-/// to an unrecognised node would invent parentage that #248 then draws:
-///
-/// * A `from` field is only known to mean "the node that asked" in a clarification record. Another
-///   node's output may carry a `from` meaning a branch, a revision, or a date.
-/// * "Preceded by an implementer checkpoint" is true of most things a run does late; it identifies a
-///   caller only for the referee, which judges that very checkpoint.
-///
-/// [`CLARIFICATION_NODE`]: `clarify.rs` writes `output_json.from` from the hook's node — the node
-/// that called the synthetic `ask` tool — so the record names its own caller. The text is
-/// model-adjacent, so a parse failure falls through rather than panicking.
-///
-/// [`REFEREE_NODE`]: the nearest preceding `implementer` checkpoint. Structural rather than
-/// statistical: every `referee_judgement` call site in `workflow.rs` judges
+/// Only the referee. Every `referee_judgement` call site in `workflow.rs` judges
 /// `latest_checkpoint(store, run_id, "implementer")`, fetched immediately before, so the nearest
-/// preceding implementer checkpoint is literally the output being judged. `"implementer"` is
-/// hardcoded because only the orchestrator knows what the referee judges — a run's `stage` and
-/// `lane` are declarative layout, not evidence of invocation.
+/// preceding implementer checkpoint is literally the output being judged — the resolution mirrors the
+/// call rather than inferring from adjacency. `"implementer"` is hardcoded because only the
+/// orchestrator knows what the referee judges; a run's `stage` and `lane` are declarative layout, not
+/// evidence of invocation.
 ///
-/// Anything else resolves to `None`: unknown, not guessed at. A new rule here needs its own
-/// evidence that the signal means a caller for that node, not a name that happens to fit.
+/// Everything else resolves to `None`, and that is a statement about the record rather than a gap for
+/// a cleverer reader to fill. A checkpoint does not record what invoked it, and the two substitutes
+/// available here do not survive the general case:
+///
+/// * **A name in a record is not necessarily the node that wrote it.** A declared stage runs under its
+///   `governedBy` identity — `StageExecutor` passes the governance id as `NodeRun.node` — so a
+///   clarification's `from`, taken from that same value, names the governance identity. Two stages
+///   sharing one `governedBy` are already indistinguishable by the time a record is written.
+/// * **Position is not provenance.** "Followed an implementer" is true of most work a run does late.
+///
+/// A caller for anything beyond the referee needs the producer to record it — an explicit caller
+/// identity per invocation (#244) — and somewhere to put more than one, since `append_unknown`
+/// collapses a name's checkpoints into a single node. Until then this stays narrow on purpose: a wrong
+/// caller is worse than an absent one, because the graph draws it.
 fn caller_of(checkpoints: &[Checkpoint], index: usize) -> Option<String> {
     let c = checkpoints.get(index)?;
-    match c.node_name.as_str() {
-        CLARIFICATION_NODE => clarification_asker(&c.output_json),
-        REFEREE_NODE => checkpoints[..index]
-            .iter()
-            .rev()
-            .find(|c| c.node_name == IMPLEMENTER_NODE)
-            .map(|c| c.node_name.clone()),
-        _ => None,
+    if c.node_name != REFEREE_NODE {
+        return None;
     }
-}
-
-/// The asking node in a clarification exchange, or `None` if this is not one.
-///
-/// `clarify.rs` writes an exchange as `{from, to, question, answer}`, every value a string, so all
-/// four are required before `from` is read as a node name. Reserving the stage identifier only stops
-/// FUTURE runs from writing something else here: the store already holds runs recorded when a custom
-/// `clarification` stage was legal, and `bundle.rs` imports checkpoints from other repositories
-/// entirely. A row from either could carry a `from` meaning a branch or a revision, and the shape
-/// this checks is what separates it from an exchange.
-fn clarification_asker(output_json: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(output_json).ok()?;
-    let exchange = value.as_object()?;
-    for field in ["from", "to", "question", "answer"] {
-        if !exchange
-            .get(field)
-            .is_some_and(serde_json::Value::is_string)
-        {
-            return None;
-        }
-    }
-    exchange["from"].as_str().map(str::to_string)
+    checkpoints[..index]
+        .iter()
+        .rev()
+        .find(|c| c.node_name == IMPLEMENTER_NODE)
+        .map(|c| c.node_name.clone())
 }
 
 /// Group a shape's nodes into stages, indexed by column.
@@ -842,9 +816,13 @@ mod tests {
     }
 
     #[test]
-    fn a_node_that_records_its_own_asker_is_believed_over_the_scan() {
-        // `clarify.rs` writes the exchange the node that called the `ask` tool took part in. That is
-        // first-hand, so it wins even with an implementer checkpoint sitting right before it.
+    fn a_clarification_claims_no_caller_even_though_its_record_names_one() {
+        // A clarification records `from`, and it is tempting to read it as the asking node. It is
+        // not: a declared stage runs under its `governedBy` identity, and that is the value this
+        // field carries — so a stage governed by `implementer` would be reported as the implementer
+        // having asked itself, and two stages sharing one `governedBy` are indistinguishable here.
+        // Naming the wrong asker is worse than naming none, because #248 anchors a branch on it, so
+        // this stays silent until the producer records the caller per invocation (#244).
         let views = derive(
             Some("awaiting_clarification"),
             &[
@@ -852,86 +830,7 @@ mod tests {
                 cp_from("clarification", "t2", EXCHANGE),
             ],
         );
-        assert_eq!(
-            caller_of_view(&views, "clarification").as_deref(),
-            Some("analyst")
-        );
-    }
-
-    #[test]
-    fn a_clarification_row_that_is_not_an_exchange_claims_no_caller() {
-        // Reserving the stage identifier only binds future runs. The store still holds runs recorded
-        // when a custom `clarification` stage was legal, and a bundle can import checkpoints from
-        // another repository altogether. Such a row's `from` means whatever that stage meant by it,
-        // so only a record shaped like an exchange is read as one.
-        for output in [
-            r#"{"from":"release-1.2"}"#,
-            r#"{"from":"release-1.2","to":"main"}"#,
-            r#"{"from":"main","to":"dev","question":"which one?"}"#,
-            r#"{"from":"main","to":"dev","question":"q","answer":42}"#,
-            r#"["from","main"]"#,
-        ] {
-            let views = derive(
-                Some("converged"),
-                &[
-                    cp("implementer", "t1"),
-                    cp_from("clarification", "t2", output),
-                ],
-            );
-            assert_eq!(
-                caller_of_view(&views, "clarification"),
-                None,
-                "`{output}` is not an exchange and must not name a caller"
-            );
-        }
-    }
-
-    #[test]
-    fn a_clarification_that_does_not_name_its_asker_has_an_unknown_caller() {
-        // Unparseable, missing `from`, or a `from` that isn't a string: the record does not say who
-        // asked, so neither does the API. There is deliberately no fall-back to the nearest
-        // implementer here — the clarification rule is the `from` field and nothing else, and an
-        // implementer that happens to precede it is not evidence it was the asker.
-        for output in [
-            "not json at all",
-            r#"{"question":"which one?"}"#,
-            r#"{"from":{"node":"analyst"}}"#,
-            r#"{"from":null}"#,
-        ] {
-            let with_implementer = derive(
-                Some("awaiting_clarification"),
-                &[
-                    cp("implementer", "t1"),
-                    cp_from("clarification", "t2", output),
-                ],
-            );
-            assert_eq!(
-                caller_of_view(&with_implementer, "clarification"),
-                None,
-                "`{output}` names no asker, and a preceding implementer must not stand in for one"
-            );
-        }
-    }
-
-    #[test]
-    fn attributing_a_caller_does_not_move_the_node() {
-        // The field ships before anything reads it. Placement stays the trailing-stage rule until
-        // #248 consumes the attribution.
-        let checkpoints = [
-            cp("context", "t1"),
-            cp("analyst", "t2"),
-            cp("red_team", "t3"),
-            cp("implementer", "t4"),
-            cp("referee", "t5"),
-        ];
-        let views = derive(Some("converged"), &checkpoints);
-        let trailing = views.iter().map(|v| v.stage).max().unwrap();
-        let referee = views.iter().find(|v| v.name == "referee").unwrap();
-        assert_eq!(referee.stage, trailing, "still appended after the shape");
-        assert_eq!(referee.lane, 0);
-        assert_eq!(referee.state, NodeState::Done);
-        assert_eq!(referee.checkpoints, 1);
-        assert_eq!(referee.caller.as_deref(), Some("implementer"));
+        assert_eq!(caller_of_view(&views, "clarification"), None);
     }
 
     #[test]
