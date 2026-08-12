@@ -14,6 +14,9 @@ root = "."
 # claims `.c` + `.h`. Add or remove languages and directories as your layout needs.
 [target_bindings]
 rust = ["."]
+# The dashboard (web/src, .ts + .tsx), the bundled workflows, and the version-controlled
+# rulesets under .ratatoskr/rules. `typescript` claims both extensions.
+typescript = ["."]
 
 # Richer targets (uncomment to use): a named target with an explicit kind and custom file
 # globs — the only way to bind generated / test / docs trees or a non-default file set.
