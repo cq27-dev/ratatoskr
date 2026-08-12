@@ -149,7 +149,7 @@ export function nodesFromEvents(events: readonly LiveEvent[]): Map<string, Deriv
  * edge, so the counts have to be separated before they can be drawn.
  */
 export interface ConvergeLoops {
-  /** The verifier (or the referee mediating for it) faulted the code, and `iterate()` ran again. */
+  /** The verifier faulted the code, and `iterate()` ran again on the same plan. */
   fix: number;
   /** The finding faulted the *plan*: `analyst()` re-ran first, so the loop reaches further back. */
   replan: number;
@@ -165,9 +165,18 @@ export interface ConvergeLoops {
  * one, and drew `×1` on runs that went straight through.
  *
  * Classified by what started in between, because nothing in the record names the route directly:
- * an `analyst` start means the plan was re-made, a `verifier` or `referee` start without one means
- * the code was faulted, and neither means the suite never went clean and the verifier sat the
- * cycle out. Every other node in the segment decides nothing and is ignored.
+ * an `analyst` start means the plan was re-made, a `verifier` start without one means the code was
+ * faulted, and neither means the suite never went clean and the verifier sat the cycle out. Every
+ * other node in the segment decides nothing and is ignored.
+ *
+ * The `verifier` start is the whole signal, and the `referee` must NOT be added to it. The referee
+ * precedes every correction regardless of route: `iterate_host` calls `referee_judgement`
+ * unconditionally at the top of the stage (`ratatoskr-nodes/src/workflow.rs:915`), before it
+ * inspects anything, so a `referee` start appears on the tests-not-clean path too — which reaches
+ * `iterate({})` without `full()` ever calling `verify()`. Counting it turns a real failed-test
+ * retry (`implementer -> referee -> implementer`) into a fix and draws an edge out of a verifier
+ * that never ran. `verify()` is reachable only inside `full()`'s `if (testsClean)` branch, so the
+ * `verifier` start alone separates the two exactly.
  *
  * Array order only — never the `at` strings, whose precision is not ours to rely on. Pass a prefix
  * and the counts are the counts as of that point, which is what keeps the edges honest while
@@ -186,7 +195,7 @@ export function convergeLoops(events: readonly LiveEvent[]): ConvergeLoops {
     }
     if (!entered) entered = true;
     else if (since.has("analyst")) out.replan += 1;
-    else if (since.has("verifier") || since.has("referee")) out.fix += 1;
+    else if (since.has("verifier")) out.fix += 1;
     else out.retry += 1;
     since = new Set();
   }

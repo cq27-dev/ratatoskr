@@ -74,12 +74,25 @@ test("a verifier between two implementer starts is a direct fix", () => {
   });
 });
 
-test("a referee mediating the cycle is a direct fix, not a retry", () => {
+// `iterate_host` runs the referee unconditionally (workflow.rs:915), including on the
+// tests-not-clean path that reaches `iterate({})` without `verify()` ever running. So a referee
+// start on its own is a failed-test retry, and must never be read as the verifier's fix.
+test("a referee with no verifier is a retry, because the referee runs on both paths", () => {
   expect(convergeLoops([start("implementer"), start("referee"), start("implementer")])).toEqual({
-    fix: 1,
+    fix: 0,
     replan: 0,
-    retry: 0,
+    retry: 1,
   });
+});
+
+test("the common real fix cycle through verifier then referee is a direct fix", () => {
+  const events = [
+    start("implementer"),
+    start("verifier"),
+    start("referee"),
+    start("implementer"),
+  ];
+  expect(convergeLoops(events)).toEqual({ fix: 1, replan: 0, retry: 0 });
 });
 
 test("an analyst re-run makes it a replan even though the verifier also ran", () => {
