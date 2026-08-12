@@ -467,6 +467,40 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_stage_cannot_shadow_the_red_teams_governance_identity() {
+        // Stage resolution matches an exact id before falling back to `governedBy`, so a stage
+        // named `redteam` answers the lookups made for `redteam_classifier` and `redteam_author`:
+        // it decides whether the red team is enabled, and on whose profile. Enabling it that way
+        // then leaves route resolution with a `redteam` that has no stage to resolve, and the run
+        // dies on the name the workflow just introduced. `implementer` and `context`, the sibling
+        // identities, are covered by reservations of their own.
+        let template = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+
+        let mut stage = template.clone();
+        stage.id = "redteam".to_string();
+        let error = validate_declarations(&[stage], "repo-workflow")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stage `redteam`"), "{error}");
+        assert!(error.contains("governance identity"), "{error}");
+
+        // The stages it governs keep their own declarable ids.
+        for declarable in ["redteam_classifier", "redteam_author"] {
+            let mut stage = template.clone();
+            stage.id = declarable.to_string();
+            stage.output_contract = policy::required_contract(declarable).unwrap().to_string();
+            stage.governed_by = Some("redteam".to_string());
+            assert!(
+                validate_declarations(&[stage], "repo-workflow").is_ok(),
+                "`{declarable}` must stay declarable"
+            );
+        }
+    }
+
+    #[test]
     fn an_override_may_not_change_a_contract_the_run_deserializes() {
         // `redTeam()` reads the `analyst` checkpoint back as `AnalystOutput` and `implement()`
         // takes one as its argument. An override that checkpoints another shape passes every other

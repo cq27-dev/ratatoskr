@@ -37,6 +37,13 @@ pub(crate) enum Reserved {
     Record,
     /// An internal gate with a fixed capability boundary. Never a configurable stage or agent.
     InternalGate,
+    /// The governance identity of a standard stage, with no stage of its own under that name.
+    ///
+    /// Resolution matches a stage id before falling back to `governedBy`, so a workflow stage
+    /// declared under this name wins the lookups made *for* the standard stages that name it —
+    /// their enablement, their route, their profile. It could then enable a red team whose own
+    /// route resolution has nowhere to go, and the run would die on the name it just introduced.
+    GovernanceIdentity,
 }
 
 impl Reserved {
@@ -60,6 +67,10 @@ impl Reserved {
             Self::InternalGate => {
                 "an internal gate with a fixed capability, not a configurable stage"
             }
+            Self::GovernanceIdentity => {
+                "the governance identity of the standard red-team stages, which a stage of that \
+                 name would answer for; choose a different stage identifier"
+            }
         }
     }
 
@@ -74,7 +85,10 @@ impl Reserved {
     /// `publisher` would spend that route, and be recorded under that identity, for a turn the
     /// workflow never made.
     fn governable(self) -> bool {
-        matches!(self, Self::Operation | Self::Lifecycle)
+        matches!(
+            self,
+            Self::Operation | Self::Lifecycle | Self::GovernanceIdentity
+        )
     }
 }
 
@@ -138,6 +152,9 @@ pub(crate) const STANDARD_IDENTIFIERS: &[(&str, Class)] = &[
     ("verify", Class::Reserved(Reserved::Operation)),
     ("isConverged", Class::Reserved(Reserved::Operation)),
     ("testCommandRan", Class::Reserved(Reserved::Operation)),
+    // `implementer` and `context`, the other two governance identities the standard stages name,
+    // are already reserved above for reasons of their own; `redteam` has no such cover.
+    ("redteam", Class::Reserved(Reserved::GovernanceIdentity)),
     ("implementer", Class::Reserved(Reserved::Lifecycle)),
     ("red_team", Class::Reserved(Reserved::Lifecycle)),
     ("memory", Class::Reserved(Reserved::Lifecycle)),
@@ -331,10 +348,12 @@ mod tests {
 
     #[test]
     fn an_operation_identity_may_still_govern_a_stage_but_a_terminal_one_may_not() {
-        // `implementer_attempt` is governed by `implementer` and `context_distillation` by
-        // `context` in the bundled definitions, so reserving those ids must not bar them here.
+        // `implementer_attempt` is governed by `implementer`, `context_distillation` by `context`
+        // and both red-team stages by `redteam` in the bundled definitions, so reserving those ids
+        // must not bar them here.
         assert!(reserved_for_governance("implementer").is_none());
         assert!(reserved_for_governance("context").is_none());
+        assert!(reserved_for_governance("redteam").is_none());
         assert_eq!(
             reserved_for_governance("publisher"),
             Some(Reserved::Terminal)
