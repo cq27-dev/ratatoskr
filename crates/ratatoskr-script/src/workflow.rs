@@ -30,7 +30,9 @@ use ratatoskr_core::{Capability, SessionScope};
 use rquickjs::loader::{BuiltinLoader, BuiltinResolver};
 use rquickjs::module::Evaluated;
 use rquickjs::promise::{Promise, Promised};
-use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Ctx, Function, Module};
+use rquickjs::{
+    AsyncContext, AsyncRuntime, CatchResultExt, Ctx, Exception, Function, Module, Object, Value,
+};
 
 use crate::ScriptError;
 use crate::transpile;
@@ -72,8 +74,8 @@ fn specifiers<'a>(modules: Modules<'a>) -> Vec<&'a str> {
     modules.iter().map(|(name, _)| *name).collect()
 }
 
-/// JS prelude: wrap each raw host (`__name`, taking/returning JSON strings) as an ergonomic
-/// `name(x)` that passes real JS values, and provide the entry invoker.
+/// JS prelude: the schema helpers a declaration is written with, `defineWorkflow` and the
+/// declaration readers, and the entry invoker. Hosts are not here — see [`HOST_WRAPPER`].
 const BOOTSTRAP: &str = r#"
 globalThis.str = Object.freeze(function (overrides) {
     return Object.assign({ type: "string" }, overrides || {});
@@ -105,29 +107,6 @@ globalThis.stage = Object.freeze(function (id, overrides) {
         appendRepositoryGuidance: false
     }, overrides || {}, { id: id });
 });
-globalThis.__wrap = function (name) {
-    return async function (x) {
-        var input = x === undefined ? null : x;
-        var renderer = globalThis.__stageQuestionRenderers[name];
-        var hostInput = input;
-        if (renderer !== undefined) {
-            var question = renderer(input);
-            if (typeof question !== "string") {
-                throw new Error("stage '" + name + "' renderQuestion must return a string");
-            }
-            hostInput = {
-                __ratatoskrRenderedQuestion: {
-                    input: input,
-                    question: question
-                }
-            };
-        }
-        var raw = await globalThis["__" + name](JSON.stringify(hostInput));
-        var r = JSON.parse(raw);
-        if (r && Object.prototype.hasOwnProperty.call(r, "__error")) throw new Error(r.__error);
-        return r.value;
-    };
-};
 globalThis.__workflow = null;
 globalThis.__workflowRenderers = {};
 globalThis.__stageQuestionRenderers = {};
@@ -212,6 +191,21 @@ globalThis.__runEntry = async function (fn, inputJson) {
     return JSON.stringify(out === undefined ? null : out);
 };
 "#;
+
+/// The ergonomic `name(x)` a workflow calls, as a factory over one stage's native call.
+///
+/// Evaluated as an expression rather than kept on `globalThis`, and given its host as an argument
+/// rather than a name to look up: the capability is then a closure variable of the returned
+/// function, which no JavaScript in the context can address, alias or re-derive. Rendering,
+/// marshaling and the renderer's own ceiling all happen inside `call` — [`host_input`] — so what is
+/// left here is the tail JavaScript has to do anyway: unwrap the host's JSON reply.
+const HOST_WRAPPER: &str = r#"(function (call) {
+    return async function (x) {
+        var r = JSON.parse(await call(x));
+        if (r && Object.prototype.hasOwnProperty.call(r, "__error")) throw new Error(r.__error);
+        return r.value;
+    };
+})"#;
 
 /// What a workflow says about itself, so something can choose between workflows without running
 /// one to find out whether it fits.
@@ -314,6 +308,13 @@ pub struct WorkflowRuntime {
     context: AsyncContext,
     /// Kept alive with the runtime whose interrupt handler reads it.
     budget: Arc<Budget>,
+    /// Set while a question renderer is running, and read by every stage call this context can
+    /// make. A renderer is repository JavaScript that a Rust-driven stage turn installs alongside
+    /// one host, so a renderer that could call a stage would buy model turns off an invocation no
+    /// JavaScript composed — turns nothing checkpoints, counts or audits. The flag is Rust's rather
+    /// than a global because a renderer owns `globalThis`, and it belongs to the context rather
+    /// than to one call so a wrapper left over from an earlier call is not a way around it.
+    rendering: Arc<std::sync::atomic::AtomicBool>,
     /// The name the workflow module is declared under — its path, or the bundled workflow's name.
     /// It is what an unresolved `import` names as the importing module, so it has to be the thing
     /// the author would go and edit.
@@ -354,6 +355,7 @@ impl WorkflowRuntime {
             _runtime: runtime,
             context,
             budget,
+            rendering: Arc::default(),
             module_name: name.into(),
             source: source.into_boxed_str(),
             meta: Box::new(meta),
@@ -399,6 +401,7 @@ impl WorkflowRuntime {
             _runtime: runtime,
             context,
             budget,
+            rendering: Arc::default(),
             module_name: module_name.into(),
             source: loaded.javascript.into_boxed_str(),
             meta: Box::new(meta),
@@ -520,9 +523,10 @@ impl WorkflowRuntime {
 
     /// Invoke one entry with `question_renderers` as the run's entire renderer table.
     ///
-    /// A renderer runs synchronously in JavaScript before its Rust host. It receives the original
+    /// A renderer runs synchronously, from Rust, before its host. It receives the original
     /// structured input and may return only a string; the host still owns the model call, output
-    /// validation, checkpointing, telemetry and every workflow gate.
+    /// validation, checkpointing, telemetry and every workflow gate. It may not call a stage: a
+    /// renderer is repository JavaScript, and a Rust-driven stage turn is not its to compose.
     ///
     /// The map is installed exactly: a stage absent from it runs with no renderer and receives its
     /// structured input. Anything else would let a renderer left over from an earlier call — the
@@ -547,6 +551,7 @@ impl WorkflowRuntime {
         let source = self.source.to_string();
         let entry = entry.to_string();
         let budget = Arc::clone(&self.budget);
+        let rendering = Arc::clone(&self.rendering);
 
         within(
             &self.module_name,
@@ -583,37 +588,45 @@ impl WorkflowRuntime {
                         .map_err(|e| ScriptError::Eval(format!("{e}")))?;
                 }
 
+                let wrap: Function = ctx
+                    .eval(HOST_WRAPPER)
+                    .catch(&ctx)
+                    .map_err(|e| ScriptError::Eval(format!("{e}")))?;
+
                 for (name, hostfn) in hosts {
                     let hf = hostfn.clone();
                     let host_budget = Arc::clone(&budget);
-                    let f = Function::new(ctx.clone(), move |arg: String| {
+                    let rendering = Arc::clone(&rendering);
+                    let stage = name.clone();
+                    let call = Function::new(ctx.clone(), move |x: Value<'_>| {
+                        let arg = host_input(&x.ctx().clone(), &stage, &rendering, x.clone())?;
                         let hf = hf.clone();
                         // A host call is Rust's time, not the workflow's: the clock stops for as
                         // long as one is outstanding and restarts when the last returns.
                         let host_budget = Arc::clone(&host_budget);
                         host_budget.enter_host();
-                        Promised(async move {
+                        Ok::<_, rquickjs::Error>(Promised(async move {
                             let result = hf(arg).await;
                             host_budget.leave_host();
                             match result {
                                 Ok(json) => format!("{{\"value\":{json}}}"),
                                 Err(e) => serde_json::json!({ "__error": e }).to_string(),
                             }
-                        })
+                        }))
                     })
                     .catch(&ctx)
                     .map_err(|e| ScriptError::Eval(format!("{e}")))?;
 
-                    ctx.globals()
-                        .set(format!("__{name}"), f)
+                    // Only the wrapper is named. The native call reaches JavaScript as an argument
+                    // and stays a closure variable of the wrapper it is given to.
+                    let wrapped: Function = wrap
+                        .call((call,))
                         .catch(&ctx)
                         .map_err(|e| ScriptError::Eval(format!("{e}")))?;
-                    // Expose the ergonomic wrapper the script actually calls.
-                    ctx.eval::<(), _>(format!(
-                        "globalThis[{name:?}] = globalThis.__wrap({name:?});"
-                    ))
-                    .catch(&ctx)
-                    .map_err(|e| ScriptError::Eval(format!("{e}")))?;
+                    ctx.globals()
+                        .set(name, wrapped)
+                        .catch(&ctx)
+                        .map_err(|e| ScriptError::Eval(format!("{e}")))?;
                 }
 
                 let run_entry: Function = ctx
@@ -695,6 +708,66 @@ fn declaration_error(module_name: &str, raw: &str, error: serde_json::Error) -> 
     ScriptError::Eval(format!("{module_name}: workflow `{workflow}`: {error}"))
 }
 
+/// What `stage`'s host receives for the call argument `x`, as JSON.
+///
+/// A stage with a declared renderer gets the rendered envelope; one without gets its structured
+/// input. Rendering happens here, on the near side of the host, for two reasons: the renderer must
+/// run before the host is awaited (it writes the question the turn asks), and the ceiling below —
+/// no stage call from inside a renderer — has to be a fact Rust holds. A renderer is repository
+/// JavaScript with `globalThis` to itself, so a flag it can see is a flag it can clear.
+fn host_input<'js>(
+    ctx: &Ctx<'js>,
+    stage: &str,
+    rendering: &std::sync::atomic::AtomicBool,
+    x: Value<'js>,
+) -> rquickjs::Result<String> {
+    if rendering.load(Ordering::Relaxed) {
+        return Err(Exception::throw_message(
+            ctx,
+            &format!("stage '{stage}' must not be invoked from a renderQuestion"),
+        ));
+    }
+    // What an argumentless call passes. `JSON.stringify(undefined)` is not JSON, so the host would
+    // otherwise see nothing rather than an explicit absence.
+    let input = if x.is_undefined() {
+        Value::new_null(ctx.clone())
+    } else {
+        x
+    };
+
+    let renderers: Object = ctx.globals().get("__stageQuestionRenderers")?;
+    let Some(renderer) = renderers.get::<_, Option<Function>>(stage)? else {
+        return stringify(ctx, input);
+    };
+
+    rendering.store(true, Ordering::Relaxed);
+    let question = renderer.call::<_, Value>((input.clone(),));
+    rendering.store(false, Ordering::Relaxed);
+    let question = question?;
+    if !question.is_string() {
+        return Err(Exception::throw_message(
+            ctx,
+            &format!("stage '{stage}' renderQuestion must return a string"),
+        ));
+    }
+
+    let rendered = Object::new(ctx.clone())?;
+    rendered.set("input", input)?;
+    rendered.set("question", question)?;
+    let envelope = Object::new(ctx.clone())?;
+    envelope.set("__ratatoskrRenderedQuestion", rendered)?;
+    stringify(ctx, envelope.into_value())
+}
+
+/// The engine's own `JSON.stringify`, which is not the global a workflow could replace.
+fn stringify<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<String> {
+    Ok(ctx
+        .json_stringify(value)?
+        .map(|json| json.to_string())
+        .transpose()?
+        .unwrap_or_else(|| "null".to_string()))
+}
+
 fn check_renderer_source(workflow: &str, stage: &str, source: &str) -> Result<(), ScriptError> {
     if transpile::is_function_expression(source) {
         return Ok(());
@@ -759,7 +832,7 @@ static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 ///   host call suspends, because waiting an hour for a model is the ordinary case.
 ///
 /// A host call must **not** touch `running`. Being inside a host says nothing about whether the
-/// interpreter is spinning, and `__wrap` invokes the host *before* awaiting it, so
+/// interpreter is spinning, and a stage wrapper invokes the host *before* awaiting it, so
 /// `const p = never(x); while (true) {}` would otherwise disarm the one mechanism that can see the
 /// spin — and the spin, never yielding, would never let the host's future be driven to completion
 /// either. Nothing would re-arm anything: a deadlock the ceilings exist to prevent.
@@ -1383,6 +1456,90 @@ export async function plan(i) { return { entryRan: true }; }
         };
         assert!(error.contains("harmless"), "{error}");
         assert!(error.contains("single function expression"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_renderer_cannot_invoke_the_stage_it_renders_for() {
+        // A renderer is repository JavaScript running inside an invocation Rust owns: the stage
+        // turn a Rust adapter drives installs one host and every declared renderer. A renderer that
+        // could reach that host would buy extra model turns off one legitimate invocation, and
+        // nothing in JavaScript would capture them — no checkpoint, no ceiling, no audit trail. It
+        // tries both names a host has ever answered to.
+        let dir = scratch("renderer-cannot-call-host");
+        let runtime = load(
+            &dir,
+            r#"defineWorkflow({
+                 name: "review",
+                 stages: [{
+                   id: "reviewer",
+                   agent: "reason",
+                   renderQuestion(input) {
+                     if (!globalThis.__forged) {
+                       globalThis.__forged = [];
+                       try {
+                         globalThis.__forged.push(
+                           globalThis.__reviewer(JSON.stringify({ forged: true })));
+                       } catch (e) {}
+                       try {
+                         globalThis.__forged.push(globalThis.reviewer({ forged: true }));
+                       } catch (e) {}
+                     }
+                     return "ORDINARY QUESTION";
+                   },
+                 }],
+               });
+               export async function plan(input) {
+                 const legitimate = await reviewer(input);
+                 // Awaited so a forged turn is counted rather than raced: the attack does not need
+                 // the result, but a test that dropped the promise would prove nothing either way.
+                 for (const forged of globalThis.__forged || []) {
+                   try { await forged; } catch (e) {}
+                 }
+                 return legitimate;
+               }"#,
+        )
+        .await;
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        let mut hosts = HashMap::new();
+        hosts.insert(
+            "reviewer".to_string(),
+            host(move |arg| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.lock()
+                        .expect("host calls mutex poisoned")
+                        .push(serde_json::from_str::<serde_json::Value>(&arg).unwrap());
+                    Ok("{}".to_string())
+                }
+            }),
+        );
+
+        let renderer = runtime.meta().stages[0].question_renderer.clone().unwrap();
+        runtime
+            .run_with_question_renderers(
+                "plan",
+                serde_json::json!({ "issue": "keep the contract" }).to_string(),
+                hosts,
+                HashMap::from([("reviewer".to_string(), renderer)]),
+            )
+            .await
+            .unwrap();
+
+        let calls = calls.lock().expect("host calls mutex poisoned");
+        // The count is the assertion: an error string says a route was closed, one turn says no
+        // route was open.
+        assert_eq!(calls.len(), 1, "forged stage turns: {calls:?}");
+        assert_eq!(
+            calls[0]["__ratatoskrRenderedQuestion"]["question"],
+            "ORDINARY QUESTION"
+        );
+        assert_eq!(
+            calls[0]["__ratatoskrRenderedQuestion"]["input"]["issue"],
+            "keep the contract"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
