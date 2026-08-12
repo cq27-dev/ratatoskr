@@ -1417,102 +1417,17 @@ pub(crate) fn build_characterizer(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     stages: &[Stage],
-    context: &PluginContext,
-    configured: Vec<ServerTools>,
-    ledger: Option<Arc<RunLedger>>,
     declared_context: Option<Arc<workflow::WorkflowContext>>,
 ) -> Result<Option<testrun::Characterizer>, PlanError> {
+    // Enablement only. What the turn runs on — route, tools, ceiling, prompt — is resolved by the
+    // stage executor from the registry this gate reads, so resolving it a second time here could
+    // only disagree with it.
     if node_route(engine, config, stages, "characterizer").is_none() {
         return Ok(None);
     }
-    // No skills either, and this is the seam that enforces it: `node_agent_config` grants the
-    // `Skill` tool whenever a node has skills bound, while the hook that answers it is installed
-    // from what the caller passes to `run_structured`. `Characterizer` passes none — so leaving
-    // skills bound here would offer it a tool whose result nothing can produce, and a node that
-    // reads a tool error as an instruction is a failure this repo has already paid for once.
-    let mut plugins = NodePlugins {
-        skills: Vec::new(),
-        ..context.for_node("characterizer")
-    };
-    // No default tools: it transcribes output it was handed. Reading the repo would invite it to
-    // decide whether a failure matters, which is the one thing it must not do.
-    let cfg = stage_agent_config(
-        engine,
-        config,
-        context.pool_for("characterizer", &configured),
-        "characterizer",
-        &[],
-        &mut plugins,
-    )?;
     Ok(Some(testrun::Characterizer {
-        route: cfg.route,
-        tools: cfg.tools,
-        max_turns: cfg.max_turns,
-        ledger,
         declared_context: declared_context.expect("characterizer route requires its stage context"),
     }))
-}
-
-/// The implementer's agent configuration.
-///
-/// Distinct from every other node's in what it may reach: the editing tools and a shell, on top of
-/// the read tools each node gets. Built in one place because those two powers belong together and
-/// to exactly one node — a second construction site is how one of them comes to be granted
-/// somewhere it was not meant to be.
-#[cfg(test)]
-fn build_implementer_agent(
-    engine: &Arc<ScriptEngine>,
-    config: &RatatoskrConfig,
-    context: &PluginContext,
-    offer: Option<ServerTools>,
-) -> Result<(NodeAgentConfig, NodePlugins), PlanError> {
-    build_implementer_agent_with_servers(engine, config, context, offer.into_iter().collect())
-}
-
-fn build_implementer_agent_with_servers(
-    engine: &Arc<ScriptEngine>,
-    config: &RatatoskrConfig,
-    context: &PluginContext,
-    configured: Vec<ServerTools>,
-) -> Result<(NodeAgentConfig, NodePlugins), PlanError> {
-    let mut plugins = context.for_node("implementer");
-    let mut tools = context.pool_for("implementer", &configured);
-    tools.add_local_tools(ratatoskr_agent::files::edit_declarations());
-    tools.add_local(ratatoskr_agent::shell::declaration());
-    // The implementer can ask. It has the most turns to spend and is the only node that changes
-    // code, so it is the one most likely to meet a question worth asking — and the run-wide
-    // `ASK_BUDGET` is what keeps that a relief valve rather than a way to spend a run.
-    tools.add_local(clarify::ask_tool());
-    let mut cfg = stage_agent_config(
-        engine,
-        config,
-        tools,
-        "implementer",
-        &implementer_default_tools(),
-        &mut plugins,
-    )?;
-    // TOML governs the built-in implementer. A ruleset can still make a deliberate, more-specific
-    // per-node override with `maxTurns`.
-    if cfg.max_turns.is_none() {
-        cfg.max_turns = Some(config.implementer.max_turns);
-    }
-    Ok((cfg, plugins))
-}
-
-/// The implementer's default `allow`: its rag-rat tools plus the ones that let it work — reading,
-/// editing, and running commands. A ruleset naming its own `allow` replaces this wholesale, and
-/// one that forgets `Write` or `Bash` leaves the node unable to do the job it exists for.
-fn implementer_default_tools() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = implementer::IMPLEMENTER_TOOLS.to_vec();
-    names.extend([
-        ratatoskr_agent::files::READ,
-        ratatoskr_agent::files::GREP,
-        ratatoskr_agent::files::GLOB,
-        ratatoskr_agent::files::WRITE,
-        ratatoskr_agent::files::EDIT,
-        ratatoskr_agent::shell::BASH,
-    ]);
-    names
 }
 
 /// Resolve a node's model from its ruleset first, then its TOML route.
@@ -1726,16 +1641,30 @@ fn wrapped(text: &str) -> String {
 mod agent_config_tests {
     use super::*;
 
-    #[test]
-    fn the_implementer_can_correct_a_memory_its_change_falsifies() {
+    #[tokio::test]
+    async fn the_implementer_can_correct_a_memory_its_change_falsifies() {
         // The defect this closes: a review that found a memory contradicted by the diff routed the
         // finding here, and this node could read memories and write none — so converge asked for a
         // fix nobody in the run could make, every iteration, until the budget ran out.
-        let tools = implementer_default_tools();
-        assert!(tools.contains(&"memory_update"), "{tools:?}");
-        assert!(tools.contains(&"memory_mark_obsolete"), "{tools:?}");
+        let stages = workflow::standard_stages().await.unwrap();
+        let tools = &stages
+            .iter()
+            .find(|stage| stage.id == "implementer_attempt")
+            .expect("the standard registry declares the implementer's attempt")
+            .tools;
+        assert!(
+            tools.iter().any(|tool| tool == "memory_update"),
+            "{tools:?}"
+        );
+        assert!(
+            tools.iter().any(|tool| tool == "memory_mark_obsolete"),
+            "{tools:?}"
+        );
         // And composing new ones stays the bookkeeper's, done once with the whole run in view.
-        assert!(!tools.contains(&"memory_create"), "{tools:?}");
+        assert!(
+            !tools.iter().any(|tool| tool == "memory_create"),
+            "{tools:?}"
+        );
     }
 
     /// scout: full ruleset (model + prompt), no `[models.scout]`. bookkeeper: partial ruleset
@@ -2177,13 +2106,35 @@ mod agent_config_tests {
     }
 
     #[tokio::test]
-    async fn toml_configures_the_implementer_turn_cap_unless_its_ruleset_overrides_it() {
+    async fn the_build_profile_caps_the_implementer_turn_unless_its_ruleset_overrides_it() {
+        // Asserted through the path the attempt takes: `implementer_attempt` resolves its turn cap
+        // from the profile it selects, and its ruleset — keyed by the governance identity,
+        // `implementer` — is the more specific answer when it names one.
         let mut config = RatatoskrConfig::default();
-        config.implementer.max_turns = 250;
-        let context = PluginContext::default();
+        config.agents.insert(
+            "build".to_string(),
+            ratatoskr_core::AgentProfileConfig {
+                capabilities: vec![ratatoskr_core::Capability::Write],
+                max_turns: Some(250),
+                ..Default::default()
+            },
+        );
+        let stages = workflow::standard_stages().await.unwrap();
+        let attempt = stages
+            .iter()
+            .find(|stage| stage.id == "implementer_attempt")
+            .expect("the standard registry declares the implementer's attempt");
 
-        let engine = engine("implementer-toml-turn-cap").await;
-        let (cfg, _) = build_implementer_agent(&engine, &config, &context, None).unwrap();
+        let engine = engine("implementer-profile-turn-cap").await;
+        let (cfg, _) = plugins::declared_stage_agent_config(
+            &engine,
+            &config,
+            ToolSet::default(),
+            attempt,
+            &[],
+            &NodePlugins::default(),
+        )
+        .unwrap();
         assert_eq!(cfg.max_turns, Some(250));
 
         let engine = binding_engine(
@@ -2191,7 +2142,15 @@ mod agent_config_tests {
             r#"defineAgent("implementer", { maxTurns: 7 });"#,
         )
         .await;
-        let (cfg, _) = build_implementer_agent(&engine, &config, &context, None).unwrap();
+        let (cfg, _) = plugins::declared_stage_agent_config(
+            &engine,
+            &config,
+            ToolSet::default(),
+            attempt,
+            &[],
+            &NodePlugins::default(),
+        )
+        .unwrap();
         assert_eq!(cfg.max_turns, Some(7));
     }
 
@@ -2215,7 +2174,11 @@ mod agent_config_tests {
     }
 
     #[tokio::test]
-    async fn a_built_in_stage_uses_its_selected_profile() {
+    async fn a_standard_stage_uses_its_selected_profile() {
+        // Through the executor's resolver: a standard stage's model, turn cap, base prompt and
+        // capability ceiling all come from the profile its declaration names, and the ceiling is
+        // the narrower of the two — a `read` profile keeps the implementer's editing tools away
+        // even though its stage declares `write`.
         let engine = binding_engine("build-profile", "").await;
         let mut config = RatatoskrConfig::default();
         config.agents.insert(
@@ -2237,19 +2200,24 @@ mod agent_config_tests {
             },
         );
 
-        let mut plugins = NodePlugins::default();
-        let cfg = stage_agent_config(
+        let stages = workflow::standard_stages().await.unwrap();
+        let attempt = stages
+            .iter()
+            .find(|stage| stage.id == "implementer_attempt")
+            .expect("the standard registry declares the implementer's attempt");
+        let default_tools = attempt.tools.iter().map(String::as_str).collect::<Vec<_>>();
+        let (cfg, profile) = plugins::declared_stage_agent_config(
             &engine,
             &config,
             ToolSet::default(),
-            "implementer",
-            &implementer_default_tools(),
-            &mut plugins,
+            attempt,
+            &default_tools,
+            &NodePlugins::default(),
         )
         .unwrap();
         assert_eq!(cfg.route.model, "profile-model");
         assert_eq!(cfg.system_prompt, None);
-        assert_eq!(plugins.profile_prompt, "profile prompt");
+        assert_eq!(profile.base_prompt, "profile prompt");
         assert_eq!(cfg.max_turns, Some(7));
         assert_eq!(cfg.tools.names(), ["Read", "Grep", "Glob"]);
     }

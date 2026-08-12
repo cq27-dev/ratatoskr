@@ -714,35 +714,6 @@ pub(crate) fn stage_agent_config(
     )
 }
 
-/// Resolve the red-team test author. It shares the `redteam` route and ruleset with the optional
-/// classifier, but its fixed job is to write tests into the pre-implementation worktree. The
-/// classifier stage's read ceiling must therefore not remove `Write` or `Edit` from the author.
-pub(crate) fn redteam_author_agent_config(
-    engine: &Arc<ScriptEngine>,
-    config: &RatatoskrConfig,
-    tools: ToolSet,
-    default_tools: &[&str],
-    plugins: &mut NodePlugins,
-) -> Result<NodeAgentConfig, PlanError> {
-    let profile = stage_profile(config, "redteam");
-    plugins.profile_prompt = profile
-        .as_ref()
-        .map_or_else(String::new, |profile| profile.base_prompt.clone());
-    let capabilities = [Capability::Write];
-    node_agent_config(
-        engine,
-        config,
-        tools,
-        "redteam",
-        default_tools,
-        plugins,
-        AgentSettings {
-            capabilities: &capabilities,
-            profile,
-        },
-    )
-}
-
 /// Resolve a declared workflow stage through the profile it names.
 pub(crate) fn declared_stage_agent_config(
     engine: &Arc<ScriptEngine>,
@@ -1023,14 +994,22 @@ mod tests {
             },
         );
 
-        for node in ["analyst", "bookkeeper"] {
-            let cfg = stage_agent_config(
+        // Through the live path: every stage a run executes resolves its policy here, from the
+        // profile its declaration names.
+        let stages = crate::workflow::standard_stages().await.unwrap();
+        for id in ["analyst", "bookkeeper"] {
+            let stage = stages
+                .iter()
+                .find(|stage| stage.id == id)
+                .expect("a standard stage");
+            assert_eq!(stage.agent, "reason", "`{id}` selects the patched profile");
+            let (cfg, _) = declared_stage_agent_config(
                 &engine,
                 &config,
                 ToolSet::default(),
-                node,
+                stage,
                 &[],
-                &mut NodePlugins::default(),
+                &NodePlugins::default(),
             )
             .unwrap();
             assert!(matches!(
@@ -1042,19 +1021,30 @@ mod tests {
 
     #[tokio::test]
     async fn redteam_test_author_retains_its_write_tools() {
+        // The author and the classifier share the `redteam` governance identity, and the
+        // classifier's stage is read-only. The author keeps its editing tools because the ceiling
+        // that narrows them is its own stage's, resolved per turn from the run's registry — not
+        // the identity's.
         let engine = binding_engine("redteam-author-writes", "").await;
         let mut config = RatatoskrConfig::default();
         let route = config.models["analyst"].clone();
         config.models.insert("redteam".to_string(), route);
+        let stages = crate::workflow::standard_stages().await.unwrap();
+        let author = stages
+            .iter()
+            .find(|stage| stage.id == "redteam_author")
+            .expect("the standard registry declares the test author");
         let mut tools = ToolSet::default();
         tools.add_local_tools(ratatoskr_agent::files::edit_declarations());
 
-        let cfg = redteam_author_agent_config(
+        let default_tools = author.tools.iter().map(String::as_str).collect::<Vec<_>>();
+        let (cfg, _) = declared_stage_agent_config(
             &engine,
             &config,
             tools,
-            crate::redteam::AUTHOR_TOOLS,
-            &mut NodePlugins::default(),
+            author,
+            &default_tools,
+            &NodePlugins::default(),
         )
         .unwrap();
 

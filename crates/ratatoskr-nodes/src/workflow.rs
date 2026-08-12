@@ -37,7 +37,7 @@ use crate::{
     ImplementerOutput, MemoryOutput, PlanError, PlanOutcome, RedTeamNode, RedTeamOutput,
     RunOutcome, ScoutOutput, Stage, bookkeeper, checkpoint, converge,
     publisher::{PublisherInput, PublisherOutput},
-    redteam, referee, stage_agent_config, verifier,
+    redteam, referee, verifier,
 };
 
 /// Backstop on total node-running binding calls per run — a runaway-loop guard, far above any real
@@ -543,58 +543,16 @@ async fn build_red_team(
     let short: String = ctx.run_id.chars().take(8).collect();
     let stages = ctx.stages().await?;
     let enabled = crate::classifier_enabled(&ctx.engine, &ctx.config, &stages);
-    let classifier = match enabled {
-        true => {
-            let mut plugins = ctx.plugin_context.for_node("redteam");
-            let cfg = stage_agent_config(
-                &ctx.engine,
-                &ctx.config,
-                ctx.plugin_context.pool_for("redteam", &ctx.servers),
-                "redteam",
-                redteam::CLASSIFIER_TOOLS,
-                &mut plugins,
-            )?;
-            Some(redteam::RedTeamClassifier {
-                route: cfg.route,
-                tools: cfg.tools,
-                files: cfg.files,
-                ledger: Some(Arc::clone(&ctx.ledger)),
-                policy: cfg.policy,
-                max_turns: cfg.max_turns,
-                clarifier: None,
-                system_prompt: cfg.system_prompt,
-                plugins,
-                declared_context: Arc::clone(ctx),
-            })
-        }
-        false => None,
-    };
-    let author = match enabled {
-        true => {
-            let mut plugins = ctx.plugin_context.for_node("redteam");
-            let mut tools = ctx.plugin_context.pool_for("redteam", &ctx.servers);
-            tools.add_local_tools(ratatoskr_agent::files::edit_declarations());
-            let cfg = crate::plugins::redteam_author_agent_config(
-                &ctx.engine,
-                &ctx.config,
-                tools,
-                redteam::AUTHOR_TOOLS,
-                &mut plugins,
-            )?;
-            Some(redteam::TestAuthor {
-                route: cfg.route,
-                tools: cfg.tools,
-                policy: cfg.policy,
-                max_turns: cfg.max_turns,
-                system_prompt: cfg.system_prompt,
-                conventions: crate::repo_conventions(&ctx.repo_path),
-                plugins,
-                ledger: Some(Arc::clone(&ctx.ledger)),
-                declared_context: Arc::clone(ctx),
-            })
-        }
-        false => None,
-    };
+    // Enablement only, for both halves. Each drives its turn through the stage executor, which
+    // resolves route, tools, ceiling and prompt from the run's registry — the classifier from
+    // `redteam_classifier`, the author from `redteam_author`, whose own `write` ceiling is what
+    // keeps the classifier's read ceiling from disarming it.
+    let classifier = enabled.then(|| redteam::RedTeamClassifier {
+        declared_context: Arc::clone(ctx),
+    });
+    let author = enabled.then(|| redteam::TestAuthor {
+        declared_context: Arc::clone(ctx),
+    });
     Ok(RedTeamNode {
         author,
         acceptance,
@@ -602,9 +560,6 @@ async fn build_red_team(
             &ctx.engine,
             &ctx.config,
             &stages,
-            &ctx.plugin_context,
-            ctx.servers.clone(),
-            Some(Arc::clone(&ctx.ledger)),
             Some(Arc::clone(ctx)),
         )?,
         repo_path: ctx.repo_path.clone(),
@@ -698,12 +653,6 @@ async fn build_implementer(
     analyst: AnalystOutput,
 ) -> Result<ImplementerNode, PlanError> {
     let stages = ctx.stages().await?;
-    let (cfg, plugins) = crate::build_implementer_agent_with_servers(
-        &ctx.engine,
-        &ctx.config,
-        &ctx.plugin_context,
-        ctx.servers.clone(),
-    )?;
     Ok(ImplementerNode {
         clarifier: Some(ctx.clarifier.as_dyn()),
         acceptance: ctx.acceptance(&analyst.acceptance),
@@ -711,9 +660,6 @@ async fn build_implementer(
             &ctx.engine,
             &ctx.config,
             &stages,
-            &ctx.plugin_context,
-            ctx.servers.clone(),
-            Some(Arc::clone(&ctx.ledger)),
             Some(Arc::clone(ctx)),
         )
         .ok()
@@ -721,14 +667,6 @@ async fn build_implementer(
         repo_path: ctx.repo_path.clone(),
         worktree_root: ctx.config.worktree.root.clone(),
         sandbox: ctx.sandbox_config(),
-        route: cfg.route,
-        tools: cfg.tools,
-        policy: cfg.policy,
-        max_turns: cfg.max_turns,
-        system_prompt: cfg.system_prompt,
-        conventions: crate::repo_conventions(&ctx.repo_path),
-        plugins,
-        ledger: Some(Arc::clone(&ctx.ledger)),
         run_id: ctx.run_id.clone(),
         issue: ctx.issue.clone(),
         analyst,
@@ -3145,6 +3083,7 @@ mod tests {
 
     struct RecordingStageTurn {
         sessions: Mutex<Vec<ratatoskr_core::SessionScope>>,
+        models: Mutex<Vec<String>>,
         nodes: Mutex<Vec<String>>,
         conversations: Mutex<Vec<Option<String>>>,
         ledger_ids: Mutex<Vec<Option<usize>>>,
@@ -3164,6 +3103,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 sessions: Mutex::new(Vec::new()),
+                models: Mutex::new(Vec::new()),
                 nodes: Mutex::new(Vec::new()),
                 conversations: Mutex::new(Vec::new()),
                 ledger_ids: Mutex::new(Vec::new()),
@@ -3191,6 +3131,10 @@ mod tests {
                 .lock()
                 .expect("recording runner mutex poisoned")
                 .push(run.route.session);
+            self.models
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(run.route.model.clone());
             self.nodes
                 .lock()
                 .expect("recording runner mutex poisoned")
@@ -5492,6 +5436,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_overridden_implementer_attempt_runs_on_its_own_profiles_model() {
+        // Startup validation never consults `config.models` for a stage, so an override whose
+        // profile carries its own model is legal with no `[models.implementer]` at all. The
+        // lifecycle adapter used to resolve a second route of its own, against the *built-in*
+        // stage table rather than the run's registry, and refused the run with
+        // `MissingRoute("implementer")` before the executor — which resolves the override
+        // correctly — ever ran.
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-implementer-profile-route-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"defineWorkflow({
+                 name: "ours",
+                 stages: [
+                   stage("implementer_attempt", {
+                     agent: "shipwright",
+                     governedBy: "implementer",
+                     inputContract: "ImplementerAttemptInput",
+                     outputContract: "Report",
+                     outputSchema: { type: "object" },
+                     instructions: "OURS",
+                     capabilities: ["write"],
+                   }),
+                 ],
+               });
+               export async function run(input) { return input; }"#,
+        )
+        .unwrap();
+        let definitions = standard_definitions().unwrap();
+        let runtime = WorkflowRuntime::load(
+            &workflow_path,
+            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        // The headline case: the override brings its own model, and the run has none.
+        config.models.remove("implementer");
+        config.agents.insert(
+            "shipwright".to_string(),
+            ratatoskr_core::AgentProfileConfig {
+                model: Some(ratatoskr_core::ModelRoute {
+                    model: "shipwright-model".to_string(),
+                    ..model_route()
+                }),
+                capabilities: vec![ratatoskr_core::Capability::Write],
+                ..Default::default()
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-implementer-profile-route",
+            "override the implementer's stage",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        install_execution_stages(&ctx, &runtime).await.unwrap();
+
+        let analyst = AnalystOutput {
+            impact_summary: "The override supplies the route.".to_string(),
+            touched: Vec::new(),
+            risks: Vec::new(),
+            requirements: Vec::new(),
+            residual_risk: String::new(),
+            changes_code: true,
+            acceptance: Vec::new(),
+            interface: Vec::new(),
+        };
+        let node = build_implementer(&ctx, analyst).await;
+        assert!(
+            node.is_ok(),
+            "an override carrying its own model is a complete route: {:?}",
+            node.err()
+        );
+
+        // And the turn that actually runs is on that model.
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({ "summary": "the override ran" }).to_string(),
+            ..Default::default()
+        });
+        evaluate_standard_stage_with_turn(
+            Arc::clone(&ctx),
+            "implementer_attempt",
+            "{}".to_string(),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            turn.models
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .as_slice(),
+            ["shipwright-model"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn an_override_that_omits_render_question_gets_no_renderer_at_all() {
         // An override restates only what it changes, so omitting `renderQuestion` is how a stage
         // says it wants its structured input. The bundled workflow is evaluated on every adapter
@@ -7123,16 +7177,12 @@ mod tests {
         Arc::get_mut(&mut ctx).unwrap().repo_path = repo.clone();
         *ctx.acceptance.lock().unwrap() = Some(Vec::new());
 
+        // A `redteam` route enables both halves. What each may reach is not decided here: both
+        // drive their turn through the stage executor, and the write ceiling that separates them
+        // is asserted against the turn it actually composes by the generic-stage parity test.
         let configured = build_red_team(&ctx, Vec::new()).await.unwrap();
-        let author_tools = configured.author.as_ref().unwrap().tools.names();
-        assert!(author_tools.iter().any(|tool| tool == "Write"));
-        assert!(author_tools.iter().any(|tool| tool == "Edit"));
-        let classifier_tools = configured.classifier.as_ref().unwrap().tools.names();
-        assert!(
-            !classifier_tools
-                .iter()
-                .any(|tool| tool == "Write" || tool == "Edit")
-        );
+        assert!(configured.author.is_some());
+        assert!(configured.classifier.is_some());
 
         let returned: RedTeamOutput = serde_json::from_str(
             &red_team_host(Arc::clone(&ctx), "null".to_string())

@@ -264,6 +264,11 @@ export const implementer_attempt = {
     "find_callers",
     "memory_search",
     "read_chunk",
+    // The two writes. A change can make a recorded memory false — it is the only thing that can —
+    // and a review that found a memory contradicted by the diff routed the finding here, to a node
+    // with no tool to correct one, every iteration until the budget ran out. `memory_create` is
+    // deliberately absent: composing a new memory is the bookkeeper's job, done once at the end
+    // with the whole run in view.
     "memory_update",
     "memory_mark_obsolete",
     "Read",

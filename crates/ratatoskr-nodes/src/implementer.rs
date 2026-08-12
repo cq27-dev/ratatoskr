@@ -11,13 +11,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ratatoskr_agent::RunLedger;
 use ratatoskr_agent::shell::ShellAccess;
-use ratatoskr_core::{ModelRoute, SandboxConfig, ToolPolicy};
+use ratatoskr_core::SandboxConfig;
 use ratatoskr_exec::worktree::{self, WorktreePath};
 use ratatoskr_exec::{SandboxSpec, create_worktree, remove_worktree};
 use ratatoskr_graph::{NodeError, parse_validated};
-use ratatoskr_mcp::ToolSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -91,33 +89,6 @@ pub struct ImplementerOutput {
 /// off limits and why, and what to do when the session opens with a diagnostic rather than a plan.
 pub const NATIVE_PREAMBLE: &str = include_str!("../prompts/implementer.md");
 
-/// The rag-rat tools the implementer gets by default.
-///
-/// Wider than a planning node's: it is the only node that changes code, and the prompt tells it to
-/// check the blast radius and the recorded memories of every symbol it touches — which it can only
-/// do if it can reach them.
-pub const IMPLEMENTER_TOOLS: &[&str] = &[
-    "impact_surface",
-    "symbol_lookup",
-    "semantic_search",
-    "find_callers",
-    "memory_search",
-    "read_chunk",
-    // The two writes. A change can make a recorded memory false — it is the only thing that can —
-    // and until now nothing in a run could correct one: reading was the whole of a node's access,
-    // and the bookkeeper's writes happen outside the agent, after the run is over. A review that
-    // found a memory contradicted by the diff therefore routed to this node and asked it for
-    // something it had no tool to do, every iteration, until the budget ran out.
-    //
-    // `memory_create` is deliberately absent. Composing a new memory from what a run learned is the
-    // bookkeeper's job, done once at the end with the whole run in view and rag-rat's dedup behind
-    // it; a node writing them mid-change would produce several immature notes about work still in
-    // progress. Correcting a memory the change falsifies is the opposite case — it is part of the
-    // change, and nobody else is in a position to know.
-    "memory_update",
-    "memory_mark_obsolete",
-];
-
 /// What the model reports when it stops. Everything that decides the run — the diff, the checks —
 /// is read from the worktree afterwards, so this carries only the part nothing else can see: what
 /// it believes it did.
@@ -152,24 +123,17 @@ pub(crate) struct ImplementerAttemptInput {
     pub diagnostic: Option<String>,
 }
 
-/// The implementer node. Holds everything needed to create the worktree and drive the model.
+/// The implementer node. Holds everything needed to create the worktree and run the acceptance
+/// checks against it.
+///
+/// What the model turn runs on is deliberately absent: every attempt goes through the stage
+/// executor, which resolves `implementer_attempt`'s route, tools, capability ceiling, turn cap and
+/// prompt from the run's registry. A workflow may override that stage, so a copy resolved here
+/// could only be the wrong answer held next to the right one.
 pub struct ImplementerNode {
     pub repo_path: PathBuf,
     pub worktree_root: PathBuf,
     pub sandbox: SandboxConfig,
-    pub route: ModelRoute,
-    pub tools: ToolSet,
-    pub policy: Option<Arc<dyn ToolPolicy>>,
-    pub max_turns: Option<usize>,
-    /// Ruleset `systemPrompt`; replaces [`NATIVE_PREAMBLE`] when set.
-    pub system_prompt: Option<String>,
-    /// The repository's own conventions (`AGENTS.md`), loaded once from the checkout and prefixed
-    /// to this node's preamble. `None` when the repo ships no conventions file — the preamble is
-    /// then exactly what it was before. It is the only node besides the test author that writes
-    /// code, so it is one of the two that carry these.
-    pub conventions: Option<String>,
-    pub plugins: crate::NodePlugins,
-    pub ledger: Option<Arc<RunLedger>>,
     /// Who answers when the implementer cannot resolve something itself.
     ///
     /// It is the node with the most turns to spend and the only one that changes code, so it is
@@ -490,14 +454,6 @@ mod tests {
             repo_path: repo.clone(),
             worktree_root: dir.join("worktrees"),
             sandbox: config.sandbox.clone(),
-            route: config.models["implementer"].clone(),
-            tools: ToolSet::default(),
-            policy: None,
-            max_turns: None,
-            system_prompt: None,
-            conventions: None,
-            plugins: crate::NodePlugins::default(),
-            ledger: None,
             clarifier: None,
             run_id,
             issue: "exercise cleanup".to_string(),
