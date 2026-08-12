@@ -149,6 +149,64 @@ pub(crate) const STANDARD_IDENTIFIERS: &[(&str, Class)] = &[
 /// Selection's stage id. Named here because it is where its class is recorded.
 pub(crate) const SELECTION_STAGE_ID: &str = "overseer";
 
+/// "Does this output actually deserialize as the Rust type the contract names?"
+///
+/// [`STANDARD_IDENTIFIERS`] says which contract a stage's output is read back as, and
+/// [`validate_declarations`](crate::validate::validate_declarations) refuses an override that
+/// changes the contract *name*. Neither says anything about `outputSchema`, which is the thing that
+/// actually gates what the model may return — so an override could keep `outputContract:
+/// "AnalystOutput"`, declare `outputSchema: { "type": "string" }`, pass every gate, checkpoint a
+/// bare string, and fail much later inside `latest_checkpoint` with a serde error that no longer
+/// says which stage produced it.
+///
+/// Deliberately not a schema-compatibility check against the canonical schema: that would forbid
+/// legitimate tightening (a `minLength`, an extra `required`) and still not prove the read
+/// succeeds. Deserializing is the exact boundary.
+///
+/// Second table rather than a field on [`Class`] only because a `const` cannot hold a monomorphised
+/// function pointer per contract; `every_deserialized_contract_has_a_check` bolts the two together,
+/// so adding a standard stage is still a single edit here.
+type ContractCheck = fn(&serde_json::Value) -> Result<(), serde_json::Error>;
+
+fn reads_as<T: serde::de::DeserializeOwned>(
+    value: &serde_json::Value,
+) -> Result<(), serde_json::Error> {
+    serde_json::from_value::<T>(value.clone()).map(|_| ())
+}
+
+const CONTRACT_CHECKS: &[(&str, ContractCheck)] = &[
+    ("ScoutOutput", reads_as::<crate::scout::ScoutOutput>),
+    ("AnalystOutput", reads_as::<crate::analyst::AnalystOutput>),
+    (
+        "CharacterizerOutput",
+        reads_as::<crate::testrun::CharacterizerOutput>,
+    ),
+    ("Classification", reads_as::<crate::redteam::Classification>),
+    ("Distillation", reads_as::<crate::context::Distillation>),
+    (
+        "VerifierOutput",
+        reads_as::<crate::verifier::VerifierOutput>,
+    ),
+    ("AuthoredTests", reads_as::<crate::redteam::AuthoredTests>),
+    ("Report", reads_as::<crate::implementer::Report>),
+];
+
+/// Refuse a stage's output before it is checkpointed, when Rust reads that stage back as a type.
+///
+/// `Ok(())` for a workflow's own stage id: those are absent from [`STANDARD_IDENTIFIERS`], nothing
+/// deserializes them, and their output shape is theirs to choose.
+pub(crate) fn check_typed_output(id: &str, output: &serde_json::Value) -> Result<(), String> {
+    let Some(contract) = required_contract(id) else {
+        return Ok(());
+    };
+    let Some((_, check)) = CONTRACT_CHECKS.iter().find(|(name, _)| *name == contract) else {
+        return Ok(());
+    };
+    check(output).map_err(|error| {
+        format!("stage `{id}` output does not deserialize as `{contract}`: {error}")
+    })
+}
+
 fn class(id: &str) -> Option<Class> {
     STANDARD_IDENTIFIERS
         .iter()
@@ -213,6 +271,45 @@ mod tests {
         for (name, _) in STANDARD_IDENTIFIERS {
             assert!(seen.insert(*name), "`{name}` is classified twice");
         }
+    }
+
+    #[test]
+    fn every_deserialized_contract_has_a_check() {
+        // The bolt between the two tables. A standard stage classified as `Overridable` with a
+        // contract nothing here can read would fall through the gate silently, which is precisely
+        // the failure the gate exists for.
+        for (name, class) in STANDARD_IDENTIFIERS {
+            let Class::Overridable {
+                contract: Some(contract),
+                ..
+            } = class
+            else {
+                continue;
+            };
+            assert!(
+                CONTRACT_CHECKS.iter().any(|(known, _)| known == contract),
+                "`{name}` is deserialized as `{contract}`, which nothing here can check"
+            );
+        }
+    }
+
+    #[test]
+    fn a_typed_stage_refuses_output_its_type_cannot_read() {
+        // The schema is what gates a stage's output, and an override may declare its own while
+        // keeping the contract name — so the name alone never proved the checkpoint is readable.
+        let error = check_typed_output("analyst", &serde_json::json!("a bare string"))
+            .expect_err("a string is not an AnalystOutput");
+        assert!(error.contains("analyst"), "{error}");
+        assert!(error.contains("AnalystOutput"), "{error}");
+        assert!(
+            check_typed_output(
+                "analyst",
+                &serde_json::json!({ "impact_summary": "it fits" })
+            )
+            .is_ok()
+        );
+        // A workflow's own stage id shapes its output however it likes.
+        assert!(check_typed_output("security_review", &serde_json::json!("anything")).is_ok());
     }
 
     #[test]

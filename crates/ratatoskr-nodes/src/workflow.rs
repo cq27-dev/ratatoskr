@@ -1449,7 +1449,13 @@ fn validate_declared_output(stage: &Stage, output: &serde_json::Value) -> Result
             "stage `{}` returned invalid `{}` output: {e}",
             stage.id, stage.output_contract
         )
-    })
+    })?;
+    // The declared schema is the stage's own; for the identifiers Rust reads back as a concrete
+    // type, passing it is not the same as being readable. Checked here rather than at load because
+    // this is the one gate every stage's output passes through on its way to a checkpoint — and
+    // failing here names the stage and the contract, which the serde error at the eventual
+    // `latest_checkpoint` no longer can.
+    crate::policy::check_typed_output(&stage.id, output)
 }
 
 fn normalize_declared_output(stage: &Stage, output: &mut serde_json::Value) -> Result<(), String> {
@@ -5403,7 +5409,11 @@ mod tests {
             ("implementer_attempt", "OVERRIDDEN IMPLEMENTER"),
             ("redteam_author", "OVERRIDDEN AUTHOR"),
         ] {
-            let turn = Arc::new(RecordingStageTurn::default());
+            // Both are identifiers Rust reads back as a type, so the stub output has to be one.
+            let turn = Arc::new(RecordingStageTurn {
+                output: json!({ "summary": "the override ran" }).to_string(),
+                ..Default::default()
+            });
             evaluate_standard_stage_with_turn(
                 Arc::clone(&ctx),
                 stage_id,
@@ -5611,7 +5621,11 @@ mod tests {
         // The bundled `implementer_attempt` renderer reads `input.analyst.impact_summary`; this
         // input is the override's own shape and has no such field.
         let input = json!({ "note": "the shape this override declares" }).to_string();
-        let turn = Arc::new(RecordingStageTurn::default());
+        // Both stages are read back as a type, so the stub output has to be one.
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({ "summary": "the override ran" }).to_string(),
+            ..Default::default()
+        });
         evaluate_standard_stage_with_turn(
             Arc::clone(&ctx),
             "implementer_attempt",
