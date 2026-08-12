@@ -12,11 +12,11 @@ use std::path::{Component, Path, PathBuf};
 use swc_core::common::sync::Lrc;
 use swc_core::common::{FileName, GLOBALS, Mark, SourceMap, Span, Spanned};
 use swc_core::ecma::ast::{
-    CallExpr, Callee, ExportAll, Expr, ImportDecl, Lit, NamedExport, Program, Str,
+    CallExpr, Callee, ExportAll, Expr, ImportDecl, Lit, NamedExport, Program, Stmt, Str,
 };
 use swc_core::ecma::codegen::text_writer::JsWriter;
 use swc_core::ecma::codegen::{Config as CodegenConfig, Emitter};
-use swc_core::ecma::parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
+use swc_core::ecma::parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 use swc_core::ecma::transforms::base::{fixer::fixer, resolver};
 use swc_core::ecma::transforms::typescript::strip;
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
@@ -288,6 +288,48 @@ fn transpile(
         }
         String::from_utf8(buf).map_err(|e| ScriptError::Transpile(e.to_string()))
     })
+}
+
+/// Whether `source` is exactly one function expression, and therefore usable as a stage's question
+/// renderer.
+///
+/// The workflow runtime installs a renderer by evaluating `"(" + source + ")"`. A source that
+/// closes that parenthesis and opens another runs statements of its own, in the runtime where the
+/// privileged hosts live — so the shape of the string is the whole gate, and it is checked here,
+/// in Rust, before any engine sees it. The two candidates are the two spellings the runtime tries:
+/// object-method shorthand only becomes an expression once it is given the `function` prefix.
+pub(crate) fn is_function_expression(source: &str) -> bool {
+    lone_function_expression(&format!("({source})"))
+        || lone_function_expression(&format!("(function {source})"))
+}
+
+/// One expression statement whose expression, past any parentheses, is a function or an arrow.
+fn lone_function_expression(candidate: &str) -> bool {
+    let cm: Lrc<SourceMap> = Default::default();
+    let fm = cm.new_source_file(Lrc::new(FileName::Anon), candidate.to_string());
+    let lexer = Lexer::new(
+        // The engine parses JavaScript, so this must too: a TypeScript parse would accept an
+        // annotation that the runtime then chokes on, and the point is to judge what runs.
+        Syntax::Es(EsSyntax::default()),
+        Default::default(),
+        StringInput::from(&*fm),
+        None,
+    );
+    let mut parser = Parser::new_from(lexer);
+    let Ok(Program::Script(script)) = parser.parse_program() else {
+        return false;
+    };
+    if !parser.take_errors().is_empty() {
+        return false;
+    }
+    let [Stmt::Expr(statement)] = script.body.as_slice() else {
+        return false;
+    };
+    let mut expr = statement.expr.as_ref();
+    while let Expr::Paren(paren) = expr {
+        expr = paren.expr.as_ref();
+    }
+    matches!(expr, Expr::Fn(_) | Expr::Arrow(_))
 }
 
 /// `{file}:{line}:{col}: {message}` — a transpile failure at the construct that caused it, so the

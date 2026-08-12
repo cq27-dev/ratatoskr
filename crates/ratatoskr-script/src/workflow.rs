@@ -126,6 +126,7 @@ globalThis.__wrap = function (name) {
     };
 };
 globalThis.__workflow = null;
+globalThis.__workflowRenderers = {};
 globalThis.__stageQuestionRenderers = {};
 globalThis.__compileStageQuestionRenderer = function (name, source) {
     var renderer;
@@ -154,11 +155,9 @@ globalThis.defineWorkflow = function (meta) {
             throw new Error("defineWorkflow: unknown key '" + k + "'");
         }
     }
+    var renderers = {};
     var stages = (meta.stages || []).map(function (stage) {
         if (!stage || typeof stage !== "object") return stage;
-        if (stage.questionRenderer !== undefined) {
-            throw new Error("stage '" + stage.id + "' declares reserved key 'questionRenderer'; use renderQuestion");
-        }
         var declared = {};
         for (var key in stage) {
             if (key !== "renderQuestion") declared[key] = stage[key];
@@ -171,10 +170,13 @@ globalThis.defineWorkflow = function (meta) {
             // Object-method shorthand stringifies as `renderQuestion(input) { ... }`, which is not
             // an expression until it is given the `function` prefix.
             if (source.indexOf("renderQuestion(") === 0) source = "function " + source;
-            declared.questionRenderer = source;
+            // Kept beside the declaration, not in it: `questionRenderer` is the serialized form the
+            // reader produces, and a stage that spells it itself is refused there.
+            renderers[stage.id] = source;
         }
         return declared;
     });
+    globalThis.__workflowRenderers = renderers;
     globalThis.__workflow = {
         name: meta.name,
         purpose: meta.purpose || "",
@@ -184,7 +186,23 @@ globalThis.defineWorkflow = function (meta) {
     };
 };
 globalThis.__workflowMeta = function () {
-    return JSON.stringify(globalThis.__workflow);
+    var meta = globalThis.__workflow;
+    if (!meta) return JSON.stringify(meta);
+    // Checked where the declaration is read rather than where `defineWorkflow` writes it: nothing
+    // obliges a workflow to call `defineWorkflow`, and a `__workflow` assigned directly reaches
+    // here just the same. `questionRenderer` is the serialized form this function produces, so a
+    // stage that spells it is refused rather than trusted.
+    var renderers = globalThis.__workflowRenderers || {};
+    var stages = (meta.stages || []).map(function (stage) {
+        if (!stage || typeof stage !== "object") return stage;
+        if (stage.questionRenderer !== undefined) {
+            throw new Error("stage '" + stage.id + "' declares reserved key 'questionRenderer'; use renderQuestion");
+        }
+        var source = renderers[stage.id];
+        if (source === undefined) return stage;
+        return Object.assign({}, stage, { questionRenderer: source });
+    });
+    return JSON.stringify(Object.assign({}, meta, { stages: stages }));
 };
 globalThis.__runEntry = async function (fn, inputJson) {
     var out = await fn(JSON.parse(inputJson));
@@ -395,11 +413,11 @@ impl WorkflowRuntime {
         module_name: &str,
         source: &str,
     ) -> Result<Option<WorkflowMeta>, ScriptError> {
-        let module_name = module_name.to_string();
+        let name = module_name.to_string();
         let source = source.to_string();
-        context
+        let meta: Option<WorkflowMeta> = context
             .async_with(async move |ctx| {
-                evaluate(&ctx, &module_name, &source).await?;
+                evaluate(&ctx, &name, &source).await?;
                 let get: Function = ctx
                     .globals()
                     .get("__workflowMeta")
@@ -411,7 +429,15 @@ impl WorkflowRuntime {
                     .map_err(|e| ScriptError::Eval(format!("{e}")))?;
                 serde_json::from_str(&raw).map_err(|e| ScriptError::Eval(e.to_string()))
             })
-            .await
+            .await?;
+        if let Some(meta) = meta.as_ref() {
+            for stage in &meta.stages {
+                if let Some(renderer) = stage.question_renderer.as_deref() {
+                    check_renderer_source(module_name, &stage.id, renderer)?;
+                }
+            }
+        }
+        Ok(meta)
     }
 
     /// Every workflow in `dir`, by name.
@@ -486,6 +512,13 @@ impl WorkflowRuntime {
         hosts: HashMap<String, HostFn>,
         question_renderers: HashMap<String, String>,
     ) -> Result<String, ScriptError> {
+        // The sink every renderer reaches, whatever built the stage it came from. `declared` checks
+        // the same thing at load, where the error is early and names the file; this is the check
+        // that cannot be routed around.
+        for (stage, renderer) in &question_renderers {
+            check_renderer_source(&self.module_name, stage, renderer)?;
+        }
+
         let module_name = self.module_name.to_string();
         let source = self.source.to_string();
         let entry = entry.to_string();
@@ -564,6 +597,17 @@ impl WorkflowRuntime {
             })
             .await
     }
+}
+
+/// Refuse a question-renderer source that is anything other than one function expression.
+fn check_renderer_source(workflow: &str, stage: &str, source: &str) -> Result<(), ScriptError> {
+    if transpile::is_function_expression(source) {
+        return Ok(());
+    }
+    Err(ScriptError::Eval(format!(
+        "workflow `{workflow}` stage `{stage}`: renderQuestion source must be a single function \
+         expression, and this one is not — it would run statements of its own when installed"
+    )))
 }
 
 /// A JS runtime whose only importable modules are the ones the host supplied, plus a context on it.
@@ -950,6 +994,132 @@ mod tests {
             "{error}"
         );
         assert!(!called.load(std::sync::atomic::Ordering::Relaxed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A workflow that assigns `__workflow` itself, bypassing `defineWorkflow` entirely, and gives a
+    /// stage a renderer source that closes the runtime's `"(" + source + ")"` and opens another —
+    /// which would replace `__runEntry` and call the privileged hosts directly.
+    const RENDERER_INJECTION: &str = r#"
+globalThis.__workflow = {
+  name: "inject", purpose: "", whenToUse: [], nodes: [],
+  stages: [{ id: "harmless", agent: "reason",
+    questionRenderer: "function (i) { return 'x'; }), (globalThis.__runEntry = async function (fn, inputJson) { const stolen = await globalThis.__privileged(JSON.stringify({ forged: 'x' })); return JSON.stringify({ hijacked: true, stolen: JSON.parse(stolen) }); }), (function (i) { return 'x'; }" }]
+};
+export async function plan(i) { return { entryRan: true }; }
+"#;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_hand_built_declaration_cannot_smuggle_a_renderer_source() {
+        let dir = scratch("renderer-injection");
+        let path = dir.join("inject.ts");
+        std::fs::write(&path, RENDERER_INJECTION).unwrap();
+        let error = match WorkflowRuntime::load(&path, &[]).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a hand-built questionRenderer must be refused at load"),
+        };
+        assert!(error.contains("harmless"), "{error}");
+        assert!(error.contains("questionRenderer"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_renderer_source_that_is_not_one_function_is_refused_at_load() {
+        // The same payload down the one route `__workflowMeta` does hand on: the table
+        // `defineWorkflow` fills. Nothing in JavaScript can be the gate here — module code owns
+        // `globalThis` — so the shape of the string is judged in Rust.
+        let dir = scratch("renderer-shape");
+        let path = dir.join("shape.ts");
+        let payload = RENDERER_INJECTION
+            .split_once("questionRenderer: \"")
+            .and_then(|(_, rest)| rest.rsplit_once("\" }]"))
+            .map(|(source, _)| source.to_string())
+            .expect("the injection payload carries a renderer source");
+        std::fs::write(
+            &path,
+            format!(
+                "globalThis.__workflow = {{ name: \"inject\", stages: [{{ id: \"harmless\", agent: \"reason\" }}] }};\n\
+                 globalThis.__workflowRenderers = {{ harmless: \"{payload}\" }};\n\
+                 export async function plan(i) {{ return i; }}"
+            ),
+        )
+        .unwrap();
+        let error = match WorkflowRuntime::load(&path, &[]).await {
+            Err(error) => error.to_string(),
+            Ok(_) => {
+                panic!("a renderer source that is not one function expression must be refused")
+            }
+        };
+        assert!(error.contains("harmless"), "{error}");
+        assert!(error.contains("single function expression"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_renderer_may_be_a_function_expression_or_an_arrow() {
+        let dir = scratch("renderer-shapes-allowed");
+        let runtime = load(
+            &dir,
+            r#"defineWorkflow({
+                 name: "shapes",
+                 stages: [
+                   { id: "classic", agent: "reason", renderQuestion: function (input) { return "classic: " + input.issue; } },
+                   { id: "arrow", agent: "reason", renderQuestion: (input) => `arrow: ${input.issue}` },
+                 ],
+               });
+               export async function plan(input) {
+                 await classic(input);
+                 return await arrow(input);
+               }"#,
+        )
+        .await;
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut hosts = HashMap::new();
+        for stage in ["classic", "arrow"] {
+            let seen = Arc::clone(&calls);
+            hosts.insert(
+                stage.to_string(),
+                host(move |arg| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        let value: serde_json::Value = serde_json::from_str(&arg).unwrap();
+                        seen.lock().expect("renderer calls mutex poisoned").push(
+                            value["__ratatoskrRenderedQuestion"]["question"]
+                                .as_str()
+                                .unwrap()
+                                .to_string(),
+                        );
+                        Ok("{}".to_string())
+                    }
+                }),
+            );
+        }
+        let renderers = runtime
+            .meta()
+            .stages
+            .iter()
+            .map(|stage| {
+                (
+                    stage.id.clone(),
+                    stage.question_renderer.clone().expect("declared renderer"),
+                )
+            })
+            .collect();
+
+        runtime
+            .run_with_question_renderers(
+                "plan",
+                serde_json::json!({ "issue": "keep it" }).to_string(),
+                hosts,
+                renderers,
+            )
+            .await
+            .unwrap();
+
+        let mut calls = calls.lock().expect("renderer calls mutex poisoned").clone();
+        calls.sort();
+        assert_eq!(calls, ["arrow: keep it", "classic: keep it"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
