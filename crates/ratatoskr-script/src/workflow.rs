@@ -421,6 +421,7 @@ impl WorkflowRuntime {
         source: &str,
     ) -> Result<Option<WorkflowMeta>, ScriptError> {
         let name = module_name.to_string();
+        let reported = module_name.to_string();
         let source = source.to_string();
         let meta: Option<WorkflowMeta> = within(
             module_name,
@@ -437,7 +438,7 @@ impl WorkflowRuntime {
                     .call(())
                     .catch(&ctx)
                     .map_err(|e| ScriptError::Eval(format!("{e}")))?;
-                serde_json::from_str(&raw).map_err(|e| ScriptError::Eval(e.to_string()))
+                serde_json::from_str(&raw).map_err(|e| declaration_error(&reported, &raw, e))
             }),
         )
         .await?;
@@ -623,6 +624,51 @@ impl WorkflowRuntime {
 }
 
 /// Refuse a question-renderer source that is anything other than one function expression.
+/// Say where a rejected workflow declaration is, in terms the author can act on.
+///
+/// The declaration round-trips through JSON before it is typed, so serde's position — `at line 1
+/// column 166` — is an offset into text nobody wrote. Find the stage that failed instead and name
+/// the file, the workflow and the stage.
+fn declaration_error(module_name: &str, raw: &str, error: serde_json::Error) -> ScriptError {
+    let Ok(declared) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return ScriptError::Eval(format!(
+            "{module_name}: invalid workflow declaration: {error}"
+        ));
+    };
+    let workflow = declared
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(module_name);
+    let stages = declared
+        .get("stages")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for stage in stages {
+        let Err(reason) = serde_json::from_value::<WorkflowStage>(stage.clone()) else {
+            continue;
+        };
+        let id = stage
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unnamed>");
+        // `{ ...nodes.analystt }` spreads `undefined`, which contributes nothing, so the
+        // declaration arrives with only what `stage(id, ..)` puts on it and no `agent`. The typo is
+        // in the import member rather than in the stage, which is not something the missing field
+        // says by itself.
+        let hint = match stage.get("agent") {
+            None => {
+                " — a spread of an undefined import member is the usual cause; check the name after `nodes.`"
+            }
+            Some(_) => "",
+        };
+        return ScriptError::Eval(format!(
+            "{module_name}: workflow `{workflow}` stage `{id}`: {reason}{hint}"
+        ));
+    }
+    ScriptError::Eval(format!("{module_name}: workflow `{workflow}`: {error}"))
+}
+
 fn check_renderer_source(workflow: &str, stage: &str, source: &str) -> Result<(), ScriptError> {
     if transpile::is_function_expression(source) {
         return Ok(());
@@ -1590,6 +1636,38 @@ export async function plan(i) { return { entryRan: true }; }
             serde_json::from_str::<serde_json::Value>(&out).unwrap()["ok"],
             true
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_spread_of_a_mistyped_import_member_names_the_workflow_and_the_stage() {
+        // `nodes.analystt` is `undefined`, and spreading it contributes nothing — so the stage
+        // arrives with no `agent`. The declaration round-trips through JSON before it is typed, so
+        // serde's own position is an offset into text the author never wrote.
+        let dir = scratch("spread-typo");
+        let path = dir.join("typo.ts");
+        std::fs::write(
+            &path,
+            "import * as nodes from \"ratatoskr/nodes\";\n\
+             defineWorkflow({ name: \"ours\", stages: [stage(\"analyst\", { ...nodes.analystt })] });",
+        )
+        .unwrap();
+
+        let module = definitions_module();
+        let error = match WorkflowRuntime::load(&path, &[("ratatoskr/nodes", &module)]).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a stage with no agent must be refused"),
+        };
+        assert!(error.contains("typo.ts"), "{error}");
+        assert!(error.contains("workflow `ours`"), "{error}");
+        assert!(error.contains("stage `analyst`"), "{error}");
+        assert!(error.contains("missing field `agent`"), "{error}");
+        assert!(
+            error.contains("spread of an undefined import member"),
+            "{error}"
+        );
+        // Never a position in the author's file that belongs to the serialized declaration.
+        assert!(!error.contains("line 1 column"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
