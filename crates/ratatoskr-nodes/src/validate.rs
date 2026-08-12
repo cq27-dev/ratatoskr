@@ -145,6 +145,16 @@ pub fn validate(
         let Some(delegation) = &parent.delegation else {
             continue;
         };
+        // Delegation folds a child's evidence into the parent's runtime input on the way to the
+        // parent's checkpoint. A stage the run reads back as evidence never reaches that, so the
+        // declaration would validate here and then be dropped, unmentioned, at every invocation.
+        if policy::folded_as_evidence(&parent.id) {
+            return Err(PlanError::Configuration(format!(
+                "stage `{}` declares delegation but is {}",
+                parent.id,
+                policy::FOLDED_AS_EVIDENCE_BECAUSE
+            )));
+        }
         let Some(target) = stages.iter().find(|stage| stage.id == delegation.target) else {
             return Err(PlanError::Configuration(format!(
                 "stage `{}` delegates to unknown target `{}`; valid stages: {}",
@@ -592,5 +602,53 @@ mod tests {
             error.contains("requires an explicit workflow host call"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_stage_the_run_folds_as_evidence_may_not_delegate() {
+        // The bolt between the policy table and this gate. Delegation only runs on the way to a
+        // checkpoint, so a standard stage whose output an adapter folds into another record takes
+        // the declaration and drops it — silently, on every invocation. Adding one at that
+        // disposition without classifying it here is what this refuses to let happen quietly.
+        let template = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        let mut child = template.clone();
+        child.id = "child".to_string();
+        child.output_contract = "Evidence".to_string();
+        child.output_schema = Some(serde_json::json!({ "type": "object" }));
+        let delegating = |id: &str| {
+            let mut parent = template.clone();
+            parent.id = id.to_string();
+            parent.delegation = Some(crate::Delegation {
+                target: "child".to_string(),
+                evidence_contract: "Evidence".to_string(),
+                input_limit: 1_000,
+            });
+            parent
+        };
+
+        let folded: Vec<&str> = policy::STANDARD_IDENTIFIERS
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| policy::folded_as_evidence(id))
+            .collect();
+        assert!(
+            !folded.is_empty(),
+            "the table classifies no stage as evidence"
+        );
+        for id in folded {
+            let stages = [delegating(id), child.clone()];
+            let error = validate(&stages, &crate::built_in_agents(), &permitted_for(&stages))
+                .expect_err("a stage the run folds as evidence must not take a delegation")
+                .to_string();
+            assert!(error.contains(id), "{error}");
+            assert!(error.contains("rather than checkpointed itself"), "{error}");
+        }
+
+        // The verifier's adapter checkpoints what it runs, so delegation from it reaches execution.
+        let stages = [delegating("verifier"), child];
+        assert!(validate(&stages, &crate::built_in_agents(), &permitted_for(&stages)).is_ok());
     }
 }

@@ -92,6 +92,22 @@ impl Reserved {
     }
 }
 
+/// Who invokes a standard stage, and what becomes of its output.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Invocation {
+    /// Installed as a workflow global under its own id. The executor checkpoints its output there.
+    Workflow,
+    /// Invoked only from a Rust lifecycle adapter, which supplies a worktree, a shell grant or a
+    /// review gate a generic JavaScript host has no way to hold. Never installed as a workflow
+    /// global — a workflow that could call one directly could hand itself the record the gate
+    /// reads. The adapter has the executor checkpoint the output under this name.
+    Adapter,
+    /// As [`Self::Adapter`], but the adapter folds the output into another stage's record rather
+    /// than checkpointing it: nothing is ever written under this name, and the executor's
+    /// checkpoint-scoped work — delegation above all — does not run for it.
+    AdapterEvidence,
+}
+
 /// What a workflow may do with one standard identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Class {
@@ -99,11 +115,7 @@ pub(crate) enum Class {
         /// The output contract a Rust adapter deserializes this stage's output as. An override that
         /// changes it type-errors mid-run, so it is refused at load.
         contract: Option<&'static str>,
-        /// Invoked only from a Rust lifecycle adapter, which supplies a worktree, a shell grant or
-        /// a review gate a generic JavaScript host has no way to hold. Never installed as a
-        /// workflow global — a workflow that could call one directly could hand itself the record
-        /// the gate reads.
-        rust_invoked: bool,
+        invocation: Invocation,
     },
     Reserved(Reserved),
 }
@@ -111,14 +123,21 @@ pub(crate) enum Class {
 const fn overridable(contract: &'static str) -> Class {
     Class::Overridable {
         contract: Some(contract),
-        rust_invoked: false,
+        invocation: Invocation::Workflow,
     }
 }
 
 const fn adapter(contract: &'static str) -> Class {
     Class::Overridable {
         contract: Some(contract),
-        rust_invoked: true,
+        invocation: Invocation::Adapter,
+    }
+}
+
+const fn adapter_evidence(contract: &'static str) -> Class {
+    Class::Overridable {
+        contract: Some(contract),
+        invocation: Invocation::AdapterEvidence,
     }
 }
 
@@ -137,9 +156,11 @@ pub(crate) const STANDARD_IDENTIFIERS: &[(&str, Class)] = &[
     // call `verifier(..)` after `verify()` could answer the gate that judges it.
     ("verifier", adapter("VerifierOutput")),
     // Rust-invoked: write authority inside the prepared worktree, which only the lifecycle adapter
-    // owns. A generic host has no worktree from which to derive a safe resource root.
-    ("redteam_author", adapter("AuthoredTests")),
-    ("implementer_attempt", adapter("Report")),
+    // owns. A generic host has no worktree from which to derive a safe resource root. Both are
+    // evidence for the record their adapter writes — the red team's output and the implementer's
+    // iteration — so neither is checkpointed under its own name.
+    ("redteam_author", adapter_evidence("AuthoredTests")),
+    ("implementer_attempt", adapter_evidence("Report")),
     // --- class 2: not declarable ---------------------------------------------------------------
     ("overseer", Class::Reserved(Reserved::Selection)),
     ("bookkeeper", Class::Reserved(Reserved::Terminal)),
@@ -259,10 +280,31 @@ pub(crate) fn required_contract(id: &str) -> Option<&'static str> {
 pub(crate) fn is_js_host(id: &str) -> bool {
     match class(id) {
         None => true,
-        Some(Class::Overridable { rust_invoked, .. }) => !rust_invoked,
+        Some(Class::Overridable { invocation, .. }) => invocation == Invocation::Workflow,
         Some(Class::Reserved(_)) => false,
     }
 }
+
+/// Whether the run folds this stage's output into another record instead of checkpointing it.
+///
+/// The executor's checkpoint-scoped behaviour is skipped for such a stage, so anything a declaration
+/// asks for there — a `delegation` above all — would be accepted and then never run. Refusing it is
+/// [`crate::validate`]'s job; saying which stages those are is this table's.
+pub(crate) fn folded_as_evidence(id: &str) -> bool {
+    matches!(
+        class(id),
+        Some(Class::Overridable {
+            invocation: Invocation::AdapterEvidence,
+            ..
+        })
+    )
+}
+
+/// The clause that goes in a refusal, after "which is" — the [`Reserved::because`] of evidence
+/// disposition.
+pub(crate) const FOLDED_AS_EVIDENCE_BECAUSE: &str = "run by a Rust adapter as evidence for another stage's checkpoint rather than checkpointed \
+     itself, so nothing would consume the child's evidence; delegate from a stage the run \
+     checkpoints";
 
 #[cfg(test)]
 mod tests {
