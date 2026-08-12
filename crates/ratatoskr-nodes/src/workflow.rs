@@ -568,15 +568,18 @@ async fn build_red_team(
 ) -> Result<RedTeamNode, PlanError> {
     let short: String = ctx.run_id.chars().take(8).collect();
     let stages = ctx.stages().await?;
-    let enabled = crate::classifier_enabled(&ctx.engine, &ctx.config, &stages);
-    // Enablement only, for both halves. Each drives its turn through the stage executor, which
-    // resolves route, tools, ceiling and prompt from the run's registry — the classifier from
-    // `redteam_classifier`, the author from `redteam_author`, whose own `write` ceiling is what
-    // keeps the classifier's read ceiling from disarming it.
-    let classifier = enabled.then(|| redteam::RedTeamClassifier {
+    // Enablement only, and each half on its own stage. Each drives its turn through the stage
+    // executor, which resolves route, tools, ceiling and prompt from the run's registry — the
+    // classifier from `redteam_classifier`, the author from `redteam_author`, whose own `write`
+    // ceiling is what keeps the classifier's read ceiling from disarming it. So the gate has to
+    // ask about the same stage the turn will run: a single answer under the shared `redteam`
+    // governance name decides for whichever stage it reached first, and is wrong for the other.
+    let enabled =
+        |stage_id| crate::red_team_half_enabled(&ctx.engine, &ctx.config, &stages, stage_id);
+    let classifier = enabled("redteam_classifier").then(|| redteam::RedTeamClassifier {
         declared_context: Arc::clone(ctx),
     });
-    let author = enabled.then(|| redteam::TestAuthor {
+    let author = enabled("redteam_author").then(|| redteam::TestAuthor {
         declared_context: Arc::clone(ctx),
     });
     Ok(RedTeamNode {

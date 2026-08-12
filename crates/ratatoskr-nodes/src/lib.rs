@@ -793,14 +793,21 @@ fn route(config: &RatatoskrConfig, name: &str) -> Result<ratatoskr_core::ModelRo
         .ok_or_else(|| PlanError::MissingRoute(name.to_string()))
 }
 
-/// The red-team classifier is opt-in: it runs only when redteam has a model route to run on,
-/// whether that comes from `[models.redteam]` or from its ruleset.
-fn classifier_enabled(
+/// A red-team half is opt-in: it runs only when its own stage has a model route to run on, whether
+/// that comes from `[models.redteam]`, its ruleset, or the profile its stage names.
+///
+/// Per stage id, not per governance name. Both halves govern as `redteam` in an unmodified
+/// registry, so one lookup under that name answers for whichever stage `for_node` happens to reach
+/// first — and each half then runs its turn under its own stage. That gap silently skipped a
+/// classifier a workflow had explicitly routed, and in the other direction enabled an author with
+/// nowhere to run, which died `MissingRoute` mid-run after the worktree was already prepared.
+fn red_team_half_enabled(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     stages: &[Stage],
+    stage_id: &str,
 ) -> bool {
-    node_route(engine, config, stages, "redteam").is_some()
+    node_route(engine, config, stages, stage_id).is_some()
 }
 
 /// The resolved agent settings for one stage: profile defaults plus stage ruleset overrides.
@@ -2286,7 +2293,9 @@ mod agent_config_tests {
         let engine = engine("redteam-optin").await;
         let stages = workflow::standard_stages().await.unwrap();
         let mut config = RatatoskrConfig::default();
-        assert!(!classifier_enabled(&engine, &config, &stages));
+        for half in ["redteam_classifier", "redteam_author"] {
+            assert!(!red_team_half_enabled(&engine, &config, &stages, half));
+        }
         config.models.insert(
             "redteam".to_string(),
             ratatoskr_core::ModelRoute {
@@ -2299,7 +2308,77 @@ mod agent_config_tests {
                 session: Default::default(),
             },
         );
-        assert!(classifier_enabled(&engine, &config, &stages));
+        // Both halves govern as `redteam`, so `[models.redteam]` still turns both on.
+        for half in ["redteam_classifier", "redteam_author"] {
+            assert!(red_team_half_enabled(&engine, &config, &stages, half));
+        }
+    }
+
+    #[tokio::test]
+    async fn each_red_team_half_is_gated_on_its_own_stage() {
+        // One answer under the shared `redteam` governance name decided for both halves, resolved
+        // through whichever stage `for_node` reached first. Both directions were wrong: it skipped
+        // a classifier the workflow had explicitly routed, and it enabled an author with nowhere to
+        // run, which then died `MissingRoute` mid-run after the worktree was already prepared.
+        let engine = engine("redteam-halves").await;
+        let route = || ratatoskr_core::ModelRoute {
+            context_window: None,
+            provider: "openai".to_string(),
+            model: "gpt-5".to_string(),
+            max_tokens: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        };
+
+        // The classifier alone is re-governed and routed. It runs; the author still has nowhere.
+        let mut stages = workflow::standard_stages().await.unwrap();
+        stages
+            .iter_mut()
+            .find(|stage| stage.id == "redteam_classifier")
+            .expect("the standard registry declares the red-team classifier")
+            .governed_by = Some("review".to_string());
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("review".to_string(), route());
+        assert!(red_team_half_enabled(
+            &engine,
+            &config,
+            &stages,
+            "redteam_classifier"
+        ));
+        assert!(!red_team_half_enabled(
+            &engine,
+            &config,
+            &stages,
+            "redteam_author"
+        ));
+
+        // The other direction, needing no override: a model on the classifier's `reason` profile is
+        // somewhere for the classifier to run and nowhere for the author, whose profile is `build`.
+        let stages = workflow::standard_stages().await.unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.agents.insert(
+            "reason".to_string(),
+            ratatoskr_core::AgentProfileConfig {
+                model: Some(route()),
+                base_prompt: String::new(),
+                capabilities: vec![ratatoskr_core::Capability::Read],
+                tool_policy: None,
+                max_turns: None,
+            },
+        );
+        assert!(red_team_half_enabled(
+            &engine,
+            &config,
+            &stages,
+            "redteam_classifier"
+        ));
+        assert!(!red_team_half_enabled(
+            &engine,
+            &config,
+            &stages,
+            "redteam_author"
+        ));
     }
 
     #[tokio::test]
