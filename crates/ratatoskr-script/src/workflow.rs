@@ -21,7 +21,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use ratatoskr_core::{Capability, SessionScope};
 use rquickjs::loader::{BuiltinLoader, BuiltinResolver};
@@ -309,6 +311,8 @@ pub struct WorkflowDelegation {
 pub struct WorkflowRuntime {
     _runtime: AsyncRuntime,
     context: AsyncContext,
+    /// Kept alive with the runtime whose interrupt handler reads it.
+    budget: Arc<Budget>,
     /// The name the workflow module is declared under — its path, or the bundled workflow's name.
     /// It is what an unresolved `import` names as the importing module, so it has to be the thing
     /// the author would go and edit.
@@ -333,8 +337,8 @@ impl WorkflowRuntime {
         modules: Modules<'_>,
     ) -> Result<Self, ScriptError> {
         let source = transpile::transpile_with_includes(name, src, includes, &specifiers(modules))?;
-        let (runtime, context) = engine(modules).await?;
-        let meta = Self::declared(&context, name, &source)
+        let (runtime, context, budget) = engine(modules).await?;
+        let meta = Self::declared(&context, &budget, name, &source)
             .await?
             .ok_or_else(|| {
                 ScriptError::Eval(format!("bundled workflow `{name}` has no declaration"))
@@ -342,6 +346,7 @@ impl WorkflowRuntime {
         Ok(Self {
             _runtime: runtime,
             context,
+            budget,
             module_name: name.into(),
             source: source.into_boxed_str(),
             meta: Box::new(meta),
@@ -361,13 +366,13 @@ impl WorkflowRuntime {
             .map_err(|e| ScriptError::Io(path.display().to_string(), e))?;
         let loaded = transpile::transpile_workflow(path, &src, &specifiers(modules))?;
 
-        let (runtime, context) = engine(modules).await?;
+        let (runtime, context, budget) = engine(modules).await?;
         let module_name = path.display().to_string();
 
         // Evaluated once here to read what the script declares about itself. `run` evaluates it
         // again in the same context, which re-runs `defineWorkflow` — an idempotent assignment, and
         // the price of keeping the two paths independent.
-        let declared = Self::declared(&context, &module_name, &loaded.javascript).await?;
+        let declared = Self::declared(&context, &budget, &module_name, &loaded.javascript).await?;
         let meta = declared.unwrap_or_else(|| WorkflowMeta {
             // A workflow that declares nothing is still usable and is named after its file, so
             // `defineWorkflow` stays optional for a workflow that only exports entries.
@@ -384,6 +389,7 @@ impl WorkflowRuntime {
         Ok(Some(WorkflowRuntime {
             _runtime: runtime,
             context,
+            budget,
             module_name: module_name.into(),
             source: loaded.javascript.into_boxed_str(),
             meta: Box::new(meta),
@@ -410,13 +416,17 @@ impl WorkflowRuntime {
     /// Read the script's `defineWorkflow` call, if it makes one.
     async fn declared(
         context: &AsyncContext,
+        budget: &Budget,
         module_name: &str,
         source: &str,
     ) -> Result<Option<WorkflowMeta>, ScriptError> {
         let name = module_name.to_string();
         let source = source.to_string();
-        let meta: Option<WorkflowMeta> = context
-            .async_with(async move |ctx| {
+        let meta: Option<WorkflowMeta> = within(
+            module_name,
+            budget,
+            LOAD_BUDGET,
+            context.async_with(async move |ctx| {
                 evaluate(&ctx, &name, &source).await?;
                 let get: Function = ctx
                     .globals()
@@ -428,8 +438,9 @@ impl WorkflowRuntime {
                     .catch(&ctx)
                     .map_err(|e| ScriptError::Eval(format!("{e}")))?;
                 serde_json::from_str(&raw).map_err(|e| ScriptError::Eval(e.to_string()))
-            })
-            .await?;
+            }),
+        )
+        .await?;
         if let Some(meta) = meta.as_ref() {
             for stage in &meta.stages {
                 if let Some(renderer) = stage.question_renderer.as_deref() {
@@ -522,9 +533,13 @@ impl WorkflowRuntime {
         let module_name = self.module_name.to_string();
         let source = self.source.to_string();
         let entry = entry.to_string();
+        let budget = Arc::clone(&self.budget);
 
-        self.context
-            .async_with(async move |ctx| {
+        within(
+            &self.module_name,
+            &self.budget,
+            RUN_BUDGET,
+            self.context.async_with(async move |ctx| {
                 // The entry is read from the evaluated module, so it has to be resolved inside this
                 // closure: `Module<Evaluated>` borrows the context's `'js` lifetime and cannot
                 // outlive it.
@@ -556,10 +571,17 @@ impl WorkflowRuntime {
 
                 for (name, hostfn) in hosts {
                     let hf = hostfn.clone();
+                    let host_budget = Arc::clone(&budget);
                     let f = Function::new(ctx.clone(), move |arg: String| {
                         let hf = hf.clone();
+                        // A host call is Rust's time, not the workflow's: the clock stops for as
+                        // long as one is outstanding and restarts when the last returns.
+                        let host_budget = Arc::clone(&host_budget);
+                        host_budget.enter_host();
                         Promised(async move {
-                            match hf(arg).await {
+                            let result = hf(arg).await;
+                            host_budget.leave_host();
+                            match result {
                                 Ok(json) => format!("{{\"value\":{json}}}"),
                                 Err(e) => serde_json::json!({ "__error": e }).to_string(),
                             }
@@ -594,8 +616,9 @@ impl WorkflowRuntime {
                     .await
                     .catch(&ctx)
                     .map_err(|e| ScriptError::Eval(format!("{e}")))
-            })
-            .await
+            }),
+        )
+        .await
     }
 }
 
@@ -610,9 +633,175 @@ fn check_renderer_source(workflow: &str, stage: &str, source: &str) -> Result<()
     )))
 }
 
+/// Heap a workflow's JavaScript may hold. A workflow is composition — a few KiB of source plus
+/// `LOAD` includes capped at 16 KiB each — so 64 MiB is orders of magnitude of headroom, and small
+/// enough that a runaway allocation fails in well under a second instead of taking the machine's
+/// memory with it.
+const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Stack a workflow's JavaScript may use. QuickJS's own default is 256 KiB; 1 MiB leaves room for
+/// the deep-ish recursion a renderer over a nested structure does, while keeping runaway recursion
+/// a JavaScript exception rather than a segfault of the host process.
+const MAX_STACK_SIZE: usize = 1024 * 1024;
+
+/// Wall clock a workflow gets to evaluate its module body and declare itself.
+///
+/// Tighter than [`RUN_BUDGET`] on purpose: discovery evaluates *every* `.ts` in the workflows
+/// directory before any command runs, so this is what one non-terminating file costs a `status` or
+/// an `ask` that was never going to select it. Declaring is parsing and one object literal —
+/// milliseconds — so five seconds is already three orders of magnitude of slack.
+const LOAD_BUDGET: Duration = Duration::from_secs(5);
+
+/// Wall clock a workflow's own JavaScript may run while no host call is outstanding.
+///
+/// Composition between stages is bookkeeping: pick a branch, reshape a value, render a question.
+/// Thirty seconds of that without calling a host is a spin, not a workflow. A host call suspends
+/// the clock entirely, so a stage that thinks for an hour is unaffected.
+const RUN_BUDGET: Duration = Duration::from_secs(30);
+
+/// The zero the deadline is measured from. Wall-clock instants do not fit in an atomic; elapsed
+/// milliseconds since a fixed start do, which is what the interrupt handler needs to read on every
+/// call without taking a lock.
+static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Deadline shared by the engine's interrupt handler and the async watchdog.
+///
+/// The two together are what bounds a workflow: the handler stops JavaScript that never yields
+/// (`while (true) {}`), the watchdog stops JavaScript that yields and never resumes (`await new
+/// Promise(() => {})`). Neither alone catches both.
+///
+/// The clock is suspended while a host call is outstanding, because the ceiling is on *JavaScript*
+/// and waiting an hour for a model is the ordinary case.
+struct Budget {
+    /// Milliseconds since [`START`], or `NO_DEADLINE` when nothing is being timed.
+    deadline: AtomicU64,
+    /// What to re-arm with when the last outstanding host call returns.
+    span_ms: AtomicU64,
+    outstanding: AtomicUsize,
+}
+
+const NO_DEADLINE: u64 = u64::MAX;
+
+impl Budget {
+    fn new() -> Self {
+        Self {
+            deadline: AtomicU64::new(NO_DEADLINE),
+            span_ms: AtomicU64::new(0),
+            outstanding: AtomicUsize::new(0),
+        }
+    }
+
+    fn now_ms() -> u64 {
+        START.elapsed().as_millis() as u64
+    }
+
+    fn arm(&self, span: Duration) {
+        let span_ms = span.as_millis() as u64;
+        self.span_ms.store(span_ms, Ordering::Relaxed);
+        self.deadline
+            .store(Self::now_ms() + span_ms, Ordering::Relaxed);
+    }
+
+    fn disarm(&self) {
+        self.deadline.store(NO_DEADLINE, Ordering::Relaxed);
+    }
+
+    fn enter_host(&self) {
+        self.outstanding.fetch_add(1, Ordering::Relaxed);
+        self.disarm();
+    }
+
+    /// Re-arm once nothing is outstanding. With several hosts in flight the clock stays suspended
+    /// until the last one returns, so concurrent stages are not held to one stage's budget.
+    fn leave_host(&self) {
+        if self.outstanding.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.deadline.store(
+                Self::now_ms() + self.span_ms.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn expired(&self) -> bool {
+        Self::now_ms() >= self.deadline.load(Ordering::Relaxed)
+    }
+
+    /// `None` while nothing is being timed.
+    fn remaining(&self) -> Option<Duration> {
+        match self.deadline.load(Ordering::Relaxed) {
+            NO_DEADLINE => None,
+            deadline => Some(Duration::from_millis(
+                deadline.saturating_sub(Self::now_ms()),
+            )),
+        }
+    }
+}
+
+/// Resolves once the budget is spent, re-reading it because a returning host call moves it.
+async fn spent(budget: &Budget) {
+    loop {
+        match budget.remaining() {
+            None => tokio::time::sleep(Duration::from_millis(100)).await,
+            Some(left) if left.is_zero() => return,
+            Some(left) => tokio::time::sleep(left).await,
+        }
+    }
+}
+
+/// Run one JavaScript operation under `span`, naming `workflow` in whichever limit it hits.
+///
+/// An engine limit surfaces as an opaque `interrupted` or `out of memory`; a workflow that will not
+/// load must say which workflow, or the operator is left bisecting their workflows directory.
+async fn within<T>(
+    workflow: &str,
+    budget: &Budget,
+    span: Duration,
+    operation: impl Future<Output = Result<T, ScriptError>>,
+) -> Result<T, ScriptError> {
+    let overran = || {
+        ScriptError::Eval(format!(
+            "workflow `{workflow}` ran more than {}s of JavaScript without progress",
+            span.as_secs()
+        ))
+    };
+    budget.arm(span);
+    let outcome = tokio::select! {
+        biased;
+        result = operation => result,
+        () = spent(budget) => Err(overran()),
+    };
+    let out_of_time = budget.expired();
+    budget.disarm();
+    outcome.map_err(|error| {
+        let text = error.to_string();
+        if out_of_time && text.contains("interrupted") {
+            overran()
+        } else if text.contains("out of memory") {
+            ScriptError::Eval(format!(
+                "workflow `{workflow}` exceeded its {} MiB memory limit",
+                MEMORY_LIMIT / (1024 * 1024)
+            ))
+        } else {
+            error
+        }
+    })
+}
+
 /// A JS runtime whose only importable modules are the ones the host supplied, plus a context on it.
-async fn engine(modules: Modules<'_>) -> Result<(AsyncRuntime, AsyncContext), ScriptError> {
+///
+/// Bounded before it is handed anything to run: a workflow is repository-authored code the harness
+/// must evaluate before it can know whether it terminates.
+async fn engine(
+    modules: Modules<'_>,
+) -> Result<(AsyncRuntime, AsyncContext, Arc<Budget>), ScriptError> {
     let runtime = AsyncRuntime::new().map_err(|e| ScriptError::Eval(e.to_string()))?;
+    runtime.set_memory_limit(MEMORY_LIMIT).await;
+    runtime.set_max_stack_size(MAX_STACK_SIZE).await;
+    let budget = Arc::new(Budget::new());
+    let watched = Arc::clone(&budget);
+    runtime
+        .set_interrupt_handler(Some(Box::new(move || watched.expired())))
+        .await;
     if !modules.is_empty() {
         let mut resolver = BuiltinResolver::default();
         let mut loader = BuiltinLoader::default();
@@ -626,7 +815,7 @@ async fn engine(modules: Modules<'_>) -> Result<(AsyncRuntime, AsyncContext), Sc
     let context = AsyncContext::full(&runtime)
         .await
         .map_err(|e| ScriptError::Eval(e.to_string()))?;
-    Ok((runtime, context))
+    Ok((runtime, context, budget))
 }
 
 /// Install the prelude, then evaluate the workflow as an ES module named after its source,
@@ -1120,6 +1309,65 @@ export async function plan(i) { return { entryRan: true }; }
         let mut calls = calls.lock().expect("renderer calls mutex poisoned").clone();
         calls.sort();
         assert_eq!(calls, ["arrow: keep it", "classic: keep it"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_workflow_that_never_returns_is_stopped_and_named() {
+        // Discovery evaluates every file in the workflows directory, so this one file must not be
+        // able to wedge a command that would never have selected it.
+        let dir = scratch("non-terminating");
+        let path = dir.join("spin.ts");
+        std::fs::write(
+            &path,
+            "while (true) {}\nexport async function plan(i) { return i; }",
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let error = match WorkflowRuntime::load(&path, &[]).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a non-terminating module body must be stopped"),
+        };
+        assert!(error.contains("spin.ts"), "{error}");
+        assert!(error.contains("without progress"), "{error}");
+        assert!(
+            started.elapsed() < LOAD_BUDGET * 3,
+            "took {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_workflow_that_never_settles_is_stopped_and_named() {
+        // Yields, so the interrupt handler never fires; only the watchdog sees it.
+        let dir = scratch("never-settles");
+        let path = dir.join("hang.ts");
+        std::fs::write(&path, "await new Promise(() => {});").unwrap();
+        let error = match WorkflowRuntime::load(&path, &[]).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a module body that never settles must be stopped"),
+        };
+        assert!(error.contains("hang.ts"), "{error}");
+        assert!(error.contains("without progress"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_workflow_that_allocates_without_bound_is_stopped_and_named() {
+        let dir = scratch("memory-hog");
+        let path = dir.join("hog.ts");
+        std::fs::write(
+            &path,
+            "const held = [];\nwhile (true) held.push(new Uint8Array(1024 * 1024));",
+        )
+        .unwrap();
+        let error = match WorkflowRuntime::load(&path, &[]).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("an unbounded allocation must be stopped"),
+        };
+        assert!(error.contains("hog.ts"), "{error}");
+        assert!(error.contains("memory limit"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
