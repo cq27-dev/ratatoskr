@@ -325,11 +325,12 @@ pub struct WorkflowRuntime {
     /// repository workflow may legitimately take any name, including the bundled one, so provenance
     /// is not something a caller can recover by comparing `meta().name`.
     bundled: bool,
-    /// The ceiling one entry call runs under: [`RUN_BUDGET`] per stretch of JavaScript. A field
-    /// rather than the constant read at the call site so the test that proves the ceiling holds can
-    /// use a fraction of a second instead of adding a real half-minute to every future run of the
-    /// suite.
+    /// The ceilings one entry call runs under: [`RUN_BUDGET`] per stretch of JavaScript and
+    /// [`RUN_TOTAL_BUDGET`] across the call. Fields rather than constants read at the call site so
+    /// the tests that prove the ceilings hold can use a fraction of a second instead of adding a
+    /// real minute to every future run of the suite.
     run_span: Duration,
+    run_total: Duration,
 }
 
 impl WorkflowRuntime {
@@ -359,6 +360,7 @@ impl WorkflowRuntime {
             dependencies: Box::new([]),
             bundled: true,
             run_span: RUN_BUDGET,
+            run_total: RUN_TOTAL_BUDGET,
         })
     }
 
@@ -403,6 +405,7 @@ impl WorkflowRuntime {
             dependencies: loaded.dependencies.into_boxed_slice(),
             bundled: false,
             run_span: RUN_BUDGET,
+            run_total: RUN_TOTAL_BUDGET,
         }))
     }
 
@@ -434,6 +437,7 @@ impl WorkflowRuntime {
         let meta: Option<WorkflowMeta> = within(
             module_name,
             budget,
+            LOAD_BUDGET,
             LOAD_BUDGET,
             context.async_with(async move |ctx| {
                 evaluate(&ctx, &name, &source).await?;
@@ -548,6 +552,7 @@ impl WorkflowRuntime {
             &self.module_name,
             &self.budget,
             self.run_span,
+            self.run_total,
             self.context.async_with(async move |ctx| {
                 // The entry is read from the evaluated module, so it has to be resolved inside this
                 // closure: `Module<Evaluated>` borrows the context's `'js` lifetime and cannot
@@ -726,6 +731,15 @@ const LOAD_BUDGET: Duration = Duration::from_secs(5);
 /// count — the interpreter is parked then — so a stage that thinks for an hour is unaffected.
 const RUN_BUDGET: Duration = Duration::from_secs(30);
 
+/// Total JavaScript one entry call may execute, host time excluded.
+///
+/// [`RUN_BUDGET`] bounds a single stretch, which a workflow renews by yielding: N cheap host
+/// round-trips with 29 seconds of spinning between them is unbounded CPU, and the workflow is
+/// authored by the repository under change. This is the ceiling on the sum. Two minutes of pure
+/// composition is orders of magnitude past anything honest — a workflow that meets it is looping,
+/// not working.
+const RUN_TOTAL_BUDGET: Duration = Duration::from_secs(120);
+
 /// The zero the deadline is measured from. Wall-clock instants do not fit in an atomic; elapsed
 /// milliseconds since a fixed start do, which is what the interrupt handler needs to read on every
 /// call without taking a lock.
@@ -843,11 +857,14 @@ async fn idle_spent(budget: &Budget) {
     }
 }
 
-/// Run one JavaScript operation under `span`, naming `workflow` in whichever limit it hits.
+/// Run one JavaScript operation under a `span` per stretch and a `total` across the call, naming
+/// `workflow` in whichever limit it hits.
 ///
 /// Both clocks are driven from here because both are about *this* operation: `span` is armed around
-/// each poll, one poll being one stretch of contiguous JavaScript (see [`Budget`]). Time the
-/// operation spends parked — waiting on a host — is in neither, which is the whole point.
+/// each poll (one poll being one stretch of contiguous JavaScript, see [`Budget`]) and `total` is
+/// the sum of those polls' durations. Time the operation spends parked — waiting on a host — is in
+/// neither, which is the whole point. The total is checked at poll boundaries, so a workflow can
+/// overshoot it by at most one `span`; that is the same granularity the interrupt handler has.
 ///
 /// An engine limit surfaces as an opaque `interrupted` or `out of memory`; a workflow that will not
 /// load must say which workflow, or the operator is left bisecting their workflows directory.
@@ -855,6 +872,7 @@ async fn within<T>(
     workflow: &str,
     budget: &Budget,
     span: Duration,
+    total: Duration,
     operation: impl Future<Output = Result<T, ScriptError>>,
 ) -> Result<T, ScriptError> {
     let overran = || {
@@ -862,12 +880,21 @@ async fn within<T>(
             "workflow `{workflow}` ran more than {span:?} of JavaScript without progress"
         ))
     };
+    let exhausted = || {
+        ScriptError::Eval(format!(
+            "workflow `{workflow}` ran more than {total:?} of JavaScript in one call"
+        ))
+    };
 
+    let total_ms = total.as_millis() as u64;
+    let mut executed_ms = 0u64;
     let mut operation = Box::pin(operation);
     let driven = std::future::poll_fn(|cx| {
         budget.enter_js(span);
+        let started = Budget::now_ms();
         let polled = operation.as_mut().poll(cx);
         let out_of_time = budget.leave_js();
+        executed_ms += Budget::now_ms().saturating_sub(started);
         match polled {
             // The engine reports its own interrupt as an opaque throw, so the deadline is what says
             // whose interrupt it was.
@@ -878,6 +905,7 @@ async fn within<T>(
                     error
                 },
             )),
+            _ if executed_ms >= total_ms => Poll::Ready(Err(exhausted())),
             other => other,
         }
     });
@@ -1467,6 +1495,11 @@ export async function plan(i) { return { entryRan: true }; }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Spin for `ms` in JavaScript, the way a runaway workflow does: no yield, so only the
+    /// interrupt handler can end it.
+    const SPIN: &str =
+        "function spin(ms) { const end = Date.now() + ms; while (Date.now() < end) {} }";
+
     #[test]
     fn a_workflow_that_spins_while_a_host_is_outstanding_is_stopped_and_named() {
         // The host is *called* and never awaited, so its promise is outstanding for the whole spin.
@@ -1493,6 +1526,7 @@ export async function plan(i) { return { entryRan: true }; }
                 .unwrap();
                 let mut runtime = WorkflowRuntime::load(&path, &[]).await.unwrap().unwrap();
                 runtime.run_span = Duration::from_millis(300);
+                runtime.run_total = Duration::from_millis(600);
 
                 let mut hosts = HashMap::new();
                 hosts.insert(
@@ -1514,6 +1548,56 @@ export async function plan(i) { return { entryRan: true }; }
             .expect_err("a spin with a host outstanding must be stopped");
         assert!(error.contains("spinner.ts"), "{error}");
         assert!(error.contains("without progress"), "{error}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn javascript_spent_between_host_calls_accumulates_against_one_total() {
+        // Each stretch is well inside the per-stretch span, so only the total can stop this: a
+        // workflow must not renew its allowance by making a cheap host call between spins.
+        let dir = scratch("cumulative");
+        let path = dir.join("renewer.ts");
+        std::fs::write(
+            &path,
+            format!(
+                "{SPIN}\n\
+                 export async function plan(input) {{\n\
+                 \x20   await tick(input);\n\
+                 \x20   spin(200);\n\
+                 \x20   await tick(input);\n\
+                 \x20   spin(200);\n\
+                 \x20   return \"finished\";\n\
+                 }}"
+            ),
+        )
+        .unwrap();
+        let tick = || {
+            let mut hosts = HashMap::new();
+            hosts.insert(
+                "tick".to_string(),
+                host(|arg| async move {
+                    // Long next to the JavaScript, and not chargeable to it: waiting on a host is
+                    // the ordinary case, and the ceiling is on the workflow's own execution.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    Ok(arg)
+                }),
+            );
+            hosts
+        };
+
+        let mut runtime = WorkflowRuntime::load(&path, &[]).await.unwrap().unwrap();
+        runtime.run_span = Duration::from_secs(5);
+        runtime.run_total = Duration::from_secs(2);
+        let finished = runtime.run("plan", "null".to_string(), tick()).await;
+        assert_eq!(finished.unwrap(), "\"finished\"");
+
+        runtime.run_total = Duration::from_millis(300);
+        let error = match runtime.run("plan", "null".to_string(), tick()).await {
+            Err(error) => error.to_string(),
+            Ok(output) => panic!("a workflow past its total must be stopped, got {output}"),
+        };
+        assert!(error.contains("renewer.ts"), "{error}");
+        assert!(error.contains("in one call"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "current_thread")]
