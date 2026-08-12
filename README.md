@@ -574,8 +574,16 @@ See [`examples/workflow.ts`](examples/workflow.ts).
 TypeScript never owns authority. Rust hosts still create and clean worktrees, grant the sandboxed
 command tool, freeze acceptance and the test interface, apply review thresholds, enforce iteration
 and ceiling-replan limits, write checkpoints, infer terminal status, and perform delivery and
-bookkeeping. Internal write-capable model stages and terminal publisher/bookkeeper stages are not
+bookkeeping. Stages the run invokes itself — the verifier and the overseer, the write-capable
+red-team and implementer stages, and the terminal publisher and bookkeeper — are not
 repository-script globals.
+
+A workflow may override an imported stage by declaring it under the same id, but not every standard
+identifier is available. Selection, delivery, the workflow operations and the checkpoint identities
+the run reads back by name (`implementer`, `red_team`, `memory`) are refused when the workflow
+loads, as is an override that changes an output contract the run deserializes. The header of
+[`nodes.ts`](crates/ratatoskr-nodes/workflows/nodes.ts) lists which exports a repository may
+declare.
 
 `.ratatoskr/` otherwise holds runtime state — logs and the store — and is gitignored, except for
 `rules/` and `workflow.ts`, which are version-controlled.
