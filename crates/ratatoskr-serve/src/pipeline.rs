@@ -16,6 +16,16 @@ const CANNOT_FAIL_THE_RUN: &[&str] = &["bookkeeper", "publisher"];
 /// not a node — it's the run's input, and it's the only record of the run's subject.
 pub const ISSUE_NODE: &str = "issue";
 
+/// The one node whose caller [`caller_of`] resolves, and the node it resolves to.
+///
+/// `referee` qualifies because what the resolution needs is guaranteed rather than inferred: it is a
+/// fixed internal gate that `validate.rs` refuses as a declared stage identifier, so the name cannot
+/// belong to anything else; it is not routed under a governance alias, so the name in the record is
+/// its own; and every instance of it in a run resolves to the same caller, so collapsing a run's
+/// referee checkpoints into one node loses nothing.
+const REFEREE_NODE: &str = "referee";
+const IMPLEMENTER_NODE: &str = "implementer";
+
 /// What a node is doing, as far as the store can honestly say.
 ///
 /// The qualifier is load-bearing. This is inferred from checkpoints, which are durable and prove
@@ -59,6 +69,10 @@ pub struct NodeView {
     /// pipeline says what it is going to do rather than staying blank until it does it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub planned: Option<PlannedNode>,
+    /// The node that ran this one, for a node the shape does not place — see [`caller_of`]. A node
+    /// the shape does place needs no attribution: its position already says what preceded it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<String>,
 }
 
 /// A node's configured route: what it will run on, and the two choices that change how it behaves.
@@ -268,6 +282,8 @@ pub fn derive_with(
                 checkpoints: times.len(),
                 first_at: times.first().map(|s| s.to_string()),
                 last_at: times.last().map(|s| s.to_string()),
+                // A shaped node's caller is its position: the stage before it ran it.
+                caller: None,
             });
         }
     }
@@ -293,21 +309,26 @@ fn append_unknown(
 ) {
     let known: std::collections::HashSet<&str> = out.iter().map(|n| n.name.as_str()).collect();
     let mut seen = std::collections::HashSet::new();
-    let mut extra: Vec<&str> = Vec::new();
-    for c in checkpoints {
+    // Each out-of-shape name with the position of its FIRST checkpoint, which is what its caller is
+    // resolved from. One row aggregates every checkpoint of that name, so a run whose
+    // `clarification` rows were asked for by different nodes cannot express all of them in one
+    // `caller`. Splitting a row per caller belongs to the placement work (#248), which owns layout.
+    let mut extra: Vec<(&str, usize)> = Vec::new();
+    for (idx, c) in checkpoints.iter().enumerate() {
         let name = c.node_name.as_str();
         // The issue pseudo-node writes a checkpoint and is deliberately not a pipeline node: it
         // records what the run was asked to do, which is not a stage of doing it.
         if name != ISSUE_NODE && !known.contains(name) && seen.insert(name) {
-            extra.push(name);
+            extra.push((name, idx));
         }
     }
     let base = out.iter().map(|n| n.stage).max().map_or(0, |s| s + 1);
-    for (i, name) in extra.into_iter().enumerate() {
+    for (i, (name, first)) in extra.into_iter().enumerate() {
         let times = node_times(checkpoints, name);
         out.push(NodeView {
             telemetry: NodeTelemetryView::latest(checkpoints, name),
             planned: PlannedNode::of(config, name),
+            caller: caller_of(checkpoints, first),
             name: name.to_string(),
             // A foreign node that wrote a checkpoint has run; nothing here can say more than that.
             state: NodeState::Done,
@@ -318,6 +339,41 @@ fn append_unknown(
             last_at: times.last().map(|s| s.to_string()),
         });
     }
+}
+
+/// Which node ran the checkpoint at `index`, when the log can say so without guessing.
+///
+/// Only the referee. Every `referee_judgement` call site in `workflow.rs` judges
+/// `latest_checkpoint(store, run_id, "implementer")`, fetched immediately before, so the nearest
+/// preceding implementer checkpoint is literally the output being judged — the resolution mirrors the
+/// call rather than inferring from adjacency. `"implementer"` is hardcoded because only the
+/// orchestrator knows what the referee judges; a run's `stage` and `lane` are declarative layout, not
+/// evidence of invocation.
+///
+/// Everything else resolves to `None`, and that is a statement about the record rather than a gap for
+/// a cleverer reader to fill. A checkpoint does not record what invoked it, and the two substitutes
+/// available here do not survive the general case:
+///
+/// * **A name in a record is not necessarily the node that wrote it.** A declared stage runs under its
+///   `governedBy` identity — `StageExecutor` passes the governance id as `NodeRun.node` — so a
+///   clarification's `from`, taken from that same value, names the governance identity. Two stages
+///   sharing one `governedBy` are already indistinguishable by the time a record is written.
+/// * **Position is not provenance.** "Followed an implementer" is true of most work a run does late.
+///
+/// A caller for anything beyond the referee needs the producer to record it — an explicit caller
+/// identity per invocation (#244) — and somewhere to put more than one, since `append_unknown`
+/// collapses a name's checkpoints into a single node. Until then this stays narrow on purpose: a wrong
+/// caller is worse than an absent one, because the graph draws it.
+fn caller_of(checkpoints: &[Checkpoint], index: usize) -> Option<String> {
+    let c = checkpoints.get(index)?;
+    if c.node_name != REFEREE_NODE {
+        return None;
+    }
+    checkpoints[..index]
+        .iter()
+        .rev()
+        .find(|c| c.node_name == IMPLEMENTER_NODE)
+        .map(|c| c.node_name.clone())
 }
 
 /// Group a shape's nodes into stages, indexed by column.
@@ -361,8 +417,29 @@ mod tests {
         }
     }
 
+    /// A clarification exchange as `clarify.rs` writes one: all four fields, every value a string.
+    const EXCHANGE: &str =
+        r#"{"from":"analyst","to":"scout","question":"which one?","answer":"the first"}"#;
+
     fn state_of(views: &[NodeView], name: &str) -> NodeState {
         views.iter().find(|v| v.name == name).unwrap().state
+    }
+
+    fn caller_of_view(views: &[NodeView], name: &str) -> Option<String> {
+        views
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap()
+            .caller
+            .clone()
+    }
+
+    /// A checkpoint whose output records who asked for it, as `clarify.rs` writes it.
+    fn cp_from(node: &str, at: &str, output_json: &str) -> Checkpoint {
+        Checkpoint {
+            output_json: output_json.to_string(),
+            ..cp(node, at)
+        }
     }
 
     #[test]
@@ -643,6 +720,133 @@ mod tests {
         let views = derive(Some("no_code_change"), &[cp("analyst", "t")]);
         assert_ne!(state_of(&views, "analyst"), NodeState::Working);
         assert_ne!(state_of(&views, "implementer"), NodeState::Working);
+    }
+
+    #[test]
+    fn a_referee_checkpoint_is_attributed_to_the_implementer_it_judged() {
+        // The referee is excluded from the shape, so it arrives through `append_unknown` with no
+        // position to explain what ran it. `referee_judgement` judges the latest implementer
+        // checkpoint, so the nearest preceding one is the output it looked at.
+        let views = derive(
+            Some("converged"),
+            &[
+                cp("context", "t1"),
+                cp("analyst", "t2"),
+                cp("red_team", "t3"),
+                cp("implementer", "t4"),
+                cp("referee", "t5"),
+            ],
+        );
+        assert_eq!(
+            caller_of_view(&views, "referee").as_deref(),
+            Some("implementer")
+        );
+    }
+
+    #[test]
+    fn only_implementer_checkpoints_before_the_referee_can_have_been_judged() {
+        // The scan runs backward from the referee's own checkpoint. An implementer row written
+        // afterwards is a later iteration the referee never saw, so it must not be claimed as the
+        // caller — the resolved name is the same either way, which is exactly why the direction has
+        // to be pinned by a case where a wrong direction changes the answer.
+        let after = derive(
+            Some("running"),
+            &[cp("referee", "t1"), cp("implementer", "t2")],
+        );
+        assert_eq!(caller_of_view(&after, "referee"), None);
+
+        // With implementer checkpoints on both sides, the ones before it resolve it.
+        let both = derive(
+            Some("running"),
+            &[
+                cp("implementer", "t1"),
+                cp("implementer", "t2"),
+                cp("referee", "t3"),
+                cp("implementer", "t4"),
+            ],
+        );
+        assert_eq!(
+            caller_of_view(&both, "referee").as_deref(),
+            Some("implementer")
+        );
+    }
+
+    #[test]
+    fn a_node_the_rules_were_not_written_for_claims_no_caller() {
+        // `append_unknown` appends whatever a custom workflow checkpoints, so both rules are
+        // dispatched on the node name rather than tried on everything. Neither signal generalises:
+        // being preceded by an implementer is true of most late work, and another node's `from` may
+        // mean a branch or a revision. Guessing here would put false parentage in the API, which
+        // #248 draws.
+        let after_implementer = derive(
+            Some("converged"),
+            &[
+                cp("implementer", "t1"),
+                cp("deploy", "t2"),
+                cp("smoke_test", "t3"),
+            ],
+        );
+        assert_eq!(caller_of_view(&after_implementer, "deploy"), None);
+        assert_eq!(caller_of_view(&after_implementer, "smoke_test"), None);
+
+        // A `from` on a foreign node means whatever that node meant by it.
+        let own_from = derive(
+            Some("converged"),
+            &[
+                cp("implementer", "t1"),
+                Checkpoint {
+                    node_name: "backport".to_string(),
+                    output_json: r#"{"from":"release-1.2"}"#.to_string(),
+                    created_at: "t2".to_string(),
+                    ..Default::default()
+                },
+            ],
+        );
+        assert_eq!(caller_of_view(&own_from, "backport"), None);
+    }
+
+    #[test]
+    fn a_referee_with_no_implementer_before_it_has_an_unknown_caller() {
+        // Legacy or pathological data. Unknown is reported as unknown, and nothing panics.
+        let views = derive(
+            Some("converged"),
+            &[cp("context", "t1"), cp("referee", "t2")],
+        );
+        assert_eq!(caller_of_view(&views, "referee"), None);
+    }
+
+    #[test]
+    fn a_clarification_claims_no_caller_even_though_its_record_names_one() {
+        // A clarification records `from`, and it is tempting to read it as the asking node. It is
+        // not: a declared stage runs under its `governedBy` identity, and that is the value this
+        // field carries — so a stage governed by `implementer` would be reported as the implementer
+        // having asked itself, and two stages sharing one `governedBy` are indistinguishable here.
+        // Naming the wrong asker is worse than naming none, because #248 anchors a branch on it, so
+        // this stays silent until the producer records the caller per invocation (#244).
+        let views = derive(
+            Some("awaiting_clarification"),
+            &[
+                cp("implementer", "t1"),
+                cp_from("clarification", "t2", EXCHANGE),
+            ],
+        );
+        assert_eq!(caller_of_view(&views, "clarification"), None);
+    }
+
+    #[test]
+    fn a_node_the_shape_places_claims_no_caller() {
+        // Its position is the answer; a name there would be a second, driftable source for it.
+        let views = derive(
+            Some("converged"),
+            &[
+                cp("context", "t1"),
+                cp("implementer", "t2"),
+                cp("referee", "t3"),
+            ],
+        );
+        for v in views.iter().filter(|v| v.name != "referee") {
+            assert_eq!(v.caller, None, "`{}` is placed by the shape", v.name);
+        }
     }
 
     #[test]
