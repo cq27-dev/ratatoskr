@@ -370,9 +370,7 @@ fn append_unknown(
 fn caller_of(checkpoints: &[Checkpoint], index: usize) -> Option<String> {
     let c = checkpoints.get(index)?;
     match c.node_name.as_str() {
-        CLARIFICATION_NODE => serde_json::from_str::<serde_json::Value>(&c.output_json)
-            .ok()
-            .and_then(|v| v.get("from")?.as_str().map(str::to_string)),
+        CLARIFICATION_NODE => clarification_asker(&c.output_json),
         REFEREE_NODE => checkpoints[..index]
             .iter()
             .rev()
@@ -380,6 +378,28 @@ fn caller_of(checkpoints: &[Checkpoint], index: usize) -> Option<String> {
             .map(|c| c.node_name.clone()),
         _ => None,
     }
+}
+
+/// The asking node in a clarification exchange, or `None` if this is not one.
+///
+/// `clarify.rs` writes an exchange as `{from, to, question, answer}`, every value a string, so all
+/// four are required before `from` is read as a node name. Reserving the stage identifier only stops
+/// FUTURE runs from writing something else here: the store already holds runs recorded when a custom
+/// `clarification` stage was legal, and `bundle.rs` imports checkpoints from other repositories
+/// entirely. A row from either could carry a `from` meaning a branch or a revision, and the shape
+/// this checks is what separates it from an exchange.
+fn clarification_asker(output_json: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(output_json).ok()?;
+    let exchange = value.as_object()?;
+    for field in ["from", "to", "question", "answer"] {
+        if !exchange
+            .get(field)
+            .is_some_and(serde_json::Value::is_string)
+        {
+            return None;
+        }
+    }
+    exchange["from"].as_str().map(str::to_string)
 }
 
 /// Group a shape's nodes into stages, indexed by column.
@@ -422,6 +442,10 @@ mod tests {
             ..Default::default()
         }
     }
+
+    /// A clarification exchange as `clarify.rs` writes one: all four fields, every value a string.
+    const EXCHANGE: &str =
+        r#"{"from":"analyst","to":"scout","question":"which one?","answer":"the first"}"#;
 
     fn state_of(views: &[NodeView], name: &str) -> NodeState {
         views.iter().find(|v| v.name == name).unwrap().state
@@ -819,23 +843,47 @@ mod tests {
 
     #[test]
     fn a_node_that_records_its_own_asker_is_believed_over_the_scan() {
-        // `clarify.rs` writes `output_json.from` from the node that called the `ask` tool. That is
+        // `clarify.rs` writes the exchange the node that called the `ask` tool took part in. That is
         // first-hand, so it wins even with an implementer checkpoint sitting right before it.
         let views = derive(
             Some("awaiting_clarification"),
             &[
                 cp("implementer", "t1"),
-                cp_from(
-                    "clarification",
-                    "t2",
-                    r#"{"from":"analyst","question":"which one?"}"#,
-                ),
+                cp_from("clarification", "t2", EXCHANGE),
             ],
         );
         assert_eq!(
             caller_of_view(&views, "clarification").as_deref(),
             Some("analyst")
         );
+    }
+
+    #[test]
+    fn a_clarification_row_that_is_not_an_exchange_claims_no_caller() {
+        // Reserving the stage identifier only binds future runs. The store still holds runs recorded
+        // when a custom `clarification` stage was legal, and a bundle can import checkpoints from
+        // another repository altogether. Such a row's `from` means whatever that stage meant by it,
+        // so only a record shaped like an exchange is read as one.
+        for output in [
+            r#"{"from":"release-1.2"}"#,
+            r#"{"from":"release-1.2","to":"main"}"#,
+            r#"{"from":"main","to":"dev","question":"which one?"}"#,
+            r#"{"from":"main","to":"dev","question":"q","answer":42}"#,
+            r#"["from","main"]"#,
+        ] {
+            let views = derive(
+                Some("converged"),
+                &[
+                    cp("implementer", "t1"),
+                    cp_from("clarification", "t2", output),
+                ],
+            );
+            assert_eq!(
+                caller_of_view(&views, "clarification"),
+                None,
+                "`{output}` is not an exchange and must not name a caller"
+            );
+        }
     }
 
     #[test]
