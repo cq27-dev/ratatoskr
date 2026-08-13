@@ -1821,6 +1821,7 @@ impl StageExecutor {
             &stage,
             &default_tools,
             &plugins,
+            capability_ceiling,
         )
         .map_err(|e| e.to_string())?;
         cfg.route.session = stage.session_scope(cfg.route.session);

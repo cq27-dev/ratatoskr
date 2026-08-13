@@ -249,6 +249,7 @@ impl NodeClarifier {
             // Answer mode runs with no tools at all, so no skills either.
             &[],
             &crate::NodePlugins::default(),
+            ratatoskr_core::Capability::Read,
         )
         .ok()?;
         Some((cfg, profile.base_prompt))

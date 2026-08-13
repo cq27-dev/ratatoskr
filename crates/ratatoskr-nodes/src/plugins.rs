@@ -676,7 +676,14 @@ fn node_agent_config(
     })
 }
 
-/// Resolve a declared workflow stage through the profile it names.
+/// Resolve a declared workflow stage through the profile it names, under what THIS invocation
+/// grants.
+///
+/// `invocation_ceiling` is what Rust handed this call — `Read` for a review turn, whatever the
+/// lifecycle adapter holds elsewhere — and it bounds the declaration rather than the other way
+/// round. Without it the narrowing below would answer to the stage's own ceiling alone, and a
+/// declaration naming a mutating MCP tool (`memory_update`, say, whose declared capability is
+/// `Write`) would be offered it on a turn whose stated grant is read-only.
 pub(crate) fn declared_stage_agent_config(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
@@ -684,6 +691,7 @@ pub(crate) fn declared_stage_agent_config(
     stage: &Stage,
     default_tools: &[&str],
     plugins: &NodePlugins,
+    invocation_ceiling: Capability,
 ) -> Result<(NodeAgentConfig, AgentProfile), PlanError> {
     let profile = agent_profiles(config)
         .into_iter()
@@ -694,7 +702,9 @@ pub(crate) fn declared_stage_agent_config(
                 stage.id, stage.agent
             ))
         })?;
-    let ceiling = stage.effective_ceiling(&profile);
+    let ceiling = stage
+        .effective_ceiling(&profile)
+        .map(|declared| declared.min(invocation_ceiling));
     let capabilities = ceiling.into_iter().collect::<Vec<_>>();
     let cfg = node_agent_config(
         engine,
@@ -800,6 +810,7 @@ mod tests {
             &analyst_stage().await,
             &["semantic_search"],
             &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
         .unwrap()
         .0;
@@ -830,6 +841,7 @@ mod tests {
             &analyst_stage().await,
             &["semantic_search"],
             &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
         .unwrap()
         .0;
@@ -864,6 +876,7 @@ mod tests {
             &analyst_stage().await,
             &[ratatoskr_agent::files::READ],
             &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
         .unwrap()
         .0;
@@ -985,6 +998,7 @@ mod tests {
                 stage,
                 &[],
                 &NodePlugins::default(),
+                ratatoskr_core::Capability::Publish,
             )
             .unwrap();
             assert!(matches!(
@@ -992,6 +1006,72 @@ mod tests {
                 ToolDecision::Deny(reason) if reason == "profile policy"
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn an_invocations_ceiling_narrows_mcp_tools_a_declaration_widened_to() {
+        // `verify()` hands the review turn a `Read` grant. A declaration that raises the stage's
+        // own ceiling to `write` and names a mutating rag-rat tool must still not be offered it:
+        // the bound belongs to the invocation, and it has to reach the MCP narrowing seam and not
+        // only the Rust-granted local tools.
+        let mut memory_update = rmcp::model::Tool::default();
+        memory_update.name = "memory_update".to_string().into();
+        let tools = ToolSet::from_servers(vec![ServerTools {
+            origin: ratatoskr_mcp::RAG_RAT.to_string(),
+            sink: None,
+            tools: vec![memory_update],
+            prefix: None,
+            renames: std::collections::BTreeMap::new(),
+            // Left to the declared table, which is what a live rag-rat connection uses: `Write`.
+            capabilities: std::collections::BTreeMap::new(),
+            provenance: ServerProvenance::Configured,
+        }]);
+        assert_eq!(tools.capability("memory_update"), Capability::Write);
+
+        let mut config = RatatoskrConfig::default();
+        let route = config.models["analyst"].clone();
+        config.models.insert("verifier".to_string(), route);
+        let engine = binding_engine("invocation-ceiling", "").await;
+        let stages = crate::workflow::standard_stages().await.unwrap();
+        let mut widened = stages
+            .iter()
+            .find(|stage| stage.id == "verifier")
+            .expect("the standard registry declares a verifier")
+            .clone();
+        widened.agent = "build".to_string();
+        widened.capabilities = vec![Capability::Write];
+        widened.tools = vec!["memory_update".to_string()];
+
+        let offered = |ceiling| {
+            let (cfg, _) = declared_stage_agent_config(
+                &engine,
+                &config,
+                tools.clone(),
+                &widened,
+                &["memory_update"],
+                &NodePlugins::default(),
+                ceiling,
+            )
+            .unwrap();
+            cfg.tools.names()
+        };
+        assert!(
+            !offered(Capability::Read)
+                .iter()
+                .any(|n| n == "memory_update"),
+            "a read-only invocation offered a durable memory mutation: {:?}",
+            offered(Capability::Read)
+        );
+        // And an invocation that grants what the declaration asks for still offers it — the
+        // unmodified registries, whose stage ceilings already equal their invocations' grants,
+        // are untouched by this.
+        assert!(
+            offered(Capability::Write)
+                .iter()
+                .any(|n| n == "memory_update"),
+            "the ceiling narrowed a tool the invocation did grant: {:?}",
+            offered(Capability::Write)
+        );
     }
 
     #[tokio::test]
@@ -1020,6 +1100,7 @@ mod tests {
             author,
             &default_tools,
             &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
         .unwrap();
 

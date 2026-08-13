@@ -2046,6 +2046,7 @@ mod agent_config_tests {
             &standard_stage("scout").await,
             &[],
             &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
         .unwrap()
         .0;
@@ -2081,6 +2082,7 @@ mod agent_config_tests {
             &standard_stage("characterizer").await,
             &[],
             &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
         .unwrap()
         .0;
@@ -2100,6 +2102,7 @@ mod agent_config_tests {
             &standard_stage("analyst").await,
             &["impact_surface", "symbol_lookup", "semantic_search"],
             &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
         .unwrap()
         .0;
@@ -2142,6 +2145,7 @@ mod agent_config_tests {
             &standard_stage("bookkeeper").await,
             &[],
             &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
         .unwrap()
         .0;
@@ -2179,6 +2183,7 @@ mod agent_config_tests {
             attempt,
             &[],
             &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
         .unwrap();
         assert_eq!(cfg.max_turns, Some(250));
@@ -2195,6 +2200,7 @@ mod agent_config_tests {
             attempt,
             &[],
             &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
         .unwrap();
         assert_eq!(cfg.max_turns, Some(7));
@@ -2214,6 +2220,7 @@ mod agent_config_tests {
                 &standard_stage("analyst").await,
                 &[],
                 &NodePlugins::default(),
+                ratatoskr_core::Capability::Publish,
             ),
             Err(PlanError::MissingRoute(n)) if n == "analyst"
         ));
@@ -2259,6 +2266,7 @@ mod agent_config_tests {
             attempt,
             &default_tools,
             &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
         .unwrap();
         assert_eq!(cfg.route.model, "profile-model");
@@ -2282,6 +2290,7 @@ mod agent_config_tests {
             &standard_stage("analyst").await,
             &["impact_surface", "symbol_lookup", "semantic_search"],
             &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
         .unwrap()
         .0;
