@@ -376,8 +376,9 @@ export default function App() {
    * Every node's box, rebuilt from the stream rather than read from the store.
    *
    * The store holds each node's LATEST row, so at any point but the end it answers a different
-   * question than the one being asked. Only the pipeline's shape — which nodes exist and where —
-   * still comes from the server, because that is a property of the graph, not of a moment.
+   * question than the one being asked. The pipeline's shape — which nodes exist and where — comes
+   * from the server, because that is a property of the graph, not of a moment; a node the shape
+   * does not place is positioned from the stream, which is the only thing that has seen it yet.
    */
   const graphNodes = useMemo(() => {
     if (!detail) return [];

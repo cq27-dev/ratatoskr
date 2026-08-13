@@ -1,6 +1,12 @@
 import { expect, test } from "bun:test";
 
-import { convergeLoops, forkHandoff, workingNodeNames } from "./derive";
+import {
+  applyDerived,
+  convergeLoops,
+  forkHandoff,
+  nodesFromEvents,
+  workingNodeNames,
+} from "./derive";
 
 function node(name, state) {
   return { name, state, checkpoints: 0, stage: 0, lane: 0 };
@@ -199,4 +205,60 @@ test("a workflow with no red team at all draws no hand-off from nothing", () => 
 
 test("a failed red team still handed the tree over, so the hand-off is drawn", () => {
   expect(forkHandoff([node("red_team", "failed"), node("implementer", "working")])).toBe(true);
+});
+
+/** A node the shape places, at a column of its own. */
+function placed(name, stage) {
+  return { name, state: "idle", checkpoints: 0, stage, lane: 0 };
+}
+
+const applied = (shape, events) => applyDerived(shape, nodesFromEvents(events));
+
+// A workflow that declares no layout records an empty shape, so the server can only place a node
+// once it has checkpointed. Until then the stream is the only thing that knows it exists.
+test("a node the shape does not place still gets a box while it works", () => {
+  expect(applied([], [start("analyst")])).toEqual([
+    { name: "analyst", state: "working", checkpoints: 0, stage: 0, lane: 0 },
+  ]);
+});
+
+test("an appended node lands in a column of its own, after everything the shape placed", () => {
+  const view = applied([placed("context", 0)], [start("context"), start("analyst")]);
+  expect(view.map((n) => [n.name, n.stage])).toEqual([
+    ["context", 0],
+    ["analyst", 1],
+  ]);
+});
+
+// `issue` records what the run was asked to do, which is not a stage of doing it — the server
+// leaves it out of the shape for exactly that reason.
+test("the issue record is not a node and gets no box", () => {
+  const events = [{ at: "2026-08-12T10:00:00Z", kind: "checkpoint", node: "issue" }];
+  expect(applied([], events)).toEqual([]);
+});
+
+// A run whose workflow declared a layout is drawn by that layout and nothing else.
+test("a shaped run draws its shape, unchanged", () => {
+  const shape = [placed("context", 0), placed("analyst", 1)];
+  const view = applied(shape, [start("context"), start("analyst")]);
+  expect(view.map((n) => [n.name, n.stage, n.lane])).toEqual([
+    ["context", 0, 0],
+    ["analyst", 1, 0],
+  ]);
+});
+
+// The costed rule is the appended node's too: derived zeros are only shown once the stream has
+// actually reported a cost.
+test("an appended node reports what the stream says it cost", () => {
+  const events = [
+    start("analyst"),
+    {
+      at: "2026-08-12T10:00:01Z",
+      kind: "usage",
+      node: "analyst",
+      usage: { input_tokens: 7, output_tokens: 3 },
+    },
+  ];
+  const [analyst] = applied([], events);
+  expect(analyst.telemetry.input_tokens).toBe(7);
 });

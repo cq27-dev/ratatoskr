@@ -8,8 +8,10 @@ import type { LiveEvent, NodeState, NodeTelemetry, NodeView } from "./api";
  * the only record that carries when each thing happened, so anything shown against a point in time
  * has to be derived from it.
  *
- * Only the pipeline's SHAPE still comes from the server — which nodes exist, and their stage and
- * lane. That is a property of the graph that ran, not of any moment inside it.
+ * The pipeline's SHAPE — which nodes exist, and their stage and lane — comes from the server, since
+ * that is a property of the graph that ran rather than of any moment inside it. The one exception is
+ * a node the shape does not place: the server derives placement from checkpoints, so a node that has
+ * started and not yet finished is placed here, from the stream, or it would have no box at all.
  */
 export interface DerivedNode {
   state: NodeState;
@@ -255,12 +257,18 @@ export function workingNodeNames(
  *
  * With no derived state at all — a run old enough that its log has rotated away — do not call
  * this. The store's final state is then the only answer there is, and it is an honest one.
+ *
+ * A node the shape does not place still gets a box. The server derives the shape from checkpoints,
+ * so a workflow that declared no layout cannot place a node until it has finished one — and until
+ * then the box doing the work would be missing entirely, on the very run where watching it matters.
+ * Only names the stream has actually seen are added: a node absent from the stream has not run, and
+ * inventing one is the lie this whole module exists to avoid.
  */
 export function applyDerived(
   shape: readonly NodeView[],
   derived: Map<string, DerivedNode>,
 ): NodeView[] {
-  return shape.map((n) => {
+  const placed = shape.map((n) => {
     const d = derived.get(n.name);
     // Not started at this point. It keeps what it is CONFIGURED to run on (`planned`), because
     // that is true before it runs, and loses everything it has not yet done.
@@ -279,7 +287,38 @@ export function applyDerived(
       ...(telemetry ? { telemetry } : {}),
     };
   });
+
+  // Trailing columns, in the order the stream first mentioned them — the same placement the server
+  // gives a node its shape does not name, so a box does not jump when its first checkpoint arrives
+  // and the server starts placing it. Column order is what the graph draws its edges from, and the
+  // node now working genuinely does come after everything already placed.
+  const known = new Set(shape.map((n) => n.name));
+  const base = placed.reduce((max, n) => Math.max(max, n.stage + 1), 0);
+  const extra: NodeView[] = [];
+  for (const [name, d] of derived) {
+    if (name === ISSUE_NODE || known.has(name)) continue;
+    extra.push({
+      name,
+      state: d.state,
+      checkpoints: d.checkpoints,
+      stage: base + extra.length,
+      lane: 0,
+      // Same rule as above by construction: there is no stored figure to prefer, so the stream's
+      // telemetry stands when it has any and the box says nothing when it does not.
+      ...(d.telemetry ? { telemetry: d.telemetry } : {}),
+    });
+  }
+  return [...placed, ...extra];
 }
+
+/**
+ * The one name in the stream that is not a node.
+ *
+ * `issue` records what the run was asked to do, not a stage of doing it. The server leaves it out
+ * of the shape (`pipeline::ISSUE_NODE`) and this list has to agree, or an unshaped run draws a box
+ * for its own brief.
+ */
+const ISSUE_NODE = "issue";
 
 function blank(): NodeTelemetry {
   return {
