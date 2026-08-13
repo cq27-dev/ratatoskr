@@ -8,9 +8,17 @@
 use ratatoskr_store::Checkpoint;
 use serde::Serialize;
 
-/// Nodes that run after the terminal status is written and whose failure is only logged. They can
-/// never be the reason a run failed, so they are never reported `Failed`.
-const CANNOT_FAIL_THE_RUN: &[&str] = &["bookkeeper", "publisher"];
+/// Nodes whose own failure cannot make a run `failed`, so they are never reported `Failed`.
+///
+/// A run fails when its workflow entry returns an error — any host call that returns `Err` and is
+/// not caught. These three cannot produce one. `bookkeeper` and `publisher` run after the terminal
+/// status is written and their failure is only logged. `verifier` runs before it, but `verify_host`
+/// turns a review that could not run into an `unavailable` result rather than an error: a change
+/// that was made and passed its tests is not failed by the reviewer being unreachable.
+///
+/// Every other name is fallible, including a stage a workflow declared itself: its host error
+/// propagates out of the script and fails the run.
+const CANNOT_FAIL_THE_RUN: &[&str] = &["bookkeeper", "publisher", "verifier"];
 
 /// The issue text is checkpointed under this name so `bookkeep` can replay a stored run. It is
 /// not a node — it's the run's input, and it's the only record of the run's subject.
@@ -183,9 +191,11 @@ pub(crate) fn is_terminal(status: Option<&str>) -> bool {
 ///   can never cause a `failed` run or be reported `Failed`. A terminal run with no bookkeeper
 ///   checkpoint is either silently failed or never applicable, and is reported `Idle` rather than
 ///   guessed at. Pair it with the run's `last_activity` to judge.
-/// - **A `failed` run that reached the fork died in converge.** Since the only step after the
-///   fork is bookkeeping and that cannot fail the run, the implementer is where it stopped, even
-///   though it has checkpoints from earlier iterations.
+/// - **A `failed` run whose fork ran, with nothing fallible after it, died in converge.** The
+///   implementer is then where it stopped, even though it has checkpoints from earlier iterations.
+///   The inference is only sound while every node after the fork is in [`CANNOT_FAIL_THE_RUN`] —
+///   which the standard tail is — because a workflow may declare a fallible stage after the
+///   implementer, and then the failure is that stage's and the implementer finished.
 ///
 /// `config` is what the run was started under, so a node that has not run yet can still say what it
 /// will run on.
@@ -212,6 +222,18 @@ pub fn derive_with(
             .get(f)
             .is_some_and(|nodes| nodes.iter().any(|n| count(checkpoints, &n.name) > 0))
     });
+    // Blaming the fork for a failure needs everything after it to be unable to have caused one.
+    // The standard tail qualifies — a review that could not run degrades, and delivery runs after
+    // the terminal write — but a declared layout may put a fallible stage after the fork, and then
+    // the implementer finished and something later is what failed.
+    let nothing_fallible_after_the_fork = fork.is_some_and(|f| {
+        stages
+            .iter()
+            .skip(f + 1)
+            .flatten()
+            .all(|n| CANNOT_FAIL_THE_RUN.contains(&n.name.as_str()))
+    });
+    let converge_died = failed && fork_started && nothing_fallible_after_the_fork;
 
     // A node has finished only if it checkpointed *and* isn't the implementer mid-converge —
     // otherwise the fork would look complete on iteration 1 and the run's activity would be
@@ -245,7 +267,7 @@ pub fn derive_with(
                 .map(|c| c.created_at.as_str())
                 .collect();
 
-            let state = if failed && Some(idx) == fork && fork_started {
+            let state = if converge_died && Some(idx) == fork {
                 // Converge died. Whatever the implementer checkpointed came from earlier
                 // iterations; red-team ran to completion if it recorded anything.
                 match name.as_str() {
@@ -431,14 +453,18 @@ mod tests {
     /// standard columns change; a stale fixture only makes these cases describe a pipeline that no
     /// longer exists, never a run drawn wrongly.
     fn standard_shape() -> String {
-        let columns: [(&[&str], bool); 6] = [
+        shape_of(&[
             (&["overseer"], true),
             (&["context"], false),
             (&["analyst"], false),
             (&["red_team", "implementer"], false),
             (&["verifier"], true),
             (&["bookkeeper", "publisher"], false),
-        ];
+        ])
+    }
+
+    /// A recorded shape from its columns, each a list of lane names and whether it may be skipped.
+    fn shape_of(columns: &[(&[&str], bool)]) -> String {
         let nodes: Vec<ratatoskr_core::shape::ShapeNode> = columns
             .iter()
             .enumerate()
@@ -605,6 +631,29 @@ mod tests {
         assert_eq!(state_of(&views, "implementer"), NodeState::Failed);
         assert_eq!(state_of(&views, "red_team"), NodeState::Done);
         assert_eq!(state_of(&views, "bookkeeper"), NodeState::Idle);
+    }
+
+    #[test]
+    fn a_failed_run_with_a_fallible_stage_after_the_fork_does_not_blame_the_implementer() {
+        // Blaming the implementer for any failed run that reached the fork is only sound where
+        // nothing after it can fail a run. A declared layout may put an ordinary stage there — its
+        // host error propagates out of the workflow and fails the run — and then the implementer
+        // finished and the later stage is where it stopped.
+        let shape = shape_of(&[
+            (&["red_team", "implementer"], false),
+            (&["deploy"], false),
+            (&["bookkeeper"], false),
+        ]);
+        let views = derive_with(
+            Some("failed"),
+            &[cp("red_team", "t1"), cp("implementer", "t2")],
+            None,
+            Some(&shape),
+        );
+        assert_eq!(state_of(&views, "implementer"), NodeState::Done);
+        assert_eq!(state_of(&views, "red_team"), NodeState::Done);
+        assert_eq!(state_of(&views, "deploy"), NodeState::Failed);
+        assert_ne!(state_of(&views, "bookkeeper"), NodeState::Failed);
     }
 
     #[test]
