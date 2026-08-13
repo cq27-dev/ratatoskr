@@ -53,6 +53,18 @@ pub struct RunStage {
     /// name reports the wrong one or none at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub governed_by: Option<String>,
+    /// The attempt-continuation scope this stage DECLARED, if it declared one. `None` means it
+    /// takes whatever its route says, which is nearly every stage.
+    ///
+    /// The declaration rather than the resolved scope, because that is the half the recorder knows:
+    /// the other half is the route, which a reader has from config and which may have been
+    /// reconfigured since. Applying one to the other is `Stage::session_scope`, and a reader must
+    /// do the same — reading the route alone reports a box on a scope its stages will not run.
+    ///
+    /// Absent from a recording written before this travelled, which reads as "declared nothing" —
+    /// the same thing it means on a stage that declares nothing today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::SessionScope>,
 }
 
 /// A recording written before the registry travelled beside the positions: a bare array of nodes,
@@ -102,6 +114,20 @@ impl Recorded {
         }
     }
 
+    /// Which node each stage's records are drawn in, in registry order.
+    ///
+    /// The accessor for a reader that needs the whole mapping, rather than walking [`Self::stages`]
+    /// and reading `.node` off each row. That walk assumes one stage has one node, which is true
+    /// today and stops being true when membership is resolved per invocation from span parentage
+    /// (#244) — `characterizer` already cannot answer it, which is why it declares none. Asking
+    /// through here, and through [`Self::node_of`], is what survives that.
+    pub fn membership(&self) -> Vec<(&str, &str)> {
+        self.stages
+            .iter()
+            .map(|stage| (stage.id.as_str(), stage.node.as_str()))
+            .collect()
+    }
+
     /// The node a record written under `stage` is drawn in — the stage itself unless it said
     /// otherwise.
     pub fn node_of<'a>(&'a self, stage: &'a str) -> &'a str {
@@ -109,6 +135,15 @@ impl Recorded {
             .iter()
             .find(|known| known.id == stage)
             .map_or(stage, |known| known.node.as_str())
+    }
+
+    /// The attempt-continuation scope `stage` declared, if it declared one. `None` means it takes
+    /// its route's, which is what [`crate::SessionScope`]'s absence has always meant.
+    pub fn session_of(&self, stage: &str) -> Option<crate::SessionScope> {
+        self.stages
+            .iter()
+            .find(|known| known.id == stage)
+            .and_then(|known| known.session)
     }
 
     /// The identity `stage`'s route is configured under — the stage itself unless it said
@@ -175,6 +210,9 @@ fn convert(placed: Vec<PositionedNode>) -> Recorded {
                     id: id.clone(),
                     node: placed.node.name.clone(),
                     governed_by: (*id != placed.node.name).then(|| placed.node.name.clone()),
+                    // That format recorded no declaration, and its reader took the box's scope
+                    // straight from the route. `None` is exactly that.
+                    session: None,
                 })
             })
             .collect(),

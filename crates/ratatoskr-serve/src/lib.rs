@@ -995,7 +995,7 @@ struct RunDetail {
     ///
     /// Empty for a run recorded before the registry travelled with it, where every node is exactly
     /// its own stage — which is what such a run's nodes were.
-    stages: Vec<ratatoskr_core::shape::RunStage>,
+    stages: Vec<StageMembership>,
     worktree: Option<WorktreeView>,
     /// The pull request the run opened, if it opened one. Absent for comment-only runs, for runs
     /// that published nothing, and for runs that never reached the publisher.
@@ -1006,6 +1006,19 @@ struct RunDetail {
     /// boundary, which can be a minute away, and a button that sprang back until the run noticed
     /// would read as the click having been lost.
     control: ControlView,
+}
+
+/// One stage of a run's registry as the dashboard needs it: what it is called, and which box its
+/// records are drawn in.
+///
+/// A projection of what the run recorded, not the recorded row. `shape_json` gains fields as a run
+/// records more about a stage — its governance identity, the session scope it declared — and none
+/// of that is the dashboard's business. Shipping the stored row would put each of them on the wire
+/// as it arrived and make every storage change a client change.
+#[derive(Debug, Serialize)]
+struct StageMembership {
+    id: String,
+    node: String,
 }
 
 /// The implementer's worktree — the reviewable deliverable, kept on `converged` and
@@ -1080,7 +1093,14 @@ async fn run_detail(
         .and_then(|t| ratatoskr_core::RatatoskrConfig::from_toml_str(&t).ok());
     let shape_json = run.as_ref().and_then(|r| r.shape_json.as_deref());
     let nodes = pipeline::derive_with(status.as_deref(), &checkpoints, config.as_ref(), shape_json);
-    let stages = ratatoskr_core::shape::recorded(shape_json).stages;
+    let stages = ratatoskr_core::shape::recorded(shape_json)
+        .membership()
+        .into_iter()
+        .map(|(id, node)| StageMembership {
+            id: id.to_string(),
+            node: node.to_string(),
+        })
+        .collect();
     let last_activity = checkpoints
         .iter()
         .map(|c| c.created_at.as_str())

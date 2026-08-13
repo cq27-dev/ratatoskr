@@ -318,6 +318,7 @@ pub fn shape_from_workflow(
                 id: stage.id.clone(),
                 node: stage.node_id().to_string(),
                 governed_by: stage.governed_by.clone(),
+                session: stage.session,
             })
             .collect(),
     }

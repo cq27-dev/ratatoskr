@@ -40,15 +40,15 @@ export interface NodeView {
 }
 
 /**
- * Mirrors `ratatoskr_core::shape::RunStage` — one stage of the run's registry.
+ * Mirrors `StageMembership` — one stage of the run's registry, as the dashboard needs it.
  *
  * `node` is the box its work is drawn in, its own id unless it declared otherwise. A member records
- * and announces itself under `id`, so this is what says those records belong in `node`'s box.
+ * and announces itself under `id`, so this is what says those records belong in `node`'s box. The
+ * server records more about a stage than this; the rest is not the dashboard's business.
  */
 export interface RunStage {
   id: string;
   node: string;
-  governed_by?: string;
 }
 
 /** Mirrors `pipeline::NodeTelemetryView`. */

@@ -110,9 +110,12 @@ pub struct PlannedNode {
     pub model: String,
     pub thinking: bool,
     pub reuses_session: bool,
-    /// Absent when the node's stages resolve routes whose session scopes differ, since no one
-    /// answer is true of the box. A reader falls back to [`Self::reuses_session`], which stays
-    /// answerable: it says whether any half carries its context across attempts.
+    /// Absent when the node's stages will run under scopes that differ, since no one answer is true
+    /// of the box. A reader falls back to [`Self::reuses_session`], which stays answerable: it says
+    /// whether any half carries its context across attempts.
+    ///
+    /// The scope each stage will RUN under, not its route's. A stage may declare its own, and
+    /// execution honours the declaration — so two stages on one route can still disagree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<ratatoskr_core::SessionScope>,
 }
@@ -139,32 +142,37 @@ impl PlannedNode {
         recorded: &ratatoskr_core::shape::Recorded,
     ) -> Option<Self> {
         let config = config?;
-        let routes: Vec<&ratatoskr_core::ModelRoute> = stages
+        // Each stage's route, and the scope it will actually run under. `Stage::session_scope` is
+        // what execution applies — the stage's own declaration wins, an absent one preserves the
+        // route — so a box whose stages declared differently against ONE route still has no single
+        // scope, and reading `route.session` here would report one, confidently and wrongly.
+        let planned: Vec<(&ratatoskr_core::ModelRoute, ratatoskr_core::SessionScope)> = stages
             .iter()
-            .filter_map(|stage| config.models.get(recorded.governance_of(stage)))
+            .filter_map(|stage| {
+                let route = config.models.get(recorded.governance_of(stage))?;
+                Some((route, recorded.session_of(stage).unwrap_or(route.session)))
+            })
             .collect();
         let mut models: Vec<String> = Vec::new();
-        for route in &routes {
+        let mut sessions: Vec<ratatoskr_core::SessionScope> = Vec::new();
+        for (route, session) in &planned {
             let model = format!("{}/{}", route.provider, route.model);
             if !models.contains(&model) {
                 models.push(model);
+            }
+            if !sessions.contains(session) {
+                sessions.push(*session);
             }
         }
         if models.is_empty() {
             return None;
         }
-        let mut sessions: Vec<ratatoskr_core::SessionScope> = Vec::new();
-        for route in &routes {
-            if !sessions.contains(&route.session) {
-                sessions.push(route.session);
-            }
-        }
         Some(PlannedNode {
             model: models.join(", "),
-            thinking: routes.iter().any(|route| thinking(route)),
-            reuses_session: routes
+            thinking: planned.iter().any(|(route, _)| thinking(route)),
+            reuses_session: sessions
                 .iter()
-                .any(|route| matches!(route.session, ratatoskr_core::SessionScope::Reuse)),
+                .any(|session| matches!(session, ratatoskr_core::SessionScope::Reuse)),
             session: match sessions.as_slice() {
                 [only] => Some(*only),
                 _ => None,
@@ -658,6 +666,7 @@ mod tests {
                         governed_by: (id != *name).then(|| (*name).to_string()),
                         id,
                         node: (*name).to_string(),
+                        session: None,
                     })
             })
             .collect()
@@ -1157,6 +1166,7 @@ mod tests {
                 id: "strategist".to_string(),
                 node: "strategist".to_string(),
                 governed_by: Some("analyst".to_string()),
+                session: None,
             }],
         };
         let views = derive_with(
@@ -1172,6 +1182,80 @@ mod tests {
                 .map(|planned| planned.model.as_str()),
             Some("anthropic/claude-sonnet-5"),
             "the box runs `models.analyst`, because that is what its stage governs as"
+        );
+    }
+
+    #[test]
+    fn a_stage_that_declared_its_own_session_plans_on_that_and_not_on_its_routes() {
+        // Execution applies `Stage::session_scope`: a stage's own declaration wins over the route's,
+        // and an absent one preserves the route. Reading `route.session` alone reports the box on a
+        // scope its stages will not run, and — because it is one route — reports it confidently.
+        let recorded = ratatoskr_core::shape::Recorded {
+            nodes: vec![ratatoskr_core::shape::ShapeNode {
+                name: "redteam".to_string(),
+                stage: 0,
+                lane: 0,
+                optional: false,
+            }],
+            stages: vec![
+                // Both halves reach one `[models.redteam]`, and one of them declares `fresh`.
+                ratatoskr_core::shape::RunStage {
+                    id: "redteam_classifier".to_string(),
+                    node: "redteam".to_string(),
+                    governed_by: Some("redteam".to_string()),
+                    session: None,
+                },
+                ratatoskr_core::shape::RunStage {
+                    id: "redteam_author".to_string(),
+                    node: "redteam".to_string(),
+                    governed_by: Some("redteam".to_string()),
+                    session: Some(ratatoskr_core::SessionScope::Fresh),
+                },
+            ],
+        };
+        let views = derive_with(
+            None,
+            &[],
+            Some(&routed("redteam")),
+            Some(&serde_json::to_string(&recorded).unwrap()),
+        );
+        let planned = view(&views, "redteam")
+            .planned
+            .as_ref()
+            .expect("one route serves both halves");
+        // One route, so one model — the disagreement is in what the stages declared, not in where
+        // they run.
+        assert_eq!(planned.model, "anthropic/claude-sonnet-5");
+        assert_eq!(
+            planned.session, None,
+            "the halves run on different scopes, so no one scope is true of the box"
+        );
+        assert!(
+            planned.reuses_session,
+            "the half that declared nothing keeps the route's `reuse`"
+        );
+
+        // And a lone stage's declaration is the box's, rather than being overwritten by the route.
+        let fresh = ratatoskr_core::shape::Recorded {
+            stages: vec![ratatoskr_core::shape::RunStage {
+                id: "redteam_classifier".to_string(),
+                node: "redteam".to_string(),
+                governed_by: Some("redteam".to_string()),
+                session: Some(ratatoskr_core::SessionScope::Fresh),
+            }],
+            ..recorded
+        };
+        let views = derive_with(
+            None,
+            &[],
+            Some(&routed("redteam")),
+            Some(&serde_json::to_string(&fresh).unwrap()),
+        );
+        let planned = view(&views, "redteam").planned.as_ref().unwrap();
+        assert_eq!(planned.session, Some(ratatoskr_core::SessionScope::Fresh));
+        assert!(
+            !planned.reuses_session,
+            "it declared itself out of the reuse"
         );
     }
 
@@ -1212,6 +1296,7 @@ mod tests {
                     id: id.to_string(),
                     node: "redteam".to_string(),
                     governed_by: None,
+                    session: None,
                 })
                 .to_vec(),
         };
