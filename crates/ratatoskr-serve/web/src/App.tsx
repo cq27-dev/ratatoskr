@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryState } from "nuqs";
-import { applyDerived, convergeLoops, nodesFromEvents, workingNodeNames } from "./derive";
+import {
+  applyDerived,
+  convergeLoops,
+  inNodeBoxes,
+  nodesFromEvents,
+  stagesOf,
+  workingNodeNames,
+} from "./derive";
 import { pendingQuestions } from "./questions";
 import {
   elapsedAt,
@@ -398,7 +405,10 @@ export default function App() {
     // is not a pipeline node, so the derivation is legitimately empty; falling back to the store
     // there showed every node finished, with its final counts, at step one of the run.
     if (!shownEvents.length) return detail.nodes;
-    return applyDerived(detail.nodes, nodesFromEvents(shownEvents), ended);
+    // Read as boxes: a member stage's events are the box's, or the fold would place each half
+    // beside the node it belongs to.
+    const boxed = inNodeBoxes(shownEvents, detail.nodes);
+    return applyDerived(detail.nodes, nodesFromEvents(boxed), ended);
   }, [detail, shownEvents, ended, loading]);
 
   /**
@@ -409,7 +419,9 @@ export default function App() {
    * would stop a node that finished ten minutes ago.
    */
   const workingNodes = useMemo(
-    () => workingNodeNames(detail?.nodes ?? [], timeline),
+    // By box, matching what a Stop is addressed to: a stage that composes a node polls under that
+    // node's name, so a control aimed at a half would reach nothing.
+    () => workingNodeNames(detail?.nodes ?? [], inNodeBoxes(timeline, detail?.nodes ?? [])),
     [detail, timeline],
   );
 
@@ -476,7 +488,10 @@ export default function App() {
    * a traversal is a re-entry, so counting the implementer's rows overstates it by the initial
    * `implement()` call.
    */
-  const loops = useMemo(() => convergeLoops(shownEvents), [shownEvents]);
+  const loops = useMemo(
+    () => convergeLoops(inNodeBoxes(shownEvents, detail?.nodes ?? [])),
+    [shownEvents, detail],
+  );
 
   /*
    * Leaving a run drops everything read for it.
@@ -628,7 +643,13 @@ export default function App() {
                     }
                   />
                 ))}
-                <Feed events={shownEvents} node={node} nameWidth={nameWidth} loading={loading} />
+                <Feed
+                  events={shownEvents}
+                  node={node}
+                  nodes={node ? stagesOf(detail?.nodes ?? [], node) : null}
+                  nameWidth={nameWidth}
+                  loading={loading}
+                />
               </div>
               {node && (
                 <div className="detail">
