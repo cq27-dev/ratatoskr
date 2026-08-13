@@ -135,8 +135,8 @@ export interface RunDetail {
   last_activity: string | null;
   nodes: NodeView[];
   worktree: WorktreeView | null;
-  /** The pull request the run opened, if any. Null for comment-only, nothing-published, or
-   * older runs whose publisher checkpoint predates this field. */
+  /** The pull request the run opened, if any. Null for comment-only runs, runs that published
+   * nothing, and runs that never reached the publisher. */
   pull_request: PullRequestView | null;
   control: ControlView;
 }

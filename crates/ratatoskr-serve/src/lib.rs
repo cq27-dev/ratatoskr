@@ -984,8 +984,8 @@ struct RunDetail {
     last_activity: Option<String>,
     nodes: Vec<NodeView>,
     worktree: Option<WorktreeView>,
-    /// The pull request the run opened, if it opened one. Absent for comment-only or
-    /// nothing-published runs, and for older runs whose `publisher` checkpoint predates this.
+    /// The pull request the run opened, if it opened one. Absent for comment-only runs, for runs
+    /// that published nothing, and for runs that never reached the publisher.
     pull_request: Option<PullRequestView>,
     /// What the operator has asked of this run — what the controls should show.
     ///
@@ -1177,10 +1177,9 @@ fn worktree_view(checkpoints: &[Checkpoint]) -> Option<WorktreeView> {
 
 /// The pull request the latest `publisher` checkpoint opened, if any.
 ///
-/// A checkpoint records `pull_request_url` separately from `comment_url`; the old `url` field is
-/// read only for compatibility. The action keeps comment-only checkpoints out of the dashboard.
-/// The parser accepts a URL only when it has GitHub's pull-request path shape, so a malformed or
-/// mixed legacy field is never used as an anchor verbatim.
+/// A checkpoint records `pull_request_url` separately from `comment_url`, and the action keeps
+/// comment-only checkpoints out of the dashboard. The parser accepts a URL only when it has
+/// GitHub's pull-request path shape, so a malformed field is never used as an anchor verbatim.
 fn pull_request_view(checkpoints: &[Checkpoint]) -> Option<PullRequestView> {
     let raw = checkpoints
         .iter()
@@ -1190,20 +1189,20 @@ fn pull_request_view(checkpoints: &[Checkpoint]) -> Option<PullRequestView> {
         .as_str();
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     match value.get("action").and_then(|v| v.as_str()) {
-        Some("pull_request") | Some("pr") | Some("both") => {}
+        Some("pull_request") | Some("both") => {}
         _ => return None,
     }
-    ["pull_request_url", "url"]
-        .into_iter()
-        .filter_map(|field| value.get(field).and_then(serde_json::Value::as_str))
-        .find_map(pull_request_url)
+    value
+        .get("pull_request_url")
+        .and_then(serde_json::Value::as_str)
+        .and_then(pull_request_url)
 }
 
 /// Extract one GitHub pull-request URL from a checkpoint field.
 ///
-/// New publisher checkpoints contain the URL alone. Splitting legacy text on whitespace recovers
-/// an old `PR: <url>\\nIssue comment: <url>` record without letting the dashboard use the mixed
-/// text as its `href`.
+/// The field is meant to hold the URL alone, but a model writes it. Splitting on whitespace
+/// recovers the URL from a labelled or otherwise chatty value without letting the dashboard use
+/// the surrounding text as its `href`.
 fn pull_request_url(value: &str) -> Option<PullRequestView> {
     value
         .split_whitespace()
@@ -2796,7 +2795,7 @@ mod tests {
     fn reads_the_pull_request_from_a_publisher_checkpoint() {
         let cps = vec![cp(
             "publisher",
-            r#"{"action":"pull_request","url":"https://github.com/o/r/pull/139","reasoning":"..."}"#,
+            r#"{"action":"pull_request","pull_request_url":"https://github.com/o/r/pull/139","reasoning":"..."}"#,
         )];
         let pr = pull_request_view(&cps).unwrap();
         assert_eq!(pr.number, 139);
@@ -2815,27 +2814,16 @@ mod tests {
     }
 
     #[test]
-    fn action_pr_still_yields_the_pull_request() {
-        let cps = vec![cp(
-            "publisher",
-            r#"{"action":"pr","pull_request_url":"https://github.com/cq27-dev/ratatoskr/pull/221","comment_url":"","reasoning":"opened the pull request"}"#,
-        )];
-        let pr = pull_request_view(&cps).unwrap();
-        assert_eq!(pr.number, 221);
-        assert_eq!(pr.url, "https://github.com/cq27-dev/ratatoskr/pull/221");
-    }
-
-    #[test]
     fn takes_the_pull_request_from_the_latest_publisher_checkpoint() {
         // Latest-wins, like worktree_view: the later publisher checkpoint is authoritative.
         let cps = vec![
             cp(
                 "publisher",
-                r#"{"action":"pull_request","url":"https://github.com/o/r/pull/1"}"#,
+                r#"{"action":"pull_request","pull_request_url":"https://github.com/o/r/pull/1"}"#,
             ),
             cp(
                 "publisher",
-                r#"{"action":"pull_request","url":"https://github.com/o/r/pull/2"}"#,
+                r#"{"action":"pull_request","pull_request_url":"https://github.com/o/r/pull/2"}"#,
             ),
         ];
         let pr = pull_request_view(&cps).unwrap();
@@ -2847,7 +2835,7 @@ mod tests {
     fn a_comment_is_never_presented_as_a_pull_request() {
         let cps = vec![cp(
             "publisher",
-            r#"{"action":"comment","url":"https://github.com/o/r/issues/12#issuecomment-999"}"#,
+            r#"{"action":"comment","comment_url":"https://github.com/o/r/issues/12#issuecomment-999"}"#,
         )];
         assert!(pull_request_view(&cps).is_none());
     }
@@ -2874,18 +2862,23 @@ mod tests {
     fn a_pull_request_with_a_non_numeric_last_segment_is_absent() {
         let cps = vec![cp(
             "publisher",
-            r#"{"action":"pull_request","url":"https://github.com/o/r/pull/not-a-number"}"#,
+            r#"{"action":"pull_request","pull_request_url":"https://github.com/o/r/pull/not-a-number"}"#,
         )];
         assert!(pull_request_view(&cps).is_none());
-        let empty_url = vec![cp("publisher", r#"{"action":"pull_request","url":""}"#)];
+        let empty_url = vec![cp(
+            "publisher",
+            r#"{"action":"pull_request","pull_request_url":""}"#,
+        )];
         assert!(pull_request_view(&empty_url).is_none());
     }
 
     #[test]
-    fn a_legacy_both_checkpoint_extracts_only_its_pull_request_url() {
+    fn a_labelled_pull_request_field_yields_only_the_url() {
+        // The publisher is told to write the URL alone, and a model writes it. A value that came
+        // back labelled still anchors the dashboard at the pull request, not at the label.
         let cps = vec![cp(
             "publisher",
-            r#"{"action":"both","url":"PR: https://github.com/cq27-dev/ratatoskr/pull/214\nIssue comment: https://github.com/cq27-dev/ratatoskr/issues/210#issuecomment-5231512849"}"#,
+            r#"{"action":"both","pull_request_url":"PR: https://github.com/cq27-dev/ratatoskr/pull/214","comment_url":"https://github.com/cq27-dev/ratatoskr/issues/210#issuecomment-5231512849"}"#,
         )];
 
         let pr = pull_request_view(&cps).unwrap();
@@ -2913,7 +2906,7 @@ mod tests {
         // Mirrors `RunDetail.pull_request`: the JSON the API/api.ts consumer sees.
         let cps = vec![cp(
             "publisher",
-            r#"{"action":"pull_request","url":"https://github.com/o/r/pull/139"}"#,
+            r#"{"action":"pull_request","pull_request_url":"https://github.com/o/r/pull/139"}"#,
         )];
         let pr = pull_request_view(&cps).unwrap();
         let json = serde_json::to_value(&pr).unwrap();
