@@ -243,6 +243,24 @@ function placed(name, stage) {
 
 const applied = (shape, events) => applyDerived(shape, nodesFromEvents(events));
 
+/** What the server sends for a node that reported nothing, so a case can vary one field of it. */
+const blankTelemetry = {
+  model: null,
+  turns: null,
+  input_tokens: 0,
+  output_tokens: 0,
+  cached_input_tokens: 0,
+  cache_creation_input_tokens: 0,
+  reasoning_tokens: 0,
+  thinking: false,
+  duration_ms: null,
+  tools: [],
+  tools_used: [],
+  reuses_session: false,
+  first_at: null,
+  last_at: null,
+};
+
 // A workflow that declares no layout records an empty shape, so the server can only place a node
 // once it has checkpointed. Until then the stream is the only thing that knows it exists.
 test("a node the shape does not place still gets a box while it works", () => {
@@ -632,6 +650,49 @@ test("the live map is keyed by the box, so the box draws with what its member an
   expect(box.facts.model).toBe("anthropic/claude-sonnet-5");
   expect(box.cycles).toBe(1);
   expect([...box.used]).toEqual(["Read"]);
+});
+
+test("a usage event costs the member whatever it reports, zero included", () => {
+  // Scrub honesty, which is what this whole derivation exists for. `fromStream` keeps the server's
+  // telemetry — the run's FINAL state — for a node the stream never costed, so a node left
+  // uncosted at an earlier position displays a later attempt's model, tokens and tools.
+  //
+  // A `usage` event is the endpoint's own report of a turn: its presence is the authority, and a
+  // zero is a measurement rather than an absence. Only a CHECKPOINT has to be doubted, because a
+  // box's turn-less aggregate carries the keys as zeros whether or not anything ran.
+  const stages = registry(["analyst"]);
+  const quiet = {
+    at: "t2",
+    kind: "usage",
+    node: "analyst",
+    detail: "",
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      reasoning_tokens: 0,
+      duration_ms: 40,
+    },
+  };
+  const derived = nodesFromEvents(inNodeBoxes([start("analyst"), quiet], stages)).get("analyst");
+  expect(derived.costed).toBe(true);
+
+  // And the fold is then what the box shows, rather than the run's end reaching back into an
+  // earlier position.
+  const server = [
+    {
+      name: "analyst",
+      state: "done",
+      checkpoints: 2,
+      stage: 0,
+      lane: 0,
+      telemetry: { ...blankTelemetry, model: "the later attempt", input_tokens: 900 },
+    },
+  ];
+  const drawn = applyDerived(server, nodesFromEvents(inNodeBoxes([start("analyst"), quiet], stages)));
+  expect(drawn[0].telemetry.input_tokens).toBe(0);
+  expect(drawn[0].telemetry.duration_ms).toBe(40);
 });
 
 test("a box's cost is the fold of its members, not whichever record landed last", () => {

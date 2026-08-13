@@ -173,14 +173,19 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
         tools_used: [...member.used],
       };
       // A checkpoint always carries usage keys, and a box's own aggregate carries them as zeros
-      // because it covers no turn. Only a figure that is actually there says the run reported what
-      // this cost.
+      // because it covers no turn — so here, and ONLY here, a figure has to be there before the
+      // record counts as one. #284 stops the producer writing them at all for a turn-less
+      // checkpoint, and retires this guard with it.
       if (e.usage && spent(e.usage)) member.costed = true;
       continue;
     }
 
     if (e.kind === "usage" && e.usage) {
-      if (spent(e.usage)) member.costed = true;
+      // Unconditional, unlike the checkpoint above. A `usage` event is the endpoint's own report of
+      // a turn: its presence is the authority and a zero is a measurement, not an absence. Doubting
+      // it leaves the member uncosted, and `fromStream` then keeps the server's telemetry — the
+      // run's FINAL state — so scrubbing back to an earlier attempt shows a later one's numbers.
+      member.costed = true;
       member.telemetry = {
         ...(member.telemetry ?? blank()),
         input_tokens: e.usage.input_tokens,
@@ -223,7 +228,12 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
   return out;
 }
 
-/** Whether a usage record reports anything at all. A box's aggregate covers no turn and is zeros. */
+/**
+ * Whether a usage record reports anything at all. A box's aggregate covers no turn and is zeros.
+ *
+ * Only the checkpoint branch may ask this. A `usage` event is a report and zero is one of its
+ * answers; applying this there is what broke scrub honesty.
+ */
 function spent(usage: EventUsage): boolean {
   return (
     usage.input_tokens > 0 ||
