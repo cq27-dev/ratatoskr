@@ -2773,7 +2773,10 @@ where
     // middle of, and a node being stopped should not spend a turn on the hooks below it.
     if let Some(controller) = control.as_ref() {
         builder = builder.add_hook(ControlHook {
-            node: node.to_string(),
+            // The BOX, like `RuntimeControl` above and like the pause ledger: an operator addresses
+            // what the graph draws, and a poll under the stage id answers `Continue` for a node
+            // they have stopped.
+            node: controlled_as.unwrap_or(node).to_string(),
             controller: Arc::clone(controller),
             pending: Arc::clone(&pending),
         });
@@ -2888,7 +2891,9 @@ where
                 node,
                 "parked; waiting to be started again"
             );
-            let said = park(controller, node).await;
+            // The box again: parking polls for the start that releases it, and a name nothing was
+            // stopped under is released immediately.
+            let said = park(controller, controlled_as.unwrap_or(node)).await;
             // Anything the operator said to the stopped node belongs to the attempt that
             // replaces it — they were talking about this work, not the abandoned transcript.
             pending.steer.lock().expect("steer poisoned").extend(
@@ -2991,7 +2996,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use rig_core::completion::CompletionRequest;
     use rig_core::streaming::StreamingCompletionResponse;
@@ -4087,6 +4093,99 @@ mod tests {
             attempts.load(Ordering::Relaxed),
             4,
             "the fresh invalid output receives its own correction turn"
+        );
+    }
+
+    /// A controller that records the name each poll was addressed to, and stops once.
+    ///
+    /// The name is the whole point. Every field involved was individually right when a Stop last
+    /// went missing — `NodeRun.controlled_as` was set, `RuntimeControl` read it — and the hook that
+    /// does the polling had been left on the stage id. Asserting on fields would have passed.
+    struct RecordsWhatItWasAsked {
+        asked: Mutex<Vec<String>>,
+        stops: AtomicUsize,
+    }
+
+    impl Controller for RecordsWhatItWasAsked {
+        fn poll<'a>(&'a self, node: &'a str) -> Pin<Box<dyn Future<Output = Control> + Send + 'a>> {
+            self.asked
+                .lock()
+                .expect("asked poisoned")
+                .push(node.to_string());
+            // Stop the first turn and carry on afterwards, so the run reaches `park` — which polls
+            // under a name of its own and was the second half of the same defect.
+            let first = self.stops.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                match first {
+                    true => Control {
+                        directive: Directive::Stop,
+                        steer: Vec::new(),
+                    },
+                    false => Control::carry_on(),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_member_stage_is_polled_for_control_under_the_box_an_operator_addresses() {
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct Done {
+            #[allow(dead_code)]
+            summary: String,
+        }
+
+        // The dashboard offers a Stop against the BOX and the run records it there, so every poll a
+        // member's turn makes has to ask under that name. Polling the stage id returns `Continue`
+        // for a node the operator has stopped — the button does nothing, for as long as the stage
+        // runs, while the dashboard shows the node stopped.
+        let route = ModelRoute {
+            provider: "test".into(),
+            model: "test-model".into(),
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        };
+        let controller = Arc::new(RecordsWhatItWasAsked {
+            asked: Mutex::new(Vec::new()),
+            stops: AtomicUsize::new(0),
+        });
+        let answered = run_typed_with_control(
+            InvalidCorrectionThenRestartedCorrection::default(),
+            NodeRun {
+                node: "implementer_attempt",
+                controlled_as: Some("implementer"),
+                route: &route,
+                preamble: "Return the requested summary.",
+                question: "Summarise the change.",
+                tools: ToolSet::default(),
+                output_schema: schemars::schema_for!(Done),
+                policy: None,
+                max_turns: Some(4),
+                clarifier: None,
+                observer: None,
+                skills: Vec::new(),
+                files: None,
+                rag_rat_worktree: None,
+                shell: None,
+                push: None,
+                conversation: None,
+                ledger: None,
+                produces: None,
+            },
+            ProviderCallQueue::default(),
+            Some(Arc::clone(&controller) as Arc<dyn Controller>),
+        )
+        .await;
+        assert!(answered.is_ok(), "the restarted attempt answers");
+
+        let asked = controller.asked.lock().expect("asked poisoned").clone();
+        assert!(!asked.is_empty(), "the turn polls for control at all");
+        assert!(
+            asked.iter().all(|name| name == "implementer"),
+            "every poll must name the box an operator can address, got {asked:?}"
         );
     }
 
