@@ -85,6 +85,31 @@ impl RunStatus {
             | RunStatus::Abandoned => true,
         }
     }
+
+    /// Whether the run reached its end under its own power, rather than stopping partway.
+    ///
+    /// Not "succeeded". `MaxIterationsReached` spent its budget and `Unreviewed` could not reach a
+    /// verifier, and both are outcomes the orchestration produced deliberately: every host it
+    /// entered finished and wrote what it writes. `Failed` and `Abandoned` are the two that stop
+    /// mid-flight, and after either, what is missing from the record proves nothing about what ran.
+    ///
+    /// A reader uses it for exactly that: to tell an absent record that was never going to be
+    /// written from one whose writer died. An exhaustive match, so a new variant has to be
+    /// classified rather than silently reading as interrupted.
+    pub fn ran_to_completion(&self) -> bool {
+        match self {
+            RunStatus::Planned
+            | RunStatus::Converged
+            | RunStatus::MaxIterationsReached
+            | RunStatus::Unreviewed
+            | RunStatus::NoCodeChange => true,
+            RunStatus::Pending
+            | RunStatus::Running
+            | RunStatus::AwaitingClarification
+            | RunStatus::Failed
+            | RunStatus::Abandoned => false,
+        }
+    }
 }
 
 /// The minimal state shape a run carries between nodes. Node-produced slots stay untyped

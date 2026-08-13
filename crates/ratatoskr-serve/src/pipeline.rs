@@ -293,6 +293,17 @@ pub(crate) fn is_terminal(status: Option<&str>) -> bool {
         .is_some_and(|s| s.is_terminal())
 }
 
+/// Whether the run reached its end under its own power — see `RunStatus::ran_to_completion`.
+///
+/// Read the same way as [`is_terminal`], and defaulting the same direction: a status this build
+/// cannot parse reads as interrupted, so nothing is claimed finished on the strength of a name
+/// nobody here classified.
+fn ran_to_completion(status: Option<&str>) -> bool {
+    status
+        .and_then(|s| s.parse::<ratatoskr_core::RunStatus>().ok())
+        .is_some_and(|s| s.ran_to_completion())
+}
+
 /// Derive each node's state from the run status and its checkpoints.
 ///
 /// Three non-uniformities are handled explicitly:
@@ -337,6 +348,7 @@ pub fn derive_with(
     let rows = rows_by_node(checkpoints);
     let stages = stages_of(&recorded.nodes);
     let terminal = is_terminal(status);
+    let completed = ran_to_completion(status);
     let failed = status == Some("failed");
     // Once the implementer has checkpointed, a failure has two candidates and the record separates
     // neither. The implementer re-enters once per converge iteration without announcing it here, so
@@ -422,7 +434,15 @@ pub fn derive_with(
             });
         }
     }
-    append_unknown(&mut out, checkpoints, config, terminal, &registry, &rows);
+    append_unknown(
+        &mut out,
+        checkpoints,
+        config,
+        terminal,
+        completed,
+        &registry,
+        &rows,
+    );
     out
 }
 
@@ -475,6 +495,7 @@ fn append_unknown(
     checkpoints: &[Checkpoint],
     config: Option<&ratatoskr_core::RatatoskrConfig>,
     terminal: bool,
+    completed: bool,
     registry: &ratatoskr_core::shape::Registry<'_>,
     rows: &Rows<'_>,
 ) {
@@ -508,15 +529,23 @@ fn append_unknown(
         // with no checkpoints of its own, which hides its controls while it is still working.
         //
         // With only members recorded, a live run has the box mid-flight — that is what a member
-        // having finished and the aggregate not having landed means. A stopped one never completed
-        // it, and which of failed, stopped and abandoned that was is not something these records
-        // carry, so nothing is claimed: `Idle` is this derivation's answer wherever the evidence
-        // does not name one, as it is for an unattributable failure above. A client holding the
-        // event stream answers it properly, from the node left working with nothing after it.
-        let state = match (times.is_empty(), terminal) {
-            (false, _) => checkpointed_state(name, terminal),
-            (true, false) => NodeState::Working,
-            (true, true) => NodeState::Idle,
+        // having finished and the aggregate not having landed means.
+        //
+        // On a stopped run the same rows have two histories and the record does not separate them.
+        // A member ALWAYS writes its own row, so their presence proves nothing on its own: a
+        // workflow may call a member stage directly, whose generic host checkpoints under the stage
+        // id and never writes an aggregate at all, and an operation host that died partway leaves
+        // exactly the same trace. What separates them is the RUN's outcome. Every operation host
+        // writes its aggregate before returning, so on a run that reached its end under its own
+        // power a missing aggregate means no host ran — the members were invoked directly, and the
+        // box's work is done. On one that failed or was abandoned, nothing is claimed: `Idle` is
+        // this derivation's answer wherever the evidence names nobody, as it is for an
+        // unattributable failure above, and a client holding the event stream answers it properly.
+        let state = match (times.is_empty(), terminal, completed) {
+            (false, ..) => checkpointed_state(name, terminal),
+            (true, false, _) => NodeState::Working,
+            (true, true, true) => NodeState::Done,
+            (true, true, false) => NodeState::Idle,
         };
         out.push(NodeView {
             telemetry: NodeTelemetryView::totalled(rows, &stages),
@@ -845,17 +874,36 @@ mod tests {
             NodeState::Done
         );
 
-        // And a run that STOPPED there never finished the box either. Which of failed, stopped and
-        // abandoned it was is not in the record, so nothing is claimed — but `done` is the one
-        // answer the record rules out.
-        for status in ["converged", "failed", "abandoned"] {
+        // A run that RAN TO COMPLETION and left a member's row and no aggregate did finish that
+        // box: a workflow may call a member stage directly, whose generic host checkpoints under
+        // the stage id, and every operation host writes its aggregate before returning — so on a
+        // run that completed, a missing aggregate means no host ran, not that one died.
+        for status in [
+            "converged",
+            "planned",
+            "max_iterations_reached",
+            "unreviewed",
+        ] {
+            assert_eq!(
+                state_of(
+                    &derive_with(Some(status), &midway, None, Some(&unplaced)),
+                    "redteam"
+                ),
+                NodeState::Done,
+                "a `{status}` run reached the member's completion with nothing left to write"
+            );
+        }
+
+        // A run that STOPPED did not. Both leave the same rows — a member's, no aggregate — and
+        // only the run's own outcome separates them, so nothing is claimed for the ones that died.
+        for status in ["failed", "abandoned"] {
             assert_eq!(
                 state_of(
                     &derive_with(Some(status), &midway, None, Some(&unplaced)),
                     "redteam"
                 ),
                 NodeState::Idle,
-                "a `{status}` run with only a member's row did not complete the box"
+                "a `{status}` run cannot say whether the box completed before it stopped"
             );
         }
     }
@@ -1539,7 +1587,18 @@ mod tests {
                 in_flight.contains(&s),
                 "`{s}` is either terminal or in flight — classify it in one and only one"
             );
+            // Completing is a strictly narrower thing than stopping, and a status that claimed to
+            // have run to completion while still in flight would report finished boxes mid-run.
+            assert!(
+                !ran_to_completion(Some(s)) || is_terminal(Some(s)),
+                "`{s}` claims to have run to completion without being terminal"
+            );
         }
+        // A status this build cannot parse is neither, so nothing is claimed finished on the
+        // strength of a name nobody here classified.
+        assert!(!is_terminal(Some("from_a_newer_build")));
+        assert!(!ran_to_completion(Some("from_a_newer_build")));
+        assert!(!ran_to_completion(None));
     }
 
     #[test]
