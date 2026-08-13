@@ -1,4 +1,4 @@
-import type { LiveEvent, NodeState, NodeTelemetry, NodeView } from "./api";
+import type { LiveEvent, NodeState, NodeTelemetry, NodeView, RunStatus } from "./api";
 
 /**
  * A run's node state, rebuilt from its event stream.
@@ -269,13 +269,18 @@ export function workingNodeNames(
  * Only the ones the shape does not place. A declared layout is the graph the workflow asked for and
  * is reproduced exactly; a run whose shape names some of its nodes and not others keeps the named
  * ones where the shape puts them.
+ *
+ * `ended` is the run's status when it has stopped AND the view is at the live end — `null` at every
+ * other position, and while the run is still executing. It is what lets the store settle a node the
+ * stream cannot finish; see `fromStream`.
  */
 export function applyDerived(
   shape: readonly NodeView[],
   derived: Map<string, DerivedNode>,
+  ended: RunStatus | null = null,
 ): NodeView[] {
   const shaped = shape.filter((n) => n.shaped !== false);
-  const placed = shaped.map((n) => fromStream(n, derived.get(n.name)));
+  const placed = shaped.map((n) => fromStream(n, derived.get(n.name), ended));
 
   // Trailing columns: everything the shape does not place, in the order the stream first mentioned
   // it. A node the server did place from a checkpoint keeps everything else it said about it — its
@@ -289,11 +294,23 @@ export function applyDerived(
   order.push(...[...unplaced.keys()].filter((name) => !derived.has(name)));
 
   const base = placed.reduce((max, n) => Math.max(max, n.stage + 1), 0);
-  const extra = order.map((name, i) => ({
-    ...fromStream(unplaced.get(name) ?? unrun(name), derived.get(name)),
-    stage: base + i,
-    lane: 0,
-  }));
+  const extra = order.map((name, i) => {
+    const server = unplaced.get(name);
+    const row = fromStream(server ?? unrun(name), derived.get(name), ended);
+    return {
+      ...row,
+      // A node the store has no row for cannot be settled against it: on a run with no declared
+      // layout the node the host died under exists only in the stream — it never checkpointed, so
+      // the server never placed it and has no state to lend. The run's own status is then the only
+      // record of what became of it, and a failed run answers the question. Without this such a run
+      // draws every box green and nothing wrong.
+      ...(!server && ended === "failed" && row.state === "idle"
+        ? { state: "failed" as NodeState }
+        : {}),
+      stage: base + i,
+      lane: 0,
+    };
+  });
   return [...placed, ...extra];
 }
 
@@ -305,8 +322,20 @@ export function applyDerived(
  * ENDED and are marked as such by being all a rotated-away log can offer. A node the stream does not
  * mention has NOT STARTED at this point: it keeps what it is CONFIGURED to run on (`planned`),
  * because that is true before it runs, and loses everything it has not yet done.
+ *
+ * One thing the stream cannot prove, and it is the one that matters most: a node STOPPING when the
+ * host dies under it. That writes no checkpoint and no node-scoped event — the only records are the
+ * run's status and a `run_failed` carrying `node: null` — so the fold leaves the dying node
+ * "working" and the run will emit nothing more to move it. `ended` is the run having stopped with
+ * the view at its live end, and there a node the stream still calls working takes what the server
+ * says about it: which node killed the run is derived from the checkpoints and the shape, and the
+ * store is the only witness to it.
+ *
+ * At every other position the stream stays the authority, `ended` being null. Scrubbed into the
+ * middle of a run, a node that genuinely WAS working then must still read working — showing how it
+ * ended is the same lie as showing a run's final state at step one.
  */
-function fromStream(n: NodeView, d: DerivedNode | undefined): NodeView {
+function fromStream(n: NodeView, d: DerivedNode | undefined, ended: RunStatus | null): NodeView {
   if (!d) {
     const { telemetry: _dropped, ...rest } = n;
     return { ...rest, state: "idle" as NodeState, checkpoints: 0 };
@@ -314,7 +343,7 @@ function fromStream(n: NodeView, d: DerivedNode | undefined): NodeView {
   const telemetry = d.costed ? d.telemetry : (n.telemetry ?? d.telemetry);
   return {
     ...n,
-    state: d.state,
+    state: ended && d.state === "working" ? n.state : d.state,
     checkpoints: d.checkpoints,
     ...(telemetry ? { telemetry } : {}),
   };

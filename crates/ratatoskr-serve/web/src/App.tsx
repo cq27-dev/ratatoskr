@@ -379,7 +379,13 @@ export default function App() {
    * question than the one being asked. The pipeline's shape — which nodes exist and where — comes
    * from the server, because that is a property of the graph, not of a moment; a node the shape
    * does not place is positioned from the stream, which is the only thing that has seen it yet.
+   *
+   * The one thing the store answers better is where a stopped run stopped. A host error writes no
+   * checkpoint and no node-scoped event, so the stream leaves the dying node working forever; at
+   * the end of a run that has stopped, the store settles it. Passed only when the cursor is at the
+   * live end — mid-run the stream is still the authority. See `applyDerived`.
    */
+  const ended = detail && cursor === null && isTerminal(detail.status) ? detail.status : null;
   const graphNodes = useMemo(() => {
     if (!detail) return [];
     // Having a timeline is what makes the stream authoritative — not whether this position has
@@ -387,8 +393,8 @@ export default function App() {
     // is not a pipeline node, so the derivation is legitimately empty; falling back to the store
     // there showed every node finished, with its final counts, at step one of the run.
     if (!shownEvents.length) return detail.nodes;
-    return applyDerived(detail.nodes, nodesFromEvents(shownEvents));
-  }, [detail, shownEvents]);
+    return applyDerived(detail.nodes, nodesFromEvents(shownEvents), ended);
+  }, [detail, shownEvents, ended]);
 
   /**
    * Which nodes are working right now — what stop and steer can be aimed at.
@@ -454,32 +460,6 @@ export default function App() {
       out.set(e.node, at);
     }
     return out;
-  }, [shownEvents]);
-
-  /**
-   * Every node currently working, from the stream.
-   *
-   * The store cannot answer this. It sees checkpoints, and mid-converge the implementer has one
-   * while still being re-run — so it reads as working — while the verifier, which is an optional
-   * stage and has not checkpointed, reads as not started. Both are the wrong way round exactly
-   * when a viewer is watching the verifier work.
-   *
-   * A SET, not the latest speaker: the bookkeeper and the publisher run concurrently at the end of
-   * a run, and taking whoever spoke last made the highlight alternate between them as their events
-   * interleaved. A node is working once it acts and stops when it checkpoints — which is the run's
-   * own meaning of the word, and holds however many are in flight.
-   */
-  const active = useMemo(() => {
-    const WORKING = new Set(["tool_call", "model_text", "node_start", "tool_result"]);
-    const working = new Set<string>();
-    for (const e of shownEvents) {
-      if (!e?.node) continue;
-      if (WORKING.has(e.kind)) working.add(e.node);
-      // Its checkpoint is the node saying it is finished. The implementer checkpoints once per
-      // converge iteration and is then re-driven, which re-adds it on its next event.
-      else if (e.kind === "checkpoint") working.delete(e.node);
-    }
-    return working;
   }, [shownEvents]);
 
   /**
@@ -618,7 +598,6 @@ export default function App() {
               <PipelineGraph
                 nodes={graphNodes}
                 live={live}
-                active={active}
                 loops={loops}
                 selected={node}
                 onSelect={setNode}

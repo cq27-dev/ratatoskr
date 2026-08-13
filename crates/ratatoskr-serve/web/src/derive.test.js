@@ -299,6 +299,60 @@ test("a declared layout is not reordered by the stream", () => {
   ]);
 });
 
+/** A tool call: a node working, with no checkpoint to follow it. */
+function working(name) {
+  return { at: "2026-08-12T10:00:02Z", kind: "tool_call", node: name, detail: "read_file" };
+}
+
+// A host error writes no checkpoint for the node it kills and no node-scoped event, so the fold
+// leaves it "working" and the run emits nothing more to move it. At the end of a stopped run the
+// store is the better witness: it knows which node the run died in.
+test("a stopped run's node the stream leaves working takes the store's state", () => {
+  const shape = [placed("analyst", 0), { ...placed("implementer", 1), state: "failed" }];
+  const view = applyDerived(
+    shape,
+    nodesFromEvents([start("analyst"), checkpointed("analyst"), start("implementer")]),
+    "failed",
+  );
+  expect(view.map((n) => [n.name, n.state])).toEqual([
+    ["analyst", "done"],
+    ["implementer", "failed"],
+  ]);
+});
+
+// The same run, scrubbed back into the middle of itself. A node that genuinely WAS working then
+// still reads working — settling it against the store there is the same lie as showing a run's
+// final state at step one.
+test("scrubbed into the middle of a stopped run, a working node still reads working", () => {
+  const shape = [placed("analyst", 0), { ...placed("implementer", 1), state: "failed" }];
+  const view = applyDerived(
+    shape,
+    nodesFromEvents([start("analyst"), checkpointed("analyst"), start("implementer")]),
+    null,
+  );
+  expect(view.find((n) => n.name === "implementer").state).toBe("working");
+});
+
+// A stopped run says nothing about a node that finished: the stream saw the checkpoint and is the
+// finer record, above all for the implementer, whose rows come one per converge iteration.
+test("only a working node is settled — a checkpointed one keeps what the stream saw", () => {
+  const shape = [{ ...placed("analyst", 0), state: "idle" }];
+  const view = applyDerived(shape, nodesFromEvents([start("analyst"), checkpointed("analyst")]), "converged");
+  expect(view[0].state).toBe("done");
+});
+
+// With no declared layout the server places a node only once it has checkpointed, so the node the
+// host died under has no server row at all. The run's status is then the only record of it, and
+// without this a failed run draws every box green and nothing wrong.
+test("a failed run marks the node it died in even when the store has no row for it", () => {
+  const events = [start("ingest"), checkpointed("ingest"), start("publish"), working("publish")];
+  const view = applyDerived([appended("ingest", 0)], nodesFromEvents(events), "failed");
+  expect(view.map((n) => [n.name, n.state])).toEqual([
+    ["ingest", "done"],
+    ["publish", "failed"],
+  ]);
+});
+
 // A run from another graph: the shape names some of its nodes and not others. The named ones stay
 // where the shape puts them; only the rest are the client's to order.
 test("a partly shaped run keeps its shaped nodes and orders the rest by the stream", () => {
