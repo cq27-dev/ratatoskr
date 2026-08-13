@@ -569,7 +569,7 @@ fn validate_configured_stage_registry(
     let profiles = agent_profiles(config);
     // The registry the run will execute, and nothing else. `overlaid_stages` builds its base from
     // exactly this expression, so what validates here is what runs. A base carrying extra built-in
-    // stages validated ghosts — `governedBy: "red_team"` passed startup against a stage the run
+    // stages validated ghosts — `governedBy: "redteam"` passed startup against a stage the run
     // never registers, and was then refused by `governable_nodes()` when a ruleset appeared.
     let base = standard_stages;
 
@@ -3468,8 +3468,8 @@ mod referee_governance_tests {
                 .find(|node| node.name == name)
                 .unwrap_or_else(|| panic!("the standard layout places `{name}`"))
         };
-        assert_eq!(at("red_team").stage, at("implementer").stage, "one column");
-        assert_ne!(at("red_team").lane, at("implementer").lane, "two lanes");
+        assert_eq!(at("redteam").stage, at("implementer").stage, "one column");
+        assert_ne!(at("redteam").lane, at("implementer").lane, "two lanes");
         assert!(at("context").stage < at("analyst").stage);
         assert!(at("overseer").optional);
         assert!(at("verifier").optional);

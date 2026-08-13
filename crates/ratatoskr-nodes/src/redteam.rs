@@ -285,7 +285,7 @@ impl RedTeamNode {
         let worktree = self.baseline_worktree().await?;
         let outcomes = run_acceptance(Acceptance {
             cfg: &self.sandbox,
-            node: "red_team",
+            node: "redteam",
             name: &self.name,
             repo_root: &self.repo_path,
             worktree: worktree.as_path(),

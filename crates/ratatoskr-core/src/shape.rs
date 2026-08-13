@@ -82,7 +82,7 @@ mod tests {
         // The fork: two nodes, one column, two lanes. Every index is inside the node count, which
         // is what a shape this build wrote always looks like.
         let real = r#"[
-            {"name":"red_team","stage":0,"lane":0,"optional":false},
+            {"name":"redteam","stage":0,"lane":0,"optional":false},
             {"name":"implementer","stage":0,"lane":1,"optional":false}
         ]"#;
         assert_eq!(recorded(Some(real)).len(), 2);

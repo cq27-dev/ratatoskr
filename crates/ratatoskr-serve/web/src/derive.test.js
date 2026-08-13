@@ -194,15 +194,15 @@ test("events belonging to no node are skipped", () => {
 // The implementer cannot start before the red team has finished (`implement_host` in
 // ratatoskr-nodes/src/workflow.rs refuses to), so both boxes having started is the whole test.
 test("both the red team and the implementer having started draws the hand-off", () => {
-  expect(forkHandoff([node("red_team", "done"), node("implementer", "working")])).toBe(true);
+  expect(forkHandoff([node("redteam", "done"), node("implementer", "working")])).toBe(true);
 });
 
 test("a started red team alone draws no hand-off, because nothing has received the tree", () => {
-  expect(forkHandoff([node("red_team", "working"), node("implementer", "idle")])).toBe(false);
+  expect(forkHandoff([node("redteam", "working"), node("implementer", "idle")])).toBe(false);
 });
 
 test("neither node having started draws no hand-off", () => {
-  expect(forkHandoff([node("red_team", "idle"), node("implementer", "idle")])).toBe(false);
+  expect(forkHandoff([node("redteam", "idle"), node("implementer", "idle")])).toBe(false);
 });
 
 test("a workflow with no red team at all draws no hand-off from nothing", () => {
@@ -214,7 +214,7 @@ test("a workflow with no red team at all draws no hand-off from nothing", () => 
 // as a diagonal across the graph on top of it.
 test("a layout that puts the two in different columns draws no lane hand-off", () => {
   const nodes = [
-    { ...node("red_team", "done"), stage: 0 },
+    { ...node("redteam", "done"), stage: 0 },
     { ...node("implementer", "working"), stage: 2 },
   ];
   expect(forkHandoff(nodes)).toBe(false);
@@ -222,14 +222,14 @@ test("a layout that puts the two in different columns draws no lane hand-off", (
 
 test("sharing a column is what draws it", () => {
   const nodes = [
-    { ...node("red_team", "done"), stage: 3, lane: 0 },
+    { ...node("redteam", "done"), stage: 3, lane: 0 },
     { ...node("implementer", "working"), stage: 3, lane: 1 },
   ];
   expect(forkHandoff(nodes)).toBe(true);
 });
 
 test("a failed red team still handed the tree over, so the hand-off is drawn", () => {
-  expect(forkHandoff([node("red_team", "failed"), node("implementer", "working")])).toBe(true);
+  expect(forkHandoff([node("redteam", "failed"), node("implementer", "working")])).toBe(true);
 });
 
 /** A node the shape places, at a column of its own. */
@@ -368,20 +368,20 @@ test("a failed run marks the one node its stream left working", () => {
 // see the checkpoint and says "done"; the stream saw the re-entry, and it is the whole difference.
 test("a converge death still marks the implementer, which its checkpoints deny", () => {
   const shape = [
-    { ...placed("red_team", 0), state: "done" },
+    { ...placed("redteam", 0), state: "done" },
     { ...placed("implementer", 0), lane: 1, state: "done" },
     { ...placed("bookkeeper", 1), state: "idle" },
   ];
   const events = [
-    start("red_team"),
-    checkpointed("red_team"),
+    start("redteam"),
+    checkpointed("redteam"),
     start("implementer"),
     checkpointed("implementer"),
     start("implementer"),
   ];
   const view = applyDerived(shape, nodesFromEvents(events), "failed");
   expect(view.map((n) => [n.name, n.state])).toEqual([
-    ["red_team", "done"],
+    ["redteam", "done"],
     ["implementer", "failed"],
     ["bookkeeper", "idle"],
   ]);

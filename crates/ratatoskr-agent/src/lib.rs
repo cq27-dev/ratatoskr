@@ -4271,7 +4271,7 @@ mod tests {
         // The converge loop runs the implementer repeatedly; each checkpoint must claim the turn
         // that preceded it, not the newest one.
         ledger.record("implementer", cost(1));
-        ledger.record("red_team", cost(9));
+        ledger.record("redteam", cost(9));
         ledger.record("implementer", cost(2));
 
         assert_eq!(ledger.take("implementer").unwrap().usage.input_tokens, 1);
@@ -4281,7 +4281,7 @@ mod tests {
             "a claimed entry is not handed out twice"
         );
         // A different node's entry is untouched by the drain of another's.
-        assert_eq!(ledger.take("red_team").unwrap().usage.input_tokens, 9);
+        assert_eq!(ledger.take("redteam").unwrap().usage.input_tokens, 9);
         // A node that never ran a model turn reports nothing rather than someone else's numbers.
         assert!(ledger.take("bookkeeper").is_none());
     }

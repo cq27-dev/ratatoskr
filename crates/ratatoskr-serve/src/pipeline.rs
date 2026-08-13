@@ -473,7 +473,7 @@ mod tests {
             (&["overseer"], true),
             (&["context"], false),
             (&["analyst"], false),
-            (&["red_team", "implementer"], false),
+            (&["redteam", "implementer"], false),
             (&["verifier"], true),
             (&["bookkeeper", "publisher"], false),
         ])
@@ -612,12 +612,12 @@ mod tests {
             &[
                 cp("context", "t1"),
                 cp("analyst", "t3"),
-                cp("red_team", "t4"),
+                cp("redteam", "t4"),
                 cp("implementer", "t5"),
                 cp("implementer", "t6"),
             ],
         );
-        assert_eq!(state_of(&live, "red_team"), NodeState::Done);
+        assert_eq!(state_of(&live, "redteam"), NodeState::Done);
         assert_eq!(state_of(&live, "implementer"), NodeState::Working);
         // The converge loop must not advance the pipeline past the fork: the bookkeeper only
         // runs after a terminal status, so claiming it's working would be structurally impossible.
@@ -633,7 +633,7 @@ mod tests {
         // Once the run reaches a terminal status the same checkpoints mean it's finished.
         let done = derive(
             Some("converged"),
-            &[cp("red_team", "t4"), cp("implementer", "t5")],
+            &[cp("redteam", "t4"), cp("implementer", "t5")],
         );
         assert_eq!(state_of(&done, "implementer"), NodeState::Done);
     }
@@ -645,7 +645,7 @@ mod tests {
         // for its fork phase rather than staying `planned`.
         let views = derive(Some("planned"), &[cp("context", "t1"), cp("analyst", "t3")]);
         assert_eq!(state_of(&views, "analyst"), NodeState::Done);
-        assert_eq!(state_of(&views, "red_team"), NodeState::Idle);
+        assert_eq!(state_of(&views, "redteam"), NodeState::Idle);
         assert_eq!(state_of(&views, "implementer"), NodeState::Idle);
     }
 
@@ -662,11 +662,11 @@ mod tests {
             &[
                 cp("context", "t1"),
                 cp("analyst", "t3"),
-                cp("red_team", "t4"),
+                cp("redteam", "t4"),
                 cp("implementer", "t5"),
             ],
         );
-        assert_eq!(state_of(&views, "red_team"), NodeState::Done);
+        assert_eq!(state_of(&views, "redteam"), NodeState::Done);
         assert_eq!(state_of(&views, "bookkeeper"), NodeState::Idle);
         assert!(
             !views.iter().any(|v| v.state == NodeState::Failed),
@@ -687,7 +687,7 @@ mod tests {
             &[
                 cp("context", "t1"),
                 cp("analyst", "t3"),
-                cp("red_team", "t4"),
+                cp("redteam", "t4"),
                 cp("implementer", "t5"),
             ],
             Some(&config),
@@ -710,11 +710,11 @@ mod tests {
         // for a verifier-side error. A node's route says what it runs on, never whether its stage
         // can error, so nothing here reads config and both runs answer the same.
         let shape = shape_of(&[
-            (&["red_team", "implementer"], false),
+            (&["redteam", "implementer"], false),
             (&["verifier"], false),
             (&["bookkeeper"], false),
         ]);
-        let checkpoints = [cp("red_team", "t1"), cp("implementer", "t2")];
+        let checkpoints = [cp("redteam", "t1"), cp("implementer", "t2")];
         let config = routed("verifier");
         for config in [Some(&config), None] {
             let views = derive_with(Some("failed"), &checkpoints, config, Some(&shape));
@@ -756,18 +756,18 @@ mod tests {
         // `iterate()` attempt, and that writes no checkpoint either. A reader of this graph must
         // not be shown a stage that never started as the run's failure.
         let shape = shape_of(&[
-            (&["red_team", "implementer"], false),
+            (&["redteam", "implementer"], false),
             (&["deploy"], false),
             (&["bookkeeper"], false),
         ]);
         let views = derive_with(
             Some("failed"),
-            &[cp("red_team", "t1"), cp("implementer", "t2")],
+            &[cp("redteam", "t1"), cp("implementer", "t2")],
             None,
             Some(&shape),
         );
         assert_eq!(state_of(&views, "implementer"), NodeState::Done);
-        assert_eq!(state_of(&views, "red_team"), NodeState::Done);
+        assert_eq!(state_of(&views, "redteam"), NodeState::Done);
         assert_eq!(state_of(&views, "deploy"), NodeState::Idle);
         assert!(
             !views.iter().any(|v| v.state == NodeState::Failed),
@@ -800,7 +800,7 @@ mod tests {
             &[
                 cp("context", "t1"),
                 cp("analyst", "t3"),
-                cp("red_team", "t4"),
+                cp("redteam", "t4"),
                 cp("implementer", "t5"),
             ],
         );
@@ -813,7 +813,7 @@ mod tests {
         // ambiguous (in flight / silently failed / never applicable) — don't guess.
         let views = derive(
             Some("converged"),
-            &[cp("red_team", "t4"), cp("implementer", "t5")],
+            &[cp("redteam", "t4"), cp("implementer", "t5")],
         );
         assert_eq!(state_of(&views, "implementer"), NodeState::Done);
         assert_eq!(state_of(&views, "bookkeeper"), NodeState::Idle);
@@ -844,7 +844,7 @@ mod tests {
         // Routed as `redteam`, checkpointed as `red_team` — the view is keyed by the latter.
         let planned = views
             .iter()
-            .find(|v| v.name == "red_team")
+            .find(|v| v.name == "redteam")
             .and_then(|v| v.planned.as_ref())
             .expect("a routed node says what it will run on");
         assert_eq!(planned.model, "anthropic/claude-sonnet-5");
@@ -920,7 +920,7 @@ mod tests {
             &[
                 cp("context", "t1"),
                 cp("analyst", "t2"),
-                cp("red_team", "t3"),
+                cp("redteam", "t3"),
                 cp("implementer", "t4"),
                 cp("bookkeeper", "t5"),
             ],
@@ -984,7 +984,7 @@ mod tests {
             &[
                 cp("context", "t1"),
                 cp("analyst", "t2"),
-                cp("red_team", "t3"),
+                cp("redteam", "t3"),
                 cp("implementer", "t4"),
                 cp("referee", "t5"),
             ],
@@ -1109,7 +1109,7 @@ mod tests {
         let views = derive(
             Some("unreviewed"),
             &[
-                cp("red_team", "t"),
+                cp("redteam", "t"),
                 cp("implementer", "t"),
                 cp("verifier", "t"),
             ],

@@ -694,7 +694,7 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
         .await
         .map_err(|e| e.to_string())?;
     // Checkpoint before the guard so a failed baseline stays inspectable.
-    note(&ctx, "red_team", &out, None).await?;
+    note(&ctx, "redteam", &out, None).await?;
     // The false-convergence guard is enforced here — the script cannot skip it.
     if !converge::test_command_ran(&out.failing_tests, out.passed_tests, out.exit_code) {
         return Err(format!(
@@ -956,7 +956,7 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
 
     // Rebuild the diagnostic Rust-side (identical wording to the hardcoded converge loop) from the
     // baseline and the latest implementer output — the script doesn't get to author it.
-    let red_team: RedTeamOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "red_team")
+    let red_team: RedTeamOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "redteam")
         .await
         .map_err(|e| e.to_string())?;
     let prev: ImplementerOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "implementer")
@@ -1359,7 +1359,7 @@ async fn replan_at_ceiling_with<R: CeilingRecovery>(
         return Ok("null".to_string());
     }
 
-    let red_team: RedTeamOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "red_team")
+    let red_team: RedTeamOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "redteam")
         .await
         .map_err(|error| error.to_string())?;
     let implementation: ImplementerOutput =
@@ -2677,7 +2677,7 @@ async fn finish_full<A: FullTerminalActions>(
         });
     }
 
-    let red_team: RedTeamOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "red_team").await?;
+    let red_team: RedTeamOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "redteam").await?;
     let implementer: ImplementerOutput =
         latest_checkpoint(&ctx.store, &ctx.run_id, "implementer").await?;
     let iterations = count_checkpoints(&ctx.store, &ctx.run_id, "implementer").await?;
@@ -3692,7 +3692,7 @@ mod tests {
                 let output = baseline.clone();
                 async move {
                     calls.lock().unwrap().push("redTeam".to_string());
-                    note(&ctx, "red_team", &output, None).await?;
+                    note(&ctx, "redteam", &output, None).await?;
                     serde_json::to_string(&output).map_err(|error| error.to_string())
                 }
             }),
@@ -3833,7 +3833,7 @@ mod tests {
                 "issue",
                 "context",
                 "analyst",
-                "red_team",
+                "redteam",
                 "implementer",
                 "verifier",
                 "analyst",
@@ -3956,7 +3956,7 @@ mod tests {
         )
         .await
         .unwrap();
-        note(&ctx, "red_team", &red(&[], &["baseline"], 0), None)
+        note(&ctx, "redteam", &red(&[], &["baseline"], 0), None)
             .await
             .unwrap();
         let first = ImplementerOutput {
@@ -4617,7 +4617,7 @@ mod tests {
         // the ranked search happened. Nothing calls it, so it is not a host.
         for removed in [
             "memory",
-            "red_team",
+            "redteam",
             "implementer",
             "newlyIntroducedFailures",
         ] {
@@ -6958,7 +6958,7 @@ mod tests {
         )
         .unwrap();
         *ctx.worktree.lock().unwrap() = Some(WorktreePath(rust_worktree.clone()));
-        checkpoint(&store, run_id, "red_team", &red(&[], &["baseline"], 0))
+        checkpoint(&store, run_id, "redteam", &red(&[], &["baseline"], 0))
             .await
             .unwrap();
         // The model claims a different directory — standing in for the operator checkout — was
@@ -7504,7 +7504,7 @@ mod tests {
             .clone()
             .expect("redTeam prepares and retains the implementer worktree");
         assert!(worktree.as_path().exists());
-        let scripted = latest_checkpoint::<RedTeamOutput>(&store, run_id, "red_team")
+        let scripted = latest_checkpoint::<RedTeamOutput>(&store, run_id, "redteam")
             .await
             .unwrap();
         assert_eq!(
@@ -9690,7 +9690,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let run_id = "scripted-terminal-parity";
         terminal_plan(&store, run_id, true).await;
-        checkpoint(&store, run_id, "red_team", &red(&["old"], &[], 1))
+        checkpoint(&store, run_id, "redteam", &red(&["old"], &[], 1))
             .await
             .unwrap();
         let worktree = dir.join("worktree");

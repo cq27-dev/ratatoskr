@@ -549,8 +549,8 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
      */
     if (forkHandoff(nodes)) {
       edges.push({
-        id: "red_team-implementer",
-        source: "red_team",
+        id: "redteam-implementer",
+        source: "redteam",
         target: "implementer",
         sourceHandle: "loop-out",
         targetHandle: "lane-in",

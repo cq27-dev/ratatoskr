@@ -1154,7 +1154,7 @@ mod tests {
             .register_for_node(&key, "redteam-waiter", "redteam", None)
             .await
             .unwrap();
-        pauses.stop(&key, "red_team").await.unwrap();
+        pauses.stop(&key, "redteam").await.unwrap();
         pauses
             .acknowledge(&key, 1, "redteam-waiter", "redteam")
             .await
@@ -1164,10 +1164,10 @@ mod tests {
             pauses.is_node_stopped(&key, "redteam").await.unwrap(),
             "acknowledging Stop delivers it; it does not restart the parked node"
         );
-        pauses.clear_stop(&key, "red_team").await.unwrap();
+        pauses.clear_stop(&key, "redteam").await.unwrap();
         assert!(
             !pauses.is_node_stopped(&key, "redteam").await.unwrap(),
-            "the control-name aliases share one durable Stop"
+            "Start clears the durable Stop a delivered acknowledgement left standing"
         );
     }
 }
