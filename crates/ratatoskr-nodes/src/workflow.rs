@@ -2378,7 +2378,13 @@ async fn run_plan_scripted_with_turn(
         .await?;
     // A scripted run is measured the same way a built-in one is; the script picks the order, not
     // whether the run is comparable to another afterwards.
-    crate::record_provenance(&ctx.store, &ctx.run_id, &ctx.config).await;
+    crate::record_provenance(
+        &ctx.store,
+        &ctx.run_id,
+        &ctx.config,
+        &crate::stage::shape_from_workflow(runtime.meta()),
+    )
+    .await;
     checkpoint(
         &ctx.store,
         &ctx.run_id,
@@ -2440,7 +2446,13 @@ async fn run_full_scripted_with_actions<A: FullTerminalActions>(
         .await?;
     // A scripted run is measured the same way a built-in one is; the script picks the order, not
     // whether the run is comparable to another afterwards.
-    crate::record_provenance(&ctx.store, &ctx.run_id, &ctx.config).await;
+    crate::record_provenance(
+        &ctx.store,
+        &ctx.run_id,
+        &ctx.config,
+        &crate::stage::shape_from_workflow(runtime.meta()),
+    )
+    .await;
     checkpoint(
         &ctx.store,
         &ctx.run_id,
@@ -3473,6 +3485,23 @@ mod tests {
                 .map(|checkpoint| checkpoint.node_name.as_str())
                 .collect::<Vec<_>>(),
             ["issue", "context", "analyst"]
+        );
+        // And the run wrote down the layout the workflow it ran declared, which is what anything
+        // drawing this run afterwards places its records against.
+        let shape: Vec<ratatoskr_core::shape::ShapeNode> = serde_json::from_str(
+            store
+                .run("run-standard-plan")
+                .await
+                .unwrap()
+                .unwrap()
+                .shape_json
+                .as_deref()
+                .expect("a run records its shape"),
+        )
+        .unwrap();
+        assert_eq!(
+            shape,
+            crate::stage::shape_from_workflow(standard_runtime().await.unwrap().meta())
         );
         let context: crate::ContextOutput =
             serde_json::from_str(&checkpoints[1].output_json).unwrap();

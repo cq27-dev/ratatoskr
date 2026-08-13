@@ -221,6 +221,38 @@ pub fn validate(
     Ok(())
 }
 
+/// Refuse a layout column naming a node the run has no way to produce.
+///
+/// The layout is what a viewer places a run's records against, so a name nothing checkpoints is a
+/// box that stays empty forever — a typo and a genuinely missing stage look identical once the run
+/// is drawn. What a run can record under is a stage's id, a stage's governance identity, or one of
+/// the lifecycle identities the run writes itself (`red_team`, `implementer`, `memory`), so those
+/// are what a column may name.
+pub fn validate_layout(
+    layout: &[ratatoskr_script::workflow::WorkflowLayoutColumn],
+    stages: &[Stage],
+    workflow: &str,
+) -> Result<(), PlanError> {
+    let mut known: BTreeSet<&str> = BTreeSet::new();
+    for stage in stages {
+        known.insert(stage.id.as_str());
+        known.insert(stage.governance_id());
+    }
+    for column in layout {
+        for node in &column.nodes {
+            if known.contains(node.as_str()) || policy::records_checkpoint(node) {
+                continue;
+            }
+            return Err(PlanError::Configuration(format!(
+                "workflow `{workflow}` lays out node `{node}`, which no stage or operation of it \
+                 provides; nodes that can be drawn: {}",
+                known.iter().copied().collect::<Vec<_>>().join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A declared output contract needs the JSON Schema that makes its name enforceable. Compile the
 /// schema before a run begins, rather than letting a malformed declaration reach a model call.
 pub fn validate_declared_contracts(stages: &[Stage]) -> Result<(), PlanError> {

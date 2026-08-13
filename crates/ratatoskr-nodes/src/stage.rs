@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use ratatoskr_core::{AgentProfileConfig, Capability, ModelRoute, SessionScope, ToolPolicy};
+use ratatoskr_core::{
+    AgentProfileConfig, Capability, ModelRoute, SessionScope, ToolPolicy, shape::ShapeNode,
+};
 
 /// Reusable model and authority defaults. A profile is not a checkpoint identity; [`Stage`] is.
 #[derive(Clone)]
@@ -251,6 +253,31 @@ pub fn stages_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> 
         .collect()
 }
 
+/// The layout a workflow declared, as the shape a run records.
+///
+/// A column is a `stage` and its `nodes` are its `lane`s, which is the whole vocabulary — the
+/// declaration maps onto [`ShapeNode`] one for one and adds nothing to it. A workflow that declares
+/// no layout gets an empty shape rather than a guessed one: nothing knows where its nodes belong,
+/// and a viewer places what a run actually recorded instead of a position no one declared.
+pub fn shape_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> Vec<ShapeNode> {
+    meta.layout
+        .iter()
+        .enumerate()
+        .flat_map(|(stage, column)| {
+            column
+                .nodes
+                .iter()
+                .enumerate()
+                .map(move |(lane, name)| ShapeNode {
+                    name: name.clone(),
+                    stage,
+                    lane,
+                    optional: column.optional,
+                })
+        })
+        .collect()
+}
+
 /// Lay a workflow's own declarations over a base registry: a declaration whose id is already there
 /// *replaces* that stage in place, a new id is appended.
 ///
@@ -340,6 +367,7 @@ mod tests {
                 delegation: None,
                 append_repository_guidance: true,
             }],
+            layout: Vec::new(),
         };
 
         let stages = stages_from_workflow(&workflow);

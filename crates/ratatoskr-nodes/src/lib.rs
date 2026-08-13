@@ -254,7 +254,12 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
 /// Best-effort throughout. This is what makes runs comparable afterwards, which is never worth
 /// failing a run over — a run with no provenance is still a run, and one refused because `git` was
 /// slow is not.
-async fn record_provenance(store: &Store, run_id: &str, config: &RatatoskrConfig) {
+async fn record_provenance(
+    store: &Store,
+    run_id: &str,
+    config: &RatatoskrConfig,
+    shape: &[ratatoskr_core::shape::ShapeNode],
+) {
     let config_json = serde_json::to_string(config)
         .inspect_err(|e| tracing::warn!("could not record the run's config: {e}"))
         .ok();
@@ -267,10 +272,10 @@ async fn record_provenance(store: &Store, run_id: &str, config: &RatatoskrConfig
             Some(&graph_fingerprint(&repo)),
             repo_sha.as_deref(),
             // The graph itself, not just a hash of it. A hash says two runs differed; the shape is
-            // what lets a run be drawn by something that never had this pipeline.
-            serde_json::to_string(&ratatoskr_core::shape::built_in())
-                .ok()
-                .as_deref(),
+            // what lets a run be drawn by something that never had this pipeline. It is the layout
+            // the *running* workflow declared — recording this build's own would draw every run
+            // against a pipeline it may never have executed.
+            serde_json::to_string(shape).ok().as_deref(),
             None,
         )
         .await
@@ -581,9 +586,17 @@ fn validate_configured_stage_registry(
     // it — not against one pool of everything configured. Pooling rejects the documented case of a
     // workflow overriding `analyst`, and rejects it twice over when two workflows each override the
     // same standard id: a run only ever executes one workflow, so they never meet.
-    let judge = |declared: Vec<Stage>, mut permitted: Vec<String>| -> Result<(), PlanError> {
+    let judge = |declared: Vec<Stage>,
+                 mut permitted: Vec<String>,
+                 meta: Option<&ratatoskr_script::workflow::WorkflowMeta>|
+     -> Result<(), PlanError> {
         let mut stages = base.clone();
         stage::overlay(&mut stages, declared);
+        // The layout is judged against the registry the workflow will actually run, so a column
+        // naming a stage it overrides into existence is accepted and one naming a typo is not.
+        if let Some(meta) = meta {
+            validate::validate_layout(&meta.layout, &stages, &meta.name)?;
+        }
         permitted.extend(stages.iter().map(|stage| stage.id.clone()));
         permitted.sort();
         permitted.dedup();
@@ -591,13 +604,13 @@ fn validate_configured_stage_registry(
     };
 
     if workflows.is_empty() {
-        return judge(Vec::new(), governable_from(std::iter::empty()));
+        return judge(Vec::new(), governable_from(std::iter::empty()), None);
     }
     for workflow in workflows {
         let declared = stage::stages_from_workflow(workflow.meta());
         validate::validate_declared_contracts(&declared)?;
         validate::validate_declarations(&declared, &workflow.meta().name)?;
-        judge(declared, governable_from([workflow]))?;
+        judge(declared, governable_from([workflow]), Some(workflow.meta()))?;
     }
     Ok(())
 }
@@ -3355,6 +3368,81 @@ mod referee_governance_tests {
             Ok(_) => panic!("the bundled workflow's name is taken"),
         };
         assert!(error.contains(BUILT_IN), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_standard_workflow_declares_the_layout_a_run_of_it_records() {
+        // The shape a run writes down comes from the workflow it ran, so this is the one place the
+        // standard pipeline's columns are stated — there is no compiled-in copy to disagree with.
+        let runtime = workflow::standard_runtime().await.unwrap();
+        let shape = stage::shape_from_workflow(runtime.meta());
+        let at = |name: &str| {
+            shape
+                .iter()
+                .find(|node| node.name == name)
+                .unwrap_or_else(|| panic!("the standard layout places `{name}`"))
+        };
+        assert_eq!(at("red_team").stage, at("implementer").stage, "one column");
+        assert_ne!(at("red_team").lane, at("implementer").lane, "two lanes");
+        assert!(at("context").stage < at("analyst").stage);
+        assert!(at("overseer").optional);
+        assert!(at("verifier").optional);
+        assert!(!at("context").optional);
+
+        // And every node it lays out is one the run can record under, judged against the registry
+        // the workflow actually runs.
+        validate::validate_layout(
+            &runtime.meta().layout,
+            &workflow::standard_stages().await.unwrap(),
+            &runtime.meta().name,
+        )
+        .expect("the bundled layout names only nodes the bundled stages provide");
+    }
+
+    #[tokio::test]
+    async fn a_layout_naming_a_node_no_stage_provides_is_refused_at_load() {
+        let (dir, found) = workflows_in(
+            "layout-typo",
+            &[(
+                "ours",
+                r#"defineWorkflow({
+                     name: "ours",
+                     layout: [{ nodes: ["analyst"] }, { nodes: ["analsyt"] }],
+                   });
+                   export async function plan(input) { return input; }"#,
+            )],
+        )
+        .await;
+        let standard = workflow::standard_stages().await.unwrap();
+        let error =
+            validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
+                .expect_err("a column naming nothing would be a box that never fills")
+                .to_string();
+        assert!(error.contains("ours"), "{error}");
+        assert!(error.contains("analsyt"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_workflow_may_lay_out_a_stage_it_declares_itself() {
+        let (dir, found) = workflows_in(
+            "layout-own-stage",
+            &[(
+                "ours",
+                r#"import * as nodes from "ratatoskr/nodes";
+                   defineWorkflow({
+                     name: "ours",
+                     stages: [stage("security_review", { ...nodes.analyst, outputContract: "" , outputSchema: undefined })],
+                     layout: [{ nodes: ["security_review"] }],
+                   });
+                   export async function plan(input) { return input; }"#,
+            )],
+        )
+        .await;
+        let standard = workflow::standard_stages().await.unwrap();
+        validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
+            .expect("a workflow may place the stages it declares");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

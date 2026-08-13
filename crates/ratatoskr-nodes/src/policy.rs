@@ -265,6 +265,15 @@ pub(crate) fn reserved_for_governance(id: &str) -> Option<Reserved> {
     reserved(id).filter(|reason| !reason.governable())
 }
 
+/// Whether the run itself writes a checkpoint under `id`, with no stage of that name to declare it.
+///
+/// The lifecycle identities: `latest_checkpoint` reads `implementer`, `red_team` and `memory` back
+/// by name, so a run records under those whatever its registry calls the stages behind them. A
+/// workflow's layout may place them for that reason.
+pub(crate) fn records_checkpoint(id: &str) -> bool {
+    reserved(id) == Some(Reserved::Lifecycle)
+}
+
 /// The output contract an override of `id` must keep, because Rust deserializes it.
 pub(crate) fn required_contract(id: &str) -> Option<&'static str> {
     match class(id)? {
