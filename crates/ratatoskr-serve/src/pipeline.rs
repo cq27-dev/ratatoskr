@@ -67,14 +67,6 @@ pub struct NodeView {
     /// positioned from these rather than from a table the frontend maintains in parallel.
     pub stage: usize,
     pub lane: usize,
-    /// The stages whose work this node is, in declaration order.
-    ///
-    /// One entry of the node's own name for the ordinary node, which is one stage. Several for a
-    /// node several stages compose — the red team's classifier and its test author — and then this
-    /// is the only thing that says so: the members run under their own identities, so their events
-    /// and their per-turn records arrive under names no column carries, and a client that did not
-    /// know they belonged here would draw each as a node of its own beside the box.
-    pub stages: Vec<String>,
     /// Whether the run's recorded shape is what put it there. False means [`append_unknown`]
     /// placed it, in first-checkpoint order — an order a client holding the event stream can
     /// better, since completion order is not start order once a workflow runs hosts concurrently.
@@ -86,8 +78,13 @@ pub struct NodeView {
     pub checkpoints: usize,
     pub first_at: Option<String>,
     pub last_at: Option<String>,
-    /// What the node ran on and cost, totalled over [`Self::stages`] — the latest record of each,
-    /// folded. Absent for a node that has not checkpointed, and for one that ran no model at all.
+    /// What the node ran on and cost, totalled over the stages composing it — the latest record of
+    /// each, folded. Absent for a node that has not checkpointed, and for one that ran no model at
+    /// all.
+    ///
+    /// Which stages those are is NOT repeated here. It is the run's recorded registry, shipped once
+    /// per run rather than once per box, because a box that has not checkpointed yet has no row in
+    /// this list at all and its membership is needed exactly then.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<NodeTelemetryView>,
     /// What this node *would* run on, read from config. Present before the node has run, so the
@@ -392,7 +389,6 @@ pub fn derive_with(
                 state,
                 stage: idx,
                 lane,
-                stages,
                 shaped: true,
                 checkpoints: times.len(),
                 first_at: times.first().map(|s| s.to_string()),
@@ -453,14 +449,9 @@ fn append_unknown(
     terminal: bool,
     recorded: &ratatoskr_core::shape::Recorded,
 ) {
-    // A placed box accounts for its own name AND for every stage that composes it. A member writes
-    // its own per-turn row under its own id, which no column carries — without this the red team
-    // would be drawn as one box plus a floating `redteam_classifier` and `redteam_author` beside
-    // it, which is exactly the stray this membership exists to prevent.
-    let known: std::collections::HashSet<&str> = out
-        .iter()
-        .flat_map(|n| std::iter::once(n.name.as_str()).chain(n.stages.iter().map(String::as_str)))
-        .collect();
+    // A box the layout already placed. A member's row resolves to its box through
+    // `Recorded::node_of` below, so only the box names have to be listed here.
+    let known: std::collections::HashSet<&str> = out.iter().map(|n| n.name.as_str()).collect();
     let mut seen = std::collections::HashSet::new();
     // Each out-of-shape name with the position of its FIRST checkpoint, which is what its caller is
     // resolved from. One row aggregates every checkpoint of that name, so a run whose
@@ -489,7 +480,6 @@ fn append_unknown(
             state: checkpointed_state(name, terminal),
             stage: base + i,
             lane: 0,
-            stages,
             shaped: false,
             checkpoints: times.len(),
             first_at: times.first().map(|s| s.to_string()),
@@ -690,6 +680,13 @@ mod tests {
     const EXCHANGE: &str =
         r#"{"from":"analyst","to":"scout","question":"which one?","answer":"the first"}"#;
 
+    /// The membership `run_detail` ships beside the nodes — the run's recorded registry, which is
+    /// where the client reads a box's stages from. Not `NodeView`: a box that has not checkpointed
+    /// has no row there, and that is the window a control is used in.
+    fn membership(shape_json: &str, node: &str) -> Vec<String> {
+        ratatoskr_core::shape::recorded(Some(shape_json)).members(node)
+    }
+
     fn state_of(views: &[NodeView], name: &str) -> NodeState {
         views.iter().find(|v| v.name == name).unwrap().state
     }
@@ -751,12 +748,17 @@ mod tests {
             ["context", "analyst", "redteam", "implementer", "verifier"],
             "one box per node, in the order the run first recorded under each"
         );
+        // And the membership the client folds the stream by comes from the same record, so it
+        // holds for a box drawn here as for one the layout placed.
         assert_eq!(
-            view(&views, "redteam").stages,
+            membership(&unplaced, "redteam"),
             ["redteam_classifier", "redteam_author"]
         );
-        assert_eq!(view(&views, "implementer").stages, ["implementer_attempt"]);
-        assert_eq!(view(&views, "analyst").stages, ["analyst"]);
+        assert_eq!(
+            membership(&unplaced, "implementer"),
+            ["implementer_attempt"]
+        );
+        assert_eq!(membership(&unplaced, "analyst"), ["analyst"]);
         // The box's own record is what says how many times it ran, exactly as for a placed one:
         // the members' rows are turns inside it, not repeats of it.
         assert_eq!(view(&views, "redteam").checkpoints, 1);
@@ -1356,11 +1358,11 @@ mod tests {
         }
         assert!(views.iter().all(|view| view.shaped), "{views:?}");
         assert_eq!(
-            view(&views, "redteam").stages,
+            membership(&standard_shape(), "redteam"),
             ["redteam_classifier", "redteam_author"]
         );
         // A node that is one stage says so the same way, so a reader never special-cases.
-        assert_eq!(view(&views, "analyst").stages, ["analyst"]);
+        assert_eq!(membership(&standard_shape(), "analyst"), ["analyst"]);
     }
 
     #[test]
@@ -1369,7 +1371,8 @@ mod tests {
         // node is exactly its own name, which is what every node of such a run was.
         let bare = r#"[{"name":"analyst","stage":0,"lane":0,"optional":false}]"#;
         let views = derive_with(Some("converged"), &[cp("analyst", "t")], None, Some(bare));
-        assert_eq!(view(&views, "analyst").stages, ["analyst"]);
+        assert_eq!(view(&views, "analyst").state, NodeState::Done);
+        assert_eq!(membership(bare, "analyst"), ["analyst"]);
     }
 
     #[test]

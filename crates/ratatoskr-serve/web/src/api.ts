@@ -27,11 +27,6 @@ export interface NodeView {
   /** Position in the pipeline: stage is the column, lane the row within it. */
   stage: number;
   lane: number;
-  /** The stages whose work this node is — its own name for a node that is one stage, several for
-   *  one they compose. Members run under their own identities, so their events arrive under names
-   *  no box carries; this is what folds them into the box instead of drawing each beside it.
-   *  Absent only from a `NodeView` this client built itself. */
-  stages?: string[];
   /** Whether the run's recorded shape is what put it there. False means the server placed it from
    *  its checkpoints, in completion order — which `applyDerived` replaces with the stream's. */
   shaped?: boolean;
@@ -42,6 +37,18 @@ export interface NodeView {
   /** The node that ran this one. Only present for a node the shape does not place — a placed node's
    *  position already says what preceded it. */
   caller?: string;
+}
+
+/**
+ * Mirrors `ratatoskr_core::shape::RunStage` — one stage of the run's registry.
+ *
+ * `node` is the box its work is drawn in, its own id unless it declared otherwise. A member records
+ * and announces itself under `id`, so this is what says those records belong in `node`'s box.
+ */
+export interface RunStage {
+  id: string;
+  node: string;
+  governed_by?: string;
 }
 
 /** Mirrors `pipeline::NodeTelemetryView`. */
@@ -134,6 +141,10 @@ export interface RunDetail {
   issue: string | null;
   last_activity: string | null;
   nodes: NodeView[];
+  /** The run's own record of its registry. `nodes` is derived from checkpoints, so a box whose
+   *  stage is executing right now is not in it yet — this is, because it is a property of the run
+   *  rather than of what has finished. Empty for a run recorded before it travelled. */
+  stages: RunStage[];
   worktree: WorktreeView | null;
   /** The pull request the run opened, if any. Null for comment-only runs, runs that published
    * nothing, and runs that never reached the publisher. */

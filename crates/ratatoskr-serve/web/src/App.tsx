@@ -407,7 +407,7 @@ export default function App() {
     if (!shownEvents.length) return detail.nodes;
     // Read as boxes: a member stage's events are the box's, or the fold would place each half
     // beside the node it belongs to.
-    const boxed = inNodeBoxes(shownEvents, detail.nodes);
+    const boxed = inNodeBoxes(shownEvents, detail.stages);
     return applyDerived(detail.nodes, nodesFromEvents(boxed), ended);
   }, [detail, shownEvents, ended, loading]);
 
@@ -421,7 +421,7 @@ export default function App() {
   const workingNodes = useMemo(
     // By box, matching what a Stop is addressed to: a stage that composes a node polls under that
     // node's name, so a control aimed at a half would reach nothing.
-    () => workingNodeNames(detail?.nodes ?? [], inNodeBoxes(timeline, detail?.nodes ?? [])),
+    () => workingNodeNames(detail?.nodes ?? [], inNodeBoxes(timeline, detail?.stages ?? [])),
     [detail, timeline],
   );
 
@@ -489,7 +489,7 @@ export default function App() {
    * `implement()` call.
    */
   const loops = useMemo(
-    () => convergeLoops(inNodeBoxes(shownEvents, detail?.nodes ?? [])),
+    () => convergeLoops(inNodeBoxes(shownEvents, detail?.stages ?? [])),
     [shownEvents, detail],
   );
 
@@ -646,7 +646,7 @@ export default function App() {
                 <Feed
                   events={shownEvents}
                   node={node}
-                  nodes={node ? stagesOf(detail?.nodes ?? [], node) : null}
+                  nodes={node ? stagesOf(detail?.stages ?? [], node) : null}
                   nameWidth={nameWidth}
                   loading={loading}
                 />

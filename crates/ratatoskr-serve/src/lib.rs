@@ -983,6 +983,19 @@ struct RunDetail {
     /// this can, by how stale it is.
     last_activity: Option<String>,
     nodes: Vec<NodeView>,
+    /// The run's own record of its registry: every stage it could execute, and the node whose work
+    /// each is. What folds a member's events into its box, and what a box's feed is filtered by.
+    ///
+    /// Shipped alongside `nodes` rather than inside them because it is a property of the RUN, not
+    /// of what has finished. `nodes` is derived from checkpoints, so a box whose stage is executing
+    /// right now is not in it yet — and that is precisely the window an operator reaches for Stop
+    /// in. Read from `nodes`, the mapping is empty exactly then, the client draws
+    /// `context_distillation` as its own box, and the Stop it offers is addressed to a name the
+    /// runtime never polls.
+    ///
+    /// Empty for a run recorded before the registry travelled with it, where every node is exactly
+    /// its own stage — which is what such a run's nodes were.
+    stages: Vec<ratatoskr_core::shape::RunStage>,
     worktree: Option<WorktreeView>,
     /// The pull request the run opened, if it opened one. Absent for comment-only runs, for runs
     /// that published nothing, and for runs that never reached the publisher.
@@ -1065,12 +1078,9 @@ async fn run_detail(
     let config = std::fs::read_to_string(&config_path)
         .ok()
         .and_then(|t| ratatoskr_core::RatatoskrConfig::from_toml_str(&t).ok());
-    let nodes = pipeline::derive_with(
-        status.as_deref(),
-        &checkpoints,
-        config.as_ref(),
-        run.as_ref().and_then(|r| r.shape_json.as_deref()),
-    );
+    let shape_json = run.as_ref().and_then(|r| r.shape_json.as_deref());
+    let nodes = pipeline::derive_with(status.as_deref(), &checkpoints, config.as_ref(), shape_json);
+    let stages = ratatoskr_core::shape::recorded(shape_json).stages;
     let last_activity = checkpoints
         .iter()
         .map(|c| c.created_at.as_str())
@@ -1112,6 +1122,7 @@ async fn run_detail(
         issue: issue_text(&checkpoints),
         last_activity,
         nodes,
+        stages,
         worktree: worktree_view(&checkpoints),
         pull_request: pull_request_view(&checkpoints),
     }))

@@ -3809,11 +3809,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["context", "analyst"]
         );
-        assert_eq!(
-            drawn[0].stages,
-            ["context_distillation"],
-            "the box says which stages do its work, so the client can fold their events into it"
+        // The record answers where the node list cannot. Before anything has checkpointed there
+        // are no nodes at all — the window in which a stage IS executing and an operator reaches
+        // for Stop — and the registry still says which box its events belong in. That is why it is
+        // shipped beside `nodes` rather than on them.
+        assert!(
+            ratatoskr_serve::pipeline::derive_with(
+                Some(RunStatus::Running.as_str()),
+                &[],
+                None,
+                run.shape_json.as_deref(),
+            )
+            .is_empty(),
+            "nothing has checkpointed, so nothing is placed"
         );
+        assert_eq!(recorded.node_of("context_distillation"), "context");
 
         // And the address a control is aimed at is the box the run answers under. `serve` polls
         // for a stop by the name it draws, so a box drawn under a member's name reaches nothing.
