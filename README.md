@@ -94,6 +94,10 @@ defineWorkflow({
 export async function plan(input) { /* compose the node bindings */ }
 ```
 
+An entry composes the node bindings in whatever order it likes, but the plan itself is
+reconstructed in Rust from what the run checkpointed, so a `plan` entry has to drive `context()`
+and `analyst()` — a workflow that skips either is refused rather than left with half a plan.
+
 A workflow is an ES module, so its entries are the functions it **exports** — a `plan` or `run`
 declared without `export` is module-scoped and the run fails saying so. That is also what lets a
 workflow `import` shared stage definitions instead of restating them; imports resolve only from

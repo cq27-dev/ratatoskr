@@ -497,6 +497,25 @@ fn infer_status(
     }
 }
 
+/// Say what a `plan` entry left undone, rather than asking whether the run converged.
+///
+/// A `plan` entry composes freely, but the plan itself is reconstructed in Rust from what the run
+/// checkpointed — so `context()` and `analyst()` are a requirement of the entry, not a suggestion.
+/// A workflow that composed something else got "not a converged run?" about a command with no
+/// converge loop, naming neither itself nor the calls it skipped.
+fn plan_entry_omitted(workflow: &str, error: PlanError) -> PlanError {
+    match error {
+        PlanError::MissingCheckpoint(_, node @ ("scout" | "memory" | "analyst")) => {
+            PlanError::Configuration(format!(
+                "workflow `{workflow}` returned from its `plan` entry with no `{node}` \
+                 checkpoint. A `plan` entry must drive `context()` and `analyst()`: the plan is \
+                 reconstructed from the checkpoints those two write, and nothing else composes it."
+            ))
+        }
+        other => other,
+    }
+}
+
 async fn reconstruct_plan(store: &Store, run_id: &str) -> Result<PlanOutcome, PlanError> {
     // A run may have gathered context either way: one `context` checkpoint, or the separate
     // `scout` and `memory` ones a script composing the older bindings still writes. Preferring the
@@ -2376,7 +2395,9 @@ async fn run_plan_scripted_with_turn(
         .await;
 
     let outcome = match result {
-        Ok(_) => reconstruct_plan(&ctx.store, &ctx.run_id).await,
+        Ok(_) => reconstruct_plan(&ctx.store, &ctx.run_id)
+            .await
+            .map_err(|error| plan_entry_omitted(runtime.meta().name.as_str(), error)),
         Err(e) => Err(PlanError::node(
             "workflow",
             NodeError::Failed(e.to_string()),
@@ -3528,9 +3549,23 @@ mod tests {
                 Ok(_) => panic!("a plan without required checkpoints must fail"),
                 Err(error) => error,
             };
+        // Named, and actionable: a `plan` entry that composes freely still has to drive the two
+        // calls the plan is reconstructed from, and nothing else documents that.
+        let error = error.to_string();
+        for expected in [
+            "incomplete-standard-plan",
+            "`scout`",
+            "context()",
+            "analyst()",
+        ] {
+            assert!(
+                error.contains(expected),
+                "the refusal never mentions {expected}: {error}"
+            );
+        }
         assert!(
-            matches!(error, PlanError::MissingCheckpoint(_, "scout")),
-            "missing context evidence must fail reconstruction: {error}"
+            !error.contains("converged"),
+            "`plan` has no converge loop to ask about: {error}"
         );
         assert_eq!(
             store
