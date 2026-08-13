@@ -237,8 +237,10 @@ pub fn validate(
 ///   run folds into another's record as evidence never checkpoints under its own name at all, so
 ///   `implementer_attempt` and `redteam_author` are boxes nothing could fill.
 /// - an identity **the run itself checkpoints under** while the model turn for that work also runs
-///   under it: `context`, `implementer`, `red_team`, `memory`. This is why the standard layout's
-///   `context` column is legal though no stage is called `context`.
+///   under it: [`policy::RUN_CHECKPOINT_IDENTITIES`]. This is why the standard layout's `context`
+///   column is legal though no stage is called `context`. Being reserved is not enough — `memory`
+///   is a checkpoint identity the run reads back and no workflow may declare, yet nothing records
+///   under it any more, so a column naming it would stay empty for the whole run.
 ///
 /// What is refused is a stage whose governance identity differs from its id and is not one of those:
 /// its events land in one box and its checkpoint in another, and no single name draws it. Separating
@@ -264,7 +266,7 @@ pub fn validate_layout(
     stages: &[Stage],
     workflow: &str,
 ) -> Result<(), PlanError> {
-    let mut known: BTreeSet<&str> = policy::checkpoint_identities().collect();
+    let mut known: BTreeSet<&str> = policy::RUN_CHECKPOINT_IDENTITIES.iter().copied().collect();
     for stage in stages {
         if stage.governance_id() == stage.id && !policy::folded_as_evidence(&stage.id) {
             known.insert(stage.id.as_str());
@@ -804,11 +806,26 @@ mod tests {
         // No stage is called any of these; the run writes them itself and the model turn behind
         // each one is recorded under the same name, so a column names the whole node.
         let stages = [crate::stage::stage_fixture("analyst", "reason")];
-        for identity in ["context", "implementer", "red_team", "memory"] {
+        for identity in ["context", "implementer", "red_team"] {
             assert!(
                 validate_layout(&column(identity), &stages, "ours").is_ok(),
                 "`{identity}` is a name a run records under"
             );
         }
+    }
+
+    #[test]
+    fn a_reserved_identity_nothing_records_under_is_not_drawable() {
+        // `memory` is a lifecycle checkpoint identity — `reconstruct_plan` reads one back for a run
+        // recorded before the merged `context` checkpoint existed — so no workflow may declare a
+        // stage under it. That is not the same as being drawable: nothing a run does writes a
+        // `memory` checkpoint now, so a column naming it is a box that stays empty for the whole
+        // run, which is the case this check exists to refuse.
+        let stages = [crate::stage::stage_fixture("analyst", "reason")];
+        let error = validate_layout(&column("memory"), &stages, "ours")
+            .expect_err("a name nothing records under draws an empty box")
+            .to_string();
+        assert!(error.contains("nothing it runs records under"), "{error}");
+        assert!(error.contains("memory"), "{error}");
     }
 }

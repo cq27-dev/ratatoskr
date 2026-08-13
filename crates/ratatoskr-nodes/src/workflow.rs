@@ -3841,6 +3841,18 @@ mod tests {
                 "verifier",
             ]
         );
+        // The bolt for `RUN_CHECKPOINT_IDENTITIES`: those names are drawable in a layout with no
+        // stage of that name behind them, on the strength of the run recording under them. One that
+        // a full run never writes would pass startup and draw a permanently empty box.
+        for identity in crate::policy::RUN_CHECKPOINT_IDENTITIES {
+            assert!(
+                checkpoints
+                    .iter()
+                    .any(|checkpoint| checkpoint.node_name == *identity),
+                "`{identity}` is drawable as a run's own record, but a full run recorded nothing \
+                 under it"
+            );
+        }
         let revision: analyst::AnalystInput = serde_json::from_str(
             checkpoints[6]
                 .input_json
