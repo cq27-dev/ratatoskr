@@ -671,16 +671,53 @@ async fn note<T: serde::Serialize>(
 /// row accounts for — a node whose model turn ran under one name and was checkpointed under
 /// another, or a turn whose checkpoint never happened. Nothing else would say: a dropped number
 /// reads exactly like a node that never called a model (#262).
+/// Stage identities whose model turn no checkpoint claims, with the reason each is allowed to.
+///
+/// A turn is claimed by the checkpoint written under the same name in the same claim scope
+/// (`crate::record` -> `RunLedger::take`), and `execute_after_guard` writes one when the invocation
+/// checkpoints OR the stage belongs to another node. A stage that is folded into someone else's
+/// record as evidence AND is a node of its own therefore has nothing to claim its turn, and its
+/// cost lands in the bin — invisible, because a dropped number reads exactly like a node that never
+/// called a model.
+///
+/// Written out and bolted both ways by `nothing_records_under_a_name_nobody_claims`: a stage that
+/// acquires the property without being listed fails, and a listed name that no longer has it fails.
+/// The second direction is the one that matters when a fix lands — the list shrinks and the case
+/// says so.
+///
+/// The other shape this admits is a delegation target: the executor invokes one at the evidence
+/// disposition, so a target that is its own node is unclaimed for the same reason (#283). The
+/// bundled registry declares no delegation, so nothing is listed for it here; the rule below covers
+/// one the moment it appears.
+pub(crate) const UNCLAIMED_BY_DESIGN: &[(&str, &str)] = &[(
+    "characterizer",
+    "folded into another stage's record as evidence and declares no node, because which node ran \
+     it depends on the invocation (#244)",
+)];
+
 fn warn_about_unclaimed_turns(ctx: &WorkflowContext) {
-    let unclaimed = ctx.ledger.unclaimed();
+    // The by-design residents are filtered out rather than reported, so what is left is always
+    // something to act on. A warning an operator learns to expect is a warning nobody reads, and
+    // `nothing_records_under_a_name_nobody_claims` is what keeps the filter from hiding a real one.
+    let unclaimed: Vec<String> = ctx
+        .ledger
+        .unclaimed()
+        .into_iter()
+        .filter(|name| {
+            !UNCLAIMED_BY_DESIGN
+                .iter()
+                .any(|(known, _)| known == &name.as_str())
+        })
+        .collect();
     if unclaimed.is_empty() {
         return;
     }
     tracing::warn!(
         nodes = %unclaimed.join(", "),
         "these model turns cost the run and reached no checkpoint, so nothing reports what they \
-         spent; a node checkpointed under a different name than its turn ran under is the usual \
-         cause"
+         spent; a stage whose output is folded into another stage's record as evidence, while \
+         being a node of its own, is the usual cause — see UNCLAIMED_BY_DESIGN for the ones that \
+         are meant to be here"
     );
 }
 
@@ -3462,6 +3499,18 @@ mod tests {
                         .as_ref()
                         .map(|ledger| Arc::as_ptr(ledger) as usize),
                 });
+            // What the live turn does at the end of a model call, and the reason a claim has
+            // anything to take: a turn is recorded under the name it RAN as, and claimed by the
+            // checkpoint written under that same name in the same scope.
+            if let Some(ledger) = run.ledger.as_ref() {
+                ledger.record(
+                    run.node,
+                    ratatoskr_core::NodeTelemetry {
+                        model: Some(run.route.model.clone()),
+                        ..Default::default()
+                    },
+                );
+            }
             let output = self
                 .outputs
                 .lock()
@@ -4674,6 +4723,210 @@ mod tests {
 
     /// The other half of the split: a stage that DOES belong to a node still answers the operator
     /// at that node's address, because the box is what the graph draws and what they can click.
+    #[tokio::test]
+    async fn the_by_design_unclaimed_names_are_the_ones_a_run_actually_leaves() {
+        // The other direction of the guard, and the one that makes the list shrink visibly when a
+        // fix lands: a name is listed only if a real invocation really does leave it unclaimed.
+        //
+        // Behavioural, because there is nothing static to predict from. Whether a turn is claimed
+        // depends on the DISPOSITION its caller chose — `execute_after_guard` writes a checkpoint
+        // when the invocation checkpoints or the stage belongs to another node — and disposition is
+        // a property of the call site, not of the registry. `characterizer` is the proof: it is an
+        // ordinary workflow host that checkpoints when a workflow calls it, and `testrun.rs`
+        // invokes the same stage as evidence, where nothing claims it.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-unclaimed-listed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config
+            .models
+            .insert("characterizer".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-unclaimed-listed",
+            "characterize",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let turn = Arc::new(SequencedStageTurn::new([json!({
+            "checks": [],
+            "total": 0
+        })]));
+        let _ = evaluate_standard_stage_with_turn(
+            Arc::clone(&ctx),
+            "characterizer",
+            json!({ "outcomes": [] }).to_string(),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await;
+
+        assert_eq!(
+            ctx.ledger.unclaimed(),
+            ["characterizer"],
+            "the evidence invocation leaves its turn for nobody, which is why it is listed"
+        );
+        for name in ctx.ledger.unclaimed() {
+            assert!(
+                UNCLAIMED_BY_DESIGN
+                    .iter()
+                    .any(|(known, reason)| *known == name && reason.len() > 20),
+                "`{name}` goes unclaimed and is not listed with a reason"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_real_run_leaves_no_turn_unclaimed() {
+        // The same invariant against a run rather than the registry, on the path that drives real
+        // operation hosts. `SequencedStageTurn` records into the ledger exactly as the live turn
+        // does, so what the executor claims — and what it leaves behind — is the real arithmetic.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-unclaimed-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("context".to_string(), model_route());
+        config.models.insert("analyst".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-unclaimed-guard",
+            "leave nothing in the bin",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let turn = Arc::new(SequencedStageTurn::new([
+            json!({
+                "brief": "b",
+                "constraints": [],
+                "prior_art": [],
+                "papertrail_summary": "p"
+            }),
+            json!({ "impact_summary": "i", "changes_code": false }),
+        ]));
+        run_plan_scripted_with_turn(
+            standard_runtime().await.unwrap(),
+            Arc::clone(&ctx),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            turn.runs
+                .lock()
+                .expect("sequenced runner mutex poisoned")
+                .len(),
+            2,
+            "both turns ran, so there was something to claim"
+        );
+        assert!(
+            ctx.ledger.unclaimed().is_empty(),
+            "a run left turns nobody claimed: {:?}",
+            ctx.ledger.unclaimed()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn every_standard_stage_is_controlled_at_the_address_its_run_draws() {
+        // The guard, not a case. A Stop is written under the name the dashboard offers — the box a
+        // run RECORDS for that stage — and the stage's turn has to be polled under that same name
+        // or the button reaches nothing. Both halves are read from the real thing here: the address
+        // comes from the recorded shape (`Registry::node_of`), which is what `serve` ships and what
+        // the pause ledger keys, and the identity the turn is given comes from running the stage
+        // through the executor. A member stage added tomorrow is covered without anyone
+        // remembering, because the registry is what this iterates.
+        //
+        // The other half of the chain — that a turn given an identity actually polls under it — is
+        // `ratatoskr-agent`'s `a_member_stage_is_polled_for_control_under_the_box_an_operator_addresses`,
+        // which drives the real hook. Two independent statements: this one cannot restate the
+        // executor's own expression, and that one cannot be satisfied by a field being set.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-control-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-control-guard", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let runtime = standard_runtime().await.unwrap();
+        let stages = standard_stages().await.unwrap();
+        let registry = crate::stage::shape_from_workflow(runtime.meta(), &stages);
+        let registry = registry.index();
+
+        // A route per governance identity, so no stage is turned away before its turn is built.
+        let mut config = RatatoskrConfig::default();
+        for stage in &stages {
+            config
+                .models
+                .insert(stage.governance_id().to_string(), model_route());
+        }
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-control-guard",
+            "stop anything",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let turn = Arc::new(RecordingStageTurn::default());
+        let executor = StageExecutor::new(
+            ctx,
+            Arc::new(stages.clone()),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        );
+
+        for stage in &stages {
+            // The result is not the subject: a stage's output gate may reject this generic answer,
+            // and the identity it was to be controlled under was decided before the turn ran.
+            let _ = executor
+                .execute(StageInvocation {
+                    stage: stage.clone(),
+                    input_json: "{}".to_string(),
+                    rendered_question: Some("anything".to_string()),
+                    resource_root: None,
+                    capability_ceiling: ratatoskr_core::Capability::Read,
+                    rag_rat_worktree: None,
+                    shell: None,
+                    publish: None,
+                    clarifier: None,
+                    invocation_guidance: None,
+                    output: StageOutput::Evidence,
+                })
+                .await;
+            let control = turn
+                .controls
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .last()
+                .cloned()
+                .unwrap_or_else(|| panic!("`{}` never reached its turn", stage.id));
+            assert_eq!(
+                control.as_deref(),
+                Some(registry.node_of(&stage.id)),
+                "`{}` is controlled under a name the run does not draw a box for",
+                stage.id
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn a_member_stage_is_controlled_at_its_nodes_address() {
         let dir =
