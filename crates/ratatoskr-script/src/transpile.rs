@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use swc_core::common::sync::Lrc;
 use swc_core::common::{FileName, GLOBALS, Mark, SourceMap, Span, Spanned};
 use swc_core::ecma::ast::{
-    CallExpr, Callee, ExportAll, Expr, ImportDecl, Lit, NamedExport, Program, Stmt, Str,
+    CallExpr, Callee, ExportAll, Expr, Ident, ImportDecl, Lit, NamedExport, Program, Stmt, Str,
 };
 use swc_core::ecma::codegen::text_writer::JsWriter;
 use swc_core::ecma::codegen::{Config as CodegenConfig, Emitter};
@@ -50,8 +50,7 @@ pub(crate) const MAX_SCRIPT_BYTES: u64 = 256 * 1024;
 /// debug build on a 2 MiB thread stack; depth 100 does not.
 ///
 /// 64 sits under that and far above real code — the deepest file in this repository, prose
-/// included, nests 19. The scan is deliberately dumb, counting brackets inside strings and comments
-/// too, which a limit several times above honest sources can afford.
+/// included, nests 19.
 const MAX_NESTING_DEPTH: usize = 64;
 
 /// Read repository TypeScript, refusing a file past [`MAX_SCRIPT_BYTES`] before reading it.
@@ -69,30 +68,228 @@ pub(crate) fn read_script_source(path: &Path) -> Result<String, ScriptError> {
     std::fs::read_to_string(path).map_err(|error| ScriptError::Io(display, error))
 }
 
+/// Whether the scan is reading code or the text of a template literal.
+#[derive(Clone, Copy)]
+enum Lexical {
+    Code,
+    TemplateText,
+}
+
+/// Words after which a `/` opens a regular expression rather than dividing.
+const REGEX_MAY_FOLLOW: &[&str] = &[
+    "return",
+    "typeof",
+    "instanceof",
+    "in",
+    "of",
+    "new",
+    "delete",
+    "void",
+    "throw",
+    "case",
+    "do",
+    "else",
+    "yield",
+    "await",
+];
+
 /// Refuse a source whose brackets nest past [`MAX_NESTING_DEPTH`], naming where it happened.
+///
+/// Counts the brackets that are *code*, skipping strings, template literal text, comments and
+/// regular expressions — prose is where brackets go unbalanced, and a comment weighing sixty-five
+/// options in parentheses is a file this must load, not one it must refuse. A template's `${…}` is
+/// code again and counts, because the parser recurses into it like any other brace.
+///
+/// Hand-rolled rather than driven by swc's `Lexer`, which cannot resolve `/` on its own:
+/// `Tokens::set_expr_allowed` and `set_next_regexp` are how the *parser* tells that lexer whether a
+/// regex or a division follows, and there is no parser here — parsing is what this runs before, and
+/// what it exists to keep off a source too deep to survive it. The rule used instead is the
+/// previous significant token, and where it is unsure it reads `/` as division: counting a regex's
+/// brackets costs nothing against a limit this far above honest code, while skipping a division
+/// would run the scan to the next `/` in the file and swallow whatever nests after it.
 fn check_nesting(file_name: &FileName, src: &str) -> Result<(), ScriptError> {
+    let bytes = src.as_bytes();
     let (mut depth, mut line, mut line_start) = (0usize, 1usize, 0usize);
-    for (offset, character) in src.char_indices() {
-        match character {
-            '\n' => {
-                line += 1;
-                line_start = offset + 1;
-            }
-            '(' | '[' | '{' => {
-                depth += 1;
-                if depth > MAX_NESTING_DEPTH {
-                    return Err(ScriptError::Transpile(format!(
-                        "{file_name}:{line}:{}: nesting limit is {MAX_NESTING_DEPTH} brackets, and \
-                         parsing deeper than that overflows the stack",
-                        offset - line_start + 1,
-                    )));
+    // What to return to when the construct being read ends: a template's text when an
+    // interpolation closes, code when a template literal does.
+    let mut enclosing: Vec<Lexical> = Vec::new();
+    // The bracket depth each open `${` reached, so its `}` is told from a block's.
+    let mut interpolations: Vec<usize> = Vec::new();
+    let mut reading = Lexical::Code;
+    // Whether a `/` here would divide. False at the start of a source, where a regex may open.
+    let mut divides = false;
+    let mut at = 0usize;
+
+    while at < bytes.len() {
+        let from = at;
+        let byte = bytes[at];
+        match reading {
+            Lexical::TemplateText => match byte {
+                b'\\' => at += 2,
+                b'`' => {
+                    reading = enclosing.pop().unwrap_or(Lexical::Code);
+                    divides = true;
+                    at += 1;
                 }
+                b'$' if bytes.get(at + 1) == Some(&b'{') => {
+                    depth += 1;
+                    too_deep(file_name, depth, line, at - line_start + 1)?;
+                    interpolations.push(depth);
+                    enclosing.push(Lexical::TemplateText);
+                    reading = Lexical::Code;
+                    divides = false;
+                    at += 2;
+                }
+                _ => at += 1,
+            },
+            Lexical::Code => match byte {
+                b'/' if bytes.get(at + 1) == Some(&b'/') => at = to_line_end(bytes, at + 2),
+                b'/' if bytes.get(at + 1) == Some(&b'*') => at = past_block_comment(bytes, at + 2),
+                b'/' if !divides => {
+                    at = past_regex(bytes, at + 1);
+                    divides = true;
+                }
+                b'\'' | b'"' => {
+                    at = past_string(bytes, at + 1, byte);
+                    divides = true;
+                }
+                b'`' => {
+                    enclosing.push(Lexical::Code);
+                    reading = Lexical::TemplateText;
+                    at += 1;
+                }
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                    too_deep(file_name, depth, line, at - line_start + 1)?;
+                    divides = false;
+                    at += 1;
+                }
+                b')' | b']' => {
+                    depth = depth.saturating_sub(1);
+                    divides = true;
+                    at += 1;
+                }
+                b'}' => {
+                    if interpolations.last() == Some(&depth) {
+                        interpolations.pop();
+                        reading = enclosing.pop().unwrap_or(Lexical::Code);
+                    }
+                    depth = depth.saturating_sub(1);
+                    divides = true;
+                    at += 1;
+                }
+                // `a++ / b` divides; every other operator leaves a regex able to open.
+                b'+' | b'-' if bytes.get(at + 1) == Some(&byte) => {
+                    divides = true;
+                    at += 2;
+                }
+                _ if is_word_byte(byte) => {
+                    let end = past_word(bytes, at);
+                    divides = !REGEX_MAY_FOLLOW.contains(&&src[at..end]);
+                    at = end;
+                }
+                _ if byte.is_ascii_whitespace() => at += 1,
+                _ => {
+                    divides = false;
+                    at += 1;
+                }
+            },
+        }
+        at = at.min(bytes.len());
+        for (offset, byte) in bytes[from..at].iter().enumerate() {
+            if *byte == b'\n' {
+                line += 1;
+                line_start = from + offset + 1;
             }
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            _ => {}
         }
     }
     Ok(())
+}
+
+fn too_deep(
+    file_name: &FileName,
+    depth: usize,
+    line: usize,
+    column: usize,
+) -> Result<(), ScriptError> {
+    if depth <= MAX_NESTING_DEPTH {
+        return Ok(());
+    }
+    Err(ScriptError::Transpile(format!(
+        "{file_name}:{line}:{column}: nesting limit is {MAX_NESTING_DEPTH} brackets, and parsing \
+         deeper than that overflows the stack"
+    )))
+}
+
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte >= 0x80
+}
+
+fn past_word(bytes: &[u8], from: usize) -> usize {
+    let mut at = from;
+    while at < bytes.len() && is_word_byte(bytes[at]) {
+        at += 1;
+    }
+    at
+}
+
+fn to_line_end(bytes: &[u8], from: usize) -> usize {
+    let mut at = from;
+    while at < bytes.len() && bytes[at] != b'\n' {
+        at += 1;
+    }
+    at
+}
+
+fn past_block_comment(bytes: &[u8], from: usize) -> usize {
+    let mut at = from;
+    while at + 1 < bytes.len() {
+        if bytes[at] == b'*' && bytes[at + 1] == b'/' {
+            return at + 2;
+        }
+        at += 1;
+    }
+    bytes.len()
+}
+
+/// Past the closing quote, or back to `from` if the literal does not close on its line — an
+/// unterminated quote is a source that will not parse, and reading the rest of the file as its
+/// contents would hide whatever nests there.
+fn past_string(bytes: &[u8], from: usize, quote: u8) -> usize {
+    let mut at = from;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'\n' => return from,
+            byte if byte == quote => return at + 1,
+            _ => at += 1,
+        }
+    }
+    from
+}
+
+/// Past the closing `/`, or back to `from` if it does not close on its line. `[…]` is a character
+/// class, where a `/` is literal.
+fn past_regex(bytes: &[u8], from: usize) -> usize {
+    let mut at = from;
+    let mut in_class = false;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'\n' => return from,
+            b'[' => {
+                in_class = true;
+                at += 1;
+            }
+            b']' => {
+                in_class = false;
+                at += 1;
+            }
+            b'/' if !in_class => return at + 1,
+            _ => at += 1,
+        }
+    }
+    from
 }
 
 pub(crate) struct WorkflowSource {
@@ -365,6 +562,50 @@ fn transpile(
 /// privileged hosts live — so the shape of the string is the whole gate, and it is checked here,
 /// in Rust, before any engine sees it. The two candidates are the two spellings the runtime tries:
 /// object-method shorthand only becomes an expression once it is given the `function` prefix.
+/// What a source is, judged from the program the parser builds rather than from its characters.
+pub(crate) struct Shape {
+    /// It has ES module syntax. `parse_program` returns a module exactly when `import`/`export` is
+    /// present, which is the same question asked of the same grammar the engine will use.
+    pub is_module: bool,
+    /// It names `defineWorkflow` as code — not in a comment, a string, or its own prose.
+    pub names_define_workflow: bool,
+}
+
+/// Parse `src` far enough to say what shape it is.
+///
+/// `None` when it does not parse or nests too deep to parse safely: the caller is diagnosing what a
+/// file is, and a source that will not load at all is better reported by the transpile behind this,
+/// which says what is wrong with it rather than what it might have been.
+pub(crate) fn shape(src: &str) -> Option<Shape> {
+    check_nesting(&FileName::Anon, src).ok()?;
+    let cm: Lrc<SourceMap> = Default::default();
+    let fm = cm.new_source_file(Lrc::new(FileName::Anon), src.to_string());
+    let mut parser = Parser::new_from(Lexer::new(
+        Syntax::Typescript(TsSyntax::default()),
+        Default::default(),
+        StringInput::from(&*fm),
+        None,
+    ));
+    let program = parser.parse_program().ok()?;
+    if !parser.take_errors().is_empty() {
+        return None;
+    }
+    let mut named = NamesDefineWorkflow(false);
+    program.visit_with(&mut named);
+    Some(Shape {
+        is_module: matches!(program, Program::Module(_)),
+        names_define_workflow: named.0,
+    })
+}
+
+struct NamesDefineWorkflow(bool);
+
+impl Visit for NamesDefineWorkflow {
+    fn visit_ident(&mut self, ident: &Ident) {
+        self.0 |= &*ident.sym == "defineWorkflow";
+    }
+}
+
 pub(crate) fn is_function_expression(source: &str) -> bool {
     lone_function_expression(&format!("({source})"))
         || lone_function_expression(&format!("(function {source})"))
@@ -688,6 +929,60 @@ mod tests {
             .to_string();
         // Positioned at the bracket that crossed the limit, like every other refusal here.
         assert!(error.starts_with("transpile error: w:1:"), "{error}");
+        assert!(
+            error.contains(&format!("nesting limit is {MAX_NESTING_DEPTH}")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn nesting_counts_brackets_that_are_code_and_not_brackets_in_prose() {
+        // Prose is where brackets go unbalanced. Each of these opens far past the limit and closes
+        // nothing, and none of it is a bracket the parser will ever recurse into.
+        let opens = "(".repeat(MAX_NESTING_DEPTH + 1);
+        let source = format!(
+            "/* {opens} a block comment weighing the options */\n\
+             // {opens} a line comment doing the same\n\
+             const prose = \"{opens} in a string\";\n\
+             const more = 'and {opens} in the other quote';\n\
+             const templated = `a template {opens} holding text`;\n\
+             const pattern = /{opens}/;\n\
+             export const x = 1;\n"
+        );
+        transpile_with_includes("w", &source, &[], &[]).unwrap();
+    }
+
+    #[test]
+    fn a_division_before_deep_nesting_does_not_hide_it() {
+        // `/` is a regex only where one can start. Reading the division here as a regex would run
+        // the scan to the next `/` in the file and swallow the nesting after it — the failure mode
+        // that makes skipping the wrong thing worse than counting too much.
+        let source = format!(
+            "const half = (1 + 2) / 3;\nconst deep = {}1{};\n",
+            "(".repeat(MAX_NESTING_DEPTH + 1),
+            ")".repeat(MAX_NESTING_DEPTH + 1)
+        );
+        let error = transpile_with_includes("w", &source, &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("nesting limit is {MAX_NESTING_DEPTH}")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_template_interpolation_is_code_and_its_brackets_count() {
+        // `${` opens a brace like any other: the expression inside it is code the parser recurses
+        // into, so leaving template text must not mean leaving the count.
+        let source = format!(
+            "const x = `text ${{{}1{}}} more`;\n",
+            "(".repeat(MAX_NESTING_DEPTH),
+            ")".repeat(MAX_NESTING_DEPTH)
+        );
+        let error = transpile_with_includes("w", &source, &[], &[])
+            .unwrap_err()
+            .to_string();
         assert!(
             error.contains(&format!("nesting limit is {MAX_NESTING_DEPTH}")),
             "{error}"

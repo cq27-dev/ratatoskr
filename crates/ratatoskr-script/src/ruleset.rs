@@ -195,18 +195,17 @@ pub struct ScriptEngine {
 /// ordinary mistake — and the engine's answer to it was a token error at a generated-JavaScript
 /// position, naming no file. These two shapes are the whole difference and neither survives a plain
 /// script eval, so seeing either is a diagnosis rather than a guess.
+/// Both are read off the parsed program, so a rules file that only *writes* about workflows — a
+/// comment naming `defineWorkflow`, a block comment whose line begins `export ` — is still a
+/// ruleset. The diagnosis is about what a file is, and refusing one for its prose leaves an author
+/// with nowhere to say what their rules govern.
 fn workflow_shape(src: &str) -> Option<&'static str> {
-    if src.contains("defineWorkflow") {
+    let shape = crate::transpile::shape(src)?;
+    if shape.names_define_workflow {
         return Some("calls `defineWorkflow`");
     }
-    src.lines()
-        .map(str::trim_start)
-        .any(|line| {
-            line.starts_with("import ")
-                || line.starts_with("import{")
-                || line.starts_with("import*")
-                || line.starts_with("export ")
-        })
+    shape
+        .is_module
         .then_some("uses ES module `import`/`export`")
 }
 
@@ -548,6 +547,32 @@ mod tests {
             .to_string();
         assert!(broken.contains("d-broken.ts"), "{broken}");
         assert!(!broken.contains("eval_script"), "{broken}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_ruleset_that_only_writes_about_workflows_is_not_mistaken_for_one() {
+        // The diagnosis is about what a file *is*, and a comment naming `defineWorkflow` or a
+        // block comment whose line happens to begin `export ` is a file writing about workflows,
+        // not a workflow. Refusing it strands a ruleset with no way to say what it means.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-rules-prose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("scout.ts"),
+            "// Mirrors the stage this repository's workflow declares with defineWorkflow.\n\
+             /*\n\
+             export const scout = { ... } is what the workflow spells; this only governs it.\n\
+             */\n\
+             const note = \"defineWorkflow lives in .ratatoskr/workflows/\";\n\
+             defineAgent(\"scout\", { maxTurns: 2, note });\n",
+        )
+        .unwrap();
+        let engine = ScriptEngine::load(&dir)
+            .await
+            .expect("a ruleset that writes about workflows is still a ruleset");
+        assert!(engine.ruleset("scout").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
