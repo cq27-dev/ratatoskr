@@ -103,7 +103,8 @@ impl Stage {
     }
 
     /// The attempt-continuation policy for this stage. An omitted declaration preserves the
-    /// selected route, which keeps legacy `[models.<stage>]` configuration authoritative.
+    /// selected route: a repository's `[models.<stage>]` setting decides unless the stage
+    /// declaration overrides it, so configuration is never silently outvoted by a default.
     pub fn session_scope(&self, route_default: SessionScope) -> SessionScope {
         self.session.unwrap_or(route_default)
     }
@@ -142,8 +143,9 @@ pub struct Delegation {
     pub input_limit: usize,
 }
 
-/// The built-in reusable profiles. Routes remain stage-keyed until a repository opts into profiles,
-/// which keeps `[models.<stage>]` and rulesets backwards compatible.
+/// The built-in reusable profiles. Routes stay stage-keyed unless a repository opts into profiles:
+/// `[models.<stage>]` and `.ratatoskr/rules/<stage>.ts` are the documented way to route one node,
+/// and a profile is the way to route several at once — not a replacement for either.
 pub fn built_in_agents() -> Vec<AgentProfile> {
     vec![
         AgentProfile {

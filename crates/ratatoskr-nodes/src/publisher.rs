@@ -35,8 +35,9 @@ pub struct PublisherOutput {
     pub action: PublisherAction,
     /// The one pull request URL, if a pull request was opened.
     ///
-    /// Never combine this with an issue-comment URL or a label such as `PR:`. Its absence is an
-    /// empty string so old checkpoints remain readable.
+    /// Never combine this with an issue-comment URL or a label such as `PR:`. It defaults to the
+    /// empty string rather than being required, because a run that opened no pull request has
+    /// none to report.
     #[serde(default)]
     pub pull_request_url: String,
     /// The one issue-comment URL, if a comment was posted.

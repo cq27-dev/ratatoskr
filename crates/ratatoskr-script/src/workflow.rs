@@ -2644,12 +2644,12 @@ export async function plan(i) { return { entryRan: true }; }
         // `defineWorkflow` is optional: a workflow that only exports entries is still discoverable.
         let dir = scratch("undeclared");
         std::fs::write(
-            dir.join("legacy.ts"),
+            dir.join("undeclared.ts"),
             "export async function plan(i) { return i; }",
         )
         .unwrap();
         let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
-        assert_eq!(found[0].meta().name, "legacy");
+        assert_eq!(found[0].meta().name, "undeclared");
         assert!(found[0].meta().purpose.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

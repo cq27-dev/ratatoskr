@@ -1430,7 +1430,8 @@ async fn replan_at_ceiling_with<R: CeilingRecovery>(
     }
 
     // Consume the recovery before either model turn. A failed best-effort analyst re-plan stops at
-    // the wall just like the legacy loop; it never earns a retry of the extra budget.
+    // the wall exactly as a run without this recovery does; it never earns a retry of the extra
+    // budget.
     if ctx.ceiling_replan_started.swap(true, Ordering::SeqCst) {
         return Ok("null".to_string());
     }
@@ -5622,7 +5623,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standard_typescript_renderers_preserve_the_legacy_text_contract() {
+    async fn standard_typescript_renderers_produce_the_exact_prompt_text() {
         let cases = vec![
             RendererParityCase {
                 stage: "overseer",
