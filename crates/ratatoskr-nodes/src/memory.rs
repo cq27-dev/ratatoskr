@@ -2,23 +2,15 @@
 //! repo memories relevant to the issue. This is the "graph enforces policy, LLM fills content
 //! only where it's needed" principle made concrete — retrieval + ranking live in rag-rat.
 
-use ratatoskr_core::RunState;
-use ratatoskr_graph::{Node, NodeError, parse_validated};
+use ratatoskr_graph::{NodeError, parse_validated};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::ServerSink;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Cap on the query text sent to `memory_search` (issue + scout context can be long).
+/// Cap on the query text sent to `memory_search` (issue + gathered context can be long).
 const MAX_QUERY_CHARS: usize = 2000;
 const MEMORY_LIMIT: u32 = 10;
-
-/// Input to the memory node: the issue plus scout's papertrail summary, used as the search query.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct MemoryInput {
-    pub issue: String,
-    pub context: String,
-}
 
 /// One repo memory rag-rat's ranking returned. A lenient subset of rag-rat's `RepoMemory` — extra
 /// fields (bindings, tags, ...) are allowed and ignored.
@@ -37,44 +29,16 @@ pub struct MemoryRecord {
     pub summary: Option<String>,
 }
 
-/// Memory node output: the ranked memories.
+/// What the retrieval returns: the ranked memories.
 #[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MemoryOutput {
     pub memories: Vec<MemoryRecord>,
 }
 
-/// The memory node: a direct rag-rat `memory_search`, no agent.
-pub struct MemoryNode {
-    /// `None` without rag-rat, where there is no index to search and the answer is simply empty.
-    pub sink: Option<ServerSink>,
-}
-
-impl Node for MemoryNode {
-    type Input = MemoryInput;
-    type Output = MemoryOutput;
-
-    fn name(&self) -> &'static str {
-        "memory"
-    }
-
-    async fn run(
-        &self,
-        input: MemoryInput,
-        _run_state: &RunState,
-    ) -> Result<MemoryOutput, NodeError> {
-        match &self.sink {
-            Some(sink) => search(sink, &input.issue, &input.context).await,
-            // Not an error: a repository with no memory index has no memories, which is a fact
-            // about it rather than a failure to retrieve them.
-            None => Ok(MemoryOutput::default()),
-        }
-    }
-}
-
 /// Run rag-rat's ranked `memory_search` for `issue` (plus any `context` narrowing it).
 ///
-/// Extracted from the node so the context node runs the identical retrieval: the guarantee that
-/// matters is that the same deterministic search happens, not which node called it.
+/// A free function rather than a node: what matters is that the same deterministic search happens
+/// wherever memories are gathered, not which caller ran it.
 pub async fn search(
     sink: &ServerSink,
     issue: &str,

@@ -917,7 +917,7 @@ impl Default for RatatoskrConfig {
             endpoint: EndpointConfig::default(),
             rag_rat: RagRatConfig {
                 // `--json` makes rag-rat emit JSON (not its default TOON), so nodes that parse
-                // tool results directly (MemoryNode) get a stable shape.
+                // tool results directly (the memory retrieval) get a stable shape.
                 command: ["npx", "-y", "@rag-rat/bin", "mcp", "--json"]
                     .map(str::to_string)
                     .to_vec(),

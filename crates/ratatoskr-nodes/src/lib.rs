@@ -37,7 +37,7 @@ pub use bookkeeper::{BookkeeperInput, BookkeeperOutput, MemoryWritten};
 pub use child::ChildTask;
 pub use context::{Constraint, ContextOutput};
 pub use implementer::{ImplementerNode, ImplementerOutput};
-pub use memory::{MemoryNode, MemoryOutput, MemoryRecord};
+pub use memory::{MemoryOutput, MemoryRecord};
 pub use overseer::OverseerOutput;
 pub use publisher::PublisherOutput;
 pub use redteam::{RedTeamNode, RedTeamOutput};
