@@ -394,10 +394,13 @@ export const getNodeCheckpoints = (
 
 /** Mirrors `pipeline::PlannedNode` — a node's configured route, known before it runs. */
 export interface PlannedNode {
+  /** Every distinct route the node's stages resolve, comma-joined — as `NodeTelemetry.model` is. */
   model: string;
   thinking: boolean;
   reuses_session: boolean;
-  session: "fresh" | "reuse" | "compacted";
+  /** Absent when the node's stages resolve routes whose session scopes differ, since no one answer
+   *  is true of the box. Fall back to `reuses_session`, which stays answerable. */
+  session?: "fresh" | "reuse" | "compacted";
 }
 
 /** Mirrors `events::LiveNodeFacts` — what a node announced when it started. */

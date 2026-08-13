@@ -44,6 +44,15 @@ pub struct RunStage {
     pub id: String,
     /// The node this stage's work is drawn in. Its own id unless it declared otherwise.
     pub node: String,
+    /// The identity this stage's `[models.*]` route, ruleset and plugin bindings resolve under.
+    /// `None` for a stage that governs as itself, which is nearly all of them.
+    ///
+    /// Recorded because a box's route is its stages', and a box need not be one of them: the
+    /// implementer's box runs `models.implementer` through `implementer_attempt`, and a stage drawn
+    /// under its own id may still govern as something else. Reading a route under the box's own
+    /// name reports the wrong one or none at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governed_by: Option<String>,
 }
 
 /// What a run recorded about the graph it executed.
@@ -86,6 +95,16 @@ impl Recorded {
             .iter()
             .find(|known| known.id == stage)
             .map_or(stage, |known| known.node.as_str())
+    }
+
+    /// The identity `stage`'s route is configured under — the stage itself unless it said
+    /// otherwise, and the stage itself for a name no recorded registry knows.
+    pub fn governance_of<'a>(&'a self, stage: &'a str) -> &'a str {
+        self.stages
+            .iter()
+            .find(|known| known.id == stage)
+            .and_then(|known| known.governed_by.as_deref())
+            .unwrap_or(stage)
     }
 }
 

@@ -107,29 +107,84 @@ pub struct NodeView {
 /// the script engine and the servers. They arrive when the node announces itself.
 #[derive(Debug, Clone, Serialize)]
 pub struct PlannedNode {
+    /// Every distinct route the node's stages resolve, comma-joined — the same rule
+    /// `NodeTelemetry::fold` reports a folded row's models by, so what a box plans to run on and
+    /// what it reports having run on read alike.
     pub model: String,
     pub thinking: bool,
     pub reuses_session: bool,
-    pub session: ratatoskr_core::SessionScope,
+    /// Absent when the node's stages resolve routes whose session scopes differ, since no one
+    /// answer is true of the box. A reader falls back to [`Self::reuses_session`], which stays
+    /// answerable: it says whether any half carries its context across attempts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<ratatoskr_core::SessionScope>,
 }
 
 impl PlannedNode {
-    /// Read a node's route out of the config, if it has one. A node with no route never runs.
-    fn of(config: Option<&ratatoskr_core::RatatoskrConfig>, node: &str) -> Option<Self> {
-        let route = config?.models.get(node)?;
+    /// What a node would run on, read from config across the stages that do its work.
+    ///
+    /// A route is keyed by a stage's GOVERNANCE identity, which need not be the box's name and
+    /// often is not: the implementer's box runs `[models.implementer]` through
+    /// `implementer_attempt`, and a stage drawn under its own id may declare `governedBy` freely.
+    /// Reading the config under the box's own name reports the wrong route for the first and none
+    /// at all for the second, on a node execution routes perfectly well.
+    ///
+    /// A box whose stages resolve DIFFERENT routes names each of them, rather than picking one.
+    /// That can genuinely happen — a composed node's halves resolve through their own profiles
+    /// (#277) — and it is the same choice folded telemetry already makes for the same reason:
+    /// dropping the disagreement would report a route the box does not entirely have, and emptying
+    /// it would read as "this node has nowhere to run".
+    ///
+    /// `None` when no stage of the node has a route. A node with no route never runs.
+    fn of(
+        config: Option<&ratatoskr_core::RatatoskrConfig>,
+        stages: &[String],
+        recorded: &ratatoskr_core::shape::Recorded,
+    ) -> Option<Self> {
+        let config = config?;
+        let routes: Vec<&ratatoskr_core::ModelRoute> = stages
+            .iter()
+            .filter_map(|stage| config.models.get(recorded.governance_of(stage)))
+            .collect();
+        let mut models: Vec<String> = Vec::new();
+        for route in &routes {
+            let model = format!("{}/{}", route.provider, route.model);
+            if !models.contains(&model) {
+                models.push(model);
+            }
+        }
+        if models.is_empty() {
+            return None;
+        }
+        let mut sessions: Vec<ratatoskr_core::SessionScope> = Vec::new();
+        for route in &routes {
+            if !sessions.contains(&route.session) {
+                sessions.push(route.session);
+            }
+        }
         Some(PlannedNode {
-            model: format!("{}/{}", route.provider, route.model),
-            thinking: route
-                .params
-                .as_ref()
-                .and_then(|p| p.get("thinking"))
-                .and_then(|t| t.get("type"))
-                .and_then(|t| t.as_str())
-                != Some("disabled"),
-            reuses_session: matches!(route.session, ratatoskr_core::SessionScope::Reuse),
-            session: route.session,
+            model: models.join(", "),
+            thinking: routes.iter().any(|route| thinking(route)),
+            reuses_session: routes
+                .iter()
+                .any(|route| matches!(route.session, ratatoskr_core::SessionScope::Reuse)),
+            session: match sessions.as_slice() {
+                [only] => Some(*only),
+                _ => None,
+            },
         })
     }
+}
+
+/// Whether a route leaves the model free to reason. Configured, not observed.
+fn thinking(route: &ratatoskr_core::ModelRoute) -> bool {
+    route
+        .params
+        .as_ref()
+        .and_then(|p| p.get("thinking"))
+        .and_then(|t| t.get("type"))
+        .and_then(|t| t.as_str())
+        != Some("disabled")
 }
 
 /// A node's model, cost, and the two facts a reader cannot infer from either: which tools it could
@@ -332,7 +387,7 @@ pub fn derive_with(
             let stages = recorded.members(name);
             out.push(NodeView {
                 telemetry: NodeTelemetryView::totalled(checkpoints, &stages),
-                planned: PlannedNode::of(config, name),
+                planned: PlannedNode::of(config, &stages, &recorded),
                 name: name.clone(),
                 state,
                 stage: idx,
@@ -428,7 +483,7 @@ fn append_unknown(
         let stages = recorded.members(name);
         out.push(NodeView {
             telemetry: NodeTelemetryView::totalled(checkpoints, &stages),
-            planned: PlannedNode::of(config, name),
+            planned: PlannedNode::of(config, &stages, recorded),
             caller: caller_of(checkpoints, first),
             name: name.to_string(),
             state: checkpointed_state(name, terminal),
@@ -568,7 +623,9 @@ mod tests {
     }
 
     /// The registry such a run would have: every box that composes nothing is one stage of its own
-    /// name, and a composed one is its members.
+    /// name governing as itself, and a composed one is its members, each governing as the box —
+    /// which is what the three bundled composed nodes do, and why one `[models.redteam]` serves
+    /// both red-team halves.
     fn registry_of(
         columns: &[(&[&str], bool)],
         composed: &[(&str, &[&str])],
@@ -577,7 +634,7 @@ mod tests {
             .iter()
             .flat_map(|(names, _)| names.iter())
             .flat_map(|name| {
-                let members = composed
+                let members: Vec<String> = composed
                     .iter()
                     .find(|(box_name, _)| box_name == name)
                     .map_or_else(
@@ -587,6 +644,7 @@ mod tests {
                 members
                     .into_iter()
                     .map(|id| ratatoskr_core::shape::RunStage {
+                        governed_by: (id != *name).then(|| (*name).to_string()),
                         id,
                         node: (*name).to_string(),
                     })
@@ -992,9 +1050,15 @@ mod tests {
             .find(|v| v.name == "redteam")
             .and_then(|v| v.planned.as_ref())
             .expect("a routed node says what it will run on");
+        // Under `redteam`, though neither stage doing the work is called that: both halves govern
+        // as the box, which is what a `[models.redteam]` entry routes.
         assert_eq!(planned.model, "anthropic/claude-sonnet-5");
         assert!(planned.reuses_session);
-        assert_eq!(planned.session, ratatoskr_core::SessionScope::Reuse);
+        assert_eq!(
+            planned.session,
+            Some(ratatoskr_core::SessionScope::Reuse),
+            "one route, so the box's session scope is that route's"
+        );
         assert!(planned.thinking, "nothing disabled it");
 
         // A node with no route never runs, and claims nothing.
@@ -1006,6 +1070,102 @@ mod tests {
                 .planned
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_node_plans_on_the_route_its_stages_govern_under_not_the_one_its_name_would_read() {
+        // A stage is drawn under its own id and routed under its governance identity, and the two
+        // are independent. Reading the config under the box's name reports nothing for a stage that
+        // governs as something else, on a node execution routes perfectly well.
+        let recorded = ratatoskr_core::shape::Recorded {
+            nodes: vec![ratatoskr_core::shape::ShapeNode {
+                name: "strategist".to_string(),
+                stage: 0,
+                lane: 0,
+                optional: false,
+            }],
+            stages: vec![ratatoskr_core::shape::RunStage {
+                id: "strategist".to_string(),
+                node: "strategist".to_string(),
+                governed_by: Some("analyst".to_string()),
+            }],
+        };
+        let views = derive_with(
+            None,
+            &[],
+            Some(&routed("analyst")),
+            Some(&serde_json::to_string(&recorded).unwrap()),
+        );
+        assert_eq!(
+            view(&views, "strategist")
+                .planned
+                .as_ref()
+                .map(|planned| planned.model.as_str()),
+            Some("anthropic/claude-sonnet-5"),
+            "the box runs `models.analyst`, because that is what its stage governs as"
+        );
+    }
+
+    #[test]
+    fn a_box_whose_stages_route_differently_names_every_route_it_would_run_on() {
+        // A composed node's halves resolve through their own profiles, so they genuinely can differ
+        // (#277). Naming one of them reports a route the box does not entirely have and naming none
+        // reads as "this node has nowhere to run" — the same reason folded telemetry names every
+        // model it covers.
+        let mut config = routed("redteam_classifier");
+        config.models.insert(
+            "redteam_author".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".into(),
+                model: "claude-haiku-5".into(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: Some(toml::Value::Table(
+                    "thinking = { type = \"disabled\" }"
+                        .parse::<toml::Table>()
+                        .unwrap(),
+                )),
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        // Both halves governing as themselves, which is what a workflow gets by declaring `node`
+        // without `governedBy` — the split #277 established can carry two routes.
+        let recorded = ratatoskr_core::shape::Recorded {
+            nodes: vec![ratatoskr_core::shape::ShapeNode {
+                name: "redteam".to_string(),
+                stage: 0,
+                lane: 0,
+                optional: false,
+            }],
+            stages: ["redteam_classifier", "redteam_author"]
+                .map(|id| ratatoskr_core::shape::RunStage {
+                    id: id.to_string(),
+                    node: "redteam".to_string(),
+                    governed_by: None,
+                })
+                .to_vec(),
+        };
+        let views = derive_with(
+            None,
+            &[],
+            Some(&config),
+            Some(&serde_json::to_string(&recorded).unwrap()),
+        );
+        let planned = view(&views, "redteam")
+            .planned
+            .as_ref()
+            .expect("both halves are routed");
+        assert_eq!(
+            planned.model,
+            "anthropic/claude-sonnet-5, anthropic/claude-haiku-5"
+        );
+        // The two facts a reader needs stay answerable across the disagreement: one half reasons,
+        // one half carries its context. The session scope does not, so it is absent rather than
+        // asserted, and a reader falls back to `reuses_session`.
+        assert!(planned.thinking);
+        assert!(planned.reuses_session);
+        assert_eq!(planned.session, None);
     }
 
     #[test]

@@ -317,6 +317,7 @@ pub fn shape_from_workflow(
             .map(|stage| RunStage {
                 id: stage.id.clone(),
                 node: stage.node_id().to_string(),
+                governed_by: stage.governed_by.clone(),
             })
             .collect(),
     }
