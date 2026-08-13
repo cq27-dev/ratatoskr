@@ -2429,13 +2429,17 @@ async fn run_plan_scripted_with_turn(
     ctx.store
         .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
         .await?;
+    // The registry first: a run's shape says which stages compose each of its nodes, and that is a
+    // property of what the run will execute rather than of what the workflow wrote down — a layout
+    // may name a node whose stages it never redeclared.
+    let stages = install_execution_stages(&ctx, &runtime).await?;
     // A scripted run is measured the same way a built-in one is; the script picks the order, not
     // whether the run is comparable to another afterwards.
     crate::record_provenance(
         &ctx.store,
         &ctx.run_id,
         &ctx.config,
-        &crate::stage::shape_from_workflow(runtime.meta()),
+        &crate::stage::shape_from_workflow(runtime.meta(), &stages),
     )
     .await;
     checkpoint(
@@ -2498,13 +2502,17 @@ async fn run_full_scripted_with_actions<A: FullTerminalActions>(
     ctx.store
         .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
         .await?;
+    // The registry first: a run's shape says which stages compose each of its nodes, and that is a
+    // property of what the run will execute rather than of what the workflow wrote down — a layout
+    // may name a node whose stages it never redeclared.
+    let stages = install_execution_stages(&ctx, &runtime).await?;
     // A scripted run is measured the same way a built-in one is; the script picks the order, not
     // whether the run is comparable to another afterwards.
     crate::record_provenance(
         &ctx.store,
         &ctx.run_id,
         &ctx.config,
-        &crate::stage::shape_from_workflow(runtime.meta()),
+        &crate::stage::shape_from_workflow(runtime.meta(), &stages),
     )
     .await;
     checkpoint(
@@ -2515,7 +2523,6 @@ async fn run_full_scripted_with_actions<A: FullTerminalActions>(
     )
     .await?;
 
-    let stages = install_execution_stages(&ctx, &runtime).await?;
     let hosts = build_hosts(&ctx, &stages)?;
     let input = json!({
         "issue": ctx.issue,
@@ -3594,7 +3601,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             shape,
-            crate::stage::shape_from_workflow(standard_runtime().await.unwrap().meta())
+            crate::stage::shape_from_workflow(
+                standard_runtime().await.unwrap().meta(),
+                &standard_stages().await.unwrap()
+            )
         );
         let context: crate::ContextOutput =
             serde_json::from_str(&checkpoints[2].output_json).unwrap();
@@ -3937,16 +3947,36 @@ mod tests {
                 "verifier",
             ]
         );
-        // The bolt for `RUN_CHECKPOINT_IDENTITIES`: those names are drawable in a layout with no
-        // stage of that name behind them, on the strength of the run recording under them. One that
-        // a full run never writes would pass startup and draw a permanently empty box.
-        for identity in crate::policy::RUN_CHECKPOINT_IDENTITIES {
+        // The bolt for membership. A node its stages declare is drawable in a layout with no stage
+        // of that name behind it, on the strength of the run's own operation host writing the box's
+        // aggregate — a node nothing writes would pass startup and draw a permanently empty box.
+        // And the name must be one no workflow can declare a stage under, or one box would mean the
+        // run's own record here and some repository's stage there.
+        let composite = standard_stages()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|stage| !stage.is_own_node())
+            .map(|stage| stage.node_id().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            composite,
+            ["context", "implementer", "redteam"]
+                .map(String::from)
+                .into_iter()
+                .collect()
+        );
+        for identity in &composite {
             assert!(
                 checkpoints
                     .iter()
                     .any(|checkpoint| checkpoint.node_name == *identity),
-                "`{identity}` is drawable as a run's own record, but a full run recorded nothing \
-                 under it"
+                "`{identity}` is drawable as a node its stages declare, but a full run recorded \
+                 nothing under it"
+            );
+            assert!(
+                crate::policy::reserved(identity).is_some(),
+                "`{identity}` is drawable as a run's own record, so a stage must not claim it"
             );
         }
         let revision: analyst::AnalystInput = serde_json::from_str(

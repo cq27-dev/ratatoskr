@@ -280,7 +280,15 @@ pub fn stages_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> 
 /// declaration maps onto [`ShapeNode`] one for one and adds nothing to it. A workflow that declares
 /// no layout gets an empty shape rather than a guessed one: nothing knows where its nodes belong,
 /// and a viewer places what a run actually recorded instead of a position no one declared.
-pub fn shape_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> Vec<ShapeNode> {
+///
+/// The membership each box carries comes from `registry` — the stages the run will actually
+/// execute, its declarations already laid over the standard ones — not from the workflow's own
+/// declarations. A workflow that lays out `redteam` without redeclaring either half still runs
+/// both, and a shape built from what it happened to write down would say the box holds nothing.
+pub fn shape_from_workflow(
+    meta: &ratatoskr_script::workflow::WorkflowMeta,
+    registry: &[Stage],
+) -> Vec<ShapeNode> {
     meta.layout
         .iter()
         .enumerate()
@@ -294,6 +302,11 @@ pub fn shape_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> V
                     stage,
                     lane,
                     optional: column.optional,
+                    stages: registry
+                        .iter()
+                        .filter(|stage| stage.node_id() == name)
+                        .map(|stage| stage.id.clone())
+                        .collect(),
                 })
         })
         .collect()

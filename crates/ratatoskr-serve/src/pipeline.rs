@@ -67,6 +67,14 @@ pub struct NodeView {
     /// positioned from these rather than from a table the frontend maintains in parallel.
     pub stage: usize,
     pub lane: usize,
+    /// The stages whose work this node is, in declaration order.
+    ///
+    /// One entry of the node's own name for the ordinary node, which is one stage. Several for a
+    /// node several stages compose — the red team's classifier and its test author — and then this
+    /// is the only thing that says so: the members run under their own identities, so their events
+    /// and their per-turn records arrive under names no column carries, and a client that did not
+    /// know they belonged here would draw each as a node of its own beside the box.
+    pub stages: Vec<String>,
     /// Whether the run's recorded shape is what put it there. False means [`append_unknown`]
     /// placed it, in first-checkpoint order — an order a client holding the event stream can
     /// better, since completion order is not start order once a workflow runs hosts concurrently.
@@ -305,6 +313,7 @@ pub fn derive_with(
                 state,
                 stage: idx,
                 lane,
+                stages: composing(node),
                 shaped: true,
                 checkpoints: times.len(),
                 first_at: times.first().map(|s| s.to_string()),
@@ -316,6 +325,18 @@ pub fn derive_with(
     }
     append_unknown(&mut out, checkpoints, config, terminal);
     out
+}
+
+/// The stages composing a shaped node.
+///
+/// A shape recorded before membership was carried says nothing, and a node is then exactly itself —
+/// which is what every node of such a run was.
+fn composing(node: &ratatoskr_core::shape::ShapeNode) -> Vec<String> {
+    if node.stages.is_empty() {
+        vec![node.name.clone()]
+    } else {
+        node.stages.clone()
+    }
 }
 
 /// What a node that has checkpointed is doing, wherever it sits.
@@ -357,7 +378,14 @@ fn append_unknown(
     config: Option<&ratatoskr_core::RatatoskrConfig>,
     terminal: bool,
 ) {
-    let known: std::collections::HashSet<&str> = out.iter().map(|n| n.name.as_str()).collect();
+    // A placed box accounts for its own name AND for every stage that composes it. A member writes
+    // its own per-turn row under its own id, which no column carries — without this the red team
+    // would be drawn as one box plus a floating `redteam_classifier` and `redteam_author` beside
+    // it, which is exactly the stray this membership exists to prevent.
+    let known: std::collections::HashSet<&str> = out
+        .iter()
+        .flat_map(|n| std::iter::once(n.name.as_str()).chain(n.stages.iter().map(String::as_str)))
+        .collect();
     let mut seen = std::collections::HashSet::new();
     // Each out-of-shape name with the position of its FIRST checkpoint, which is what its caller is
     // resolved from. One row aggregates every checkpoint of that name, so a run whose
@@ -383,6 +411,8 @@ fn append_unknown(
             state: checkpointed_state(name, terminal),
             stage: base + i,
             lane: 0,
+            // Nothing places it, so nothing says it is anyone's work but its own.
+            stages: vec![name.to_string()],
             shaped: false,
             checkpoints: times.len(),
             first_at: times.first().map(|s| s.to_string()),
@@ -467,18 +497,33 @@ mod tests {
     /// standard columns change; a stale fixture only makes these cases describe a pipeline that no
     /// longer exists, never a run drawn wrongly.
     fn standard_shape() -> String {
-        shape_of(&[
-            (&["overseer"], true),
-            (&["context"], false),
-            (&["analyst"], false),
-            (&["redteam", "implementer"], false),
-            (&["verifier"], true),
-            (&["bookkeeper", "publisher"], false),
-        ])
+        shape_with(
+            &[
+                (&["overseer"], true),
+                (&["context"], false),
+                (&["analyst"], false),
+                (&["redteam", "implementer"], false),
+                (&["verifier"], true),
+                (&["bookkeeper", "publisher"], false),
+            ],
+            // The three boxes the standard workflow composes out of stages that are not boxes of
+            // their own. Each member records its own turn; the box records the aggregate.
+            &[
+                ("context", &["context_distillation"]),
+                ("redteam", &["redteam_classifier", "redteam_author"]),
+                ("implementer", &["implementer_attempt"]),
+            ],
+        )
     }
 
     /// A recorded shape from its columns, each a list of lane names and whether it may be skipped.
+    /// Every box is a single stage of its own name.
     fn shape_of(columns: &[(&[&str], bool)]) -> String {
+        shape_with(columns, &[])
+    }
+
+    /// As [`shape_of`], with the stages composing the boxes that are made of more than themselves.
+    fn shape_with(columns: &[(&[&str], bool)], composed: &[(&str, &[&str])]) -> String {
         let nodes: Vec<ratatoskr_core::shape::ShapeNode> = columns
             .iter()
             .enumerate()
@@ -491,6 +536,13 @@ mod tests {
                         stage,
                         lane,
                         optional: *optional,
+                        stages: composed
+                            .iter()
+                            .find(|(box_name, _)| box_name == name)
+                            .map_or_else(
+                                || vec![(*name).to_string()],
+                                |(_, members)| members.iter().map(|m| (*m).to_string()).collect(),
+                            ),
                     })
             })
             .collect();
@@ -537,6 +589,13 @@ mod tests {
 
     fn state_of(views: &[NodeView], name: &str) -> NodeState {
         views.iter().find(|v| v.name == name).unwrap().state
+    }
+
+    fn view<'a>(views: &'a [NodeView], name: &str) -> &'a NodeView {
+        views
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap_or_else(|| panic!("no `{name}` node"))
     }
 
     fn caller_of_view(views: &[NodeView], name: &str) -> Option<String> {
@@ -969,6 +1028,54 @@ mod tests {
         let views = derive(Some("no_code_change"), &[cp("analyst", "t")]);
         assert_ne!(state_of(&views, "analyst"), NodeState::Working);
         assert_ne!(state_of(&views, "implementer"), NodeState::Working);
+    }
+
+    #[test]
+    fn a_boxs_members_are_drawn_inside_it_rather_than_beside_it() {
+        // The regression this membership exists to prevent, and it is name-matched, so it fails
+        // quietly: the red team's halves keep their own identities now, so each writes a per-turn
+        // row under a name no column carries. Without membership `append_unknown` would tack
+        // `redteam_classifier` and `redteam_author` on as two floating boxes next to the red team.
+        let views = derive(
+            Some("converged"),
+            &[
+                cp("context_distillation", "t1"),
+                cp("context", "t2"),
+                cp("analyst", "t3"),
+                cp("redteam_classifier", "t4"),
+                cp("redteam_author", "t5"),
+                cp("redteam", "t6"),
+                cp("implementer_attempt", "t7"),
+                cp("implementer", "t8"),
+            ],
+        );
+        for member in [
+            "redteam_classifier",
+            "redteam_author",
+            "implementer_attempt",
+            "context_distillation",
+        ] {
+            assert!(
+                !views.iter().any(|view| view.name == member),
+                "`{member}` is the red team's or the implementer's work, not a box of its own"
+            );
+        }
+        assert!(views.iter().all(|view| view.shaped), "{views:?}");
+        assert_eq!(
+            view(&views, "redteam").stages,
+            ["redteam_classifier", "redteam_author"]
+        );
+        // A node that is one stage says so the same way, so a reader never special-cases.
+        assert_eq!(view(&views, "analyst").stages, ["analyst"]);
+    }
+
+    #[test]
+    fn a_shape_recorded_before_membership_makes_every_node_its_own_stage() {
+        // An imported run, or one from before boxes carried their stages. Nothing is inferred: the
+        // node is exactly its own name, which is what every node of such a run was.
+        let bare = r#"[{"name":"analyst","stage":0,"lane":0,"optional":false}]"#;
+        let views = derive_with(Some("converged"), &[cp("analyst", "t")], None, Some(bare));
+        assert_eq!(view(&views, "analyst").stages, ["analyst"]);
     }
 
     #[test]
