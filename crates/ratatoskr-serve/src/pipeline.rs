@@ -86,8 +86,8 @@ pub struct NodeView {
     pub checkpoints: usize,
     pub first_at: Option<String>,
     pub last_at: Option<String>,
-    /// What the node ran on and cost, from its most recent checkpoint. Absent for a node that has
-    /// not checkpointed, and for one that ran no model at all.
+    /// What the node ran on and cost, totalled over [`Self::stages`] — the latest record of each,
+    /// folded. Absent for a node that has not checkpointed, and for one that ran no model at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<NodeTelemetryView>,
     /// What this node *would* run on, read from config. Present before the node has run, so the
@@ -160,13 +160,35 @@ pub struct NodeTelemetryView {
 }
 
 impl NodeTelemetryView {
-    /// The node's latest checkpoint, when it recorded a model turn. `None` for a node that ran no
-    /// model — the issue pseudo-node, or one whose turn was never claimed.
-    fn latest(checkpoints: &[Checkpoint], node: &str) -> Option<Self> {
-        let t = &checkpoints.iter().rfind(|c| c.node_name == node)?.telemetry;
-        t.model.as_ref()?;
+    /// What a node cost, totalled over the stages that do its work.
+    ///
+    /// A node's cost is not one row. Each stage composing it records the turn it ran under its own
+    /// name, and the box's own record — the aggregate its operation host writes — carries no turn
+    /// at all, so reading a single canonical name reports nothing for a composed node and a
+    /// perfectly ordinary number for every other. The latest row of each member, folded.
+    ///
+    /// Identical to reading the one row for a node that is a single stage, which is nearly all of
+    /// them: the fold of one thing is that thing.
+    ///
+    /// `None` when no member recorded a model turn — the issue pseudo-node, one whose turn was
+    /// never claimed, or a node that has not run.
+    fn totalled(checkpoints: &[Checkpoint], stages: &[String]) -> Option<Self> {
+        // `NodeTelemetry::fold` is the same arithmetic a multi-turn checkpoint is written with:
+        // figures add, a figure nobody reported stays unreported, and the models and tool sets are
+        // named distinctly rather than one overwriting the other. A box that ran two profiles
+        // therefore names both — true of the box, while each member's own row stays true of its
+        // turn.
+        let t = stages
+            .iter()
+            .filter_map(|stage| checkpoints.iter().rfind(|c| &c.node_name == stage))
+            .map(|c| c.telemetry.clone())
+            .filter(|t| t.model.is_some())
+            .reduce(|mut folded, next| {
+                folded.fold(next);
+                folded
+            })?;
         Some(NodeTelemetryView {
-            model: t.model.clone(),
+            model: t.model,
             turns: t.turns,
             input_tokens: t.usage.input_tokens,
             output_tokens: t.usage.output_tokens,
@@ -175,8 +197,8 @@ impl NodeTelemetryView {
             reasoning_tokens: t.usage.reasoning_tokens,
             thinking: t.thinking,
             duration_ms: t.duration_ms,
-            tools: t.tools.clone(),
-            tools_used: t.tools_used.clone(),
+            tools: t.tools,
+            tools_used: t.tools_used,
             reuses_session: t.reuses_session,
         })
     }
@@ -306,14 +328,15 @@ pub fn derive_with(
                 checkpointed_state(name, terminal)
             };
 
+            let stages = composing(node);
             out.push(NodeView {
-                telemetry: NodeTelemetryView::latest(checkpoints, name),
+                telemetry: NodeTelemetryView::totalled(checkpoints, &stages),
                 planned: PlannedNode::of(config, name),
                 name: name.clone(),
                 state,
                 stage: idx,
                 lane,
-                stages: composing(node),
+                stages,
                 shaped: true,
                 checkpoints: times.len(),
                 first_at: times.first().map(|s| s.to_string()),
@@ -403,16 +426,17 @@ fn append_unknown(
     let base = out.iter().map(|n| n.stage).max().map_or(0, |s| s + 1);
     for (i, (name, first)) in extra.into_iter().enumerate() {
         let times = node_times(checkpoints, name);
+        // Nothing places it, so nothing says it is anyone's work but its own.
+        let stages = vec![name.to_string()];
         out.push(NodeView {
-            telemetry: NodeTelemetryView::latest(checkpoints, name),
+            telemetry: NodeTelemetryView::totalled(checkpoints, &stages),
             planned: PlannedNode::of(config, name),
             caller: caller_of(checkpoints, first),
             name: name.to_string(),
             state: checkpointed_state(name, terminal),
             stage: base + i,
             lane: 0,
-            // Nothing places it, so nothing says it is anyone's work but its own.
-            stages: vec![name.to_string()],
+            stages,
             shaped: false,
             checkpoints: times.len(),
             first_at: times.first().map(|s| s.to_string()),
@@ -964,6 +988,51 @@ mod tests {
                 .telemetry
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_box_costs_what_its_stages_cost_between_them() {
+        // A composed node's own record carries no turn — the operation host writes it after the
+        // stages have run — so reading one canonical name reports nothing at all for the red team.
+        // The cost is on its members' rows, one per turn, and the box is their total.
+        let spent = |node: &str, at: &str, model: &str, input: u64, tool: &str| {
+            let mut c = cp(node, at);
+            c.telemetry = ratatoskr_core::NodeTelemetry {
+                model: Some(model.into()),
+                turns: Some(1),
+                usage: ratatoskr_core::TokenUsage {
+                    input_tokens: input,
+                    ..Default::default()
+                },
+                tools: vec![tool.into()],
+                ..Default::default()
+            };
+            c
+        };
+        let views = derive(
+            Some("converged"),
+            &[
+                spent("redteam_classifier", "t1", "anthropic/reasoner", 10, "Read"),
+                spent("redteam_author", "t2", "anthropic/builder", 20, "Write"),
+                cp("redteam", "t3"),
+            ],
+        );
+        let t = view(&views, "redteam")
+            .telemetry
+            .as_ref()
+            .expect("the red team ran two model turns");
+        assert_eq!(
+            t.input_tokens, 30,
+            "what the box cost is what its halves did"
+        );
+        assert_eq!(t.turns, Some(2));
+        // Both routes are named, because both ran. Which turn ran on which is answered by the
+        // members' own rows, and that is why they exist: a box cannot say it honestly.
+        assert_eq!(
+            t.model.as_deref(),
+            Some("anthropic/reasoner, anthropic/builder")
+        );
+        assert_eq!(t.tools, ["Read", "Write"]);
     }
 
     #[test]
