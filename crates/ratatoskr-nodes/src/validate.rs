@@ -139,6 +139,36 @@ pub fn validate(
                 )));
             }
         }
+        // Membership says which box the stage's work is drawn in, and a box has to be something a
+        // run records: a Rust-owned operation that writes the aggregate under that name, or another
+        // stage that is a node of its own. A membership naming anything else draws a box no record
+        // ever reaches — the same empty box `validate_layout` refuses a column for, arrived at from
+        // the other direction, and the likeliest cause is a misspelling of a real one.
+        //
+        // A stage may not join a stage that is itself a member: a box holds turns, not boxes, and a
+        // chain would make "which box is this drawn in" a traversal with no reason to terminate.
+        if let Some(node) = stage.node.as_deref()
+            && node != stage.id
+        {
+            if !machine_name(node) {
+                return Err(PlanError::Configuration(format!(
+                    "stage `{}` node `{node}` must use an underscore-separated identifier",
+                    stage.id
+                )));
+            }
+            let composed = stages
+                .iter()
+                .any(|other| other.id == node && other.is_own_node());
+            if !composed && policy::reserved(node).is_none() {
+                return Err(PlanError::Configuration(format!(
+                    "stage `{}` declares node `{node}`, which nothing this run records under; a \
+                     stage's node is the box its work is drawn in, and that box needs either a \
+                     Rust-owned operation writing under the name or a stage of its own called \
+                     `{node}`",
+                    stage.id
+                )));
+            }
+        }
     }
 
     for parent in stages {
@@ -227,25 +257,26 @@ pub fn validate(
 /// box that stays empty forever — a typo and a genuinely missing stage look identical once the run
 /// is drawn.
 ///
-/// A run records one node's work under *two* names, and a box only draws it whole when they are the
-/// same name. `StageExecutor` passes the stage's [`Stage::governance_id`] as the model turn's node,
-/// so that is what `node_start` and every model event carry; it checkpoints under the stage's `id`.
-/// A column may therefore only name something both halves arrive under:
+/// A box is a node, and a node is what its stages declare it to be. Every stage names one —
+/// [`Stage::node_id`], its own id unless it says otherwise — so the drawable names are exactly the
+/// nodes the registry's stages claim membership of:
 ///
-/// - a stage's **own id**, when the stage governs as itself — the ordinary case, and what the
-///   standard layout's `analyst`, `verifier`, `bookkeeper` and `publisher` columns are. A stage the
-///   run folds into another's record as evidence never checkpoints under its own name at all, so
-///   `implementer_attempt` and `redteam_author` are boxes nothing could fill.
-/// - an identity **the run itself checkpoints under** while the model turn for that work also runs
-///   under it: [`policy::RUN_CHECKPOINT_IDENTITIES`]. This is why the standard layout's `context`
-///   column is legal though no stage is called `context`. Being reserved is not enough — `memory`
-///   is a checkpoint identity the run reads back and no workflow may declare, yet nothing records
-///   under it any more, so a column naming it would stay empty for the whole run.
+/// - a stage that is **its own node** is drawable under its own id. That is the ordinary case, and
+///   what the standard layout's `analyst`, `verifier`, `bookkeeper` and `publisher` columns are.
+///   The exception is one the run folds into another record as evidence without declaring a node —
+///   `characterizer` — which never checkpoints anywhere and is a box nothing could fill.
+/// - a **node its stages name**: `redteam`, `implementer` and `context` are drawable because the
+///   red-team halves, the implementer's attempt and the context distillation say they belong there.
+///   No stage carries those names and none needs to; the run's own operation host writes the box's
+///   aggregate and each member writes its turn.
 ///
-/// What is refused is a stage whose governance identity differs from its id and is not one of those:
-/// its events land in one box and its checkpoint in another, and no single name draws it. Separating
-/// the two identities (#259) is what makes such a stage drawable; until then it stays out of the
-/// layout rather than being drawn half-empty under either spelling.
+/// Derived rather than listed. A hand-maintained set of "identities a run records under" is a
+/// second statement of the same fact, and the two go out of step the first time a workflow composes
+/// a node of its own. `memory` stays undrawable by falling out of the derivation rather than by
+/// being kept off a list: nothing declares membership of it, so nothing draws it.
+///
+/// `governedBy` no longer bears on this at all. A stage's records name the stage (#259), so a stage
+/// that governs under another name is drawn under its own like any other.
 ///
 /// A name may appear once. Two columns naming it would draw two boxes with one identity, and the
 /// viewer keys nodes by name — the second would overwrite the first's edges and state rather than
@@ -266,9 +297,11 @@ pub fn validate_layout(
     stages: &[Stage],
     workflow: &str,
 ) -> Result<(), PlanError> {
-    let mut known: BTreeSet<&str> = policy::RUN_CHECKPOINT_IDENTITIES.iter().copied().collect();
+    let mut known: BTreeSet<&str> = BTreeSet::new();
     for stage in stages {
-        if stage.governance_id() == stage.id && !policy::folded_as_evidence(&stage.id) {
+        if !stage.is_own_node() {
+            known.insert(stage.node_id());
+        } else if !policy::folded_as_evidence(&stage.id) {
             known.insert(stage.id.as_str());
         }
     }
@@ -288,27 +321,10 @@ pub fn validate_layout(
         for node in &column.nodes {
             if !known.contains(node.as_str()) {
                 let drawable = known.iter().copied().collect::<Vec<_>>().join(", ");
-                // Name the split where there is one: "nothing records under it" is true but
-                // misleading for a stage whose records exist and simply arrive under two names.
-                let split = stages.iter().find(|stage| {
-                    stage.governance_id() != stage.id
-                        && !policy::folded_as_evidence(&stage.id)
-                        && (stage.id == *node || stage.governance_id() == node)
-                });
-                return Err(PlanError::Configuration(match split {
-                    Some(stage) => format!(
-                        "workflow `{workflow}` lays out node `{node}`, but stage `{id}` is \
-                         governedBy `{governed}`: its model events are recorded under `{governed}` \
-                         and its checkpoint under `{id}`, so neither name draws it whole. Drop \
-                         `governedBy` from `{id}` so the two agree, or lay out one of: {drawable}",
-                        id = stage.id,
-                        governed = stage.governance_id(),
-                    ),
-                    None => format!(
-                        "workflow `{workflow}` lays out node `{node}`, which nothing it runs \
-                         records under; nodes that can be drawn: {drawable}"
-                    ),
-                }));
+                return Err(PlanError::Configuration(format!(
+                    "workflow `{workflow}` lays out node `{node}`, which no stage it runs is; \
+                     nodes that can be drawn: {drawable}"
+                )));
             }
             if !placed.insert(node.as_str()) {
                 return Err(PlanError::Configuration(format!(
@@ -432,6 +448,66 @@ mod tests {
         stage.governed_by = None;
 
         assert!(validate(&[stage], &crate::built_in_agents(), &[]).is_ok());
+    }
+
+    #[test]
+    fn a_stage_joins_a_box_something_records_under_or_it_joins_nothing() {
+        // A membership is a box name, and a box nothing writes under is a box that stays empty for
+        // the whole run — the failure `validate_layout` refuses a column for, reached from the
+        // declaration side. The likeliest way to arrive at one is a misspelling.
+        let member = |node: &str| {
+            let mut stage = crate::stage::stage_fixture("half", "reason");
+            stage.node = Some(node.to_string());
+            stage
+        };
+
+        let error = validate(&[member("redtaem")], &crate::built_in_agents(), &[])
+            .expect_err("a box nothing records under cannot be joined")
+            .to_string();
+        assert!(error.contains("nothing this run records under"), "{error}");
+
+        // A Rust-owned operation writes the aggregate under its own name, which is what the bundled
+        // red team, implementer and context stages join.
+        for identity in ["redteam", "implementer", "context"] {
+            assert!(
+                validate(&[member(identity)], &crate::built_in_agents(), &[]).is_ok(),
+                "`{identity}` is a box the run records under"
+            );
+        }
+
+        // So does a peer stage that is a node of its own: two stages composing one repository box.
+        let peer = crate::stage::stage_fixture("review", "reason");
+        assert!(
+            validate(
+                &[member("review"), peer.clone()],
+                &crate::built_in_agents(),
+                &[]
+            )
+            .is_ok()
+        );
+
+        // But not a peer that is itself a member. A box holds turns, not boxes.
+        let mut nested = peer;
+        nested.node = Some("redteam".to_string());
+        let error = validate(&[member("review"), nested], &crate::built_in_agents(), &[])
+            .expect_err("membership does not chain")
+            .to_string();
+        assert!(error.contains("nothing this run records under"), "{error}");
+    }
+
+    #[test]
+    fn a_stage_shares_a_route_without_being_merged_into_the_other_stage() {
+        // The pair `governedBy` alone could not express: one `[models.*]` route, one ruleset, two
+        // stages that stay two pieces of work. Neither declares a membership, so each is its own
+        // node, and the shared governance says only what they run on.
+        let mut classifier = crate::stage::stage_fixture("triage_classifier", "reason");
+        classifier.governed_by = Some("triage".to_string());
+        let mut author = crate::stage::stage_fixture("triage_author", "build");
+        author.governed_by = Some("triage".to_string());
+        let stages = [classifier, author];
+
+        assert!(validate(&stages, &crate::built_in_agents(), &permitted_for(&stages)).is_ok());
+        assert!(stages.iter().all(Stage::is_own_node));
     }
 
     #[test]
@@ -781,52 +857,61 @@ mod tests {
     }
 
     #[test]
-    fn a_stage_governed_under_another_identity_is_not_drawable_under_either_name() {
+    fn a_stage_governed_under_another_identity_is_drawn_under_its_own() {
+        // `governedBy` says what the turn runs on and nothing else: the reviewer's records name the
+        // reviewer, so its box is the reviewer's own. Sharing the analyst's route does not put its
+        // work in the analyst's box, and nothing about the pair needs the layout to express it.
         let mut reviewer = crate::stage::stage_fixture("reviewer", "reason");
         reviewer.governed_by = Some("analyst".to_string());
         let analyst = crate::stage::stage_fixture("analyst", "reason");
         let stages = [reviewer, analyst];
 
-        // A run records the reviewer's model events under `analyst` and its checkpoint under
-        // `reviewer`, so a column under either name draws half of it. The one it does not already
-        // own is refused outright...
-        let error = validate_layout(&column("reviewer"), &stages, "ours")
-            .expect_err("a split identity cannot be drawn as one box")
-            .to_string();
-        assert!(error.contains("governedBy `analyst`"), "{error}");
-        assert!(error.contains("neither name draws it whole"), "{error}");
-
-        // ...and `analyst` stays drawable, because the analyst stage governs as itself: that box is
-        // the analyst's own record. The reviewer's turns joining it is what separating execution
-        // identity from governance identity fixes, not something the layout can express.
+        assert!(validate_layout(&column("reviewer"), &stages, "ours").is_ok());
         assert!(validate_layout(&column("analyst"), &stages, "ours").is_ok());
     }
 
     #[test]
-    fn the_identities_a_run_checkpoints_under_are_drawable_without_a_stage_of_that_name() {
-        // No stage is called any of these; the run writes them itself and the model turn behind
-        // each one is recorded under the same name, so a column names the whole node.
-        let stages = [crate::stage::stage_fixture("analyst", "reason")];
+    fn a_node_its_stages_declare_is_drawable_without_a_stage_of_that_name() {
+        // No stage is called any of these. They are drawable because the stages that do the work
+        // say they belong there — the run's operation host writes the box's aggregate, and each
+        // member writes the turn it ran. Membership is what supplies the name, so there is no list.
+        let member = |id: &str, node: &str| {
+            let mut stage = crate::stage::stage_fixture(id, "reason");
+            stage.node = Some(node.to_string());
+            stage
+        };
+        let stages = [
+            crate::stage::stage_fixture("analyst", "reason"),
+            member("context_distillation", "context"),
+            member("implementer_attempt", "implementer"),
+            member("redteam_classifier", "redteam"),
+            member("redteam_author", "redteam"),
+        ];
         for identity in ["context", "implementer", "redteam"] {
             assert!(
                 validate_layout(&column(identity), &stages, "ours").is_ok(),
-                "`{identity}` is a name a run records under"
+                "`{identity}` is a node its stages declare"
             );
         }
+
+        // And a member is not a box of its own: it is drawn inside the one it named.
+        let error = validate_layout(&column("redteam_author"), &stages, "ours")
+            .expect_err("a stage that belongs to a node is not also a node")
+            .to_string();
+        assert!(error.contains("no stage it runs is"), "{error}");
     }
 
     #[test]
     fn a_reserved_identity_nothing_records_under_is_not_drawable() {
         // `memory` is a lifecycle checkpoint identity — `reconstruct_plan` reads one back for a run
         // recorded before the merged `context` checkpoint existed — so no workflow may declare a
-        // stage under it. That is not the same as being drawable: nothing a run does writes a
-        // `memory` checkpoint now, so a column naming it is a box that stays empty for the whole
-        // run, which is the case this check exists to refuse.
+        // stage under it. That is not the same as being drawable: no stage says it belongs to
+        // `memory`, so a column naming it is a box that stays empty for the whole run.
         let stages = [crate::stage::stage_fixture("analyst", "reason")];
         let error = validate_layout(&column("memory"), &stages, "ours")
             .expect_err("a name nothing records under draws an empty box")
             .to_string();
-        assert!(error.contains("nothing it runs records under"), "{error}");
+        assert!(error.contains("no stage it runs is"), "{error}");
         assert!(error.contains("memory"), "{error}");
     }
 }

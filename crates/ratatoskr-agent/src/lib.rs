@@ -2596,8 +2596,16 @@ impl RunLedger {
 /// A parameter struct because these travel together from every node, and as a positional list
 /// they were a long train of same-typed strings that a caller could silently transpose.
 pub struct NodeRun<'a> {
-    /// The node's name, for the log span and for labelling its `ask` calls.
+    /// What ran, for the log span, the `node_start` event, the ledger claim and the label on its
+    /// `ask` calls. Every record this turn leaves behind names it.
     pub node: &'a str,
+    /// The identity an operator's Stop, Steer and provider-pause address, when it is not
+    /// [`Self::node`].
+    ///
+    /// An operator acts on the graph they are looking at, and the graph draws one box per node —
+    /// so two stages composing one node poll under the box's name and a Stop reaches whichever of
+    /// them is running. The record still says which one that was; only the address is shared.
+    pub controlled_as: Option<&'a str>,
     pub route: &'a ModelRoute,
     pub preamble: &'a str,
     pub question: &'a str,
@@ -2698,6 +2706,7 @@ where
     let for_compaction = model.clone();
     let NodeRun {
         node,
+        controlled_as,
         route,
         preamble,
         question,
@@ -2738,7 +2747,7 @@ where
     // hook boundary, but operator text sent while they are paused must still reach the node.
     let pending = pending_for_attempt(compacted_session.as_ref());
     let runtime_control = control.as_ref().map(|controller| RuntimeControl {
-        node: node.to_string(),
+        node: controlled_as.unwrap_or(node).to_string(),
         controller: Arc::clone(controller),
         pending: Arc::clone(&pending),
     });
@@ -4047,6 +4056,7 @@ mod tests {
             model,
             NodeRun {
                 node: "analyst",
+                controlled_as: None,
                 route: &route,
                 preamble: "Return the requested summary.",
                 question: "Summarise the change.",
@@ -4669,6 +4679,7 @@ mod tests {
         };
         let answer = run_structured(NodeRun {
             node: "livetest",
+            controlled_as: None,
             route: &route,
             preamble: "You edit files with the tools you are given. Do exactly what is asked.",
             question: "Create `greet.py` containing exactly these two lines:\n\
@@ -4741,6 +4752,7 @@ mod tests {
         };
         let answer = run_structured(NodeRun {
             node: "usagetest",
+            controlled_as: None,
             route: &route,
             preamble: "You answer briefly but completely.",
             question: "In four or five full sentences, describe what a git worktree is.",
@@ -4802,6 +4814,7 @@ mod tests {
         fn run<'a>(route: &'a ModelRoute, conversation: Option<&'a str>) -> NodeRun<'a> {
             NodeRun {
                 node: "implementer",
+                controlled_as: None,
                 route,
                 preamble: "",
                 question: "",

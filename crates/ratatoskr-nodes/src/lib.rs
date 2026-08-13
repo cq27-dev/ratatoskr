@@ -3417,7 +3417,7 @@ mod referee_governance_tests {
 
         // And it is drawn under the new name: the layout the workflow declares is what a run of it
         // records, and it names the stage it now has.
-        let shape = stage::shape_from_workflow(runtime.meta());
+        let shape = stage::shape_from_workflow(runtime.meta(), &stages);
         assert!(
             shape.iter().any(|node| node.name == "strategist"),
             "{shape:?}"
@@ -3461,7 +3461,8 @@ mod referee_governance_tests {
         // The shape a run writes down comes from the workflow it ran, so this is the one place the
         // standard pipeline's columns are stated — there is no compiled-in copy to disagree with.
         let runtime = workflow::standard_runtime().await.unwrap();
-        let shape = stage::shape_from_workflow(runtime.meta());
+        let stages = workflow::standard_stages().await.unwrap();
+        let shape = stage::shape_from_workflow(runtime.meta(), &stages);
         let at = |name: &str| {
             shape
                 .iter()
@@ -3475,14 +3476,20 @@ mod referee_governance_tests {
         assert!(at("verifier").optional);
         assert!(!at("context").optional);
 
+        // Each box says which stages do its work: one of its own name, or the several that compose
+        // it. This is what lets the fork be one red-team box while both halves keep their identity.
+        assert_eq!(at("analyst").stages, ["analyst"]);
+        assert_eq!(
+            at("redteam").stages,
+            ["redteam_classifier", "redteam_author"]
+        );
+        assert_eq!(at("implementer").stages, ["implementer_attempt"]);
+        assert_eq!(at("context").stages, ["context_distillation"]);
+
         // And every node it lays out is one the run can record under, judged against the registry
         // the workflow actually runs.
-        validate::validate_layout(
-            &runtime.meta().layout,
-            &workflow::standard_stages().await.unwrap(),
-            &runtime.meta().name,
-        )
-        .expect("the bundled layout names only nodes the bundled stages provide");
+        validate::validate_layout(&runtime.meta().layout, &stages, &runtime.meta().name)
+            .expect("the bundled layout names only nodes the bundled stages provide");
     }
 
     #[tokio::test]

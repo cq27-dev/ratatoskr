@@ -288,6 +288,14 @@ impl NodeClarifier {
         let answerer = resolve_target(to);
 
         let mut context = format!("ISSUE:\n{}\n", self.issue);
+        // "That answerer's prior output" is the record under the answerer's own name — the BOX's
+        // record, when the box is composed of stages. `ask("redteam", ..)` gets the red team's
+        // aggregate: its classification and its authored tests together, which is the red team's
+        // answer to what it was asked to do. The halves' own rows exist beside it and are
+        // deliberately not read here — one of them is half an answer, and which half depends on
+        // which ran last, so an asker would get the classifier's verdict or the author's file list
+        // depending on timing. A question addressed to a name is answered by what that name
+        // produced.
         if let Some(prior) = self.latest_output(answerer).await {
             let _ = write!(
                 context,

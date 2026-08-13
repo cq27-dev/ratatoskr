@@ -41,6 +41,8 @@ pub struct Stage {
     pub agent: String,
     /// Stable route/rules/plugin identity. Defaults to [`Self::id`].
     pub governed_by: Option<String>,
+    /// The graph node this stage's work belongs to. Defaults to [`Self::id`].
+    pub node: Option<String>,
     pub input_contract: String,
     pub output_contract: String,
     /// JSON Schema for [`Self::output_contract`] on user-declared stages.
@@ -72,6 +74,24 @@ pub struct ArrayNormalization {
 impl Stage {
     pub fn governance_id(&self) -> &str {
         self.governed_by.as_deref().unwrap_or(&self.id)
+    }
+
+    /// The graph node this stage's work belongs to — the box a run of it is drawn in.
+    ///
+    /// A stage that declares no membership is its own node, which is every stage a repository is
+    /// likely to write. The bundled definitions use it for the four stages that are somebody's
+    /// implementation rather than a box of their own: both red-team halves, the implementer's
+    /// attempt, and the context distillation.
+    ///
+    /// Not [`Self::governance_id`]. A stage may share a route without sharing a box, and a box may
+    /// hold stages that route separately — the red team's classifier reasons and its author writes.
+    pub fn node_id(&self) -> &str {
+        self.node.as_deref().unwrap_or(&self.id)
+    }
+
+    /// Whether this stage is a node of its own rather than part of somebody else's.
+    pub fn is_own_node(&self) -> bool {
+        self.node_id() == self.id
     }
 
     pub fn effective_ceiling(&self, profile: &AgentProfile) -> Option<Capability> {
@@ -225,6 +245,7 @@ pub fn stages_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> 
             id: stage.id.clone(),
             agent: stage.agent.clone(),
             governed_by: stage.governed_by.clone(),
+            node: stage.node.clone(),
             input_contract: stage.input_contract.clone(),
             output_contract: stage.output_contract.clone(),
             output_schema: stage.output_schema.clone(),
@@ -259,7 +280,15 @@ pub fn stages_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> 
 /// declaration maps onto [`ShapeNode`] one for one and adds nothing to it. A workflow that declares
 /// no layout gets an empty shape rather than a guessed one: nothing knows where its nodes belong,
 /// and a viewer places what a run actually recorded instead of a position no one declared.
-pub fn shape_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> Vec<ShapeNode> {
+///
+/// The membership each box carries comes from `registry` — the stages the run will actually
+/// execute, its declarations already laid over the standard ones — not from the workflow's own
+/// declarations. A workflow that lays out `redteam` without redeclaring either half still runs
+/// both, and a shape built from what it happened to write down would say the box holds nothing.
+pub fn shape_from_workflow(
+    meta: &ratatoskr_script::workflow::WorkflowMeta,
+    registry: &[Stage],
+) -> Vec<ShapeNode> {
     meta.layout
         .iter()
         .enumerate()
@@ -273,6 +302,11 @@ pub fn shape_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> V
                     stage,
                     lane,
                     optional: column.optional,
+                    stages: registry
+                        .iter()
+                        .filter(|stage| stage.node_id() == name)
+                        .map(|stage| stage.id.clone())
+                        .collect(),
                 })
         })
         .collect()
@@ -306,6 +340,7 @@ pub(crate) fn stage_fixture(id: &str, agent: &str) -> Stage {
         id: id.into(),
         agent: agent.into(),
         governed_by: None,
+        node: None,
         input_contract: String::new(),
         output_contract: String::new(),
         output_schema: None,
@@ -336,6 +371,7 @@ mod tests {
                 id: "review".to_string(),
                 agent: "reason".to_string(),
                 governed_by: None,
+                node: None,
                 input_contract: "ReviewInput".to_string(),
                 output_contract: "ReviewOutput".to_string(),
                 output_schema: Some(serde_json::json!({ "type": "object" })),

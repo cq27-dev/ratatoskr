@@ -254,6 +254,46 @@ export function handoffDrawn(source: NodeView, target: NodeView): boolean {
 }
 
 /**
+ * The stages whose records are `name`'s work — what to look for when the box is asked about.
+ *
+ * A box the server describes says so itself. One it does not — a name typed into the address bar,
+ * or a run whose shape predates membership — is exactly itself, which is what it was.
+ */
+export function stagesOf(nodes: readonly NodeView[], name: string): string[] {
+  const found = nodes.find((n) => n.name === name);
+  return found?.stages?.length ? found.stages : [name];
+}
+
+/**
+ * Rename each event to the box it is drawn in.
+ *
+ * A stage keeps its own identity now, so a `node_start` from the red team says `redteam_author`
+ * while the graph draws one `redteam` box. Everything that folds the stream into node state — the
+ * boxes, the converge-loop edges, what a control can be aimed at — is about the box, and would
+ * otherwise see a name it has never heard of and invent a node for it.
+ *
+ * The events themselves are left alone: the feed shows which half actually ran, which is the whole
+ * point of the split. Only this reading of them is renamed, and only where a box says a stage is
+ * its work.
+ */
+export function inNodeBoxes(
+  events: readonly LiveEvent[],
+  nodes: readonly NodeView[],
+): readonly LiveEvent[] {
+  const box = new Map<string, string>();
+  for (const node of nodes) {
+    for (const stage of node.stages ?? []) {
+      if (stage !== node.name) box.set(stage, node.name);
+    }
+  }
+  if (box.size === 0) return events;
+  return events.map((e) => {
+    const drawn = e.node ? box.get(e.node) : undefined;
+    return drawn ? { ...e, node: drawn } : e;
+  });
+}
+
+/**
  * Nodes a current control can reach.
  *
  * The event stream records the process's active attempt, including the concurrent delivery

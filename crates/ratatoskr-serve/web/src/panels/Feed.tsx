@@ -204,20 +204,29 @@ function Skeleton() {
 export function Feed({
   events,
   node,
+  nodes,
   nameWidth,
   loading,
 }: {
   events: LiveEvent[];
+  /** The box the feed is filtered to, or null for the whole run. */
   node: string | null;
+  /** The stages whose events are that box's work. Several when the box is composed of several —
+   *  each keeps its own name in the rows, which is what says which half of the red team is
+   *  talking, so the name column stays. */
+  nodes: readonly string[] | null;
   /** Characters to reserve for the node column, so every row's icon starts at the same x. */
   nameWidth: number;
   /** The run's history has been asked for and has not arrived. */
   loading: boolean;
 }) {
   const shown = useMemo(
-    () => rows(node ? events.filter((e) => e.node === node) : events),
-    [events, node],
+    () => rows(nodes ? events.filter((e) => !!e.node && nodes.includes(e.node)) : events),
+    [events, nodes],
   );
+  // Suppressed only when every row would repeat the same name. A box made of several stages needs
+  // it: the rows are the reason to look at the box at all.
+  const named = !node || (nodes?.length ?? 1) > 1;
   // Delayed, so a switch that lands in fifty milliseconds shows no placeholder at all.
   const waiting = useSettled(loading, SKELETON_AFTER_MS);
   const tail = useRef<HTMLDivElement>(null);
@@ -252,7 +261,7 @@ export function Feed({
           <>
             <span className="ev-t">{clock(r.at)}</span>
             {/* Who, then what. A feed reads as a sentence about a node, not a list of verbs. */}
-            {!node && (
+            {named && (
               <span className="ev-n" style={r.node ? { color: accent(r.node) } : undefined}>
                 {r.node ?? "—"}
               </span>
@@ -328,7 +337,7 @@ export function Feed({
               r.parts.map((p, n) => (
                 <div className="ev ev--sub" key={`${key}-${n}`}>
                   <span className="ev-t">{clock(p.at)}</span>
-                  {!node && <span className="ev-n" />}
+                  {named && <span className="ev-n" />}
                   <span className="ev-k ev-k--sub">{r.action}</span>
                   {p.subject !== undefined && <span className="ev-d">{p.subject}</span>}
                   {p.args !== undefined && <Arguments args={p.args} />}

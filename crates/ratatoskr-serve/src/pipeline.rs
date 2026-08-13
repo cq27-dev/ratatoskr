@@ -67,6 +67,14 @@ pub struct NodeView {
     /// positioned from these rather than from a table the frontend maintains in parallel.
     pub stage: usize,
     pub lane: usize,
+    /// The stages whose work this node is, in declaration order.
+    ///
+    /// One entry of the node's own name for the ordinary node, which is one stage. Several for a
+    /// node several stages compose — the red team's classifier and its test author — and then this
+    /// is the only thing that says so: the members run under their own identities, so their events
+    /// and their per-turn records arrive under names no column carries, and a client that did not
+    /// know they belonged here would draw each as a node of its own beside the box.
+    pub stages: Vec<String>,
     /// Whether the run's recorded shape is what put it there. False means [`append_unknown`]
     /// placed it, in first-checkpoint order — an order a client holding the event stream can
     /// better, since completion order is not start order once a workflow runs hosts concurrently.
@@ -78,8 +86,8 @@ pub struct NodeView {
     pub checkpoints: usize,
     pub first_at: Option<String>,
     pub last_at: Option<String>,
-    /// What the node ran on and cost, from its most recent checkpoint. Absent for a node that has
-    /// not checkpointed, and for one that ran no model at all.
+    /// What the node ran on and cost, totalled over [`Self::stages`] — the latest record of each,
+    /// folded. Absent for a node that has not checkpointed, and for one that ran no model at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<NodeTelemetryView>,
     /// What this node *would* run on, read from config. Present before the node has run, so the
@@ -152,13 +160,35 @@ pub struct NodeTelemetryView {
 }
 
 impl NodeTelemetryView {
-    /// The node's latest checkpoint, when it recorded a model turn. `None` for a node that ran no
-    /// model — the issue pseudo-node, or one whose turn was never claimed.
-    fn latest(checkpoints: &[Checkpoint], node: &str) -> Option<Self> {
-        let t = &checkpoints.iter().rfind(|c| c.node_name == node)?.telemetry;
-        t.model.as_ref()?;
+    /// What a node cost, totalled over the stages that do its work.
+    ///
+    /// A node's cost is not one row. Each stage composing it records the turn it ran under its own
+    /// name, and the box's own record — the aggregate its operation host writes — carries no turn
+    /// at all, so reading a single canonical name reports nothing for a composed node and a
+    /// perfectly ordinary number for every other. The latest row of each member, folded.
+    ///
+    /// Identical to reading the one row for a node that is a single stage, which is nearly all of
+    /// them: the fold of one thing is that thing.
+    ///
+    /// `None` when no member recorded a model turn — the issue pseudo-node, one whose turn was
+    /// never claimed, or a node that has not run.
+    fn totalled(checkpoints: &[Checkpoint], stages: &[String]) -> Option<Self> {
+        // `NodeTelemetry::fold` is the same arithmetic a multi-turn checkpoint is written with:
+        // figures add, a figure nobody reported stays unreported, and the models and tool sets are
+        // named distinctly rather than one overwriting the other. A box that ran two profiles
+        // therefore names both — true of the box, while each member's own row stays true of its
+        // turn.
+        let t = stages
+            .iter()
+            .filter_map(|stage| checkpoints.iter().rfind(|c| &c.node_name == stage))
+            .map(|c| c.telemetry.clone())
+            .filter(|t| t.model.is_some())
+            .reduce(|mut folded, next| {
+                folded.fold(next);
+                folded
+            })?;
         Some(NodeTelemetryView {
-            model: t.model.clone(),
+            model: t.model,
             turns: t.turns,
             input_tokens: t.usage.input_tokens,
             output_tokens: t.usage.output_tokens,
@@ -167,8 +197,8 @@ impl NodeTelemetryView {
             reasoning_tokens: t.usage.reasoning_tokens,
             thinking: t.thinking,
             duration_ms: t.duration_ms,
-            tools: t.tools.clone(),
-            tools_used: t.tools_used.clone(),
+            tools: t.tools,
+            tools_used: t.tools_used,
             reuses_session: t.reuses_session,
         })
     }
@@ -298,13 +328,15 @@ pub fn derive_with(
                 checkpointed_state(name, terminal)
             };
 
+            let stages = composing(node);
             out.push(NodeView {
-                telemetry: NodeTelemetryView::latest(checkpoints, name),
+                telemetry: NodeTelemetryView::totalled(checkpoints, &stages),
                 planned: PlannedNode::of(config, name),
                 name: name.clone(),
                 state,
                 stage: idx,
                 lane,
+                stages,
                 shaped: true,
                 checkpoints: times.len(),
                 first_at: times.first().map(|s| s.to_string()),
@@ -316,6 +348,18 @@ pub fn derive_with(
     }
     append_unknown(&mut out, checkpoints, config, terminal);
     out
+}
+
+/// The stages composing a shaped node.
+///
+/// A shape recorded before membership was carried says nothing, and a node is then exactly itself —
+/// which is what every node of such a run was.
+fn composing(node: &ratatoskr_core::shape::ShapeNode) -> Vec<String> {
+    if node.stages.is_empty() {
+        vec![node.name.clone()]
+    } else {
+        node.stages.clone()
+    }
 }
 
 /// What a node that has checkpointed is doing, wherever it sits.
@@ -357,7 +401,14 @@ fn append_unknown(
     config: Option<&ratatoskr_core::RatatoskrConfig>,
     terminal: bool,
 ) {
-    let known: std::collections::HashSet<&str> = out.iter().map(|n| n.name.as_str()).collect();
+    // A placed box accounts for its own name AND for every stage that composes it. A member writes
+    // its own per-turn row under its own id, which no column carries — without this the red team
+    // would be drawn as one box plus a floating `redteam_classifier` and `redteam_author` beside
+    // it, which is exactly the stray this membership exists to prevent.
+    let known: std::collections::HashSet<&str> = out
+        .iter()
+        .flat_map(|n| std::iter::once(n.name.as_str()).chain(n.stages.iter().map(String::as_str)))
+        .collect();
     let mut seen = std::collections::HashSet::new();
     // Each out-of-shape name with the position of its FIRST checkpoint, which is what its caller is
     // resolved from. One row aggregates every checkpoint of that name, so a run whose
@@ -375,14 +426,17 @@ fn append_unknown(
     let base = out.iter().map(|n| n.stage).max().map_or(0, |s| s + 1);
     for (i, (name, first)) in extra.into_iter().enumerate() {
         let times = node_times(checkpoints, name);
+        // Nothing places it, so nothing says it is anyone's work but its own.
+        let stages = vec![name.to_string()];
         out.push(NodeView {
-            telemetry: NodeTelemetryView::latest(checkpoints, name),
+            telemetry: NodeTelemetryView::totalled(checkpoints, &stages),
             planned: PlannedNode::of(config, name),
             caller: caller_of(checkpoints, first),
             name: name.to_string(),
             state: checkpointed_state(name, terminal),
             stage: base + i,
             lane: 0,
+            stages,
             shaped: false,
             checkpoints: times.len(),
             first_at: times.first().map(|s| s.to_string()),
@@ -404,10 +458,10 @@ fn append_unknown(
 /// a cleverer reader to fill. A checkpoint does not record what invoked it, and the two substitutes
 /// available here do not survive the general case:
 ///
-/// * **A name in a record is not necessarily the node that wrote it.** A declared stage runs under its
-///   `governedBy` identity — `StageExecutor` passes the governance id as `NodeRun.node` — so a
-///   clarification's `from`, taken from that same value, names the governance identity. Two stages
-///   sharing one `governedBy` are already indistinguishable by the time a record is written.
+/// * **A name in a record is not necessarily a node the graph draws.** A clarification's `from` is
+///   the STAGE that asked, and a stage may compose another node rather than being one — an
+///   `implementer_attempt` asking is drawn inside the implementer's box, under a name no column
+///   carries.
 /// * **Position is not provenance.** "Followed an implementer" is true of most work a run does late.
 ///
 /// A caller for anything beyond the referee needs the producer to record it — an explicit caller
@@ -467,18 +521,33 @@ mod tests {
     /// standard columns change; a stale fixture only makes these cases describe a pipeline that no
     /// longer exists, never a run drawn wrongly.
     fn standard_shape() -> String {
-        shape_of(&[
-            (&["overseer"], true),
-            (&["context"], false),
-            (&["analyst"], false),
-            (&["redteam", "implementer"], false),
-            (&["verifier"], true),
-            (&["bookkeeper", "publisher"], false),
-        ])
+        shape_with(
+            &[
+                (&["overseer"], true),
+                (&["context"], false),
+                (&["analyst"], false),
+                (&["redteam", "implementer"], false),
+                (&["verifier"], true),
+                (&["bookkeeper", "publisher"], false),
+            ],
+            // The three boxes the standard workflow composes out of stages that are not boxes of
+            // their own. Each member records its own turn; the box records the aggregate.
+            &[
+                ("context", &["context_distillation"]),
+                ("redteam", &["redteam_classifier", "redteam_author"]),
+                ("implementer", &["implementer_attempt"]),
+            ],
+        )
     }
 
     /// A recorded shape from its columns, each a list of lane names and whether it may be skipped.
+    /// Every box is a single stage of its own name.
     fn shape_of(columns: &[(&[&str], bool)]) -> String {
+        shape_with(columns, &[])
+    }
+
+    /// As [`shape_of`], with the stages composing the boxes that are made of more than themselves.
+    fn shape_with(columns: &[(&[&str], bool)], composed: &[(&str, &[&str])]) -> String {
         let nodes: Vec<ratatoskr_core::shape::ShapeNode> = columns
             .iter()
             .enumerate()
@@ -491,6 +560,13 @@ mod tests {
                         stage,
                         lane,
                         optional: *optional,
+                        stages: composed
+                            .iter()
+                            .find(|(box_name, _)| box_name == name)
+                            .map_or_else(
+                                || vec![(*name).to_string()],
+                                |(_, members)| members.iter().map(|m| (*m).to_string()).collect(),
+                            ),
                     })
             })
             .collect();
@@ -537,6 +613,13 @@ mod tests {
 
     fn state_of(views: &[NodeView], name: &str) -> NodeState {
         views.iter().find(|v| v.name == name).unwrap().state
+    }
+
+    fn view<'a>(views: &'a [NodeView], name: &str) -> &'a NodeView {
+        views
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap_or_else(|| panic!("no `{name}` node"))
     }
 
     fn caller_of_view(views: &[NodeView], name: &str) -> Option<String> {
@@ -908,6 +991,51 @@ mod tests {
     }
 
     #[test]
+    fn a_box_costs_what_its_stages_cost_between_them() {
+        // A composed node's own record carries no turn — the operation host writes it after the
+        // stages have run — so reading one canonical name reports nothing at all for the red team.
+        // The cost is on its members' rows, one per turn, and the box is their total.
+        let spent = |node: &str, at: &str, model: &str, input: u64, tool: &str| {
+            let mut c = cp(node, at);
+            c.telemetry = ratatoskr_core::NodeTelemetry {
+                model: Some(model.into()),
+                turns: Some(1),
+                usage: ratatoskr_core::TokenUsage {
+                    input_tokens: input,
+                    ..Default::default()
+                },
+                tools: vec![tool.into()],
+                ..Default::default()
+            };
+            c
+        };
+        let views = derive(
+            Some("converged"),
+            &[
+                spent("redteam_classifier", "t1", "anthropic/reasoner", 10, "Read"),
+                spent("redteam_author", "t2", "anthropic/builder", 20, "Write"),
+                cp("redteam", "t3"),
+            ],
+        );
+        let t = view(&views, "redteam")
+            .telemetry
+            .as_ref()
+            .expect("the red team ran two model turns");
+        assert_eq!(
+            t.input_tokens, 30,
+            "what the box cost is what its halves did"
+        );
+        assert_eq!(t.turns, Some(2));
+        // Both routes are named, because both ran. Which turn ran on which is answered by the
+        // members' own rows, and that is why they exist: a box cannot say it honestly.
+        assert_eq!(
+            t.model.as_deref(),
+            Some("anthropic/reasoner, anthropic/builder")
+        );
+        assert_eq!(t.tools, ["Read", "Write"]);
+    }
+
+    #[test]
     fn a_skipped_optional_stage_does_not_hold_the_pipeline_behind_it() {
         // The overseer and the verifier only run where they are configured. A run that skipped
         // both still reached the bookkeeper, and reading the stage list literally would report
@@ -969,6 +1097,54 @@ mod tests {
         let views = derive(Some("no_code_change"), &[cp("analyst", "t")]);
         assert_ne!(state_of(&views, "analyst"), NodeState::Working);
         assert_ne!(state_of(&views, "implementer"), NodeState::Working);
+    }
+
+    #[test]
+    fn a_boxs_members_are_drawn_inside_it_rather_than_beside_it() {
+        // The regression this membership exists to prevent, and it is name-matched, so it fails
+        // quietly: the red team's halves keep their own identities now, so each writes a per-turn
+        // row under a name no column carries. Without membership `append_unknown` would tack
+        // `redteam_classifier` and `redteam_author` on as two floating boxes next to the red team.
+        let views = derive(
+            Some("converged"),
+            &[
+                cp("context_distillation", "t1"),
+                cp("context", "t2"),
+                cp("analyst", "t3"),
+                cp("redteam_classifier", "t4"),
+                cp("redteam_author", "t5"),
+                cp("redteam", "t6"),
+                cp("implementer_attempt", "t7"),
+                cp("implementer", "t8"),
+            ],
+        );
+        for member in [
+            "redteam_classifier",
+            "redteam_author",
+            "implementer_attempt",
+            "context_distillation",
+        ] {
+            assert!(
+                !views.iter().any(|view| view.name == member),
+                "`{member}` is the red team's or the implementer's work, not a box of its own"
+            );
+        }
+        assert!(views.iter().all(|view| view.shaped), "{views:?}");
+        assert_eq!(
+            view(&views, "redteam").stages,
+            ["redteam_classifier", "redteam_author"]
+        );
+        // A node that is one stage says so the same way, so a reader never special-cases.
+        assert_eq!(view(&views, "analyst").stages, ["analyst"]);
+    }
+
+    #[test]
+    fn a_shape_recorded_before_membership_makes_every_node_its_own_stage() {
+        // An imported run, or one from before boxes carried their stages. Nothing is inferred: the
+        // node is exactly its own name, which is what every node of such a run was.
+        let bare = r#"[{"name":"analyst","stage":0,"lane":0,"optional":false}]"#;
+        let views = derive_with(Some("converged"), &[cp("analyst", "t")], None, Some(bare));
+        assert_eq!(view(&views, "analyst").stages, ["analyst"]);
     }
 
     #[test]
@@ -1066,12 +1242,12 @@ mod tests {
 
     #[test]
     fn a_clarification_claims_no_caller_even_though_its_record_names_one() {
-        // A clarification records `from`, and it is tempting to read it as the asking node. It is
-        // not: a declared stage runs under its `governedBy` identity, and that is the value this
-        // field carries — so a stage governed by `implementer` would be reported as the implementer
-        // having asked itself, and two stages sharing one `governedBy` are indistinguishable here.
-        // Naming the wrong asker is worse than naming none, because #248 anchors a branch on it, so
-        // this stays silent until the producer records the caller per invocation (#244).
+        // A clarification records `from`, and it is tempting to read it as the asking node. It
+        // names the STAGE that asked, which is not the same thing: a stage that composes another
+        // node is drawn inside that node's box, so `implementer_attempt` asking would be reported
+        // as a node no column names. Naming the wrong asker is worse than naming none, because #248
+        // anchors a branch on it, so this stays silent until the producer records the caller per
+        // invocation (#244).
         let views = derive(
             Some("awaiting_clarification"),
             &[

@@ -149,6 +149,7 @@ impl RefereeNode {
         crate::verifier::run_judgement(
             ratatoskr_agent::NodeRun {
                 node: "referee",
+                controlled_as: None,
                 route: &self.route,
                 preamble: PREAMBLE,
                 question: &render_prompt(&input),

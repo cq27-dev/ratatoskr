@@ -5,7 +5,9 @@ import {
   convergeLoops,
   forkHandoff,
   handoffDrawn,
+  inNodeBoxes,
   nodesFromEvents,
+  stagesOf,
   workingNodeNames,
 } from "./derive";
 
@@ -486,4 +488,75 @@ test("a partly shaped run keeps its shaped nodes and orders the rest by the stre
     ["slow", 1],
     ["fast", 2],
   ]);
+});
+
+/** A box drawn from several stages, and the stages that are its work. */
+function composed(name, state, stages) {
+  return { name, state, checkpoints: 0, stage: 0, lane: 0, stages };
+}
+
+test("a box's member stages are folded into it rather than drawn beside it", () => {
+  // The regression the whole pairing exists to prevent, and it is name-matched, so it fails
+  // quietly: a red-team half starts under its own id, and without membership `applyDerived` gives
+  // that name a trailing column of its own next to the box it belongs to.
+  const shape = [composed("redteam", "idle", ["redteam_classifier", "redteam_author"])];
+  const events = [start("redteam_classifier"), checkpointed("redteam_classifier")];
+
+  const strays = applied(shape, events);
+  expect(strays.map((n) => n.name)).toEqual(["redteam", "redteam_classifier"]);
+
+  const drawn = applied(shape, inNodeBoxes(events, shape));
+  expect(drawn.map((n) => n.name)).toEqual(["redteam"]);
+  expect(drawn[0].state).toBe("done");
+});
+
+test("reading events as boxes leaves the events themselves alone", () => {
+  // The feed shows which half ran — that is what the split bought. Only the fold is renamed.
+  const shape = [composed("redteam", "idle", ["redteam_classifier", "redteam_author"])];
+  const events = [start("redteam_author")];
+  expect(events[0].node).toBe("redteam_author");
+  expect(inNodeBoxes(events, shape)[0].node).toBe("redteam");
+  expect(events[0].node).toBe("redteam_author");
+
+  // A node that is its own stage is not touched, and neither is a name no box claims.
+  const plain = [node("analyst", "idle"), composed("scout", "idle", ["scout"])];
+  const untouched = [start("analyst"), start("scout"), start("characterizer")];
+  expect(inNodeBoxes(untouched, plain)).toBe(untouched);
+});
+
+test("a re-entry is counted from the box, whichever stage announced it", () => {
+  // `convergeLoops` reads `implementer` starts. The implementer's turn now announces itself as
+  // `implementer_attempt`, so counting the raw stream would report a run that looped as one that
+  // went straight through.
+  const shape = [
+    composed("implementer", "idle", ["implementer_attempt"]),
+    node("verifier", "idle"),
+  ];
+  const events = [
+    start("implementer_attempt"),
+    start("verifier"),
+    start("implementer_attempt"),
+  ];
+  expect(convergeLoops(events)).toEqual({ fix: 0, replan: 0, retry: 0 });
+  expect(convergeLoops(inNodeBoxes(events, shape))).toEqual({ fix: 1, replan: 0, retry: 0 });
+});
+
+test("a control is aimed at the box the stage runs inside", () => {
+  // The run polls for a Stop under the node's name, so this has to name the same thing — a control
+  // offered against `redteam_classifier` would be sent to an address nothing answers.
+  const shape = [composed("redteam", "idle", ["redteam_classifier", "redteam_author"])];
+  const events = [start("redteam_classifier")];
+  expect(workingNodeNames(shape, inNodeBoxes(events, shape))).toEqual(["redteam"]);
+});
+
+test("the stages of a box are what its feed is filtered by", () => {
+  const shape = [
+    composed("redteam", "idle", ["redteam_classifier", "redteam_author"]),
+    node("analyst", "idle"),
+  ];
+  expect(stagesOf(shape, "redteam")).toEqual(["redteam_classifier", "redteam_author"]);
+  // A node the server describes as one stage, and a name it does not describe at all, are both
+  // exactly themselves.
+  expect(stagesOf(shape, "analyst")).toEqual(["analyst"]);
+  expect(stagesOf(shape, "characterizer")).toEqual(["characterizer"]);
 });

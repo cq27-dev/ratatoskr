@@ -19,6 +19,20 @@ pub struct ShapeNode {
     pub name: String,
     pub stage: usize,
     pub lane: usize,
+    /// The stages whose work this node is, in declaration order.
+    ///
+    /// One box, and the turns inside it. A node that is a single stage names that stage and nothing
+    /// else; one composed of several — the red team's classifier and its test author — names each,
+    /// because they run on different profiles with different tool sets and each records its own
+    /// turn. Reading a box's cost means totalling these, and drawing it means folding their events
+    /// into one box rather than tacking each on as a node of its own.
+    ///
+    /// Recorded with the shape, for the same reason the shape is recorded at all: which stages
+    /// compose a node is a property of the workflow that ran, and a viewer reading it from its own
+    /// build would read an imported run against a composition nobody executed. Empty for a run
+    /// recorded before this was carried, which reads as "this box is just its own name".
+    #[serde(default)]
+    pub stages: Vec<String>,
     /// Whether the node runs at all is a property of configuration, not of the run — the overseer
     /// only runs where a workflow has to be chosen, the verifier and publisher only where the repo
     /// gave them a route. An optional node with no checkpoint has not stalled; it was never asked.
