@@ -241,13 +241,24 @@ pub struct WorkflowMeta {
     pub stages: Vec<WorkflowStage>,
     /// Where this workflow's nodes sit when a run of it is drawn, in column order.
     ///
-    /// Declarative layout and nothing more. A column is a position, not a claim about ordering or
-    /// concurrency — what ran after what is derived from the run's own events, never from here.
+    /// Column order is meaningful, and is the only edge relation the drawn graph has: adjacent
+    /// columns are joined, every node of one to every node of the next, unconditionally. Putting a
+    /// node in the column after another therefore draws a hand-off saying the first fed the second,
+    /// so two unrelated nodes placed next to each other claim a hand-off that never happens.
+    ///
+    /// Within a column nothing is ordered. Lane order positions the boxes top to bottom and is not
+    /// evidence of concurrency: the nodes of a column may run together, in sequence, or not at all.
+    ///
+    /// None of it is a record of the run. The layout is the author's drawing of the graph; what
+    /// actually ran, and after what, is read from the run's own events.
     #[serde(default)]
     pub layout: Vec<WorkflowLayoutColumn>,
 }
 
 /// One column of a workflow's declared layout: the nodes that sit side by side in it.
+///
+/// The column's *position* is the load-bearing part — it is what draws the graph's edges, per
+/// [`WorkflowMeta::layout`]. Within the column, lane order only stacks the boxes.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkflowLayoutColumn {

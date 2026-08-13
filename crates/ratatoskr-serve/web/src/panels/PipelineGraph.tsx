@@ -539,10 +539,11 @@ export default function PipelineGraph({ nodes, live, active, loops, selected, on
      * team has already written, and cannot start before it has. Stage edges only ever join one
      * stage to the next, so without this the two read as a fork.
      *
-     * Both names are hardcoded, and that is not an oversight to generalise from `stage`/`lane`:
-     * only the orchestrator knows which pair within a stage is sequenced, and the shape does not
-     * express it — its stage and lane numbers are declarative layout and prove nothing about
-     * ordering or concurrency. `forkHandoff` needs both boxes present in this list, so a workflow
+     * Both names are hardcoded, and that is not an oversight to generalise from `lane`: only the
+     * orchestrator knows which pair within a stage is sequenced, and the shape does not express it —
+     * lane order stacks the boxes and proves nothing about ordering or concurrency. (A node's
+     * *stage* does carry a claim, which is what the edges above are; a lane carries none.)
+     * `forkHandoff` needs both boxes present in this list, so a workflow
      * without a red team draws nothing. A short vertical line down the lane gap, unlabelled and
      * untinted: it is a forward hand-off and should look like the other forward edges.
      */

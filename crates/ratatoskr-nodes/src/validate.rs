@@ -248,6 +248,17 @@ pub fn validate(
 /// A name may appear once. Two columns naming it would draw two boxes with one identity, and the
 /// viewer keys nodes by name — the second would overwrite the first's edges and state rather than
 /// appearing beside it.
+///
+/// What is deliberately NOT checked is whether the column ORDER matches what the workflow does.
+/// Order is meaningful — it is what draws the graph's hand-off edges, see
+/// [`ratatoskr_script::workflow::WorkflowMeta::layout`] — so a layout can claim a hand-off its entry
+/// function never performs, and that stays legal. Which hosts a run reaches, and in what order, is
+/// decided by ordinary TypeScript control flow while the run executes; nothing in the declaration
+/// states a data flow to compare a drawing against, and one layout legitimately serves every path a
+/// run can take, which is what an `optional` column is for. Refusing a legal drawing on a guess
+/// about an imperative script would be exactly the inference this design avoids. The checks here
+/// are the ones the declaration can actually answer: that a named box can be filled at all, and
+/// that each name is drawn once.
 pub fn validate_layout(
     layout: &[ratatoskr_script::workflow::WorkflowLayoutColumn],
     stages: &[Stage],

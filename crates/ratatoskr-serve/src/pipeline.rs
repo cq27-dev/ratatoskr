@@ -311,7 +311,9 @@ fn checkpointed_state(name: &str, terminal: bool) -> NodeState {
 ///
 /// They go in trailing stages, in the order they first ran. That is not the shape they executed
 /// in — it cannot be recovered from checkpoints alone — but it shows every node with its output and
-/// its cost, which is what someone analysing an unplaced run came for. What each node is *doing*
+/// its cost, which is what someone analysing an unplaced run came for. One stage each, because
+/// adjacent columns are drawn joined: a chain in first-checkpoint order is the least wrong claim
+/// available, where a shared column would assert nodes ran side by side that merely lack a layout. What each node is *doing*
 /// comes from [`checkpointed_state`], the same rule a placed node gets: a live implementer holds a
 /// checkpoint from an earlier converge iteration and is still working, wherever it was drawn.
 fn append_unknown(

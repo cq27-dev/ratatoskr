@@ -23,9 +23,12 @@ defineWorkflow({
   // where a workflow has to be chosen, the verifier only where the repo gave it a route — so an
   // empty one has not stalled.
   //
-  // Layout only. A column is a position, not an ordering or a concurrency claim: what ran after
-  // what is derived from the run's own events. The two deliveries share the last column because
-  // neither needs the other's result, not because they are simultaneous.
+  // Column ORDER is meaningful: adjacent columns are joined, every node of one to every node of the
+  // next, so placing a node in the column after another draws a hand-off saying the first fed the
+  // second. Within a column nothing is ordered — the two deliveries share the last one because
+  // neither needs the other's result, and the red team and the implementer share the fork column
+  // though the implementer cannot start until the red team has finished. A lane is a position, not
+  // evidence of concurrency; what ran after what is read from the run's own events.
   layout: [
     { nodes: ["overseer"], optional: true },
     { nodes: ["context"] },
