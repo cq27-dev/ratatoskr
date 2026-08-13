@@ -209,6 +209,25 @@ test("a workflow with no red team at all draws no hand-off from nothing", () => 
   expect(forkHandoff([node("analyst", "done"), node("implementer", "working")])).toBe(false);
 });
 
+// The edge is a vertical step down the lane gap between two boxes in one column. A layout that
+// puts them in different columns already joins them the ordinary way, and this one would render
+// as a diagonal across the graph on top of it.
+test("a layout that puts the two in different columns draws no lane hand-off", () => {
+  const nodes = [
+    { ...node("red_team", "done"), stage: 0 },
+    { ...node("implementer", "working"), stage: 2 },
+  ];
+  expect(forkHandoff(nodes)).toBe(false);
+});
+
+test("sharing a column is what draws it", () => {
+  const nodes = [
+    { ...node("red_team", "done"), stage: 3, lane: 0 },
+    { ...node("implementer", "working"), stage: 3, lane: 1 },
+  ];
+  expect(forkHandoff(nodes)).toBe(true);
+});
+
 test("a failed red team still handed the tree over, so the hand-off is drawn", () => {
   expect(forkHandoff([node("red_team", "failed"), node("implementer", "working")])).toBe(true);
 });

@@ -222,10 +222,18 @@ export function convergeLoops(events: readonly LiveEvent[]): ConvergeLoops {
  *
  * Takes the same event-corrected list the boxes are drawn from, so it cannot drift out of step
  * with them — an edge reading a different source than its endpoints is exactly the bug in c9b5e13.
+ *
+ * Only where the two SHARE a column, which is the case this exists for. The edge is a short
+ * vertical step down the lane gap, geometry that assumes exactly that; a layout is free to put the
+ * two in different columns — or to declare none, and have the client place them — and there the
+ * same edge renders as a diagonal across the graph, duplicating the forward edge the columns
+ * already draw.
  */
 export function forkHandoff(nodes: readonly NodeView[]): boolean {
-  const started = (name: string) => nodes.some((n) => n.name === name && n.state !== "idle");
-  return started("red_team") && started("implementer");
+  const started = (name: string) => nodes.find((n) => n.name === name && n.state !== "idle");
+  const redTeam = started("red_team");
+  const implementer = started("implementer");
+  return !!redTeam && !!implementer && redTeam.stage === implementer.stage;
 }
 
 /**
