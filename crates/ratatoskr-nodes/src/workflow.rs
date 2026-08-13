@@ -2108,7 +2108,20 @@ fn build_hosts_with_turn(
         )));
     }
     hosts.extend(declared);
-    Ok(hosts)
+    // One host call is one claim scope. This is the boundary a workflow can cross twice at once —
+    // `Promise.all([probe(a), probe(b)])` runs one stage's host twice, under one name — so it is
+    // where the identity a checkpoint claims against has to be minted. Everything an invocation
+    // runs inside itself is inside its scope: the halves a composite host folds into one record,
+    // and a nested stage whose own checkpoint claims under its own name.
+    Ok(hosts
+        .into_iter()
+        .map(|(name, host)| (name, claiming(host)))
+        .collect())
+}
+
+/// Wrap a host so its call is one claim scope.
+fn claiming(host: HostFn) -> HostFn {
+    Arc::new(move |arg| Box::pin(ratatoskr_agent::claim_scope(host(arg))))
 }
 
 fn build_hosts(
@@ -3347,6 +3360,11 @@ mod tests {
     struct ChargingStageTurn {
         output: String,
         telemetry: ratatoskr_core::NodeTelemetry,
+        /// Holds every turn open until they have all recorded, so what a claim sees is a ledger
+        /// with another live invocation's turn still standing in it. Without it a turn that
+        /// completes synchronously is claimed before the next one starts, and no ordering a
+        /// concurrent workflow can produce is exercised at all.
+        barrier: Option<Arc<tokio::sync::Barrier>>,
     }
 
     impl StageTurn for ChargingStageTurn {
@@ -3360,7 +3378,13 @@ mod tests {
                 .expect("the executor charges every turn to the run's ledger")
                 .record(run.node, self.telemetry.clone());
             let output = self.output.clone();
-            Box::pin(async move { Ok(output) })
+            let barrier = self.barrier.clone();
+            Box::pin(async move {
+                if let Some(barrier) = barrier {
+                    barrier.wait().await;
+                }
+                Ok(output)
+            })
         }
     }
 
@@ -4536,6 +4560,108 @@ mod tests {
             .unwrap();
         assert_eq!(checkpoints.len(), 1);
         assert_eq!(checkpoints[0].node_name, "arbitrary_probe");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A workflow may call one declared stage twice at once — `Promise.all([probe(a), probe(b)])`
+    /// — and nothing stops it: only `iterate`, `verify` and `replanAtCeiling` hold the iterate
+    /// lock, and `implement`/`redTeam` have order guards. Two such invocations are two turns and
+    /// two records, and each record has to report what its own invocation spent.
+    #[tokio::test]
+    async fn concurrent_invocations_of_one_stage_each_report_their_own_cost() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-concurrent-declared-stage-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-concurrent-stage", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "concurrent_probe".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-concurrent-stage",
+            "probe this twice",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let mut stage = crate::stage::stage_fixture("concurrent_probe", "reason");
+        stage.input_contract = "ProbeInput".to_string();
+        stage.output_contract = "ProbeOutput".to_string();
+        stage.output_schema = Some(json!({
+            "type": "object",
+            "required": ["ok"],
+            "properties": { "ok": { "type": "boolean" } }
+        }));
+        let turn = ChargingStageTurn {
+            output: json!({ "ok": true }).to_string(),
+            telemetry: ratatoskr_core::NodeTelemetry {
+                model: Some("anthropic/test-model".to_string()),
+                duration_ms: Some(50),
+                usage: ratatoskr_core::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 100,
+                    ..Default::default()
+                },
+                turns: Some(1),
+                ..Default::default()
+            },
+            // Both turns record before either checkpoint claims — the ordering the ledger has to
+            // survive, and the one a real pair of overlapping model turns produces.
+            barrier: Some(Arc::new(tokio::sync::Barrier::new(2))),
+        };
+        let hosts =
+            build_hosts_with_turn(&ctx, &[stage], Arc::new(turn) as Arc<dyn StageTurn>).unwrap();
+        let host = hosts.get("concurrent_probe").unwrap().clone();
+
+        let (first, second) = tokio::join!(host("{}".to_string()), host("{}".to_string()));
+        first.unwrap();
+        second.unwrap();
+
+        let checkpoints = store
+            .checkpoints_for_run("run-concurrent-stage")
+            .await
+            .unwrap();
+        assert_eq!(
+            checkpoints.len(),
+            2,
+            "each invocation writes its own record"
+        );
+        for checkpoint in &checkpoints {
+            assert_eq!(
+                checkpoint.telemetry.usage.input_tokens, 10,
+                "each record reports its own invocation's turn, not both and not neither"
+            );
+            assert_eq!(checkpoint.telemetry.usage.output_tokens, 100);
+            assert_eq!(checkpoint.telemetry.turns, Some(1));
+            assert_eq!(
+                checkpoint.telemetry.model.as_deref(),
+                Some("anthropic/test-model")
+            );
+        }
+        assert!(
+            ctx.ledger.unclaimed().is_empty(),
+            "both turns were claimed by a checkpoint"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -7855,6 +7981,7 @@ mod tests {
         // profile — `build` for the author, `reason` for the classifier — so the models they run
         // on can genuinely differ.
         let author = ChargingStageTurn {
+            barrier: None,
             output: json!({ "files": [], "tests": [], "covers": "no interface" }).to_string(),
             telemetry: ratatoskr_core::NodeTelemetry {
                 model: Some("anthropic/author-model".to_string()),
@@ -7891,6 +8018,7 @@ mod tests {
         .await
         .unwrap();
         let classifier = ChargingStageTurn {
+            barrier: None,
             output: json!({ "classifications": [] }).to_string(),
             telemetry: ratatoskr_core::NodeTelemetry {
                 model: Some("anthropic/classifier-model".to_string()),
