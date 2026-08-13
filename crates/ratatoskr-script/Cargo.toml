@@ -7,15 +7,14 @@ rust-version.workspace = true
 
 [dependencies]
 ratatoskr-core.workspace = true
-rquickjs = { version = "0.12.2", features = ["parallel", "futures"] }
+rquickjs = { version = "0.12.2", features = ["parallel", "futures", "loader"] }
 swc_core = { version = "75", features = ["ecma_ast", "ecma_parser", "ecma_codegen", "ecma_visit", "ecma_utils", "ecma_transforms", "ecma_transforms_typescript", "common"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
-
-[dev-dependencies]
+# `time` only: the watchdog that bounds a workflow's JavaScript needs a timer, not a runtime.
 tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
 
 [lints]
 workspace = true

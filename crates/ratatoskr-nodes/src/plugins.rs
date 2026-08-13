@@ -13,10 +13,7 @@ use ratatoskr_graph::NodeError;
 use ratatoskr_mcp::{Connection, ServerProvenance, ServerTools, SpawnEnvironment, ToolSet};
 use ratatoskr_script::ScriptEngine;
 
-use crate::stage::stage_profile;
-use crate::{
-    AgentProfile, NodeAgentConfig, PlanError, Stage, agent_profiles, built_in_stages, route, skills,
-};
+use crate::{AgentProfile, NodeAgentConfig, PlanError, Stage, agent_profiles, route, skills};
 
 /// What each plugin contributed for this run.
 ///
@@ -679,71 +676,14 @@ fn node_agent_config(
     })
 }
 
-/// Resolve a built-in stage through its selected reusable profile.
-pub(crate) fn stage_agent_config(
-    engine: &Arc<ScriptEngine>,
-    config: &RatatoskrConfig,
-    tools: ToolSet,
-    node: &str,
-    default_tools: &[&str],
-    plugins: &mut NodePlugins,
-) -> Result<NodeAgentConfig, PlanError> {
-    let stages = built_in_stages();
-    let stage_id = if node == "redteam" { "red_team" } else { node };
-    let stage = stages.iter().find(|stage| stage.id == stage_id);
-    let profile = stage_profile(config, node);
-    plugins.profile_prompt = profile
-        .as_ref()
-        .map_or_else(String::new, |profile| profile.base_prompt.clone());
-    let ceiling = match (stage, profile.as_ref()) {
-        (Some(stage), Some(profile)) => stage.effective_ceiling(profile),
-        _ => Some(Capability::Read),
-    };
-    let capabilities = ceiling.into_iter().collect::<Vec<_>>();
-    node_agent_config(
-        engine,
-        config,
-        tools,
-        node,
-        default_tools,
-        plugins,
-        AgentSettings {
-            capabilities: &capabilities,
-            profile,
-        },
-    )
-}
-
-/// Resolve the red-team test author. It shares the `redteam` route and ruleset with the optional
-/// classifier, but its fixed job is to write tests into the pre-implementation worktree. The
-/// classifier stage's read ceiling must therefore not remove `Write` or `Edit` from the author.
-pub(crate) fn redteam_author_agent_config(
-    engine: &Arc<ScriptEngine>,
-    config: &RatatoskrConfig,
-    tools: ToolSet,
-    default_tools: &[&str],
-    plugins: &mut NodePlugins,
-) -> Result<NodeAgentConfig, PlanError> {
-    let profile = stage_profile(config, "redteam");
-    plugins.profile_prompt = profile
-        .as_ref()
-        .map_or_else(String::new, |profile| profile.base_prompt.clone());
-    let capabilities = [Capability::Write];
-    node_agent_config(
-        engine,
-        config,
-        tools,
-        "redteam",
-        default_tools,
-        plugins,
-        AgentSettings {
-            capabilities: &capabilities,
-            profile,
-        },
-    )
-}
-
-/// Resolve a declared workflow stage through the profile it names.
+/// Resolve a declared workflow stage through the profile it names, under what THIS invocation
+/// grants.
+///
+/// `invocation_ceiling` is what Rust handed this call — `Read` for a review turn, whatever the
+/// lifecycle adapter holds elsewhere — and it bounds the declaration rather than the other way
+/// round. Without it the narrowing below would answer to the stage's own ceiling alone, and a
+/// declaration naming a mutating MCP tool (`memory_update`, say, whose declared capability is
+/// `Write`) would be offered it on a turn whose stated grant is read-only.
 pub(crate) fn declared_stage_agent_config(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
@@ -751,6 +691,7 @@ pub(crate) fn declared_stage_agent_config(
     stage: &Stage,
     default_tools: &[&str],
     plugins: &NodePlugins,
+    invocation_ceiling: Capability,
 ) -> Result<(NodeAgentConfig, AgentProfile), PlanError> {
     let profile = agent_profiles(config)
         .into_iter()
@@ -761,7 +702,9 @@ pub(crate) fn declared_stage_agent_config(
                 stage.id, stage.agent
             ))
         })?;
-    let ceiling = stage.effective_ceiling(&profile);
+    let ceiling = stage
+        .effective_ceiling(&profile)
+        .map(|declared| declared.min(invocation_ceiling));
     let capabilities = ceiling.into_iter().collect::<Vec<_>>();
     let cfg = node_agent_config(
         engine,
@@ -795,6 +738,16 @@ pub(crate) fn default_allow(built_in: &[&str], from_plugins: Vec<String>) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The analyst as the standard registry declares it — the stage a run would resolve.
+    async fn analyst_stage() -> Stage {
+        crate::workflow::standard_stages()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .expect("the standard registry declares the analyst")
+    }
 
     /// A ruleset directory built for one test.
     async fn binding_engine(case: &str, source: &str) -> Arc<ScriptEngine> {
@@ -850,15 +803,17 @@ mod tests {
         let config = RatatoskrConfig::default();
 
         let default_engine = binding_engine("exa-default-denied", "").await;
-        let default = stage_agent_config(
+        let default = declared_stage_agent_config(
             &default_engine,
             &config,
             tools.clone(),
-            "analyst",
+            &analyst_stage().await,
             &["semantic_search"],
-            &mut NodePlugins::default(),
+            &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(
             !default
                 .tools
@@ -879,15 +834,17 @@ mod tests {
             r#"defineAgent("analyst", { tools: { allow: ["semantic_search"] } });"#,
         )
         .await;
-        let explicit = stage_agent_config(
+        let explicit = declared_stage_agent_config(
             &explicit_engine,
             &config,
             tools,
-            "analyst",
+            &analyst_stage().await,
             &["semantic_search"],
-            &mut NodePlugins::default(),
+            &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(explicit.tools.names(), vec!["semantic_search"]);
     }
 
@@ -912,15 +869,17 @@ mod tests {
         let config = RatatoskrConfig::default();
         let engine = binding_engine("configured-read-collision", "").await;
 
-        let configured = stage_agent_config(
+        let configured = declared_stage_agent_config(
             &engine,
             &config,
             tools,
-            "analyst",
+            &analyst_stage().await,
             &[ratatoskr_agent::files::READ],
-            &mut NodePlugins::default(),
+            &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
-        .unwrap();
+        .unwrap()
+        .0;
 
         assert_eq!(
             configured
@@ -1023,14 +982,23 @@ mod tests {
             },
         );
 
-        for node in ["analyst", "bookkeeper"] {
-            let cfg = stage_agent_config(
+        // Through the live path: every stage a run executes resolves its policy here, from the
+        // profile its declaration names.
+        let stages = crate::workflow::standard_stages().await.unwrap();
+        for id in ["analyst", "bookkeeper"] {
+            let stage = stages
+                .iter()
+                .find(|stage| stage.id == id)
+                .expect("a standard stage");
+            assert_eq!(stage.agent, "reason", "`{id}` selects the patched profile");
+            let (cfg, _) = declared_stage_agent_config(
                 &engine,
                 &config,
                 ToolSet::default(),
-                node,
+                stage,
                 &[],
-                &mut NodePlugins::default(),
+                &NodePlugins::default(),
+                ratatoskr_core::Capability::Publish,
             )
             .unwrap();
             assert!(matches!(
@@ -1041,20 +1009,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_invocations_ceiling_narrows_mcp_tools_a_declaration_widened_to() {
+        // `verify()` hands the review turn a `Read` grant. A declaration that raises the stage's
+        // own ceiling to `write` and names a mutating rag-rat tool must still not be offered it:
+        // the bound belongs to the invocation, and it has to reach the MCP narrowing seam and not
+        // only the Rust-granted local tools.
+        let mut memory_update = rmcp::model::Tool::default();
+        memory_update.name = "memory_update".to_string().into();
+        let tools = ToolSet::from_servers(vec![ServerTools {
+            origin: ratatoskr_mcp::RAG_RAT.to_string(),
+            sink: None,
+            tools: vec![memory_update],
+            prefix: None,
+            renames: std::collections::BTreeMap::new(),
+            // Left to the declared table, which is what a live rag-rat connection uses: `Write`.
+            capabilities: std::collections::BTreeMap::new(),
+            provenance: ServerProvenance::Configured,
+        }]);
+        assert_eq!(tools.capability("memory_update"), Capability::Write);
+
+        let mut config = RatatoskrConfig::default();
+        let route = config.models["analyst"].clone();
+        config.models.insert("verifier".to_string(), route);
+        let engine = binding_engine("invocation-ceiling", "").await;
+        let stages = crate::workflow::standard_stages().await.unwrap();
+        let mut widened = stages
+            .iter()
+            .find(|stage| stage.id == "verifier")
+            .expect("the standard registry declares a verifier")
+            .clone();
+        widened.agent = "build".to_string();
+        widened.capabilities = vec![Capability::Write];
+        widened.tools = vec!["memory_update".to_string()];
+
+        let offered = |ceiling| {
+            let (cfg, _) = declared_stage_agent_config(
+                &engine,
+                &config,
+                tools.clone(),
+                &widened,
+                &["memory_update"],
+                &NodePlugins::default(),
+                ceiling,
+            )
+            .unwrap();
+            cfg.tools.names()
+        };
+        assert!(
+            !offered(Capability::Read)
+                .iter()
+                .any(|n| n == "memory_update"),
+            "a read-only invocation offered a durable memory mutation: {:?}",
+            offered(Capability::Read)
+        );
+        // And an invocation that grants what the declaration asks for still offers it — the
+        // unmodified registries, whose stage ceilings already equal their invocations' grants,
+        // are untouched by this.
+        assert!(
+            offered(Capability::Write)
+                .iter()
+                .any(|n| n == "memory_update"),
+            "the ceiling narrowed a tool the invocation did grant: {:?}",
+            offered(Capability::Write)
+        );
+    }
+
+    #[tokio::test]
     async fn redteam_test_author_retains_its_write_tools() {
+        // The author and the classifier share the `redteam` governance identity, and the
+        // classifier's stage is read-only. The author keeps its editing tools because the ceiling
+        // that narrows them is its own stage's, resolved per turn from the run's registry — not
+        // the identity's.
         let engine = binding_engine("redteam-author-writes", "").await;
         let mut config = RatatoskrConfig::default();
         let route = config.models["analyst"].clone();
         config.models.insert("redteam".to_string(), route);
+        let stages = crate::workflow::standard_stages().await.unwrap();
+        let author = stages
+            .iter()
+            .find(|stage| stage.id == "redteam_author")
+            .expect("the standard registry declares the test author");
         let mut tools = ToolSet::default();
         tools.add_local_tools(ratatoskr_agent::files::edit_declarations());
 
-        let cfg = redteam_author_agent_config(
+        let default_tools = author.tools.iter().map(String::as_str).collect::<Vec<_>>();
+        let (cfg, _) = declared_stage_agent_config(
             &engine,
             &config,
             tools,
-            crate::redteam::AUTHOR_TOOLS,
-            &mut NodePlugins::default(),
+            author,
+            &default_tools,
+            &NodePlugins::default(),
+            ratatoskr_core::Capability::Publish,
         )
         .unwrap();
 

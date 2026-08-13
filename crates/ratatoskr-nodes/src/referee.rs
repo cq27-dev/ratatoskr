@@ -179,16 +179,33 @@ impl RefereeNode {
 /// use the same fixed route, candidates, diff extraction and model invocation, while retaining
 /// their own iteration metadata when they write the observable `referee` record. `Ok(None)` means
 /// no route was configured, so callers must not write a referee checkpoint.
+pub(crate) struct Judgement<'a> {
+    pub engine: &'a Arc<ScriptEngine>,
+    pub config: &'a RatatoskrConfig,
+    /// The registry this run executes, so the verifier fallback resolves against the stage that
+    /// will actually review rather than a fixed table.
+    pub stages: &'a [crate::Stage],
+    pub ledger: &'a Arc<RunLedger>,
+    pub issue: &'a str,
+    pub requirements: &'a [String],
+    pub implementer: &'a crate::ImplementerOutput,
+    pub worktree: &'a WorktreePath,
+}
+
 pub(crate) async fn judge(
-    engine: &Arc<ScriptEngine>,
-    config: &RatatoskrConfig,
-    ledger: &Arc<RunLedger>,
-    issue: &str,
-    requirements: &[String],
-    implementer: &crate::ImplementerOutput,
-    worktree: &WorktreePath,
+    judgement: Judgement<'_>,
 ) -> Result<Option<Vec<Violation>>, crate::PlanError> {
-    let Some(route) = crate::referee_route(engine, config) else {
+    let Judgement {
+        engine,
+        config,
+        stages,
+        ledger,
+        issue,
+        requirements,
+        implementer,
+        worktree,
+    } = judgement;
+    let Some(route) = crate::referee_route(engine, config, stages) else {
         tracing::info!("no referee or verifier route configured; trusting test results alone");
         return Ok(None);
     };
@@ -604,15 +621,16 @@ rename to src/new.rs
         let engine = rules_engine("judge-no-route", "").await;
         let config = RatatoskrConfig::default();
         let ledger = Arc::new(RunLedger::default());
-        let violations = judge(
-            &engine,
-            &config,
-            &ledger,
-            "the issue",
-            &["keep the tests intact".to_string()],
-            &implementer(&["crates/foo/src/lib.rs"]),
-            &worktree("judge-no-route"),
-        )
+        let violations = judge(Judgement {
+            engine: &engine,
+            config: &config,
+            stages: &crate::built_in_stages(),
+            ledger: &ledger,
+            issue: "the issue",
+            requirements: &["keep the tests intact".to_string()],
+            implementer: &implementer(&["crates/foo/src/lib.rs"]),
+            worktree: &worktree("judge-no-route"),
+        })
         .await
         .expect("no route is a skipped judgement, not an error");
         assert!(
@@ -641,29 +659,31 @@ rename to src/new.rs
         let ledger = Arc::new(RunLedger::default());
 
         // Every rewrite sits under the declared exemption: no candidates, no judgement.
-        let violations = judge(
-            &engine,
-            &config,
-            &ledger,
-            "the issue",
-            &[],
-            &implementer(&["crates/foo/tests/api.rs"]),
-            &worktree("judge-exempt"),
-        )
+        let violations = judge(Judgement {
+            engine: &engine,
+            config: &config,
+            stages: &crate::built_in_stages(),
+            ledger: &ledger,
+            issue: "the issue",
+            requirements: &[],
+            implementer: &implementer(&["crates/foo/tests/api.rs"]),
+            worktree: &worktree("judge-exempt"),
+        })
         .await
         .expect("nothing to judge is not an error");
         assert!(matches!(violations, Some(ref violations) if violations.is_empty()));
 
         // And the trivial spelling: the implementer rewrote nothing at all.
-        let violations = judge(
-            &engine,
-            &config,
-            &ledger,
-            "the issue",
-            &[],
-            &implementer(&[]),
-            &worktree("judge-exempt"),
-        )
+        let violations = judge(Judgement {
+            engine: &engine,
+            config: &config,
+            stages: &crate::built_in_stages(),
+            ledger: &ledger,
+            issue: "the issue",
+            requirements: &[],
+            implementer: &implementer(&[]),
+            worktree: &worktree("judge-exempt"),
+        })
         .await
         .expect("nothing rewritten is nothing to judge");
         assert!(matches!(violations, Some(ref violations) if violations.is_empty()));
@@ -681,15 +701,16 @@ rename to src/new.rs
             route("no-such-provider", "no-such-model"),
         );
         let ledger = Arc::new(RunLedger::default());
-        let result = judge(
-            &engine,
-            &config,
-            &ledger,
-            "the issue",
-            &[],
-            &implementer(&["crates/foo/src/lib.rs"]),
-            &worktree("judge-fails-open"),
-        )
+        let result = judge(Judgement {
+            engine: &engine,
+            config: &config,
+            stages: &crate::built_in_stages(),
+            ledger: &ledger,
+            issue: "the issue",
+            requirements: &[],
+            implementer: &implementer(&["crates/foo/src/lib.rs"]),
+            worktree: &worktree("judge-fails-open"),
+        })
         .await;
         assert!(
             result.is_err(),

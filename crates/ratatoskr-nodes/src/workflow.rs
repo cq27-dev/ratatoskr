@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use ratatoskr_core::{RatatoskrConfig, RunState, RunStatus};
 use ratatoskr_exec::{WorktreePath, remove_worktree};
-use ratatoskr_graph::{Node, NodeError};
+use ratatoskr_graph::NodeError;
 use ratatoskr_mcp::{RagRatClient, ServerTools};
 use ratatoskr_script::{HostFn, ScriptEngine, WorkflowRuntime};
 use ratatoskr_store::Store;
@@ -34,10 +34,10 @@ use serde_json::json;
 
 use crate::{
     AnalystOutput, BookkeeperInput, BookkeeperOutput, ChildTask, ImplementerNode,
-    ImplementerOutput, MemoryNode, MemoryOutput, PlanError, PlanOutcome, RedTeamNode,
-    RedTeamOutput, RunOutcome, ScoutOutput, Stage, bookkeeper, checkpoint, converge, memory,
+    ImplementerOutput, MemoryOutput, PlanError, PlanOutcome, RedTeamNode, RedTeamOutput,
+    RunOutcome, ScoutOutput, Stage, bookkeeper, checkpoint, converge,
     publisher::{PublisherInput, PublisherOutput},
-    redteam, referee, stage_agent_config, verifier,
+    redteam, referee, verifier,
 };
 
 /// Backstop on total node-running binding calls per run — a runaway-loop guard, far above any real
@@ -46,7 +46,10 @@ use crate::{
 const INVOCATION_CEILING: usize = 500;
 
 const STANDARD_WORKFLOW_NAME: &str = "ratatoskr-standard-v1";
-const STANDARD_WORKFLOW_V1: &str = include_str!("../workflows/standard-v1.ts");
+pub(crate) const STANDARD_WORKFLOW_V1: &str = include_str!("../workflows/standard-v1.ts");
+/// What a workflow imports the standard node definitions from.
+pub(crate) const STANDARD_DEFINITIONS_MODULE: &str = "ratatoskr/nodes";
+const STANDARD_DEFINITIONS: &str = include_str!("../workflows/nodes.ts");
 const STANDARD_WORKFLOW_INCLUDES: &[(&str, &str)] = &[
     ("prompts/analyst.md", include_str!("../prompts/analyst.md")),
     (
@@ -131,6 +134,33 @@ pub struct WorkflowContext {
     acceptance: Mutex<Option<Vec<ratatoskr_core::AcceptanceStep>>>,
     /// OCI image identity frozen when this run first executes container-backed work.
     container_image: tokio::sync::OnceCell<Option<String>>,
+    /// The one stage registry this run executes: the standard stages with the running workflow's
+    /// declarations laid over them.
+    ///
+    /// Every consumer reads it from here — the JavaScript host table *and* the Rust-owned lifecycle
+    /// adapters that run `implementer_attempt`, `redteam_author`, `redteam_classifier` and
+    /// `characterizer`. Rebuilding it per path is what let an override validate at startup and then
+    /// be ignored by the model turn that actually ran.
+    stages: ExecutionStages,
+}
+
+/// The one stage registry a run executes, resolved once and shared by everything that has to answer
+/// *about* that run — the executor, and the clarifier that speaks for a stage without running it.
+///
+/// Shared rather than re-derived: a second resolution is a second answer, and the clarifier
+/// answering out of the compiled-in table while the executor ran the overlaid registry is exactly
+/// how one run came to route the same node two different ways.
+pub(crate) type ExecutionStages = Arc<tokio::sync::OnceCell<Arc<Vec<Stage>>>>;
+
+/// This run's registry, falling back to the bundled standard one. See [`WorkflowContext::stages`]
+/// for when that fallback is the right answer.
+pub(crate) async fn execution_stages(
+    stages: &ExecutionStages,
+) -> Result<Arc<Vec<Stage>>, PlanError> {
+    stages
+        .get_or_try_init(|| async { Ok(Arc::new(standard_stages().await?)) })
+        .await
+        .cloned()
 }
 
 pub(crate) struct WorkflowContextParams<'a> {
@@ -184,7 +214,17 @@ impl WorkflowContext {
         } = params;
         let repo_path = std::env::current_dir()
             .map_err(|e| PlanError::node("workflow", NodeError::Failed(format!("cwd: {e}"))))?;
-        let clarifier = crate::clarify::NodeClarifier::new(config, store, engine, run_id, issue);
+        // One registry cell, shared with the clarifier: it must answer for the stage this run
+        // executes, not for the compiled-in stage of the same name.
+        let stages: ExecutionStages = Arc::default();
+        let clarifier = crate::clarify::NodeClarifier::new(
+            config,
+            store,
+            engine,
+            run_id,
+            issue,
+            Arc::clone(&stages),
+        );
         let configured_servers = configured.to_vec();
         Ok(Arc::new(Self {
             ledger,
@@ -192,6 +232,7 @@ impl WorkflowContext {
             acceptance: Mutex::new(None),
             container_image: tokio::sync::OnceCell::new(),
             plugin_context,
+            stages,
             config: config.clone(),
             store: store.clone(),
             engine: Arc::clone(engine),
@@ -268,6 +309,47 @@ impl WorkflowContext {
     pub(crate) fn ledger(&self) -> &Arc<ratatoskr_agent::RunLedger> {
         &self.ledger
     }
+
+    /// This run's stage registry.
+    ///
+    /// `install_execution_stages` puts the running workflow's overlaid registry here before the
+    /// first host call. A context that never runs a workflow — the overseer's selection turn, and
+    /// the terminal bookkeeper/publisher adapters, both of which run outside one — falls back to the
+    /// bundled standard registry, which is what those turns are defined against. Every stage that
+    /// can reach this fallback is refused to workflows at the load-time gate, so the fallback can
+    /// never stand in for a declaration someone made and expected to run.
+    pub(crate) async fn stages(&self) -> Result<Arc<Vec<Stage>>, PlanError> {
+        execution_stages(&self.stages).await
+    }
+}
+
+/// Resolve the registry this run executes and install it on the context, once.
+///
+/// The workflow's declarations are laid over the standard stages rather than appended: an override
+/// replaces the standard stage where it sat, so the by-id scans (delegation resolution among them)
+/// find the override and not the original.
+async fn install_execution_stages(
+    ctx: &WorkflowContext,
+    runtime: &WorkflowRuntime,
+) -> Result<Arc<Vec<Stage>>, PlanError> {
+    ctx.stages
+        .get_or_try_init(|| async { Ok(Arc::new(overlaid_stages(runtime).await?)) })
+        .await
+        .cloned()
+}
+
+async fn overlaid_stages(runtime: &WorkflowRuntime) -> Result<Vec<Stage>, PlanError> {
+    let mut stages = standard_stages().await?;
+    // The bundled runtime declares the base stages itself; laying them over themselves would be a
+    // no-op with a duplicate-work cost. Decided by provenance, not by name: a repository workflow
+    // may take any name, including the bundled one, and its declarations still have to be honored.
+    if !runtime.is_bundled() {
+        crate::stage::overlay(
+            &mut stages,
+            crate::stage::stages_from_workflow(runtime.meta()),
+        );
+    }
+    Ok(stages)
 }
 
 // --- reconstruction helpers -------------------------------------------------
@@ -324,13 +406,23 @@ enum ScriptedReview {
 }
 
 fn scripted_review(checkpoints: &[ratatoskr_store::Checkpoint]) -> ScriptedReview {
-    let Some(checkpoint) = checkpoints
+    let Some(reviewed_at) = checkpoints
         .iter()
-        .rev()
-        .find(|checkpoint| checkpoint.node_name == "verifier")
+        .rposition(|checkpoint| checkpoint.node_name == "verifier")
     else {
         return ScriptedReview::NotRun;
     };
+    // An implementer checkpoint written after the review means the tree moved on since it was
+    // judged: that review describes a state this run no longer has, so it cannot be the review
+    // terminal status rests on. Unreviewed, not reviewed-clean. The bundled flow always verifies
+    // after its last iterate, so it never lands here.
+    if checkpoints[reviewed_at + 1..]
+        .iter()
+        .any(|checkpoint| checkpoint.node_name == "implementer")
+    {
+        return ScriptedReview::NotRun;
+    }
+    let checkpoint = &checkpoints[reviewed_at];
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&checkpoint.output_json) else {
         return ScriptedReview::Unavailable;
     };
@@ -402,6 +494,25 @@ fn infer_status(
         RunStatus::Converged
     } else {
         RunStatus::MaxIterationsReached
+    }
+}
+
+/// Say what a `plan` entry left undone, rather than asking whether the run converged.
+///
+/// A `plan` entry composes freely, but the plan itself is reconstructed in Rust from what the run
+/// checkpointed — so `context()` and `analyst()` are a requirement of the entry, not a suggestion.
+/// A workflow that composed something else got "not a converged run?" about a command with no
+/// converge loop, naming neither itself nor the calls it skipped.
+fn plan_entry_omitted(workflow: &str, error: PlanError) -> PlanError {
+    match error {
+        PlanError::MissingCheckpoint(_, node @ ("scout" | "memory" | "analyst")) => {
+            PlanError::Configuration(format!(
+                "workflow `{workflow}` returned from its `plan` entry with no `{node}` \
+                 checkpoint. A `plan` entry must drive `context()` and `analyst()`: the plan is \
+                 reconstructed from the checkpoints those two write, and nothing else composes it."
+            ))
+        }
+        other => other,
     }
 }
 
@@ -477,91 +588,36 @@ where
     })
 }
 
-async fn memory_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
-    ctx.guard()?;
-    let input: memory::MemoryInput =
-        serde_json::from_str(&arg).map_err(|e| format!("memory arg: {e}"))?;
-    let node = MemoryNode {
-        sink: ctx.sink.clone(),
-    };
-    let out = node
-        .run(input, &RunState::new(&ctx.run_id, None))
-        .await
-        .map_err(|e| e.to_string())?;
-    note(&ctx, "memory", &out, Some(arg)).await?;
-    serde_json::to_string(&out).map_err(|e| e.to_string())
-}
-
 /// `acceptance` is passed in rather than read here because the baseline and the post-change run
 /// must execute the same steps — a red team that resolved its own would drift from the implementer
 /// the moment a plan proposed anything.
-fn build_red_team(
+async fn build_red_team(
     ctx: &Arc<WorkflowContext>,
     acceptance: Vec<ratatoskr_core::AcceptanceStep>,
 ) -> Result<RedTeamNode, PlanError> {
     let short: String = ctx.run_id.chars().take(8).collect();
-    let enabled = crate::classifier_enabled(&ctx.engine, &ctx.config);
-    let classifier = match enabled {
-        true => {
-            let mut plugins = ctx.plugin_context.for_node("redteam");
-            let cfg = stage_agent_config(
-                &ctx.engine,
-                &ctx.config,
-                ctx.plugin_context.pool_for("redteam", &ctx.servers),
-                "redteam",
-                redteam::CLASSIFIER_TOOLS,
-                &mut plugins,
-            )?;
-            Some(redteam::RedTeamClassifier {
-                route: cfg.route,
-                tools: cfg.tools,
-                files: cfg.files,
-                ledger: Some(Arc::clone(&ctx.ledger)),
-                policy: cfg.policy,
-                max_turns: cfg.max_turns,
-                clarifier: None,
-                system_prompt: cfg.system_prompt,
-                plugins,
-                declared_context: Arc::clone(ctx),
-            })
-        }
-        false => None,
-    };
-    let author = match enabled {
-        true => {
-            let mut plugins = ctx.plugin_context.for_node("redteam");
-            let mut tools = ctx.plugin_context.pool_for("redteam", &ctx.servers);
-            tools.add_local_tools(ratatoskr_agent::files::edit_declarations());
-            let cfg = crate::plugins::redteam_author_agent_config(
-                &ctx.engine,
-                &ctx.config,
-                tools,
-                redteam::AUTHOR_TOOLS,
-                &mut plugins,
-            )?;
-            Some(redteam::TestAuthor {
-                route: cfg.route,
-                tools: cfg.tools,
-                policy: cfg.policy,
-                max_turns: cfg.max_turns,
-                system_prompt: cfg.system_prompt,
-                conventions: crate::repo_conventions(&ctx.repo_path),
-                plugins,
-                ledger: Some(Arc::clone(&ctx.ledger)),
-                declared_context: Arc::clone(ctx),
-            })
-        }
-        false => None,
-    };
+    let stages = ctx.stages().await?;
+    // Enablement only, and each half on its own stage. Each drives its turn through the stage
+    // executor, which resolves route, tools, ceiling and prompt from the run's registry — the
+    // classifier from `redteam_classifier`, the author from `redteam_author`, whose own `write`
+    // ceiling is what keeps the classifier's read ceiling from disarming it. So the gate has to
+    // ask about the same stage the turn will run: a single answer under the shared `redteam`
+    // governance name decides for whichever stage it reached first, and is wrong for the other.
+    let enabled =
+        |stage_id| crate::red_team_half_enabled(&ctx.engine, &ctx.config, &stages, stage_id);
+    let classifier = enabled("redteam_classifier").then(|| redteam::RedTeamClassifier {
+        declared_context: Arc::clone(ctx),
+    });
+    let author = enabled("redteam_author").then(|| redteam::TestAuthor {
+        declared_context: Arc::clone(ctx),
+    });
     Ok(RedTeamNode {
         author,
         acceptance,
         characterizer: crate::build_characterizer(
             &ctx.engine,
             &ctx.config,
-            &ctx.plugin_context,
-            ctx.servers.clone(),
-            Some(Arc::clone(&ctx.ledger)),
+            &stages,
             Some(Arc::clone(ctx)),
         )?,
         repo_path: ctx.repo_path.clone(),
@@ -625,10 +681,14 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
         .map_err(|error| error.to_string())?;
     ctx.resolved_container_image().await?;
     let acceptance = ctx.acceptance(&analyst.acceptance);
-    let implementer = build_implementer(&ctx, analyst.clone()).map_err(|e| e.to_string())?;
+    let implementer = build_implementer(&ctx, analyst.clone())
+        .await
+        .map_err(|e| e.to_string())?;
     let worktree = implementer.prepare().await.map_err(|e| e.to_string())?;
     *ctx.worktree.lock().unwrap() = Some(worktree.clone());
-    let node = build_red_team(&ctx, acceptance).map_err(|e| e.to_string())?;
+    let node = build_red_team(&ctx, acceptance)
+        .await
+        .map_err(|e| e.to_string())?;
     let out = node
         .run_and_author(worktree.as_path(), &ctx.issue, &analyst.interface)
         .await
@@ -646,25 +706,18 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
-fn build_implementer(
+async fn build_implementer(
     ctx: &Arc<WorkflowContext>,
     analyst: AnalystOutput,
 ) -> Result<ImplementerNode, PlanError> {
-    let (cfg, plugins) = crate::build_implementer_agent_with_servers(
-        &ctx.engine,
-        &ctx.config,
-        &ctx.plugin_context,
-        ctx.servers.clone(),
-    )?;
+    let stages = ctx.stages().await?;
     Ok(ImplementerNode {
         clarifier: Some(ctx.clarifier.as_dyn()),
         acceptance: ctx.acceptance(&analyst.acceptance),
         characterizer: crate::build_characterizer(
             &ctx.engine,
             &ctx.config,
-            &ctx.plugin_context,
-            ctx.servers.clone(),
-            Some(Arc::clone(&ctx.ledger)),
+            &stages,
             Some(Arc::clone(ctx)),
         )
         .ok()
@@ -672,14 +725,6 @@ fn build_implementer(
         repo_path: ctx.repo_path.clone(),
         worktree_root: ctx.config.worktree.root.clone(),
         sandbox: ctx.sandbox_config(),
-        route: cfg.route,
-        tools: cfg.tools,
-        policy: cfg.policy,
-        max_turns: cfg.max_turns,
-        system_prompt: cfg.system_prompt,
-        conventions: crate::repo_conventions(&ctx.repo_path),
-        plugins,
-        ledger: Some(Arc::clone(&ctx.ledger)),
         run_id: ctx.run_id.clone(),
         issue: ctx.issue.clone(),
         analyst,
@@ -707,7 +752,9 @@ async fn implement_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String
     let input: ImplementArg =
         serde_json::from_str(&arg).map_err(|e| format!("implement arg: {e}"))?;
     ctx.resolved_container_image().await?;
-    let node = build_implementer(&ctx, input.analyst).map_err(|e| e.to_string())?;
+    let node = build_implementer(&ctx, input.analyst)
+        .await
+        .map_err(|e| e.to_string())?;
     let prepared = { ctx.worktree.lock().unwrap().clone() };
     let worktree = match prepared {
         Some(worktree) => worktree,
@@ -735,15 +782,23 @@ async fn referee_judgement(
     analyst: &AnalystOutput,
     implementer: &ImplementerOutput,
 ) -> Vec<referee::Violation> {
-    let violations = match referee::judge(
-        &ctx.engine,
-        &ctx.config,
-        &ctx.ledger,
-        &ctx.issue,
-        &analyst.requirements,
+    let stages = match ctx.stages().await {
+        Ok(stages) => stages,
+        Err(error) => {
+            tracing::warn!("the referee could not resolve this run's stages: {error}");
+            return Vec::new();
+        }
+    };
+    let violations = match referee::judge(referee::Judgement {
+        engine: &ctx.engine,
+        config: &ctx.config,
+        stages: &stages,
+        ledger: &ctx.ledger,
+        issue: &ctx.issue,
+        requirements: &analyst.requirements,
         implementer,
         worktree,
-    )
+    })
     .await
     {
         Ok(Some(violations)) => violations,
@@ -965,7 +1020,9 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
     };
 
     ctx.resolved_container_image().await?;
-    let node = build_implementer(&ctx, analyst).map_err(|e| e.to_string())?;
+    let node = build_implementer(&ctx, analyst)
+        .await
+        .map_err(|e| e.to_string())?;
     let out = node
         .iterate(&worktree, &diagnostic)
         .await
@@ -1046,6 +1103,14 @@ async fn verify_host(
     }
     ctx.guard()?;
     let input: Arg = serde_json::from_str(&arg).map_err(|e| format!("verify arg: {e}"))?;
+    // Review excludes editing. A verifier that runs beside `iterate()` reads the worktree while an
+    // implementer is writing it, and its checkpoint is what terminal status rests on — so the
+    // review would be of a half-written tree that never existed. Held for the whole call, and
+    // taken before any early return so the exclusion does not depend on the verifier's config.
+    let _iterate = ctx
+        .iterate_lock
+        .try_lock()
+        .map_err(|_| "verify() cannot overlap iterate()".to_string())?;
 
     let none = |configured, unavailable| {
         serde_json::to_string(&VerifyResult {
@@ -1057,7 +1122,7 @@ async fn verify_host(
         })
         .map_err(|e| e.to_string())
     };
-    if !crate::verifier_enabled(&ctx.engine, &ctx.config) {
+    if !crate::verifier_enabled(&ctx.engine, &ctx.config, executor.stages.as_slice()) {
         return none(false, false);
     }
     let worktree = ctx
@@ -1115,6 +1180,9 @@ async fn verify_host(
             input_json.clone(),
             StandardStageInvocation {
                 resource_root: Some(worktree.0.clone()),
+                // The review reads the change in place; it never gets to be the last writer in the
+                // tree it judges, whatever a workflow declares for the `verifier` stage.
+                capability_ceiling: ratatoskr_core::Capability::Read,
                 rag_rat_worktree: Some(worktree.0.clone()),
                 shell: None,
                 publish: None,
@@ -1193,6 +1261,7 @@ impl CeilingRecovery for LiveCeilingRecovery {
             input_json,
             StandardStageInvocation {
                 resource_root: None,
+                capability_ceiling: ratatoskr_core::Capability::Read,
                 rag_rat_worktree: None,
                 shell: None,
                 publish: None,
@@ -1224,6 +1293,7 @@ impl CeilingRecovery for LiveCeilingRecovery {
     ) -> Result<ImplementerOutput, String> {
         ctx.resolved_container_image().await?;
         build_implementer(ctx, revised.clone())
+            .await
             .map_err(|error| error.to_string())?
             .iterate(worktree, diagnostic)
             .await
@@ -1388,8 +1458,8 @@ async fn replan_at_ceiling_with<R: CeilingRecovery>(
 
 /// `context(issue)` — the merged gather step: distilled findings plus the memories unmodified.
 ///
-/// `scout()` and `memory()` remain for a script that composes them itself. This is the one that
-/// guarantees the ranked memory search happened.
+/// The one operation that guarantees the ranked memory search happened, so it is what both bundled
+/// entries call before anything reasons about the issue.
 async fn context_host(
     ctx: Arc<WorkflowContext>,
     executor: Arc<StageExecutor>,
@@ -1417,6 +1487,7 @@ async fn context_host(
         input_json,
         StandardStageInvocation {
             resource_root: None,
+            capability_ceiling: ratatoskr_core::Capability::Read,
             rag_rat_worktree: None,
             shell: None,
             publish: None,
@@ -1449,7 +1520,13 @@ fn validate_declared_output(stage: &Stage, output: &serde_json::Value) -> Result
             "stage `{}` returned invalid `{}` output: {e}",
             stage.id, stage.output_contract
         )
-    })
+    })?;
+    // The declared schema is the stage's own; for the identifiers Rust reads back as a concrete
+    // type, passing it is not the same as being readable. Checked here rather than at load because
+    // this is the one gate every stage's output passes through on its way to a checkpoint — and
+    // failing here names the stage and the contract, which the serde error at the eventual
+    // `latest_checkpoint` no longer can.
+    crate::policy::check_typed_output(&stage.id, output)
 }
 
 fn normalize_declared_output(stage: &Stage, output: &mut serde_json::Value) -> Result<(), String> {
@@ -1570,6 +1647,13 @@ struct StageInvocation {
     input_json: String,
     rendered_question: Option<String>,
     resource_root: Option<PathBuf>,
+    /// What Rust grants THIS invocation, independent of where its file tools resolve.
+    ///
+    /// `resource_root` answers "where", never "may mutate": `verify_host` hands the review turn the
+    /// implementer's worktree so it can read the change, and a workflow is free to override the
+    /// verifier's declared capabilities. The offer takes the lower of this and the stage's own
+    /// ceiling, so an override can only ever narrow what the caller granted.
+    capability_ceiling: ratatoskr_core::Capability,
     rag_rat_worktree: Option<PathBuf>,
     shell: Option<ratatoskr_agent::shell::ShellAccess>,
     publish: Option<StandardStagePublishResources>,
@@ -1599,6 +1683,7 @@ fn stage_invocation(stage: Stage, host_input_json: String) -> Result<StageInvoca
             input_json: host_input_json,
             rendered_question: None,
             resource_root: None,
+            capability_ceiling: ratatoskr_core::Capability::Read,
             rag_rat_worktree: None,
             shell: None,
             publish: None,
@@ -1615,6 +1700,7 @@ fn stage_invocation(stage: Stage, host_input_json: String) -> Result<StageInvoca
             .map_err(|error| error.to_string())?,
         rendered_question: Some(envelope.rendered.question),
         resource_root: None,
+        capability_ceiling: ratatoskr_core::Capability::Read,
         rag_rat_worktree: None,
         shell: None,
         publish: None,
@@ -1670,6 +1756,7 @@ impl StageExecutor {
             input_json,
             rendered_question,
             resource_root,
+            capability_ceiling,
             rag_rat_worktree,
             shell,
             publish,
@@ -1686,24 +1773,44 @@ impl StageExecutor {
             .ctx
             .plugin_context
             .pool_for(&governance_id, &self.ctx.servers);
-        if stage.tools.iter().any(|tool| {
-            tool == ratatoskr_agent::files::WRITE || tool == ratatoskr_agent::files::EDIT
-        }) && ratatoskr_core::Capability::ceiling(&stage.capabilities)
-            .is_some_and(|ceiling| ceiling.permits(ratatoskr_core::Capability::Write))
+        // A file-mutation tool is offered only against the root Rust supplied for this invocation,
+        // never on the strength of the declaration alone. A declared stage host owns no worktree
+        // lifecycle, and its file root otherwise falls back to the process's working directory —
+        // the operator's checkout — so a stage that declared `Write` would be editing that.
+        //
+        // The root says *where* the file tools resolve and nothing more: the caller's ceiling says
+        // whether this invocation may mutate there. Reading the two out of one field is what let a
+        // `capabilities: ["write"]` override of the read-only `verifier` hold Edit/Write inside the
+        // implementer's worktree — as the last writer after every gate had already passed.
+        let granted = ratatoskr_core::Capability::ceiling(&stage.capabilities)
+            .map(|declared| declared.min(capability_ceiling));
+        if resource_root.is_some()
+            && stage.tools.iter().any(|tool| {
+                tool == ratatoskr_agent::files::WRITE || tool == ratatoskr_agent::files::EDIT
+            })
+            && granted.is_some_and(|granted| granted.permits(ratatoskr_core::Capability::Write))
         {
             offered.add_local_tools(ratatoskr_agent::files::edit_declarations());
         }
-        if stage
-            .tools
-            .iter()
-            .any(|tool| tool == ratatoskr_agent::shell::BASH)
+        // The grant is what puts an implementation behind `Bash`, exactly as `gh` needs its
+        // publish grant. Offered without one it is a tool whose every call is refused, and the
+        // model spends turns discovering that.
+        if shell.is_some()
+            && stage
+                .tools
+                .iter()
+                .any(|tool| tool == ratatoskr_agent::shell::BASH)
         {
             offered.add_local(ratatoskr_agent::shell::declaration());
         }
-        if stage
-            .tools
-            .iter()
-            .any(|tool| tool == ratatoskr_agent::ASK_TOOL_NAME)
+        // Same rule again: without the clarifier grant, `ask` reaches a stub that errors on every
+        // call. JS-host invocations pass none, so a repository stage that declares `ask` would hold
+        // a tool it can only discover is broken.
+        if clarifier.is_some()
+            && stage
+                .tools
+                .iter()
+                .any(|tool| tool == ratatoskr_agent::ASK_TOOL_NAME)
         {
             offered.add_local(crate::clarify::ask_tool());
         }
@@ -1733,16 +1840,31 @@ impl StageExecutor {
             &stage,
             &default_tools,
             &plugins,
+            capability_ceiling,
         )
         .map_err(|e| e.to_string())?;
         cfg.route.session = stage.session_scope(cfg.route.session);
 
-        // A child is evidence within its parent's call, never a second checkpointed graph stage.
-        let runtime_input = if let Some(delegation) = stage
+        // Delegation folds the child's evidence into the parent's runtime input on the way to the
+        // parent's checkpoint, so only a checkpointed invocation can honour it. `characterizer`,
+        // `redteam_classifier` and `context_distillation` are each *both* a global a workflow may
+        // call directly and a stage a Rust adapter invokes as evidence — one stage id, two
+        // dispositions — so the load-time refusal in `validate` cannot speak for this one. Refuse
+        // here instead of running the turn with the declaration quietly omitted.
+        if let Some(delegation) = stage
             .delegation
             .as_ref()
-            .filter(|_| disposition == StageOutput::Checkpoint)
+            .filter(|_| disposition == StageOutput::Evidence)
         {
+            return Err(format!(
+                "stage `{}` delegates to `{}`, but this invocation folds its output into another \
+                 stage's record instead of checkpointing it, and cannot honour the delegation; \
+                 drop the delegation or call `{}` directly from the workflow",
+                stage.id, delegation.target, stage.id
+            ));
+        }
+        // A child is evidence within its parent's call, never a second checkpointed graph stage.
+        let runtime_input = if let Some(delegation) = stage.delegation.as_ref() {
             let target = self
                 .stages
                 .iter()
@@ -1765,6 +1887,7 @@ impl StageExecutor {
                 input_json: serde_json::to_string(&task.input).map_err(|e| e.to_string())?,
                 rendered_question: None,
                 resource_root: resource_root.clone(),
+                capability_ceiling,
                 rag_rat_worktree: rag_rat_worktree.clone(),
                 shell: None,
                 publish: None,
@@ -1852,12 +1975,15 @@ impl StageExecutor {
     }
 }
 
-/// Compatibility adapter for scripted operations that still own Rust-only workflow state or
-/// gates. Migrating one means replacing this entry with a standard declarative stage.
+/// A Rust-owned operation a workflow calls as a bare host.
+///
+/// These are not stages and are not migrating away: each owns run state or a gate a declared stage
+/// cannot hold — the worktree lifecycle, the iteration ceiling, the acceptance baseline, the
+/// deterministic memory search behind `context`. The bundled `plan` and `full` entries call every
+/// one of them, and so may a repository workflow.
 #[derive(Clone, Copy)]
-enum TemporaryOperation {
+pub(crate) enum OperationHost {
     Context,
-    Memory,
     RedTeam,
     Implement,
     Iterate,
@@ -1867,7 +1993,7 @@ enum TemporaryOperation {
     TestCommandRan,
 }
 
-impl TemporaryOperation {
+impl OperationHost {
     fn host(self, ctx: &Arc<WorkflowContext>, executor: &Arc<StageExecutor>) -> HostFn {
         match self {
             Self::Context => {
@@ -1879,7 +2005,6 @@ impl TemporaryOperation {
                     Box::pin(async move { context_host(ctx, executor, arg).await })
                 })
             }
-            Self::Memory => binding(Arc::clone(ctx), memory_host),
             Self::RedTeam => binding(Arc::clone(ctx), red_team_host),
             Self::Implement => binding(Arc::clone(ctx), implement_host),
             Self::Iterate => binding(Arc::clone(ctx), iterate_host),
@@ -1907,39 +2032,43 @@ impl TemporaryOperation {
     }
 }
 
-const TEMPORARY_OPERATIONS: &[(&str, TemporaryOperation)] = &[
-    ("context", TemporaryOperation::Context),
-    ("memory", TemporaryOperation::Memory),
-    ("redTeam", TemporaryOperation::RedTeam),
-    ("implement", TemporaryOperation::Implement),
-    ("iterate", TemporaryOperation::Iterate),
-    ("replanAtCeiling", TemporaryOperation::ReplanAtCeiling),
-    ("verify", TemporaryOperation::Verify),
-    ("isConverged", TemporaryOperation::IsConverged),
-    ("testCommandRan", TemporaryOperation::TestCommandRan),
+/// The one authority on which names are operation hosts. Both the host table below and the
+/// startup check that reserves these names against stage declarations read this list, so a host
+/// added here cannot be silently shadowed by a declared stage of the same name.
+pub(crate) const OPERATION_HOSTS: &[(&str, OperationHost)] = &[
+    ("context", OperationHost::Context),
+    ("redTeam", OperationHost::RedTeam),
+    ("implement", OperationHost::Implement),
+    ("iterate", OperationHost::Iterate),
+    ("replanAtCeiling", OperationHost::ReplanAtCeiling),
+    ("verify", OperationHost::Verify),
+    ("isConverged", OperationHost::IsConverged),
+    ("testCommandRan", OperationHost::TestCommandRan),
 ];
 
-fn build_legacy_operation_hosts(
+fn build_operation_hosts(
     ctx: &Arc<WorkflowContext>,
     executor: &Arc<StageExecutor>,
 ) -> HashMap<String, HostFn> {
-    TEMPORARY_OPERATIONS
+    OPERATION_HOSTS
         .iter()
         .map(|(name, operation)| ((*name).to_string(), operation.host(ctx, executor)))
         .collect()
 }
 
-// These model turns need write authority only inside Rust-owned lifecycle adapters that provide
-// the prepared worktree and, for implementation, the sandbox and clarification rendezvous. The
-// declarations stay in `StageExecutor` for those adapters, but must never become repository-JS
-// globals: a generic host has no worktree lifecycle from which to derive a safe resource root.
-const INTERNAL_WRITE_STAGE_IDS: &[&str] = &["redteam_author", "implementer_attempt"];
+pub(crate) use crate::policy::SELECTION_STAGE_ID;
 
+/// The stages a workflow can call, as globals under their own ids.
+///
+/// [`crate::policy::is_js_host`] decides, so the filter is the classification rather than a list
+/// beside it. Filtered here, at the one place where a stage becomes a repository-JS global, rather
+/// than out of the registry — the Rust adapters still have to resolve these stages, and a filter
+/// applied before an overlay is a filter an override walks past.
 fn build_declared_stage_hosts(executor: &Arc<StageExecutor>) -> HashMap<String, HostFn> {
     executor
         .stages
         .iter()
-        .filter(|stage| !INTERNAL_WRITE_STAGE_IDS.contains(&stage.id.as_str()))
+        .filter(|stage| crate::policy::is_js_host(&stage.id))
         .map(|stage| (stage.id.clone(), executor.host(stage.clone())))
         .collect()
 }
@@ -1952,10 +2081,10 @@ fn build_hosts_with_turn(
     let stages = Arc::new(stages.to_vec());
     let executor = StageExecutor::new(Arc::clone(ctx), Arc::clone(&stages), turn);
     let declared = build_declared_stage_hosts(&executor);
-    let mut hosts = build_legacy_operation_hosts(ctx, &executor);
+    let mut hosts = build_operation_hosts(ctx, &executor);
     if let Some(stage) = stages.iter().find(|stage| hosts.contains_key(&stage.id)) {
         return Err(PlanError::Configuration(format!(
-            "stage `{}` conflicts with a legacy workflow operation",
+            "stage `{}` conflicts with a workflow operation host",
             stage.id
         )));
     }
@@ -1990,12 +2119,31 @@ pub(crate) async fn standard_stages() -> Result<Vec<Stage>, PlanError> {
 }
 
 pub(crate) async fn standard_runtime() -> Result<WorkflowRuntime, PlanError> {
+    let definitions = standard_definitions()?;
     WorkflowRuntime::bundled_with_includes(
         STANDARD_WORKFLOW_NAME,
         STANDARD_WORKFLOW_V1,
         STANDARD_WORKFLOW_INCLUDES,
+        &[(STANDARD_DEFINITIONS_MODULE, &definitions)],
     )
     .await
+    .map_err(|error| PlanError::node("workflow", NodeError::Failed(error.to_string())))
+}
+
+/// The standard node definitions as importable JavaScript.
+///
+/// Transpiled through the include-resolving entry rather than plain type stripping: the definitions
+/// carry `LOAD("prompts/..")` calls, which are compile-time inclusions with no runtime equivalent.
+/// Every workflow gets the same map — a repository's own workflow imports these exactly as the
+/// bundled one does.
+pub(crate) fn standard_definitions() -> Result<String, PlanError> {
+    ratatoskr_script::transpile_with_includes(
+        STANDARD_DEFINITIONS_MODULE,
+        STANDARD_DEFINITIONS,
+        STANDARD_WORKFLOW_INCLUDES,
+        // The definitions module is the leaf of the import graph: it imports nothing.
+        &[],
+    )
     .map_err(|error| PlanError::node("workflow", NodeError::Failed(error.to_string())))
 }
 
@@ -2012,33 +2160,6 @@ pub(crate) async fn evaluate_standard_stage(
     evaluate_standard_stage_with_turn(ctx, stage_id, input_json, Arc::new(LiveStageTurn)).await
 }
 
-/// Evaluate a bundled standard stage with its file tools rooted at a Rust-owned resource.
-///
-/// The caller retains ownership of that resource's lifecycle. In particular, the red-team author
-/// may write into the implementer's pre-change worktree without giving a declared stage authority
-/// to create, select, retain, or remove worktrees.
-pub(crate) async fn evaluate_standard_stage_at(
-    ctx: Arc<WorkflowContext>,
-    stage_id: &str,
-    input_json: String,
-    resource_root: std::path::PathBuf,
-) -> Result<String, String> {
-    evaluate_standard_stage_with_resources(
-        ctx,
-        stage_id,
-        input_json,
-        StandardStageResources {
-            rag_rat_worktree: Some(resource_root.clone()),
-            resource_root,
-            shell: None,
-            publish: None,
-            clarifier: None,
-            guidance: None,
-        },
-    )
-    .await
-}
-
 /// Rust-owned resources granted to one bundled evidence turn.
 ///
 /// A stage may use these resources but cannot create, replace, retain, or clean them up. That
@@ -2047,6 +2168,8 @@ pub(crate) async fn evaluate_standard_stage_at(
 #[derive(Clone)]
 pub(crate) struct StandardStageResources {
     pub resource_root: PathBuf,
+    /// What this invocation may do in `resource_root`. See [`StageInvocation::capability_ceiling`].
+    pub capability_ceiling: ratatoskr_core::Capability,
     /// A linked worktree that rag-rat queries must see as an overlay over the base index.
     ///
     /// This is deliberately separate from the file-tool root: a Rust host selects the worktree
@@ -2070,6 +2193,9 @@ pub(crate) struct StandardStagePublishResources {
 #[derive(Clone)]
 struct StandardStageInvocation {
     resource_root: Option<PathBuf>,
+    /// See [`StageInvocation::capability_ceiling`]: the mutation grant is per invocation, not a
+    /// second meaning read out of `resource_root`.
+    capability_ceiling: ratatoskr_core::Capability,
     rag_rat_worktree: Option<PathBuf>,
     shell: Option<ratatoskr_agent::shell::ShellAccess>,
     publish: Option<StandardStagePublishResources>,
@@ -2096,6 +2222,7 @@ async fn execute_standard_stage(
         Box::pin(async move {
             let mut invocation = stage_invocation(stage, rendered_input)?;
             invocation.resource_root = settings.resource_root;
+            invocation.capability_ceiling = settings.capability_ceiling;
             invocation.rag_rat_worktree = settings.rag_rat_worktree;
             invocation.shell = settings.shell;
             invocation.publish = settings.publish;
@@ -2174,19 +2301,37 @@ async fn evaluate_standard_stage_with_turn_and_resources(
     resources: Option<StandardStageResources>,
     turn: Arc<dyn StageTurn>,
 ) -> Result<String, String> {
-    let (resource_root, rag_rat_worktree, shell, publish, clarifier, invocation_guidance) =
-        match resources {
-            Some(resources) => (
-                Some(resources.resource_root),
-                resources.rag_rat_worktree,
-                resources.shell,
-                resources.publish,
-                resources.clarifier,
-                resources.guidance,
-            ),
-            None => (None, None, None, None, None, None),
-        };
-    let stages = Arc::new(standard_stages().await.map_err(|error| error.to_string())?);
+    let (
+        resource_root,
+        capability_ceiling,
+        rag_rat_worktree,
+        shell,
+        publish,
+        clarifier,
+        invocation_guidance,
+    ) = match resources {
+        Some(resources) => (
+            Some(resources.resource_root),
+            resources.capability_ceiling,
+            resources.rag_rat_worktree,
+            resources.shell,
+            resources.publish,
+            resources.clarifier,
+            resources.guidance,
+        ),
+        None => (
+            None,
+            ratatoskr_core::Capability::Read,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    };
+    // The run's registry, not a fresh standard one: a workflow that overrides `implementer_attempt`
+    // (or any other adapter-invoked stage) must have that override be what this turn runs.
+    let stages = ctx.stages().await.map_err(|error| error.to_string())?;
     let stage = stages
         .iter()
         .find(|stage| stage.id == stage_id)
@@ -2199,6 +2344,7 @@ async fn evaluate_standard_stage_with_turn_and_resources(
         input_json,
         StandardStageInvocation {
             resource_root,
+            capability_ceiling,
             rag_rat_worktree,
             shell,
             publish,
@@ -2209,20 +2355,6 @@ async fn evaluate_standard_stage_with_turn_and_resources(
         },
     )
     .await
-}
-
-async fn execution_stages(runtime: &WorkflowRuntime) -> Result<Vec<Stage>, PlanError> {
-    let mut stages = standard_stages().await?;
-    // Delivery is terminal external I/O, not a workflow operation. These declarations are
-    // executed only by their Rust terminal adapters, after Rust has accepted the run outcome.
-    stages.retain(|stage| !matches!(stage.id.as_str(), "bookkeeper" | "publisher"));
-    // The bundled runtime declares the base stages themselves. Repository workflows add only
-    // their own declarations; appending standard-v1 to itself would duplicate every model host and
-    // reintroduce the terminal declarations filtered above.
-    if runtime.meta().name != STANDARD_WORKFLOW_NAME {
-        stages.extend(crate::stage::stages_from_workflow(runtime.meta()));
-    }
-    Ok(stages)
 }
 
 // --- wrappers (own every status write, gate, and cleanup) -------------------
@@ -2255,7 +2387,7 @@ async fn run_plan_scripted_with_turn(
     )
     .await?;
 
-    let stages = execution_stages(&runtime).await?;
+    let stages = install_execution_stages(&ctx, &runtime).await?;
     let hosts = build_hosts_with_turn(&ctx, &stages, turn)?;
     let input = json!({ "issue": ctx.issue }).to_string();
     let result = runtime
@@ -2263,7 +2395,9 @@ async fn run_plan_scripted_with_turn(
         .await;
 
     let outcome = match result {
-        Ok(_) => reconstruct_plan(&ctx.store, &ctx.run_id).await,
+        Ok(_) => reconstruct_plan(&ctx.store, &ctx.run_id)
+            .await
+            .map_err(|error| plan_entry_omitted(runtime.meta().name.as_str(), error)),
         Err(e) => Err(PlanError::node(
             "workflow",
             NodeError::Failed(e.to_string()),
@@ -2315,7 +2449,7 @@ async fn run_full_scripted_with_actions<A: FullTerminalActions>(
     )
     .await?;
 
-    let stages = execution_stages(&runtime).await?;
+    let stages = install_execution_stages(&ctx, &runtime).await?;
     let hosts = build_hosts(&ctx, &stages)?;
     let input = json!({
         "issue": ctx.issue,
@@ -2337,6 +2471,12 @@ async fn run_full_scripted_with_actions<A: FullTerminalActions>(
             NodeError::Failed(e.to_string()),
         )),
     };
+
+    // Before the cleanup below, not at the end of the function: an abandoned host future is frozen
+    // in the runtime's spawner rather than cancelled, and dropping the runtime is what drops it —
+    // which is what kills a sandbox child still writing the tree. Removing the worktree first
+    // would remove it out from under that child.
+    drop(runtime);
 
     if result.is_err() {
         // Take the handle out before awaiting so the mutex guard isn't held across the await.
@@ -2646,10 +2786,13 @@ async fn bookkeep_scripted(
             input_json,
             StandardStageResources {
                 resource_root: ctx.repo_path.clone(),
+                capability_ceiling: ratatoskr_core::Capability::Read,
                 rag_rat_worktree: None,
                 shell: None,
                 publish: None,
-                clarifier: None,
+                // The bundled bookkeeper declares `ask`, and this run's clarifier is right here —
+                // the same one whose exchanges this path already drains into the run state.
+                clarifier: Some(ctx.clarifier.as_dyn()),
                 guidance: None,
             },
         )
@@ -3060,6 +3203,7 @@ mod tests {
 
     struct RecordingStageTurn {
         sessions: Mutex<Vec<ratatoskr_core::SessionScope>>,
+        models: Mutex<Vec<String>>,
         nodes: Mutex<Vec<String>>,
         conversations: Mutex<Vec<Option<String>>>,
         ledger_ids: Mutex<Vec<Option<usize>>>,
@@ -3079,6 +3223,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 sessions: Mutex::new(Vec::new()),
+                models: Mutex::new(Vec::new()),
                 nodes: Mutex::new(Vec::new()),
                 conversations: Mutex::new(Vec::new()),
                 ledger_ids: Mutex::new(Vec::new()),
@@ -3106,6 +3251,10 @@ mod tests {
                 .lock()
                 .expect("recording runner mutex poisoned")
                 .push(run.route.session);
+            self.models
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(run.route.model.clone());
             self.nodes
                 .lock()
                 .expect("recording runner mutex poisoned")
@@ -3368,7 +3517,8 @@ mod tests {
         let runtime = WorkflowRuntime::bundled_with_includes(
             "incomplete-standard-plan",
             r#"defineWorkflow({ name: "incomplete-standard-plan" });
-               async function plan(input) { return input; }"#,
+               export async function plan(input) { return input; }"#,
+            &[],
             &[],
         )
         .await
@@ -3399,9 +3549,23 @@ mod tests {
                 Ok(_) => panic!("a plan without required checkpoints must fail"),
                 Err(error) => error,
             };
+        // Named, and actionable: a `plan` entry that composes freely still has to drive the two
+        // calls the plan is reconstructed from, and nothing else documents that.
+        let error = error.to_string();
+        for expected in [
+            "incomplete-standard-plan",
+            "`scout`",
+            "context()",
+            "analyst()",
+        ] {
+            assert!(
+                error.contains(expected),
+                "the refusal never mentions {expected}: {error}"
+            );
+        }
         assert!(
-            matches!(error, PlanError::MissingCheckpoint(_, "scout")),
-            "missing context evidence must fail reconstruction: {error}"
+            !error.contains("converged"),
+            "`plan` has no converge loop to ask about: {error}"
         );
         assert_eq!(
             store
@@ -3459,7 +3623,7 @@ mod tests {
         });
         let turn = Arc::new(SequencedStageTurn::new([initial, revised]));
         let runtime = standard_runtime().await.unwrap();
-        let stages = execution_stages(&runtime).await.unwrap();
+        let stages = install_execution_stages(&ctx, &runtime).await.unwrap();
         let mut hosts =
             build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
         assert!(!hosts.contains_key("publisher"));
@@ -3888,7 +4052,7 @@ mod tests {
             "changes_code": false
         })]));
         let runtime = standard_runtime().await.unwrap();
-        let stages = execution_stages(&runtime).await.unwrap();
+        let stages = install_execution_stages(&ctx, &runtime).await.unwrap();
         let mut hosts =
             build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
         let context_out = crate::ContextOutput {
@@ -3977,7 +4141,7 @@ mod tests {
             crate::PluginContext::default(),
         )
         .unwrap();
-        let implementer = build_implementer(&ctx, analyst).unwrap();
+        let implementer = build_implementer(&ctx, analyst).await.unwrap();
         let clarifier = implementer
             .clarifier
             .expect("the native implementer receives the run clarifier");
@@ -4071,6 +4235,7 @@ mod tests {
                 input_json: "{}".to_string(),
                 rendered_question: None,
                 resource_root: None,
+                capability_ceiling: ratatoskr_core::Capability::Read,
                 rag_rat_worktree: None,
                 shell: None,
                 publish: None,
@@ -4090,6 +4255,134 @@ mod tests {
             vec![ratatoskr_core::SessionScope::Compacted],
             "the declared stage must override its route before NodeRun reaches the agent"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_declared_stage_gets_file_mutation_tools_only_against_a_supplied_root() {
+        // A declared stage host owns no worktree lifecycle. Without a root from Rust its file tools
+        // would resolve against the process's working directory — the operator's own checkout — so
+        // the declaration alone must not put `Write` or `Edit` on the table.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-declared-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "leak".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-declared-write",
+            "write something",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let mut stage = crate::built_in_stages().pop().unwrap();
+        stage.id = "leak".to_string();
+        stage.agent = "build".to_string();
+        stage.governed_by = None;
+        stage.output_contract = "LeakOutput".to_string();
+        stage.output_schema = Some(json!({ "type": "object" }));
+        stage.capabilities = vec![ratatoskr_core::Capability::Write];
+        stage.tools = [
+            "Read",
+            "Write",
+            "Edit",
+            "Bash",
+            ratatoskr_agent::ASK_TOOL_NAME,
+        ]
+        .map(str::to_string)
+        .to_vec();
+        stage.question_renderer = None;
+        let stages = Arc::new(vec![stage.clone()]);
+        let turn = Arc::new(RecordingStageTurn::default());
+        let executor = StageExecutor::new(ctx, stages, Arc::clone(&turn) as Arc<dyn StageTurn>);
+
+        // Root alone, ceiling alone, and both: only the invocation that was granted BOTH a root and
+        // a `write` ceiling may mutate. The read-only grant is `verify_host`'s: a review turn is
+        // handed the implementer's worktree to read, and a `capabilities: ["write"]` override of
+        // the verifier must not turn that root into Edit/Write in the tree it judges.
+        let clarifier: Arc<dyn ratatoskr_agent::Clarifier> = Arc::new(StaticClarifier);
+        for (resource_root, ceiling, clarifier) in [
+            (None, ratatoskr_core::Capability::Write, None),
+            (Some(dir.clone()), ratatoskr_core::Capability::Read, None),
+            (
+                Some(dir.clone()),
+                ratatoskr_core::Capability::Write,
+                Some(Arc::clone(&clarifier)),
+            ),
+        ] {
+            executor
+                .execute(StageInvocation {
+                    stage: stage.clone(),
+                    input_json: "{}".to_string(),
+                    rendered_question: None,
+                    resource_root,
+                    capability_ceiling: ceiling,
+                    rag_rat_worktree: None,
+                    shell: None,
+                    publish: None,
+                    clarifier,
+                    invocation_guidance: None,
+                    output: StageOutput::Evidence,
+                })
+                .await
+                .unwrap();
+        }
+
+        let offered = turn.tools.lock().expect("recording runner mutex poisoned");
+        for tool in ["Write", "Edit"] {
+            assert!(
+                !offered[0].iter().any(|offered| offered == tool),
+                "{tool} was offered to a stage Rust gave no root"
+            );
+            assert!(
+                !offered[1].iter().any(|offered| offered == tool),
+                "{tool} was offered to a stage Rust granted only `read` in the supplied root"
+            );
+            assert!(
+                offered[2].iter().any(|offered| offered == tool),
+                "{tool} must still be offered against a supplied root and a `write` grant"
+            );
+        }
+        // The same rule for the shell, which no invocation was granted.
+        assert!(
+            !offered.iter().any(|run| run.iter().any(|t| t == "Bash")),
+            "Bash was offered without a shell grant"
+        );
+        // And for `ask`: without a clarifier the call reaches a stub that errors every time, so the
+        // only thing an offer buys is turns spent discovering that.
+        for run in &offered[..2] {
+            assert!(
+                !run.iter()
+                    .any(|tool| tool == ratatoskr_agent::ASK_TOOL_NAME),
+                "`ask` was offered without a clarifier to answer it"
+            );
+        }
+        assert!(
+            offered[2]
+                .iter()
+                .any(|tool| tool == ratatoskr_agent::ASK_TOOL_NAME),
+            "`ask` must still be offered where Rust wired a clarifier"
+        );
+        // Reading is not gated on the root, and never was.
+        assert!(offered[0].iter().any(|tool| tool == "Read"));
+        drop(offered);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4254,7 +4547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn temporary_operation_adapters_remain_registered_and_guarded() {
+    async fn operation_host_adapters_remain_registered_and_guarded() {
         let dir = std::env::temp_dir().join(format!(
             "ratatoskr-temporary-operations-{}",
             std::process::id()
@@ -4276,17 +4569,20 @@ mod tests {
         let hosts =
             build_hosts_with_turn(&ctx, &[], Arc::new(RecordingStageTurn::default())).unwrap();
 
-        for (name, _) in TEMPORARY_OPERATIONS {
+        for (name, _) in OPERATION_HOSTS {
             assert!(
                 hosts.contains_key(*name),
                 "missing operation adapter `{name}`"
             );
         }
-        assert!(
-            hosts.contains_key("memory"),
-            "repository workflows still use the deterministic memory adapter"
-        );
-        for removed in ["red_team", "implementer", "newlyIntroducedFailures"] {
+        // `memory` was superseded by the composite `context` operation, which is what guarantees
+        // the ranked search happened. Nothing calls it, so it is not a host.
+        for removed in [
+            "memory",
+            "red_team",
+            "implementer",
+            "newlyIntroducedFailures",
+        ] {
             assert!(
                 !hosts.contains_key(removed),
                 "obsolete operation alias `{removed}` was re-registered"
@@ -4307,11 +4603,11 @@ mod tests {
         let error = hosts["verify"]("{}".to_string()).await.unwrap_err();
         assert!(
             error.contains("verify arg"),
-            "legacy alias changed: {error}"
+            "operation host argument check changed: {error}"
         );
 
         ctx.invocations.store(INVOCATION_CEILING, Ordering::Relaxed);
-        let error = hosts["memory"]("{}".to_string()).await.unwrap_err();
+        let error = hosts["iterate"]("{}".to_string()).await.unwrap_err();
         assert!(error.contains("runaway loop"));
 
         let context = crate::built_in_stages()
@@ -4323,10 +4619,10 @@ mod tests {
             &[context],
             Arc::new(RecordingStageTurn::default()),
         ) {
-            Ok(_) => panic!("a declared stage replaced a temporary operation adapter"),
+            Ok(_) => panic!("a declared stage replaced an operation host"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("legacy workflow operation"));
+        assert!(error.to_string().contains("workflow operation host"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4342,14 +4638,14 @@ mod tests {
         std::fs::write(
             &workflow_path,
             r#"defineWorkflow({ name: "terminal-probe" });
-               async function plan(input) {
+               export async function plan(input) {
                  return input.target === "publisher"
                    ? await publisher(input)
                    : await bookkeeper(input);
                }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -4365,7 +4661,7 @@ mod tests {
             crate::PluginContext::default(),
         )
         .unwrap();
-        let stages = execution_stages(&runtime).await.unwrap();
+        let stages = install_execution_stages(&ctx, &runtime).await.unwrap();
         let hosts = build_hosts(&ctx, &stages).unwrap();
         assert!(!hosts.contains_key("publisher"));
         assert!(!hosts.contains_key("bookkeeper"));
@@ -4405,14 +4701,14 @@ mod tests {
         std::fs::write(
             &workflow_path,
             r#"defineWorkflow({ name: "write-stage-probe" });
-               async function plan(input) {
+               export async function plan(input) {
                  return input.target === "redteam_author"
                    ? await redteam_author(input)
                    : await implementer_attempt(input);
                }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -4428,11 +4724,11 @@ mod tests {
             crate::PluginContext::default(),
         )
         .unwrap();
-        let stages = execution_stages(&runtime).await.unwrap();
-        for stage_id in INTERNAL_WRITE_STAGE_IDS {
+        let stages = install_execution_stages(&ctx, &runtime).await.unwrap();
+        for stage_id in ["redteam_author", "implementer_attempt"] {
             let stage = stages
                 .iter()
-                .find(|stage| stage.id == *stage_id)
+                .find(|stage| stage.id == stage_id)
                 .expect("internal stage remains available to Rust adapters");
             assert_eq!(stage.capabilities, [ratatoskr_core::Capability::Write]);
         }
@@ -4441,8 +4737,8 @@ mod tests {
             build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
         assert!(hosts.contains_key("redTeam"));
         assert!(hosts.contains_key("implement"));
-        for stage_id in INTERNAL_WRITE_STAGE_IDS {
-            assert!(!hosts.contains_key(*stage_id));
+        for stage_id in ["redteam_author", "implementer_attempt"] {
+            assert!(!hosts.contains_key(stage_id));
             let error = runtime
                 .run_with_question_renderers(
                     "plan",
@@ -4610,13 +4906,13 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            r#"async function plan(input) {
+            r#"export async function plan(input) {
                  await analyst(input.fresh);
                  return await analyst(input.revision);
                }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -4946,9 +5242,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let source = format!(
-            "defineWorkflow({{ name: \"renderer-parity\" }}); async function run(input) {{ {calls} return true; }}"
+            "defineWorkflow({{ name: \"renderer-parity\" }}); export async function run(input) {{ {calls} return true; }}"
         );
-        let runtime = WorkflowRuntime::bundled_with_includes("renderer-parity", &source, &[])
+        let runtime = WorkflowRuntime::bundled_with_includes("renderer-parity", &source, &[], &[])
             .await
             .unwrap();
         let captured = Arc::new(Mutex::new(HashMap::<String, Vec<serde_json::Value>>::new()));
@@ -5042,6 +5338,633 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_overridden_verifier_agent_is_what_decides_whether_review_runs() {
+        // Enablement asked a fixed table which agent the verifier used, so moving it to a
+        // configured profile made `verifier_enabled` resolve through the *imported* stage, find no
+        // model, and report `{configured:false}` — a run that converged with no review at all and
+        // said nothing about it.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-verifier-agent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"import * as nodes from "ratatoskr/nodes";
+               defineWorkflow({
+                 name: "ours",
+                 stages: [stage("verifier", { ...nodes.verifier, agent: "reason" })],
+               });
+               export async function plan(input) { return input; }"#,
+        )
+        .unwrap();
+        let definitions = standard_definitions().unwrap();
+        let runtime = WorkflowRuntime::load(
+            &workflow_path,
+            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let rules_dir = dir.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        let engine = ScriptEngine::load(&rules_dir).await.unwrap();
+        // Only `reason` has a model: no `[models.verifier]`, and `explore` — the agent the
+        // imported verifier uses — has none.
+        let mut config = RatatoskrConfig::default();
+        config.agents.insert(
+            "reason".to_string(),
+            ratatoskr_core::AgentProfileConfig {
+                model: Some(ratatoskr_core::ModelRoute {
+                    provider: "anthropic".to_string(),
+                    model: "test-model".to_string(),
+                    max_tokens: None,
+                    context_window: None,
+                    temperature: None,
+                    params: None,
+                    session: Default::default(),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let standard = standard_stages().await.unwrap();
+        assert!(
+            !crate::verifier_enabled(&engine, &config, &standard),
+            "without the override there is nowhere for the verifier to run"
+        );
+        let stages = overlaid_stages(&runtime).await.unwrap();
+        assert_eq!(
+            stages
+                .iter()
+                .find(|stage| stage.id == "verifier")
+                .map(|stage| stage.agent.as_str()),
+            Some("reason")
+        );
+        assert!(
+            crate::verifier_enabled(&engine, &config, &stages),
+            "the registry the run executes decides, so the override's profile enables review"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn selection_and_review_are_not_callable_from_a_workflow() {
+        // `scripted_review` reads the *last* `verifier` checkpoint, so a workflow that could call
+        // `verifier({..})` after `verify()` would answer the gate that judges it. `overseer` is
+        // refused as a declaration; installing it as a host anyway would let a workflow burn the
+        // `[models.overseer]` route and overwrite the recorded routing decision.
+        let store = Store::open_in_memory().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-no-gate-host-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let ctx = WorkflowContext::new(
+            None,
+            &RatatoskrConfig::default(),
+            &store,
+            "run-no-gate-host",
+            "try to answer the gate",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = standard_stages().await.unwrap();
+        let hosts = build_hosts_with_turn(
+            &ctx,
+            &stages,
+            Arc::new(RecordingStageTurn::default()) as Arc<dyn StageTurn>,
+        )
+        .unwrap();
+        for gate in ["verifier", "overseer"] {
+            assert!(
+                stages.iter().any(|stage| stage.id == gate),
+                "`{gate}` must stay in the registry for the Rust adapter that runs it"
+            );
+            assert!(
+                !hosts.contains_key(gate),
+                "`{gate}` must not be reachable from a workflow"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_overridden_standard_stage_is_the_one_a_run_executes() {
+        // The registry a run actually executes from. The override keeps the id `analyst`, so the
+        // standard definition must be gone rather than sitting ahead of it — the by-id scan that
+        // picks a stage to execute and resolves a delegation target takes the first match.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-exec-override-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"import * as nodes from "ratatoskr/nodes";
+               defineWorkflow({
+                 name: "ours",
+                 stages: [
+                   stage("analyst", { ...nodes.analyst, instructions: "our own analysis" }),
+                   stage("reviewer", {
+                     agent: "reason",
+                     instructions: "review",
+                     delegation: { target: "analyst", evidenceContract: "AnalystOutput" },
+                   }),
+                 ],
+               });
+               export async function plan(input) { return input; }"#,
+        )
+        .unwrap();
+        let definitions = standard_definitions().unwrap();
+        let runtime = WorkflowRuntime::load(
+            &workflow_path,
+            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let stages = overlaid_stages(&runtime).await.unwrap();
+        assert_eq!(
+            stages.iter().filter(|stage| stage.id == "analyst").count(),
+            1,
+            "the override replaces the imported stage instead of joining it"
+        );
+        let resolved = stages.iter().find(|stage| stage.id == "analyst").unwrap();
+        assert_eq!(resolved.instructions, "our own analysis");
+        // Everything the override did not restate is still the standard definition's.
+        let standard = standard_stages().await.unwrap();
+        let imported = standard.iter().find(|stage| stage.id == "analyst").unwrap();
+        assert_ne!(imported.instructions, resolved.instructions);
+        assert_eq!(resolved.output_schema, imported.output_schema);
+        // And the delegation target resolves through the same scan.
+        let reviewer = stages.iter().find(|stage| stage.id == "reviewer").unwrap();
+        let target = reviewer.delegation.as_ref().unwrap().target.clone();
+        assert_eq!(
+            stages
+                .iter()
+                .find(|stage| stage.id == target)
+                .unwrap()
+                .instructions,
+            "our own analysis"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_override_of_an_adapter_invoked_stage_is_what_the_model_turn_runs() {
+        // `implementer_attempt` and `redteam_author` never appear in the JavaScript host table:
+        // they run from Rust lifecycle adapters. Those adapters used to build a registry of their
+        // own, so an override of either validated at startup and was then ignored by the turn that
+        // actually ran. Asserted through the adapter entry point, not the registry.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-adapter-override-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"defineWorkflow({
+                 name: "ours",
+                 stages: [
+                   stage("implementer_attempt", {
+                     agent: "build",
+                     governedBy: "implementer",
+                     instructions: "OVERRIDDEN IMPLEMENTER",
+                     outputSchema: { type: "object" },
+                     renderQuestion(input: any) { return "OVERRIDDEN IMPLEMENTER QUESTION"; },
+                   }),
+                   stage("redteam_author", {
+                     agent: "build",
+                     governedBy: "redteam",
+                     instructions: "OVERRIDDEN AUTHOR",
+                     outputSchema: { type: "object" },
+                     renderQuestion(input: any) { return "OVERRIDDEN AUTHOR QUESTION"; },
+                   }),
+                 ],
+               });
+               export async function run(input) { return input; }"#,
+        )
+        .unwrap();
+        let definitions = standard_definitions().unwrap();
+        let runtime = WorkflowRuntime::load(
+            &workflow_path,
+            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("redteam".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-adapter-override",
+            "override an adapter-invoked stage",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        install_execution_stages(&ctx, &runtime).await.unwrap();
+
+        for (stage_id, sentinel) in [
+            ("implementer_attempt", "OVERRIDDEN IMPLEMENTER"),
+            ("redteam_author", "OVERRIDDEN AUTHOR"),
+        ] {
+            // Both are identifiers Rust reads back as a type, so the stub output has to be one.
+            let turn = Arc::new(RecordingStageTurn {
+                output: json!({ "summary": "the override ran" }).to_string(),
+                ..Default::default()
+            });
+            evaluate_standard_stage_with_turn(
+                Arc::clone(&ctx),
+                stage_id,
+                "{}".to_string(),
+                Arc::clone(&turn) as Arc<dyn StageTurn>,
+            )
+            .await
+            .unwrap();
+            let preambles = turn
+                .preambles
+                .lock()
+                .expect("recording runner mutex poisoned");
+            let questions = turn
+                .questions
+                .lock()
+                .expect("recording runner mutex poisoned");
+            assert_eq!(preambles.len(), 1, "`{stage_id}` ran once");
+            assert!(
+                preambles[0].contains(sentinel),
+                "the adapter ran the standard `{stage_id}` instead of the override: {}",
+                preambles[0]
+            );
+            assert!(
+                questions[0].ends_with(&format!("{sentinel} QUESTION")),
+                "the override's renderQuestion is not the one that composed the turn: {}",
+                questions[0]
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_delegation_invoked_as_evidence_is_refused_rather_than_dropped() {
+        // `context_distillation` is both a global a workflow may call directly (checkpointed —
+        // delegation runs) and the stage `context()` invokes as evidence. Load-time validation
+        // cannot tell one invocation from the other, so the evidence path has to refuse the
+        // declaration rather than run the parent turn with the child silently omitted.
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-evidence-delegation-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"import * as nodes from "ratatoskr/nodes";
+               defineWorkflow({
+                 name: "ours",
+                 stages: [
+                   stage("context_distillation", {
+                     ...nodes.context_distillation,
+                     delegation: { target: "helper", inputLimit: 65536 },
+                   }),
+                   stage("helper", { agent: "explore", instructions: "help" }),
+                 ],
+               });
+               export async function plan(input) { return input; }"#,
+        )
+        .unwrap();
+        let definitions = standard_definitions().unwrap();
+        let runtime = WorkflowRuntime::load(
+            &workflow_path,
+            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("context".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-evidence-delegation",
+            "delegate from an evidence stage",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        install_execution_stages(&ctx, &runtime).await.unwrap();
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({
+                "brief": "a brief",
+                "constraints": [],
+                "prior_art": [],
+                "papertrail_summary": ""
+            })
+            .to_string(),
+            ..Default::default()
+        });
+        let error = evaluate_standard_stage_with_turn(
+            Arc::clone(&ctx),
+            "context_distillation",
+            json!({ "issue": "x", "memory": { "memories": [] }, "searchable": false }).to_string(),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await
+        .expect_err("a delegation this caller cannot honour must be refused");
+        assert!(
+            error.contains("context_distillation") && error.contains("helper"),
+            "the refusal names neither the stage nor its delegation target: {error}"
+        );
+        assert!(
+            turn.nodes
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .is_empty(),
+            "the parent turn ran with its delegation dropped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_overridden_implementer_attempt_runs_on_its_own_profiles_model() {
+        // Startup validation never consults `config.models` for a stage, so an override whose
+        // profile carries its own model is legal with no `[models.implementer]` at all. The
+        // lifecycle adapter used to resolve a second route of its own, against the *built-in*
+        // stage table rather than the run's registry, and refused the run with
+        // `MissingRoute("implementer")` before the executor — which resolves the override
+        // correctly — ever ran.
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-implementer-profile-route-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"defineWorkflow({
+                 name: "ours",
+                 stages: [
+                   stage("implementer_attempt", {
+                     agent: "shipwright",
+                     governedBy: "implementer",
+                     inputContract: "ImplementerAttemptInput",
+                     outputContract: "Report",
+                     outputSchema: { type: "object" },
+                     instructions: "OURS",
+                     capabilities: ["write"],
+                   }),
+                 ],
+               });
+               export async function run(input) { return input; }"#,
+        )
+        .unwrap();
+        let definitions = standard_definitions().unwrap();
+        let runtime = WorkflowRuntime::load(
+            &workflow_path,
+            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        // The headline case: the override brings its own model, and the run has none.
+        config.models.remove("implementer");
+        config.agents.insert(
+            "shipwright".to_string(),
+            ratatoskr_core::AgentProfileConfig {
+                model: Some(ratatoskr_core::ModelRoute {
+                    model: "shipwright-model".to_string(),
+                    ..model_route()
+                }),
+                capabilities: vec![ratatoskr_core::Capability::Write],
+                ..Default::default()
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-implementer-profile-route",
+            "override the implementer's stage",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        install_execution_stages(&ctx, &runtime).await.unwrap();
+
+        let analyst = AnalystOutput {
+            impact_summary: "The override supplies the route.".to_string(),
+            touched: Vec::new(),
+            risks: Vec::new(),
+            requirements: Vec::new(),
+            residual_risk: String::new(),
+            changes_code: true,
+            acceptance: Vec::new(),
+            interface: Vec::new(),
+        };
+        let node = build_implementer(&ctx, analyst).await;
+        assert!(
+            node.is_ok(),
+            "an override carrying its own model is a complete route: {:?}",
+            node.err()
+        );
+
+        // And the turn that actually runs is on that model.
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({ "summary": "the override ran" }).to_string(),
+            ..Default::default()
+        });
+        evaluate_standard_stage_with_turn(
+            Arc::clone(&ctx),
+            "implementer_attempt",
+            "{}".to_string(),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            turn.models
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .as_slice(),
+            ["shipwright-model"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_override_that_omits_render_question_gets_no_renderer_at_all() {
+        // An override restates only what it changes, so omitting `renderQuestion` is how a stage
+        // says it wants its structured input. The bundled workflow is evaluated on every adapter
+        // call and registers the standard renderers as it goes; installing the run's renderers over
+        // that left the bundled one answering for a stage that had dropped it, and a replacement
+        // that also changed its input contract got a prompt written for the shape it replaced.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-omitted-renderer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"defineWorkflow({
+                 name: "ours",
+                 stages: [
+                   stage("implementer_attempt", {
+                     agent: "build",
+                     governedBy: "implementer",
+                     instructions: "OVERRIDDEN IMPLEMENTER",
+                     inputContract: "OurImplementerInput",
+                     outputContract: "OurReport",
+                     outputSchema: { type: "object" },
+                   }),
+                   stage("redteam_author", {
+                     agent: "build",
+                     governedBy: "redteam",
+                     instructions: "OVERRIDDEN AUTHOR",
+                     inputContract: "OurAuthorInput",
+                     outputContract: "OurTests",
+                     outputSchema: { type: "object" },
+                     renderQuestion(input: any) { return `AUTHOR: ${input.note}`; },
+                   }),
+                 ],
+               });
+               export async function run(input) { return input; }"#,
+        )
+        .unwrap();
+        let definitions = standard_definitions().unwrap();
+        let runtime = WorkflowRuntime::load(
+            &workflow_path,
+            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("redteam".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-omitted-renderer",
+            "drop a bundled renderer",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        install_execution_stages(&ctx, &runtime).await.unwrap();
+
+        // The bundled `implementer_attempt` renderer reads `input.analyst.impact_summary`; this
+        // input is the override's own shape and has no such field.
+        let input = json!({ "note": "the shape this override declares" }).to_string();
+        // Both stages are read back as a type, so the stub output has to be one.
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({ "summary": "the override ran" }).to_string(),
+            ..Default::default()
+        });
+        evaluate_standard_stage_with_turn(
+            Arc::clone(&ctx),
+            "implementer_attempt",
+            input.clone(),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await
+        .unwrap();
+        // And a stage that did restate `renderQuestion` still gets it: installing the run's table
+        // exactly must not swing into installing nothing.
+        evaluate_standard_stage_with_turn(
+            Arc::clone(&ctx),
+            "redteam_author",
+            input.clone(),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await
+        .unwrap();
+
+        let questions = turn
+            .questions
+            .lock()
+            .expect("recording runner mutex poisoned");
+        assert_eq!(
+            questions[0],
+            format!("Input contract: OurImplementerInput\nOutput contract: OurReport\n\n{input}"),
+            "the stage that dropped renderQuestion must receive its structured input"
+        );
+        assert_eq!(
+            questions[1],
+            "Input contract: OurAuthorInput\nOutput contract: OurTests\n\n\
+             AUTHOR: the shape this override declares"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_repository_workflow_may_take_the_bundled_name() {
+        // Provenance is a property of the runtime, not of its declared name. Comparing against
+        // `ratatoskr-standard-v1` made a repository workflow that chose that name lose every
+        // declaration it made — its own stages and its overrides both.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-bundled-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"import * as nodes from "ratatoskr/nodes";
+               defineWorkflow({
+                 name: "ratatoskr-standard-v1",
+                 stages: [
+                   stage("analyst", { ...nodes.analyst, instructions: "our own analysis" }),
+                   stage("reviewer", { agent: "reason", instructions: "review" }),
+                 ],
+               });
+               export async function plan(input) { return input; }"#,
+        )
+        .unwrap();
+        let definitions = standard_definitions().unwrap();
+        let runtime = WorkflowRuntime::load(
+            &workflow_path,
+            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!runtime.is_bundled());
+        assert!(standard_runtime().await.unwrap().is_bundled());
+
+        let stages = overlaid_stages(&runtime).await.unwrap();
+        assert_eq!(
+            stages
+                .iter()
+                .find(|stage| stage.id == "analyst")
+                .unwrap()
+                .instructions,
+            "our own analysis"
+        );
+        assert!(
+            stages.iter().any(|stage| stage.id == "reviewer"),
+            "a workflow's own stages must survive its choice of name"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn bookkeeper_declaration_matches_its_typed_schema_and_rust_question() {
         let dir = std::env::temp_dir().join(format!(
             "ratatoskr-bookkeeper-renderer-{}",
@@ -5052,21 +5975,24 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            "async function run(input) { return await bookkeeper(input); }",
+            "export async function run(input) { return await bookkeeper(input); }",
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
         let stages = standard_stages().await.unwrap();
+        // The declaration stays in the run's registry — the Rust terminal adapter resolves it
+        // there. What a repository workflow never gets is a host to call it with, which
+        // `repository_workflows_cannot_invoke_terminal_stages` holds.
         assert!(
-            execution_stages(&runtime)
+            overlaid_stages(&runtime)
                 .await
                 .unwrap()
                 .iter()
-                .all(|stage| stage.id != "bookkeeper"),
-            "repository workflows must not manufacture terminal bookkeeping"
+                .any(|stage| stage.id == "bookkeeper"),
+            "the terminal adapter must still be able to resolve its declaration"
         );
         let bookkeeper = stages
             .iter()
@@ -5218,6 +6144,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("compose a memory".to_string()),
             resource_root: Some(dir.clone()),
+            capability_ceiling: ratatoskr_core::Capability::Read,
             rag_rat_worktree: None,
             shell: None,
             publish: None,
@@ -5260,21 +6187,21 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            "async function run(input) { return await publisher(input); }",
+            "export async function run(input) { return await publisher(input); }",
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
         let stages = standard_stages().await.unwrap();
         assert!(
-            execution_stages(&runtime)
+            overlaid_stages(&runtime)
                 .await
                 .unwrap()
                 .iter()
-                .all(|stage| stage.id != "publisher"),
-            "repository workflows must not acquire terminal publish authority"
+                .any(|stage| stage.id == "publisher"),
+            "the terminal adapter must still be able to resolve its declaration"
         );
         let publisher = stages.iter().find(|stage| stage.id == "publisher").unwrap();
         assert_eq!(publisher.agent, "publish");
@@ -5424,6 +6351,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("do not publish".to_string()),
             resource_root: Some(dir.clone()),
+            capability_ceiling: ratatoskr_core::Capability::Publish,
             rag_rat_worktree: None,
             shell: None,
             publish: None,
@@ -5462,6 +6390,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("publish".to_string()),
             resource_root: Some(dir.clone()),
+            capability_ceiling: ratatoskr_core::Capability::Publish,
             rag_rat_worktree: None,
             shell: None,
             publish: Some(StandardStagePublishResources {
@@ -5556,6 +6485,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("deliver the run".to_string()),
             resource_root: Some(dir.clone()),
+            capability_ceiling: ratatoskr_core::Capability::Publish,
             rag_rat_worktree: None,
             shell: None,
             publish: Some(StandardStagePublishResources {
@@ -5660,6 +6590,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("deliver the run".to_string()),
             resource_root: Some(dir.clone()),
+            capability_ceiling: ratatoskr_core::Capability::Publish,
             rag_rat_worktree: None,
             shell: None,
             publish: Some(StandardStagePublishResources { push: None }),
@@ -5748,6 +6679,7 @@ mod tests {
             input_json: "{}".to_string(),
             rendered_question: Some("deliver the run".to_string()),
             resource_root: Some(dir.clone()),
+            capability_ceiling: ratatoskr_core::Capability::Publish,
             rag_rat_worktree: None,
             shell: None,
             publish: None,
@@ -6135,14 +7067,14 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            r#"async function plan(input) { return await context_distillation(input); }"#,
+            r#"export async function plan(input) { return await context_distillation(input); }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
-        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
         let store = Store::open_in_memory().unwrap();
         store
             .upsert_run(
@@ -6380,14 +7312,14 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            r#"async function plan(input) { return await context(input.issue); }"#,
+            r#"export async function plan(input) { return await context(input.issue); }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
-        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
         let store = Store::open_in_memory().unwrap();
         store
             .upsert_run("run-context-no-rag", None, RunStatus::Running.as_str())
@@ -6517,16 +7449,12 @@ mod tests {
         Arc::get_mut(&mut ctx).unwrap().repo_path = repo.clone();
         *ctx.acceptance.lock().unwrap() = Some(Vec::new());
 
-        let configured = build_red_team(&ctx, Vec::new()).unwrap();
-        let author_tools = configured.author.as_ref().unwrap().tools.names();
-        assert!(author_tools.iter().any(|tool| tool == "Write"));
-        assert!(author_tools.iter().any(|tool| tool == "Edit"));
-        let classifier_tools = configured.classifier.as_ref().unwrap().tools.names();
-        assert!(
-            !classifier_tools
-                .iter()
-                .any(|tool| tool == "Write" || tool == "Edit")
-        );
+        // A `redteam` route enables both halves. What each may reach is not decided here: both
+        // drive their turn through the stage executor, and the write ceiling that separates them
+        // is asserted against the turn it actually composes by the generic-stage parity test.
+        let configured = build_red_team(&ctx, Vec::new()).await.unwrap();
+        assert!(configured.author.is_some());
+        assert!(configured.classifier.is_some());
 
         let returned: RedTeamOutput = serde_json::from_str(
             &red_team_host(Arc::clone(&ctx), "null".to_string())
@@ -6552,6 +7480,7 @@ mod tests {
         // Both flows use `run_and_author`: the scripted checkpoint must carry the same
         // deterministic evidence as a built-in invocation on the retained pre-change tree.
         let built_in = build_red_team(&ctx, Vec::new())
+            .await
             .unwrap()
             .run_and_author(worktree.as_path(), &ctx.issue, &analyst.interface)
             .await
@@ -6629,16 +7558,16 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            r#"async function plan(input) {
+            r#"export async function plan(input) {
                 return await redteam_classifier(input.classifier);
             }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
-        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
         let store = Store::open_in_memory().unwrap();
         store
             .upsert_run("run-standard-redteam", None, RunStatus::Running.as_str())
@@ -6709,6 +7638,7 @@ mod tests {
             serde_json::to_string(&author).unwrap(),
             StandardStageResources {
                 resource_root: author_root.clone(),
+                capability_ceiling: ratatoskr_core::Capability::Write,
                 rag_rat_worktree: Some(author_root.clone()),
                 shell: None,
                 publish: None,
@@ -6855,6 +7785,7 @@ mod tests {
             serde_json::to_string(&author).unwrap(),
             StandardStageResources {
                 resource_root: author_root.clone(),
+                capability_ceiling: ratatoskr_core::Capability::Write,
                 rag_rat_worktree: None,
                 shell: None,
                 publish: None,
@@ -7018,10 +7949,13 @@ mod tests {
                 serde_json::to_string(input).unwrap(),
                 StandardStageResources {
                     resource_root: dir.clone(),
+                    capability_ceiling: ratatoskr_core::Capability::Write,
                     rag_rat_worktree: None,
                     shell: None,
                     publish: None,
-                    clarifier: None,
+                    // As the implementer adapter wires it — `ask` is offered on this grant, not on
+                    // the declaration.
+                    clarifier: Some(Arc::new(StaticClarifier)),
                     guidance: None,
                 },
                 Arc::clone(&turn) as Arc<dyn StageTurn>,
@@ -7087,12 +8021,19 @@ mod tests {
             .expect("recording runner mutex poisoned")
             .iter()
         {
-            for expected in ["Read", "Grep", "Glob", "Write", "Edit", "Bash", "ask"] {
+            // The root Rust supplied is what puts the file-mutation tools on the table.
+            for expected in ["Read", "Grep", "Glob", "Write", "Edit", "ask"] {
                 assert!(
                     offered.iter().any(|tool| tool == expected),
                     "missing {expected}"
                 );
             }
+            // These invocations were granted no shell, so `Bash` has nothing behind it and is not
+            // offered — a tool whose every call is refused only spends turns.
+            assert!(
+                !offered.iter().any(|tool| tool == "Bash"),
+                "Bash was offered without a shell grant"
+            );
         }
         let checkpoints = store
             .checkpoints_for_run("run-standard-implementer")
@@ -7163,6 +8104,7 @@ mod tests {
             serde_json::to_string(&input).unwrap(),
             StandardStageResources {
                 resource_root: worktree.clone(),
+                capability_ceiling: ratatoskr_core::Capability::Write,
                 rag_rat_worktree: Some(worktree.clone()),
                 shell: Some(shell.clone()),
                 publish: None,
@@ -7210,6 +8152,7 @@ mod tests {
             serde_json::to_string(&input).unwrap(),
             StandardStageResources {
                 resource_root: dir.clone(),
+                capability_ceiling: ratatoskr_core::Capability::Write,
                 rag_rat_worktree: None,
                 shell: Some(shell),
                 publish: None,
@@ -7291,6 +8234,21 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(overlap, "iterate() is already in progress");
+        // Review excludes editing for the same reason: a verifier that runs while an implementer
+        // is mid-edit reviews a torn tree, and its checkpoint is what decides terminal status.
+        let executor = StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::new(stages),
+            Arc::new(RecordingStageTurn::default()),
+        );
+        let reviewing = verify_host(
+            Arc::clone(&ctx),
+            executor,
+            json!({ "analyst": review_plan() }).to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reviewing, "verify() cannot overlap iterate()");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -7305,14 +8263,14 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            r#"async function plan(input) { return await characterizer(input); }"#,
+            r#"export async function plan(input) { return await characterizer(input); }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
-        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
         let store = Store::open_in_memory().unwrap();
         store
             .upsert_run(
@@ -7603,10 +8561,10 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            r#"async function plan(input) { return await overseer(input); }"#,
+            r#"export async function plan(input) { return await overseer(input); }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -7676,17 +8634,49 @@ mod tests {
             .to_string(),
             ..Default::default()
         });
+        // Selection is Rust-invoked. `overseer` is never a workflow global, so the dispatch under
+        // test is the adapter's — a script asking for it finds nothing there.
         let hosts =
             build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
-        runtime
-            .run_with_question_renderers(
-                "plan",
-                serde_json::to_string(&input).unwrap(),
-                hosts,
-                stage_question_renderers(&stages),
-            )
-            .await
-            .unwrap();
+        assert!(!hosts.contains_key("overseer"));
+        assert!(
+            runtime
+                .run_with_question_renderers(
+                    "plan",
+                    serde_json::to_string(&input).unwrap(),
+                    hosts,
+                    stage_question_renderers(&stages),
+                )
+                .await
+                .is_err()
+        );
+        let executor = StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::new(stages.clone()),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        );
+        execute_standard_stage(
+            &executor,
+            stages
+                .iter()
+                .find(|stage| stage.id == "overseer")
+                .cloned()
+                .unwrap(),
+            serde_json::to_string(&input).unwrap(),
+            StandardStageInvocation {
+                resource_root: None,
+                capability_ceiling: ratatoskr_core::Capability::Read,
+                rag_rat_worktree: None,
+                shell: None,
+                publish: None,
+                clarifier: None,
+                invocation_guidance: None,
+                output: StageOutput::Checkpoint,
+                after_guard: true,
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             *turn.nodes.lock().expect("recording runner mutex poisoned"),
@@ -7771,8 +8761,11 @@ mod tests {
             output: json!({ "workflow": "research" }).to_string(),
             ..Default::default()
         });
-        let mut hosts =
-            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        let executor = StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::new(stages.clone()),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        );
         let envelope = json!({
             "__ratatoskrRenderedQuestion": {
                 "input": {
@@ -7787,9 +8780,16 @@ mod tests {
             }
         })
         .to_string();
-        let error = hosts.remove("overseer").unwrap()(envelope)
-            .await
-            .unwrap_err();
+        // Reached through the executor, not a global: overseer is Rust-invoked.
+        let error = executor.host(
+            stages
+                .iter()
+                .find(|stage| stage.id == "overseer")
+                .cloned()
+                .unwrap(),
+        )(envelope)
+        .await
+        .unwrap_err();
         assert!(error.contains("invalid `OverseerOutput` output"), "{error}");
         assert!(error.contains("reasoning"), "{error}");
         assert!(
@@ -7813,10 +8813,10 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            r#"async function plan(input) { return await verifier(input); }"#,
+            r#"export async function plan(input) { return await verifier(input); }"#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -7900,17 +8900,49 @@ mod tests {
             .to_string(),
             ..Default::default()
         });
+        // Review is Rust-invoked. `verifier` is never a workflow global — `scripted_review` reads
+        // the *last* `verifier` checkpoint, so a script able to call it could answer its own gate.
         let hosts =
             build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
-        runtime
-            .run_with_question_renderers(
-                "plan",
-                input_value.to_string(),
-                hosts,
-                stage_question_renderers(&stages),
-            )
-            .await
-            .unwrap();
+        assert!(!hosts.contains_key("verifier"));
+        assert!(
+            runtime
+                .run_with_question_renderers(
+                    "plan",
+                    input_value.to_string(),
+                    hosts,
+                    stage_question_renderers(&stages),
+                )
+                .await
+                .is_err()
+        );
+        let executor = StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::new(stages.clone()),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        );
+        execute_standard_stage(
+            &executor,
+            stages
+                .iter()
+                .find(|stage| stage.id == "verifier")
+                .cloned()
+                .unwrap(),
+            input_value.to_string(),
+            StandardStageInvocation {
+                resource_root: None,
+                capability_ceiling: ratatoskr_core::Capability::Read,
+                rag_rat_worktree: None,
+                shell: None,
+                publish: None,
+                clarifier: None,
+                invocation_guidance: None,
+                output: StageOutput::Checkpoint,
+                after_guard: true,
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             *turn.nodes.lock().expect("recording runner mutex poisoned"),
@@ -8017,8 +9049,11 @@ mod tests {
             .to_string(),
             ..Default::default()
         });
-        let mut hosts =
-            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
+        let executor = StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::new(stages.clone()),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        );
         let envelope = json!({
             "__ratatoskrRenderedQuestion": {
                 "input": {
@@ -8032,9 +9067,16 @@ mod tests {
             }
         })
         .to_string();
-        let error = hosts.remove("verifier").unwrap()(envelope)
-            .await
-            .unwrap_err();
+        // Reached through the executor, not a global: verifier is Rust-invoked.
+        let error = executor.host(
+            stages
+                .iter()
+                .find(|stage| stage.id == "verifier")
+                .cloned()
+                .unwrap(),
+        )(envelope)
+        .await
+        .unwrap_err();
         assert!(error.contains("invalid `VerifierOutput` output"), "{error}");
         assert!(error.contains("failure_scenario"), "{error}");
         assert!(
@@ -8383,6 +9425,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_review_the_implementer_has_since_overwritten_is_not_this_runs_review() {
+        let clean = verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: "nothing blocking".to_string(),
+        };
+        let implementer = json!({ "summary": "edited" });
+        let none: Option<&()> = None;
+
+        // The bundled order — implement, review — is the reviewed one, and stays reviewed.
+        let reviewed = [
+            review_checkpoint("implementer", &implementer, none),
+            review_checkpoint("verifier", &clean, none),
+        ];
+        assert!(matches!(
+            scripted_review(&reviewed),
+            ScriptedReview::Available(_)
+        ));
+
+        // Reviewed, then edited again: the review describes a tree that no longer exists, so
+        // terminal status must not rest on it.
+        let superseded = [
+            review_checkpoint("implementer", &implementer, none),
+            review_checkpoint("verifier", &clean, none),
+            review_checkpoint("implementer", &implementer, none),
+        ];
+        assert!(matches!(
+            scripted_review(&superseded),
+            ScriptedReview::NotRun
+        ));
+    }
+
     #[tokio::test]
     async fn reconstruct_plan_rebuilds_from_checkpoints_and_missing_is_the_gate() {
         let store = Store::open_in_memory().unwrap();
@@ -8664,10 +9738,10 @@ mod tests {
         let workflow_path = dir.join("workflow.ts");
         std::fs::write(
             &workflow_path,
-            "async function run() { throw new Error('terminal failure'); }",
+            "export async function run() { throw new Error('terminal failure'); }",
         )
         .unwrap();
-        let runtime = WorkflowRuntime::load(&workflow_path)
+        let runtime = WorkflowRuntime::load(&workflow_path, &[])
             .await
             .unwrap()
             .unwrap();
@@ -8814,7 +9888,7 @@ mod tests {
             // A source's hosts are the Rust-owned operations plus every stage it declares:
             // `build_declared_stage_hosts` installs declared stages through the same async
             // wrapper, so they carry the same Promise, and they are most of what a workflow calls.
-            let mut hosts: Vec<String> = TEMPORARY_OPERATIONS
+            let mut hosts: Vec<String> = OPERATION_HOSTS
                 .iter()
                 .map(|(name, _)| name.to_string())
                 .collect();
@@ -8823,7 +9897,7 @@ mod tests {
                 rest.split_once('"').map(|(id, _)| id.to_string())
             }));
             assert!(
-                hosts.len() > TEMPORARY_OPERATIONS.len(),
+                hosts.len() > OPERATION_HOSTS.len(),
                 "{path} declares no stages, so this guard would only cover the operations"
             );
             for (number, line) in source.lines().enumerate() {
@@ -9141,8 +10215,8 @@ mod tests {
 
         // And what was resolved is what the implementer's sandbox is built from — the digest,
         // not the mutable tag the config named.
-        let implementer = build_implementer(&ctx, review_plan()).unwrap();
-        let red_team = build_red_team(&ctx, Vec::new()).unwrap();
+        let implementer = build_implementer(&ctx, review_plan()).await.unwrap();
+        let red_team = build_red_team(&ctx, Vec::new()).await.unwrap();
         assert_eq!(implementer.sandbox.image, first_digest);
         assert_eq!(red_team.sandbox.image, first_digest);
 
@@ -9191,7 +10265,7 @@ mod tests {
 
         // The sandbox the run builds is untouched: the host root and the host's toolchain,
         // exactly as configured.
-        let implementer = build_implementer(&ctx, review_plan()).unwrap();
+        let implementer = build_implementer(&ctx, review_plan()).await.unwrap();
         assert_eq!(implementer.sandbox.backend, "landlock");
         assert_eq!(implementer.sandbox.image, config.sandbox.image);
 

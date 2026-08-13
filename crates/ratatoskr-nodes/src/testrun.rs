@@ -12,9 +12,8 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use ratatoskr_core::{AcceptanceStep, ModelRoute, SandboxConfig};
+use ratatoskr_core::{AcceptanceStep, SandboxConfig};
 use ratatoskr_exec::{Mount, SandboxSpec, sandbox_run};
-use ratatoskr_mcp::ToolSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -214,13 +213,10 @@ pub(crate) struct CharacterizerInput {
 ///
 /// Optional by design: with no `[models.characterizer]` route a run still converges on
 /// [`by_exit_code`], comparing at step granularity. Coarser, never wrong.
+///
+/// Carries only the stage context: the executor resolves this stage's route, tools and turn cap
+/// from the run's registry, and charges its turn to the run's ledger.
 pub struct Characterizer {
-    pub route: ModelRoute,
-    pub tools: ToolSet,
-    pub max_turns: Option<usize>,
-    /// Where its cost is charged. It runs on every acceptance run — twice per converge iteration —
-    /// so leaving it unreported understated a run by one of its most frequent calls.
-    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
     /// The generic stage executor context used for characterization.
     pub(crate) declared_context: std::sync::Arc<crate::workflow::WorkflowContext>,
 }

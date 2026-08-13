@@ -180,22 +180,39 @@ pub fn agent_profiles(config: &ratatoskr_core::RatatoskrConfig) -> Vec<AgentProf
     profiles
 }
 
-/// Resolve the profile selected by a built-in stage.
-pub fn stage_profile(
+/// Resolve the profile of the stage that runs under `node` in `stages`.
+///
+/// The registry is a parameter because a route or an enablement decision is about the stage that
+/// will actually run, and a workflow may have overridden it. Resolving against a fixed table
+/// instead is how `stage("verifier", { ...nodes.verifier, agent: "reason" })` came to report the
+/// *built-in* verifier's agent, find no model for it, and disable review with no mention of it.
+///
+/// By stage id first — the standard stages are named after their identities — then by `governedBy`,
+/// which is how the Rust-owned operations name the stage that runs for them: `implementer` resolves
+/// to `implementer_attempt`, `redteam` to `redteam_classifier`, `context` to
+/// `context_distillation`.
+pub fn profile_for(
     config: &ratatoskr_core::RatatoskrConfig,
-    stage_id: &str,
+    stages: &[Stage],
+    node: &str,
 ) -> Option<AgentProfile> {
-    let stage_id = if stage_id == "redteam" {
-        "red_team"
-    } else {
-        stage_id
-    };
-    let stage = built_in_stages()
-        .into_iter()
-        .find(|stage| stage.id == stage_id)?;
+    let stage = for_node(stages, node)?;
     agent_profiles(config)
         .into_iter()
         .find(|profile| profile.id == stage.agent)
+}
+
+/// The stage that runs when `node` is asked for, by the resolution [`profile_for`] documents.
+///
+/// Separate from [`profile_for`] because a route decision needs the stage itself, not its profile:
+/// a stage's ruleset and `[models.*]` route are keyed by [`Stage::governance_id`], and looking those
+/// up under the caller's name while the profile came from here is how the two halves of one decision
+/// came to disagree.
+pub fn for_node<'a>(stages: &'a [Stage], node: &str) -> Option<&'a Stage> {
+    stages
+        .iter()
+        .find(|stage| stage.id == node)
+        .or_else(|| stages.iter().find(|stage| stage.governance_id() == node))
 }
 
 /// Resolve a workflow's script metadata into the registry type validated by the execution layer.
@@ -232,6 +249,22 @@ pub fn stages_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> 
             append_repository_guidance: stage.append_repository_guidance,
         })
         .collect()
+}
+
+/// Lay a workflow's own declarations over a base registry: a declaration whose id is already there
+/// *replaces* that stage in place, a new id is appended.
+///
+/// Importing `ratatoskr/nodes` and changing one field of a standard stage is the point of the
+/// import, so the result has to be that one stage rather than two competing definitions of it.
+/// Replacing in place also keeps the override where the standard stage sat, so the lookups that
+/// resolve a stage by scanning the vec — delegation targets among them — find the override.
+pub fn overlay(base: &mut Vec<Stage>, declared: Vec<Stage>) {
+    for stage in declared {
+        match base.iter_mut().find(|existing| existing.id == stage.id) {
+            Some(existing) => *existing = stage,
+            None => base.push(stage),
+        }
+    }
 }
 
 /// Built-in stage identities are intentionally the historic checkpoint names.

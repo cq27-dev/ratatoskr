@@ -9,28 +9,12 @@
 
 use std::path::PathBuf;
 
-use ratatoskr_core::ModelRoute;
 use ratatoskr_exec::{WorktreePath, create_worktree, delete_worktree_branch, remove_worktree};
 use ratatoskr_graph::{NodeError, parse_validated};
-use ratatoskr_mcp::ToolSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::testrun::{Acceptance, Characterizer, by_exit_code, run_acceptance};
-
-/// rag-rat tools the classifier may use to inspect the failing tests' code.
-pub const CLASSIFIER_TOOLS: &[&str] = &["symbol_lookup", "semantic_search"];
-
-/// Tools required by the test author, which writes its contracted tests before implementation.
-pub const AUTHOR_TOOLS: &[&str] = &[
-    "symbol_lookup",
-    "semantic_search",
-    ratatoskr_agent::files::READ,
-    ratatoskr_agent::files::GREP,
-    ratatoskr_agent::files::GLOB,
-    ratatoskr_agent::files::WRITE,
-    ratatoskr_agent::files::EDIT,
-];
 
 /// One baseline failure's classification. Additive context, not part of the strict pass/fail.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -77,20 +61,11 @@ pub struct RedTeamOutput {
 }
 
 /// Optional LLM classifier for baseline failures.
+///
+/// Carries nothing but the stage context: the classification turn runs through the stage executor,
+/// which resolves this stage's route, tools, capability ceiling, prompt and ledger from the run's
+/// registry. Holding a second copy of any of that here could only disagree with what runs.
 pub struct RedTeamClassifier {
-    pub route: ModelRoute,
-    pub tools: ToolSet,
-    pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
-    pub max_turns: Option<usize>,
-    pub clarifier: Option<std::sync::Arc<dyn ratatoskr_agent::Clarifier>>,
-    /// Legacy ruleset prompt slot; the declared stage resolves the effective prompt.
-    pub system_prompt: Option<String>,
-    /// What the plugins this node binds contribute to it.
-    pub plugins: crate::NodePlugins,
-    /// Where this node reports what its turn cost, for the checkpoint the executor writes.
-    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
-    /// The repository its built-in file tools read within.
-    pub files: Option<std::path::PathBuf>,
     /// The generic stage executor context used for classification.
     pub(crate) declared_context: std::sync::Arc<crate::workflow::WorkflowContext>,
 }
@@ -145,18 +120,12 @@ const AUTHOR_PREAMBLE: &str = include_str!("../prompts/redteam-author.md");
 /// Separate from the classifier because they are different jobs on different sides of the run —
 /// one reads a baseline that already happened, the other writes what has to become true. Both are
 /// opt-in on having a route.
+///
+/// Like the classifier, it carries only the stage context. The `redteam_author` stage declares its
+/// own `write` ceiling and its own tools, and the executor resolves them per turn — which is what
+/// keeps the classifier's read ceiling from taking `Write` and `Edit` away from the author that
+/// shares its governance identity.
 pub struct TestAuthor {
-    pub route: ModelRoute,
-    pub tools: ToolSet,
-    pub policy: Option<std::sync::Arc<dyn ratatoskr_core::ToolPolicy>>,
-    pub max_turns: Option<usize>,
-    pub system_prompt: Option<String>,
-    /// The repository's own conventions (`AGENTS.md`), loaded once from the checkout and prefixed
-    /// to this node's preamble. `None` when the repo ships no conventions file. The test author
-    /// writes code, so it carries these; the classifier, which only reads, does not.
-    pub conventions: Option<String>,
-    pub plugins: crate::NodePlugins,
-    pub ledger: Option<std::sync::Arc<ratatoskr_agent::RunLedger>>,
     /// The generic stage executor context used for test authoring.
     pub(crate) declared_context: std::sync::Arc<crate::workflow::WorkflowContext>,
 }
@@ -181,11 +150,22 @@ impl TestAuthor {
         };
         let input_json = serde_json::to_string(&input)
             .map_err(|error| NodeError::Failed(format!("test author input: {error}")))?;
-        let raw = crate::workflow::evaluate_standard_stage_at(
+        // The author is the one red-team half that mutates: it writes failing tests into the
+        // implementer's pre-change worktree. The grant is stated here rather than inferred from the
+        // root, so the classifier's read-only half — and any override of either — cannot borrow it.
+        let raw = crate::workflow::evaluate_standard_stage_with_resources(
             std::sync::Arc::clone(&self.declared_context),
             "redteam_author",
             input_json,
-            worktree.to_path_buf(),
+            crate::workflow::StandardStageResources {
+                resource_root: worktree.to_path_buf(),
+                capability_ceiling: ratatoskr_core::Capability::Write,
+                rag_rat_worktree: Some(worktree.to_path_buf()),
+                shell: None,
+                publish: None,
+                clarifier: None,
+                guidance: None,
+            },
         )
         .await
         .map_err(|error| NodeError::Failed(format!("test author failed: {error}")))?;

@@ -91,8 +91,18 @@ defineWorkflow({
   purpose: "Answer a question about the repository without changing it.",
   whenToUse: ["the task asks what or why", "no code change is expected"],
 });
-async function plan(input) { /* compose the node bindings */ }
+export async function plan(input) { /* compose the node bindings */ }
 ```
+
+An entry composes the node bindings in whatever order it likes, but the plan itself is
+reconstructed in Rust from what the run checkpointed, so a `plan` entry has to drive `context()`
+and `analyst()` — a workflow that skips either is refused rather than left with half a plan.
+
+A workflow is an ES module, so its entries are the functions it **exports** — a `plan` or `run`
+declared without `export` is module-scoped and the run fails saying so. That is also what lets a
+workflow `import` shared stage definitions instead of restating them; imports resolve only from
+what the host offers (`ratatoskr/nodes`), never from the filesystem, and a specifier that is not a
+string literal is refused when the workflow is loaded.
 
 A workflow that introduces a node of its own lists it in `nodes`, so `.ratatoskr/rules/<node>.ts`
 is accepted rather than rejected as targeting something that does not exist. A node's preamble is
@@ -108,8 +118,9 @@ With one defined it is used; with several, name one with `--workflow <name>` —
 `[models.overseer]` route and one is chosen per task from the declared purposes and cases, with the
 choice and its reasoning checkpointed. Without either, a repo with several workflows is asked to
 name one rather than guessed at: choosing the alphabetically-first would look like a decision while
-being an accident. With none, the built-in flow above runs. A single `.ratatoskr/workflow.ts` still
-works and is registered under its filename.
+being an accident. With none, the built-in flow above runs. A single `.ratatoskr/workflow.ts` is
+also read, and is registered under the name it declares, falling back to its filename when it
+declares none.
 
 Every node's output is validated against its JSON Schema and checkpointed before the next node
 runs, so a failure stops the run with `status = failed` attributed to the node that failed, and the
@@ -568,11 +579,28 @@ See [`examples/workflow.ts`](examples/workflow.ts).
 TypeScript never owns authority. Rust hosts still create and clean worktrees, grant the sandboxed
 command tool, freeze acceptance and the test interface, apply review thresholds, enforce iteration
 and ceiling-replan limits, write checkpoints, infer terminal status, and perform delivery and
-bookkeeping. Internal write-capable model stages and terminal publisher/bookkeeper stages are not
+bookkeeping. Stages the run invokes itself — the verifier and the overseer, the write-capable
+red-team and implementer stages, and the terminal publisher and bookkeeper — are not
 repository-script globals.
 
+A workflow may override an imported stage by declaring it under the same id, but not every standard
+identifier is available. Refused when the workflow loads: selection, delivery, the workflow
+operations, the checkpoint identities the run reads back by name (`implementer`, `red_team`,
+`memory`), the records the run writes itself (`issue`, `clarification`), the red team's governance
+identity (`redteam`) and the internal gate (`referee`) — as is an override that changes an output
+contract the run deserializes. The header of
+[`nodes.ts`](crates/ratatoskr-nodes/workflows/nodes.ts) lists which exports a repository may
+declare.
+
 `.ratatoskr/` otherwise holds runtime state — logs and the store — and is gitignored, except for
-`rules/` and `workflow.ts`, which are version-controlled.
+`rules/`, `workflows/` and `workflow.ts`, which are version-controlled.
+
+A repository's scripts are read before anything evaluates them, and refused past a ceiling: 256 KiB
+a file, 64 nested brackets, and 16 KiB a `LOAD` target. What loads then runs under budgets — 64 MiB
+of heap, a 1 MiB stack, five seconds to load and thirty to compose between stage calls, two minutes
+of composition in one entry. Composition is bookkeeping between model turns, so honest workflows sit
+far below all of these; a stage that thinks for an hour is unaffected, because a stage call suspends
+the clock. The same ceilings govern `rules/`.
 
 Per-run worktrees live outside the checkout (`[worktree] root`). Build tools find their project root
 by walking up, so a worktree nested inside the repository resolves to the outer project rather than

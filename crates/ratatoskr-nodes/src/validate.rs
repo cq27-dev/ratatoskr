@@ -2,18 +2,65 @@
 
 use std::collections::BTreeSet;
 
-use crate::{AgentProfile, PlanError, Stage};
+use crate::{AgentProfile, PlanError, Stage, policy};
 
-const INTERNAL_GATES: &[&str] = &["referee"];
-// These names are kept for existing workflow.ts scripts. They are hosts, not stages: accepting
-// one as a declared stage would replace its declared binding with the legacy host below it.
-const LEGACY_HOST_ALIASES: &[&str] = &["memory", "implement", "iterate", "verify"];
-// The run writes checkpoints under these names itself — `issue` for the task it was given,
-// `clarification` for a completed question exchange — and readers identify those records by name
-// alone: `issue_text` in ratatoskr-serve, the clarification-history check in this crate's workflow
-// module, and the caller resolution the shape API does for a node it cannot place. A declared stage
-// sharing a name would land its own output in the same column and be read as one of those records.
-const RESERVED_RECORD_NAMES: &[&str] = &["issue", "clarification"];
+/// Judge what one workflow declares, before its declarations are laid over the standard registry.
+///
+/// A workflow may reuse a *standard* identifier — that is an override, and the overlay replaces the
+/// imported stage with it. What it may not do is take a name the run itself owns, or change a
+/// contract the Rust side deserializes. Both come from [`crate::policy`], the one table that
+/// classifies a standard identifier. Every case is refused here, at load, rather than filtered
+/// afterwards: silently dropping a declaration is how an override comes to validate at startup and
+/// then not run.
+pub fn validate_declarations(stages: &[Stage], workflow: &str) -> Result<(), PlanError> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for stage in stages {
+        // Declaring the same id twice is not an override of anything: the overlay would silently
+        // keep only the last.
+        if !seen.insert(stage.id.as_str()) {
+            return Err(PlanError::Configuration(format!(
+                "workflow `{workflow}` declares stage `{}` more than once",
+                stage.id
+            )));
+        }
+        if let Some(reason) = policy::reserved(&stage.id) {
+            return Err(PlanError::Configuration(format!(
+                "workflow `{workflow}` declares stage `{}`, which is {}",
+                stage.id,
+                reason.because()
+            )));
+        }
+        // An override replaces the stage a Rust adapter runs, and that adapter deserializes the
+        // output into a concrete type. Changing the contract is accepted by every other gate and
+        // then fails — or, worse, deserializes into the wrong shape — in the middle of a run.
+        if let Some(required) = policy::required_contract(&stage.id)
+            && stage.output_contract != required
+        {
+            return Err(PlanError::Configuration(format!(
+                "workflow `{workflow}` overrides stage `{}` with output contract `{}`; the run deserializes that stage's output as `{required}`, so an override must keep it",
+                stage.id,
+                if stage.output_contract.is_empty() {
+                    "<none>"
+                } else {
+                    &stage.output_contract
+                },
+            )));
+        }
+        // `governedBy` is the identity the model turn is recorded under: its ruleset, its
+        // `[models.*]` route, its plugin bindings, its telemetry attribution and its conversation
+        // key. A name the run owns is no more available there than it is as a stage id.
+        if let Some(governed_by) = stage.governed_by.as_deref()
+            && let Some(reason) = policy::reserved_for_governance(governed_by)
+        {
+            return Err(PlanError::Configuration(format!(
+                "workflow `{workflow}` stage `{}` is governedBy `{governed_by}`, which is {}",
+                stage.id,
+                reason.because()
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Reject invalid stage references before a workflow can start a model call.
 pub fn validate(
@@ -32,7 +79,7 @@ pub fn validate(
     }
 
     for profile in profiles {
-        if INTERNAL_GATES.contains(&profile.id.as_str()) {
+        if policy::reserved(&profile.id) == Some(policy::Reserved::InternalGate) {
             return Err(PlanError::Configuration(format!(
                 "agent `{}` claims internal fixed capability; internal gates are not configurable agents",
                 profile.id
@@ -41,25 +88,19 @@ pub fn validate(
     }
 
     for stage in stages {
-        if INTERNAL_GATES.contains(&stage.id.as_str()) {
+        if policy::reserved(&stage.id) == Some(policy::Reserved::InternalGate) {
             return Err(PlanError::Configuration(format!(
                 "stage `{}` claims internal fixed capability; valid stages: {}",
                 stage.id,
                 stage_names
                     .iter()
-                    .filter(|name| !INTERNAL_GATES.contains(name))
+                    .filter(|name| policy::reserved(name) != Some(policy::Reserved::InternalGate))
                     .copied()
                     .collect::<Vec<_>>()
                     .join(", ")
             )));
         }
-        if LEGACY_HOST_ALIASES.contains(&stage.id.as_str()) {
-            return Err(PlanError::Configuration(format!(
-                "stage `{}` conflicts with a legacy workflow host alias; choose a different stage identifier",
-                stage.id
-            )));
-        }
-        if RESERVED_RECORD_NAMES.contains(&stage.id.as_str()) {
+        if policy::reserved(&stage.id) == Some(policy::Reserved::Record) {
             return Err(PlanError::Configuration(format!(
                 "stage `{}` conflicts with a checkpoint the run writes itself; choose a different stage identifier",
                 stage.id
@@ -104,6 +145,16 @@ pub fn validate(
         let Some(delegation) = &parent.delegation else {
             continue;
         };
+        // Delegation folds a child's evidence into the parent's runtime input on the way to the
+        // parent's checkpoint. A stage the run reads back as evidence never reaches that, so the
+        // declaration would validate here and then be dropped, unmentioned, at every invocation.
+        if policy::folded_as_evidence(&parent.id) {
+            return Err(PlanError::Configuration(format!(
+                "stage `{}` declares delegation but is {}",
+                parent.id,
+                policy::FOLDED_AS_EVIDENCE_BECAUSE
+            )));
+        }
         let Some(target) = stages.iter().find(|stage| stage.id == delegation.target) else {
             return Err(PlanError::Configuration(format!(
                 "stage `{}` delegates to unknown target `{}`; valid stages: {}",
@@ -112,6 +163,23 @@ pub fn validate(
                 stage_names.iter().copied().collect::<Vec<_>>().join(", ")
             )));
         };
+        // The executor invokes a delegated child at the evidence disposition, and refuses a stage
+        // that carries a delegation there — so a chain accepted here is a registry guaranteed to
+        // fail the moment its parent runs. Refuse it while the error can still name the
+        // declaration. Self-delegation is this same case pointing at itself, and would be an
+        // infinite regress if it were honoured.
+        //
+        // Folding evidence recursively is the alternative. It would buy a depth of model turns
+        // nothing bounds, for a shape no workflow here asks for: one stage gathering evidence from
+        // one other is what delegation is for.
+        if let Some(onwards) = &target.delegation {
+            return Err(PlanError::Configuration(format!(
+                "stage `{}` delegates to `{}`, which delegates onwards to `{}`; a delegation \
+                 target must not delegate, and `{}` is invoked as evidence where its own \
+                 delegation cannot run",
+                parent.id, target.id, onwards.target, target.id
+            )));
+        }
         // A delegated child is invoked directly by the Rust executor, not through the JavaScript
         // host wrapper where `renderQuestion` runs. Refuse the unsupported shape up front instead
         // of silently handing the child raw JSON under a declaration that promised another prompt.
@@ -346,23 +414,179 @@ mod tests {
     }
 
     #[test]
-    fn declared_stages_cannot_shadow_legacy_workflow_hosts() {
+    fn declared_stages_cannot_shadow_a_workflow_operation_host() {
+        // Reserved from the host table itself, so a host added there cannot pick up a validation
+        // gap. `context` is the case that used to slip through: it is an operation the bundled
+        // `plan` and `full` both call, and a declaration of it failed only once the run was already
+        // writing checkpoints.
         let template = crate::built_in_stages()
             .into_iter()
             .find(|stage| stage.id == "analyst")
             .unwrap();
-        let profiles = crate::built_in_agents();
 
-        for alias in LEGACY_HOST_ALIASES {
+        for (name, _) in crate::workflow::OPERATION_HOSTS {
             let mut stage = template.clone();
-            stage.id = (*alias).to_string();
-            let stages = [stage];
-            let error = validate(&stages, &profiles, &permitted_for(&stages))
+            stage.id = (*name).to_string();
+            let error = validate_declarations(&[stage], "repo-workflow")
                 .unwrap_err()
                 .to_string();
             assert!(
-                error.contains("legacy workflow host alias"),
-                "{alias} must be reserved: {error}"
+                error.contains("Rust-owned workflow operation"),
+                "`{name}` must be reserved: {error}"
+            );
+            assert!(error.contains(name), "{error}");
+        }
+    }
+
+    #[test]
+    fn declared_stages_cannot_take_a_terminal_adapter_name() {
+        let template = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+
+        for terminal in ["bookkeeper", "publisher"] {
+            let mut stage = template.clone();
+            stage.id = terminal.to_string();
+            let error = validate_declarations(&[stage], "repo-workflow")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("terminal adapter"), "{error}");
+            assert!(error.contains(terminal), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_standard_stage_may_still_be_overridden() {
+        let mut stage = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        stage.id = "implementer_attempt".to_string();
+        stage.output_contract = "Report".to_string();
+
+        assert!(validate_declarations(&[stage], "repo-workflow").is_ok());
+    }
+
+    #[test]
+    fn declared_stages_cannot_take_a_lifecycle_checkpoint_identity() {
+        // The run counts `implementer` checkpoints for the iteration ordinal and the ceiling gate,
+        // and deserializes `implementer`, `red_team` and `memory` into concrete types. A stage
+        // checkpointing its own output under one of those names inflates the count, spends the
+        // ceiling recovery early, or fails deserialization in the middle of a run.
+        let template = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+
+        for reserved in ["implementer", "red_team", "memory"] {
+            let mut stage = template.clone();
+            stage.id = reserved.to_string();
+            let error = validate_declarations(&[stage], "repo-workflow")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("lifecycle checkpoint identity"),
+                "`{reserved}` must be reserved: {error}"
+            );
+            assert!(error.contains(reserved), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_declared_stage_cannot_shadow_the_red_teams_governance_identity() {
+        // Stage resolution matches an exact id before falling back to `governedBy`, so a stage
+        // named `redteam` answers the lookups made for `redteam_classifier` and `redteam_author`:
+        // it decides whether the red team is enabled, and on whose profile. Enabling it that way
+        // then leaves route resolution with a `redteam` that has no stage to resolve, and the run
+        // dies on the name the workflow just introduced. `implementer` and `context`, the sibling
+        // identities, are covered by reservations of their own.
+        let template = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+
+        let mut stage = template.clone();
+        stage.id = "redteam".to_string();
+        let error = validate_declarations(&[stage], "repo-workflow")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stage `redteam`"), "{error}");
+        assert!(error.contains("governance identity"), "{error}");
+
+        // The stages it governs keep their own declarable ids.
+        for declarable in ["redteam_classifier", "redteam_author"] {
+            let mut stage = template.clone();
+            stage.id = declarable.to_string();
+            stage.output_contract = policy::required_contract(declarable).unwrap().to_string();
+            stage.governed_by = Some("redteam".to_string());
+            assert!(
+                validate_declarations(&[stage], "repo-workflow").is_ok(),
+                "`{declarable}` must stay declarable"
+            );
+        }
+    }
+
+    #[test]
+    fn an_override_may_not_change_a_contract_the_run_deserializes() {
+        // `redTeam()` reads the `analyst` checkpoint back as `AnalystOutput` and `implement()`
+        // takes one as its argument. An override that checkpoints another shape passes every other
+        // gate and fails when the adapter reads it — after the stage has already run.
+        let template = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+
+        let mut changed = template.clone();
+        changed.output_contract = "SecurityPlan".to_string();
+        let error = validate_declarations(&[changed], "repo-workflow")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stage `analyst`"), "{error}");
+        assert!(error.contains("`AnalystOutput`"), "{error}");
+        assert!(error.contains("`SecurityPlan`"), "{error}");
+
+        // Everything else about the stage is still the workflow's to change.
+        let mut kept = template;
+        kept.agent = "explore".to_string();
+        kept.instructions = "read the diff first".to_string();
+        assert!(validate_declarations(&[kept], "repo-workflow").is_ok());
+    }
+
+    #[test]
+    fn governance_may_not_name_a_turn_the_workflow_never_makes() {
+        // A stage's model turn runs under its `governedBy` identity: that ruleset, that
+        // `[models.*]` route, those plugin bindings, that telemetry attribution and that
+        // conversation key. Selection runs before a workflow is chosen and delivery after its
+        // outcome is accepted, so neither is an identity a workflow stage can run as.
+        let template = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+
+        for reserved in ["publisher", "bookkeeper", "overseer"] {
+            let mut stage = template.clone();
+            stage.id = "custom_plan".to_string();
+            stage.governed_by = Some(reserved.to_string());
+            let error = validate_declarations(&[stage], "repo-workflow")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!("governedBy `{reserved}`")),
+                "{error}"
+            );
+        }
+
+        // The operations a workflow does drive keep their governance identity: the bundled
+        // definitions declare `implementer_attempt` as governedBy `implementer` and
+        // `context_distillation` as governedBy `context`.
+        for permitted in ["implementer", "context", "redteam"] {
+            let mut stage = template.clone();
+            stage.id = "custom_plan".to_string();
+            stage.governed_by = Some(permitted.to_string());
+            assert!(
+                validate_declarations(&[stage], "repo-workflow").is_ok(),
+                "`{permitted}` must remain a governance identity"
             );
         }
     }
@@ -395,5 +619,102 @@ mod tests {
             error.contains("requires an explicit workflow host call"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_delegation_target_that_itself_delegates_is_refused_at_load() {
+        // The executor invokes a delegated child at the evidence disposition, and a stage with a
+        // delegation of its own is refused there — so a chain that loads is a registry guaranteed
+        // to fail the moment its parent runs. Folding evidence recursively is the alternative, and
+        // it buys a depth of model turns nothing bounds for a shape no workflow here wants.
+        //
+        // Self-delegation is the same declaration pointing at itself: an infinite regress if it
+        // were honoured, and the same refusal covers it.
+        let template = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        let delegating = |id: &str, target: &str| {
+            let mut stage = template.clone();
+            stage.id = id.to_string();
+            stage.output_contract = "Evidence".to_string();
+            stage.output_schema = Some(serde_json::json!({ "type": "object" }));
+            stage.delegation = Some(crate::Delegation {
+                target: target.to_string(),
+                evidence_contract: "Evidence".to_string(),
+                input_limit: 1_000,
+            });
+            stage
+        };
+        let mut leaf = template.clone();
+        leaf.id = "leaf".to_string();
+        leaf.output_contract = "Evidence".to_string();
+        leaf.output_schema = Some(serde_json::json!({ "type": "object" }));
+
+        let chain = [
+            delegating("first", "second"),
+            delegating("second", "leaf"),
+            leaf,
+        ];
+        let error = validate(&chain, &crate::built_in_agents(), &permitted_for(&chain))
+            .expect_err("a delegation target that delegates must be refused")
+            .to_string();
+        assert!(error.contains("first"), "{error}");
+        assert!(error.contains("second"), "{error}");
+        assert!(error.contains("delegates onwards"), "{error}");
+
+        let itself = [delegating("loop", "loop")];
+        let error = validate(&itself, &crate::built_in_agents(), &permitted_for(&itself))
+            .expect_err("a stage that delegates to itself must be refused")
+            .to_string();
+        assert!(error.contains("loop"), "{error}");
+    }
+
+    #[test]
+    fn a_stage_the_run_folds_as_evidence_may_not_delegate() {
+        // The bolt between the policy table and this gate. Delegation only runs on the way to a
+        // checkpoint, so a standard stage whose output an adapter folds into another record takes
+        // the declaration and drops it — silently, on every invocation. Adding one at that
+        // disposition without classifying it here is what this refuses to let happen quietly.
+        let template = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        let mut child = template.clone();
+        child.id = "child".to_string();
+        child.output_contract = "Evidence".to_string();
+        child.output_schema = Some(serde_json::json!({ "type": "object" }));
+        let delegating = |id: &str| {
+            let mut parent = template.clone();
+            parent.id = id.to_string();
+            parent.delegation = Some(crate::Delegation {
+                target: "child".to_string(),
+                evidence_contract: "Evidence".to_string(),
+                input_limit: 1_000,
+            });
+            parent
+        };
+
+        let folded: Vec<&str> = policy::STANDARD_IDENTIFIERS
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| policy::folded_as_evidence(id))
+            .collect();
+        assert!(
+            !folded.is_empty(),
+            "the table classifies no stage as evidence"
+        );
+        for id in folded {
+            let stages = [delegating(id), child.clone()];
+            let error = validate(&stages, &crate::built_in_agents(), &permitted_for(&stages))
+                .expect_err("a stage the run folds as evidence must not take a delegation")
+                .to_string();
+            assert!(error.contains(id), "{error}");
+            assert!(error.contains("rather than checkpointed itself"), "{error}");
+        }
+
+        // The verifier's adapter checkpoints what it runs, so delegation from it reaches execution.
+        let stages = [delegating("verifier"), child];
+        assert!(validate(&stages, &crate::built_in_agents(), &permitted_for(&stages)).is_ok());
     }
 }
