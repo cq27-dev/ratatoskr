@@ -11,6 +11,7 @@ import {
   stagesOf,
   workingNodeNames,
 } from "./derive";
+import { isTerminal } from "./api";
 
 function node(name, state) {
   return { name, state, checkpoints: 0, stage: 0, lane: 0 };
@@ -622,4 +623,29 @@ test("the stages of a box are what its feed is filtered by", () => {
   // themselves.
   expect(stagesOf(stages, "analyst")).toEqual(["analyst"]);
   expect(stagesOf(stages, "characterizer")).toEqual(["characterizer"]);
+});
+
+test("a status this build has never heard of reads as still executing", () => {
+  // The two-sided rule the Rust side keeps: an unclassified status must show a stale run rather
+  // than declare a live one finished. Read the other way, an old bundle against a server that has
+  // since added a non-terminal status hides a live run's controls — `applyDerived` settles every
+  // working node, and `ended` is what turns that on.
+  expect(isTerminal("from_a_newer_build")).toBe(false);
+  expect(isTerminal(null)).toBe(false);
+  for (const live of ["pending", "running", "awaiting_clarification"]) {
+    expect(isTerminal(live)).toBe(false);
+  }
+  // And every status the server can actually persist is classified, including the two the union
+  // had never been told about.
+  for (const done of [
+    "planned",
+    "converged",
+    "max_iterations_reached",
+    "unreviewed",
+    "no_code_change",
+    "failed",
+    "abandoned",
+  ]) {
+    expect(isTerminal(done)).toBe(true);
+  }
 });

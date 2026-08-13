@@ -16,6 +16,8 @@ export type RunStatus =
   | "planned"
   | "converged"
   | "max_iterations_reached"
+  | "unreviewed"
+  | "no_code_change"
   | "failed"
   | "abandoned";
 
@@ -101,14 +103,23 @@ export interface Me {
  * Whether a run has stopped executing. Mirrors `RunStatus::is_terminal` on the server, and the
  * same two-sided rule applies: a status this build has never heard of reads as still executing,
  * which shows a stale run rather than declaring a live one finished.
+ *
+ * So the terminal ones are listed, and everything else — including a status from a newer server —
+ * is in flight. Excluding the in-flight names instead read every unknown as finished, which is the
+ * direction that hides a live run's controls.
  */
+const TERMINAL: ReadonlySet<string> = new Set<RunStatus>([
+  "planned",
+  "converged",
+  "max_iterations_reached",
+  "unreviewed",
+  "no_code_change",
+  "failed",
+  "abandoned",
+]);
+
 export function isTerminal(status: RunStatus | null): boolean {
-  return (
-    status !== null &&
-    status !== "pending" &&
-    status !== "running" &&
-    status !== "awaiting_clarification"
-  );
+  return status !== null && TERMINAL.has(status);
 }
 
 export function mayAct(role: Role | undefined): boolean {
