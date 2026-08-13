@@ -3589,7 +3589,7 @@ mod tests {
         );
         // And the run wrote down the layout the workflow it ran declared, which is what anything
         // drawing this run afterwards places its records against.
-        let shape: Vec<ratatoskr_core::shape::ShapeNode> = serde_json::from_str(
+        let shape: ratatoskr_core::shape::Recorded = serde_json::from_str(
             store
                 .run("run-standard-plan")
                 .await
@@ -3708,6 +3708,126 @@ mod tests {
                 .as_deref(),
             Some(RunStatus::Failed.as_str())
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_workflow_that_declares_no_layout_is_still_drawn_one_box_per_node() {
+        // A layout is optional and `examples/workflow.ts` declares none, so this is a supported
+        // configuration rather than a degenerate one. Such a run records no positions — nothing
+        // knows where its nodes belong — but its registry composes them exactly as a laid-out run's
+        // does, and the dashboard has to draw one box per node all the same.
+        //
+        // Read back through the real reader, because everything downstream of the record is name
+        // matching: a case on either side of the boundary alone passes its own fixture names in.
+        let runtime = WorkflowRuntime::bundled_with_includes(
+            "unplaced",
+            r#"defineWorkflow({ name: "unplaced" });
+               export async function plan(input) {
+                 const gathered = await context(input.issue);
+                 const analysis = await analyst({
+                   issue: input.issue,
+                   scout: gathered.scout,
+                   memory: gathered.memory,
+                 });
+                 return { context: gathered, analyst: analysis };
+               }"#,
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(
+            runtime.meta().layout.is_empty(),
+            "this case is about a workflow that lays out nothing"
+        );
+
+        let dir = std::env::temp_dir().join(format!("ratatoskr-unplaced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let run_id = "run-unplaced";
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("context".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            run_id,
+            "draw a run nobody laid out",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        run_plan_scripted_with_turn(
+            runtime,
+            Arc::clone(&ctx),
+            Arc::new(SequencedStageTurn::new([
+                json!({
+                    "brief": "no layout, same registry",
+                    "constraints": [],
+                    "prior_art": [],
+                    "papertrail_summary": "unplaced"
+                }),
+                json!({ "impact_summary": "draw the boxes", "changes_code": false }),
+            ])) as Arc<dyn StageTurn>,
+        )
+        .await
+        .unwrap();
+
+        let checkpoints = store.checkpoints_for_run(run_id).await.unwrap();
+        // The distillation is the context node's model turn and records under its own name; the
+        // box's aggregate is `context`. Two rows, one box — which is the whole problem here.
+        assert_eq!(
+            checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.node_name.as_str())
+                .collect::<Vec<_>>(),
+            ["issue", "context_distillation", "context", "analyst"]
+        );
+        let run = store.run(run_id).await.unwrap().unwrap();
+        let recorded = ratatoskr_core::shape::recorded(run.shape_json.as_deref());
+        assert!(
+            recorded.nodes.is_empty(),
+            "a workflow that laid nothing out places nothing"
+        );
+        assert_eq!(recorded.members("context"), ["context_distillation"]);
+
+        let drawn = ratatoskr_serve::pipeline::derive_with(
+            Some(RunStatus::Planned.as_str()),
+            &checkpoints,
+            None,
+            run.shape_json.as_deref(),
+        );
+        // One box per node, not one per stage. `context_distillation` is the context node's work
+        // and is drawn inside it.
+        assert_eq!(
+            drawn
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["context", "analyst"]
+        );
+        assert_eq!(
+            drawn[0].stages,
+            ["context_distillation"],
+            "the box says which stages do its work, so the client can fold their events into it"
+        );
+
+        // And the address a control is aimed at is the box the run answers under. `serve` polls
+        // for a stop by the name it draws, so a box drawn under a member's name reaches nothing.
+        for node in &drawn {
+            assert!(
+                crate::stage::for_node(&standard_stages().await.unwrap(), &node.name)
+                    .is_some_and(|stage| stage.node_id() == node.name)
+                    || checkpoints
+                        .iter()
+                        .any(|checkpoint| checkpoint.node_name == node.name),
+                "`{}` is drawn as a box nothing runs or records under",
+                node.name
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

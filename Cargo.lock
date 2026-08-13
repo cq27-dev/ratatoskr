@@ -5430,6 +5430,7 @@ dependencies = [
  "ratatoskr-mcp",
  "ratatoskr-plugin",
  "ratatoskr-script",
+ "ratatoskr-serve",
  "ratatoskr-store",
  "reqwest",
  "rmcp",

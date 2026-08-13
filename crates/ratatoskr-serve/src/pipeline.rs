@@ -250,10 +250,11 @@ pub fn derive_with(
     shape_json: Option<&str>,
 ) -> Vec<NodeView> {
     // The graph the run recorded, and only that. A run from another machine — or from this one
-    // before the pipeline changed — is drawn against its own shape; one that recorded none is
-    // placed entirely by `append_unknown`, from the records it has.
-    let shape = ratatoskr_core::shape::recorded(shape_json);
-    let stages = stages_of(&shape);
+    // before the pipeline changed — is drawn against its own shape; one that recorded no layout is
+    // placed entirely by `append_unknown`, from the records it has. Its membership still applies
+    // there: which stages compose a node is the registry's, not the layout's.
+    let recorded = ratatoskr_core::shape::recorded(shape_json);
+    let stages = stages_of(&recorded.nodes);
     let terminal = is_terminal(status);
     let failed = status == Some("failed");
     // Once the implementer has checkpointed, a failure has two candidates and the record separates
@@ -328,7 +329,7 @@ pub fn derive_with(
                 checkpointed_state(name, terminal)
             };
 
-            let stages = composing(node);
+            let stages = recorded.members(name);
             out.push(NodeView {
                 telemetry: NodeTelemetryView::totalled(checkpoints, &stages),
                 planned: PlannedNode::of(config, name),
@@ -346,20 +347,8 @@ pub fn derive_with(
             });
         }
     }
-    append_unknown(&mut out, checkpoints, config, terminal);
+    append_unknown(&mut out, checkpoints, config, terminal, &recorded);
     out
-}
-
-/// The stages composing a shaped node.
-///
-/// A shape recorded before membership was carried says nothing, and a node is then exactly itself —
-/// which is what every node of such a run was.
-fn composing(node: &ratatoskr_core::shape::ShapeNode) -> Vec<String> {
-    if node.stages.is_empty() {
-        vec![node.name.clone()]
-    } else {
-        node.stages.clone()
-    }
 }
 
 /// What a node that has checkpointed is doing, wherever it sits.
@@ -395,11 +384,19 @@ fn checkpointed_state(name: &str, terminal: bool) -> NodeState {
 /// available, where a shared column would assert nodes ran side by side that merely lack a layout. What each node is *doing*
 /// comes from [`checkpointed_state`], the same rule a placed node gets: a live implementer holds a
 /// checkpoint from an earlier converge iteration and is still working, wherever it was drawn.
+///
+/// A record is placed under the NODE it belongs to, not the stage that wrote it. A composed node's
+/// members each write their own row, so a layout-less run of the standard workflow has rows under
+/// `context_distillation`, `redteam_classifier`, `redteam_author` and `implementer_attempt` beside
+/// the three aggregates their operation hosts write — one box each here would draw four strays and,
+/// worse, offer each of them controls under a name the runtime never polls. The member's row folds
+/// into its box, exactly as it does for a node the layout placed.
 fn append_unknown(
     out: &mut Vec<NodeView>,
     checkpoints: &[Checkpoint],
     config: Option<&ratatoskr_core::RatatoskrConfig>,
     terminal: bool,
+    recorded: &ratatoskr_core::shape::Recorded,
 ) {
     // A placed box accounts for its own name AND for every stage that composes it. A member writes
     // its own per-turn row under its own id, which no column carries — without this the red team
@@ -416,7 +413,9 @@ fn append_unknown(
     // `caller`. Splitting a row per caller belongs to the placement work (#248), which owns layout.
     let mut extra: Vec<(&str, usize)> = Vec::new();
     for (idx, c) in checkpoints.iter().enumerate() {
-        let name = c.node_name.as_str();
+        // The box the record belongs to. A member's row is its node's, so the several rows a
+        // composed node's stages write claim one position between them — the first of them.
+        let name = recorded.node_of(c.node_name.as_str());
         // The issue pseudo-node writes a checkpoint and is deliberately not a pipeline node: it
         // records what the run was asked to do, which is not a stage of doing it.
         if name != ISSUE_NODE && !known.contains(name) && seen.insert(name) {
@@ -426,8 +425,7 @@ fn append_unknown(
     let base = out.iter().map(|n| n.stage).max().map_or(0, |s| s + 1);
     for (i, (name, first)) in extra.into_iter().enumerate() {
         let times = node_times(checkpoints, name);
-        // Nothing places it, so nothing says it is anyone's work but its own.
-        let stages = vec![name.to_string()];
+        let stages = recorded.members(name);
         out.push(NodeView {
             telemetry: NodeTelemetryView::totalled(checkpoints, &stages),
             planned: PlannedNode::of(config, name),
@@ -521,56 +519,79 @@ mod tests {
     /// standard columns change; a stale fixture only makes these cases describe a pipeline that no
     /// longer exists, never a run drawn wrongly.
     fn standard_shape() -> String {
-        shape_with(
-            &[
-                (&["overseer"], true),
-                (&["context"], false),
-                (&["analyst"], false),
-                (&["redteam", "implementer"], false),
-                (&["verifier"], true),
-                (&["bookkeeper", "publisher"], false),
-            ],
-            // The three boxes the standard workflow composes out of stages that are not boxes of
-            // their own. Each member records its own turn; the box records the aggregate.
-            &[
-                ("context", &["context_distillation"]),
-                ("redteam", &["redteam_classifier", "redteam_author"]),
-                ("implementer", &["implementer_attempt"]),
-            ],
-        )
+        shape_with(STANDARD_COLUMNS, STANDARD_COMPOSED)
     }
 
-    /// A recorded shape from its columns, each a list of lane names and whether it may be skipped.
-    /// Every box is a single stage of its own name.
+    const STANDARD_COLUMNS: &[(&[&str], bool)] = &[
+        (&["overseer"], true),
+        (&["context"], false),
+        (&["analyst"], false),
+        (&["redteam", "implementer"], false),
+        (&["verifier"], true),
+        (&["bookkeeper", "publisher"], false),
+    ];
+
+    /// The three boxes the standard workflow composes out of stages that are not boxes of their
+    /// own. Each member records its own turn; the box records the aggregate.
+    const STANDARD_COMPOSED: &[(&str, &[&str])] = &[
+        ("context", &["context_distillation"]),
+        ("redteam", &["redteam_classifier", "redteam_author"]),
+        ("implementer", &["implementer_attempt"]),
+    ];
+
+    /// A recording from its columns, each a list of lane names and whether it may be skipped. Every
+    /// box is a single stage of its own name.
     fn shape_of(columns: &[(&[&str], bool)]) -> String {
         shape_with(columns, &[])
     }
 
     /// As [`shape_of`], with the stages composing the boxes that are made of more than themselves.
     fn shape_with(columns: &[(&[&str], bool)], composed: &[(&str, &[&str])]) -> String {
-        let nodes: Vec<ratatoskr_core::shape::ShapeNode> = columns
+        serde_json::to_string(&ratatoskr_core::shape::Recorded {
+            nodes: columns
+                .iter()
+                .enumerate()
+                .flat_map(|(stage, (names, optional))| {
+                    names.iter().enumerate().map(move |(lane, name)| {
+                        ratatoskr_core::shape::ShapeNode {
+                            name: (*name).to_string(),
+                            stage,
+                            lane,
+                            optional: *optional,
+                        }
+                    })
+                })
+                .collect(),
+            stages: registry_of(columns, composed),
+        })
+        .unwrap()
+    }
+
+    /// The registry such a run would have: every box that composes nothing is one stage of its own
+    /// name, and a composed one is its members.
+    fn registry_of(
+        columns: &[(&[&str], bool)],
+        composed: &[(&str, &[&str])],
+    ) -> Vec<ratatoskr_core::shape::RunStage> {
+        columns
             .iter()
-            .enumerate()
-            .flat_map(|(stage, (names, optional))| {
-                names
+            .flat_map(|(names, _)| names.iter())
+            .flat_map(|name| {
+                let members = composed
                     .iter()
-                    .enumerate()
-                    .map(move |(lane, name)| ratatoskr_core::shape::ShapeNode {
-                        name: (*name).to_string(),
-                        stage,
-                        lane,
-                        optional: *optional,
-                        stages: composed
-                            .iter()
-                            .find(|(box_name, _)| box_name == name)
-                            .map_or_else(
-                                || vec![(*name).to_string()],
-                                |(_, members)| members.iter().map(|m| (*m).to_string()).collect(),
-                            ),
+                    .find(|(box_name, _)| box_name == name)
+                    .map_or_else(
+                        || vec![(*name).to_string()],
+                        |(_, members)| members.iter().map(|m| (*m).to_string()).collect(),
+                    );
+                members
+                    .into_iter()
+                    .map(|id| ratatoskr_core::shape::RunStage {
+                        id,
+                        node: (*name).to_string(),
                     })
             })
-            .collect();
-        serde_json::to_string(&nodes).unwrap()
+            .collect()
     }
 
     /// A run of the standard pipeline, which is what every case below is about unless it says
@@ -637,6 +658,50 @@ mod tests {
             output_json: output_json.to_string(),
             ..cp(node, at)
         }
+    }
+
+    #[test]
+    fn a_run_that_laid_nothing_out_still_draws_one_box_per_node() {
+        // A workflow need not declare a layout, so its run records no positions — but it composes
+        // its nodes out of the same stages a laid-out run does, and membership is recorded whether
+        // or not anything was placed. Without it every member of the standard workflow's three
+        // composed nodes draws as a box of its own, and the dashboard offers each of those boxes a
+        // Stop under a name the runtime never polls for.
+        let unplaced = serde_json::to_string(&ratatoskr_core::shape::Recorded {
+            nodes: Vec::new(),
+            stages: registry_of(STANDARD_COLUMNS, STANDARD_COMPOSED),
+        })
+        .unwrap();
+        let views = derive_with(
+            Some("succeeded"),
+            &[
+                cp("context_distillation", "t1"),
+                cp("context", "t2"),
+                cp("analyst", "t3"),
+                cp("redteam_classifier", "t4"),
+                cp("redteam_author", "t5"),
+                cp("redteam", "t6"),
+                cp("implementer_attempt", "t7"),
+                cp("implementer", "t8"),
+                cp("verifier", "t9"),
+            ],
+            None,
+            Some(&unplaced),
+        );
+        assert_eq!(
+            views.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            ["context", "analyst", "redteam", "implementer", "verifier"],
+            "one box per node, in the order the run first recorded under each"
+        );
+        assert_eq!(
+            view(&views, "redteam").stages,
+            ["redteam_classifier", "redteam_author"]
+        );
+        assert_eq!(view(&views, "implementer").stages, ["implementer_attempt"]);
+        assert_eq!(view(&views, "analyst").stages, ["analyst"]);
+        // The box's own record is what says how many times it ran, exactly as for a placed one:
+        // the members' rows are turns inside it, not repeats of it.
+        assert_eq!(view(&views, "redteam").checkpoints, 1);
     }
 
     #[test]

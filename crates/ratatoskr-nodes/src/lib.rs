@@ -256,7 +256,7 @@ async fn record_provenance(
     store: &Store,
     run_id: &str,
     config: &RatatoskrConfig,
-    shape: &[ratatoskr_core::shape::ShapeNode],
+    shape: &ratatoskr_core::shape::Recorded,
 ) {
     let config_json = serde_json::to_string(config)
         .inspect_err(|e| tracing::warn!("could not record the run's config: {e}"))
@@ -3420,11 +3420,11 @@ mod referee_governance_tests {
         // records, and it names the stage it now has.
         let shape = stage::shape_from_workflow(runtime.meta(), &stages);
         assert!(
-            shape.iter().any(|node| node.name == "strategist"),
+            shape.nodes.iter().any(|node| node.name == "strategist"),
             "{shape:?}"
         );
         assert!(
-            !shape.iter().any(|node| node.name == "analyst"),
+            !shape.nodes.iter().any(|node| node.name == "analyst"),
             "{shape:?}"
         );
         // The rename is still judged against the registry it produced, so the column and the stage
@@ -3466,6 +3466,7 @@ mod referee_governance_tests {
         let shape = stage::shape_from_workflow(runtime.meta(), &stages);
         let at = |name: &str| {
             shape
+                .nodes
                 .iter()
                 .find(|node| node.name == name)
                 .unwrap_or_else(|| panic!("the standard layout places `{name}`"))
@@ -3479,13 +3480,14 @@ mod referee_governance_tests {
 
         // Each box says which stages do its work: one of its own name, or the several that compose
         // it. This is what lets the fork be one red-team box while both halves keep their identity.
-        assert_eq!(at("analyst").stages, ["analyst"]);
+        // It comes from the registry, so it is recorded whether or not the box was laid out.
+        assert_eq!(shape.members("analyst"), ["analyst"]);
         assert_eq!(
-            at("redteam").stages,
+            shape.members("redteam"),
             ["redteam_classifier", "redteam_author"]
         );
-        assert_eq!(at("implementer").stages, ["implementer_attempt"]);
-        assert_eq!(at("context").stages, ["context_distillation"]);
+        assert_eq!(shape.members("implementer"), ["implementer_attempt"]);
+        assert_eq!(shape.members("context"), ["context_distillation"]);
 
         // And every node it lays out is one the run can record under, judged against the registry
         // the workflow actually runs.
