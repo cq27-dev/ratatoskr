@@ -225,15 +225,25 @@ pub fn validate(
 ///
 /// The layout is what a viewer places a run's records against, so a name nothing records under is a
 /// box that stays empty forever — a typo and a genuinely missing stage look identical once the run
-/// is drawn. A column may therefore only name something a run reports as:
+/// is drawn.
 ///
-/// - a stage's **governance identity**, which is what a model turn's `node_start` carries. This is
-///   why the standard layout's `context` column is legal: no stage is called `context`, but
-///   `context_distillation` governs as one.
-/// - a stage's **own id**, which is what the executor checkpoints under — but only for a stage that
-///   checkpoints at all. One the run folds into another stage's record as evidence never appears
-///   under its own name, so `implementer_attempt` and `redteam_author` are boxes nothing could fill.
-/// - a **lifecycle identity** the run writes itself (`red_team`, `implementer`, `memory`).
+/// A run records one node's work under *two* names, and a box only draws it whole when they are the
+/// same name. `StageExecutor` passes the stage's [`Stage::governance_id`] as the model turn's node,
+/// so that is what `node_start` and every model event carry; it checkpoints under the stage's `id`.
+/// A column may therefore only name something both halves arrive under:
+///
+/// - a stage's **own id**, when the stage governs as itself — the ordinary case, and what the
+///   standard layout's `analyst`, `verifier`, `bookkeeper` and `publisher` columns are. A stage the
+///   run folds into another's record as evidence never checkpoints under its own name at all, so
+///   `implementer_attempt` and `redteam_author` are boxes nothing could fill.
+/// - an identity **the run itself checkpoints under** while the model turn for that work also runs
+///   under it: `context`, `implementer`, `red_team`, `memory`. This is why the standard layout's
+///   `context` column is legal though no stage is called `context`.
+///
+/// What is refused is a stage whose governance identity differs from its id and is not one of those:
+/// its events land in one box and its checkpoint in another, and no single name draws it. Separating
+/// the two identities (#259) is what makes such a stage drawable; until then it stays out of the
+/// layout rather than being drawn half-empty under either spelling.
 ///
 /// A name may appear once. Two columns naming it would draw two boxes with one identity, and the
 /// viewer keys nodes by name — the second would overwrite the first's edges and state rather than
@@ -245,8 +255,7 @@ pub fn validate_layout(
 ) -> Result<(), PlanError> {
     let mut known: BTreeSet<&str> = policy::checkpoint_identities().collect();
     for stage in stages {
-        known.insert(stage.governance_id());
-        if !policy::folded_as_evidence(&stage.id) {
+        if stage.governance_id() == stage.id && !policy::folded_as_evidence(&stage.id) {
             known.insert(stage.id.as_str());
         }
     }
@@ -254,11 +263,28 @@ pub fn validate_layout(
     for column in layout {
         for node in &column.nodes {
             if !known.contains(node.as_str()) {
-                return Err(PlanError::Configuration(format!(
-                    "workflow `{workflow}` lays out node `{node}`, which nothing it runs records \
-                     under; nodes that can be drawn: {}",
-                    known.iter().copied().collect::<Vec<_>>().join(", ")
-                )));
+                let drawable = known.iter().copied().collect::<Vec<_>>().join(", ");
+                // Name the split where there is one: "nothing records under it" is true but
+                // misleading for a stage whose records exist and simply arrive under two names.
+                let split = stages.iter().find(|stage| {
+                    stage.governance_id() != stage.id
+                        && !policy::folded_as_evidence(&stage.id)
+                        && (stage.id == *node || stage.governance_id() == node)
+                });
+                return Err(PlanError::Configuration(match split {
+                    Some(stage) => format!(
+                        "workflow `{workflow}` lays out node `{node}`, but stage `{id}` is \
+                         governedBy `{governed}`: its model events are recorded under `{governed}` \
+                         and its checkpoint under `{id}`, so neither name draws it whole. Drop \
+                         `governedBy` from `{id}` so the two agree, or lay out one of: {drawable}",
+                        id = stage.id,
+                        governed = stage.governance_id(),
+                    ),
+                    None => format!(
+                        "workflow `{workflow}` lays out node `{node}`, which nothing it runs \
+                         records under; nodes that can be drawn: {drawable}"
+                    ),
+                }));
             }
             if !placed.insert(node.as_str()) {
                 return Err(PlanError::Configuration(format!(
@@ -720,5 +746,47 @@ mod tests {
         // The verifier's adapter checkpoints what it runs, so delegation from it reaches execution.
         let stages = [delegating("verifier"), child];
         assert!(validate(&stages, &crate::built_in_agents(), &permitted_for(&stages)).is_ok());
+    }
+
+    fn column(node: &str) -> [ratatoskr_script::workflow::WorkflowLayoutColumn; 1] {
+        [ratatoskr_script::workflow::WorkflowLayoutColumn {
+            nodes: vec![node.to_string()],
+            optional: false,
+        }]
+    }
+
+    #[test]
+    fn a_stage_governed_under_another_identity_is_not_drawable_under_either_name() {
+        let mut reviewer = crate::stage::stage_fixture("reviewer", "reason");
+        reviewer.governed_by = Some("analyst".to_string());
+        let analyst = crate::stage::stage_fixture("analyst", "reason");
+        let stages = [reviewer, analyst];
+
+        // A run records the reviewer's model events under `analyst` and its checkpoint under
+        // `reviewer`, so a column under either name draws half of it. The one it does not already
+        // own is refused outright...
+        let error = validate_layout(&column("reviewer"), &stages, "ours")
+            .expect_err("a split identity cannot be drawn as one box")
+            .to_string();
+        assert!(error.contains("governedBy `analyst`"), "{error}");
+        assert!(error.contains("neither name draws it whole"), "{error}");
+
+        // ...and `analyst` stays drawable, because the analyst stage governs as itself: that box is
+        // the analyst's own record. The reviewer's turns joining it is what separating execution
+        // identity from governance identity fixes, not something the layout can express.
+        assert!(validate_layout(&column("analyst"), &stages, "ours").is_ok());
+    }
+
+    #[test]
+    fn the_identities_a_run_checkpoints_under_are_drawable_without_a_stage_of_that_name() {
+        // No stage is called any of these; the run writes them itself and the model turn behind
+        // each one is recorded under the same name, so a column names the whole node.
+        let stages = [crate::stage::stage_fixture("analyst", "reason")];
+        for identity in ["context", "implementer", "red_team", "memory"] {
+            assert!(
+                validate_layout(&column(identity), &stages, "ours").is_ok(),
+                "`{identity}` is a name a run records under"
+            );
+        }
     }
 }

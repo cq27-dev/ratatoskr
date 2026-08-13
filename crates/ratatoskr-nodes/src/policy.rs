@@ -273,11 +273,22 @@ pub(crate) fn reserved_for_governance(id: &str) -> Option<Reserved> {
 /// place them for that reason. A list rather than a predicate because a refusal has to name what
 /// *is* allowed to be actionable, and a set the caller can print is the only way acceptance and the
 /// message cannot drift apart.
+///
+/// These are also the names under which a run's *model events* for that work arrive, which is what
+/// makes them drawable rather than merely written: an `implementer_attempt` turn is recorded under
+/// `implementer` and a red-team turn under `redteam`, which the dashboard folds to `red_team`.
+/// `memory` runs no model at all, so its checkpoint is the whole record.
 pub(crate) fn checkpoint_identities() -> impl Iterator<Item = &'static str> {
     STANDARD_IDENTIFIERS
         .iter()
         .filter(|(_, class)| matches!(class, Class::Reserved(Reserved::Lifecycle)))
         .map(|(name, _)| *name)
+        // `context` belongs here for the same reason but is classed `Operation`, because what its
+        // entry records is why a workflow may not *declare* a stage under the name. The run still
+        // checkpoints the merged gather step under it (`context_host`), and `context_distillation`
+        // — the model turn inside that step — governs as `context`, so both halves of the record
+        // arrive under this one name.
+        .chain(std::iter::once("context"))
 }
 
 /// The output contract an override of `id` must keep, because Rust deserializes it.
