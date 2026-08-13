@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use ratatoskr_core::{AgentProfileConfig, Capability, ModelRoute, SessionScope, ToolPolicy};
+use ratatoskr_core::{
+    AgentProfileConfig, Capability, ModelRoute, SessionScope, ToolPolicy, shape::ShapeNode,
+};
 
 /// Reusable model and authority defaults. A profile is not a checkpoint identity; [`Stage`] is.
 #[derive(Clone)]
@@ -251,6 +253,31 @@ pub fn stages_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> 
         .collect()
 }
 
+/// The layout a workflow declared, as the shape a run records.
+///
+/// A column is a `stage` and its `nodes` are its `lane`s, which is the whole vocabulary — the
+/// declaration maps onto [`ShapeNode`] one for one and adds nothing to it. A workflow that declares
+/// no layout gets an empty shape rather than a guessed one: nothing knows where its nodes belong,
+/// and a viewer places what a run actually recorded instead of a position no one declared.
+pub fn shape_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> Vec<ShapeNode> {
+    meta.layout
+        .iter()
+        .enumerate()
+        .flat_map(|(stage, column)| {
+            column
+                .nodes
+                .iter()
+                .enumerate()
+                .map(move |(lane, name)| ShapeNode {
+                    name: name.clone(),
+                    stage,
+                    lane,
+                    optional: column.optional,
+                })
+        })
+        .collect()
+}
+
 /// Lay a workflow's own declarations over a base registry: a declaration whose id is already there
 /// *replaces* that stage in place, a new id is appended.
 ///
@@ -267,37 +294,20 @@ pub fn overlay(base: &mut Vec<Stage>, declared: Vec<Stage>) {
     }
 }
 
-/// Built-in stage identities are intentionally the historic checkpoint names.
-pub fn built_in_stages() -> Vec<Stage> {
-    [
-        ("overseer", "reason", "Vec<Workflow>", "OverseerOutput"),
-        ("scout", "explore", "String", "ScoutOutput"),
-        ("analyst", "reason", "AnalystInput", "AnalystOutput"),
-        ("implementer", "build", "ImplementArg", "ImplementerOutput"),
-        ("verifier", "explore", "VerifierInput", "VerifierOutput"),
-        (
-            "characterizer",
-            "transcribe",
-            "CharacterizerInput",
-            "CharacterizerOutput",
-        ),
-        ("red_team", "reason", "()", "RedTeamOutput"),
-        ("context", "explore", "String", "ContextOutput"),
-        (
-            "bookkeeper",
-            "reason",
-            "BookkeeperInput",
-            "BookkeeperOutput",
-        ),
-        ("publisher", "publish", "PublisherInput", "PublisherOutput"),
-    ]
-    .into_iter()
-    .map(|(id, agent, input_contract, output_contract)| Stage {
+/// One bare stage, for a case that needs a [`Stage`] to mutate rather than a pipeline.
+///
+/// Deliberately not a registry: the stages a run has are `nodes.ts`'s, resolved by
+/// [`crate::workflow::standard_stages`], and a second list of them here would be a second answer to
+/// what the pipeline is. A case that needs the real registry awaits that; a case that only needs
+/// *a* stage builds one here.
+#[cfg(test)]
+pub(crate) fn stage_fixture(id: &str, agent: &str) -> Stage {
+    Stage {
         id: id.into(),
         agent: agent.into(),
         governed_by: None,
-        input_contract: input_contract.into(),
-        output_contract: output_contract.into(),
+        input_contract: String::new(),
+        output_contract: String::new(),
         output_schema: None,
         instructions: String::new(),
         context: String::new(),
@@ -308,8 +318,7 @@ pub fn built_in_stages() -> Vec<Stage> {
         array_normalization: Vec::new(),
         delegation: None,
         append_repository_guidance: true,
-    })
-    .collect()
+    }
 }
 
 #[cfg(test)]
@@ -317,7 +326,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workflow_stage_session_overrides_a_route_and_built_ins_preserve_it() {
+    fn a_declared_session_overrides_a_route_and_an_undeclared_one_preserves_it() {
         let workflow = ratatoskr_script::workflow::WorkflowMeta {
             name: "custom".to_string(),
             purpose: String::new(),
@@ -340,6 +349,7 @@ mod tests {
                 delegation: None,
                 append_repository_guidance: true,
             }],
+            layout: Vec::new(),
         };
 
         let stages = stages_from_workflow(&workflow);
@@ -348,11 +358,11 @@ mod tests {
             SessionScope::Compacted
         );
         assert_eq!(stages[0].governance_id(), "review");
-        assert!(
-            built_in_stages()
-                .iter()
-                .all(|stage| stage.session_scope(SessionScope::Reuse) == SessionScope::Reuse),
-            "legacy stages keep their TOML route session without an explicit workflow override"
+        // A stage that declares no session keeps whatever its `[models.*]` route chose, which is
+        // what makes an existing TOML route authoritative until a workflow says otherwise.
+        assert_eq!(
+            stage_fixture("review", "reason").session_scope(SessionScope::Reuse),
+            SessionScope::Reuse
         );
     }
 }

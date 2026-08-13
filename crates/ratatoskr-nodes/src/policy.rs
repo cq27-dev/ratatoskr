@@ -265,6 +265,34 @@ pub(crate) fn reserved_for_governance(id: &str) -> Option<Reserved> {
     reserved(id).filter(|reason| !reason.governable())
 }
 
+/// The identities a run writes a checkpoint under today, with no stage of that name to declare
+/// them.
+///
+/// `latest_checkpoint` reads `implementer` and `red_team` back by name, so a run records under
+/// those whatever its registry calls the stages behind them, and a workflow's layout may place them
+/// for that reason. A list rather than a predicate because a refusal has to name what *is* allowed
+/// to be actionable, and a set the caller can print is the only way acceptance and the message
+/// cannot drift apart.
+///
+/// These are also the names under which a run's *model events* for that work arrive, which is what
+/// makes them drawable rather than merely written: an `implementer_attempt` turn is recorded under
+/// `implementer` and a red-team turn under `redteam`, which the dashboard folds to `red_team`.
+///
+/// Written out rather than filtered over a [`Class`], because "the run owns this name" and "a run
+/// records under this name" are different questions and no one class answers both. `context` is
+/// [`Reserved::Operation`] — what its entry records is why a workflow may not *declare* a stage
+/// under the name — and the run still checkpoints the merged gather step under it (`context_host`),
+/// with `context_distillation`, the model turn inside that step, governing as `context`: both
+/// halves of the record arrive under this one name. `memory` is the mirror image, and stays out.
+/// It is [`Reserved::Lifecycle`] because `reconstruct_plan` still reads a `memory` checkpoint back
+/// for a run recorded before the merged `context` one existed, so no workflow may declare a stage
+/// under it — but nothing a run does now writes one, and a column naming it would draw a box that
+/// stays empty for the whole run, which is what refusing an undrawable name exists to prevent.
+///
+/// `bundled_standard_full_sequences_revision_review_and_rust_terminal_actions` bolts this list to
+/// what a run of the bundled workflow records, so an entry cannot go stale here unnoticed.
+pub(crate) const RUN_CHECKPOINT_IDENTITIES: &[&str] = &["context", "implementer", "red_team"];
+
 /// The output contract an override of `id` must keep, because Rust deserializes it.
 pub(crate) fn required_contract(id: &str) -> Option<&'static str> {
     match class(id)? {
@@ -320,6 +348,20 @@ mod tests {
                 reserved(name),
                 Some(Reserved::Operation),
                 "operation host `{name}` is not classified as one"
+            );
+        }
+    }
+
+    #[test]
+    fn every_drawable_run_identity_is_one_no_workflow_can_declare() {
+        // A layout may name these though no stage does. Each must therefore be a name a workflow
+        // cannot declare a stage under, or one box would mean the run's own record here and some
+        // repository's stage there. The converse is deliberately not asserted: `memory` is
+        // reserved and not drawable, because nothing a run does records under it.
+        for name in RUN_CHECKPOINT_IDENTITIES {
+            assert!(
+                reserved(name).is_some(),
+                "`{name}` is drawable as a run's own record, so a stage must not be able to claim it"
             );
         }
     }

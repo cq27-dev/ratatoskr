@@ -17,6 +17,26 @@ defineWorkflow({
     stage("publisher", nodes.publisher),
     stage("verifier", nodes.verifier),
   ],
+  // Where a run of this workflow is drawn: one entry per column, `nodes` its lanes in order. The
+  // names are the ones the run checkpoints under, which is what a viewer matches a node's record
+  // against. `optional` marks a column that may legitimately be skipped — the overseer only runs
+  // where a workflow has to be chosen, the verifier only where the repo gave it a route — so an
+  // empty one has not stalled.
+  //
+  // Column ORDER is meaningful: adjacent columns are joined, every node of one to every node of the
+  // next, so placing a node in the column after another draws a hand-off saying the first fed the
+  // second. Within a column nothing is ordered — the two deliveries share the last one because
+  // neither needs the other's result, and the red team and the implementer share the fork column
+  // though the implementer cannot start until the red team has finished. A lane is a position, not
+  // evidence of concurrency; what ran after what is read from the run's own events.
+  layout: [
+    { nodes: ["overseer"], optional: true },
+    { nodes: ["context"] },
+    { nodes: ["analyst"] },
+    { nodes: ["red_team", "implementer"] },
+    { nodes: ["verifier"], optional: true },
+    { nodes: ["bookkeeper", "publisher"] },
+  ],
 });
 
 // Back `ratatoskr plan` with the same runtime used by repository workflows. `context` owns the

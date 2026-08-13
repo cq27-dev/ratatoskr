@@ -221,6 +221,106 @@ pub fn validate(
     Ok(())
 }
 
+/// Refuse a layout column naming a node the run has no way to produce.
+///
+/// The layout is what a viewer places a run's records against, so a name nothing records under is a
+/// box that stays empty forever — a typo and a genuinely missing stage look identical once the run
+/// is drawn.
+///
+/// A run records one node's work under *two* names, and a box only draws it whole when they are the
+/// same name. `StageExecutor` passes the stage's [`Stage::governance_id`] as the model turn's node,
+/// so that is what `node_start` and every model event carry; it checkpoints under the stage's `id`.
+/// A column may therefore only name something both halves arrive under:
+///
+/// - a stage's **own id**, when the stage governs as itself — the ordinary case, and what the
+///   standard layout's `analyst`, `verifier`, `bookkeeper` and `publisher` columns are. A stage the
+///   run folds into another's record as evidence never checkpoints under its own name at all, so
+///   `implementer_attempt` and `redteam_author` are boxes nothing could fill.
+/// - an identity **the run itself checkpoints under** while the model turn for that work also runs
+///   under it: [`policy::RUN_CHECKPOINT_IDENTITIES`]. This is why the standard layout's `context`
+///   column is legal though no stage is called `context`. Being reserved is not enough — `memory`
+///   is a checkpoint identity the run reads back and no workflow may declare, yet nothing records
+///   under it any more, so a column naming it would stay empty for the whole run.
+///
+/// What is refused is a stage whose governance identity differs from its id and is not one of those:
+/// its events land in one box and its checkpoint in another, and no single name draws it. Separating
+/// the two identities (#259) is what makes such a stage drawable; until then it stays out of the
+/// layout rather than being drawn half-empty under either spelling.
+///
+/// A name may appear once. Two columns naming it would draw two boxes with one identity, and the
+/// viewer keys nodes by name — the second would overwrite the first's edges and state rather than
+/// appearing beside it.
+///
+/// What is deliberately NOT checked is whether the column ORDER matches what the workflow does.
+/// Order is meaningful — it is what draws the graph's hand-off edges, see
+/// [`ratatoskr_script::workflow::WorkflowMeta::layout`] — so a layout can claim a hand-off its entry
+/// function never performs, and that stays legal. Which hosts a run reaches, and in what order, is
+/// decided by ordinary TypeScript control flow while the run executes; nothing in the declaration
+/// states a data flow to compare a drawing against, and one layout legitimately serves every path a
+/// run can take, which is what an `optional` column is for. Refusing a legal drawing on a guess
+/// about an imperative script would be exactly the inference this design avoids. The checks here
+/// are the ones the declaration can actually answer: that a named box can be filled at all, and
+/// that each name is drawn once.
+pub fn validate_layout(
+    layout: &[ratatoskr_script::workflow::WorkflowLayoutColumn],
+    stages: &[Stage],
+    workflow: &str,
+) -> Result<(), PlanError> {
+    let mut known: BTreeSet<&str> = policy::RUN_CHECKPOINT_IDENTITIES.iter().copied().collect();
+    for stage in stages {
+        if stage.governance_id() == stage.id && !policy::folded_as_evidence(&stage.id) {
+            known.insert(stage.id.as_str());
+        }
+    }
+    let mut placed: BTreeSet<&str> = BTreeSet::new();
+    for (index, column) in layout.iter().enumerate() {
+        // A column is a position, and an empty one still takes its place in the order: the nodes
+        // after it are drawn a column further along with nothing to their left. Declaring the whole
+        // layout empty is worse — it records exactly what declaring none records, so a workflow
+        // that meant to say where its nodes go is read as having said nothing.
+        if column.nodes.is_empty() {
+            return Err(PlanError::Configuration(format!(
+                "workflow `{workflow}` lays out an empty column at position {index}; a column is \
+                 the nodes drawn side by side in it, and one with none leaves a gap rather than \
+                 placing anything"
+            )));
+        }
+        for node in &column.nodes {
+            if !known.contains(node.as_str()) {
+                let drawable = known.iter().copied().collect::<Vec<_>>().join(", ");
+                // Name the split where there is one: "nothing records under it" is true but
+                // misleading for a stage whose records exist and simply arrive under two names.
+                let split = stages.iter().find(|stage| {
+                    stage.governance_id() != stage.id
+                        && !policy::folded_as_evidence(&stage.id)
+                        && (stage.id == *node || stage.governance_id() == node)
+                });
+                return Err(PlanError::Configuration(match split {
+                    Some(stage) => format!(
+                        "workflow `{workflow}` lays out node `{node}`, but stage `{id}` is \
+                         governedBy `{governed}`: its model events are recorded under `{governed}` \
+                         and its checkpoint under `{id}`, so neither name draws it whole. Drop \
+                         `governedBy` from `{id}` so the two agree, or lay out one of: {drawable}",
+                        id = stage.id,
+                        governed = stage.governance_id(),
+                    ),
+                    None => format!(
+                        "workflow `{workflow}` lays out node `{node}`, which nothing it runs \
+                         records under; nodes that can be drawn: {drawable}"
+                    ),
+                }));
+            }
+            if !placed.insert(node.as_str()) {
+                return Err(PlanError::Configuration(format!(
+                    "workflow `{workflow}` lays out node `{node}` more than once; a run records \
+                     one box under that name, so the later column would replace the earlier"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A declared output contract needs the JSON Schema that makes its name enforceable. Compile the
 /// schema before a run begins, rather than letting a malformed declaration reach a model call.
 pub fn validate_declared_contracts(stages: &[Stage]) -> Result<(), PlanError> {
@@ -259,17 +359,19 @@ fn machine_name(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The governance identities a registry offers: every stage's id and the identity it runs
+    /// under. What `governable_from` derives from the real standard stages, over the stages a case
+    /// declares.
     fn permitted_for(stages: &[Stage]) -> Vec<String> {
-        crate::BUILT_IN_NODES
+        stages
             .iter()
-            .map(|name| (*name).to_string())
-            .chain(stages.iter().map(|stage| stage.id.clone()))
+            .flat_map(|stage| [stage.id.clone(), stage.governance_id().to_string()])
             .collect()
     }
 
     #[test]
     fn declared_contracts_require_a_valid_schema() {
-        let mut stage = crate::built_in_stages().pop().unwrap();
+        let mut stage = crate::stage::stage_fixture("publisher", "publish");
         stage.id = "security_evidence".to_string();
         stage.output_contract = "SecurityEvidence".to_string();
         assert!(validate_declared_contracts(&[stage.clone()]).is_err());
@@ -284,10 +386,7 @@ mod tests {
 
     #[test]
     fn declared_stages_are_a_registry_not_an_execution_sequence() {
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
         let mut plan = template.clone();
         plan.id = "plan".to_string();
         plan.input_contract = "Issue".to_string();
@@ -313,10 +412,7 @@ mod tests {
         // alone — so a declared stage under either name would put its own output where a reader
         // expects the run's, and the shape API would report its `from` field as a node caller.
         for reserved in ["issue", "clarification"] {
-            let mut stage = crate::built_in_stages()
-                .into_iter()
-                .find(|stage| stage.id == "analyst")
-                .unwrap();
+            let mut stage = crate::stage::stage_fixture("analyst", "reason");
             stage.id = reserved.to_string();
             stage.governed_by = None;
 
@@ -331,10 +427,7 @@ mod tests {
 
     #[test]
     fn omitted_governance_keeps_the_stage_identifier_fallback() {
-        let mut stage = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let mut stage = crate::stage::stage_fixture("analyst", "reason");
         stage.id = "custom_plan".to_string();
         stage.governed_by = None;
 
@@ -343,26 +436,25 @@ mod tests {
 
     #[test]
     fn explicit_builtin_governance_is_permitted() {
-        let mut stage = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let mut stage = crate::stage::stage_fixture("analyst", "reason");
         stage.id = "test_author".to_string();
         stage.governed_by = Some("redteam".to_string());
-        let permitted = crate::BUILT_IN_NODES
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect::<Vec<_>>();
 
-        assert!(validate(&[stage], &crate::built_in_agents(), &permitted).is_ok());
+        // `redteam` is what the standard red-team stages are governed by, so it is in the set
+        // `governable_from` derives from them.
+        assert!(
+            validate(
+                &[stage],
+                &crate::built_in_agents(),
+                &["redteam".to_string()],
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn explicit_workflow_governance_is_permitted() {
-        let mut stage = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let mut stage = crate::stage::stage_fixture("analyst", "reason");
         stage.id = "custom_plan".to_string();
         stage.governed_by = Some("shared_policy".to_string());
 
@@ -378,10 +470,7 @@ mod tests {
 
     #[test]
     fn explicit_governance_may_name_another_declared_stage() {
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
         let mut policy = template.clone();
         policy.id = "shared_policy".to_string();
         let mut plan = template;
@@ -394,16 +483,10 @@ mod tests {
 
     #[test]
     fn explicit_unknown_governance_is_rejected_before_execution() {
-        let mut stage = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let mut stage = crate::stage::stage_fixture("analyst", "reason");
         stage.id = "custom_plan".to_string();
         stage.governed_by = Some("verifer".to_string());
-        let permitted = crate::BUILT_IN_NODES
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect::<Vec<_>>();
+        let permitted = ["verifier".to_string(), "redteam".to_string()];
 
         let error = validate(&[stage], &crate::built_in_agents(), &permitted)
             .unwrap_err()
@@ -419,10 +502,7 @@ mod tests {
         // gap. `context` is the case that used to slip through: it is an operation the bundled
         // `plan` and `full` both call, and a declaration of it failed only once the run was already
         // writing checkpoints.
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
 
         for (name, _) in crate::workflow::OPERATION_HOSTS {
             let mut stage = template.clone();
@@ -440,10 +520,7 @@ mod tests {
 
     #[test]
     fn declared_stages_cannot_take_a_terminal_adapter_name() {
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
 
         for terminal in ["bookkeeper", "publisher"] {
             let mut stage = template.clone();
@@ -458,10 +535,7 @@ mod tests {
 
     #[test]
     fn a_standard_stage_may_still_be_overridden() {
-        let mut stage = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let mut stage = crate::stage::stage_fixture("analyst", "reason");
         stage.id = "implementer_attempt".to_string();
         stage.output_contract = "Report".to_string();
 
@@ -474,10 +548,7 @@ mod tests {
         // and deserializes `implementer`, `red_team` and `memory` into concrete types. A stage
         // checkpointing its own output under one of those names inflates the count, spends the
         // ceiling recovery early, or fails deserialization in the middle of a run.
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
 
         for reserved in ["implementer", "red_team", "memory"] {
             let mut stage = template.clone();
@@ -501,10 +572,7 @@ mod tests {
         // then leaves route resolution with a `redteam` that has no stage to resolve, and the run
         // dies on the name the workflow just introduced. `implementer` and `context`, the sibling
         // identities, are covered by reservations of their own.
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
 
         let mut stage = template.clone();
         stage.id = "redteam".to_string();
@@ -532,10 +600,8 @@ mod tests {
         // `redTeam()` reads the `analyst` checkpoint back as `AnalystOutput` and `implement()`
         // takes one as its argument. An override that checkpoints another shape passes every other
         // gate and fails when the adapter reads it — after the stage has already run.
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let mut template = crate::stage::stage_fixture("analyst", "reason");
+        template.output_contract = "AnalystOutput".to_string();
 
         let mut changed = template.clone();
         changed.output_contract = "SecurityPlan".to_string();
@@ -559,10 +625,7 @@ mod tests {
         // `[models.*]` route, those plugin bindings, that telemetry attribution and that
         // conversation key. Selection runs before a workflow is chosen and delivery after its
         // outcome is accepted, so neither is an identity a workflow stage can run as.
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
 
         for reserved in ["publisher", "bookkeeper", "overseer"] {
             let mut stage = template.clone();
@@ -593,10 +656,7 @@ mod tests {
 
     #[test]
     fn a_delegated_renderer_is_refused_before_execution() {
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
         let mut parent = template.clone();
         parent.id = "parent".to_string();
         parent.delegation = Some(crate::Delegation {
@@ -630,10 +690,7 @@ mod tests {
         //
         // Self-delegation is the same declaration pointing at itself: an infinite regress if it
         // were honoured, and the same refusal covers it.
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
         let delegating = |id: &str, target: &str| {
             let mut stage = template.clone();
             stage.id = id.to_string();
@@ -676,10 +733,7 @@ mod tests {
         // checkpoint, so a standard stage whose output an adapter folds into another record takes
         // the declaration and drops it — silently, on every invocation. Adding one at that
         // disposition without classifying it here is what this refuses to let happen quietly.
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
         let mut child = template.clone();
         child.id = "child".to_string();
         child.output_contract = "Evidence".to_string();
@@ -716,5 +770,62 @@ mod tests {
         // The verifier's adapter checkpoints what it runs, so delegation from it reaches execution.
         let stages = [delegating("verifier"), child];
         assert!(validate(&stages, &crate::built_in_agents(), &permitted_for(&stages)).is_ok());
+    }
+
+    fn column(node: &str) -> [ratatoskr_script::workflow::WorkflowLayoutColumn; 1] {
+        [ratatoskr_script::workflow::WorkflowLayoutColumn {
+            nodes: vec![node.to_string()],
+            optional: false,
+        }]
+    }
+
+    #[test]
+    fn a_stage_governed_under_another_identity_is_not_drawable_under_either_name() {
+        let mut reviewer = crate::stage::stage_fixture("reviewer", "reason");
+        reviewer.governed_by = Some("analyst".to_string());
+        let analyst = crate::stage::stage_fixture("analyst", "reason");
+        let stages = [reviewer, analyst];
+
+        // A run records the reviewer's model events under `analyst` and its checkpoint under
+        // `reviewer`, so a column under either name draws half of it. The one it does not already
+        // own is refused outright...
+        let error = validate_layout(&column("reviewer"), &stages, "ours")
+            .expect_err("a split identity cannot be drawn as one box")
+            .to_string();
+        assert!(error.contains("governedBy `analyst`"), "{error}");
+        assert!(error.contains("neither name draws it whole"), "{error}");
+
+        // ...and `analyst` stays drawable, because the analyst stage governs as itself: that box is
+        // the analyst's own record. The reviewer's turns joining it is what separating execution
+        // identity from governance identity fixes, not something the layout can express.
+        assert!(validate_layout(&column("analyst"), &stages, "ours").is_ok());
+    }
+
+    #[test]
+    fn the_identities_a_run_checkpoints_under_are_drawable_without_a_stage_of_that_name() {
+        // No stage is called any of these; the run writes them itself and the model turn behind
+        // each one is recorded under the same name, so a column names the whole node.
+        let stages = [crate::stage::stage_fixture("analyst", "reason")];
+        for identity in ["context", "implementer", "red_team"] {
+            assert!(
+                validate_layout(&column(identity), &stages, "ours").is_ok(),
+                "`{identity}` is a name a run records under"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reserved_identity_nothing_records_under_is_not_drawable() {
+        // `memory` is a lifecycle checkpoint identity — `reconstruct_plan` reads one back for a run
+        // recorded before the merged `context` checkpoint existed — so no workflow may declare a
+        // stage under it. That is not the same as being drawable: nothing a run does writes a
+        // `memory` checkpoint now, so a column naming it is a box that stays empty for the whole
+        // run, which is the case this check exists to refuse.
+        let stages = [crate::stage::stage_fixture("analyst", "reason")];
+        let error = validate_layout(&column("memory"), &stages, "ours")
+            .expect_err("a name nothing records under draws an empty box")
+            .to_string();
+        assert!(error.contains("nothing it runs records under"), "{error}");
+        assert!(error.contains("memory"), "{error}");
     }
 }

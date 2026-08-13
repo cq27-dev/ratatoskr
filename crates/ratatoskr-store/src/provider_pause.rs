@@ -603,7 +603,28 @@ fn touch(tx: &rusqlite::Transaction<'_>, key: &ProviderPauseKey) -> Result<(), S
     Ok(())
 }
 
+/// The node-key spelling this ledger is written in, stamped on the instance database.
+///
+/// `PRAGMA user_version` is the whole marker: the rows themselves cannot say which rule wrote them,
+/// because the old spelling and the new one overlap for every name without an underscore.
+const NODE_KEY_SPELLING: i64 = 1;
+
 fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
+    let spelling: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if spelling < NODE_KEY_SPELLING {
+        // Node keys were once spelled with every underscore stripped, so a Stop recorded then
+        // addresses no node now: a stage stopped as `security_review` sits under `securityreview`,
+        // the child asks under its current name and is told it may run, and the Start that would
+        // clear the row deletes under the current spelling and matches nothing. The old spelling
+        // cannot be turned back into the new one — underscores were dropped, not encoded, so
+        // `securityreview` is as much `securityreview` as `security_review` — so the rows are
+        // cleared rather than rewritten, which leaves the ledger saying what the child already
+        // believes: that nothing is stopped.
+        conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS provider_pause_stops;
+             PRAGMA user_version = {NODE_KEY_SPELLING};"
+        ))?;
+    }
     if !table_exists(conn, "provider_pause_runs")? {
         return Ok(());
     }
@@ -889,6 +910,49 @@ mod tests {
 
         assert!(!pauses.is_holding(&open).await.unwrap());
         assert!(pauses.is_holding(&shut).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_stop_spelled_by_the_old_rule_is_cleared_rather_than_left_unaddressable() {
+        // Node keys once had their underscores stripped, so a stage stopped as `security_review`
+        // was recorded as `securityreview`. Under the current rule nothing addresses that row: the
+        // child asks whether `security_review` is stopped and is told it may run, while the
+        // dashboard keeps listing a stopped node whose Start deletes under the current spelling.
+        // Clearing it makes the ledger agree with the child; keeping it would leave the operator
+        // starting a node the store never stops answering for.
+        let conn = Connection::open_in_memory().expect("in-memory SQLite connection");
+        conn.execute_batch(include_str!("provider_pause_schema.sql"))
+            .expect("pause schema");
+        conn.execute_batch(
+            "INSERT INTO provider_pause_runs
+                (project, run_id, latest_generation, last_seen_ms)
+             VALUES ('project', 'run', 0, 0);
+             INSERT INTO provider_pause_stops (project, run_id, node)
+             VALUES ('project', 'run', 'securityreview');",
+        )
+        .expect("a ledger written under the old spelling");
+
+        let pauses = ProviderPauseStore::from_connection(conn).expect("migrated provider pauses");
+
+        assert!(
+            pauses.stopped_nodes(&key()).await.unwrap().is_empty(),
+            "a stop nothing can address is cleared, not carried forward"
+        );
+
+        // And only once: a Stop written under the current spelling is durable, which is the whole
+        // point of the table.
+        pauses.stop(&key(), "security_review").await.unwrap();
+        {
+            let conn = pauses
+                .conn
+                .lock()
+                .expect("provider pause store mutex poisoned");
+            migrate_schema(&conn).expect("re-opening a migrated ledger");
+        }
+        assert_eq!(
+            pauses.stopped_nodes(&key()).await.unwrap(),
+            ["security_review"]
+        );
     }
 
     #[tokio::test]

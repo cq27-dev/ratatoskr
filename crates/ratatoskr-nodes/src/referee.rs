@@ -624,7 +624,7 @@ rename to src/new.rs
         let violations = judge(Judgement {
             engine: &engine,
             config: &config,
-            stages: &crate::built_in_stages(),
+            stages: &[crate::stage::stage_fixture("verifier", "explore")],
             ledger: &ledger,
             issue: "the issue",
             requirements: &["keep the tests intact".to_string()],
@@ -662,7 +662,7 @@ rename to src/new.rs
         let violations = judge(Judgement {
             engine: &engine,
             config: &config,
-            stages: &crate::built_in_stages(),
+            stages: &[crate::stage::stage_fixture("verifier", "explore")],
             ledger: &ledger,
             issue: "the issue",
             requirements: &[],
@@ -677,7 +677,7 @@ rename to src/new.rs
         let violations = judge(Judgement {
             engine: &engine,
             config: &config,
-            stages: &crate::built_in_stages(),
+            stages: &[crate::stage::stage_fixture("verifier", "explore")],
             ledger: &ledger,
             issue: "the issue",
             requirements: &[],
@@ -704,7 +704,7 @@ rename to src/new.rs
         let result = judge(Judgement {
             engine: &engine,
             config: &config,
-            stages: &crate::built_in_stages(),
+            stages: &[crate::stage::stage_fixture("verifier", "explore")],
             ledger: &ledger,
             issue: "the issue",
             requirements: &[],

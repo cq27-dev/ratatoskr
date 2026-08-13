@@ -27,6 +27,9 @@ export interface NodeView {
   /** Position in the pipeline: stage is the column, lane the row within it. */
   stage: number;
   lane: number;
+  /** Whether the run's recorded shape is what put it there. False means the server placed it from
+   *  its checkpoints, in completion order — which `applyDerived` replaces with the stream's. */
+  shaped?: boolean;
   /** Absent for a node that has not run, or that ran no model. */
   telemetry?: NodeTelemetry;
   /** What the node *would* run on, from config. Present before it has run. */

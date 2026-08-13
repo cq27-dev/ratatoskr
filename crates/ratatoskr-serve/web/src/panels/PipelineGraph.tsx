@@ -18,7 +18,7 @@ import {
 import { Brain, Infinity as InfinityIcon, Repeat, Wrench } from "lucide-react";
 import { TOOL_GROUPS } from "../ui/tools";
 import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode } from "../api";
-import { forkHandoff, type ConvergeLoops } from "../derive";
+import { forkHandoff, handoffDrawn, type ConvergeLoops } from "../derive";
 
 /*
  * Positions are computed from the `stage` and `lane` the server sends with each node, not from a
@@ -458,11 +458,16 @@ export interface LiveNode {
 }
 
 interface Props {
+  /**
+   * The pipeline as it stands at the position being shown — the server's shape with every
+   * per-moment fact already folded in from the event stream, and, at the end of a stopped run,
+   * reconciled against the store. One list, computed once in `App`: a second correction applied
+   * here is how the node a failed run died in went on reading "working" under a failed status,
+   * with the server's answer computed, sent, and overwritten before it could be drawn.
+   */
   nodes: NodeView[];
   /** Keyed by node name. Fills the box while a node is still working. */
   live: Map<string, LiveNode>;
-  /** Every node working right now — more than one late in a run, when nodes run in parallel. */
-  active: ReadonlySet<string>;
   /** Implementer re-entries so far, by route. Folded from the same event prefix as `nodes`. */
   loops: ConvergeLoops;
   selected: string | null;
@@ -470,36 +475,14 @@ interface Props {
   onSelect: (name: string | null) => void;
 }
 
-export default function PipelineGraph({ nodes, live, active, loops, selected, onSelect }: Props) {
-
+export default function PipelineGraph({ nodes, live, loops, selected, onSelect }: Props) {
   /*
-   * The pipeline as it actually stands, from two sources each authoritative for a different half.
-   *
-   * The store proves what has *completed*: checkpoints are durable and survive a reload. The event
-   * stream is the only thing that knows what is happening *now* — and the store's guess at that is
-   * inverted precisely when it matters. Mid-converge the implementer holds a checkpoint and is
-   * still being re-run, so it reads as working; the verifier is an optional stage that has not
-   * checkpointed, so it reads as not started. Someone watching the verifier sees the implementer
-   * lit up instead.
-   *
-   * Everything below reads from this one list — boxes, edges, and the converge loop. Deriving any
-   * of them from the raw list is how the loop came to glow green while a different node worked.
+   * Everything below — boxes, edges, and the converge loop — reads `nodes` and nothing else.
+   * Deriving any of them from a second source is how the loop came to glow green while a different
+   * node worked, and how a failed run's dead node went on reading "working".
    */
-  const view = useMemo(() => {
-    if (!active.size) return nodes;
-    return nodes.map((n) => {
-      if (active.has(n.name)) return { ...n, state: "working" as const };
-      // Nothing says this one is working: fall back to what its checkpoints support. A node with
-      // one is done; a node with none never started.
-      if (n.state === "working") {
-        return { ...n, state: (n.checkpoints > 0 ? "done" : "idle") as NodeView["state"] };
-      }
-      return n;
-    });
-  }, [nodes, active]);
-
-  const columns = useMemo(() => stages(view), [view]);
-  const byName = useMemo(() => new Map(view.map((n) => [n.name, n])), [view]);
+  const columns = useMemo(() => stages(nodes), [nodes]);
+  const byName = useMemo(() => new Map(nodes.map((n) => [n.name, n])), [nodes]);
 
   const desiredNodes = useMemo<PipelineNodeType[]>(() => {
     const maxLanes = Math.max(1, ...columns.map((c) => c.length));
@@ -517,36 +500,54 @@ export default function PipelineGraph({ nodes, live, active, loops, selected, on
 
   const desiredEdges = useMemo<Edge[]>(() => {
     // Every node in a stage feeds every node in the next one — which is what a fork joining back
-    // together looks like, and the only edge relation the pipeline has.
+    // together looks like, and the only edge relation the pipeline has. Except into a node the
+    // shape does not place, whose column is the client's ordering rather than a declared hand-off:
+    // see `handoffDrawn`.
     // Rounded rather than square: the boxes carry the substrate's right angles, and the wiring
     // reads better when it does not compete with them.
+    const forward = (source: NodeView, target: NodeView) => ({
+      id: `${source.name}-${target.name}`,
+      source: source.name,
+      target: target.name,
+      sourceHandle: "out",
+      targetHandle: "in",
+      type: "smoothstep",
+      pathOptions: { borderRadius: 24 },
+    });
     const edges: Edge[] = columns.flatMap((lanes, i) =>
       (columns[i + 1] ?? []).flatMap((target) =>
-        lanes.map((source) => ({
-          id: `${source.name}-${target.name}`,
-          source: source.name,
-          target: target.name,
-          sourceHandle: "out",
-          targetHandle: "in",
-          type: "smoothstep",
-          pathOptions: { borderRadius: 24 },
-        })),
+        lanes.filter((source) => handoffDrawn(source, target)).map((source) => forward(source, target)),
       ),
     );
+
+    /*
+     * The one in-edge an appended node can prove. The server resolves `caller` only where the
+     * record names the invocation rather than adjacency suggesting it — today the referee, which
+     * judges the implementer checkpoint fetched immediately before it — so where it is present it
+     * is the hand-off the columns above deliberately do not draw. Drawn like any other forward
+     * edge, and skipped when the caller has no box or the pair is already joined.
+     */
+    for (const target of nodes) {
+      const source = target.shaped === false && target.caller ? byName.get(target.caller) : undefined;
+      if (!source) continue;
+      const edge = forward(source, target);
+      if (!edges.some((e) => e.id === edge.id)) edges.push(edge);
+    }
 
     /*
      * The one sequenced pair inside a stage: the implementer receives a tree whose tests the red
      * team has already written, and cannot start before it has. Stage edges only ever join one
      * stage to the next, so without this the two read as a fork.
      *
-     * Both names are hardcoded, and that is not an oversight to generalise from `stage`/`lane`:
-     * only the orchestrator knows which pair within a stage is sequenced, and the shape does not
-     * express it — its stage and lane numbers are declarative layout and prove nothing about
-     * ordering or concurrency. `forkHandoff` needs both boxes present in this list, so a workflow
+     * Both names are hardcoded, and that is not an oversight to generalise from `lane`: only the
+     * orchestrator knows which pair within a stage is sequenced, and the shape does not express it —
+     * lane order stacks the boxes and proves nothing about ordering or concurrency. (A node's
+     * *stage* does carry a claim, which is what the edges above are; a lane carries none.)
+     * `forkHandoff` needs both boxes present in this list, so a workflow
      * without a red team draws nothing. A short vertical line down the lane gap, unlabelled and
      * untinted: it is a forward hand-off and should look like the other forward edges.
      */
-    if (forkHandoff(view)) {
+    if (forkHandoff(nodes)) {
       edges.push({
         id: "red_team-implementer",
         source: "red_team",
@@ -636,7 +637,7 @@ export default function PipelineGraph({ nodes, live, active, loops, selected, on
     // Not clickable, and not focusable by tab: an edge here states a relation between two nodes and
     // has nothing to show when you pick it. See the note in `ConvergeEdge` on the hit path.
     return edges.map((e) => ({ ...e, selectable: false, focusable: false, interactionWidth: 0 }));
-  }, [byName, columns, loops, view]);
+  }, [byName, columns, loops, nodes]);
 
   /*
    * React Flow is a controlled component: it owns node measurement and writes the result back

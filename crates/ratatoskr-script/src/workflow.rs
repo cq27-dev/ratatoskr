@@ -114,7 +114,7 @@ globalThis.defineWorkflow = function (meta) {
         throw new Error("defineWorkflow: `name` is required");
     }
     for (var k in meta) {
-        if (k !== "name" && k !== "purpose" && k !== "whenToUse" && k !== "nodes" && k !== "stages") {
+        if (k !== "name" && k !== "purpose" && k !== "whenToUse" && k !== "nodes" && k !== "stages" && k !== "layout") {
             throw new Error("defineWorkflow: unknown key '" + k + "'");
         }
     }
@@ -145,7 +145,8 @@ globalThis.defineWorkflow = function (meta) {
         purpose: meta.purpose || "",
         whenToUse: meta.whenToUse || [],
         nodes: meta.nodes || [],
-        stages: stages
+        stages: stages,
+        layout: meta.layout || []
     };
 };
 globalThis.__workflowMeta = function () {
@@ -238,6 +239,35 @@ pub struct WorkflowMeta {
     /// Ordered user-defined stages. Their contracts are checked at startup before a run starts.
     #[serde(default)]
     pub stages: Vec<WorkflowStage>,
+    /// Where this workflow's nodes sit when a run of it is drawn, in column order.
+    ///
+    /// Column order is meaningful, and is the only edge relation the drawn graph has: adjacent
+    /// columns are joined, every node of one to every node of the next, unconditionally. Putting a
+    /// node in the column after another therefore draws a hand-off saying the first fed the second,
+    /// so two unrelated nodes placed next to each other claim a hand-off that never happens.
+    ///
+    /// Within a column nothing is ordered. Lane order positions the boxes top to bottom and is not
+    /// evidence of concurrency: the nodes of a column may run together, in sequence, or not at all.
+    ///
+    /// None of it is a record of the run. The layout is the author's drawing of the graph; what
+    /// actually ran, and after what, is read from the run's own events.
+    #[serde(default)]
+    pub layout: Vec<WorkflowLayoutColumn>,
+}
+
+/// One column of a workflow's declared layout: the nodes that sit side by side in it.
+///
+/// The column's *position* is the load-bearing part — it is what draws the graph's edges, per
+/// [`WorkflowMeta::layout`]. Within the column, lane order only stacks the boxes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowLayoutColumn {
+    /// The column's nodes, in lane order.
+    pub nodes: Vec<String>,
+    /// Whether the column may legitimately be skipped — an empty optional column has not stalled,
+    /// it was never asked.
+    #[serde(default)]
+    pub optional: bool,
 }
 
 /// A serializable stage declaration kept in the script crate so workflow metadata remains independent
@@ -408,6 +438,7 @@ impl WorkflowRuntime {
             when_to_use: Vec::new(),
             nodes: Vec::new(),
             stages: Vec::new(),
+            layout: Vec::new(),
         });
 
         Ok(Some(WorkflowRuntime {
@@ -2367,6 +2398,43 @@ export async function plan(i) { return { entryRan: true }; }
             serde_json::from_str::<serde_json::Value>(&out).unwrap()["ok"],
             true
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_workflow_declares_where_its_nodes_are_drawn_and_a_misspelt_key_is_refused() {
+        let dir = scratch("declared-layout");
+        std::fs::write(
+            dir.join("laid-out.ts"),
+            r#"defineWorkflow({
+                 name: "laid-out",
+                 layout: [
+                   { nodes: ["opening"], optional: true },
+                   { nodes: ["left", "right"] },
+                 ],
+               });"#,
+        )
+        .unwrap();
+        let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
+        let layout = &found[0].meta().layout;
+        assert_eq!(layout[0].nodes, ["opening"]);
+        assert!(layout[0].optional);
+        assert_eq!(layout[1].nodes, ["left", "right"]);
+        // Omitted is required: a column no one marked skippable is one a run has to reach.
+        assert!(!layout[1].optional);
+
+        // And the allow-list still refuses what it does not know, so `layouts:` binds nothing
+        // silently.
+        std::fs::write(
+            dir.join("misspelt.ts"),
+            r#"defineWorkflow({ name: "misspelt", layouts: [] });"#,
+        )
+        .unwrap();
+        let error = match WorkflowRuntime::discover(&dir, &[]).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("`layouts` is not a key `defineWorkflow` knows"),
+        };
+        assert!(error.contains("unknown key 'layouts'"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

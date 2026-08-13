@@ -8,9 +8,20 @@
 use ratatoskr_store::Checkpoint;
 use serde::Serialize;
 
-/// Nodes that run after the terminal status is written and whose failure is only logged. They can
-/// never be the reason a run failed, so they are never reported `Failed`.
-const CANNOT_FAIL_THE_RUN: &[&str] = &["bookkeeper", "publisher"];
+/// Whether this node's own failure can be what made a run `failed`.
+///
+/// A run fails when its workflow entry returns an error — any host call that returns `Err` and is
+/// not caught. `bookkeeper` and `publisher` never can: they run after the terminal status is
+/// written and their failure is only logged, so a run that failed did not fail in either of them.
+///
+/// Every other name is fallible, including a stage a workflow declared itself: its host error
+/// propagates out of the script and fails the run. Nothing here reads config. A node's route decides
+/// what it will run on, not whether its stage can error — a verifier reached through a ruleset, an
+/// agent profile, or an overridden `governedBy` has no entry under `models` and is fallible all the
+/// same.
+fn can_fail_the_run(name: &str) -> bool {
+    !matches!(name, "bookkeeper" | "publisher")
+}
 
 /// The issue text is checkpointed under this name so `bookkeep` can replay a stored run. It is
 /// not a node — it's the run's input, and it's the only record of the run's subject.
@@ -56,6 +67,12 @@ pub struct NodeView {
     /// positioned from these rather than from a table the frontend maintains in parallel.
     pub stage: usize,
     pub lane: usize,
+    /// Whether the run's recorded shape is what put it there. False means [`append_unknown`]
+    /// placed it, in first-checkpoint order — an order a client holding the event stream can
+    /// better, since completion order is not start order once a workflow runs hosts concurrently.
+    /// The distinction has to be on the wire: the two are otherwise indistinguishable, and a client
+    /// that reordered a declared layout would be redrawing the graph the workflow asked for.
+    pub shaped: bool,
     /// How many checkpoints this node wrote. Only the implementer (per converge iteration) and
     /// the bookkeeper (via `ratatoskr bookkeep` replay) can exceed one.
     pub checkpoints: usize,
@@ -183,37 +200,45 @@ pub(crate) fn is_terminal(status: Option<&str>) -> bool {
 ///   can never cause a `failed` run or be reported `Failed`. A terminal run with no bookkeeper
 ///   checkpoint is either silently failed or never applicable, and is reported `Idle` rather than
 ///   guessed at. Pair it with the run's `last_activity` to judge.
-/// - **A `failed` run that reached the fork died in converge.** Since the only step after the
-///   fork is bookkeeping and that cannot fail the run, the implementer is where it stopped, even
-///   though it has checkpoints from earlier iterations.
-pub fn derive(status: Option<&str>, checkpoints: &[Checkpoint]) -> Vec<NodeView> {
-    derive_with(status, checkpoints, None, None)
-}
-
-/// [`derive`], plus the config the run was started under — so a node that has not run yet can still
-/// say what it will run on.
+/// - **Once the implementer has checkpointed, a `failed` run names nobody.** The implementer
+///   re-enters once per converge iteration and checkpoints once per attempt, so an attempt that died
+///   leaves exactly the record a later host dying leaves: the implementer's last checkpoint and
+///   nothing after it. Two candidates fit — the attempt that never checkpointed, and whatever stage
+///   the cursor sits at — and nothing here separates them, so neither is named. Before the
+///   implementer runs there is nothing to re-enter, the stage the run stopped at is the only
+///   candidate, and it is still reported.
+///
+/// Which node a run died in is answered far better by the event stream, where the node the host
+/// killed is the one left working with no checkpoint to follow it — see `web/src/derive.ts`. That is
+/// the answer the dashboard draws. This derivation is what a run whose log has rotated away has
+/// left, and it says only what checkpoints can prove.
+///
+/// `config` is what the run was started under, so a node that has not run yet can still say what it
+/// will run on.
 pub fn derive_with(
     status: Option<&str>,
     checkpoints: &[Checkpoint],
     config: Option<&ratatoskr_core::RatatoskrConfig>,
     shape_json: Option<&str>,
 ) -> Vec<NodeView> {
-    // The graph the run recorded, not the one this build happens to have. A run from another
-    // machine — or from this one before the pipeline changed — is drawn against its own shape.
-    let shape = ratatoskr_core::shape::recorded_or_built_in(shape_json);
+    // The graph the run recorded, and only that. A run from another machine — or from this one
+    // before the pipeline changed — is drawn against its own shape; one that recorded none is
+    // placed entirely by `append_unknown`, from the records it has.
+    let shape = ratatoskr_core::shape::recorded(shape_json);
     let stages = stages_of(&shape);
     let terminal = is_terminal(status);
     let failed = status == Some("failed");
-    // The fork is wherever the implementer is in THIS run's shape, not a fixed index.
-    let fork = shape
-        .iter()
-        .find(|n| n.name == "implementer")
-        .map(|n| n.stage);
-    let fork_started = fork.is_some_and(|f| {
-        stages
-            .get(f)
-            .is_some_and(|nodes| nodes.iter().any(|n| count(checkpoints, &n.name) > 0))
-    });
+    // Once the implementer has checkpointed, a failure has two candidates and the record separates
+    // neither. The implementer re-enters once per converge iteration without announcing it here, so
+    // an attempt that died leaves the same trace a later host dying leaves — the implementer's last
+    // checkpoint and nothing after it. Reporting the stage the cursor happens to sit at is a guess
+    // about whichever node is drawn next, and reporting the implementer is the same guess mirrored.
+    // Neither is named; the run's own status still says it failed.
+    //
+    // The implementer's OWN checkpoints, not its column's. A declared fork column may hold any
+    // lanes a workflow likes, and a peer that checkpointed says nothing about whether the
+    // implementer ever ran.
+    let unattributable = failed && count(checkpoints, IMPLEMENTER_NODE) > 0;
 
     // A node has finished only if it checkpointed *and* isn't the implementer mid-converge —
     // otherwise the fork would look complete on iteration 1 and the run's activity would be
@@ -236,6 +261,15 @@ pub fn derive_with(
             && !(nodes.iter().all(|n| finished(&n.name))
                 || last_seen.is_some_and(|seen| seen > idx))
     });
+    // How many nodes of the stage the run stopped at could be the one it died in. A declared column
+    // may hold any lanes a workflow likes, and a failure that fits several of them is evidence about
+    // none: naming them all paints boxes red that may never have run. Only a lone candidate is named.
+    let candidates = current.map_or(0, |idx| {
+        stages[idx]
+            .iter()
+            .filter(|n| count(checkpoints, &n.name) == 0 && can_fail_the_run(&n.name))
+            .count()
+    });
 
     let mut out = Vec::new();
     for (idx, nodes) in stages.iter().enumerate() {
@@ -247,29 +281,23 @@ pub fn derive_with(
                 .map(|c| c.created_at.as_str())
                 .collect();
 
-            let state = if failed && Some(idx) == fork && fork_started {
-                // Converge died. Whatever the implementer checkpointed came from earlier
-                // iterations; red-team ran to completion if it recorded anything.
-                match name.as_str() {
-                    "implementer" => NodeState::Failed,
-                    _ if times.is_empty() => NodeState::Failed,
-                    _ => NodeState::Done,
-                }
-            } else if times.is_empty() {
+            let state = if times.is_empty() {
                 match () {
                     // Later than where the run is: nothing to say about it yet.
                     _ if current != Some(idx) => NodeState::Idle,
-                    // A failure here belongs upstream: these run past the terminal status.
-                    _ if CANNOT_FAIL_THE_RUN.contains(&name.as_str()) => NodeState::Idle,
+                    // A failure here belongs upstream: delivery runs past the terminal status.
+                    _ if !can_fail_the_run(name) => NodeState::Idle,
+                    // Once the implementer has run, this stage and its next attempt fit the record
+                    // equally well, so neither is named.
+                    _ if unattributable => NodeState::Idle,
+                    // Several lanes of this column fit the failure equally.
+                    _ if candidates > 1 => NodeState::Idle,
                     _ if failed => NodeState::Failed,
                     _ if !terminal => NodeState::Working,
                     _ => NodeState::Idle,
                 }
-            } else if name == "implementer" && !terminal {
-                // Checkpointed at least once, but converge may still be iterating on it.
-                NodeState::Working
             } else {
-                NodeState::Done
+                checkpointed_state(name, terminal)
             };
 
             out.push(NodeView {
@@ -279,6 +307,7 @@ pub fn derive_with(
                 state,
                 stage: idx,
                 lane,
+                shaped: true,
                 checkpoints: times.len(),
                 first_at: times.first().map(|s| s.to_string()),
                 last_at: times.last().map(|s| s.to_string()),
@@ -287,25 +316,48 @@ pub fn derive_with(
             });
         }
     }
-    append_unknown(&mut out, checkpoints, config);
+    append_unknown(&mut out, checkpoints, config, terminal);
     out
 }
 
-/// Add nodes the run has data for that this build's pipeline does not contain.
+/// What a node that has checkpointed is doing, wherever it sits.
 ///
-/// The shape above is compiled in, so a run of the standard pipeline renders anywhere — including
-/// on an installation with no config at all, which is what an imported run has to survive. A run
-/// from a DIFFERENT graph is the case this covers: a custom workflow's nodes are not in the list,
-/// and without this its checkpoints would be silently dropped and the run would appear to have
-/// done nothing.
+/// A checkpoint proves the node completed something — but the implementer is checkpointed once per
+/// converge iteration, so while the run is live one of its checkpoints says the opposite of
+/// finished. That is the whole rule, and both placements share it: a node the shape places and one
+/// [`append_unknown`] appends are the same evidence read the same way.
+fn checkpointed_state(name: &str, terminal: bool) -> NodeState {
+    if name == IMPLEMENTER_NODE && !terminal {
+        NodeState::Working
+    } else {
+        NodeState::Done
+    }
+}
+
+/// Add nodes the run has data for that its recorded shape does not place.
 ///
-/// They go in trailing stages, in the order they first ran. That is not the shape they executed
-/// in — it cannot be recovered from checkpoints alone — but it shows every node with its output
-/// and its cost, which is what someone analysing a foreign run came for.
+/// Two cases reach here, and neither is exotic. A run from a DIFFERENT graph — an imported one, or
+/// one from before the pipeline changed — carries a shape whose columns do not name the nodes in
+/// its records; without this its checkpoints would be silently dropped and the run would appear to
+/// have done nothing. And a workflow that declares no layout records an empty shape, so *every*
+/// node of such a run arrives here, including its own. Nothing about this path is a fallback for
+/// foreign data only.
+///
+/// They go in trailing stages, in the order they first CHECKPOINTED, which is the only order the
+/// records carry. Concurrent hosts do not finish in the order they started, so they are marked
+/// `shaped: false` and a client holding the event stream places them by first mention instead.
+/// That is not the shape they executed
+/// in — it cannot be recovered from checkpoints alone — but it shows every node with its output and
+/// its cost, which is what someone analysing an unplaced run came for. One stage each, because
+/// adjacent columns are drawn joined: a chain in first-checkpoint order is the least wrong claim
+/// available, where a shared column would assert nodes ran side by side that merely lack a layout. What each node is *doing*
+/// comes from [`checkpointed_state`], the same rule a placed node gets: a live implementer holds a
+/// checkpoint from an earlier converge iteration and is still working, wherever it was drawn.
 fn append_unknown(
     out: &mut Vec<NodeView>,
     checkpoints: &[Checkpoint],
     config: Option<&ratatoskr_core::RatatoskrConfig>,
+    terminal: bool,
 ) {
     let known: std::collections::HashSet<&str> = out.iter().map(|n| n.name.as_str()).collect();
     let mut seen = std::collections::HashSet::new();
@@ -330,10 +382,10 @@ fn append_unknown(
             planned: PlannedNode::of(config, name),
             caller: caller_of(checkpoints, first),
             name: name.to_string(),
-            // A foreign node that wrote a checkpoint has run; nothing here can say more than that.
-            state: NodeState::Done,
+            state: checkpointed_state(name, terminal),
             stage: base + i,
             lane: 0,
+            shaped: false,
             checkpoints: times.len(),
             first_at: times.first().map(|s| s.to_string()),
             last_at: times.last().map(|s| s.to_string()),
@@ -408,6 +460,51 @@ fn count(checkpoints: &[Checkpoint], node: &str) -> usize {
 mod tests {
     use super::*;
 
+    /// The layout `standard-v1.ts` declares, as these cases' fixture.
+    ///
+    /// Written out here because these cases are *about* the standard pipeline — a skipped verifier
+    /// holding the current position, a `failed` run that reached the fork, the two deliveries
+    /// sharing a column. Nothing in this crate knows that layout: a run brings its own, and the
+    /// workflow that ran is what declared it. Keep this in step with `standard-v1.ts` if the
+    /// standard columns change; a stale fixture only makes these cases describe a pipeline that no
+    /// longer exists, never a run drawn wrongly.
+    fn standard_shape() -> String {
+        shape_of(&[
+            (&["overseer"], true),
+            (&["context"], false),
+            (&["analyst"], false),
+            (&["red_team", "implementer"], false),
+            (&["verifier"], true),
+            (&["bookkeeper", "publisher"], false),
+        ])
+    }
+
+    /// A recorded shape from its columns, each a list of lane names and whether it may be skipped.
+    fn shape_of(columns: &[(&[&str], bool)]) -> String {
+        let nodes: Vec<ratatoskr_core::shape::ShapeNode> = columns
+            .iter()
+            .enumerate()
+            .flat_map(|(stage, (names, optional))| {
+                names
+                    .iter()
+                    .enumerate()
+                    .map(move |(lane, name)| ratatoskr_core::shape::ShapeNode {
+                        name: (*name).to_string(),
+                        stage,
+                        lane,
+                        optional: *optional,
+                    })
+            })
+            .collect();
+        serde_json::to_string(&nodes).unwrap()
+    }
+
+    /// A run of the standard pipeline, which is what every case below is about unless it says
+    /// otherwise.
+    fn derive(status: Option<&str>, checkpoints: &[Checkpoint]) -> Vec<NodeView> {
+        derive_with(status, checkpoints, None, Some(&standard_shape()))
+    }
+
     fn cp(node: &str, at: &str) -> Checkpoint {
         Checkpoint {
             node_name: node.to_string(),
@@ -415,6 +512,25 @@ mod tests {
             created_at: at.to_string(),
             ..Default::default()
         }
+    }
+
+    /// A config that gives one node somewhere to run. A node with no route here never runs, which
+    /// is what makes the verifier's presence in a run a question the config answers.
+    fn routed(node: &str) -> ratatoskr_core::RatatoskrConfig {
+        let mut config = ratatoskr_core::RatatoskrConfig::default();
+        config.models.insert(
+            node.to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-5".into(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Reuse,
+            },
+        );
+        config
     }
 
     /// A clarification exchange as `clarify.rs` writes one: all four fields, every value a string.
@@ -440,6 +556,30 @@ mod tests {
             output_json: output_json.to_string(),
             ..cp(node, at)
         }
+    }
+
+    #[test]
+    fn a_run_that_recorded_no_shape_is_still_drawn_from_its_records() {
+        // A workflow that declares no layout records none, and there is no compiled-in pipeline to
+        // stand in for it. Every node the run has evidence for is still placed, in the order it
+        // first ran — the most that can be said when nothing declared where they sat.
+        let views = derive_with(
+            Some("planned"),
+            &[cp("gather", "t1"), cp("decide", "t2"), cp("gather", "t3")],
+            None,
+            None,
+        );
+        assert_eq!(
+            views.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            ["gather", "decide"]
+        );
+        assert_eq!(views[0].stage, 0);
+        assert_eq!(views[1].stage, 1);
+        assert_eq!(
+            views[0].checkpoints, 2,
+            "one row aggregates a node's records"
+        );
+        assert_eq!(state_of(&views, "decide"), NodeState::Done);
     }
 
     #[test]
@@ -510,10 +650,13 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_during_converge_lands_on_the_implementer_not_the_bookkeeper() {
-        // Converge died on a later iteration, so the implementer has checkpoints from earlier
-        // ones. The only step after the fork is bookkeeping, which can't fail a run — so this
-        // failure is the implementer's.
+    fn a_failure_during_converge_names_nobody_from_checkpoints_alone() {
+        // Converge died on a later iteration, so the implementer has checkpoints from earlier ones.
+        // This used to be read as proof the implementer died — nothing after the fork could fail the
+        // run, so it was the only thing left. It is not proof: the implementer re-enters without
+        // announcing it here, so a dead attempt and a dead later host leave the same record. Which
+        // node the host died under is answered from the event stream, where the dying node is the
+        // one left working; these checkpoints cannot answer it and no longer pretend to.
         let views = derive(
             Some("failed"),
             &[
@@ -523,9 +666,130 @@ mod tests {
                 cp("implementer", "t5"),
             ],
         );
-        assert_eq!(state_of(&views, "implementer"), NodeState::Failed);
         assert_eq!(state_of(&views, "red_team"), NodeState::Done);
         assert_eq!(state_of(&views, "bookkeeper"), NodeState::Idle);
+        assert!(
+            !views.iter().any(|v| v.state == NodeState::Failed),
+            "an unattributed failure, not one pinned on whichever node is convenient"
+        );
+    }
+
+    #[test]
+    fn an_optional_stage_after_the_fork_is_no_more_blamable_than_a_required_one() {
+        // The routing case above with the standard shape, whose verifier column is OPTIONAL. That
+        // changes where the cursor sits — an empty optional stage never holds it — and must not
+        // change the attribution: an optional stage that did run and died leaves the same record as
+        // one that was skipped while a later host died, which is the implementer's last checkpoint
+        // and nothing after it. Neither is named.
+        let config = routed("verifier");
+        let views = derive_with(
+            Some("failed"),
+            &[
+                cp("context", "t1"),
+                cp("analyst", "t3"),
+                cp("red_team", "t4"),
+                cp("implementer", "t5"),
+            ],
+            Some(&config),
+            Some(&standard_shape()),
+        );
+        assert_eq!(state_of(&views, "implementer"), NodeState::Done);
+        assert!(
+            !views.iter().any(|v| v.state == NodeState::Failed),
+            "an unattributed failure, not one pinned on whichever node is convenient"
+        );
+    }
+
+    #[test]
+    fn how_a_verifier_is_routed_does_not_change_who_a_failed_run_blames() {
+        // Attribution used to turn on whether `config.models` held a route for the verifier: routed
+        // meant the column could have failed the run and nobody was named, unrouted meant it could
+        // not and the implementer was. That read the wrong fact. A verifier reached through a
+        // ruleset, an agent profile, or an overridden `governedBy` has no `models` entry and would
+        // have been treated as unable to fail — which fired the inference and blamed the implementer
+        // for a verifier-side error. A node's route says what it runs on, never whether its stage
+        // can error, so nothing here reads config and both runs answer the same.
+        let shape = shape_of(&[
+            (&["red_team", "implementer"], false),
+            (&["verifier"], false),
+            (&["bookkeeper"], false),
+        ]);
+        let checkpoints = [cp("red_team", "t1"), cp("implementer", "t2")];
+        let config = routed("verifier");
+        for config in [Some(&config), None] {
+            let views = derive_with(Some("failed"), &checkpoints, config, Some(&shape));
+            assert_eq!(state_of(&views, "verifier"), NodeState::Idle);
+            assert_eq!(state_of(&views, "implementer"), NodeState::Done);
+            assert!(
+                !views.iter().any(|v| v.state == NodeState::Failed),
+                "neither half of an ambiguous failure is named, however the verifier got its model"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_run_does_not_redden_every_lane_of_the_column_it_stopped_at() {
+        // A declared column may hold any lanes a workflow likes. Two of these never checkpointed and
+        // either could be the one that died — so neither is named, exactly as two candidates either
+        // side of the fork are not. Marking them both used to be how the fork's own column was
+        // drawn, which reddened lanes that may never have run.
+        let shape = shape_of(&[(&["scribe", "auditor", "publisher"], false)]);
+        let views = derive_with(Some("failed"), &[], None, Some(&shape));
+        assert_eq!(state_of(&views, "scribe"), NodeState::Idle);
+        assert_eq!(state_of(&views, "auditor"), NodeState::Idle);
+        // Delivery is still never blamed, and is what leaves the other two as the only candidates.
+        assert_eq!(state_of(&views, "publisher"), NodeState::Idle);
+        assert!(!views.iter().any(|v| v.state == NodeState::Failed));
+
+        // With one lane the run's stopping place is unambiguous again, and is still reported.
+        let alone = shape_of(&[(&["scribe", "publisher"], false)]);
+        let named = derive_with(Some("failed"), &[], None, Some(&alone));
+        assert_eq!(state_of(&named, "scribe"), NodeState::Failed);
+        assert_eq!(state_of(&named, "publisher"), NodeState::Idle);
+    }
+
+    #[test]
+    fn a_failed_run_with_a_fallible_stage_after_the_fork_blames_neither_of_them() {
+        // Blaming the implementer for any failed run that reached the fork is only sound where
+        // nothing after it can fail a run. A declared layout may put an ordinary stage there — its
+        // host error propagates out of the workflow and fails the run — but so does a later
+        // `iterate()` attempt, and that writes no checkpoint either. A reader of this graph must
+        // not be shown a stage that never started as the run's failure.
+        let shape = shape_of(&[
+            (&["red_team", "implementer"], false),
+            (&["deploy"], false),
+            (&["bookkeeper"], false),
+        ]);
+        let views = derive_with(
+            Some("failed"),
+            &[cp("red_team", "t1"), cp("implementer", "t2")],
+            None,
+            Some(&shape),
+        );
+        assert_eq!(state_of(&views, "implementer"), NodeState::Done);
+        assert_eq!(state_of(&views, "red_team"), NodeState::Done);
+        assert_eq!(state_of(&views, "deploy"), NodeState::Idle);
+        assert!(
+            !views.iter().any(|v| v.state == NodeState::Failed),
+            "an unattributed failure, not one pinned on the stage that happens to be next"
+        );
+    }
+
+    #[test]
+    fn a_failed_run_that_never_reached_the_fork_still_names_the_node_it_died_on() {
+        // The ambiguity above is the fork's: it comes from the implementer re-entering without a
+        // record. Before the fork there is nothing to re-enter, so the stage the run stopped at is
+        // the only candidate and is still reported — withholding that would lose the attribution
+        // the graph exists to show.
+        let shape = shape_of(&[
+            (&["analyst"], false),
+            (&["implementer"], false),
+            (&["deploy"], false),
+        ]);
+        let views = derive_with(Some("failed"), &[cp("analyst", "t1")], None, Some(&shape));
+        assert_eq!(state_of(&views, "analyst"), NodeState::Done);
+        assert_eq!(state_of(&views, "implementer"), NodeState::Failed);
+        assert_eq!(state_of(&views, "deploy"), NodeState::Idle);
     }
 
     #[test]
@@ -574,21 +838,9 @@ mod tests {
     fn a_node_says_what_it_will_run_on_before_it_runs() {
         // Otherwise the pipeline is blank until a node finishes, which is the wrong way round: a
         // reader wants to know what is about to happen, not only what already did.
-        let mut config = ratatoskr_core::RatatoskrConfig::default();
-        config.models.insert(
-            "redteam".to_string(),
-            ratatoskr_core::ModelRoute {
-                provider: "anthropic".into(),
-                model: "claude-sonnet-5".into(),
-                max_tokens: None,
-                context_window: None,
-                temperature: None,
-                params: None,
-                session: ratatoskr_core::SessionScope::Reuse,
-            },
-        );
+        let config = routed("redteam");
 
-        let views = derive_with(None, &[], Some(&config), None);
+        let views = derive_with(None, &[], Some(&config), Some(&standard_shape()));
         // Routed as `redteam`, checkpointed as `red_team` — the view is keyed by the latter.
         let planned = views
             .iter()
@@ -864,5 +1116,31 @@ mod tests {
         );
         assert_eq!(state_of(&views, "implementer"), NodeState::Done);
         assert_ne!(state_of(&views, "verifier"), NodeState::Working);
+    }
+
+    #[test]
+    fn a_live_implementer_is_working_in_a_run_that_declared_no_layout() {
+        // A workflow with no `layout` records an empty shape, so every node of the run — its own
+        // included — is placed by `append_unknown`. `implement()` checkpoints on its first pass
+        // while `iterate()` carries on, so a checkpoint there does not mean the implementer is
+        // finished, exactly as it does not in a run that declared a layout.
+        let checkpoints = [
+            cp("issue", "t0"),
+            cp("context", "t1"),
+            cp("implementer", "t2"),
+        ];
+        let views = derive_with(Some("running"), &checkpoints, None, Some("[]"));
+        assert_eq!(state_of(&views, "implementer"), NodeState::Working);
+        assert_eq!(state_of(&views, "context"), NodeState::Done);
+
+        // A finished run's nodes still read Done, including names this build knows nothing about.
+        let done = derive_with(
+            Some("converged"),
+            &[cp("implementer", "t2"), cp("gather", "t3")],
+            None,
+            Some("[]"),
+        );
+        assert_eq!(state_of(&done, "implementer"), NodeState::Done);
+        assert_eq!(state_of(&done, "gather"), NodeState::Done);
     }
 }

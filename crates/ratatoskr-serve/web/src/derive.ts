@@ -1,4 +1,4 @@
-import type { LiveEvent, NodeState, NodeTelemetry, NodeView } from "./api";
+import type { LiveEvent, NodeState, NodeTelemetry, NodeView, RunStatus } from "./api";
 
 /**
  * A run's node state, rebuilt from its event stream.
@@ -8,8 +8,10 @@ import type { LiveEvent, NodeState, NodeTelemetry, NodeView } from "./api";
  * the only record that carries when each thing happened, so anything shown against a point in time
  * has to be derived from it.
  *
- * Only the pipeline's SHAPE still comes from the server — which nodes exist, and their stage and
- * lane. That is a property of the graph that ran, not of any moment inside it.
+ * The pipeline's SHAPE — which nodes exist, and their stage and lane — comes from the server, since
+ * that is a property of the graph that ran rather than of any moment inside it. The one exception is
+ * a node the shape does not place: the server derives placement from checkpoints, so a node that has
+ * started and not yet finished is placed here, from the stream, or it would have no box at all.
  */
 export interface DerivedNode {
   state: NodeState;
@@ -220,10 +222,35 @@ export function convergeLoops(events: readonly LiveEvent[]): ConvergeLoops {
  *
  * Takes the same event-corrected list the boxes are drawn from, so it cannot drift out of step
  * with them — an edge reading a different source than its endpoints is exactly the bug in c9b5e13.
+ *
+ * Only where the two SHARE a column, which is the case this exists for. The edge is a short
+ * vertical step down the lane gap, geometry that assumes exactly that; a layout is free to put the
+ * two in different columns — or to declare none, and have the client place them — and there the
+ * same edge renders as a diagonal across the graph, duplicating the forward edge the columns
+ * already draw.
  */
 export function forkHandoff(nodes: readonly NodeView[]): boolean {
-  const started = (name: string) => nodes.some((n) => n.name === name && n.state !== "idle");
-  return started("red_team") && started("implementer");
+  const started = (name: string) => nodes.find((n) => n.name === name && n.state !== "idle");
+  const redTeam = started("red_team");
+  const implementer = started("implementer");
+  return !!redTeam && !!implementer && redTeam.stage === implementer.stage;
+}
+
+/**
+ * Whether a forward hand-off from `source` to `target` is a claim the record supports.
+ *
+ * Adjacent columns are drawn joined, so every stage edge asserts that the earlier column ran the
+ * later one. A DECLARED layout is exactly that assertion, and is drawn in full. An appended node is
+ * not: the shape never named it, and it is given a trailing column in first-mention order purely so
+ * it has somewhere to be. Joining the last shaped column to it invents a hand-off — the referee an
+ * iterating run appends is invoked by the implementer mid-converge, and reads instead as the
+ * pipeline's final stage, judging what the publisher published.
+ *
+ * Chained edges *within* the appended run are kept. For a run whose workflow declared no layout,
+ * the order the stream first saw each node is the only ordering it has.
+ */
+export function handoffDrawn(source: NodeView, target: NodeView): boolean {
+  return target.shaped !== false || source.shaped === false;
 }
 
 /**
@@ -255,31 +282,127 @@ export function workingNodeNames(
  *
  * With no derived state at all — a run old enough that its log has rotated away — do not call
  * this. The store's final state is then the only answer there is, and it is an honest one.
+ *
+ * A node the shape does not place still gets a box, and the CLIENT places it. The server can only
+ * place such a node once it has checkpointed, and orders those by first checkpoint — but a workflow
+ * that declared no layout may run its hosts concurrently, and completion order is then not start
+ * order. Inheriting the server's numbers would move a box the moment its checkpoint landed, and
+ * since column adjacency is what the graph draws its hand-offs from, the arrow between two such
+ * boxes would reverse. The stream is the one record that knows when each node started, so every
+ * unplaced node is ordered by first mention here and keeps that place across refreshes.
+ *
+ * Only the ones the shape does not place. A declared layout is the graph the workflow asked for and
+ * is reproduced exactly; a run whose shape names some of its nodes and not others keeps the named
+ * ones where the shape puts them.
+ *
+ * `ended` is the run's status when it has stopped AND the view is at the live end — `null` at every
+ * other position, and while the run is still executing. It is what lets a node the stream cannot
+ * finish be settled; see `fromStream`.
  */
 export function applyDerived(
   shape: readonly NodeView[],
   derived: Map<string, DerivedNode>,
+  ended: RunStatus | null = null,
 ): NodeView[] {
-  return shape.map((n) => {
-    const d = derived.get(n.name);
-    // Not started at this point. It keeps what it is CONFIGURED to run on (`planned`), because
-    // that is true before it runs, and loses everything it has not yet done.
-    if (!d) {
-      const { telemetry: _dropped, ...rest } = n;
-      return { ...rest, state: "idle" as NodeState, checkpoints: 0 };
-    }
-    // State and checkpoint counts always come from the stream — those it can always prove. Cost
-    // only when it actually carries it; otherwise the store's figures stand, which are true of
-    // where the run ENDED and are marked as such by being all a rotated-away log can offer.
-    const telemetry = d.costed ? d.telemetry : (n.telemetry ?? d.telemetry);
-    return {
-      ...n,
-      state: d.state,
-      checkpoints: d.checkpoints,
-      ...(telemetry ? { telemetry } : {}),
-    };
-  });
+  // Which node a failed run died in, when the record names one.
+  //
+  // A host error writes no checkpoint and no node-scoped event, so the node it killed is left
+  // "working" by the fold and the run emits nothing more to move it. At the live end of a failed
+  // run those nodes are therefore the candidates: the ones that started and never finished. This is
+  // evidence about which node actually died — no other record has it, and it holds wherever the node
+  // sits and whatever the shape declared.
+  //
+  // Spend it only where it names someone: exactly one candidate and no other. The run's status is a
+  // fact about the RUN — it says the run died, never which node died in it — and a workflow may run
+  // several hosts at once, so with two in flight both keep the state the stream gave them. An
+  // unattributed failure is worse than a correct attribution and much better than a wrong one.
+  const candidates =
+    ended === "failed"
+      ? [...derived].filter(([, d]) => d.state === "working").map(([name]) => name)
+      : [];
+  const died = candidates.length === 1 ? candidates[0] : null;
+
+  const shaped = shape.filter((n) => n.shaped !== false);
+  const placed = shaped.map((n) => fromStream(n, derived.get(n.name), ended, n.name === died));
+
+  // Trailing columns: everything the shape does not place, in the order the stream first mentioned
+  // it. A node the server did place from a checkpoint keeps everything else it said about it — its
+  // caller above all — and only its column is taken back. One the stream has never mentioned has no
+  // start to be ordered by and holds the last columns, which is where the server had it.
+  const known = new Set(shaped.map((n) => n.name));
+  const unplaced = new Map(
+    shape.filter((n) => n.shaped === false).map((n) => [n.name, n] as const),
+  );
+  const order = [...derived.keys()].filter((name) => name !== ISSUE_NODE && !known.has(name));
+  order.push(...[...unplaced.keys()].filter((name) => !derived.has(name)));
+
+  const base = placed.reduce((max, n) => Math.max(max, n.stage + 1), 0);
+  const extra = order.map((name, i) => ({
+    ...fromStream(unplaced.get(name) ?? unrun(name), derived.get(name), ended, name === died),
+    stage: base + i,
+    lane: 0,
+    // These columns are this function's ordering, not a hand-off any shape declared — including
+    // for a node only the stream has seen, which arrives here with nothing said about it. What
+    // is drawn between them depends on knowing that: see `handoffDrawn`.
+    shaped: false,
+  }));
+  return [...placed, ...extra];
 }
+
+/**
+ * One node's row: what the server said about it, with every per-moment fact taken from the stream.
+ *
+ * State and checkpoint counts always come from the stream — those it can always prove. Cost only
+ * when it actually carries it; otherwise the store's figures stand, which are true of where the run
+ * ENDED and are marked as such by being all a rotated-away log can offer. A node the stream does not
+ * mention has NOT STARTED at this point: it keeps what it is CONFIGURED to run on (`planned`),
+ * because that is true before it runs, and loses everything it has not yet done.
+ *
+ * One thing the stream cannot prove on its own, and it is the one that matters most: a node STOPPING
+ * when the host dies under it. That writes no checkpoint and no node-scoped event — the only records
+ * are the run's status and a `run_failed` carrying `node: null` — so the fold leaves the dying node
+ * "working" and the run will emit nothing more to move it. `ended` is the run having stopped with
+ * the view at its live end, and there a node the stream still calls working is finished by two
+ * facts it cannot see itself: `died`, which `applyDerived` sets on the one node a failed run's
+ * record names, and otherwise the server's state, which is the best the store can say.
+ *
+ * At every other position the stream stays the authority, `ended` being null. Scrubbed into the
+ * middle of a run, a node that genuinely WAS working then must still read working — showing how it
+ * ended is the same lie as showing a run's final state at step one.
+ */
+function fromStream(
+  n: NodeView,
+  d: DerivedNode | undefined,
+  ended: RunStatus | null,
+  died: boolean,
+): NodeView {
+  if (!d) {
+    const { telemetry: _dropped, ...rest } = n;
+    return { ...rest, state: "idle" as NodeState, checkpoints: 0 };
+  }
+  const telemetry = d.costed ? d.telemetry : (n.telemetry ?? d.telemetry);
+  const settled: NodeState = died ? "failed" : n.state;
+  return {
+    ...n,
+    state: ended && d.state === "working" ? settled : d.state,
+    checkpoints: d.checkpoints,
+    ...(telemetry ? { telemetry } : {}),
+  };
+}
+
+/** A box for a name only the stream knows: the server has nothing to say about it yet. */
+function unrun(name: string): NodeView {
+  return { name, state: "idle", checkpoints: 0, stage: 0, lane: 0 };
+}
+
+/**
+ * The one name in the stream that is not a node.
+ *
+ * `issue` records what the run was asked to do, not a stage of doing it. The server leaves it out
+ * of the shape (`pipeline::ISSUE_NODE`) and this list has to agree, or an unshaped run draws a box
+ * for its own brief.
+ */
+const ISSUE_NODE = "issue";
 
 function blank(): NodeTelemetry {
   return {

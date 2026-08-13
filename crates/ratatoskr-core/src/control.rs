@@ -155,21 +155,32 @@ impl RunControl {
 }
 
 /// Whether two node names are the same node.
-///
-/// Underscores are ignored, because one node is known by two spellings on the two sides of this
-/// exchange: the red team *runs* as `redteam` and *checkpoints* as `red_team`, and the dashboard
-/// names nodes the way its checkpoints do. Comparing literally would make its stop button a
-/// no-op — the command would sit waiting for a node that never asks by that name.
 fn same_node(a: &str, b: &str) -> bool {
     normalized_node_name(a) == normalized_node_name(b)
 }
 
 /// The stable identity shared by every control delivery path for a node.
 ///
-/// The red team runs as `redteam` but checkpoints as `red_team`, so underscores cannot be part of
-/// a control target's identity. The durable provider-pause ledger uses the same spelling rule.
+/// One node is known by two spellings on the two sides of this exchange: the red team *runs* as
+/// `redteam` and *checkpoints* as `red_team`, and the dashboard names nodes the way its checkpoints
+/// do. Comparing literally would make its stop button a no-op — the command would sit waiting for a
+/// node that never asks by that name.
+///
+/// That one pair is folded, and nothing else. Every other name is its own address, underscores
+/// included, because a workflow declares stage ids of its own and those are only checked for being
+/// distinct as written: folding underscores out of every name made `implement_er` and `implementer`
+/// one control target, so a stop aimed at one ended the other and steer text was taken by whichever
+/// polled first. Both spellings of the red team are reserved (`policy::STANDARD_IDENTIFIERS`), so
+/// no declared stage can reach the identity this does fold.
+///
+/// The durable provider-pause ledger uses the same spelling rule.
 pub fn normalized_node_name(node: &str) -> String {
-    node.replace('_', "").to_ascii_lowercase()
+    let node = node.to_ascii_lowercase();
+    if node == "red_team" {
+        "redteam".to_string()
+    } else {
+        node
+    }
 }
 
 #[cfg(test)]
@@ -285,6 +296,26 @@ mod tests {
 
         control.apply(steer("red_team", "check the baseline"));
         assert_eq!(control.poll("redteam").steer, ["check the baseline"]);
+    }
+
+    #[test]
+    fn a_workflow_stage_is_not_the_standard_node_it_is_spelled_like() {
+        // A workflow may declare a stage id of its own, and `implement_er` is a legal one. Only the
+        // red team's two spellings are one address: folding underscores out of every name made this
+        // stage the standard implementer's address too, so a stop aimed at one ended the other and
+        // steer text went to whichever polled first.
+        let mut control = RunControl::default();
+        control.apply(Command::Stop {
+            node: "implementer".to_string(),
+        });
+        assert_eq!(control.poll("implement_er").directive, Directive::Continue);
+
+        control.apply(steer("implementer", "not for the workflow's stage"));
+        assert!(control.poll("implement_er").steer.is_empty());
+        assert_eq!(
+            control.poll("implementer").steer,
+            ["not for the workflow's stage"]
+        );
     }
 
     #[test]
