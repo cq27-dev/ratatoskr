@@ -181,26 +181,55 @@ impl<'a> Registry<'a> {
 /// a recording in some other shape, or one whose positions are not positions. Nothing is substituted for it — a viewer places such a run's
 /// nodes from the records it actually has, which is the most that can be said about where they sat.
 ///
-/// The bound is here rather than at the writer because a recording does not only arrive from a
-/// workflow this machine validated: an imported bundle carries one another machine wrote, and it is
-/// stored as it came. A reader sizing anything from `stage` — grouping into columns is the obvious
-/// one — would be sizing it from a number the run's author chose. Positions index a recording's own
-/// nodes, so one at or past their count is not a position, and the placement is dropped whole
-/// rather than partly trusted. Membership survives it: it indexes nothing, and a run whose columns
-/// are unreadable still draws its boxes out of the right stages.
+/// The bounds are here rather than at the writer because a recording does not only arrive from a
+/// workflow this machine validated: an imported bundle carries one another machine wrote, and
+/// `Store::import` stores it as it came. Two things a reader does with it have to be bounded, and
+/// the second is the one that keeps being missed — **bound what a reader indexes BY, and also what
+/// it expands INTO**:
+///
+/// - *positions*, which a reader sizes a column grouping from. One at or past the node count is not
+///   a position.
+/// - *names*, which a reader expands through the registry. `Registry::members` returns every stage
+///   claiming a node and the derivation asks once per POSITION, so one name placed N times while N
+///   stages claim it is N² work on a document of size N. A repeated stage id is the same exposure
+///   read from the other side: `NodeTelemetryView::totalled` folds a box's members, so a duplicate
+///   charges one turn twice and the box reports a cost the run never paid.
+///
+/// Refused rather than deduplicated, and deliberately. There is no version to refuse a recording
+/// on, so the choice is between dropping what cannot be read and picking a winner among records
+/// that disagree — and a silent pick is a run drawn against a graph nobody executed, which is what
+/// this module exists to prevent. Refusing is also what the write side already says: a layout may
+/// name a node once (`validate_layout`) and a stage id is unique across a registry
+/// (`validate::validate`), so a recording with either duplicate was written by no workflow this
+/// build would have accepted.
+///
+/// Dropped whole rather than partly trusted, and the two halves are dropped independently: a
+/// recording whose placement is unreadable still draws its boxes out of the right stages, and one
+/// whose registry is unreadable still places its nodes, each of them exactly its own stage.
 pub fn recorded(shape_json: Option<&str>) -> Recorded {
     let Some(raw) = shape_json else {
         return Recorded::default();
     };
     let mut record = serde_json::from_str::<Recorded>(raw).unwrap_or_default();
-    if record
-        .nodes
-        .iter()
-        .any(|node| node.stage >= record.nodes.len() || node.lane >= record.nodes.len())
+    let placed_once = distinct(record.nodes.iter().map(|node| node.name.as_str()));
+    if !placed_once
+        || record
+            .nodes
+            .iter()
+            .any(|node| node.stage >= record.nodes.len() || node.lane >= record.nodes.len())
     {
         record.nodes = Vec::new();
     }
+    if !distinct(record.stages.iter().map(|stage| stage.id.as_str())) {
+        record.stages = Vec::new();
+    }
     record
+}
+
+/// Whether every name is its own. A repeated one is what turns a lookup into an expansion.
+fn distinct<'a>(names: impl Iterator<Item = &'a str>) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    names.into_iter().all(|name| seen.insert(name))
 }
 
 #[cfg(test)]
@@ -251,6 +280,35 @@ mod tests {
             {"name":"implementer","stage":0,"lane":1,"optional":false}
         ]}"#;
         assert_eq!(recorded(Some(real)).nodes.len(), 2);
+    }
+
+    #[test]
+    fn a_name_recorded_twice_makes_the_whole_recording_unreadable() {
+        // The read gate bounds what a reader INDEXES BY and must also bound what it EXPANDS INTO.
+        // `members` returns every stage claiming a node, and the derivation calls it once per
+        // POSITION — so a recording that places one name N times while N stages claim it does N²
+        // work on a document of size N. `Store::import` preserves foreign JSON, so the write-side
+        // guarantee that a layout names each node once does not reach here.
+        let repeated = r#"{"nodes":[
+            {"name":"x","stage":0,"lane":0,"optional":false},
+            {"name":"x","stage":1,"lane":0,"optional":false}
+        ],"stages":[{"id":"a","node":"x"},{"id":"b","node":"x"}]}"#;
+        let record = recorded(Some(repeated));
+        assert!(
+            record.nodes.is_empty(),
+            "a name placed twice is not a placement"
+        );
+
+        // A registry that names one stage twice is refused for the same reason from the other
+        // side: `totalled` folds a box's members, so a repeated id charges its turn twice and the
+        // box reports a cost the run never paid.
+        let twice = r#"{"stages":[{"id":"a","node":"x"},{"id":"a","node":"x"}]}"#;
+        assert!(recorded(Some(twice)).stages.is_empty());
+
+        // A registry naming several stages under one node is ordinary and stays: that is what a
+        // composed box IS.
+        let composed = r#"{"stages":[{"id":"a","node":"x"},{"id":"b","node":"x"}]}"#;
+        assert_eq!(recorded(Some(composed)).index().members("x"), ["a", "b"]);
     }
 
     #[test]
