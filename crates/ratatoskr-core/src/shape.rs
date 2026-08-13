@@ -19,6 +19,8 @@
 //! layout-less run came to record none at all, and then drew each member as a box of its own with
 //! controls addressed to a name the runtime never polls.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// One node's place in the graph: `stage` is the column, `lane` the row within it.
@@ -97,61 +99,92 @@ pub struct Recorded {
 }
 
 impl Recorded {
+    /// Index this recording's registry for lookup.
+    ///
+    /// Build it ONCE per read and ask it everything. The registry is a list, and a derivation asks
+    /// it a question per node and per record — over a document `Store::import` writes verbatim,
+    /// whose size is the run author's to choose, so a scan per question is quadratic work an
+    /// imported recording can dictate. The position bound in [`recorded`] caps the indices in such a
+    /// document; it says nothing about how many rows it has.
+    pub fn index(&self) -> Registry<'_> {
+        let mut by_id: HashMap<&str, &RunStage> = HashMap::with_capacity(self.stages.len());
+        let mut members: HashMap<&str, Vec<&str>> = HashMap::new();
+        for stage in &self.stages {
+            by_id.insert(stage.id.as_str(), stage);
+            members
+                .entry(stage.node.as_str())
+                .or_default()
+                .push(stage.id.as_str());
+        }
+        let order = self
+            .stages
+            .iter()
+            .map(|stage| (stage.id.as_str(), stage.node.as_str()))
+            .collect();
+        Registry {
+            by_id,
+            members,
+            order,
+        }
+    }
+}
+
+/// A run's recorded registry, indexed.
+///
+/// Every question about a stage is asked through here, and the answers — not the rows — are what
+/// callers see. That is deliberate: membership is one node per stage today, and becomes one per
+/// INVOCATION when it is resolved from span parentage (#244). `characterizer` already cannot answer
+/// the static form, which is why it declares none and is the one legitimate resident of the
+/// unclaimed-turn warning. A caller that asks [`Self::node_of`] survives that change; one handed the
+/// index to walk does not.
+pub struct Registry<'a> {
+    by_id: HashMap<&'a str, &'a RunStage>,
+    members: HashMap<&'a str, Vec<&'a str>>,
+    /// Every stage with its node, in the registry's own order — which is the order a box's members
+    /// are declared in, and so the order its feed reads.
+    order: Vec<(&'a str, &'a str)>,
+}
+
+impl<'a> Registry<'a> {
     /// The stages whose work `node` is, in registry order.
     ///
     /// A node no stage claims is exactly itself: a name from a recording that carries no registry,
     /// and the ordinary answer for every node that is one stage.
-    pub fn members(&self, node: &str) -> Vec<String> {
-        let members: Vec<String> = self
-            .stages
-            .iter()
-            .filter(|stage| stage.node == node)
-            .map(|stage| stage.id.clone())
-            .collect();
-        match members.is_empty() {
-            true => vec![node.to_string()],
-            false => members,
-        }
+    pub fn members(&self, node: &'a str) -> Vec<&'a str> {
+        self.members
+            .get(node)
+            .cloned()
+            .unwrap_or_else(|| vec![node])
     }
 
     /// Which node each stage's records are drawn in, in registry order.
     ///
-    /// The accessor for a reader that needs the whole mapping, rather than walking [`Self::stages`]
-    /// and reading `.node` off each row. That walk assumes one stage has one node, which is true
-    /// today and stops being true when membership is resolved per invocation from span parentage
-    /// (#244) — `characterizer` already cannot answer it, which is why it declares none. Asking
-    /// through here, and through [`Self::node_of`], is what survives that.
-    pub fn membership(&self) -> Vec<(&str, &str)> {
-        self.stages
-            .iter()
-            .map(|stage| (stage.id.as_str(), stage.node.as_str()))
-            .collect()
+    /// The accessor for a reader that needs the whole mapping, rather than walking
+    /// [`Recorded::stages`] and reading `.node` off each row — see this type's note on why that walk
+    /// is the thing that will have to change.
+    pub fn membership(&self) -> Vec<(&'a str, &'a str)> {
+        self.order.clone()
     }
 
     /// The node a record written under `stage` is drawn in — the stage itself unless it said
     /// otherwise.
-    pub fn node_of<'a>(&'a self, stage: &'a str) -> &'a str {
-        self.stages
-            .iter()
-            .find(|known| known.id == stage)
+    pub fn node_of(&self, stage: &'a str) -> &'a str {
+        self.by_id
+            .get(stage)
             .map_or(stage, |known| known.node.as_str())
     }
 
     /// The attempt-continuation scope `stage` declared, if it declared one. `None` means it takes
-    /// its route's, which is what [`crate::SessionScope`]'s absence has always meant.
+    /// its route's, which is what an absent declaration has always meant.
     pub fn session_of(&self, stage: &str) -> Option<crate::SessionScope> {
-        self.stages
-            .iter()
-            .find(|known| known.id == stage)
-            .and_then(|known| known.session)
+        self.by_id.get(stage).and_then(|known| known.session)
     }
 
     /// The identity `stage`'s route is configured under — the stage itself unless it said
     /// otherwise, and the stage itself for a name no recorded registry knows.
-    pub fn governance_of<'a>(&'a self, stage: &'a str) -> &'a str {
-        self.stages
-            .iter()
-            .find(|known| known.id == stage)
+    pub fn governance_of(&self, stage: &'a str) -> &'a str {
+        self.by_id
+            .get(stage)
             .and_then(|known| known.governed_by.as_deref())
             .unwrap_or(stage)
     }
@@ -259,7 +292,7 @@ mod tests {
         }"#;
         let record = recorded(Some(with_stages));
         assert!(record.nodes.is_empty());
-        assert_eq!(record.members("x"), ["x_turn"]);
+        assert_eq!(record.index().members("x"), ["x_turn"]);
 
         // The fork: two nodes, one column, two lanes. Every index is inside the node count, which
         // is what a recording this build writes always looks like.
@@ -306,16 +339,16 @@ mod tests {
         ));
         assert!(record.nodes.is_empty());
         assert_eq!(
-            record.members("redteam"),
+            record.index().members("redteam"),
             ["redteam_classifier", "redteam_author"]
         );
-        assert_eq!(record.members("analyst"), ["analyst"]);
-        assert_eq!(record.node_of("redteam_author"), "redteam");
-        assert_eq!(record.node_of("analyst"), "analyst");
+        assert_eq!(record.index().members("analyst"), ["analyst"]);
+        assert_eq!(record.index().node_of("redteam_author"), "redteam");
+        assert_eq!(record.index().node_of("analyst"), "analyst");
         // A name the registry never heard of is its own box, which is what an unplaced record of
         // one is.
-        assert_eq!(record.members("clarification"), ["clarification"]);
-        assert_eq!(record.node_of("clarification"), "clarification");
+        assert_eq!(record.index().members("clarification"), ["clarification"]);
+        assert_eq!(record.index().node_of("clarification"), "clarification");
     }
 
     #[test]
@@ -333,17 +366,17 @@ mod tests {
         let record = recorded(Some(placed));
         assert_eq!(record.nodes.len(), 2);
         assert_eq!(
-            record.members("redteam"),
+            record.index().members("redteam"),
             ["redteam_classifier", "redteam_author"]
         );
-        assert_eq!(record.node_of("redteam_author"), "redteam");
-        assert_eq!(record.members("analyst"), ["analyst"]);
+        assert_eq!(record.index().node_of("redteam_author"), "redteam");
+        assert_eq!(record.index().members("analyst"), ["analyst"]);
 
         // That format carried no governance, and its reader took a box's route from the box's own
         // name. Converting says so, rather than leaving every composed box of every stored run
         // reporting no route at all: `[models.redteam]` is what such a run's red team ran on.
-        assert_eq!(record.governance_of("redteam_author"), "redteam");
-        assert_eq!(record.governance_of("analyst"), "analyst");
+        assert_eq!(record.index().governance_of("redteam_author"), "redteam");
+        assert_eq!(record.index().governance_of("analyst"), "analyst");
     }
 
     #[test]
@@ -357,7 +390,7 @@ mod tests {
         let record = recorded(Some(bare));
         assert_eq!(record.nodes.len(), 2);
         assert!(record.stages.is_empty());
-        assert_eq!(record.members("redteam"), ["redteam"]);
-        assert_eq!(record.governance_of("redteam"), "redteam");
+        assert_eq!(record.index().members("redteam"), ["redteam"]);
+        assert_eq!(record.index().governance_of("redteam"), "redteam");
     }
 }

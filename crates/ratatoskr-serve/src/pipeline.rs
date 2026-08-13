@@ -8,6 +8,22 @@
 use ratatoskr_store::Checkpoint;
 use serde::Serialize;
 
+/// A run's checkpoints grouped by the name each was written under, in order.
+///
+/// Built once per derivation, for the same reason the registry is indexed: every question this file
+/// asks of the log is "the rows under this name", it asks one per node and per stage, and the log is
+/// a run author's document that `Store::import` writes verbatim. A scan per question is quadratic
+/// work an imported run can dictate.
+type Rows<'a> = std::collections::HashMap<&'a str, Vec<&'a Checkpoint>>;
+
+fn rows_by_node(checkpoints: &[Checkpoint]) -> Rows<'_> {
+    let mut rows: Rows<'_> = Rows::with_capacity(checkpoints.len());
+    for c in checkpoints {
+        rows.entry(c.node_name.as_str()).or_default().push(c);
+    }
+    rows
+}
+
 /// Whether this node's own failure can be what made a run `failed`.
 ///
 /// A run fails when its workflow entry returns an error — any host call that returns `Err` and is
@@ -138,8 +154,8 @@ impl PlannedNode {
     /// `None` when no stage of the node has a route. A node with no route never runs.
     fn of(
         config: Option<&ratatoskr_core::RatatoskrConfig>,
-        stages: &[String],
-        recorded: &ratatoskr_core::shape::Recorded,
+        stages: &[&str],
+        registry: &ratatoskr_core::shape::Registry<'_>,
     ) -> Option<Self> {
         let config = config?;
         // Each stage's route, and the scope it will actually run under. `Stage::session_scope` is
@@ -149,8 +165,8 @@ impl PlannedNode {
         let planned: Vec<(&ratatoskr_core::ModelRoute, ratatoskr_core::SessionScope)> = stages
             .iter()
             .filter_map(|stage| {
-                let route = config.models.get(recorded.governance_of(stage))?;
-                Some((route, recorded.session_of(stage).unwrap_or(route.session)))
+                let route = config.models.get(registry.governance_of(stage))?;
+                Some((route, registry.session_of(stage).unwrap_or(route.session)))
             })
             .collect();
         let mut models: Vec<String> = Vec::new();
@@ -232,7 +248,7 @@ impl NodeTelemetryView {
     ///
     /// `None` when no member recorded a model turn — the issue pseudo-node, one whose turn was
     /// never claimed, or a node that has not run.
-    fn totalled(checkpoints: &[Checkpoint], stages: &[String]) -> Option<Self> {
+    fn totalled(rows: &Rows<'_>, stages: &[&str]) -> Option<Self> {
         // `NodeTelemetry::fold` is the same arithmetic a multi-turn checkpoint is written with:
         // figures add, a figure nobody reported stays unreported, and the models and tool sets are
         // named distinctly rather than one overwriting the other. A box that ran two profiles
@@ -240,7 +256,7 @@ impl NodeTelemetryView {
         // turn.
         let t = stages
             .iter()
-            .filter_map(|stage| checkpoints.iter().rfind(|c| &c.node_name == stage))
+            .filter_map(|stage| rows.get(stage)?.last())
             .map(|c| c.telemetry.clone())
             .filter(|t| t.model.is_some())
             .reduce(|mut folded, next| {
@@ -314,6 +330,11 @@ pub fn derive_with(
     // placed entirely by `append_unknown`, from the records it has. Its membership still applies
     // there: which stages compose a node is the registry's, not the layout's.
     let recorded = ratatoskr_core::shape::recorded(shape_json);
+    // Both lookups this derivation makes, indexed once: the registry it asks about every node, and
+    // the log it asks about every name. Either scanned per question is quadratic over a document an
+    // imported run brought with it.
+    let registry = recorded.index();
+    let rows = rows_by_node(checkpoints);
     let stages = stages_of(&recorded.nodes);
     let terminal = is_terminal(status);
     let failed = status == Some("failed");
@@ -327,13 +348,12 @@ pub fn derive_with(
     // The implementer's OWN checkpoints, not its column's. A declared fork column may hold any
     // lanes a workflow likes, and a peer that checkpointed says nothing about whether the
     // implementer ever ran.
-    let unattributable = failed && count(checkpoints, IMPLEMENTER_NODE) > 0;
+    let unattributable = failed && count(&rows, IMPLEMENTER_NODE) > 0;
 
     // A node has finished only if it checkpointed *and* isn't the implementer mid-converge —
     // otherwise the fork would look complete on iteration 1 and the run's activity would be
     // attributed to the bookkeeper, which by the invariant above hasn't started.
-    let finished =
-        |name: &str| count(checkpoints, name) > 0 && !(name == "implementer" && !terminal);
+    let finished = |name: &str| count(&rows, name) > 0 && !(name == "implementer" && !terminal);
     // Where the run has got to: the first stage that has not finished and has nothing after it
     // checkpointed. Without that second half a skipped verifier would hold the position forever
     // and report every later node as not yet reached, on a run that has finished.
@@ -344,7 +364,7 @@ pub fn derive_with(
     // version of that guess.
     let last_seen = stages
         .iter()
-        .rposition(|nodes| nodes.iter().any(|n| count(checkpoints, &n.name) > 0));
+        .rposition(|nodes| nodes.iter().any(|n| count(&rows, &n.name) > 0));
     let current = stages.iter().enumerate().position(|(idx, nodes)| {
         !nodes.iter().all(|n| n.optional)
             && !(nodes.iter().all(|n| finished(&n.name))
@@ -356,7 +376,7 @@ pub fn derive_with(
     let candidates = current.map_or(0, |idx| {
         stages[idx]
             .iter()
-            .filter(|n| count(checkpoints, &n.name) == 0 && can_fail_the_run(&n.name))
+            .filter(|n| count(&rows, &n.name) == 0 && can_fail_the_run(&n.name))
             .count()
     });
 
@@ -364,11 +384,7 @@ pub fn derive_with(
     for (idx, nodes) in stages.iter().enumerate() {
         for node in nodes {
             let (lane, name) = (node.lane, &node.name);
-            let times: Vec<&str> = checkpoints
-                .iter()
-                .filter(|c| c.node_name == *name)
-                .map(|c| c.created_at.as_str())
-                .collect();
+            let times = node_times(&rows, name);
 
             let state = if times.is_empty() {
                 match () {
@@ -389,10 +405,10 @@ pub fn derive_with(
                 checkpointed_state(name, terminal)
             };
 
-            let stages = recorded.members(name);
+            let stages = registry.members(name);
             out.push(NodeView {
-                telemetry: NodeTelemetryView::totalled(checkpoints, &stages),
-                planned: PlannedNode::of(config, &stages, &recorded),
+                telemetry: NodeTelemetryView::totalled(&rows, &stages),
+                planned: PlannedNode::of(config, &stages, &registry),
                 name: name.clone(),
                 state,
                 stage: idx,
@@ -406,7 +422,7 @@ pub fn derive_with(
             });
         }
     }
-    append_unknown(&mut out, checkpoints, config, terminal, &recorded);
+    append_unknown(&mut out, checkpoints, config, terminal, &registry, &rows);
     out
 }
 
@@ -459,7 +475,8 @@ fn append_unknown(
     checkpoints: &[Checkpoint],
     config: Option<&ratatoskr_core::RatatoskrConfig>,
     terminal: bool,
-    recorded: &ratatoskr_core::shape::Recorded,
+    registry: &ratatoskr_core::shape::Registry<'_>,
+    rows: &Rows<'_>,
 ) {
     // A box the layout already placed. A member's row resolves to its box through
     // `Recorded::node_of` below, so only the box names have to be listed here.
@@ -473,7 +490,7 @@ fn append_unknown(
     for (idx, c) in checkpoints.iter().enumerate() {
         // The box the record belongs to. A member's row is its node's, so the several rows a
         // composed node's stages write claim one position between them — the first of them.
-        let name = recorded.node_of(c.node_name.as_str());
+        let name = registry.node_of(c.node_name.as_str());
         // The issue pseudo-node writes a checkpoint and is deliberately not a pipeline node: it
         // records what the run was asked to do, which is not a stage of doing it.
         if name != ISSUE_NODE && !known.contains(name) && seen.insert(name) {
@@ -482,8 +499,8 @@ fn append_unknown(
     }
     let base = out.iter().map(|n| n.stage).max().map_or(0, |s| s + 1);
     for (i, (name, first)) in extra.into_iter().enumerate() {
-        let times = node_times(checkpoints, name);
-        let stages = recorded.members(name);
+        let times = node_times(rows, name);
+        let stages = registry.members(name);
         // `Done` means the box's OWN record exists. A box arrives here because something it
         // composes checkpointed, and that may be a member rather than the box: the red team's
         // classifier finishes while its author is still writing tests, and the aggregate its host
@@ -502,8 +519,8 @@ fn append_unknown(
             (true, true) => NodeState::Idle,
         };
         out.push(NodeView {
-            telemetry: NodeTelemetryView::totalled(checkpoints, &stages),
-            planned: PlannedNode::of(config, &stages, recorded),
+            telemetry: NodeTelemetryView::totalled(rows, &stages),
+            planned: PlannedNode::of(config, &stages, registry),
             caller: caller_of(checkpoints, first),
             name: name.to_string(),
             state,
@@ -568,16 +585,14 @@ fn stages_of(
 }
 
 /// When each of `node`'s checkpoints was written, in order.
-fn node_times(checkpoints: &[Checkpoint], node: &str) -> Vec<String> {
-    checkpoints
-        .iter()
-        .filter(|c| c.node_name == node)
-        .map(|c| c.created_at.clone())
-        .collect()
+fn node_times<'a>(rows: &Rows<'a>, node: &str) -> Vec<&'a str> {
+    rows.get(node).map_or_else(Vec::new, |rows| {
+        rows.iter().map(|c| c.created_at.as_str()).collect()
+    })
 }
 
-fn count(checkpoints: &[Checkpoint], node: &str) -> usize {
-    checkpoints.iter().filter(|c| c.node_name == node).count()
+fn count(rows: &Rows<'_>, node: &str) -> usize {
+    rows.get(node).map_or(0, Vec::len)
 }
 
 #[cfg(test)]
@@ -714,7 +729,12 @@ mod tests {
     /// where the client reads a box's stages from. Not `NodeView`: a box that has not checkpointed
     /// has no row there, and that is the window a control is used in.
     fn membership(shape_json: &str, node: &str) -> Vec<String> {
-        ratatoskr_core::shape::recorded(Some(shape_json)).members(node)
+        ratatoskr_core::shape::recorded(Some(shape_json))
+            .index()
+            .members(node)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
     }
 
     fn state_of(views: &[NodeView], name: &str) -> NodeState {
@@ -838,6 +858,60 @@ mod tests {
                 "a `{status}` run with only a member's row did not complete the box"
             );
         }
+    }
+
+    #[test]
+    fn a_large_recording_is_derived_in_work_proportional_to_its_size() {
+        // `Store::import` writes `shape_json` and a run's checkpoints verbatim, so both are the run
+        // author's documents and both can be large. Every question this file asks — a box's members,
+        // a record's box, the rows under a name — used to be a scan of one of them, asked once per
+        // node and once per record, which is quadratic work an imported recording can dictate. The
+        // position bound in `shape::recorded` caps the indices in such a document; it says nothing
+        // about how many rows it has.
+        //
+        // Sized from measurement rather than guessed, and asserted as a ceiling rather than a
+        // window, which is what keeps it off the flaky list. At this size a debug build derives
+        // this in about 0.2s indexed and about 370s scanning, so the bound below sits ~25x above
+        // the first and ~74x below the second: neither a slow machine nor a loaded one moves the
+        // answer. Re-derive if it ever looks tight — the scan curve is 4x per doubling of N and the
+        // index curve is 2x, so the gap only widens.
+        const N: usize = 30_000;
+        let recorded = ratatoskr_core::shape::Recorded {
+            nodes: (0..N)
+                .map(|i| ratatoskr_core::shape::ShapeNode {
+                    name: format!("n{i}"),
+                    stage: i,
+                    lane: 0,
+                    optional: false,
+                })
+                .collect(),
+            stages: (0..N)
+                .map(|i| ratatoskr_core::shape::RunStage {
+                    id: format!("s{i}"),
+                    node: format!("n{i}"),
+                    governed_by: None,
+                    session: None,
+                })
+                .collect(),
+        };
+        let shape = serde_json::to_string(&recorded).unwrap();
+        let checkpoints: Vec<Checkpoint> = (0..N).map(|i| cp(&format!("s{i}"), "t")).collect();
+
+        let started = std::time::Instant::now();
+        let views = derive_with(Some("converged"), &checkpoints, None, Some(&shape));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "deriving {N} nodes over {N} records took {elapsed:?}, which is scan-shaped work"
+        );
+
+        // And it is derived correctly at that size, so an index that dropped or reordered entries
+        // is caught here too rather than only being fast.
+        assert_eq!(views.len(), N);
+        let registry = recorded.index();
+        assert_eq!(registry.members("n7"), ["s7"]);
+        assert_eq!(registry.node_of("s7"), "n7");
+        assert_eq!(registry.membership().len(), N);
     }
 
     #[test]

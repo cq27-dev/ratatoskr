@@ -3792,7 +3792,10 @@ mod tests {
             recorded.nodes.is_empty(),
             "a workflow that laid nothing out places nothing"
         );
-        assert_eq!(recorded.members("context"), ["context_distillation"]);
+        assert_eq!(
+            recorded.index().members("context"),
+            ["context_distillation"]
+        );
 
         let drawn = ratatoskr_serve::pipeline::derive_with(
             Some(RunStatus::Planned.as_str()),
@@ -3823,7 +3826,7 @@ mod tests {
             .is_empty(),
             "nothing has checkpointed, so nothing is placed"
         );
-        assert_eq!(recorded.node_of("context_distillation"), "context");
+        assert_eq!(recorded.index().node_of("context_distillation"), "context");
 
         // And the address a control is aimed at is the box the run answers under. `serve` polls
         // for a stop by the name it draws, so a box drawn under a member's name reaches nothing.

@@ -3481,13 +3481,16 @@ mod referee_governance_tests {
         // Each box says which stages do its work: one of its own name, or the several that compose
         // it. This is what lets the fork be one red-team box while both halves keep their identity.
         // It comes from the registry, so it is recorded whether or not the box was laid out.
-        assert_eq!(shape.members("analyst"), ["analyst"]);
+        assert_eq!(shape.index().members("analyst"), ["analyst"]);
         assert_eq!(
-            shape.members("redteam"),
+            shape.index().members("redteam"),
             ["redteam_classifier", "redteam_author"]
         );
-        assert_eq!(shape.members("implementer"), ["implementer_attempt"]);
-        assert_eq!(shape.members("context"), ["context_distillation"]);
+        assert_eq!(
+            shape.index().members("implementer"),
+            ["implementer_attempt"]
+        );
+        assert_eq!(shape.index().members("context"), ["context_distillation"]);
 
         // And every node it lays out is one the run can record under, judged against the registry
         // the workflow actually runs.

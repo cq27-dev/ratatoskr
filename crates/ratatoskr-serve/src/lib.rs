@@ -1093,7 +1093,9 @@ async fn run_detail(
         .and_then(|t| ratatoskr_core::RatatoskrConfig::from_toml_str(&t).ok());
     let shape_json = run.as_ref().and_then(|r| r.shape_json.as_deref());
     let nodes = pipeline::derive_with(status.as_deref(), &checkpoints, config.as_ref(), shape_json);
-    let stages = ratatoskr_core::shape::recorded(shape_json)
+    let recorded = ratatoskr_core::shape::recorded(shape_json);
+    let stages = recorded
+        .index()
         .membership()
         .into_iter()
         .map(|(id, node)| StageMembership {
