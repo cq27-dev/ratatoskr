@@ -391,6 +391,31 @@ test("a failed run marks the node it died in even when the store has no row for 
   ]);
 });
 
+// A layout-less workflow may run its hosts concurrently, and if one dies before any of them
+// checkpoints, none of them has a server row to be settled against. The run's status says the run
+// died — never which of them died in it — so a reader must not be shown three failed boxes for one
+// failure. Only an unambiguous candidate is named.
+test("a failed run does not mark every concurrent host it has no row for", () => {
+  const events = [start("lint"), working("lint"), start("build"), working("build")];
+  const view = applyDerived([], nodesFromEvents(events), "failed");
+  expect(view.map((n) => [n.name, n.state])).toEqual([
+    ["lint", "idle"],
+    ["build", "idle"],
+  ]);
+});
+
+// One of the two finished before the run died, so the other is the only candidate left and is
+// still named — withholding attribution the record does support would lose the one thing this
+// correction exists to show.
+test("a failed run still marks the one host left working among several", () => {
+  const events = [start("lint"), checkpointed("lint"), start("build"), working("build")];
+  const view = applyDerived([], nodesFromEvents(events), "failed");
+  expect(view.map((n) => [n.name, n.state])).toEqual([
+    ["lint", "done"],
+    ["build", "failed"],
+  ]);
+});
+
 // A run from another graph: the shape names some of its nodes and not others. The named ones stay
 // where the shape puts them; only the rest are the client's to order.
 test("a partly shaped run keeps its shaped nodes and orders the rest by the stream", () => {

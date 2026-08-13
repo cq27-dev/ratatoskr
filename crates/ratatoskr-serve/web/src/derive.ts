@@ -319,27 +319,33 @@ export function applyDerived(
   order.push(...[...unplaced.keys()].filter((name) => !derived.has(name)));
 
   const base = placed.reduce((max, n) => Math.max(max, n.stage + 1), 0);
-  const extra = order.map((name, i) => {
+  const rows = order.map((name) => {
     const server = unplaced.get(name);
-    const row = fromStream(server ?? unrun(name), derived.get(name), ended);
-    return {
-      ...row,
-      // A node the store has no row for cannot be settled against it: on a run with no declared
-      // layout the node the host died under exists only in the stream — it never checkpointed, so
-      // the server never placed it and has no state to lend. The run's own status is then the only
-      // record of what became of it, and a failed run answers the question. Without this such a run
-      // draws every box green and nothing wrong.
-      ...(!server && ended === "failed" && row.state === "idle"
-        ? { state: "failed" as NodeState }
-        : {}),
-      stage: base + i,
-      lane: 0,
-      // These columns are this function's ordering, not a hand-off any shape declared — including
-      // for a node only the stream has seen, which arrives here with nothing said about it. What
-      // is drawn between them depends on knowing that: see `handoffDrawn`.
-      shaped: false,
-    };
+    return { server, row: fromStream(server ?? unrun(name), derived.get(name), ended) };
   });
+  // A node the store has no row for cannot be settled against it: on a run with no declared layout
+  // the node the host died under exists only in the stream — it never checkpointed, so the server
+  // never placed it and has no state to lend. The run's own status is then the only record of what
+  // became of it, and without it such a run draws every box green and nothing wrong.
+  //
+  // But that status is a fact about the RUN: it says the run died, not which node died in it. A
+  // layout-less workflow may have several hosts working at once, and then every one of them is
+  // sitting here with no server row and nothing to settle against. Spend the run's status only
+  // where it names someone — one candidate and no other — and otherwise leave the boxes as they
+  // were, which is the same rule the server follows when a failure past the fork could be either
+  // side of it.
+  const died =
+    ended === "failed" ? rows.filter(({ server, row }) => !server && row.state === "idle") : [];
+  const extra = rows.map(({ row }, i) => ({
+    ...row,
+    ...(died.length === 1 && died[0]?.row === row ? { state: "failed" as NodeState } : {}),
+    stage: base + i,
+    lane: 0,
+    // These columns are this function's ordering, not a hand-off any shape declared — including
+    // for a node only the stream has seen, which arrives here with nothing said about it. What
+    // is drawn between them depends on knowing that: see `handoffDrawn`.
+    shaped: false,
+  }));
   return [...placed, ...extra];
 }
 
