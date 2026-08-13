@@ -343,10 +343,15 @@ function working(name) {
 }
 
 // A host error writes no checkpoint for the node it kills and no node-scoped event, so the fold
-// leaves it "working" and the run emits nothing more to move it. At the end of a stopped run the
-// store is the better witness: it knows which node the run died in.
-test("a stopped run's node the stream leaves working takes the store's state", () => {
-  const shape = [placed("analyst", 0), { ...placed("implementer", 1), state: "failed" }];
+// leaves it "working" and the run emits nothing more to move it. That node is therefore the
+// evidence: at the end of a failed run it is the one that started and never finished.
+//
+// This used to take the SERVER's state for such a node, and the server derived it from position —
+// which stage the implementer sat in, what followed it, whether the verifier had a route. The state
+// the server sends is now ignored where the stream names a candidate, so the shape below says
+// "done" and the box still reads failed.
+test("a failed run marks the one node its stream left working", () => {
+  const shape = [placed("analyst", 0), { ...placed("implementer", 1), state: "done" }];
   const view = applyDerived(
     shape,
     nodesFromEvents([start("analyst"), checkpointed("analyst"), start("implementer")]),
@@ -355,6 +360,61 @@ test("a stopped run's node the stream leaves working takes the store's state", (
   expect(view.map((n) => [n.name, n.state])).toEqual([
     ["analyst", "done"],
     ["implementer", "failed"],
+  ]);
+});
+
+// The case the deleted machinery existed for: converge died on a later iteration, so the
+// implementer holds a checkpoint from an earlier one and was then re-entered. The store can only
+// see the checkpoint and says "done"; the stream saw the re-entry, and it is the whole difference.
+test("a converge death still marks the implementer, which its checkpoints deny", () => {
+  const shape = [
+    { ...placed("red_team", 0), state: "done" },
+    { ...placed("implementer", 0), lane: 1, state: "done" },
+    { ...placed("bookkeeper", 1), state: "idle" },
+  ];
+  const events = [
+    start("red_team"),
+    checkpointed("red_team"),
+    start("implementer"),
+    checkpointed("implementer"),
+    start("implementer"),
+  ];
+  const view = applyDerived(shape, nodesFromEvents(events), "failed");
+  expect(view.map((n) => [n.name, n.state])).toEqual([
+    ["red_team", "done"],
+    ["implementer", "failed"],
+    ["bookkeeper", "idle"],
+  ]);
+});
+
+// A verifier that died after the fork. The store cannot name it — the implementer's re-entry fits
+// the same checkpoints — so it sends "idle" and the box used to draw grey on a run that plainly
+// failed in it. The stream saw the verifier start and never finish, which names it outright.
+test("a verifier that died after the fork is marked, not left grey", () => {
+  const shape = [
+    { ...placed("implementer", 0), state: "done" },
+    { ...placed("verifier", 1), state: "idle" },
+  ];
+  const events = [start("implementer"), checkpointed("implementer"), start("verifier")];
+  const view = applyDerived(shape, nodesFromEvents(events), "failed");
+  expect(view.map((n) => [n.name, n.state])).toEqual([
+    ["implementer", "done"],
+    ["verifier", "failed"],
+  ]);
+});
+
+// Two shaped hosts in flight when one of them died. The run's status says the run died, never which
+// of them died in it, so neither is named — the same answer the store gives past a fork that ran.
+test("a failed run with two shaped nodes still working names neither", () => {
+  const shape = [
+    { ...placed("implementer", 0), state: "done" },
+    { ...placed("deploy", 1), state: "idle" },
+  ];
+  const events = [start("implementer"), start("deploy")];
+  const view = applyDerived(shape, nodesFromEvents(events), "failed");
+  expect(view.map((n) => [n.name, n.state])).toEqual([
+    ["implementer", "done"],
+    ["deploy", "idle"],
   ]);
 });
 

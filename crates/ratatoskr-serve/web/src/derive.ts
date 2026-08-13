@@ -296,16 +296,34 @@ export function workingNodeNames(
  * ones where the shape puts them.
  *
  * `ended` is the run's status when it has stopped AND the view is at the live end — `null` at every
- * other position, and while the run is still executing. It is what lets the store settle a node the
- * stream cannot finish; see `fromStream`.
+ * other position, and while the run is still executing. It is what lets a node the stream cannot
+ * finish be settled; see `fromStream`.
  */
 export function applyDerived(
   shape: readonly NodeView[],
   derived: Map<string, DerivedNode>,
   ended: RunStatus | null = null,
 ): NodeView[] {
+  // Which node a failed run died in, when the record names one.
+  //
+  // A host error writes no checkpoint and no node-scoped event, so the node it killed is left
+  // "working" by the fold and the run emits nothing more to move it. At the live end of a failed
+  // run those nodes are therefore the candidates: the ones that started and never finished. This is
+  // evidence about which node actually died — no other record has it, and it holds wherever the node
+  // sits and whatever the shape declared.
+  //
+  // Spend it only where it names someone: exactly one candidate and no other. The run's status is a
+  // fact about the RUN — it says the run died, never which node died in it — and a workflow may run
+  // several hosts at once, so with two in flight both keep the state the stream gave them. An
+  // unattributed failure is worse than a correct attribution and much better than a wrong one.
+  const candidates =
+    ended === "failed"
+      ? [...derived].filter(([, d]) => d.state === "working").map(([name]) => name)
+      : [];
+  const died = candidates.length === 1 ? candidates[0] : null;
+
   const shaped = shape.filter((n) => n.shaped !== false);
-  const placed = shaped.map((n) => fromStream(n, derived.get(n.name), ended));
+  const placed = shaped.map((n) => fromStream(n, derived.get(n.name), ended, n.name === died));
 
   // Trailing columns: everything the shape does not place, in the order the stream first mentioned
   // it. A node the server did place from a checkpoint keeps everything else it said about it — its
@@ -319,26 +337,8 @@ export function applyDerived(
   order.push(...[...unplaced.keys()].filter((name) => !derived.has(name)));
 
   const base = placed.reduce((max, n) => Math.max(max, n.stage + 1), 0);
-  const rows = order.map((name) => {
-    const server = unplaced.get(name);
-    return { server, row: fromStream(server ?? unrun(name), derived.get(name), ended) };
-  });
-  // A node the store has no row for cannot be settled against it: on a run with no declared layout
-  // the node the host died under exists only in the stream — it never checkpointed, so the server
-  // never placed it and has no state to lend. The run's own status is then the only record of what
-  // became of it, and without it such a run draws every box green and nothing wrong.
-  //
-  // But that status is a fact about the RUN: it says the run died, not which node died in it. A
-  // layout-less workflow may have several hosts working at once, and then every one of them is
-  // sitting here with no server row and nothing to settle against. Spend the run's status only
-  // where it names someone — one candidate and no other — and otherwise leave the boxes as they
-  // were, which is the same rule the server follows when a failure past the fork could be either
-  // side of it.
-  const died =
-    ended === "failed" ? rows.filter(({ server, row }) => !server && row.state === "idle") : [];
-  const extra = rows.map(({ row }, i) => ({
-    ...row,
-    ...(died.length === 1 && died[0]?.row === row ? { state: "failed" as NodeState } : {}),
+  const extra = order.map((name, i) => ({
+    ...fromStream(unplaced.get(name) ?? unrun(name), derived.get(name), ended, name === died),
     stage: base + i,
     lane: 0,
     // These columns are this function's ordering, not a hand-off any shape declared — including
@@ -358,27 +358,33 @@ export function applyDerived(
  * mention has NOT STARTED at this point: it keeps what it is CONFIGURED to run on (`planned`),
  * because that is true before it runs, and loses everything it has not yet done.
  *
- * One thing the stream cannot prove, and it is the one that matters most: a node STOPPING when the
- * host dies under it. That writes no checkpoint and no node-scoped event — the only records are the
- * run's status and a `run_failed` carrying `node: null` — so the fold leaves the dying node
+ * One thing the stream cannot prove on its own, and it is the one that matters most: a node STOPPING
+ * when the host dies under it. That writes no checkpoint and no node-scoped event — the only records
+ * are the run's status and a `run_failed` carrying `node: null` — so the fold leaves the dying node
  * "working" and the run will emit nothing more to move it. `ended` is the run having stopped with
- * the view at its live end, and there a node the stream still calls working takes what the server
- * says about it: which node killed the run is derived from the checkpoints and the shape, and the
- * store is the only witness to it.
+ * the view at its live end, and there a node the stream still calls working is finished by two
+ * facts it cannot see itself: `died`, which `applyDerived` sets on the one node a failed run's
+ * record names, and otherwise the server's state, which is the best the store can say.
  *
  * At every other position the stream stays the authority, `ended` being null. Scrubbed into the
  * middle of a run, a node that genuinely WAS working then must still read working — showing how it
  * ended is the same lie as showing a run's final state at step one.
  */
-function fromStream(n: NodeView, d: DerivedNode | undefined, ended: RunStatus | null): NodeView {
+function fromStream(
+  n: NodeView,
+  d: DerivedNode | undefined,
+  ended: RunStatus | null,
+  died: boolean,
+): NodeView {
   if (!d) {
     const { telemetry: _dropped, ...rest } = n;
     return { ...rest, state: "idle" as NodeState, checkpoints: 0 };
   }
   const telemetry = d.costed ? d.telemetry : (n.telemetry ?? d.telemetry);
+  const settled: NodeState = died ? "failed" : n.state;
   return {
     ...n,
-    state: ended && d.state === "working" ? n.state : d.state,
+    state: ended && d.state === "working" ? settled : d.state,
     checkpoints: d.checkpoints,
     ...(telemetry ? { telemetry } : {}),
   };
