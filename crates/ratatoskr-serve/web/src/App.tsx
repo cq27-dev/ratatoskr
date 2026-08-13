@@ -388,13 +388,18 @@ export default function App() {
   const ended = detail && cursor === null && isTerminal(detail.status) ? detail.status : null;
   const graphNodes = useMemo(() => {
     if (!detail) return [];
+    // Nothing until both halves are in. The detail arrives first and the history a moment later,
+    // and drawing the detail alone draws a graph that is about to change: a node still working has
+    // no checkpoint, so the server has not placed it, and its box appears out of nowhere — shifting
+    // every box after it — the instant the history lands.
+    if (loading) return [];
     // Having a timeline is what makes the stream authoritative — not whether this position has
     // reached a node yet. At the very start of a run the only event is the issue checkpoint, which
     // is not a pipeline node, so the derivation is legitimately empty; falling back to the store
     // there showed every node finished, with its final counts, at step one of the run.
     if (!shownEvents.length) return detail.nodes;
     return applyDerived(detail.nodes, nodesFromEvents(shownEvents), ended);
-  }, [detail, shownEvents, ended]);
+  }, [detail, shownEvents, ended, loading]);
 
   /**
    * Which nodes are working right now — what stop and steer can be aimed at.
