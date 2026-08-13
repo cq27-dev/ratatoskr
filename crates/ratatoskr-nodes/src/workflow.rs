@@ -9888,7 +9888,7 @@ mod tests {
             // A source's hosts are the Rust-owned operations plus every stage it declares:
             // `build_declared_stage_hosts` installs declared stages through the same async
             // wrapper, so they carry the same Promise, and they are most of what a workflow calls.
-            let mut hosts: Vec<String> = TEMPORARY_OPERATIONS
+            let mut hosts: Vec<String> = OPERATION_HOSTS
                 .iter()
                 .map(|(name, _)| name.to_string())
                 .collect();
@@ -9897,7 +9897,7 @@ mod tests {
                 rest.split_once('"').map(|(id, _)| id.to_string())
             }));
             assert!(
-                hosts.len() > TEMPORARY_OPERATIONS.len(),
+                hosts.len() > OPERATION_HOSTS.len(),
                 "{path} declares no stages, so this guard would only cover the operations"
             );
             for (number, line) in source.lines().enumerate() {
