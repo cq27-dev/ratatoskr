@@ -243,7 +243,7 @@ pub fn validate_layout(
     stages: &[Stage],
     workflow: &str,
 ) -> Result<(), PlanError> {
-    let mut known: BTreeSet<&str> = BTreeSet::new();
+    let mut known: BTreeSet<&str> = policy::checkpoint_identities().collect();
     for stage in stages {
         known.insert(stage.governance_id());
         if !policy::folded_as_evidence(&stage.id) {
@@ -253,7 +253,7 @@ pub fn validate_layout(
     let mut placed: BTreeSet<&str> = BTreeSet::new();
     for column in layout {
         for node in &column.nodes {
-            if !known.contains(node.as_str()) && !policy::records_checkpoint(node) {
+            if !known.contains(node.as_str()) {
                 return Err(PlanError::Configuration(format!(
                     "workflow `{workflow}` lays out node `{node}`, which nothing it runs records \
                      under; nodes that can be drawn: {}",

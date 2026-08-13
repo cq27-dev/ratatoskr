@@ -265,13 +265,19 @@ pub(crate) fn reserved_for_governance(id: &str) -> Option<Reserved> {
     reserved(id).filter(|reason| !reason.governable())
 }
 
-/// Whether the run itself writes a checkpoint under `id`, with no stage of that name to declare it.
+/// The identities the run itself writes a checkpoint under, with no stage of that name to declare
+/// them.
 ///
-/// The lifecycle identities: `latest_checkpoint` reads `implementer`, `red_team` and `memory` back
-/// by name, so a run records under those whatever its registry calls the stages behind them. A
-/// workflow's layout may place them for that reason.
-pub(crate) fn records_checkpoint(id: &str) -> bool {
-    reserved(id) == Some(Reserved::Lifecycle)
+/// `latest_checkpoint` reads `implementer`, `red_team` and `memory` back by name, so a run records
+/// under those whatever its registry calls the stages behind them, and a workflow's layout may
+/// place them for that reason. A list rather than a predicate because a refusal has to name what
+/// *is* allowed to be actionable, and a set the caller can print is the only way acceptance and the
+/// message cannot drift apart.
+pub(crate) fn checkpoint_identities() -> impl Iterator<Item = &'static str> {
+    STANDARD_IDENTIFIERS
+        .iter()
+        .filter(|(_, class)| matches!(class, Class::Reserved(Reserved::Lifecycle)))
+        .map(|(name, _)| *name)
 }
 
 /// The output contract an override of `id` must keep, because Rust deserializes it.
