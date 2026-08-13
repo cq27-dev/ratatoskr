@@ -8716,6 +8716,133 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A failing first attempt must send the standard loop back to `iterate()`, not on to review.
+    ///
+    /// Every host is an `async function`, so a bare `testCommandRan(x) && isConverged(y)` is a
+    /// Promise — always truthy — and the loop would take the clean branch regardless of the test
+    /// results. This drives the bundled composition and reads the decision off the host calls it
+    /// actually made, which is the only place the difference shows.
+    #[tokio::test]
+    async fn a_failing_first_attempt_iterates_before_it_reviews() {
+        let runtime = standard_runtime().await.unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        // Every host records its own name; the ones the loop branches on answer from the
+        // implementation shape it is handed, exactly as their Rust owners do.
+        let mut hosts: HashMap<String, HostFn> = HashMap::new();
+        let mut bind = |name: &str, reply: fn(serde_json::Value) -> serde_json::Value| {
+            let calls = Arc::clone(&calls);
+            let recorded = name.to_string();
+            let host: HostFn = Arc::new(move |arg: String| {
+                let calls = Arc::clone(&calls);
+                let recorded = recorded.clone();
+                Box::pin(async move {
+                    calls.lock().expect("call log poisoned").push(recorded);
+                    let arg: serde_json::Value = serde_json::from_str(&arg).unwrap();
+                    Ok(reply(arg).to_string())
+                })
+            });
+            hosts.insert(name.to_string(), host);
+        };
+
+        bind("context", |_| json!({ "scout": {}, "memory": {} }));
+        bind("analyst", |_| json!({ "changes_code": true }));
+        bind("redTeam", |_| json!({ "failing_tests": ["acceptance"] }));
+        // The first attempt leaves the acceptance test failing; `iterate` is what fixes it.
+        bind(
+            "implement",
+            |_| json!({ "failing_tests": ["acceptance"], "passed_tests": 0, "exit_code": 1 }),
+        );
+        bind(
+            "iterate",
+            |_| json!({ "failing_tests": [], "passed_tests": 1, "exit_code": 0 }),
+        );
+        bind("testCommandRan", |arg| json!(arg["exit_code"] == 0));
+        bind("isConverged", |arg| {
+            json!(arg["post"]["failing_tests"].as_array().unwrap().is_empty())
+        });
+        bind("verify", |_| {
+            json!({
+                "configured": false,
+                "unavailable": false,
+                "findings": [],
+                "blocking": [],
+                "needsReplan": false,
+            })
+        });
+        bind("replanAtCeiling", |_| serde_json::Value::Null);
+
+        runtime
+            .run(
+                "run",
+                json!({ "issue": "x", "maxIterations": 3, "alwaysFork": false }).to_string(),
+                hosts,
+            )
+            .await
+            .unwrap();
+
+        let calls = calls.lock().expect("call log poisoned").clone();
+        let first = |name: &str| calls.iter().position(|call| call == name);
+        assert!(
+            first("iterate").is_some(),
+            "a failing attempt must be sent back to the implementer; calls were {calls:?}"
+        );
+        assert!(
+            first("iterate") < first("verify"),
+            "review must not run until the tests are clean; calls were {calls:?}"
+        );
+    }
+
+    /// Guards the whole class the behavioural test above catches one instance of.
+    ///
+    /// A host call is an `async function` call, so its value is a Promise until awaited — and a
+    /// Promise is truthy, is not `===` anything, and stringifies to `[object Promise]`. None of
+    /// that is a type error, so nothing but reading the source catches it. Every host call in a
+    /// source we ship therefore has to be awaited on the spot. A workflow that deliberately forks
+    /// with `Promise.all` is the one shape this forbids; award it its own awaited binding first.
+    #[test]
+    fn every_host_call_in_a_shipped_workflow_is_awaited() {
+        let sources = [
+            ("workflows/standard-v1.ts", STANDARD_WORKFLOW_V1),
+            (
+                "examples/workflow.ts",
+                include_str!("../../../examples/workflow.ts"),
+            ),
+        ];
+        let mut unawaited = Vec::new();
+        for (path, source) in sources {
+            for (number, line) in source.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                for (host, _) in TEMPORARY_OPERATIONS {
+                    for (at, _) in line.match_indices(host) {
+                        let before = &line[..at];
+                        let after = line[at + host.len()..].trim_start();
+                        // A call, not a property, a key, or a longer identifier that contains it.
+                        if !after.starts_with('(')
+                            || before
+                                .chars()
+                                .next_back()
+                                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                        {
+                            continue;
+                        }
+                        if !before.trim_end().ends_with("await") {
+                            unawaited.push(format!("{path}:{}: {}", number + 1, line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            unawaited.is_empty(),
+            "these host calls are missing an `await`, so each yields a truthy Promise \
+             rather than its value:\n{}",
+            unawaited.join("\n")
+        );
+    }
+
     #[test]
     fn scripted_review_warning_describes_the_optional_binding() {
         assert!(crate::SCRIPTED_REVIEW_WARNING.contains("controls whether to run the verifier"));

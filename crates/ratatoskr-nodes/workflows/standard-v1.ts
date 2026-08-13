@@ -806,9 +806,11 @@ async function full(input: {
   }
 
   while (true) {
+    // Every host is an `async function`: an unawaited call is a Promise, and a Promise is truthy
+    // whatever it resolves to. Both operands must be awaited before the `&&` sees them.
     const testsClean =
-      testCommandRan(implementation) &&
-      isConverged({ baseline, post: implementation });
+      (await testCommandRan(implementation)) &&
+      (await isConverged({ baseline, post: implementation }));
     if (testsClean) {
       const review = await verify({ analyst: analysis });
       if (!review.configured || review.unavailable || review.blocking.length === 0) break;
