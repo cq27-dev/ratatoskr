@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { clock } from "../ui/text";
-import { LIVE, type RunDetail } from "../api";
+import { isTerminal, type RunDetail } from "../api";
 
 /** A live run with nothing recorded for this long is almost certainly dead, not busy. */
 const STALE_MS = 120_000;
@@ -25,7 +25,10 @@ export function RunMeta({ detail, lastEvent }: { detail: RunDetail; lastEvent: s
   const lastSeen = seen.length ? seen[seen.length - 1]! : null;
   const stale =
     detail.status !== null &&
-    LIVE.has(detail.status) &&
+    // Still executing means NOT terminal, asked the same open-world way `isTerminal` answers it: a
+    // status this build has never heard of is a run that may still be going, so it is one this can
+    // still call stale. A closed list of live names answered the opposite for exactly those.
+    !isTerminal(detail.status) &&
     lastSeen !== null &&
     Date.now() - Date.parse(lastSeen) > STALE_MS;
 
@@ -136,7 +139,7 @@ export function RunMeta({ detail, lastEvent }: { detail: RunDetail; lastEvent: s
                 #{detail.pull_request.number}
               </a>
             ) : (
-              <span className="muted">{detail.status && LIVE.has(detail.status) ? "not yet" : "none"}</span>
+              <span className="muted">{detail.status && !isTerminal(detail.status) ? "not yet" : "none"}</span>
             )}
           </dd>
         </div>

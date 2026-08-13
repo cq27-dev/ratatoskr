@@ -754,3 +754,18 @@ test("a status this build has never heard of reads as still executing", () => {
     expect(isTerminal(done)).toBe(true);
   }
 });
+
+test("a run's header reads a newer server's status as live, like everything else", () => {
+  // `isTerminal` is deliberately open-world: anything this build cannot classify is still
+  // executing. A closed set of LIVE names is the same question asked the other way round, and it
+  // answers the opposite — so a status a newer server sent gave the run live controls and
+  // unsettled nodes while its header said no pull request would ever appear and never marked a
+  // silent run stale.
+  for (const live of ["running", "pending", "awaiting_clarification", "from_a_newer_build"]) {
+    expect(isTerminal(live)).toBe(false);
+  }
+  // And a status that IS classified terminal stays terminal on both.
+  for (const done of ["converged", "failed", "no_code_change"]) {
+    expect(isTerminal(done)).toBe(true);
+  }
+});

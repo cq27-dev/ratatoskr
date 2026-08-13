@@ -219,13 +219,6 @@ export interface CheckpointView {
   output: unknown;
 }
 
-/** Statuses that mean the run is still executing. */
-export const LIVE: ReadonlySet<string> = new Set([
-  "running",
-  "awaiting_clarification",
-  "pending",
-]);
-
 /**
  * Thrown when the server says who you are is the problem.
  *
