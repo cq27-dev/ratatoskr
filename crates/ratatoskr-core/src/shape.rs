@@ -27,18 +27,66 @@ pub struct ShapeNode {
 
 /// Read the shape a run recorded.
 ///
-/// Empty when there is nothing readable to read: a workflow that declared no layout, or a run from
-/// before shapes were stored. Nothing is substituted for it — a viewer places such a run's nodes
-/// from the records it actually has, which is the most that can be said about where they sat.
+/// Empty when there is nothing readable to read: a workflow that declared no layout, a run from
+/// before shapes were stored, or a recording whose positions are not positions. Nothing is
+/// substituted for it — a viewer places such a run's nodes from the records it actually has, which
+/// is the most that can be said about where they sat.
+///
+/// The bound is here rather than at the writer because a shape does not only arrive from a workflow
+/// this machine validated: an imported bundle carries one another machine recorded, and it is
+/// written to the store as it came. A reader sizing anything from `stage` — grouping into columns
+/// is the obvious one — would be sizing it from a number the run's author chose. Positions index a
+/// shape's own nodes, so one at or past their count is not a position, and the whole recording is
+/// unreadable rather than partly trusted.
 pub fn recorded(shape_json: Option<&str>) -> Vec<ShapeNode> {
-    shape_json
+    let nodes: Vec<ShapeNode> = shape_json
         .and_then(|raw| serde_json::from_str::<Vec<ShapeNode>>(raw).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if nodes
+        .iter()
+        .any(|node| node.stage >= nodes.len() || node.lane >= nodes.len())
+    {
+        return Vec::new();
+    }
+    nodes
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_position_past_the_shape_it_indexes_makes_the_whole_recording_unreadable() {
+        // An imported bundle's shape was validated on the machine that wrote it, and is stored as
+        // it arrived. A reader that groups by `stage` sizes that grouping from the number in the
+        // record, so a shape claiming a position no node could occupy is refused outright rather
+        // than placed — the run is then drawn from its own records, as any unshaped run is.
+        let far = r#"[{"name":"x","stage":1000000000,"lane":0,"optional":false}]"#;
+        assert!(
+            recorded(Some(far)).is_empty(),
+            "a position must index this shape's own nodes"
+        );
+
+        let saturated = format!(
+            r#"[{{"name":"x","stage":{},"lane":0,"optional":false}}]"#,
+            usize::MAX
+        );
+        assert!(
+            recorded(Some(&saturated)).is_empty(),
+            "and must not be one that overflows"
+        );
+
+        let lane = r#"[{"name":"x","stage":0,"lane":9000,"optional":false}]"#;
+        assert!(recorded(Some(lane)).is_empty(), "a lane is a position too");
+
+        // The fork: two nodes, one column, two lanes. Every index is inside the node count, which
+        // is what a shape this build wrote always looks like.
+        let real = r#"[
+            {"name":"red_team","stage":0,"lane":0,"optional":false},
+            {"name":"implementer","stage":0,"lane":1,"optional":false}
+        ]"#;
+        assert_eq!(recorded(Some(real)).len(), 2);
+    }
 
     #[test]
     fn a_run_is_drawn_against_the_shape_it_recorded_and_nothing_else() {
