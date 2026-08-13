@@ -163,6 +163,23 @@ pub fn validate(
                 stage_names.iter().copied().collect::<Vec<_>>().join(", ")
             )));
         };
+        // The executor invokes a delegated child at the evidence disposition, and refuses a stage
+        // that carries a delegation there — so a chain accepted here is a registry guaranteed to
+        // fail the moment its parent runs. Refuse it while the error can still name the
+        // declaration. Self-delegation is this same case pointing at itself, and would be an
+        // infinite regress if it were honoured.
+        //
+        // Folding evidence recursively is the alternative. It would buy a depth of model turns
+        // nothing bounds, for a shape no workflow here asks for: one stage gathering evidence from
+        // one other is what delegation is for.
+        if let Some(onwards) = &target.delegation {
+            return Err(PlanError::Configuration(format!(
+                "stage `{}` delegates to `{}`, which delegates onwards to `{}`; a delegation \
+                 target must not delegate, and `{}` is invoked as evidence where its own \
+                 delegation cannot run",
+                parent.id, target.id, onwards.target, target.id
+            )));
+        }
         // A delegated child is invoked directly by the Rust executor, not through the JavaScript
         // host wrapper where `renderQuestion` runs. Refuse the unsupported shape up front instead
         // of silently handing the child raw JSON under a declaration that promised another prompt.
@@ -602,6 +619,55 @@ mod tests {
             error.contains("requires an explicit workflow host call"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_delegation_target_that_itself_delegates_is_refused_at_load() {
+        // The executor invokes a delegated child at the evidence disposition, and a stage with a
+        // delegation of its own is refused there — so a chain that loads is a registry guaranteed
+        // to fail the moment its parent runs. Folding evidence recursively is the alternative, and
+        // it buys a depth of model turns nothing bounds for a shape no workflow here wants.
+        //
+        // Self-delegation is the same declaration pointing at itself: an infinite regress if it
+        // were honoured, and the same refusal covers it.
+        let template = crate::built_in_stages()
+            .into_iter()
+            .find(|stage| stage.id == "analyst")
+            .unwrap();
+        let delegating = |id: &str, target: &str| {
+            let mut stage = template.clone();
+            stage.id = id.to_string();
+            stage.output_contract = "Evidence".to_string();
+            stage.output_schema = Some(serde_json::json!({ "type": "object" }));
+            stage.delegation = Some(crate::Delegation {
+                target: target.to_string(),
+                evidence_contract: "Evidence".to_string(),
+                input_limit: 1_000,
+            });
+            stage
+        };
+        let mut leaf = template.clone();
+        leaf.id = "leaf".to_string();
+        leaf.output_contract = "Evidence".to_string();
+        leaf.output_schema = Some(serde_json::json!({ "type": "object" }));
+
+        let chain = [
+            delegating("first", "second"),
+            delegating("second", "leaf"),
+            leaf,
+        ];
+        let error = validate(&chain, &crate::built_in_agents(), &permitted_for(&chain))
+            .expect_err("a delegation target that delegates must be refused")
+            .to_string();
+        assert!(error.contains("first"), "{error}");
+        assert!(error.contains("second"), "{error}");
+        assert!(error.contains("delegates onwards"), "{error}");
+
+        let itself = [delegating("loop", "loop")];
+        let error = validate(&itself, &crate::built_in_agents(), &permitted_for(&itself))
+            .expect_err("a stage that delegates to itself must be refused")
+            .to_string();
+        assert!(error.contains("loop"), "{error}");
     }
 
     #[test]
