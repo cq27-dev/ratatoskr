@@ -108,9 +108,7 @@ pub struct PlannedNode {
 impl PlannedNode {
     /// Read a node's route out of the config, if it has one. A node with no route never runs.
     fn of(config: Option<&ratatoskr_core::RatatoskrConfig>, node: &str) -> Option<Self> {
-        // `red_team` checkpoints under that name but is routed as `redteam`.
-        let key = if node == "red_team" { "redteam" } else { node };
-        let route = config?.models.get(key)?;
+        let route = config?.models.get(node)?;
         Some(PlannedNode {
             model: format!("{}/{}", route.provider, route.model),
             thinking: route
@@ -841,7 +839,6 @@ mod tests {
         let config = routed("redteam");
 
         let views = derive_with(None, &[], Some(&config), Some(&standard_shape()));
-        // Routed as `redteam`, checkpointed as `red_team` — the view is keyed by the latter.
         let planned = views
             .iter()
             .find(|v| v.name == "redteam")
