@@ -522,7 +522,28 @@ test("a box's member stages are folded into it rather than drawn beside it", () 
 
   const drawn = applied(shape, inNodeBoxes(events, stages));
   expect(drawn.map((n) => n.name)).toEqual(["redteam"]);
+  // WORKING, not done: the classifier finishing is the box started, and the author has not run.
+  // This case asserted `done` while the server said otherwise for the same records — the box's own
+  // aggregate is what completes it, on both sides.
+  expect(drawn[0].state).toBe("working");
+  expect(drawn[0].checkpoints).toBe(0);
+});
+
+test("a box is done when its own record lands, and counts only its own", () => {
+  const shape = [composed("redteam", "idle")];
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const events = [
+    start("redteam_classifier"),
+    checkpointed("redteam_classifier"),
+    start("redteam_author"),
+    checkpointed("redteam_author"),
+    checkpointed("redteam"),
+  ];
+  const drawn = applied(shape, inNodeBoxes(events, stages));
   expect(drawn[0].state).toBe("done");
+  // One, not three. The server counts the box's own rows, and a number that changes when a log
+  // rotates away is a number nobody can read.
+  expect(drawn[0].checkpoints).toBe(1);
 });
 
 test("a stage executing with nothing checkpointed yet is already drawn in its box", () => {
@@ -542,8 +563,9 @@ test("a stage executing with nothing checkpointed yet is already drawn in its bo
   expect(drawn[0].state).toBe("working");
   // The control address, which is the half of this that reaches the run.
   expect(workingNodeNames(shape, boxed)).toEqual(["context"]);
-  // And the feed filter for that box, asked while it has no row of its own.
-  expect(stagesOf(stages, "context")).toEqual(["context_distillation"]);
+  // And the feed filter for that box, asked while it has no row of its own: its member's name and
+  // its own, because the box's aggregate and its acceptance output are logged under the box.
+  expect(stagesOf(stages, "context")).toEqual(["context_distillation", "context"]);
 });
 
 test("reading events as boxes leaves the events themselves alone", () => {
@@ -554,10 +576,15 @@ test("reading events as boxes leaves the events themselves alone", () => {
   expect(inNodeBoxes(events, stages)[0].node).toBe("redteam");
   expect(events[0].node).toBe("redteam_author");
 
-  // A stage that is its own box is not touched, and neither is a name the registry never heard of.
+  // A stage that is its own box keeps its name, and so does one the registry never heard of. Both
+  // still carry `member`, because a fold has to be able to tell a member's record from its box's
+  // whether or not a rename happened.
   const plain = registry(["analyst"], ["scout"]);
   const untouched = [start("analyst"), start("scout"), start("characterizer")];
-  expect(inNodeBoxes(untouched, plain)).toBe(untouched);
+  const read = inNodeBoxes(untouched, plain);
+  expect(read.map((e) => e.node)).toEqual(["analyst", "scout", "characterizer"]);
+  expect(read.map((e) => e.member)).toEqual(["analyst", "scout", "characterizer"]);
+  expect(untouched.some((e) => "member" in e)).toBe(false);
 });
 
 test("a re-entry is counted from the box, whichever stage announced it", () => {
@@ -607,6 +634,78 @@ test("the live map is keyed by the box, so the box draws with what its member an
   expect([...box.used]).toEqual(["Read"]);
 });
 
+test("a box's cost is the fold of its members, not whichever record landed last", () => {
+  // Two defects in one: the box's own aggregate carries a `usage` block of zeros because it covers
+  // no turn, and two members each carry their own. Overwriting on every checkpoint reported the
+  // zeros; replacing rather than folding reported only the last member.
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const spent = (node, at, input, model) => ({
+    at,
+    kind: "checkpoint",
+    node,
+    detail: "",
+    facts: { model, tools: ["Read"], thinking: false, reuses_session: false },
+    usage: {
+      input_tokens: input,
+      output_tokens: 1,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      reasoning_tokens: 0,
+      duration_ms: 10,
+    },
+    turns: 1,
+  });
+  const aggregate = {
+    at: "t3",
+    kind: "checkpoint",
+    node: "redteam",
+    detail: "",
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      reasoning_tokens: 0,
+      duration_ms: 0,
+    },
+  };
+  const events = [
+    spent("redteam_classifier", "t1", 20, "sonnet"),
+    spent("redteam_author", "t2", 10, "haiku"),
+    aggregate,
+  ];
+  const derived = nodesFromEvents(inNodeBoxes(events, stages)).get("redteam");
+  expect(derived.telemetry.input_tokens).toBe(30);
+  expect(derived.telemetry.output_tokens).toBe(2);
+  expect(derived.telemetry.turns).toBe(2);
+  // Both routes named, as the server names them, rather than the later one silently winning.
+  expect(derived.telemetry.model).toBe("sonnet, haiku");
+  // The aggregate's zeros are not a report of cost, so they neither establish `costed` nor let a
+  // zeroed row displace the server's folded figure.
+  expect(derived.costed).toBe(true);
+  expect(derived.state).toBe("done");
+  expect(derived.checkpoints).toBe(1);
+});
+
+test("a working box shows every member's model and tools, not the latest one's", () => {
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const announced = (node, at, model, tool) => ({
+    at,
+    kind: "node_start",
+    node,
+    detail: "",
+    facts: { model, tools: [tool], thinking: false, reuses_session: false },
+  });
+  const events = [
+    announced("redteam_classifier", "t1", "sonnet", "Read"),
+    announced("redteam_author", "t2", "haiku", "Write"),
+  ];
+  const derived = nodesFromEvents(inNodeBoxes(events, stages)).get("redteam");
+  expect(derived.telemetry.model).toBe("sonnet, haiku");
+  expect(derived.telemetry.tools).toEqual(["Read", "Write"]);
+  expect(derived.state).toBe("working");
+});
+
 test("a control is aimed at the box the stage runs inside", () => {
   // The run polls for a Stop under the node's name, so this has to name the same thing — a control
   // offered against `redteam_classifier` would be sent to an address nothing answers.
@@ -618,7 +717,13 @@ test("a control is aimed at the box the stage runs inside", () => {
 
 test("the stages of a box are what its feed is filtered by", () => {
   const stages = registry(["redteam", "redteam_classifier", "redteam_author"], ["analyst"]);
-  expect(stagesOf(stages, "redteam")).toEqual(["redteam_classifier", "redteam_author"]);
+  // Its members AND its own name: `redteam` is not a stage id, so a members-only answer drops the
+  // aggregate rows and the acceptance suite, both logged under the box.
+  expect(stagesOf(stages, "redteam")).toEqual([
+    "redteam_classifier",
+    "redteam_author",
+    "redteam",
+  ]);
   // A box that is one stage, and a name the registry does not carry at all, are both exactly
   // themselves.
   expect(stagesOf(stages, "analyst")).toEqual(["analyst"]);
