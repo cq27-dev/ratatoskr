@@ -46,6 +46,20 @@ pub fn validate_declarations(stages: &[Stage], workflow: &str) -> Result<(), Pla
                 },
             )));
         }
+        // The same rule as the contract above, for the other half of what makes an override run
+        // where the standard stage did. A stage the run folds into another's record as evidence is
+        // invoked by its Rust adapter whatever a workflow declares, so an override that drops its
+        // membership becomes a node of its own, writes no row, and its cost goes to nobody — the
+        // failure `UNCLAIMED_BY_DESIGN` exists to keep to a named set. Refused at load, where the
+        // error can still name the declaration.
+        if policy::folded_as_evidence(&stage.id) && stage.is_own_node() {
+            return Err(PlanError::Configuration(format!(
+                "workflow `{workflow}` declares stage `{}` without a node; the run {}, so a \
+                 declaration of it must say which node's work it is",
+                stage.id,
+                policy::FOLDED_AS_EVIDENCE_BECAUSE
+            )));
+        }
         // `governedBy` is the identity the model turn is recorded under: its ruleset, its
         // `[models.*]` route, its plugin bindings, its telemetry attribution and its conversation
         // key. A name the run owns is no more available there than it is as a stage id.
@@ -458,6 +472,34 @@ mod tests {
     }
 
     #[test]
+    fn an_override_of_an_evidence_stage_keeps_its_membership_as_it_keeps_its_contract() {
+        // A from-scratch redeclaration is the shape this catches: `implementer_attempt` written out
+        // with its contract intact and no `node`. Every other gate passes it, the adapter invokes
+        // it as evidence exactly as before, and it silently becomes a node of its own — no member
+        // row, no claim, and a model turn charged to nobody.
+        let mut orphan = crate::stage::stage_fixture("implementer_attempt", "build");
+        orphan.output_contract = "Report".to_string();
+        let error = match validate_declarations(&[orphan.clone()], "custom") {
+            Ok(()) => panic!("an evidence stage that is its own node is unclaimable"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("implementer_attempt"), "{error}");
+        assert!(error.contains("without a node"), "{error}");
+
+        // Declaring the membership the bundled stage has is what makes the override run where it
+        // did, and that is accepted.
+        let mut member = orphan;
+        member.node = Some("implementer".to_string());
+        assert!(validate_declarations(&[member], "custom").is_ok());
+
+        // An ordinary stage is unaffected: nothing folds it into anyone's record, so being its own
+        // node is what it is for.
+        let mut ordinary = crate::stage::stage_fixture("security_review", "reason");
+        ordinary.output_contract = String::new();
+        assert!(validate_declarations(&[ordinary], "custom").is_ok());
+    }
+
+    #[test]
     fn a_stage_joins_a_box_something_records_under_or_it_joins_nothing() {
         // A membership is a box name, and a box nothing writes under is a box that stays empty for
         // the whole run — the failure `validate_layout` refuses a column for, reached from the
@@ -633,6 +675,10 @@ mod tests {
         let mut stage = crate::stage::stage_fixture("analyst", "reason");
         stage.id = "implementer_attempt".to_string();
         stage.output_contract = "Report".to_string();
+        // Its contract AND its membership: the run folds this stage's output into the
+        // implementer's record whatever a workflow says, so an override that kept only the
+        // contract would run in the same place and be recorded in none.
+        stage.node = Some("implementer".to_string());
 
         assert!(validate_declarations(&[stage], "repo-workflow").is_ok());
     }
@@ -684,6 +730,9 @@ mod tests {
             stage.id = declarable.to_string();
             stage.output_contract = policy::required_contract(declarable).unwrap().to_string();
             stage.governed_by = Some("redteam".to_string());
+            // The box as well as the route. `redteam_author` is folded into the red team's record
+            // as evidence, so a declaration of it has to say whose work it is.
+            stage.node = Some("redteam".to_string());
             assert!(
                 validate_declarations(&[stage], "repo-workflow").is_ok(),
                 "`{declarable}` must stay declarable"
