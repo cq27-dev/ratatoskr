@@ -291,17 +291,19 @@ fn machine_name(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The governance identities a registry offers: every stage's id and the identity it runs
+    /// under. What `governable_from` derives from the real standard stages, over the stages a case
+    /// declares.
     fn permitted_for(stages: &[Stage]) -> Vec<String> {
-        crate::BUILT_IN_NODES
+        stages
             .iter()
-            .map(|name| (*name).to_string())
-            .chain(stages.iter().map(|stage| stage.id.clone()))
+            .flat_map(|stage| [stage.id.clone(), stage.governance_id().to_string()])
             .collect()
     }
 
     #[test]
     fn declared_contracts_require_a_valid_schema() {
-        let mut stage = crate::built_in_stages().pop().unwrap();
+        let mut stage = crate::stage::stage_fixture("publisher", "publish");
         stage.id = "security_evidence".to_string();
         stage.output_contract = "SecurityEvidence".to_string();
         assert!(validate_declared_contracts(&[stage.clone()]).is_err());
@@ -316,10 +318,7 @@ mod tests {
 
     #[test]
     fn declared_stages_are_a_registry_not_an_execution_sequence() {
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
         let mut plan = template.clone();
         plan.id = "plan".to_string();
         plan.input_contract = "Issue".to_string();
@@ -345,10 +344,7 @@ mod tests {
         // alone — so a declared stage under either name would put its own output where a reader
         // expects the run's, and the shape API would report its `from` field as a node caller.
         for reserved in ["issue", "clarification"] {
-            let mut stage = crate::built_in_stages()
-                .into_iter()
-                .find(|stage| stage.id == "analyst")
-                .unwrap();
+            let mut stage = crate::stage::stage_fixture("analyst", "reason");
             stage.id = reserved.to_string();
             stage.governed_by = None;
 
@@ -363,10 +359,7 @@ mod tests {
 
     #[test]
     fn omitted_governance_keeps_the_stage_identifier_fallback() {
-        let mut stage = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let mut stage = crate::stage::stage_fixture("analyst", "reason");
         stage.id = "custom_plan".to_string();
         stage.governed_by = None;
 
@@ -375,26 +368,25 @@ mod tests {
 
     #[test]
     fn explicit_builtin_governance_is_permitted() {
-        let mut stage = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let mut stage = crate::stage::stage_fixture("analyst", "reason");
         stage.id = "test_author".to_string();
         stage.governed_by = Some("redteam".to_string());
-        let permitted = crate::BUILT_IN_NODES
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect::<Vec<_>>();
 
-        assert!(validate(&[stage], &crate::built_in_agents(), &permitted).is_ok());
+        // `redteam` is what the standard red-team stages are governed by, so it is in the set
+        // `governable_from` derives from them.
+        assert!(
+            validate(
+                &[stage],
+                &crate::built_in_agents(),
+                &["redteam".to_string()],
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn explicit_workflow_governance_is_permitted() {
-        let mut stage = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let mut stage = crate::stage::stage_fixture("analyst", "reason");
         stage.id = "custom_plan".to_string();
         stage.governed_by = Some("shared_policy".to_string());
 
@@ -410,10 +402,7 @@ mod tests {
 
     #[test]
     fn explicit_governance_may_name_another_declared_stage() {
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
         let mut policy = template.clone();
         policy.id = "shared_policy".to_string();
         let mut plan = template;
@@ -426,16 +415,10 @@ mod tests {
 
     #[test]
     fn explicit_unknown_governance_is_rejected_before_execution() {
-        let mut stage = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let mut stage = crate::stage::stage_fixture("analyst", "reason");
         stage.id = "custom_plan".to_string();
         stage.governed_by = Some("verifer".to_string());
-        let permitted = crate::BUILT_IN_NODES
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect::<Vec<_>>();
+        let permitted = ["verifier".to_string(), "redteam".to_string()];
 
         let error = validate(&[stage], &crate::built_in_agents(), &permitted)
             .unwrap_err()
@@ -451,10 +434,7 @@ mod tests {
         // gap. `context` is the case that used to slip through: it is an operation the bundled
         // `plan` and `full` both call, and a declaration of it failed only once the run was already
         // writing checkpoints.
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
 
         for (name, _) in crate::workflow::OPERATION_HOSTS {
             let mut stage = template.clone();
@@ -472,10 +452,7 @@ mod tests {
 
     #[test]
     fn declared_stages_cannot_take_a_terminal_adapter_name() {
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
 
         for terminal in ["bookkeeper", "publisher"] {
             let mut stage = template.clone();
@@ -490,10 +467,7 @@ mod tests {
 
     #[test]
     fn a_standard_stage_may_still_be_overridden() {
-        let mut stage = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let mut stage = crate::stage::stage_fixture("analyst", "reason");
         stage.id = "implementer_attempt".to_string();
         stage.output_contract = "Report".to_string();
 
@@ -506,10 +480,7 @@ mod tests {
         // and deserializes `implementer`, `red_team` and `memory` into concrete types. A stage
         // checkpointing its own output under one of those names inflates the count, spends the
         // ceiling recovery early, or fails deserialization in the middle of a run.
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
 
         for reserved in ["implementer", "red_team", "memory"] {
             let mut stage = template.clone();
@@ -533,10 +504,7 @@ mod tests {
         // then leaves route resolution with a `redteam` that has no stage to resolve, and the run
         // dies on the name the workflow just introduced. `implementer` and `context`, the sibling
         // identities, are covered by reservations of their own.
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
 
         let mut stage = template.clone();
         stage.id = "redteam".to_string();
@@ -564,10 +532,8 @@ mod tests {
         // `redTeam()` reads the `analyst` checkpoint back as `AnalystOutput` and `implement()`
         // takes one as its argument. An override that checkpoints another shape passes every other
         // gate and fails when the adapter reads it — after the stage has already run.
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let mut template = crate::stage::stage_fixture("analyst", "reason");
+        template.output_contract = "AnalystOutput".to_string();
 
         let mut changed = template.clone();
         changed.output_contract = "SecurityPlan".to_string();
@@ -591,10 +557,7 @@ mod tests {
         // `[models.*]` route, those plugin bindings, that telemetry attribution and that
         // conversation key. Selection runs before a workflow is chosen and delivery after its
         // outcome is accepted, so neither is an identity a workflow stage can run as.
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
 
         for reserved in ["publisher", "bookkeeper", "overseer"] {
             let mut stage = template.clone();
@@ -625,10 +588,7 @@ mod tests {
 
     #[test]
     fn a_delegated_renderer_is_refused_before_execution() {
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
         let mut parent = template.clone();
         parent.id = "parent".to_string();
         parent.delegation = Some(crate::Delegation {
@@ -662,10 +622,7 @@ mod tests {
         //
         // Self-delegation is the same declaration pointing at itself: an infinite regress if it
         // were honoured, and the same refusal covers it.
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
         let delegating = |id: &str, target: &str| {
             let mut stage = template.clone();
             stage.id = id.to_string();
@@ -708,10 +665,7 @@ mod tests {
         // checkpoint, so a standard stage whose output an adapter folds into another record takes
         // the declaration and drops it — silently, on every invocation. Adding one at that
         // disposition without classifying it here is what this refuses to let happen quietly.
-        let template = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = crate::stage::stage_fixture("analyst", "reason");
         let mut child = template.clone();
         child.id = "child".to_string();
         child.output_contract = "Evidence".to_string();

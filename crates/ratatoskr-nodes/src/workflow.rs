@@ -49,8 +49,8 @@ const STANDARD_WORKFLOW_NAME: &str = "ratatoskr-standard-v1";
 pub(crate) const STANDARD_WORKFLOW_V1: &str = include_str!("../workflows/standard-v1.ts");
 /// What a workflow imports the standard node definitions from.
 pub(crate) const STANDARD_DEFINITIONS_MODULE: &str = "ratatoskr/nodes";
-const STANDARD_DEFINITIONS: &str = include_str!("../workflows/nodes.ts");
-const STANDARD_WORKFLOW_INCLUDES: &[(&str, &str)] = &[
+pub(crate) const STANDARD_DEFINITIONS: &str = include_str!("../workflows/nodes.ts");
+pub(crate) const STANDARD_WORKFLOW_INCLUDES: &[(&str, &str)] = &[
     ("prompts/analyst.md", include_str!("../prompts/analyst.md")),
     (
         "prompts/bookkeeper.md",
@@ -3139,7 +3139,7 @@ mod tests {
 
     #[test]
     fn declared_contracts_validate_all_json_root_values() {
-        let mut stage = crate::built_in_stages().pop().unwrap();
+        let mut stage = crate::stage::stage_fixture("publisher", "publish");
         stage.id = "security_evidence".into();
         stage.output_contract = "SecurityEvidence".into();
         stage.output_schema = Some(json!({
@@ -3167,10 +3167,7 @@ mod tests {
 
     #[test]
     fn declared_stage_guidance_precedes_runtime_input() {
-        let mut stage = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let mut stage = crate::stage::stage_fixture("analyst", "reason");
         stage.instructions = "stage instructions".to_string();
         stage.context = "stage context".to_string();
         let mut profile = crate::built_in_agents()
@@ -4248,7 +4245,7 @@ mod tests {
             crate::PluginContext::default(),
         )
         .unwrap();
-        let mut stage = crate::built_in_stages().pop().unwrap();
+        let mut stage = crate::stage::stage_fixture("publisher", "publish");
         stage.id = "declared_review".to_string();
         stage.agent = "reason".to_string();
         stage.output_contract = "ReviewOutput".to_string();
@@ -4321,7 +4318,7 @@ mod tests {
             crate::PluginContext::default(),
         )
         .unwrap();
-        let mut stage = crate::built_in_stages().pop().unwrap();
+        let mut stage = crate::stage::stage_fixture("publisher", "publish");
         stage.id = "leak".to_string();
         stage.agent = "build".to_string();
         stage.governed_by = None;
@@ -4452,7 +4449,7 @@ mod tests {
             crate::PluginContext::default(),
         )
         .unwrap();
-        let mut stage = crate::built_in_stages().pop().unwrap();
+        let mut stage = crate::stage::stage_fixture("publisher", "publish");
         stage.id = "arbitrary_probe".to_string();
         stage.agent = "reason".to_string();
         stage.input_contract = "ProbeInput".to_string();
@@ -4524,7 +4521,7 @@ mod tests {
             crate::PluginContext::default(),
         )
         .unwrap();
-        let mut stage = crate::built_in_stages().pop().unwrap();
+        let mut stage = crate::stage::stage_fixture("publisher", "publish");
         stage.id = "rendered_probe".to_string();
         stage.agent = "reason".to_string();
         stage.input_contract = "ProbeInput".to_string();
@@ -4639,10 +4636,7 @@ mod tests {
         let error = hosts["iterate"]("{}".to_string()).await.unwrap_err();
         assert!(error.contains("runaway loop"));
 
-        let context = crate::built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "context")
-            .unwrap();
+        let context = crate::stage::stage_fixture("context", "explore");
         let error = match build_hosts_with_turn(
             &ctx,
             &[context],

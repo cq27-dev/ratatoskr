@@ -43,9 +43,7 @@ pub use publisher::PublisherOutput;
 pub use redteam::{RedTeamNode, RedTeamOutput};
 pub use referee::{RefereeNode, RefereeOutput, Violation};
 pub use scout::{RelatedItem, ScoutOutput};
-pub use stage::{
-    AgentProfile, Delegation, Stage, agent_profiles, built_in_agents, built_in_stages,
-};
+pub use stage::{AgentProfile, Delegation, Stage, agent_profiles, built_in_agents};
 pub use validate::validate;
 pub use verifier::{Finding, FindingKind, Severity, VerifierOutput};
 
@@ -400,29 +398,6 @@ pub const BUILT_IN: &str = "built-in";
 const SCRIPTED_REVIEW_WARNING: &str = "this workflow controls whether to run the verifier; if it \
     omits verify(), the change will be accepted on its Rust-owned test and referee gates alone";
 
-/// The nodes a ruleset may govern out of the box — the LLM agents that go through
-/// `run_structured`. `memory` is absent because it is a direct rag-rat call with no model or tool
-/// set to override, so targeting it is a config error rather than a no-op.
-///
-/// The implementer belongs here now that it drives a model directly rather than a coding CLI: it
-/// resolves through `node_agent_config` like every other node, so a ruleset already shapes its
-/// route, prompt, tools and plugins — this list was the only thing saying otherwise.
-///
-/// Lives here rather than in the CLI because this crate is what decides which nodes exist. A
-/// workflow may add to this set; see [`Workflow::nodes`].
-pub const BUILT_IN_NODES: &[&str] = &[
-    "overseer",
-    "publisher",
-    "context",
-    "scout",
-    "analyst",
-    "implementer",
-    "bookkeeper",
-    "redteam",
-    "verifier",
-    "characterizer",
-];
-
 /// One workflow a run can use.
 ///
 /// The built-in uses the bundled standard TypeScript runtime for composition. Its host operations
@@ -442,7 +417,7 @@ impl Workflow {
         }
     }
 
-    /// Node names this workflow governs beyond [`BUILT_IN_NODES`].
+    /// Node names this workflow governs beyond the standard set.
     ///
     /// A workflow that only re-sequences the existing nodes declares none. One that introduces a
     /// node has to say so, or its `.ratatoskr/rules/<node>.ts` is rejected at load as targeting
@@ -479,14 +454,27 @@ impl Workflow {
 /// The single-script path, still honoured so a repo that has one keeps working untouched.
 const LEGACY_WORKFLOW: &str = ".ratatoskr/workflow.ts";
 
-/// Every node any workflow in this repo may govern: the built-in set plus what each declares.
+/// Every node any workflow in this repo may govern: the standard stages plus what each declares.
 ///
-/// The union across all of them, not just the one a run selects, because rulesets are loaded
+/// The standard half is the identity each standard stage is *governed* under, read off the stages
+/// `nodes.ts` declares rather than listed here — a ruleset is keyed by
+/// [`Stage::governance_id`](stage::Stage::governance_id), so that is the name a
+/// `.ratatoskr/rules/<node>.ts` has to match. `memory` is absent for the same reason it always was:
+/// it is a direct rag-rat call with no model or tool set to override, so it declares no stage and
+/// targeting it is a config error rather than a no-op.
+///
+/// The union across all workflows, not just the one a run selects, because rulesets are loaded
 /// before a workflow is chosen — and a ruleset targeting a node that some workflow declares is
 /// legitimate whether or not this particular run uses that workflow. The internal referee is
 /// never governable, even when a workflow names it.
-fn governable_from<'a>(workflows: impl IntoIterator<Item = &'a WorkflowRuntime>) -> Vec<String> {
-    let mut names: Vec<String> = BUILT_IN_NODES.iter().map(|s| s.to_string()).collect();
+fn governable_from<'a>(
+    standard: &[Stage],
+    workflows: impl IntoIterator<Item = &'a WorkflowRuntime>,
+) -> Vec<String> {
+    let mut names: Vec<String> = standard
+        .iter()
+        .map(|stage| stage.governance_id().to_string())
+        .collect();
     for workflow in workflows {
         names.extend(workflow.meta().nodes.iter().cloned());
         names.extend(workflow.meta().stages.iter().map(|stage| stage.id.clone()));
@@ -498,7 +486,10 @@ fn governable_from<'a>(workflows: impl IntoIterator<Item = &'a WorkflowRuntime>)
 }
 
 pub async fn governable_nodes() -> Result<Vec<String>, PlanError> {
-    Ok(governable_from(&defined().await?))
+    Ok(governable_from(
+        &workflow::standard_stages().await?,
+        &defined().await?,
+    ))
 }
 
 /// Every workflow a run could use: the built-in, then whatever this repo defines.
@@ -604,13 +595,17 @@ fn validate_configured_stage_registry(
     };
 
     if workflows.is_empty() {
-        return judge(Vec::new(), governable_from(std::iter::empty()), None);
+        return judge(Vec::new(), governable_from(&base, std::iter::empty()), None);
     }
     for workflow in workflows {
         let declared = stage::stages_from_workflow(workflow.meta());
         validate::validate_declared_contracts(&declared)?;
         validate::validate_declarations(&declared, &workflow.meta().name)?;
-        judge(declared, governable_from([workflow]), Some(workflow.meta()))?;
+        judge(
+            declared,
+            governable_from(&base, [workflow]),
+            Some(workflow.meta()),
+        )?;
     }
     Ok(())
 }
@@ -2840,10 +2835,7 @@ mod agent_config_tests {
 
     #[test]
     fn configured_registry_allows_governance_by_another_declared_stage() {
-        let template = built_in_stages()
-            .into_iter()
-            .find(|stage| stage.id == "analyst")
-            .unwrap();
+        let template = stage::stage_fixture("analyst", "reason");
         let mut policy = template.clone();
         policy.id = "shared_policy".to_string();
         let mut consumer = template;
@@ -2863,7 +2855,11 @@ mod agent_config_tests {
         let built_in = Workflow::BuiltIn;
         // The built-in adds none: it governs exactly the standard set.
         assert!(built_in.nodes().is_empty());
-        assert!(!BUILT_IN_NODES.contains(&"referee"));
+        let standard = governable_from(
+            &workflow::standard_stages().await.unwrap(),
+            std::iter::empty(),
+        );
+        assert!(!standard.contains(&"referee".to_string()));
 
         let dir = std::env::temp_dir().join(format!("ratatoskr-nodes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2881,11 +2877,11 @@ mod agent_config_tests {
         // The standard set is what a repo defining nothing may govern. `memory` is deliberately
         // absent — a direct rag-rat call with no model or tool set to override, so targeting it is
         // a config error rather than a no-op.
-        assert!(BUILT_IN_NODES.contains(&"verifier"));
-        assert!(!BUILT_IN_NODES.contains(&"memory"));
+        assert!(standard.contains(&"verifier".to_string()));
+        assert!(!standard.contains(&"memory".to_string()));
         // The implementer resolves through `node_agent_config` like every other node now that it
         // drives a model rather than a coding CLI, so a ruleset shapes it like any other.
-        assert!(BUILT_IN_NODES.contains(&"implementer"));
+        assert!(standard.contains(&"implementer".to_string()));
     }
 
     #[test]
@@ -2991,8 +2987,12 @@ mod agent_config_tests {
         // has said it wants that kind of check.
         let verifier = toml_route("anthropic", "claude-sonnet-4-6");
         config.models.insert("verifier".to_string(), verifier);
-        let route = referee_route(&engine, &config, &built_in_stages())
-            .expect("the verifier route is the fallback");
+        let route = referee_route(
+            &engine,
+            &config,
+            &[stage::stage_fixture("verifier", "explore")],
+        )
+        .expect("the verifier route is the fallback");
         assert_eq!(route.provider, "anthropic");
         assert_eq!(route.model, "claude-sonnet-4-6");
 
@@ -3003,8 +3003,12 @@ mod agent_config_tests {
         )
         .await;
         let config = RatatoskrConfig::default();
-        let route = referee_route(&ruleset, &config, &built_in_stages())
-            .expect("ruleset verifier is the fallback");
+        let route = referee_route(
+            &ruleset,
+            &config,
+            &[stage::stage_fixture("verifier", "explore")],
+        )
+        .expect("ruleset verifier is the fallback");
         assert_eq!(route.provider, "openai");
         assert_eq!(route.model, "gpt-5");
     }
@@ -3017,8 +3021,12 @@ mod agent_config_tests {
         config.models.insert("verifier".to_string(), verifier);
         let own = toml_route("openai", "gpt-5");
         config.models.insert("referee".to_string(), own);
-        let route = referee_route(&engine, &config, &built_in_stages())
-            .expect("a referee route is configured");
+        let route = referee_route(
+            &engine,
+            &config,
+            &[stage::stage_fixture("verifier", "explore")],
+        )
+        .expect("a referee route is configured");
         assert_eq!(
             route.model, "gpt-5",
             "[models.referee] beats [models.verifier]"
@@ -3030,8 +3038,12 @@ mod agent_config_tests {
             r#"defineAgent("referee", { model: { provider: "moonshot", model: "kimi-k2.5" } });"#,
         )
         .await;
-        let route = referee_route(&ruleset, &config, &built_in_stages())
-            .expect("TOML referee route still wins");
+        let route = referee_route(
+            &ruleset,
+            &config,
+            &[stage::stage_fixture("verifier", "explore")],
+        )
+        .expect("TOML referee route still wins");
         assert_eq!(route.provider, "openai");
         assert_eq!(route.model, "gpt-5");
     }
@@ -3043,7 +3055,12 @@ mod agent_config_tests {
         // rulesets bind neither either.
         let config = RatatoskrConfig::default();
         assert!(
-            referee_route(&engine, &config, &built_in_stages()).is_none(),
+            referee_route(
+                &engine,
+                &config,
+                &[stage::stage_fixture("verifier", "explore")]
+            )
+            .is_none(),
             "with no route there is no judgement: converge trusts the test result alone, and says so"
         );
     }
@@ -3159,7 +3176,7 @@ mod repo_conventions_tests {
 mod referee_governance_tests {
     use super::*;
 
-    // Contract reading (#209): "referee" leaves `BUILT_IN_NODES` and with it
+    // Contract reading (#209): "referee" is outside
     // `governable_nodes()`, so a `.ratatoskr/rules/referee.ts` is rejected at startup exactly
     // the way a typo'd node name is today — the CLI's load_rules predicate, composed below.
     // `referee_route` keeps its signature but stops consulting a "referee" ruleset:
@@ -3198,8 +3215,9 @@ mod referee_governance_tests {
         // The judgement keeps its checkpoint name but loses its governance socket: its
         // capability boundary is part of the gate's correctness contract, not something a
         // ruleset or plugin may shape.
+        let standard = standard_governable().await;
         assert!(
-            !BUILT_IN_NODES.contains(&"referee"),
+            !standard.contains(&"referee".to_string()),
             "the internal diff-judgement is not a governable node"
         );
         // Everything else stays exactly as governable as it was.
@@ -3216,7 +3234,7 @@ mod referee_governance_tests {
             "characterizer",
         ] {
             assert!(
-                BUILT_IN_NODES.contains(&name),
+                standard.contains(&name.to_string()),
                 "{name} must stay governable"
             );
         }
@@ -3344,6 +3362,73 @@ mod referee_governance_tests {
         }
         let found = defined_in(&dir, &dir.join("absent.ts")).await.unwrap();
         (dir, found)
+    }
+
+    /// The nodes a ruleset may govern in a checkout that defines no workflow of its own — derived
+    /// from the standard stages `nodes.ts` declares, which is the only place they are named.
+    async fn standard_governable() -> Vec<String> {
+        governable_from(
+            &workflow::standard_stages().await.unwrap(),
+            std::iter::empty(),
+        )
+    }
+
+    #[tokio::test]
+    async fn renaming_a_standard_stage_in_typescript_renames_what_governs_and_what_is_drawn() {
+        // The whole point of the definitions living in TypeScript: nothing in Rust enumerates the
+        // pipeline, so a rename there is the rename everywhere. Only the two TypeScript sources
+        // change here — `nodes.ts` names the stage, `standard-v1.ts` composes and lays it out.
+        let definitions = ratatoskr_script::transpile_with_includes(
+            workflow::STANDARD_DEFINITIONS_MODULE,
+            &workflow::STANDARD_DEFINITIONS
+                .replace("export const analyst =", "export const strategist ="),
+            workflow::STANDARD_WORKFLOW_INCLUDES,
+            &[],
+        )
+        .unwrap();
+        let composed = workflow::STANDARD_WORKFLOW_V1
+            .replace(
+                r#"stage("analyst", nodes.analyst)"#,
+                r#"stage("strategist", nodes.strategist)"#,
+            )
+            .replace(r#"nodes: ["analyst"]"#, r#"nodes: ["strategist"]"#);
+        assert!(composed.contains("strategist"), "the rename applied");
+        let runtime = ratatoskr_script::workflow::WorkflowRuntime::bundled_with_includes(
+            "renamed-standard",
+            &composed,
+            workflow::STANDARD_WORKFLOW_INCLUDES,
+            &[(workflow::STANDARD_DEFINITIONS_MODULE, &definitions)],
+        )
+        .await
+        .unwrap();
+        let stages = stage::stages_from_workflow(runtime.meta());
+
+        // It governs under the new name: a `.ratatoskr/rules/strategist.ts` is accepted and a
+        // `analyst.ts` is now the typo it has become.
+        let governable = governable_from(&stages, std::iter::empty());
+        assert!(
+            governable.contains(&"strategist".to_string()),
+            "{governable:?}"
+        );
+        assert!(
+            !governable.contains(&"analyst".to_string()),
+            "{governable:?}"
+        );
+
+        // And it is drawn under the new name: the layout the workflow declares is what a run of it
+        // records, and it names the stage it now has.
+        let shape = stage::shape_from_workflow(runtime.meta());
+        assert!(
+            shape.iter().any(|node| node.name == "strategist"),
+            "{shape:?}"
+        );
+        assert!(
+            !shape.iter().any(|node| node.name == "analyst"),
+            "{shape:?}"
+        );
+        // The rename is still judged against the registry it produced, so the column and the stage
+        // agree.
+        validate::validate_layout(&runtime.meta().layout, &stages, &runtime.meta().name).unwrap();
     }
 
     #[tokio::test]
@@ -3606,7 +3691,9 @@ mod referee_governance_tests {
         let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
         assert_eq!(found[0].meta().nodes, ["referee"]);
         assert!(
-            !governable_from(&found).iter().any(|name| name == "referee"),
+            !governable_from(&workflow::standard_stages().await.unwrap(), &found)
+                .iter()
+                .any(|name| name == "referee"),
             "a workflow declaration cannot make the internal judge governable"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3624,7 +3711,12 @@ mod referee_governance_tests {
         .await;
         let config = RatatoskrConfig::default();
         assert!(
-            referee_route(&engine, &config, &built_in_stages()).is_none(),
+            referee_route(
+                &engine,
+                &config,
+                &[stage::stage_fixture("verifier", "explore")]
+            )
+            .is_none(),
             "a referee ruleset is never consulted for a route"
         );
     }
@@ -3651,8 +3743,12 @@ mod referee_governance_tests {
             route("anthropic", "claude-haiku-4-5-20251001"),
         );
 
-        let resolved = referee_route(&engine, &config, &built_in_stages())
-            .expect("[models.referee] is configured");
+        let resolved = referee_route(
+            &engine,
+            &config,
+            &[stage::stage_fixture("verifier", "explore")],
+        )
+        .expect("[models.referee] is configured");
         assert_eq!(resolved.provider, "anthropic");
         assert_eq!(resolved.model, "claude-haiku-4-5-20251001");
         assert_ne!(
@@ -3679,8 +3775,12 @@ mod referee_governance_tests {
             "verifier".to_string(),
             route("anthropic", "claude-sonnet-4-6"),
         );
-        let resolved = referee_route(&engine, &config, &built_in_stages())
-            .expect("the verifier route is the fallback");
+        let resolved = referee_route(
+            &engine,
+            &config,
+            &[stage::stage_fixture("verifier", "explore")],
+        )
+        .expect("the verifier route is the fallback");
         assert_eq!(resolved.provider, "anthropic");
         assert_eq!(resolved.model, "claude-sonnet-4-6");
     }
