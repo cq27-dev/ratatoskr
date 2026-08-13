@@ -8,17 +8,32 @@
 use ratatoskr_store::Checkpoint;
 use serde::Serialize;
 
-/// Nodes whose own failure cannot make a run `failed`, so they are never reported `Failed`.
+/// Whether this node's own failure can be what made a run `failed`.
 ///
 /// A run fails when its workflow entry returns an error — any host call that returns `Err` and is
-/// not caught. These three cannot produce one. `bookkeeper` and `publisher` run after the terminal
-/// status is written and their failure is only logged. `verifier` runs before it, but `verify_host`
-/// turns a review that could not run into an `unavailable` result rather than an error: a change
-/// that was made and passed its tests is not failed by the reviewer being unreachable.
+/// not caught. `bookkeeper` and `publisher` never can: they run after the terminal status is
+/// written and their failure is only logged.
+///
+/// `verifier` is the one that depends on the run. `verify_host` turns a review that could not *run*
+/// into an `unavailable` result rather than an error — a change that was made and passed its tests
+/// is not failed by the reviewer being unreachable — but everything around that review still
+/// errors: `verify()` called before `implement()`, an analyst argument that no longer matches its
+/// checkpoint, an overlap with `iterate()`, a store read that failed. Those fail the run, and the
+/// call reaches none of them without a route to review with: without one it answers "not
+/// configured" before it looks at the run at all. So the question is not the name but this run's
+/// config, read exactly as [`PlannedNode::of`] reads it. A verifier routed only from a ruleset
+/// therefore reads as unrouted here, and such a run is attributed as it was before — the
+/// approximation only ever withholds the doubt, never invents it.
 ///
 /// Every other name is fallible, including a stage a workflow declared itself: its host error
 /// propagates out of the script and fails the run.
-const CANNOT_FAIL_THE_RUN: &[&str] = &["bookkeeper", "publisher", "verifier"];
+fn can_fail_the_run(name: &str, config: Option<&ratatoskr_core::RatatoskrConfig>) -> bool {
+    match name {
+        "bookkeeper" | "publisher" => false,
+        "verifier" => PlannedNode::of(config, "verifier").is_some(),
+        _ => true,
+    }
+}
 
 /// The issue text is checkpointed under this name so `bookkeep` can replay a stored run. It is
 /// not a node — it's the run's input, and it's the only record of the run's subject.
@@ -199,9 +214,10 @@ pub(crate) fn is_terminal(status: Option<&str>) -> bool {
 ///   guessed at. Pair it with the run's `last_activity` to judge.
 /// - **A `failed` run whose fork ran, with nothing fallible after it, died in converge.** The
 ///   implementer is then where it stopped, even though it has checkpoints from earlier iterations.
-///   The inference is only sound while every node after the fork is in [`CANNOT_FAIL_THE_RUN`] —
-///   which the standard tail is — because a workflow may declare a fallible stage after the
-///   implementer, and then the failure is that stage's and the implementer finished.
+///   The inference is only sound while nothing after the fork [`can_fail_the_run`], because a
+///   workflow may declare a fallible stage after the implementer — and a run that routed its
+///   verifier has a fallible one there already — and then the failure is as likely theirs, with
+///   nothing in the record to say which. It is left unattributed rather than guessed at.
 ///
 /// `config` is what the run was started under, so a node that has not run yet can still say what it
 /// will run on.
@@ -229,15 +245,16 @@ pub fn derive_with(
             .is_some_and(|nodes| nodes.iter().any(|n| count(checkpoints, &n.name) > 0))
     });
     // Blaming the fork for a failure needs everything after it to be unable to have caused one.
-    // The standard tail qualifies — a review that could not run degrades, and delivery runs after
-    // the terminal write — but a declared layout may put a fallible stage after the fork, and then
-    // the implementer finished and something later is what failed.
+    // Delivery qualifies, running after the terminal write — but a declared layout may put a
+    // fallible stage after the fork, and a routed verifier is fallible too, and then the failure is
+    // as likely theirs as the implementer's. Nothing in the record separates the two, so the run is
+    // left unattributed rather than pinned on the implementer.
     let nothing_fallible_after_the_fork = fork.is_some_and(|f| {
         stages
             .iter()
             .skip(f + 1)
             .flatten()
-            .all(|n| CANNOT_FAIL_THE_RUN.contains(&n.name.as_str()))
+            .all(|n| !can_fail_the_run(&n.name, config))
     });
     let converge_died = failed && fork_started && nothing_fallible_after_the_fork;
 
@@ -285,8 +302,9 @@ pub fn derive_with(
                 match () {
                     // Later than where the run is: nothing to say about it yet.
                     _ if current != Some(idx) => NodeState::Idle,
-                    // A failure here belongs upstream: these run past the terminal status.
-                    _ if CANNOT_FAIL_THE_RUN.contains(&name.as_str()) => NodeState::Idle,
+                    // A failure here belongs upstream: delivery runs past the terminal status, and
+                    // an unrouted verifier reviews nothing.
+                    _ if !can_fail_the_run(name, config) => NodeState::Idle,
                     _ if failed => NodeState::Failed,
                     _ if !terminal => NodeState::Working,
                     _ => NodeState::Idle,
@@ -509,6 +527,25 @@ mod tests {
         }
     }
 
+    /// A config that gives one node somewhere to run. A node with no route here never runs, which
+    /// is what makes the verifier's presence in a run a question the config answers.
+    fn routed(node: &str) -> ratatoskr_core::RatatoskrConfig {
+        let mut config = ratatoskr_core::RatatoskrConfig::default();
+        config.models.insert(
+            node.to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-5".into(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Reuse,
+            },
+        );
+        config
+    }
+
     /// A clarification exchange as `clarify.rs` writes one: all four fields, every value a string.
     const EXCHANGE: &str =
         r#"{"from":"analyst","to":"scout","question":"which one?","answer":"the first"}"#;
@@ -645,6 +682,66 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_run_whose_verifier_had_a_route_is_not_pinned_on_the_implementer() {
+        // The same records as the converge-death case above, from a run that routed its verifier.
+        // `verify()` degrades a review it could not run, but it still returns an error for an
+        // analyst argument that no longer matches its checkpoint, an overlap with `iterate()`, or a
+        // store read that failed — and those fail the run. Which of the two died is not in the
+        // record: the last checkpoint is the implementer's either way, because `verify()` runs
+        // directly after the attempt it reviews. So nothing is attributed.
+        let config = routed("verifier");
+        let views = derive_with(
+            Some("failed"),
+            &[
+                cp("context", "t1"),
+                cp("analyst", "t3"),
+                cp("red_team", "t4"),
+                cp("implementer", "t5"),
+            ],
+            Some(&config),
+            Some(&standard_shape()),
+        );
+        assert_eq!(state_of(&views, "implementer"), NodeState::Done);
+        assert!(
+            !views.iter().any(|v| v.state == NodeState::Failed),
+            "an unattributed failure, not one pinned on whichever node is convenient"
+        );
+    }
+
+    #[test]
+    fn a_routed_verifier_a_layout_always_runs_is_where_a_failed_run_stopped() {
+        // A column the layout does not mark optional says every run reaches it. With a route to
+        // review with and no checkpoint of its own on a failed run, the verifier is where the run
+        // stopped — the case the old classification could not report, because it held that the
+        // verifier is never what fails a run.
+        let shape = shape_of(&[
+            (&["red_team", "implementer"], false),
+            (&["verifier"], false),
+            (&["bookkeeper"], false),
+        ]);
+        let config = routed("verifier");
+        let views = derive_with(
+            Some("failed"),
+            &[cp("red_team", "t1"), cp("implementer", "t2")],
+            Some(&config),
+            Some(&shape),
+        );
+        assert_eq!(state_of(&views, "verifier"), NodeState::Failed);
+        assert_eq!(state_of(&views, "implementer"), NodeState::Done);
+
+        // Unrouted, the same run reaches a `verify()` that answers "not configured" before it does
+        // anything of its own, so the fork is still the only thing that can have died.
+        let unrouted = derive_with(
+            Some("failed"),
+            &[cp("red_team", "t1"), cp("implementer", "t2")],
+            None,
+            Some(&shape),
+        );
+        assert_eq!(state_of(&unrouted, "verifier"), NodeState::Idle);
+        assert_eq!(state_of(&unrouted, "implementer"), NodeState::Failed);
+    }
+
+    #[test]
     fn a_failed_run_with_a_fallible_stage_after_the_fork_does_not_blame_the_implementer() {
         // Blaming the implementer for any failed run that reached the fork is only sound where
         // nothing after it can fail a run. A declared layout may put an ordinary stage there — its
@@ -713,19 +810,7 @@ mod tests {
     fn a_node_says_what_it_will_run_on_before_it_runs() {
         // Otherwise the pipeline is blank until a node finishes, which is the wrong way round: a
         // reader wants to know what is about to happen, not only what already did.
-        let mut config = ratatoskr_core::RatatoskrConfig::default();
-        config.models.insert(
-            "redteam".to_string(),
-            ratatoskr_core::ModelRoute {
-                provider: "anthropic".into(),
-                model: "claude-sonnet-5".into(),
-                max_tokens: None,
-                context_window: None,
-                temperature: None,
-                params: None,
-                session: ratatoskr_core::SessionScope::Reuse,
-            },
-        );
+        let config = routed("redteam");
 
         let views = derive_with(None, &[], Some(&config), Some(&standard_shape()));
         // Routed as `redteam`, checkpointed as `red_team` — the view is keyed by the latter.
