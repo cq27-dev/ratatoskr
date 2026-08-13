@@ -505,7 +505,7 @@ impl WorkflowRuntime {
                 return Err(ScriptError::Eval(format!(
                     "two workflows are both named `{}`: {} and {}",
                     workflow.meta.name,
-                    clash.meta.name,
+                    clash.module_name,
                     path.display()
                 )));
             }
@@ -2503,6 +2503,16 @@ export async function plan(i) { return { entryRan: true }; }
             Ok(_) => panic!("this must be refused"),
         };
         assert!(err.contains("both named `same`"), "{err}");
+        // Which two files, so the author can open them. Naming the clash again instead is a
+        // message that says `same: same and …/b.ts` and leaves the first file unfound.
+        assert!(
+            err.contains(&dir.join("a.ts").display().to_string()),
+            "{err}"
+        );
+        assert!(
+            err.contains(&dir.join("b.ts").display().to_string()),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
