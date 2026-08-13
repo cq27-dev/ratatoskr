@@ -1807,12 +1807,26 @@ impl StageExecutor {
         .map_err(|e| e.to_string())?;
         cfg.route.session = stage.session_scope(cfg.route.session);
 
-        // A child is evidence within its parent's call, never a second checkpointed graph stage.
-        let runtime_input = if let Some(delegation) = stage
+        // Delegation folds the child's evidence into the parent's runtime input on the way to the
+        // parent's checkpoint, so only a checkpointed invocation can honour it. `characterizer`,
+        // `redteam_classifier` and `context_distillation` are each *both* a global a workflow may
+        // call directly and a stage a Rust adapter invokes as evidence — one stage id, two
+        // dispositions — so the load-time refusal in `validate` cannot speak for this one. Refuse
+        // here instead of running the turn with the declaration quietly omitted.
+        if let Some(delegation) = stage
             .delegation
             .as_ref()
-            .filter(|_| disposition == StageOutput::Checkpoint)
+            .filter(|_| disposition == StageOutput::Evidence)
         {
+            return Err(format!(
+                "stage `{}` delegates to `{}`, but this invocation folds its output into another \
+                 stage's record instead of checkpointing it, and cannot honour the delegation; \
+                 drop the delegation or call `{}` directly from the workflow",
+                stage.id, delegation.target, stage.id
+            ));
+        }
+        // A child is evidence within its parent's call, never a second checkpointed graph stage.
+        let runtime_input = if let Some(delegation) = stage.delegation.as_ref() {
             let target = self
                 .stages
                 .iter()
@@ -5536,6 +5550,90 @@ mod tests {
                 questions[0]
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_delegation_invoked_as_evidence_is_refused_rather_than_dropped() {
+        // `context_distillation` is both a global a workflow may call directly (checkpointed —
+        // delegation runs) and the stage `context()` invokes as evidence. Load-time validation
+        // cannot tell one invocation from the other, so the evidence path has to refuse the
+        // declaration rather than run the parent turn with the child silently omitted.
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-evidence-delegation-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        std::fs::write(
+            &workflow_path,
+            r#"import * as nodes from "ratatoskr/nodes";
+               defineWorkflow({
+                 name: "ours",
+                 stages: [
+                   stage("context_distillation", {
+                     ...nodes.context_distillation,
+                     delegation: { target: "helper", inputLimit: 65536 },
+                   }),
+                   stage("helper", { agent: "explore", instructions: "help" }),
+                 ],
+               });
+               export async function plan(input) { return input; }"#,
+        )
+        .unwrap();
+        let definitions = standard_definitions().unwrap();
+        let runtime = WorkflowRuntime::load(
+            &workflow_path,
+            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("context".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-evidence-delegation",
+            "delegate from an evidence stage",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        install_execution_stages(&ctx, &runtime).await.unwrap();
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({
+                "brief": "a brief",
+                "constraints": [],
+                "prior_art": [],
+                "papertrail_summary": ""
+            })
+            .to_string(),
+            ..Default::default()
+        });
+        let error = evaluate_standard_stage_with_turn(
+            Arc::clone(&ctx),
+            "context_distillation",
+            json!({ "issue": "x", "memory": { "memories": [] }, "searchable": false }).to_string(),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await
+        .expect_err("a delegation this caller cannot honour must be refused");
+        assert!(
+            error.contains("context_distillation") && error.contains("helper"),
+            "the refusal names neither the stage nor its delegation target: {error}"
+        );
+        assert!(
+            turn.nodes
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .is_empty(),
+            "the parent turn ran with its delegation dropped"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
