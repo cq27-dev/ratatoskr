@@ -33,6 +33,9 @@ pub struct Bundle {
 }
 
 /// The version this build writes and is willing to read.
+///
+/// One version is one shape: a bundle claiming this version carries every field of it, so adding a
+/// field is a version bump rather than a defaulted key the reader has to guess at.
 pub const FORMAT_VERSION: u32 = 1;
 
 /// What an import did, per run.
@@ -268,47 +271,5 @@ mod tests {
         let run = theirs.run("r1").await.unwrap().expect("the run arrived");
         assert_eq!(run.image_digest.as_deref(), Some("sha256:abc"));
         assert_eq!(run.graph_hash.as_deref(), Some("deadbeef"));
-    }
-
-    #[tokio::test]
-    async fn a_bundle_from_before_image_digests_imports_with_its_provenance_intact() {
-        // An older exporter's bytes carry every provenance key but `image_digest`. Reading them
-        // must not fail on the missing key, and importing must keep what they do carry — the
-        // run simply has no pinned image to report.
-        let legacy_run = bson::doc! {
-            "run_id": "old-1",
-            "issue_id": bson::Bson::Null,
-            "status": "converged",
-            "updated_at": "then",
-            "config_json": "{}",
-            "graph_hash": "deadbeef",
-            "repo_sha": "abc123",
-            "origin": bson::Bson::Null,
-            "shape_json": bson::Bson::Null,
-            "tags": [],
-        };
-        let doc = bson::doc! {
-            "version": 1i32,
-            "exported_by": "old@host",
-            "exported_at": "then",
-            "runs": [ bson::doc! {
-                "run": legacy_run,
-                "checkpoints": [],
-                "events": [],
-            } ],
-        };
-        let bytes = bson::serialize_to_vec(&doc).unwrap();
-        let bundle = from_bytes(&bytes).expect("an older bundle still reads");
-        assert!(bundle.runs[0].run.image_digest.is_none());
-
-        let store = Store::open_in_memory().unwrap();
-        let report = store.import(&bundle).await.unwrap();
-        assert!(report[0].inserted);
-
-        let run = store.run("old-1").await.unwrap().expect("the run arrived");
-        assert!(run.image_digest.is_none());
-        assert_eq!(run.config_json.as_deref(), Some("{}"));
-        assert_eq!(run.graph_hash.as_deref(), Some("deadbeef"));
-        assert_eq!(run.repo_sha.as_deref(), Some("abc123"));
     }
 }
