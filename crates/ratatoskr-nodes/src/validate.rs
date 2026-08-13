@@ -139,6 +139,36 @@ pub fn validate(
                 )));
             }
         }
+        // Membership says which box the stage's work is drawn in, and a box has to be something a
+        // run records: a Rust-owned operation that writes the aggregate under that name, or another
+        // stage that is a node of its own. A membership naming anything else draws a box no record
+        // ever reaches — the same empty box `validate_layout` refuses a column for, arrived at from
+        // the other direction, and the likeliest cause is a misspelling of a real one.
+        //
+        // A stage may not join a stage that is itself a member: a box holds turns, not boxes, and a
+        // chain would make "which box is this drawn in" a traversal with no reason to terminate.
+        if let Some(node) = stage.node.as_deref()
+            && node != stage.id
+        {
+            if !machine_name(node) {
+                return Err(PlanError::Configuration(format!(
+                    "stage `{}` node `{node}` must use an underscore-separated identifier",
+                    stage.id
+                )));
+            }
+            let composed = stages
+                .iter()
+                .any(|other| other.id == node && other.is_own_node());
+            if !composed && policy::reserved(node).is_none() {
+                return Err(PlanError::Configuration(format!(
+                    "stage `{}` declares node `{node}`, which nothing this run records under; a \
+                     stage's node is the box its work is drawn in, and that box needs either a \
+                     Rust-owned operation writing under the name or a stage of its own called \
+                     `{node}`",
+                    stage.id
+                )));
+            }
+        }
     }
 
     for parent in stages {
@@ -432,6 +462,66 @@ mod tests {
         stage.governed_by = None;
 
         assert!(validate(&[stage], &crate::built_in_agents(), &[]).is_ok());
+    }
+
+    #[test]
+    fn a_stage_joins_a_box_something_records_under_or_it_joins_nothing() {
+        // A membership is a box name, and a box nothing writes under is a box that stays empty for
+        // the whole run — the failure `validate_layout` refuses a column for, reached from the
+        // declaration side. The likeliest way to arrive at one is a misspelling.
+        let member = |node: &str| {
+            let mut stage = crate::stage::stage_fixture("half", "reason");
+            stage.node = Some(node.to_string());
+            stage
+        };
+
+        let error = validate(&[member("redtaem")], &crate::built_in_agents(), &[])
+            .expect_err("a box nothing records under cannot be joined")
+            .to_string();
+        assert!(error.contains("nothing this run records under"), "{error}");
+
+        // A Rust-owned operation writes the aggregate under its own name, which is what the bundled
+        // red team, implementer and context stages join.
+        for identity in ["redteam", "implementer", "context"] {
+            assert!(
+                validate(&[member(identity)], &crate::built_in_agents(), &[]).is_ok(),
+                "`{identity}` is a box the run records under"
+            );
+        }
+
+        // So does a peer stage that is a node of its own: two stages composing one repository box.
+        let peer = crate::stage::stage_fixture("review", "reason");
+        assert!(
+            validate(
+                &[member("review"), peer.clone()],
+                &crate::built_in_agents(),
+                &[]
+            )
+            .is_ok()
+        );
+
+        // But not a peer that is itself a member. A box holds turns, not boxes.
+        let mut nested = peer;
+        nested.node = Some("redteam".to_string());
+        let error = validate(&[member("review"), nested], &crate::built_in_agents(), &[])
+            .expect_err("membership does not chain")
+            .to_string();
+        assert!(error.contains("nothing this run records under"), "{error}");
+    }
+
+    #[test]
+    fn a_stage_shares_a_route_without_being_merged_into_the_other_stage() {
+        // The pair `governedBy` alone could not express: one `[models.*]` route, one ruleset, two
+        // stages that stay two pieces of work. Neither declares a membership, so each is its own
+        // node, and the shared governance says only what they run on.
+        let mut classifier = crate::stage::stage_fixture("triage_classifier", "reason");
+        classifier.governed_by = Some("triage".to_string());
+        let mut author = crate::stage::stage_fixture("triage_author", "build");
+        author.governed_by = Some("triage".to_string());
+        let stages = [classifier, author];
+
+        assert!(validate(&stages, &crate::built_in_agents(), &permitted_for(&stages)).is_ok());
+        assert!(stages.iter().all(Stage::is_own_node));
     }
 
     #[test]

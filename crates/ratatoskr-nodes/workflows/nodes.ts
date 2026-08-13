@@ -116,6 +116,7 @@ export const characterizer = {
 export const redteam_classifier = {
   agent: "reason",
   governedBy: "redteam",
+  node: "redteam",
   inputContract: "ClassifierInput",
   outputContract: "Classification",
   outputSchema: schemaWithDefs(
@@ -162,6 +163,7 @@ export const redteam_classifier = {
 export const redteam_author = {
   agent: "build",
   governedBy: "redteam",
+  node: "redteam",
   inputContract: "TestAuthorInput",
   outputContract: "AuthoredTests",
   outputSchema: obj({
@@ -200,6 +202,7 @@ export const redteam_author = {
 export const implementer_attempt = {
   agent: "build",
   governedBy: "implementer",
+  node: "implementer",
   inputContract: "ImplementerAttemptInput",
   outputContract: "Report",
   outputSchema: obj(
@@ -286,6 +289,7 @@ export const implementer_attempt = {
 export const context_distillation = {
   agent: "explore",
   governedBy: "context",
+  node: "context",
   inputContract: "ContextDistillationInput",
   outputContract: "Distillation",
   outputSchema: schemaWithDefs(

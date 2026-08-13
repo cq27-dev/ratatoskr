@@ -278,10 +278,19 @@ pub struct WorkflowStage {
     #[serde(alias = "name")]
     pub id: String,
     pub agent: String,
-    /// Route, ruleset, plugin and telemetry identity when this stage is embedded in a Rust-owned
-    /// operation whose stable public name differs from the stage declaration.
+    /// Route, ruleset and plugin identity when this stage is embedded in a Rust-owned operation
+    /// whose stable public name differs from the stage declaration.
     #[serde(default)]
     pub governed_by: Option<String>,
+    /// The graph node whose work this stage does — the box a viewer draws it inside. Defaults to
+    /// the stage's own id, which is what a stage that is its own node declares by saying nothing.
+    ///
+    /// Separate from [`Self::governed_by`] because the two answer different questions. Governance
+    /// says what the turn runs ON; membership says whose work it IS. A stage may share a route
+    /// without being merged into another stage's identity, and two stages may compose one node
+    /// while running on routes of their own.
+    #[serde(default)]
+    pub node: Option<String>,
     #[serde(default, alias = "input")]
     pub input_contract: String,
     #[serde(default, alias = "output")]

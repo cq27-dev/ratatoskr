@@ -7317,6 +7317,11 @@ mod tests {
             .find(|stage| stage.id == "context_distillation")
             .unwrap();
         assert_eq!(stage.governance_id(), "context");
+        assert_eq!(
+            stage.node_id(),
+            "context",
+            "the distillation is the context node's turn"
+        );
         assert_eq!(stage.agent, "explore");
         assert_eq!(stage.session, None);
         assert_eq!(
@@ -7811,6 +7816,12 @@ mod tests {
             .unwrap();
         assert_eq!(author_stage.governance_id(), "redteam");
         assert_eq!(classifier_stage.governance_id(), "redteam");
+        assert_eq!(author_stage.node_id(), "redteam");
+        assert_eq!(
+            classifier_stage.node_id(),
+            "redteam",
+            "both halves are the red team's work, and each keeps its own identity doing it"
+        );
         assert_eq!(
             author_stage.instructions,
             include_str!("../prompts/redteam-author.md").trim()
@@ -8270,6 +8281,11 @@ mod tests {
             .find(|stage| stage.id == "implementer_attempt")
             .unwrap();
         assert_eq!(stage.governance_id(), "implementer");
+        assert_eq!(
+            stage.node_id(),
+            "implementer",
+            "an attempt is the implementer's work"
+        );
         assert_eq!(stage.session, Some(ratatoskr_core::SessionScope::Compacted));
         assert_eq!(stage.capabilities, [ratatoskr_core::Capability::Write]);
         assert_eq!(
