@@ -1660,13 +1660,19 @@ mod tests {
     }
 
     #[test]
-    fn a_shape_recorded_before_membership_makes_every_node_its_own_stage() {
-        // An imported run, or one from before boxes carried their stages. Nothing is inferred: the
-        // node is exactly its own name, which is what every node of such a run was.
-        let bare = r#"[{"name":"analyst","stage":0,"lane":0,"optional":false}]"#;
-        let views = derive_with(Some("converged"), &[cp("analyst", "t")], None, Some(bare));
+    fn a_recording_this_build_cannot_read_places_nothing_and_infers_nothing() {
+        // Not a fallback: there is one recorded format and anything else is unreadable. The run is
+        // then drawn from its own records, as any unplaced run is, and every node is exactly its
+        // own name — which is all a reader with no registry can say.
+        let views = derive_with(
+            Some("converged"),
+            &[cp("analyst", "t")],
+            None,
+            Some(r#"[{"name":"analyst","stage":0,"lane":0,"optional":false}]"#),
+        );
         assert_eq!(view(&views, "analyst").state, NodeState::Done);
-        assert_eq!(membership(bare, "analyst"), ["analyst"]);
+        assert!(!view(&views, "analyst").shaped, "nothing placed it");
+        assert_eq!(membership("[]", "analyst"), ["analyst"]);
     }
 
     #[test]

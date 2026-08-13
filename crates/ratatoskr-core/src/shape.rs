@@ -69,22 +69,6 @@ pub struct RunStage {
     pub session: Option<crate::SessionScope>,
 }
 
-/// A recording written before the registry travelled beside the positions: a bare array of nodes,
-/// each naming the stages composing it.
-///
-/// Kept as a decode path, not as a shape anything writes. `shape_json` carries no version to refuse
-/// a recording on, so the alternative to converting is not rejecting the run — it is drawing it
-/// against no membership at all and saying nothing, which puts every member back as a box of its
-/// own with a control address the run never polled. (Where a version *does* exist, refuse instead:
-/// `Bundle::version` is why a bundle's fields carry no serde defaults.)
-#[derive(Deserialize)]
-struct PositionedNode {
-    #[serde(flatten)]
-    node: ShapeNode,
-    #[serde(default)]
-    stages: Vec<String>,
-}
-
 /// What a run recorded about the graph it executed.
 ///
 /// Serialized into the run's `shape_json`.
@@ -192,8 +176,9 @@ impl<'a> Registry<'a> {
 
 /// Read the graph a run recorded.
 ///
-/// Empty when there is nothing readable to read: a run from before this was stored, or a recording
-/// whose positions are not positions. Nothing is substituted for it — a viewer places such a run's
+/// One format, and anything else is unreadable — there is no decode path for a shape this build no
+/// longer writes. Empty when there is nothing readable to read: a run from before this was stored,
+/// a recording in some other shape, or one whose positions are not positions. Nothing is substituted for it — a viewer places such a run's
 /// nodes from the records it actually has, which is the most that can be said about where they sat.
 ///
 /// The bound is here rather than at the writer because a recording does not only arrive from a
@@ -207,14 +192,7 @@ pub fn recorded(shape_json: Option<&str>) -> Recorded {
     let Some(raw) = shape_json else {
         return Recorded::default();
     };
-    let mut record = serde_json::from_str::<Recorded>(raw)
-        .ok()
-        .or_else(|| {
-            serde_json::from_str::<Vec<PositionedNode>>(raw)
-                .ok()
-                .map(convert)
-        })
-        .unwrap_or_default();
+    let mut record = serde_json::from_str::<Recorded>(raw).unwrap_or_default();
     if record
         .nodes
         .iter()
@@ -223,34 +201,6 @@ pub fn recorded(shape_json: Option<&str>) -> Recorded {
         record.nodes = Vec::new();
     }
     record
-}
-
-/// Turn a recording that hung membership off each node into one that records the registry.
-///
-/// A node's members become its stages. `governed_by` is set to the box for a member that is not the
-/// box itself, because that format carried no governance and its reader took a box's route from the
-/// box's own name — so this is what the recording meant, stated in the vocabulary that replaced it.
-/// Guessing anything else would leave every composed box of every stored run reporting no route.
-///
-/// A node naming no stages contributes none, which is the recording from before membership existed:
-/// [`Recorded::members`] then answers with the node's own name, as it did.
-fn convert(placed: Vec<PositionedNode>) -> Recorded {
-    Recorded {
-        stages: placed
-            .iter()
-            .flat_map(|placed| {
-                placed.stages.iter().map(|id| RunStage {
-                    id: id.clone(),
-                    node: placed.node.name.clone(),
-                    governed_by: (*id != placed.node.name).then(|| placed.node.name.clone()),
-                    // That format recorded no declaration, and its reader took the box's scope
-                    // straight from the route. `None` is exactly that.
-                    session: None,
-                })
-            })
-            .collect(),
-        nodes: placed.into_iter().map(|placed| placed.node).collect(),
-    }
 }
 
 #[cfg(test)]
@@ -349,48 +299,5 @@ mod tests {
         // one is.
         assert_eq!(record.index().members("clarification"), ["clarification"]);
         assert_eq!(record.index().node_of("clarification"), "clarification");
-    }
-
-    #[test]
-    fn a_recording_that_hung_membership_off_each_node_keeps_it() {
-        // The format immediately before this one: a bare array whose nodes each name the stages
-        // composing them. Runs recorded by it are in stores now and arrive in bundles, and there is
-        // no version on `shape_json` to refuse one on — so dropping the field would not refuse the
-        // recording, it would draw the run wrong and say nothing. Its members would come back as
-        // boxes of their own, with controls addressed to names the run never polled.
-        let placed = r#"[
-            {"name":"analyst","stage":0,"lane":0,"optional":false,"stages":["analyst"]},
-            {"name":"redteam","stage":1,"lane":0,"optional":false,
-             "stages":["redteam_classifier","redteam_author"]}
-        ]"#;
-        let record = recorded(Some(placed));
-        assert_eq!(record.nodes.len(), 2);
-        assert_eq!(
-            record.index().members("redteam"),
-            ["redteam_classifier", "redteam_author"]
-        );
-        assert_eq!(record.index().node_of("redteam_author"), "redteam");
-        assert_eq!(record.index().members("analyst"), ["analyst"]);
-
-        // That format carried no governance, and its reader took a box's route from the box's own
-        // name. Converting says so, rather than leaving every composed box of every stored run
-        // reporting no route at all: `[models.redteam]` is what such a run's red team ran on.
-        assert_eq!(record.index().governance_of("redteam_author"), "redteam");
-        assert_eq!(record.index().governance_of("analyst"), "analyst");
-    }
-
-    #[test]
-    fn a_recording_from_before_membership_makes_every_node_its_own_stage() {
-        // Older still: positions alone. Its nodes place as they always did, and every one of them is
-        // exactly its own stage — which is what they were.
-        let bare = r#"[
-            {"name":"analyst","stage":0,"lane":0,"optional":false},
-            {"name":"redteam","stage":1,"lane":0,"optional":false}
-        ]"#;
-        let record = recorded(Some(bare));
-        assert_eq!(record.nodes.len(), 2);
-        assert!(record.stages.is_empty());
-        assert_eq!(record.index().members("redteam"), ["redteam"]);
-        assert_eq!(record.index().governance_of("redteam"), "redteam");
     }
 }
