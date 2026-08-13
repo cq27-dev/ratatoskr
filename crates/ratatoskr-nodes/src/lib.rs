@@ -3536,6 +3536,33 @@ mod referee_governance_tests {
     }
 
     #[tokio::test]
+    async fn a_layout_column_with_no_nodes_is_refused() {
+        // An empty column still takes its position, so the ones after it are drawn a column further
+        // along with a gap to their left; a layout that is empty throughout records what declaring
+        // none records, and the workflow is read as having said nothing about where its nodes go.
+        let (dir, found) = workflows_in(
+            "layout-empty-column",
+            &[(
+                "ours",
+                r#"defineWorkflow({
+                     name: "ours",
+                     layout: [{ nodes: [] }, { nodes: ["analyst"] }],
+                   });
+                   export async function plan(input) { return input; }"#,
+            )],
+        )
+        .await;
+        let standard = workflow::standard_stages().await.unwrap();
+        let error =
+            validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
+                .expect_err("a column with no nodes places nothing")
+                .to_string();
+        assert!(error.contains("ours"), "{error}");
+        assert!(error.contains("empty column"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_layout_naming_one_node_twice_is_refused() {
         // The viewer keys a box by its name, so a second column of the same name would replace the
         // first's edges and state rather than drawing beside it.

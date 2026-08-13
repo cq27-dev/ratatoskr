@@ -260,7 +260,18 @@ pub fn validate_layout(
         }
     }
     let mut placed: BTreeSet<&str> = BTreeSet::new();
-    for column in layout {
+    for (index, column) in layout.iter().enumerate() {
+        // A column is a position, and an empty one still takes its place in the order: the nodes
+        // after it are drawn a column further along with nothing to their left. Declaring the whole
+        // layout empty is worse — it records exactly what declaring none records, so a workflow
+        // that meant to say where its nodes go is read as having said nothing.
+        if column.nodes.is_empty() {
+            return Err(PlanError::Configuration(format!(
+                "workflow `{workflow}` lays out an empty column at position {index}; a column is \
+                 the nodes drawn side by side in it, and one with none leaves a gap rather than \
+                 placing anything"
+            )));
+        }
         for node in &column.nodes {
             if !known.contains(node.as_str()) {
                 let drawable = known.iter().copied().collect::<Vec<_>>().join(", ");
