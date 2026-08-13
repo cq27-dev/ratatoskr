@@ -4,6 +4,7 @@ import {
   applyDerived,
   convergeLoops,
   forkHandoff,
+  handoffDrawn,
   nodesFromEvents,
   workingNodeNames,
 } from "./derive";
@@ -222,8 +223,9 @@ const applied = (shape, events) => applyDerived(shape, nodesFromEvents(events));
 // A workflow that declares no layout records an empty shape, so the server can only place a node
 // once it has checkpointed. Until then the stream is the only thing that knows it exists.
 test("a node the shape does not place still gets a box while it works", () => {
+  // Marked unshaped: the column is this side's ordering, and what is drawn into it turns on that.
   expect(applied([], [start("analyst")])).toEqual([
-    { name: "analyst", state: "working", checkpoints: 0, stage: 0, lane: 0 },
+    { name: "analyst", state: "working", checkpoints: 0, stage: 0, lane: 0, shaped: false },
   ]);
 });
 
@@ -297,6 +299,23 @@ test("a declared layout is not reordered by the stream", () => {
     ["fast", 0],
     ["slow", 1],
   ]);
+});
+
+// An appended node's column is the client's ordering, not a hand-off the shape declared. Drawing
+// one into it turned the referee an iterating run appends — invoked by the implementer
+// mid-converge — into a final stage judging what the publisher had just published.
+test("no forward edge is drawn from a shaped column into an appended node", () => {
+  expect(handoffDrawn(placed("publisher", 5), appended("referee", 6))).toBe(false);
+});
+
+// The order the stream first saw each node is all the ordering a layout-less run has, so its own
+// chain stays.
+test("an appended node still hands off to the next appended node", () => {
+  expect(handoffDrawn(appended("transform", 0), appended("publish_docs", 1))).toBe(true);
+});
+
+test("a declared layout's own hand-offs are drawn in full", () => {
+  expect(handoffDrawn(placed("analyst", 2), placed("implementer", 3))).toBe(true);
 });
 
 /** A tool call: a node working, with no checkpoint to follow it. */

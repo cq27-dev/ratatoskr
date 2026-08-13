@@ -18,7 +18,7 @@ import {
 import { Brain, Infinity as InfinityIcon, Repeat, Wrench } from "lucide-react";
 import { TOOL_GROUPS } from "../ui/tools";
 import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode } from "../api";
-import { forkHandoff, type ConvergeLoops } from "../derive";
+import { forkHandoff, handoffDrawn, type ConvergeLoops } from "../derive";
 
 /*
  * Positions are computed from the `stage` and `lane` the server sends with each node, not from a
@@ -500,22 +500,39 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
 
   const desiredEdges = useMemo<Edge[]>(() => {
     // Every node in a stage feeds every node in the next one — which is what a fork joining back
-    // together looks like, and the only edge relation the pipeline has.
+    // together looks like, and the only edge relation the pipeline has. Except into a node the
+    // shape does not place, whose column is the client's ordering rather than a declared hand-off:
+    // see `handoffDrawn`.
     // Rounded rather than square: the boxes carry the substrate's right angles, and the wiring
     // reads better when it does not compete with them.
+    const forward = (source: NodeView, target: NodeView) => ({
+      id: `${source.name}-${target.name}`,
+      source: source.name,
+      target: target.name,
+      sourceHandle: "out",
+      targetHandle: "in",
+      type: "smoothstep",
+      pathOptions: { borderRadius: 24 },
+    });
     const edges: Edge[] = columns.flatMap((lanes, i) =>
       (columns[i + 1] ?? []).flatMap((target) =>
-        lanes.map((source) => ({
-          id: `${source.name}-${target.name}`,
-          source: source.name,
-          target: target.name,
-          sourceHandle: "out",
-          targetHandle: "in",
-          type: "smoothstep",
-          pathOptions: { borderRadius: 24 },
-        })),
+        lanes.filter((source) => handoffDrawn(source, target)).map((source) => forward(source, target)),
       ),
     );
+
+    /*
+     * The one in-edge an appended node can prove. The server resolves `caller` only where the
+     * record names the invocation rather than adjacency suggesting it — today the referee, which
+     * judges the implementer checkpoint fetched immediately before it — so where it is present it
+     * is the hand-off the columns above deliberately do not draw. Drawn like any other forward
+     * edge, and skipped when the caller has no box or the pair is already joined.
+     */
+    for (const target of nodes) {
+      const source = target.shaped === false && target.caller ? byName.get(target.caller) : undefined;
+      if (!source) continue;
+      const edge = forward(source, target);
+      if (!edges.some((e) => e.id === edge.id)) edges.push(edge);
+    }
 
     /*
      * The one sequenced pair inside a stage: the implementer receives a tree whose tests the red

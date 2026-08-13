@@ -229,6 +229,23 @@ export function forkHandoff(nodes: readonly NodeView[]): boolean {
 }
 
 /**
+ * Whether a forward hand-off from `source` to `target` is a claim the record supports.
+ *
+ * Adjacent columns are drawn joined, so every stage edge asserts that the earlier column ran the
+ * later one. A DECLARED layout is exactly that assertion, and is drawn in full. An appended node is
+ * not: the shape never named it, and it is given a trailing column in first-mention order purely so
+ * it has somewhere to be. Joining the last shaped column to it invents a hand-off — the referee an
+ * iterating run appends is invoked by the implementer mid-converge, and reads instead as the
+ * pipeline's final stage, judging what the publisher published.
+ *
+ * Chained edges *within* the appended run are kept. For a run whose workflow declared no layout,
+ * the order the stream first saw each node is the only ordering it has.
+ */
+export function handoffDrawn(source: NodeView, target: NodeView): boolean {
+  return target.shaped !== false || source.shaped === false;
+}
+
+/**
  * Nodes a current control can reach.
  *
  * The event stream records the process's active attempt, including the concurrent delivery
@@ -309,6 +326,10 @@ export function applyDerived(
         : {}),
       stage: base + i,
       lane: 0,
+      // These columns are this function's ordering, not a hand-off any shape declared — including
+      // for a node only the stream has seen, which arrives here with nothing said about it. What
+      // is drawn between them depends on knowing that: see `handoffDrawn`.
+      shaped: false,
     };
   });
   return [...placed, ...extra];
