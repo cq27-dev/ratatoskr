@@ -186,21 +186,19 @@ pub(crate) fn is_terminal(status: Option<&str>) -> bool {
 /// - **A `failed` run that reached the fork died in converge.** Since the only step after the
 ///   fork is bookkeeping and that cannot fail the run, the implementer is where it stopped, even
 ///   though it has checkpoints from earlier iterations.
-pub fn derive(status: Option<&str>, checkpoints: &[Checkpoint]) -> Vec<NodeView> {
-    derive_with(status, checkpoints, None, None)
-}
-
-/// [`derive`], plus the config the run was started under — so a node that has not run yet can still
-/// say what it will run on.
+///
+/// `config` is what the run was started under, so a node that has not run yet can still say what it
+/// will run on.
 pub fn derive_with(
     status: Option<&str>,
     checkpoints: &[Checkpoint],
     config: Option<&ratatoskr_core::RatatoskrConfig>,
     shape_json: Option<&str>,
 ) -> Vec<NodeView> {
-    // The graph the run recorded, not the one this build happens to have. A run from another
-    // machine — or from this one before the pipeline changed — is drawn against its own shape.
-    let shape = ratatoskr_core::shape::recorded_or_built_in(shape_json);
+    // The graph the run recorded, and only that. A run from another machine — or from this one
+    // before the pipeline changed — is drawn against its own shape; one that recorded none is
+    // placed entirely by `append_unknown`, from the records it has.
+    let shape = ratatoskr_core::shape::recorded(shape_json);
     let stages = stages_of(&shape);
     let terminal = is_terminal(status);
     let failed = status == Some("failed");
@@ -408,6 +406,47 @@ fn count(checkpoints: &[Checkpoint], node: &str) -> usize {
 mod tests {
     use super::*;
 
+    /// The layout `standard-v1.ts` declares, as these cases' fixture.
+    ///
+    /// Written out here because these cases are *about* the standard pipeline — a skipped verifier
+    /// holding the current position, a `failed` run that reached the fork, the two deliveries
+    /// sharing a column. Nothing in this crate knows that layout: a run brings its own, and the
+    /// workflow that ran is what declared it. Keep this in step with `standard-v1.ts` if the
+    /// standard columns change; a stale fixture only makes these cases describe a pipeline that no
+    /// longer exists, never a run drawn wrongly.
+    fn standard_shape() -> String {
+        let columns: [(&[&str], bool); 6] = [
+            (&["overseer"], true),
+            (&["context"], false),
+            (&["analyst"], false),
+            (&["red_team", "implementer"], false),
+            (&["verifier"], true),
+            (&["bookkeeper", "publisher"], false),
+        ];
+        let nodes: Vec<ratatoskr_core::shape::ShapeNode> = columns
+            .iter()
+            .enumerate()
+            .flat_map(|(stage, (names, optional))| {
+                names
+                    .iter()
+                    .enumerate()
+                    .map(move |(lane, name)| ratatoskr_core::shape::ShapeNode {
+                        name: (*name).to_string(),
+                        stage,
+                        lane,
+                        optional: *optional,
+                    })
+            })
+            .collect();
+        serde_json::to_string(&nodes).unwrap()
+    }
+
+    /// A run of the standard pipeline, which is what every case below is about unless it says
+    /// otherwise.
+    fn derive(status: Option<&str>, checkpoints: &[Checkpoint]) -> Vec<NodeView> {
+        derive_with(status, checkpoints, None, Some(&standard_shape()))
+    }
+
     fn cp(node: &str, at: &str) -> Checkpoint {
         Checkpoint {
             node_name: node.to_string(),
@@ -440,6 +479,30 @@ mod tests {
             output_json: output_json.to_string(),
             ..cp(node, at)
         }
+    }
+
+    #[test]
+    fn a_run_that_recorded_no_shape_is_still_drawn_from_its_records() {
+        // A workflow that declares no layout records none, and there is no compiled-in pipeline to
+        // stand in for it. Every node the run has evidence for is still placed, in the order it
+        // first ran — the most that can be said when nothing declared where they sat.
+        let views = derive_with(
+            Some("planned"),
+            &[cp("gather", "t1"), cp("decide", "t2"), cp("gather", "t3")],
+            None,
+            None,
+        );
+        assert_eq!(
+            views.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            ["gather", "decide"]
+        );
+        assert_eq!(views[0].stage, 0);
+        assert_eq!(views[1].stage, 1);
+        assert_eq!(
+            views[0].checkpoints, 2,
+            "one row aggregates a node's records"
+        );
+        assert_eq!(state_of(&views, "decide"), NodeState::Done);
     }
 
     #[test]
@@ -588,7 +651,7 @@ mod tests {
             },
         );
 
-        let views = derive_with(None, &[], Some(&config), None);
+        let views = derive_with(None, &[], Some(&config), Some(&standard_shape()));
         // Routed as `redteam`, checkpointed as `red_team` — the view is keyed by the latter.
         let planned = views
             .iter()
