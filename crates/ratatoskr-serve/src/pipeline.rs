@@ -300,22 +300,20 @@ fn checkpointed_state(name: &str, terminal: bool) -> NodeState {
     }
 }
 
-/// Add nodes the run has data for that this build's pipeline does not contain.
+/// Add nodes the run has data for that its recorded shape does not place.
 ///
-/// The shape above is compiled in, so a run of the standard pipeline renders anywhere — including
-/// on an installation with no config at all, which is what an imported run has to survive. A run
-/// from a DIFFERENT graph is the case this covers: a custom workflow's nodes are not in the list,
-/// and without this its checkpoints would be silently dropped and the run would appear to have
-/// done nothing.
+/// Two cases reach here, and neither is exotic. A run from a DIFFERENT graph — an imported one, or
+/// one from before the pipeline changed — carries a shape whose columns do not name the nodes in
+/// its records; without this its checkpoints would be silently dropped and the run would appear to
+/// have done nothing. And a workflow that declares no layout records an empty shape, so *every*
+/// node of such a run arrives here, including its own. Nothing about this path is a fallback for
+/// foreign data only.
 ///
 /// They go in trailing stages, in the order they first ran. That is not the shape they executed
-/// in — it cannot be recovered from checkpoints alone — but it shows every node with its output
-/// and its cost, which is what someone analysing a foreign run came for.
-///
-/// A workflow that declares no layout records an empty shape, so this places *every* node of such a
-/// run — including the run's own. It is therefore not only the foreign case, and the state it
-/// reports is the same one a shaped node gets from [`checkpointed_state`]: a live implementer holds
-/// a checkpoint from an earlier converge iteration and is still working.
+/// in — it cannot be recovered from checkpoints alone — but it shows every node with its output and
+/// its cost, which is what someone analysing an unplaced run came for. What each node is *doing*
+/// comes from [`checkpointed_state`], the same rule a placed node gets: a live implementer holds a
+/// checkpoint from an earlier converge iteration and is still working, wherever it was drawn.
 fn append_unknown(
     out: &mut Vec<NodeView>,
     checkpoints: &[Checkpoint],
