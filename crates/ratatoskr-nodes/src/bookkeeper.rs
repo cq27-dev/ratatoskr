@@ -2,7 +2,7 @@
 //! a run change what the *next* run knows.
 //!
 //! It composes the memory content with a cheap LLM (real prose is the point — a templated dump
-//! wouldn't rank on a later `MemoryNode` retrieval), then calls rag-rat's own `memory_create`
+//! wouldn't rank on a later `memory::search`), then calls rag-rat's own `memory_create`
 //! directly (deterministic), adopting rag-rat's `kind` taxonomy rather than inventing one.
 
 use ratatoskr_graph::NodeError;

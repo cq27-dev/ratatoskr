@@ -115,7 +115,6 @@ pub struct Run {
     /// The commit the run started from.
     pub repo_sha: Option<String>,
     /// Immutable OCI image ID used for this run's sandboxed work, when it had any.
-    #[serde(default)]
     pub image_digest: Option<String>,
     /// Where this run came from, when it was not produced here. `None` for a local run.
     pub origin: Option<String>,

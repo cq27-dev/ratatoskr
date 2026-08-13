@@ -1232,7 +1232,8 @@ mod tests {
 
     #[test]
     fn a_referee_with_no_implementer_before_it_has_an_unknown_caller() {
-        // Legacy or pathological data. Unknown is reported as unknown, and nothing panics.
+        // A shape the producer does not emit, but the reader still has to survive: unknown is
+        // reported as unknown, and nothing panics.
         let views = derive(
             Some("converged"),
             &[cp("context", "t1"), cp("referee", "t2")],

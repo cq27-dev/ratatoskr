@@ -625,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_tool_arguments_fall_back_to_the_tool_name() {
+    fn unusable_tool_arguments_fall_back_to_the_tool_name() {
         for args in [
             None,
             Some(serde_json::json!({"not": "a string"})),

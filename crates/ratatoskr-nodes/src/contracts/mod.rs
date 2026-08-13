@@ -10,7 +10,7 @@ mod tests {
     use std::any::TypeId;
 
     #[test]
-    fn legacy_module_paths_reexport_the_contract_types() {
+    fn the_crate_root_paths_reexport_the_contract_types() {
         assert_eq!(
             TypeId::of::<crate::analyst::AnalystOutput>(),
             TypeId::of::<super::analyst::AnalystOutput>()

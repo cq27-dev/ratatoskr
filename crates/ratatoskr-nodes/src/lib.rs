@@ -37,7 +37,7 @@ pub use bookkeeper::{BookkeeperInput, BookkeeperOutput, MemoryWritten};
 pub use child::ChildTask;
 pub use context::{Constraint, ContextOutput};
 pub use implementer::{ImplementerNode, ImplementerOutput};
-pub use memory::{MemoryNode, MemoryOutput, MemoryRecord};
+pub use memory::{MemoryOutput, MemoryRecord};
 pub use overseer::OverseerOutput;
 pub use publisher::PublisherOutput;
 pub use redteam::{RedTeamNode, RedTeamOutput};
@@ -315,7 +315,7 @@ fn graph_fingerprint_of(repo: &std::path::Path, orchestration: &str, definitions
     // Every workflow, not just the one this run used: which workflows exist is part of what the
     // graph *is* now, and two runs cannot be compared across a registry that changed under them.
     let mut workflows = scripts_in(repo.join(WORKFLOW_DIR));
-    workflows.push(repo.join(LEGACY_WORKFLOW));
+    workflows.push(repo.join(SINGLE_FILE_WORKFLOW));
     // The same module map a run gives a workflow, so one that legitimately imports the standard
     // definitions still reports its `LOAD` dependencies instead of failing to transpile.
     let modules = [(workflow::STANDARD_DEFINITIONS_MODULE, definitions)];
@@ -451,8 +451,9 @@ impl Workflow {
     }
 }
 
-/// The single-script path, still honoured so a repo that has one keeps working untouched.
-const LEGACY_WORKFLOW: &str = ".ratatoskr/workflow.ts";
+/// The single-file form: a repository with exactly one workflow keeps it here rather than in a
+/// directory of one. A supported configuration, read alongside `.ratatoskr/workflows/*.ts`.
+const SINGLE_FILE_WORKFLOW: &str = ".ratatoskr/workflow.ts";
 
 /// Every node any workflow in this repo may govern: the standard stages plus what each declares.
 ///
@@ -502,12 +503,12 @@ pub async fn registry() -> Result<Vec<Workflow>, PlanError> {
 /// The workflows this repo defines, in name order.
 ///
 /// `.ratatoskr/workflows/*.ts` first, then a bare `.ratatoskr/workflow.ts` if one is there. Both,
-/// rather than one superseding the other: a repo that has the old file gets it as an ordinary
-/// entry in the registry rather than a migration to perform before anything runs.
+/// rather than one superseding the other: the single-file form is an ordinary entry in the
+/// registry, so a repo that outgrows it can add the directory without moving the file first.
 pub async fn defined() -> Result<Vec<WorkflowRuntime>, PlanError> {
     defined_in(
         std::path::Path::new(WORKFLOW_DIR),
-        std::path::Path::new(LEGACY_WORKFLOW),
+        std::path::Path::new(SINGLE_FILE_WORKFLOW),
     )
     .await
 }
@@ -515,7 +516,7 @@ pub async fn defined() -> Result<Vec<WorkflowRuntime>, PlanError> {
 /// `defined()` against explicit paths, so the import wiring is testable without a fixed cwd.
 async fn defined_in(
     dir: &std::path::Path,
-    legacy_path: &std::path::Path,
+    single_file: &std::path::Path,
 ) -> Result<Vec<WorkflowRuntime>, PlanError> {
     let fail = |e: ratatoskr_script::ScriptError| {
         PlanError::node("workflow", NodeError::Failed(e.to_string()))
@@ -527,14 +528,14 @@ async fn defined_in(
     let mut found = WorkflowRuntime::discover(dir, &modules)
         .await
         .map_err(fail)?;
-    if let Some(legacy) = WorkflowRuntime::load(legacy_path, &modules)
+    if let Some(single) = WorkflowRuntime::load(single_file, &modules)
         .await
         .map_err(fail)?
     {
         // Only when the directory has not already claimed that name, so a repo mid-move does not
         // get a duplicate-name error for a file it has already copied across.
-        if !found.iter().any(|w| w.meta().name == legacy.meta().name) {
-            found.push(legacy);
+        if !found.iter().any(|w| w.meta().name == single.meta().name) {
+            found.push(single);
         }
     }
     // The bundled workflow is always in the registry, so a repository workflow answering to its
@@ -2547,9 +2548,9 @@ mod agent_config_tests {
         std::fs::write(rules.join("scout.ts"), "a").unwrap();
 
         let absent = graph_fingerprint(&root);
-        std::fs::write(root.join(LEGACY_WORKFLOW), "").unwrap();
+        std::fs::write(root.join(SINGLE_FILE_WORKFLOW), "").unwrap();
         assert_ne!(absent, graph_fingerprint(&root), "absent is not empty");
-        std::fs::remove_file(root.join(LEGACY_WORKFLOW)).unwrap();
+        std::fs::remove_file(root.join(SINGLE_FILE_WORKFLOW)).unwrap();
         assert_eq!(absent, graph_fingerprint(&root));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2830,7 +2831,7 @@ mod agent_config_tests {
     async fn the_default_standard_stage_registry_has_unique_identifiers() {
         validate_configured_stages(&RatatoskrConfig::default())
             .await
-            .expect("the bundled standard declarations replace legacy terminal placeholders");
+            .expect("the bundled standard declarations name each stage once");
     }
 
     #[test]

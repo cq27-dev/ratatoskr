@@ -29,7 +29,8 @@ pub enum NodeError {
 ///
 /// `raw` may be wrapped in prose or ```json fences (agents in `OutputMode::Tool` are *instructed*
 /// but not *forced* to emit clean JSON). A complete JSON document is preferred, which preserves
-/// array and scalar roots; object extraction remains the fallback for legacy prose-wrapped output.
+/// array and scalar roots; object extraction is the fallback when a model wraps its object in
+/// prose anyway, which is a thing models do and not a thing only old output did.
 pub fn parse_validated<T>(raw: &str) -> Result<T, NodeError>
 where
     T: DeserializeOwned + JsonSchema,
@@ -96,7 +97,7 @@ pub fn validate_value(
     Ok(())
 }
 
-/// Return a complete JSON document, or recover an object from prose-wrapped legacy output.
+/// Return a complete JSON document, or recover an object from prose the model wrapped it in.
 fn extract_json_value(raw: &str) -> Option<&str> {
     let raw = raw.trim();
     serde_json::from_str::<serde_json::Value>(raw)

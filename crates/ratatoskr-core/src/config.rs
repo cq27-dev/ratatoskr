@@ -21,7 +21,8 @@ pub struct RatatoskrConfig {
     /// Per-node model routing, keyed by stage name (`"scout"`, `"analyst"`, ...).
     #[serde(default)]
     pub models: HashMap<String, ModelRoute>,
-    /// Reusable execution profiles. Stage names remain the model/ruleset compatibility key.
+    /// Reusable execution profiles. A stage name is still the key for `[models.*]` and rulesets;
+    /// a profile groups what several stages share rather than replacing that key.
     #[serde(default)]
     pub agents: HashMap<String, AgentProfileConfig>,
     #[serde(default)]
@@ -36,8 +37,8 @@ pub struct RatatoskrConfig {
     pub endpoint: EndpointConfig,
 }
 
-/// Configurable defaults for a reusable agent profile. A missing model keeps the existing
-/// `[models.<stage>]` fallback, preserving stage-keyed configuration compatibility.
+/// Configurable defaults for a reusable agent profile. A missing model leaves the stage on its
+/// `[models.<stage>]` route, so adopting a profile never silently re-routes a node.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentProfileConfig {
@@ -916,7 +917,7 @@ impl Default for RatatoskrConfig {
             endpoint: EndpointConfig::default(),
             rag_rat: RagRatConfig {
                 // `--json` makes rag-rat emit JSON (not its default TOON), so nodes that parse
-                // tool results directly (MemoryNode) get a stable shape.
+                // tool results directly (the memory retrieval) get a stable shape.
                 command: ["npx", "-y", "@rag-rat/bin", "mcp", "--json"]
                     .map(str::to_string)
                     .to_vec(),
