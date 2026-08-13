@@ -175,11 +175,18 @@ impl PlannedNode {
                 Some((route, registry.session_of(stage).unwrap_or(route.session)))
             })
             .collect();
+        // A vector for the output and a set to decide what goes in it. The order is meaningful — a
+        // box lists every distinct route it runs on, in registry order — but asking the vector
+        // whether it already holds one rescans everything collected so far, once per member, and a
+        // workflow may compose a box out of as many stages as it likes.
         let mut models: Vec<String> = Vec::new();
+        let mut named = std::collections::HashSet::new();
+        // `sessions` needs no set. `SessionScope` has three variants, so this vector is three long
+        // at worst and the scan is bounded by the enum rather than by the box.
         let mut sessions: Vec<ratatoskr_core::SessionScope> = Vec::new();
         for (route, session) in &planned {
             let model = format!("{}/{}", route.provider, route.model);
-            if !models.contains(&model) {
+            if named.insert(model.clone()) {
                 models.push(model);
             }
             if !sessions.contains(session) {
@@ -1038,6 +1045,76 @@ mod tests {
         assert_eq!(registry.members("n7"), ["s7"]);
         assert_eq!(registry.node_of("s7"), "n7");
         assert_eq!(registry.membership().len(), N);
+    }
+
+    #[test]
+    fn a_box_of_many_stages_is_derived_in_work_proportional_to_its_members() {
+        // A DIFFERENT exposure from the wide registry above, and the one that case cannot reach: it
+        // gives every box one stage and supplies no config, so `PlannedNode::of` returns before its
+        // loop runs. A box's own metadata — every distinct route it will run on, and every distinct
+        // session scope — is collected per member, and testing membership by rescanning what has
+        // been collected so far is quadratic in the member count.
+        //
+        // A workflow may compose a box out of as many stages as it likes, and a recording may be
+        // imported. A wide REGISTRY and a wide BOX are different exposures and both are cheap, so
+        // both cases are kept.
+        //
+        // Sized from measurement and asserted as a ceiling, like its sibling: at this size a debug
+        // build plans this in about 0.24s deduplicating with a set and about 14.5s rescanning, so
+        // the bound sits ~8x above the first and ~7x below the second. Re-derive if it looks tight
+        // — the rescan curve is 4x per doubling of N and the set curve is 2x, so the gap widens.
+        const N: usize = 50_000;
+        let recorded = ratatoskr_core::shape::Recorded {
+            nodes: vec![ratatoskr_core::shape::ShapeNode {
+                name: "wide".to_string(),
+                stage: 0,
+                lane: 0,
+                optional: false,
+            }],
+            stages: (0..N)
+                .map(|i| ratatoskr_core::shape::RunStage {
+                    id: format!("s{i}"),
+                    node: "wide".to_string(),
+                    // Each member governs as itself, so each resolves its own route and none of
+                    // them dedupes away — the worst case, and the one a composed box can reach.
+                    governed_by: None,
+                    session: None,
+                })
+                .collect(),
+        };
+        let shape = serde_json::to_string(&recorded).unwrap();
+        let mut config = ratatoskr_core::RatatoskrConfig::default();
+        for i in 0..N {
+            let mut route = routed("x").models.remove("x").expect("a route");
+            route.model = format!("model-{i}");
+            config.models.insert(format!("s{i}"), route);
+        }
+
+        let started = std::time::Instant::now();
+        let views = derive_with(
+            Some("converged"),
+            &[cp("wide", "t")],
+            Some(&config),
+            Some(&shape),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "planning a box of {N} stages took {elapsed:?}, which is rescan-shaped work"
+        );
+
+        // And it still says what it is for: every distinct route, in registry order.
+        let planned = view(&views, "wide")
+            .planned
+            .as_ref()
+            .expect("every member is routed");
+        assert_eq!(planned.model.split(", ").count(), N);
+        assert!(
+            planned
+                .model
+                .starts_with("anthropic/model-0, anthropic/model-1, ")
+        );
+        assert_eq!(planned.sessions, [ratatoskr_core::SessionScope::Reuse]);
     }
 
     #[test]
