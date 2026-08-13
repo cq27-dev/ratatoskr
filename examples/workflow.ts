@@ -8,7 +8,10 @@
 // `verify()` owns diff collection and review thresholds; and terminal status and effects are
 // reconstructed from Rust checkpoints, never from anything the script returns.
 //
-// Relevant bindings (all async except the pure convergence helpers):
+// Relevant bindings. EVERY one is async and must be awaited — including the two that answer a
+// plain boolean. An unawaited call is a Promise, and a Promise is truthy however it resolves, so
+// `testCommandRan(x) && isConverged(y)` is always true. Await each call before a boolean, a
+// ternary, an `if`, a `!`, a `===`, or a template string reads it:
 //   context(issue) -> ContextOutput
 //   analyst({issue, scout, memory, brief?, constraints?, previous?, findings?}) -> AnalystOutput
 //   redTeam() -> RedTeamOutput                     // prepares the tree; baseline + authored tests
@@ -134,7 +137,11 @@ async function run(input: { issue: string; maxIterations: number; alwaysFork: bo
 
   // The loop mirrors standard-v1, but Rust owns every decision that grants another model attempt.
   while (true) {
-    const testsClean = testCommandRan(impl) && isConverged({ baseline: redTeamOut, post: impl });
+    // Both hosts are `async function`s, so each call must be awaited before `&&` reads it — an
+    // unawaited call is a Promise, which is truthy no matter what it resolves to.
+    const testsClean =
+      (await testCommandRan(impl)) &&
+      (await isConverged({ baseline: redTeamOut, post: impl }));
     if (testsClean) {
       const review = await verify({ analyst: analystOut });
       if (!review.configured || review.unavailable || review.blocking.length === 0) break;
