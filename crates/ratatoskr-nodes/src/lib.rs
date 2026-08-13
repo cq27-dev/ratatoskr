@@ -328,8 +328,12 @@ fn graph_fingerprint_of(repo: &std::path::Path, orchestration: &str, definitions
     sources.dedup();
 
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    // Length-prefixed, so where one input ends and the next begins is itself hashed. A flat
+    // concatenation is the same stream however it is partitioned: a rules file whose text ends in
+    // the name of the file after it produces, byte for byte, what a different pair of files
+    // produces, and the two graphs report one provenance.
     let mut fold = |bytes: &[u8]| {
-        for byte in bytes {
+        for byte in (bytes.len() as u64).to_le_bytes().iter().chain(bytes) {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
@@ -346,15 +350,19 @@ fn graph_fingerprint_of(repo: &std::path::Path, orchestration: &str, definitions
     // the definitions above, which is why *those* have to be the transpiled form.
     fold(orchestration.as_bytes());
     for path in sources {
-        // A missing file still contributes its name, so adding a `workflow.ts` changes the
-        // fingerprint even if it is empty.
         fold(
             path.strip_prefix(repo)
                 .unwrap_or(&path)
                 .as_os_str()
                 .as_encoded_bytes(),
         );
-        fold(&std::fs::read(&path).unwrap_or_default());
+        // Absent and empty are folded apart. `.ratatoskr/workflow.ts` is listed whether or not it
+        // exists, and creating it empty is a change to the graph: a script that declares nothing is
+        // still loaded, under a workflow name taken from its file stem. Reading a missing file as
+        // empty bytes made those two states one fingerprint.
+        let contents = std::fs::read(&path).ok();
+        fold(&[u8::from(contents.is_some())]);
+        fold(contents.as_deref().unwrap_or_default());
     }
     format!("{hash:016x}")
 }
@@ -2514,6 +2522,55 @@ mod agent_config_tests {
             graph_fingerprint(&root),
             graph_fingerprint_of(&root, workflow::STANDARD_WORKFLOW_V1, &definitions),
             "the fingerprint is the one taken over this build's definitions"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_graph_fingerprint_tells_an_absent_workflow_from_an_empty_one() {
+        // `.ratatoskr/workflow.ts` is the one path folded in whether or not it exists, and the two
+        // states are not the same graph: creating it empty puts a workflow named after the file
+        // into the registry, because a script that declares nothing is still named after its stem.
+        let root = std::env::temp_dir().join(format!("ratatoskr-fp-empty-{}", std::process::id()));
+        let rules = root.join(".ratatoskr/rules");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(rules.join("scout.ts"), "a").unwrap();
+
+        let absent = graph_fingerprint(&root);
+        std::fs::write(root.join(LEGACY_WORKFLOW), "").unwrap();
+        assert_ne!(absent, graph_fingerprint(&root), "absent is not empty");
+        std::fs::remove_file(root.join(LEGACY_WORKFLOW)).unwrap();
+        assert_eq!(absent, graph_fingerprint(&root));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_graph_fingerprint_frames_each_input_it_folds() {
+        // Two repositories whose sources differ, arranged so that the paths and contents
+        // concatenate to one identical byte stream: `a.ts` swallows the name of the file after it.
+        // With no boundary between one input and the next, that is one fingerprint over
+        // demonstrably different rules.
+        let root = std::env::temp_dir().join(format!("ratatoskr-fp-frame-{}", std::process::id()));
+        let rules = root.join(".ratatoskr/rules");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&rules).unwrap();
+
+        let after = std::path::Path::new(".ratatoskr")
+            .join("rules")
+            .join("b.ts");
+        let after = after.to_string_lossy();
+        std::fs::write(rules.join("a.ts"), "A").unwrap();
+        std::fs::write(rules.join("b.ts"), format!("B{after}C")).unwrap();
+        let one = graph_fingerprint(&root);
+        std::fs::write(rules.join("a.ts"), format!("A{after}B")).unwrap();
+        std::fs::write(rules.join("b.ts"), "C").unwrap();
+        assert_ne!(
+            one,
+            graph_fingerprint(&root),
+            "re-partitioned bytes collide"
         );
 
         let _ = std::fs::remove_dir_all(&root);
