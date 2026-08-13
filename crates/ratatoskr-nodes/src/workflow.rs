@@ -406,13 +406,23 @@ enum ScriptedReview {
 }
 
 fn scripted_review(checkpoints: &[ratatoskr_store::Checkpoint]) -> ScriptedReview {
-    let Some(checkpoint) = checkpoints
+    let Some(reviewed_at) = checkpoints
         .iter()
-        .rev()
-        .find(|checkpoint| checkpoint.node_name == "verifier")
+        .rposition(|checkpoint| checkpoint.node_name == "verifier")
     else {
         return ScriptedReview::NotRun;
     };
+    // An implementer checkpoint written after the review means the tree moved on since it was
+    // judged: that review describes a state this run no longer has, so it cannot be the review
+    // terminal status rests on. Unreviewed, not reviewed-clean. The bundled flow always verifies
+    // after its last iterate, so it never lands here.
+    if checkpoints[reviewed_at + 1..]
+        .iter()
+        .any(|checkpoint| checkpoint.node_name == "implementer")
+    {
+        return ScriptedReview::NotRun;
+    }
+    let checkpoint = &checkpoints[reviewed_at];
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&checkpoint.output_json) else {
         return ScriptedReview::Unavailable;
     };
@@ -1074,6 +1084,14 @@ async fn verify_host(
     }
     ctx.guard()?;
     let input: Arg = serde_json::from_str(&arg).map_err(|e| format!("verify arg: {e}"))?;
+    // Review excludes editing. A verifier that runs beside `iterate()` reads the worktree while an
+    // implementer is writing it, and its checkpoint is what terminal status rests on — so the
+    // review would be of a half-written tree that never existed. Held for the whole call, and
+    // taken before any early return so the exclusion does not depend on the verifier's config.
+    let _iterate = ctx
+        .iterate_lock
+        .try_lock()
+        .map_err(|_| "verify() cannot overlap iterate()".to_string())?;
 
     let none = |configured, unavailable| {
         serde_json::to_string(&VerifyResult {
@@ -8174,6 +8192,21 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(overlap, "iterate() is already in progress");
+        // Review excludes editing for the same reason: a verifier that runs while an implementer
+        // is mid-edit reviews a torn tree, and its checkpoint is what decides terminal status.
+        let executor = StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::new(stages),
+            Arc::new(RecordingStageTurn::default()),
+        );
+        let reviewing = verify_host(
+            Arc::clone(&ctx),
+            executor,
+            json!({ "analyst": review_plan() }).to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reviewing, "verify() cannot overlap iterate()");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -9348,6 +9381,38 @@ mod tests {
             RunStatus::Converged,
             "a workflow that never requested review keeps the documented test-only result"
         );
+    }
+
+    #[test]
+    fn a_review_the_implementer_has_since_overwritten_is_not_this_runs_review() {
+        let clean = verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: "nothing blocking".to_string(),
+        };
+        let implementer = json!({ "summary": "edited" });
+        let none: Option<&()> = None;
+
+        // The bundled order — implement, review — is the reviewed one, and stays reviewed.
+        let reviewed = [
+            review_checkpoint("implementer", &implementer, none),
+            review_checkpoint("verifier", &clean, none),
+        ];
+        assert!(matches!(
+            scripted_review(&reviewed),
+            ScriptedReview::Available(_)
+        ));
+
+        // Reviewed, then edited again: the review describes a tree that no longer exists, so
+        // terminal status must not rest on it.
+        let superseded = [
+            review_checkpoint("implementer", &implementer, none),
+            review_checkpoint("verifier", &clean, none),
+            review_checkpoint("implementer", &implementer, none),
+        ];
+        assert!(matches!(
+            scripted_review(&superseded),
+            ScriptedReview::NotRun
+        ));
     }
 
     #[tokio::test]
