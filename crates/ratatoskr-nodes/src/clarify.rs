@@ -233,26 +233,37 @@ impl NodeClarifier {
     /// The turn settings the run itself would give `answerer` — resolved through the run's registry
     /// by the same chain `node_route` uses, so an answer speaks on the route its stage executes on.
     ///
-    /// `None` when the run has no stage for that role, or no model route for the stage it found.
+    /// `None` when the run has no stage for that role, or none of them has a model route.
     async fn answerer_agent(&self, answerer: &str) -> Option<(crate::NodeAgentConfig, String)> {
-        // `resolve_target` maps the asker's word to a ROLE; the registry maps that role to the stage
-        // that plays it — by id, then by `governedBy`, exactly as `node_route` does. So `redteam`
-        // reaches whichever stage governs as `redteam` in this run, and an overridden `analyst`
-        // answers under its own governance identity rather than under the name it was asked by.
+        // `resolve_target` maps the asker's word to a ROLE; the registry maps that role to the
+        // stage that plays it — by id, then by `governedBy`, the precedence `node_route` uses. So
+        // an overridden `analyst` answers under its own governance identity rather than under the
+        // name it was asked by.
+        //
+        // Several stages may govern as one name, and they route separately: `redteam` is the
+        // classifier on the `reason` profile and the author on `build`, and a run may route either
+        // half alone. The one that can answer is the one with somewhere to run, so this takes the
+        // first candidate that *resolves* rather than the first that matches — otherwise a run with
+        // a red team is told its red team does not exist because the other half is declared first.
         let stages = crate::workflow::execution_stages(&self.stages).await.ok()?;
-        let stage = crate::stage::for_node(&stages, answerer)?;
-        let (cfg, profile) = crate::plugins::declared_stage_agent_config(
-            &self.engine,
-            &self.config,
-            ToolSet::default(),
-            stage,
-            // Answer mode runs with no tools at all, so no skills either.
-            &[],
-            &crate::NodePlugins::default(),
-            ratatoskr_core::Capability::Read,
-        )
-        .ok()?;
-        Some((cfg, profile.base_prompt))
+        let by_id = stages.iter().filter(|stage| stage.id == answerer);
+        let by_governance = stages
+            .iter()
+            .filter(|stage| stage.id != answerer && stage.governance_id() == answerer);
+        by_id.chain(by_governance).find_map(|stage| {
+            let (cfg, profile) = crate::plugins::declared_stage_agent_config(
+                &self.engine,
+                &self.config,
+                ToolSet::default(),
+                stage,
+                // Answer mode runs with no tools at all, so no skills either.
+                &[],
+                &crate::NodePlugins::default(),
+                ratatoskr_core::Capability::Read,
+            )
+            .ok()?;
+            Some((cfg, profile.base_prompt))
+        })
     }
 
     async fn answer_inner(
@@ -475,6 +486,63 @@ mod tests {
             .answerer_agent("analyst")
             .await
             .expect("the run's analyst has a route");
+        assert_eq!(cfg.route.model, "gpt-5");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `redteam` is one advertised answerer over two stages that route separately: the classifier
+    /// on the `reason` profile, the author on `build`. A run that routes only the author still has
+    /// a red team, and an implementer asking it must reach the half that can answer rather than
+    /// the half that happens to be declared first.
+    #[tokio::test]
+    async fn the_clarifier_reaches_the_red_team_half_the_run_can_route() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-clarifier-redteam-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+
+        // Only the author's profile is routed: no `[models.redteam]`, nothing on `reason`.
+        let mut config = ratatoskr_core::RatatoskrConfig::default();
+        config.agents.insert(
+            "build".to_string(),
+            ratatoskr_core::AgentProfileConfig {
+                model: Some(ratatoskr_core::ModelRoute {
+                    provider: "openai".to_string(),
+                    model: "gpt-5".to_string(),
+                    max_tokens: None,
+                    context_window: None,
+                    temperature: None,
+                    params: None,
+                    session: Default::default(),
+                }),
+                base_prompt: String::new(),
+                capabilities: vec![ratatoskr_core::Capability::Write],
+                tool_policy: None,
+                max_turns: None,
+            },
+        );
+
+        let stages = crate::workflow::standard_stages().await.unwrap();
+        let registry: crate::workflow::ExecutionStages = Arc::default();
+        registry.set(Arc::new(stages)).unwrap();
+
+        let clarifier = NodeClarifier::new(
+            &config,
+            &store,
+            &engine,
+            "run-clarify-redteam",
+            "an issue",
+            registry,
+        );
+        let (cfg, _) = clarifier
+            .answerer_agent("redteam")
+            .await
+            .expect("a routed red-team half answers for `redteam`");
         assert_eq!(cfg.route.model, "gpt-5");
 
         let _ = std::fs::remove_dir_all(dir);
