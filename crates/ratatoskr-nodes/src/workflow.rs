@@ -8811,11 +8811,27 @@ mod tests {
         ];
         let mut unawaited = Vec::new();
         for (path, source) in sources {
+            // A source's hosts are the Rust-owned operations plus every stage it declares:
+            // `build_declared_stage_hosts` installs declared stages through the same async
+            // wrapper, so they carry the same Promise, and they are most of what a workflow calls.
+            let mut hosts: Vec<String> = TEMPORARY_OPERATIONS
+                .iter()
+                .map(|(name, _)| name.to_string())
+                .collect();
+            hosts.extend(source.match_indices("stage(\"").filter_map(|(at, opener)| {
+                let rest = &source[at + opener.len()..];
+                rest.split_once('"').map(|(id, _)| id.to_string())
+            }));
+            assert!(
+                hosts.len() > TEMPORARY_OPERATIONS.len(),
+                "{path} declares no stages, so this guard would only cover the operations"
+            );
             for (number, line) in source.lines().enumerate() {
                 if line.trim_start().starts_with("//") {
                     continue;
                 }
-                for (host, _) in TEMPORARY_OPERATIONS {
+                for host in &hosts {
+                    let host = host.as_str();
                     for (at, _) in line.match_indices(host) {
                         let before = &line[..at];
                         let after = line[at + host.len()..].trim_start();
