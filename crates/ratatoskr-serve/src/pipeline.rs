@@ -404,10 +404,10 @@ fn append_unknown(
 /// a cleverer reader to fill. A checkpoint does not record what invoked it, and the two substitutes
 /// available here do not survive the general case:
 ///
-/// * **A name in a record is not necessarily the node that wrote it.** A declared stage runs under its
-///   `governedBy` identity — `StageExecutor` passes the governance id as `NodeRun.node` — so a
-///   clarification's `from`, taken from that same value, names the governance identity. Two stages
-///   sharing one `governedBy` are already indistinguishable by the time a record is written.
+/// * **A name in a record is not necessarily a node the graph draws.** A clarification's `from` is
+///   the STAGE that asked, and a stage may compose another node rather than being one — an
+///   `implementer_attempt` asking is drawn inside the implementer's box, under a name no column
+///   carries.
 /// * **Position is not provenance.** "Followed an implementer" is true of most work a run does late.
 ///
 /// A caller for anything beyond the referee needs the producer to record it — an explicit caller
@@ -1066,12 +1066,12 @@ mod tests {
 
     #[test]
     fn a_clarification_claims_no_caller_even_though_its_record_names_one() {
-        // A clarification records `from`, and it is tempting to read it as the asking node. It is
-        // not: a declared stage runs under its `governedBy` identity, and that is the value this
-        // field carries — so a stage governed by `implementer` would be reported as the implementer
-        // having asked itself, and two stages sharing one `governedBy` are indistinguishable here.
-        // Naming the wrong asker is worse than naming none, because #248 anchors a branch on it, so
-        // this stays silent until the producer records the caller per invocation (#244).
+        // A clarification records `from`, and it is tempting to read it as the asking node. It
+        // names the STAGE that asked, which is not the same thing: a stage that composes another
+        // node is drawn inside that node's box, so `implementer_attempt` asking would be reported
+        // as a node no column names. Naming the wrong asker is worse than naming none, because #248
+        // anchors a branch on it, so this stays silent until the producer records the caller per
+        // invocation (#244).
         let views = derive(
             Some("awaiting_clarification"),
             &[

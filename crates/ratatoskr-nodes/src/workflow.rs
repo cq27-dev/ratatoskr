@@ -1957,11 +1957,23 @@ impl StageExecutor {
             .map_err(|e| format!("stage `{}` has invalid outputSchema: {e}", stage.id))?;
         // Stable within this run and stage, unique across runs. Endpoint reuse needs the uniqueness;
         // local compaction uses the same key so both continuation modes agree on stage identity.
-        let conversation = format!("{}-{governance_id}", self.ctx.run_id);
+        //
+        // Per STAGE, not per governance identity. Two stages that share a route are still two
+        // pieces of work with different capabilities, and a shared key would continue one of them
+        // into the other's session — handing a read-only half the write-capable half's context the
+        // moment a route stops being `fresh`.
+        let conversation = format!("{}-{}", self.ctx.run_id, stage.id);
         let raw = self
             .turn
             .run(ratatoskr_agent::NodeRun {
-                node: &governance_id,
+                // The stage, so the span, the `node_start` event, the ledger claim and a
+                // clarification's `from` all name the work that actually ran. `governance_id`
+                // stays what it is documented to be — the route, the ruleset, the plugins and the
+                // skills, all resolved above under it.
+                node: &stage.id,
+                // The operator, though, acts on the box the graph draws. A stage that is its own
+                // node is that box; one that belongs to another answers at the box's address.
+                controlled_as: Some(stage.node_id()),
                 route: &cfg.route,
                 preamble: &preamble,
                 question: &question,
@@ -1987,7 +1999,16 @@ impl StageExecutor {
             .map_err(|e| format!("stage `{}` returned invalid JSON: {e}", stage.id))?;
         validate_declared_output(&stage, &output)?;
         normalize_declared_output(&stage, &mut output)?;
-        if disposition == StageOutput::Checkpoint {
+        // Evidence is folded into the enclosing host's aggregate record rather than checkpointed —
+        // but the model turn behind it is this stage's, and its cost has to land somewhere. A stage
+        // that belongs to a node writes its own row inside that node's box: the aggregate becomes
+        // the parent, and each child row describes exactly one turn. That is the only honest place
+        // for `model` and `tools`, because the halves of a box run on different profiles with
+        // different tool sets, and a row naming both is true of the box and useless about either.
+        //
+        // Without it the turn would be recorded under the stage and claimed under the box, which is
+        // exactly the cost-in-the-bin that `RunLedger::unclaimed` exists to catch.
+        if disposition == StageOutput::Checkpoint || !stage.is_own_node() {
             note(&self.ctx, &stage.id, &output, Some(input_json)).await?;
         }
         serde_json::to_string(&output).map_err(|e| e.to_string())
@@ -3248,6 +3269,7 @@ mod tests {
         sessions: Mutex<Vec<ratatoskr_core::SessionScope>>,
         models: Mutex<Vec<String>>,
         nodes: Mutex<Vec<String>>,
+        controls: Mutex<Vec<Option<String>>>,
         conversations: Mutex<Vec<Option<String>>>,
         ledger_ids: Mutex<Vec<Option<usize>>>,
         tools: Mutex<Vec<Vec<String>>>,
@@ -3268,6 +3290,7 @@ mod tests {
                 sessions: Mutex::new(Vec::new()),
                 models: Mutex::new(Vec::new()),
                 nodes: Mutex::new(Vec::new()),
+                controls: Mutex::new(Vec::new()),
                 conversations: Mutex::new(Vec::new()),
                 ledger_ids: Mutex::new(Vec::new()),
                 tools: Mutex::new(Vec::new()),
@@ -3302,6 +3325,10 @@ mod tests {
                 .lock()
                 .expect("recording runner mutex poisoned")
                 .push(run.node.to_string());
+            self.controls
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .push(run.controlled_as.map(str::to_string));
             self.conversations
                 .lock()
                 .expect("recording runner mutex poisoned")
@@ -3548,7 +3575,9 @@ mod tests {
                 .iter()
                 .map(|checkpoint| checkpoint.node_name.as_str())
                 .collect::<Vec<_>>(),
-            ["issue", "context", "analyst"]
+            // The distillation is the context node's model turn and writes its own row inside
+            // that node's box; `context` is the box's own aggregate, written by the operation host.
+            ["issue", "context_distillation", "context", "analyst"]
         );
         // And the run wrote down the layout the workflow it ran declared, which is what anything
         // drawing this run afterwards places its records against.
@@ -3568,9 +3597,9 @@ mod tests {
             crate::stage::shape_from_workflow(standard_runtime().await.unwrap().meta())
         );
         let context: crate::ContextOutput =
-            serde_json::from_str(&checkpoints[1].output_json).unwrap();
+            serde_json::from_str(&checkpoints[2].output_json).unwrap();
         let analyst_input: analyst::AnalystInput =
-            serde_json::from_str(checkpoints[2].input_json.as_deref().unwrap()).unwrap();
+            serde_json::from_str(checkpoints[3].input_json.as_deref().unwrap()).unwrap();
         assert_eq!(analyst_input.issue, "preserve the declared plan path");
         assert!(analyst_input.brief.is_empty());
         assert!(analyst_input.constraints.is_empty());
@@ -3586,7 +3615,7 @@ mod tests {
         let runs = turn.runs.lock().expect("sequenced runner mutex poisoned");
         assert_eq!(
             runs.iter().map(|run| run.node.as_str()).collect::<Vec<_>>(),
-            ["context", "analyst"]
+            ["context_distillation", "analyst"]
         );
         assert_eq!(runs[1].session, ratatoskr_core::SessionScope::Compacted);
         assert!(runs[0].ledger_id.is_some());
@@ -4359,6 +4388,207 @@ mod tests {
                 .expect("recording runner mutex poisoned"),
             vec![ratatoskr_core::SessionScope::Compacted],
             "the declared stage must override its route before NodeRun reaches the agent"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Two stages sharing one `governedBy` are two pieces of work, and every record a run makes has
+    /// to say which of them ran.
+    ///
+    /// `governedBy` selects the route, the ruleset and the plugin bindings — that is what it is
+    /// documented to do and both halves still resolve the same ones. What it must NOT decide is who
+    /// ran: the span, the `node_start` event, the ledger claim and the conversation key all name the
+    /// stage. The conversation matters beyond bookkeeping — a shared key hands a read-only half the
+    /// write-capable half's continued session the moment a route stops being `fresh`.
+    ///
+    /// The control address is the exception, and deliberately: an operator stops the box they can
+    /// see, so both halves poll under the identity the graph draws.
+    #[tokio::test]
+    async fn stages_sharing_a_governance_identity_still_run_under_their_own() {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-split-identity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "shared_box".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "one-route".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-split",
+            "share a route without sharing a name",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+
+        let half = |id: &str| {
+            let mut stage = crate::stage::stage_fixture(id, "reason");
+            stage.governed_by = Some("shared_box".to_string());
+            stage.output_schema = Some(json!({ "type": "object" }));
+            stage
+        };
+        let first = half("first_half");
+        let second = half("second_half");
+        let stages = Arc::new(vec![first.clone(), second.clone()]);
+        let turn = Arc::new(RecordingStageTurn::default());
+        let executor = StageExecutor::new(ctx, stages, Arc::clone(&turn) as Arc<dyn StageTurn>);
+
+        for stage in [first, second] {
+            executor
+                .execute(StageInvocation {
+                    stage,
+                    input_json: "{}".to_string(),
+                    rendered_question: None,
+                    resource_root: None,
+                    capability_ceiling: ratatoskr_core::Capability::Read,
+                    rag_rat_worktree: None,
+                    shell: None,
+                    publish: None,
+                    clarifier: None,
+                    invocation_guidance: None,
+                    output: StageOutput::Evidence,
+                })
+                .await
+                .unwrap();
+        }
+
+        let recorded = |field: &Mutex<Vec<String>>| {
+            field
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .clone()
+        };
+        assert_eq!(
+            recorded(&turn.nodes),
+            ["first_half", "second_half"],
+            "the span, the node_start event and the ledger claim all name the stage that ran"
+        );
+        assert_eq!(
+            *turn
+                .conversations
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            [
+                Some("run-split-first_half".to_string()),
+                Some("run-split-second_half".to_string())
+            ],
+            "a shared conversation key would hand one stage the other's session"
+        );
+        assert_eq!(
+            recorded(&turn.models),
+            ["one-route", "one-route"],
+            "`governedBy` still selects the route both halves run on"
+        );
+        // Neither declares a membership, so each is its own box and answers at its own address.
+        assert_eq!(
+            *turn
+                .controls
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            [
+                Some("first_half".to_string()),
+                Some("second_half".to_string())
+            ]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The other half of the split: a stage that DOES belong to a node still answers the operator
+    /// at that node's address, because the box is what the graph draws and what they can click.
+    #[tokio::test]
+    async fn a_member_stage_is_controlled_at_its_nodes_address() {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-member-control-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-member-control", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "redteam".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-member-control",
+            "stop the red team",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let stages = standard_stages().await.unwrap();
+        let turn = Arc::new(RecordingStageTurn::default());
+        let executor = StageExecutor::new(
+            ctx,
+            Arc::new(stages.clone()),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        );
+        let stage = stages
+            .iter()
+            .find(|stage| stage.id == "redteam_classifier")
+            .unwrap()
+            .clone();
+        executor
+            .execute(StageInvocation {
+                stage,
+                input_json: serde_json::to_string(&crate::redteam::ClassifierInput {
+                    failing: Vec::new(),
+                    raw_output: String::new(),
+                })
+                .unwrap(),
+                rendered_question: Some("classify these".to_string()),
+                resource_root: None,
+                capability_ceiling: ratatoskr_core::Capability::Read,
+                rag_rat_worktree: None,
+                shell: None,
+                publish: None,
+                clarifier: None,
+                invocation_guidance: None,
+                output: StageOutput::Evidence,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *turn.nodes.lock().expect("recording runner mutex poisoned"),
+            ["redteam_classifier"],
+            "the record says which half ran"
+        );
+        assert_eq!(
+            *turn
+                .controls
+                .lock()
+                .expect("recording runner mutex poisoned"),
+            [Some("redteam".to_string())],
+            "and an operator stops the box the graph drew"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -7379,7 +7609,8 @@ mod tests {
 
         assert_eq!(
             *turn.nodes.lock().expect("recording runner mutex poisoned"),
-            ["context"]
+            ["context_distillation"],
+            "the turn is the distillation's, whatever box it is drawn in"
         );
         assert_eq!(
             *turn
@@ -7594,8 +7825,15 @@ mod tests {
             .checkpoints_for_run("run-context-no-rag")
             .await
             .unwrap();
-        assert_eq!(checkpoints.len(), 1);
-        assert_eq!(checkpoints[0].node_name, "context");
+        // The distillation's own row, then the box's aggregate.
+        assert_eq!(
+            checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.node_name.as_str())
+                .collect::<Vec<_>>(),
+            ["context_distillation", "context"]
+        );
+        let checkpoints = &checkpoints[1..];
         assert_eq!(
             checkpoints[0].input_json.as_deref(),
             Some(r#""explain context""#)
@@ -7880,7 +8118,7 @@ mod tests {
 
         assert_eq!(
             *turn.nodes.lock().expect("recording runner mutex poisoned"),
-            ["redteam", "redteam"]
+            ["redteam_author", "redteam_classifier"]
         );
         assert_eq!(
             *turn
@@ -7939,10 +8177,17 @@ mod tests {
             .checkpoints_for_run("run-standard-redteam")
             .await
             .unwrap();
-        assert_eq!(checkpoints.len(), 1);
-        assert_eq!(checkpoints[0].node_name, "redteam_classifier");
+        // Both halves ran and both recorded their own turn; no aggregate, because the operation
+        // host that writes `redteam` is not what this case drives.
+        assert_eq!(
+            checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.node_name.as_str())
+                .collect::<Vec<_>>(),
+            ["redteam_author", "redteam_classifier"]
+        );
         let checkpoint_classifier: crate::redteam::ClassifierInput =
-            serde_json::from_str(checkpoints[0].input_json.as_deref().unwrap()).unwrap();
+            serde_json::from_str(checkpoints[1].input_json.as_deref().unwrap()).unwrap();
         assert_eq!(
             checkpoint_classifier.raw_output,
             "assertion failed: deleted > 0"
@@ -8067,25 +8312,44 @@ mod tests {
         .unwrap();
 
         let checkpoints = store.checkpoints_for_run("run-redteam-cost").await.unwrap();
-        let telemetry = &checkpoints
-            .iter()
-            .find(|checkpoint| checkpoint.node_name == "redteam")
-            .expect("the red team is checkpointed under `redteam`")
-            .telemetry;
+        let row = |node: &str| {
+            checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.node_name == node)
+                .unwrap_or_else(|| panic!("no `{node}` checkpoint"))
+                .telemetry
+                .clone()
+        };
+
+        // One row per turn, each describing the turn it covers. This is what a folded row could
+        // not do: the halves run on different profiles with different tool sets, so a row naming
+        // both routes is true of the box and useless about either.
+        let author = row("redteam_author");
+        assert_eq!(author.model.as_deref(), Some("anthropic/author-model"));
+        assert_eq!(author.tools, ["Write"]);
+        assert_eq!(author.usage.input_tokens, 20);
+        assert_eq!(author.turns, Some(2));
+
+        let classifier = row("redteam_classifier");
         assert_eq!(
-            telemetry.usage.input_tokens, 30,
-            "the record accounts for both halves, not whichever one recorded first"
+            classifier.model.as_deref(),
+            Some("anthropic/classifier-model")
         );
-        assert_eq!(telemetry.usage.output_tokens, 300);
-        assert_eq!(telemetry.turns, Some(3));
-        assert_eq!(telemetry.duration_ms, Some(300));
-        // Neither route is asserted to be the one the node ran on: both are named, because both
-        // ran and the row covers both.
+        assert_eq!(classifier.tools, ["semantic_search"]);
+        assert_eq!(classifier.usage.input_tokens, 10);
+        assert_eq!(classifier.turns, Some(1));
+
+        // The box's own record is the parent of those two. It ran no turn itself, so it reports
+        // none; what the red team cost is the sum of its members, which the shape API totals.
+        assert_eq!(row("redteam").model, None);
         assert_eq!(
-            telemetry.model.as_deref(),
-            Some("anthropic/author-model, anthropic/classifier-model")
+            author.usage.input_tokens + classifier.usage.input_tokens,
+            30
         );
-        assert_eq!(telemetry.tools, ["Write", "semantic_search"]);
+        assert_eq!(
+            author.usage.output_tokens + classifier.usage.output_tokens,
+            300
+        );
         assert!(
             ctx.ledger.unclaimed().is_empty(),
             "nothing the red team spent is left for the run to discard"
@@ -8180,12 +8444,18 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("invalid `Classification` output"), "{error}");
         assert!(error.contains("test"), "{error}");
-        assert!(
+        // The author's turn happened and is recorded under its own name; the classifier's failed
+        // its output gate before reaching a record. Neither writes the `redteam` aggregate — that
+        // is the operation host's, and it never ran here.
+        assert_eq!(
             store
                 .checkpoints_for_run("run-redteam-evidence")
                 .await
                 .unwrap()
-                .is_empty()
+                .iter()
+                .map(|checkpoint| checkpoint.node_name.as_str())
+                .collect::<Vec<_>>(),
+            ["redteam_author"]
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -8329,7 +8599,7 @@ mod tests {
 
         assert_eq!(
             *turn.nodes.lock().expect("recording runner mutex poisoned"),
-            ["implementer", "implementer"]
+            ["implementer_attempt", "implementer_attempt"]
         );
         assert_eq!(
             *turn
@@ -8348,9 +8618,10 @@ mod tests {
                 .lock()
                 .expect("recording runner mutex poisoned"),
             [
-                Some("run-standard-implementer-implementer".to_string()),
-                Some("run-standard-implementer-implementer".to_string())
-            ]
+                Some("run-standard-implementer-implementer_attempt".to_string()),
+                Some("run-standard-implementer-implementer_attempt".to_string())
+            ],
+            "the conversation is the stage's, so a peer under the same governance cannot inherit it"
         );
         {
             let ledger_ids = turn
@@ -8402,9 +8673,13 @@ mod tests {
             .checkpoints_for_run("run-standard-implementer")
             .await
             .unwrap();
-        assert!(
-            checkpoints.is_empty(),
-            "internal evidence turns do not own workflow checkpoints"
+        assert_eq!(
+            checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.node_name.as_str())
+                .collect::<Vec<_>>(),
+            ["implementer_attempt", "implementer_attempt"],
+            "each attempt records its own turn; the `implementer` aggregate stays the host's"
         );
         assert_eq!(
             *turn.files.lock().expect("recording runner mutex poisoned"),
@@ -8528,13 +8803,16 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("invalid `Report` output"), "{error}");
         assert!(error.contains("summary"), "{error}");
-        assert!(
+        assert_eq!(
             store
                 .checkpoints_for_run("run-implementer-resources")
                 .await
                 .unwrap()
-                .is_empty(),
-            "evidence invocations never own workflow checkpoints"
+                .iter()
+                .map(|checkpoint| checkpoint.node_name.as_str())
+                .collect::<Vec<_>>(),
+            ["implementer_attempt"],
+            "an attempt records its own turn; the `implementer` aggregate stays the host's"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
