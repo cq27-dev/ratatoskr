@@ -263,11 +263,8 @@ pub fn derive_with(
                     _ if !terminal => NodeState::Working,
                     _ => NodeState::Idle,
                 }
-            } else if name == "implementer" && !terminal {
-                // Checkpointed at least once, but converge may still be iterating on it.
-                NodeState::Working
             } else {
-                NodeState::Done
+                checkpointed_state(name, terminal)
             };
 
             out.push(NodeView {
@@ -285,8 +282,22 @@ pub fn derive_with(
             });
         }
     }
-    append_unknown(&mut out, checkpoints, config);
+    append_unknown(&mut out, checkpoints, config, terminal);
     out
+}
+
+/// What a node that has checkpointed is doing, wherever it sits.
+///
+/// A checkpoint proves the node completed something — but the implementer is checkpointed once per
+/// converge iteration, so while the run is live one of its checkpoints says the opposite of
+/// finished. That is the whole rule, and both placements share it: a node the shape places and one
+/// [`append_unknown`] appends are the same evidence read the same way.
+fn checkpointed_state(name: &str, terminal: bool) -> NodeState {
+    if name == IMPLEMENTER_NODE && !terminal {
+        NodeState::Working
+    } else {
+        NodeState::Done
+    }
 }
 
 /// Add nodes the run has data for that this build's pipeline does not contain.
@@ -300,10 +311,16 @@ pub fn derive_with(
 /// They go in trailing stages, in the order they first ran. That is not the shape they executed
 /// in — it cannot be recovered from checkpoints alone — but it shows every node with its output
 /// and its cost, which is what someone analysing a foreign run came for.
+///
+/// A workflow that declares no layout records an empty shape, so this places *every* node of such a
+/// run — including the run's own. It is therefore not only the foreign case, and the state it
+/// reports is the same one a shaped node gets from [`checkpointed_state`]: a live implementer holds
+/// a checkpoint from an earlier converge iteration and is still working.
 fn append_unknown(
     out: &mut Vec<NodeView>,
     checkpoints: &[Checkpoint],
     config: Option<&ratatoskr_core::RatatoskrConfig>,
+    terminal: bool,
 ) {
     let known: std::collections::HashSet<&str> = out.iter().map(|n| n.name.as_str()).collect();
     let mut seen = std::collections::HashSet::new();
@@ -328,8 +345,7 @@ fn append_unknown(
             planned: PlannedNode::of(config, name),
             caller: caller_of(checkpoints, first),
             name: name.to_string(),
-            // A foreign node that wrote a checkpoint has run; nothing here can say more than that.
-            state: NodeState::Done,
+            state: checkpointed_state(name, terminal),
             stage: base + i,
             lane: 0,
             checkpoints: times.len(),
@@ -927,5 +943,31 @@ mod tests {
         );
         assert_eq!(state_of(&views, "implementer"), NodeState::Done);
         assert_ne!(state_of(&views, "verifier"), NodeState::Working);
+    }
+
+    #[test]
+    fn a_live_implementer_is_working_in_a_run_that_declared_no_layout() {
+        // A workflow with no `layout` records an empty shape, so every node of the run — its own
+        // included — is placed by `append_unknown`. `implement()` checkpoints on its first pass
+        // while `iterate()` carries on, so a checkpoint there does not mean the implementer is
+        // finished, exactly as it does not in a run that declared a layout.
+        let checkpoints = [
+            cp("issue", "t0"),
+            cp("context", "t1"),
+            cp("implementer", "t2"),
+        ];
+        let views = derive_with(Some("running"), &checkpoints, None, Some("[]"));
+        assert_eq!(state_of(&views, "implementer"), NodeState::Working);
+        assert_eq!(state_of(&views, "context"), NodeState::Done);
+
+        // A finished run's nodes still read Done, including names this build knows nothing about.
+        let done = derive_with(
+            Some("converged"),
+            &[cp("implementer", "t2"), cp("gather", "t3")],
+            None,
+            Some("[]"),
+        );
+        assert_eq!(state_of(&done, "implementer"), NodeState::Done);
+        assert_eq!(state_of(&done, "gather"), NodeState::Done);
     }
 }
