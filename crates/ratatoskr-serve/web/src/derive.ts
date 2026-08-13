@@ -258,57 +258,71 @@ export function workingNodeNames(
  * With no derived state at all — a run old enough that its log has rotated away — do not call
  * this. The store's final state is then the only answer there is, and it is an honest one.
  *
- * A node the shape does not place still gets a box. The server derives the shape from checkpoints,
- * so a workflow that declared no layout cannot place a node until it has finished one — and until
- * then the box doing the work would be missing entirely, on the very run where watching it matters.
- * Only names the stream has actually seen are added: a node absent from the stream has not run, and
- * inventing one is the lie this whole module exists to avoid.
+ * A node the shape does not place still gets a box, and the CLIENT places it. The server can only
+ * place such a node once it has checkpointed, and orders those by first checkpoint — but a workflow
+ * that declared no layout may run its hosts concurrently, and completion order is then not start
+ * order. Inheriting the server's numbers would move a box the moment its checkpoint landed, and
+ * since column adjacency is what the graph draws its hand-offs from, the arrow between two such
+ * boxes would reverse. The stream is the one record that knows when each node started, so every
+ * unplaced node is ordered by first mention here and keeps that place across refreshes.
+ *
+ * Only the ones the shape does not place. A declared layout is the graph the workflow asked for and
+ * is reproduced exactly; a run whose shape names some of its nodes and not others keeps the named
+ * ones where the shape puts them.
  */
 export function applyDerived(
   shape: readonly NodeView[],
   derived: Map<string, DerivedNode>,
 ): NodeView[] {
-  const placed = shape.map((n) => {
-    const d = derived.get(n.name);
-    // Not started at this point. It keeps what it is CONFIGURED to run on (`planned`), because
-    // that is true before it runs, and loses everything it has not yet done.
-    if (!d) {
-      const { telemetry: _dropped, ...rest } = n;
-      return { ...rest, state: "idle" as NodeState, checkpoints: 0 };
-    }
-    // State and checkpoint counts always come from the stream — those it can always prove. Cost
-    // only when it actually carries it; otherwise the store's figures stand, which are true of
-    // where the run ENDED and are marked as such by being all a rotated-away log can offer.
-    const telemetry = d.costed ? d.telemetry : (n.telemetry ?? d.telemetry);
-    return {
-      ...n,
-      state: d.state,
-      checkpoints: d.checkpoints,
-      ...(telemetry ? { telemetry } : {}),
-    };
-  });
+  const shaped = shape.filter((n) => n.shaped !== false);
+  const placed = shaped.map((n) => fromStream(n, derived.get(n.name)));
 
-  // Trailing columns, in the order the stream first mentioned them — the same placement the server
-  // gives a node its shape does not name, so a box does not jump when its first checkpoint arrives
-  // and the server starts placing it. Column order is what the graph draws its edges from, and the
-  // node now working genuinely does come after everything already placed.
-  const known = new Set(shape.map((n) => n.name));
+  // Trailing columns: everything the shape does not place, in the order the stream first mentioned
+  // it. A node the server did place from a checkpoint keeps everything else it said about it — its
+  // caller above all — and only its column is taken back. One the stream has never mentioned has no
+  // start to be ordered by and holds the last columns, which is where the server had it.
+  const known = new Set(shaped.map((n) => n.name));
+  const unplaced = new Map(
+    shape.filter((n) => n.shaped === false).map((n) => [n.name, n] as const),
+  );
+  const order = [...derived.keys()].filter((name) => name !== ISSUE_NODE && !known.has(name));
+  order.push(...[...unplaced.keys()].filter((name) => !derived.has(name)));
+
   const base = placed.reduce((max, n) => Math.max(max, n.stage + 1), 0);
-  const extra: NodeView[] = [];
-  for (const [name, d] of derived) {
-    if (name === ISSUE_NODE || known.has(name)) continue;
-    extra.push({
-      name,
-      state: d.state,
-      checkpoints: d.checkpoints,
-      stage: base + extra.length,
-      lane: 0,
-      // Same rule as above by construction: there is no stored figure to prefer, so the stream's
-      // telemetry stands when it has any and the box says nothing when it does not.
-      ...(d.telemetry ? { telemetry: d.telemetry } : {}),
-    });
-  }
+  const extra = order.map((name, i) => ({
+    ...fromStream(unplaced.get(name) ?? unrun(name), derived.get(name)),
+    stage: base + i,
+    lane: 0,
+  }));
   return [...placed, ...extra];
+}
+
+/**
+ * One node's row: what the server said about it, with every per-moment fact taken from the stream.
+ *
+ * State and checkpoint counts always come from the stream — those it can always prove. Cost only
+ * when it actually carries it; otherwise the store's figures stand, which are true of where the run
+ * ENDED and are marked as such by being all a rotated-away log can offer. A node the stream does not
+ * mention has NOT STARTED at this point: it keeps what it is CONFIGURED to run on (`planned`),
+ * because that is true before it runs, and loses everything it has not yet done.
+ */
+function fromStream(n: NodeView, d: DerivedNode | undefined): NodeView {
+  if (!d) {
+    const { telemetry: _dropped, ...rest } = n;
+    return { ...rest, state: "idle" as NodeState, checkpoints: 0 };
+  }
+  const telemetry = d.costed ? d.telemetry : (n.telemetry ?? d.telemetry);
+  return {
+    ...n,
+    state: d.state,
+    checkpoints: d.checkpoints,
+    ...(telemetry ? { telemetry } : {}),
+  };
+}
+
+/** A box for a name only the stream knows: the server has nothing to say about it yet. */
+function unrun(name: string): NodeView {
+  return { name, state: "idle", checkpoints: 0, stage: 0, lane: 0 };
 }
 
 /**

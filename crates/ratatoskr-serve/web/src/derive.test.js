@@ -17,6 +17,11 @@ function start(name) {
   return { at: "2026-08-12T10:00:00Z", kind: "node_start", node: name, detail: "node started" };
 }
 
+/** The checkpoint that finishes a node — and that makes the server start placing it. */
+function checkpointed(name) {
+  return { at: "2026-08-12T10:00:01Z", kind: "checkpoint", node: name, detail: "checkpoint" };
+}
+
 test("a live delivery stage replaces the inferred implementer control target", () => {
   const nodes = [
     node("implementer", "working"),
@@ -261,4 +266,47 @@ test("an appended node reports what the stream says it cost", () => {
   ];
   const [analyst] = applied([], events);
   expect(analyst.telemetry.input_tokens).toBe(7);
+});
+
+/** A node the server appended from a checkpoint rather than from a declared layout. */
+function appended(name, stage) {
+  return { ...placed(name, stage), shaped: false };
+}
+
+/**
+ * A run with no declared layout runs its hosts concurrently, so the order they finish in is not
+ * the order they started in. The server can only place a node once it has checkpointed, and it
+ * orders those by first checkpoint; the stream is the only record of what started when. Adopting
+ * the server's numbers would move a box the moment its checkpoint arrived — and since column
+ * adjacency is what the hand-off arrow is drawn from, the arrow would then point backwards.
+ */
+test("an unshaped box keeps its place when the server starts placing it", () => {
+  const events = [start("slow"), start("fast"), checkpointed("fast")];
+  expect(applied([], events.slice(0, 2)).map((n) => n.name)).toEqual(["slow", "fast"]);
+  expect(applied([appended("fast", 0)], events).map((n) => [n.name, n.stage])).toEqual([
+    ["slow", 0],
+    ["fast", 1],
+  ]);
+});
+
+// A workflow that declared a layout is drawn by it, whatever order the stream saw.
+test("a declared layout is not reordered by the stream", () => {
+  const shape = [placed("fast", 0), placed("slow", 1)];
+  const view = applied(shape, [start("slow"), start("fast")]);
+  expect(view.map((n) => [n.name, n.stage])).toEqual([
+    ["fast", 0],
+    ["slow", 1],
+  ]);
+});
+
+// A run from another graph: the shape names some of its nodes and not others. The named ones stay
+// where the shape puts them; only the rest are the client's to order.
+test("a partly shaped run keeps its shaped nodes and orders the rest by the stream", () => {
+  const shape = [placed("context", 0), appended("fast", 1)];
+  const events = [start("context"), start("slow"), start("fast"), checkpointed("fast")];
+  expect(applied(shape, events).map((n) => [n.name, n.stage])).toEqual([
+    ["context", 0],
+    ["slow", 1],
+    ["fast", 2],
+  ]);
 });

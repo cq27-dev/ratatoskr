@@ -64,6 +64,12 @@ pub struct NodeView {
     /// positioned from these rather than from a table the frontend maintains in parallel.
     pub stage: usize,
     pub lane: usize,
+    /// Whether the run's recorded shape is what put it there. False means [`append_unknown`]
+    /// placed it, in first-checkpoint order — an order a client holding the event stream can
+    /// better, since completion order is not start order once a workflow runs hosts concurrently.
+    /// The distinction has to be on the wire: the two are otherwise indistinguishable, and a client
+    /// that reordered a declared layout would be redrawing the graph the workflow asked for.
+    pub shaped: bool,
     /// How many checkpoints this node wrote. Only the implementer (per converge iteration) and
     /// the bookkeeper (via `ratatoskr bookkeep` replay) can exceed one.
     pub checkpoints: usize,
@@ -296,6 +302,7 @@ pub fn derive_with(
                 state,
                 stage: idx,
                 lane,
+                shaped: true,
                 checkpoints: times.len(),
                 first_at: times.first().map(|s| s.to_string()),
                 last_at: times.last().map(|s| s.to_string()),
@@ -331,7 +338,10 @@ fn checkpointed_state(name: &str, terminal: bool) -> NodeState {
 /// node of such a run arrives here, including its own. Nothing about this path is a fallback for
 /// foreign data only.
 ///
-/// They go in trailing stages, in the order they first ran. That is not the shape they executed
+/// They go in trailing stages, in the order they first CHECKPOINTED, which is the only order the
+/// records carry. Concurrent hosts do not finish in the order they started, so they are marked
+/// `shaped: false` and a client holding the event stream places them by first mention instead.
+/// That is not the shape they executed
 /// in — it cannot be recovered from checkpoints alone — but it shows every node with its output and
 /// its cost, which is what someone analysing an unplaced run came for. One stage each, because
 /// adjacent columns are drawn joined: a chain in first-checkpoint order is the least wrong claim
@@ -370,6 +380,7 @@ fn append_unknown(
             state: checkpointed_state(name, terminal),
             stage: base + i,
             lane: 0,
+            shaped: false,
             checkpoints: times.len(),
             first_at: times.first().map(|s| s.to_string()),
             last_at: times.last().map(|s| s.to_string()),
