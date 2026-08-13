@@ -665,6 +665,25 @@ async fn note<T: serde::Serialize>(
     .map_err(|e| e.to_string())
 }
 
+/// Say so when a run ends still holding model turns nobody claimed.
+///
+/// A turn is claimed by the checkpoint it belongs to. Whatever is left is cost the run paid that no
+/// row accounts for — a node whose model turn ran under one name and was checkpointed under
+/// another, or a turn whose checkpoint never happened. Nothing else would say: a dropped number
+/// reads exactly like a node that never called a model (#262).
+fn warn_about_unclaimed_turns(ctx: &WorkflowContext) {
+    let unclaimed = ctx.ledger.unclaimed();
+    if unclaimed.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        nodes = %unclaimed.join(", "),
+        "these model turns cost the run and reached no checkpoint, so nothing reports what they \
+         spent; a node checkpointed under a different name than its turn ran under is the usual \
+         cause"
+    );
+}
+
 async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String, String> {
     ctx.guard()?;
     if ctx.red_team_started.swap(true, Ordering::SeqCst) {
@@ -2421,6 +2440,7 @@ async fn run_plan_scripted_with_turn(
     {
         tracing::warn!("failed to record final run status: {e}");
     }
+    warn_about_unclaimed_turns(&ctx);
     ctx.plugin_context.session_end(status.as_str()).await;
     outcome
 }
@@ -2512,6 +2532,7 @@ async fn run_full_scripted_with_actions<A: FullTerminalActions>(
         Ok(outcome) => outcome.status,
         Err(_) => RunStatus::Failed,
     };
+    warn_about_unclaimed_turns(&ctx);
     ctx.plugin_context.session_end(reason.as_str()).await;
     result
 }
