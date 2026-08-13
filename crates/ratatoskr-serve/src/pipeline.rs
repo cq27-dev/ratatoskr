@@ -397,8 +397,23 @@ pub fn derive_with(
         for node in nodes {
             let (lane, name) = (node.lane, &node.name);
             let times = node_times(&rows, name);
+            // What its members' records say, when it has none of its own — the same question
+            // `append_unknown` asks, asked through the same function.
+            let by_members = match times.is_empty() {
+                false => None,
+                true => from_members(
+                    registry
+                        .members(name)
+                        .iter()
+                        .any(|member| *member != name && count(&rows, member) > 0),
+                    terminal,
+                    completed,
+                ),
+            };
 
-            let state = if times.is_empty() {
+            let state = if let Some(state) = by_members {
+                state
+            } else if times.is_empty() {
                 match () {
                     // Later than where the run is: nothing to say about it yet.
                     _ if current != Some(idx) => NodeState::Idle,
@@ -444,6 +459,32 @@ pub fn derive_with(
         &rows,
     );
     out
+}
+
+/// What a box with no record of its own is doing, from the fact that its MEMBERS have records.
+///
+/// `None` when the records say nothing and the caller's own rules apply — either because no member
+/// has recorded (the box has not started) or because the run stopped and what is missing proves
+/// nothing about what ran.
+///
+/// One function, called from both placements, because expressing this rule twice is exactly what
+/// produced the defect it now prevents: `append_unknown` was taught that a run which reached its
+/// end under its own power completes a member-only box, and the placed branch kept the old answer,
+/// so a laid-out pipeline drew finished work as never-started.
+///
+/// The rule itself: a member always writes its own row, so its presence cannot separate a workflow
+/// that called the member DIRECTLY — no aggregate is ever written for that box — from an operation
+/// host that died before writing one. The run's outcome separates them. Every operation host writes
+/// its aggregate before returning, so on a run that completed, a missing aggregate means no host
+/// ran and the member's work is the box's work, done. On a run still going the box is mid-flight.
+/// On one that failed or was abandoned, nothing is claimed here.
+fn from_members(members_recorded: bool, terminal: bool, completed: bool) -> Option<NodeState> {
+    match (members_recorded, terminal, completed) {
+        (false, ..) => None,
+        (true, false, _) => Some(NodeState::Working),
+        (true, true, true) => Some(NodeState::Done),
+        (true, true, false) => None,
+    }
 }
 
 /// What a node whose OWN record exists is doing, wherever it sits.
@@ -541,11 +582,12 @@ fn append_unknown(
         // box's work is done. On one that failed or was abandoned, nothing is claimed: `Idle` is
         // this derivation's answer wherever the evidence names nobody, as it is for an
         // unattributable failure above, and a client holding the event stream answers it properly.
-        let state = match (times.is_empty(), terminal, completed) {
-            (false, ..) => checkpointed_state(name, terminal),
-            (true, false, _) => NodeState::Working,
-            (true, true, true) => NodeState::Done,
-            (true, true, false) => NodeState::Idle,
+        // A box reaches here because something it composes recorded, so if it has no row of its
+        // own its members must have one. `Idle` is what is left when the records name nobody, as it
+        // is everywhere else in this derivation.
+        let state = match times.is_empty() {
+            false => checkpointed_state(name, terminal),
+            true => from_members(true, terminal, completed).unwrap_or(NodeState::Idle),
         };
         out.push(NodeView {
             telemetry: NodeTelemetryView::totalled(rows, &stages),
@@ -841,6 +883,42 @@ mod tests {
         // The box's own record is what says how many times it ran, exactly as for a placed one:
         // the members' rows are turns inside it, not repeats of it.
         assert_eq!(view(&views, "redteam").checkpoints, 1);
+    }
+
+    #[test]
+    fn a_placed_box_reads_its_members_the_way_an_unplaced_one_does() {
+        // The same records, the same run, the same answer — whether or not a layout placed the box.
+        // A workflow may call a member stage directly, and then no aggregate is ever written: the
+        // box's work is its member's, and on a run that reached its end under its own power that
+        // work is done. Deciding it only where `append_unknown` runs left a laid-out pipeline
+        // drawing finished work as never-started.
+        let midway = [cp("redteam_classifier", "t1")];
+        let placed = derive_with(Some("converged"), &midway, None, Some(&standard_shape()));
+        let unplaced = serde_json::to_string(&ratatoskr_core::shape::Recorded {
+            nodes: Vec::new(),
+            stages: registry_of(STANDARD_COLUMNS, STANDARD_COMPOSED),
+        })
+        .unwrap();
+        let appended = derive_with(Some("converged"), &midway, None, Some(&unplaced));
+        assert_eq!(
+            state_of(&placed, "redteam"),
+            NodeState::Done,
+            "a placed box completed by its member reads as completed"
+        );
+        assert_eq!(state_of(&placed, "redteam"), state_of(&appended, "redteam"));
+
+        // Live, both say working; stopped, neither claims anything. The rule is one rule.
+        for (status, expected) in [
+            (Some("running"), NodeState::Working),
+            (Some("abandoned"), NodeState::Idle),
+        ] {
+            let placed = derive_with(status, &midway, None, Some(&standard_shape()));
+            assert_eq!(
+                state_of(&placed, "redteam"),
+                expected,
+                "a placed box on a `{status:?}` run"
+            );
+        }
     }
 
     #[test]
