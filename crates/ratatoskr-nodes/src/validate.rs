@@ -140,10 +140,17 @@ pub fn validate(
             }
         }
         // Membership says which box the stage's work is drawn in, and a box has to be something a
-        // run records: a Rust-owned operation that writes the aggregate under that name, or another
-        // stage that is a node of its own. A membership naming anything else draws a box no record
-        // ever reaches — the same empty box `validate_layout` refuses a column for, arrived at from
-        // the other direction, and the likeliest cause is a misspelling of a real one.
+        // run records: a Rust-owned operation that writes the aggregate under that name
+        // ([`policy::AGGREGATE_IDENTITIES`]), or another stage that is a node of its own. A
+        // membership naming anything else draws a box no record ever reaches — the same empty box
+        // `validate_layout` refuses a column for, arrived at from the other direction, and the
+        // likeliest cause is a misspelling of a real one.
+        //
+        // Being *reserved* is not the qualification, though every aggregate identity is also
+        // reserved. `issue` is the run's input, checkpointed before any stage runs, so a box under
+        // that name reads complete before its stage has started; `verify` is an operation host that
+        // checkpoints nothing of its own, so a box under it stays empty for the whole run. Both are
+        // reserved, and neither is a box.
         //
         // A stage may not join a stage that is itself a member: a box holds turns, not boxes, and a
         // chain would make "which box is this drawn in" a traversal with no reason to terminate.
@@ -159,7 +166,7 @@ pub fn validate(
             let composed = stages
                 .iter()
                 .any(|other| other.id == node && other.is_own_node());
-            if !composed && policy::reserved(node).is_none() {
+            if !composed && !policy::is_aggregate_identity(node) {
                 return Err(PlanError::Configuration(format!(
                     "stage `{}` declares node `{node}`, which nothing this run records under; a \
                      stage's node is the box its work is drawn in, and that box needs either a \
@@ -468,11 +475,23 @@ mod tests {
 
         // A Rust-owned operation writes the aggregate under its own name, which is what the bundled
         // red team, implementer and context stages join.
-        for identity in ["redteam", "implementer", "context"] {
+        for identity in policy::AGGREGATE_IDENTITIES {
             assert!(
                 validate(&[member(identity)], &crate::built_in_agents(), &[]).is_ok(),
                 "`{identity}` is a box the run records under"
             );
+        }
+
+        // Reserved is not the qualification. `issue` is the run's input, checkpointed before any
+        // stage runs, so a box under it reads complete before its stage has started; `verify` is an
+        // operation host that checkpoints nothing of its own, so a box under it stays empty for the
+        // whole run. Both are names a workflow may not declare a stage under, and neither is a box.
+        for reserved in ["issue", "verify", "memory", "overseer"] {
+            let error = match validate(&[member(reserved)], &crate::built_in_agents(), &[]) {
+                Ok(()) => panic!("`{reserved}` is not a box anything records under"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("nothing this run records under"), "{error}");
         }
 
         // So does a peer stage that is a node of its own: two stages composing one repository box.

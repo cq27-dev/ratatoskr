@@ -190,6 +190,31 @@ pub(crate) const STANDARD_IDENTIFIERS: &[(&str, Class)] = &[
 /// Selection's stage id. Named here because it is where its class is recorded.
 pub(crate) const SELECTION_STAGE_ID: &str = "overseer";
 
+/// The names a Rust operation host writes a box's *aggregate* checkpoint under.
+///
+/// A stage may declare itself part of a node no stage carries the name of — `implementer_attempt`
+/// belongs to `implementer`, `context_distillation` to `context`, both red-team halves to
+/// `redteam`. Those boxes are drawable because the run's own operation host writes their record;
+/// a membership naming anything else is a box no record ever reaches, which draws empty for the
+/// whole run.
+///
+/// Written out, and it has to be. No [`Class`] answers the question: `context` is
+/// [`Reserved::Operation`] and so is `verify`, which checkpoints nothing of its own; `implementer`
+/// is [`Reserved::Lifecycle`] and so is `memory`, which nothing writes any more; `redteam` is
+/// [`Reserved::GovernanceIdentity`]. And it cannot be derived from membership, because membership
+/// is the thing being judged — a workflow would then authorize its own box by claiming it.
+///
+/// So it is bolted to what a run of the bundled workflow actually records instead, by
+/// `bundled_standard_full_sequences_revision_review_and_rust_terminal_actions`: every name a full
+/// run checkpoints under that no stage of its registry carries is exactly this set, both ways. An
+/// entry nothing writes, and a host writing under a name absent here, each fail that case.
+pub(crate) const AGGREGATE_IDENTITIES: &[&str] = &["context", "implementer", "redteam"];
+
+/// Whether `id` is a box a Rust operation host writes the aggregate record of.
+pub(crate) fn is_aggregate_identity(id: &str) -> bool {
+    AGGREGATE_IDENTITIES.contains(&id)
+}
+
 /// "Does this output actually deserialize as the Rust type the contract names?"
 ///
 /// [`STANDARD_IDENTIFIERS`] says which contract a stage's output is read back as, and
@@ -323,6 +348,30 @@ mod tests {
                 reserved(name),
                 Some(Reserved::Operation),
                 "operation host `{name}` is not classified as one"
+            );
+        }
+    }
+
+    #[test]
+    fn every_aggregate_identity_is_one_no_workflow_can_declare() {
+        // A layout may name these though no stage does, and a stage may declare itself part of one.
+        // Each must therefore be a name a workflow cannot declare a stage under, or one box would
+        // mean the run's own record here and some repository's stage there. The converse is
+        // deliberately not asserted: `memory` is reserved and is not an aggregate, because nothing
+        // a run does records under it.
+        for name in AGGREGATE_IDENTITIES {
+            assert!(
+                reserved(name).is_some(),
+                "`{name}` is a box the run records itself, so a stage must not be able to claim it"
+            );
+        }
+        // Being reserved is not the qualification, and reading it as one is how `issue` — the
+        // run's input, checkpointed before any stage runs — came to pass as a node a stage could
+        // declare itself part of.
+        for name in ["issue", "verify", "memory", "overseer", "publisher"] {
+            assert!(
+                reserved(name).is_some() && !is_aggregate_identity(name),
+                "`{name}` is reserved without being a box anything records under"
             );
         }
     }

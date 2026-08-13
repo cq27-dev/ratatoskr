@@ -4068,36 +4068,37 @@ mod tests {
                 "verifier",
             ]
         );
-        // The bolt for membership. A node its stages declare is drawable in a layout with no stage
-        // of that name behind it, on the strength of the run's own operation host writing the box's
-        // aggregate — a node nothing writes would pass startup and draw a permanently empty box.
-        // And the name must be one no workflow can declare a stage under, or one box would mean the
-        // run's own record here and some repository's stage there.
-        let composite = standard_stages()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|stage| !stage.is_own_node())
-            .map(|stage| stage.node_id().to_string())
+        // The bolt for `policy::AGGREGATE_IDENTITIES`, which cannot be derived: it is what says a
+        // membership or a layout column may name a box no stage carries the name of, so deriving it
+        // from membership would let a workflow authorize its own box. It is held to what a full run
+        // records instead, in both directions.
+        //
+        // Every name this run checkpointed under that no stage of its registry carries — the issue
+        // pseudo-node aside, which is the run's input and not a box — is a box a Rust operation
+        // host wrote the aggregate of, and so must be listed. A host writing under a new name fails
+        // here rather than silently becoming a box nothing will accept.
+        let registry = standard_stages().await.unwrap();
+        let aggregates = checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.node_name.clone())
+            .filter(|name| name != "issue" && !registry.iter().any(|stage| stage.id == *name))
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
-            composite,
-            ["context", "implementer", "redteam"]
-                .map(String::from)
-                .into_iter()
-                .collect()
+            aggregates,
+            crate::policy::AGGREGATE_IDENTITIES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            "a full run records under exactly the boxes policy calls aggregate identities"
         );
-        for identity in &composite {
+        // And every box the standard stages join is one of them, so a membership the bundled
+        // definitions declare is one this gate accepts.
+        for stage in registry.iter().filter(|stage| !stage.is_own_node()) {
             assert!(
-                checkpoints
-                    .iter()
-                    .any(|checkpoint| checkpoint.node_name == *identity),
-                "`{identity}` is drawable as a node its stages declare, but a full run recorded \
-                 nothing under it"
-            );
-            assert!(
-                crate::policy::reserved(identity).is_some(),
-                "`{identity}` is drawable as a run's own record, so a stage must not claim it"
+                crate::policy::is_aggregate_identity(stage.node_id()),
+                "`{}` joins `{}`, which nothing writes the aggregate of",
+                stage.id,
+                stage.node_id()
             );
         }
         let revision: analyst::AnalystInput = serde_json::from_str(
