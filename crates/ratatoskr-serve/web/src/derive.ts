@@ -231,7 +231,7 @@ export function convergeLoops(events: readonly LiveEvent[]): ConvergeLoops {
  */
 export function forkHandoff(nodes: readonly NodeView[]): boolean {
   const started = (name: string) => nodes.find((n) => n.name === name && n.state !== "idle");
-  const redTeam = started("red_team");
+  const redTeam = started("redteam");
   const implementer = started("implementer");
   return !!redTeam && !!implementer && redTeam.stage === implementer.stage;
 }

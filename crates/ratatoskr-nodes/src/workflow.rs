@@ -665,6 +665,25 @@ async fn note<T: serde::Serialize>(
     .map_err(|e| e.to_string())
 }
 
+/// Say so when a run ends still holding model turns nobody claimed.
+///
+/// A turn is claimed by the checkpoint it belongs to. Whatever is left is cost the run paid that no
+/// row accounts for — a node whose model turn ran under one name and was checkpointed under
+/// another, or a turn whose checkpoint never happened. Nothing else would say: a dropped number
+/// reads exactly like a node that never called a model (#262).
+fn warn_about_unclaimed_turns(ctx: &WorkflowContext) {
+    let unclaimed = ctx.ledger.unclaimed();
+    if unclaimed.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        nodes = %unclaimed.join(", "),
+        "these model turns cost the run and reached no checkpoint, so nothing reports what they \
+         spent; a node checkpointed under a different name than its turn ran under is the usual \
+         cause"
+    );
+}
+
 async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String, String> {
     ctx.guard()?;
     if ctx.red_team_started.swap(true, Ordering::SeqCst) {
@@ -694,7 +713,7 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
         .await
         .map_err(|e| e.to_string())?;
     // Checkpoint before the guard so a failed baseline stays inspectable.
-    note(&ctx, "red_team", &out, None).await?;
+    note(&ctx, "redteam", &out, None).await?;
     // The false-convergence guard is enforced here — the script cannot skip it.
     if !converge::test_command_ran(&out.failing_tests, out.passed_tests, out.exit_code) {
         return Err(format!(
@@ -956,7 +975,7 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
 
     // Rebuild the diagnostic Rust-side (identical wording to the hardcoded converge loop) from the
     // baseline and the latest implementer output — the script doesn't get to author it.
-    let red_team: RedTeamOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "red_team")
+    let red_team: RedTeamOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "redteam")
         .await
         .map_err(|e| e.to_string())?;
     let prev: ImplementerOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "implementer")
@@ -1359,7 +1378,7 @@ async fn replan_at_ceiling_with<R: CeilingRecovery>(
         return Ok("null".to_string());
     }
 
-    let red_team: RedTeamOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "red_team")
+    let red_team: RedTeamOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "redteam")
         .await
         .map_err(|error| error.to_string())?;
     let implementation: ImplementerOutput =
@@ -2089,7 +2108,20 @@ fn build_hosts_with_turn(
         )));
     }
     hosts.extend(declared);
-    Ok(hosts)
+    // One host call is one claim scope. This is the boundary a workflow can cross twice at once —
+    // `Promise.all([probe(a), probe(b)])` runs one stage's host twice, under one name — so it is
+    // where the identity a checkpoint claims against has to be minted. Everything an invocation
+    // runs inside itself is inside its scope: the halves a composite host folds into one record,
+    // and a nested stage whose own checkpoint claims under its own name.
+    Ok(hosts
+        .into_iter()
+        .map(|(name, host)| (name, claiming(host)))
+        .collect())
+}
+
+/// Wrap a host so its call is one claim scope.
+fn claiming(host: HostFn) -> HostFn {
+    Arc::new(move |arg| Box::pin(ratatoskr_agent::claim_scope(host(arg))))
 }
 
 fn build_hosts(
@@ -2421,6 +2453,7 @@ async fn run_plan_scripted_with_turn(
     {
         tracing::warn!("failed to record final run status: {e}");
     }
+    warn_about_unclaimed_turns(&ctx);
     ctx.plugin_context.session_end(status.as_str()).await;
     outcome
 }
@@ -2512,6 +2545,7 @@ async fn run_full_scripted_with_actions<A: FullTerminalActions>(
         Ok(outcome) => outcome.status,
         Err(_) => RunStatus::Failed,
     };
+    warn_about_unclaimed_turns(&ctx);
     ctx.plugin_context.session_end(reason.as_str()).await;
     result
 }
@@ -2677,7 +2711,7 @@ async fn finish_full<A: FullTerminalActions>(
         });
     }
 
-    let red_team: RedTeamOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "red_team").await?;
+    let red_team: RedTeamOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "redteam").await?;
     let implementer: ImplementerOutput =
         latest_checkpoint(&ctx.store, &ctx.run_id, "implementer").await?;
     let iterations = count_checkpoints(&ctx.store, &ctx.run_id, "implementer").await?;
@@ -3321,6 +3355,39 @@ mod tests {
         }
     }
 
+    /// A stage turn that charges the run's ledger the way a live one does, so what a checkpoint
+    /// reports about cost can be asserted without spending a model turn.
+    struct ChargingStageTurn {
+        output: String,
+        telemetry: ratatoskr_core::NodeTelemetry,
+        /// Holds every turn open until they have all recorded, so what a claim sees is a ledger
+        /// with another live invocation's turn still standing in it. Without it a turn that
+        /// completes synchronously is claimed before the next one starts, and no ordering a
+        /// concurrent workflow can produce is exercised at all.
+        barrier: Option<Arc<tokio::sync::Barrier>>,
+    }
+
+    impl StageTurn for ChargingStageTurn {
+        fn run<'a>(
+            &'a self,
+            run: ratatoskr_agent::NodeRun<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, ratatoskr_agent::AgentError>> + Send + 'a>>
+        {
+            run.ledger
+                .as_ref()
+                .expect("the executor charges every turn to the run's ledger")
+                .record(run.node, self.telemetry.clone());
+            let output = self.output.clone();
+            let barrier = self.barrier.clone();
+            Box::pin(async move {
+                if let Some(barrier) = barrier {
+                    barrier.wait().await;
+                }
+                Ok(output)
+            })
+        }
+    }
+
     struct SequencedStageTurn {
         outputs: Mutex<VecDeque<String>>,
         runs: Mutex<Vec<ObservedStageRun>>,
@@ -3692,7 +3759,7 @@ mod tests {
                 let output = baseline.clone();
                 async move {
                     calls.lock().unwrap().push("redTeam".to_string());
-                    note(&ctx, "red_team", &output, None).await?;
+                    note(&ctx, "redteam", &output, None).await?;
                     serde_json::to_string(&output).map_err(|error| error.to_string())
                 }
             }),
@@ -3833,7 +3900,7 @@ mod tests {
                 "issue",
                 "context",
                 "analyst",
-                "red_team",
+                "redteam",
                 "implementer",
                 "verifier",
                 "analyst",
@@ -3956,7 +4023,7 @@ mod tests {
         )
         .await
         .unwrap();
-        note(&ctx, "red_team", &red(&[], &["baseline"], 0), None)
+        note(&ctx, "redteam", &red(&[], &["baseline"], 0), None)
             .await
             .unwrap();
         let first = ImplementerOutput {
@@ -4496,6 +4563,108 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A workflow may call one declared stage twice at once — `Promise.all([probe(a), probe(b)])`
+    /// — and nothing stops it: only `iterate`, `verify` and `replanAtCeiling` hold the iterate
+    /// lock, and `implement`/`redTeam` have order guards. Two such invocations are two turns and
+    /// two records, and each record has to report what its own invocation spent.
+    #[tokio::test]
+    async fn concurrent_invocations_of_one_stage_each_report_their_own_cost() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-concurrent-declared-stage-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-concurrent-stage", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "concurrent_probe".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-concurrent-stage",
+            "probe this twice",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let mut stage = crate::stage::stage_fixture("concurrent_probe", "reason");
+        stage.input_contract = "ProbeInput".to_string();
+        stage.output_contract = "ProbeOutput".to_string();
+        stage.output_schema = Some(json!({
+            "type": "object",
+            "required": ["ok"],
+            "properties": { "ok": { "type": "boolean" } }
+        }));
+        let turn = ChargingStageTurn {
+            output: json!({ "ok": true }).to_string(),
+            telemetry: ratatoskr_core::NodeTelemetry {
+                model: Some("anthropic/test-model".to_string()),
+                duration_ms: Some(50),
+                usage: ratatoskr_core::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 100,
+                    ..Default::default()
+                },
+                turns: Some(1),
+                ..Default::default()
+            },
+            // Both turns record before either checkpoint claims — the ordering the ledger has to
+            // survive, and the one a real pair of overlapping model turns produces.
+            barrier: Some(Arc::new(tokio::sync::Barrier::new(2))),
+        };
+        let hosts =
+            build_hosts_with_turn(&ctx, &[stage], Arc::new(turn) as Arc<dyn StageTurn>).unwrap();
+        let host = hosts.get("concurrent_probe").unwrap().clone();
+
+        let (first, second) = tokio::join!(host("{}".to_string()), host("{}".to_string()));
+        first.unwrap();
+        second.unwrap();
+
+        let checkpoints = store
+            .checkpoints_for_run("run-concurrent-stage")
+            .await
+            .unwrap();
+        assert_eq!(
+            checkpoints.len(),
+            2,
+            "each invocation writes its own record"
+        );
+        for checkpoint in &checkpoints {
+            assert_eq!(
+                checkpoint.telemetry.usage.input_tokens, 10,
+                "each record reports its own invocation's turn, not both and not neither"
+            );
+            assert_eq!(checkpoint.telemetry.usage.output_tokens, 100);
+            assert_eq!(checkpoint.telemetry.turns, Some(1));
+            assert_eq!(
+                checkpoint.telemetry.model.as_deref(),
+                Some("anthropic/test-model")
+            );
+        }
+        assert!(
+            ctx.ledger.unclaimed().is_empty(),
+            "both turns were claimed by a checkpoint"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn generic_executor_consumes_a_rendered_question_and_checkpoints_original_input() {
         let dir = std::env::temp_dir().join(format!(
@@ -4617,7 +4786,7 @@ mod tests {
         // the ranked search happened. Nothing calls it, so it is not a host.
         for removed in [
             "memory",
-            "red_team",
+            "redteam",
             "implementer",
             "newlyIntroducedFailures",
         ] {
@@ -6958,7 +7127,7 @@ mod tests {
         )
         .unwrap();
         *ctx.worktree.lock().unwrap() = Some(WorktreePath(rust_worktree.clone()));
-        checkpoint(&store, run_id, "red_team", &red(&[], &["baseline"], 0))
+        checkpoint(&store, run_id, "redteam", &red(&[], &["baseline"], 0))
             .await
             .unwrap();
         // The model claims a different directory — standing in for the operator checkout — was
@@ -7504,7 +7673,7 @@ mod tests {
             .clone()
             .expect("redTeam prepares and retains the implementer worktree");
         assert!(worktree.as_path().exists());
-        let scripted = latest_checkpoint::<RedTeamOutput>(&store, run_id, "red_team")
+        let scripted = latest_checkpoint::<RedTeamOutput>(&store, run_id, "redteam")
             .await
             .unwrap();
         assert_eq!(
@@ -7766,6 +7935,149 @@ mod tests {
         assert_eq!(
             checkpoint_classifier.raw_output,
             "assertion failed: deleted > 0"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_run_with_both_red_team_halves_reports_what_both_of_them_cost() {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-redteam-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let author_root = dir.join("implementer-tree");
+        std::fs::create_dir_all(&author_root).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-redteam-cost", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "redteam".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-redteam-cost",
+            "add Store::prune",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+
+        // A run that enables the red team enables both halves, and both spend a turn before the
+        // one `redteam` record is written. They resolve their route through their own agent
+        // profile — `build` for the author, `reason` for the classifier — so the models they run
+        // on can genuinely differ.
+        let author = ChargingStageTurn {
+            barrier: None,
+            output: json!({ "files": [], "tests": [], "covers": "no interface" }).to_string(),
+            telemetry: ratatoskr_core::NodeTelemetry {
+                model: Some("anthropic/author-model".to_string()),
+                duration_ms: Some(200),
+                usage: ratatoskr_core::TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 200,
+                    ..Default::default()
+                },
+                turns: Some(2),
+                tools: vec!["Write".to_string()],
+                ..Default::default()
+            },
+        };
+        evaluate_standard_stage_with_resources_and_turn(
+            Arc::clone(&ctx),
+            "redteam_author",
+            serde_json::to_string(&crate::redteam::TestAuthorInput {
+                issue: "add Store::prune".to_string(),
+                interface: Vec::new(),
+            })
+            .unwrap(),
+            StandardStageResources {
+                resource_root: author_root,
+                capability_ceiling: ratatoskr_core::Capability::Write,
+                rag_rat_worktree: None,
+                shell: None,
+                publish: None,
+                clarifier: None,
+                guidance: None,
+            },
+            Arc::new(author),
+        )
+        .await
+        .unwrap();
+        let classifier = ChargingStageTurn {
+            barrier: None,
+            output: json!({ "classifications": [] }).to_string(),
+            telemetry: ratatoskr_core::NodeTelemetry {
+                model: Some("anthropic/classifier-model".to_string()),
+                duration_ms: Some(100),
+                usage: ratatoskr_core::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 100,
+                    ..Default::default()
+                },
+                turns: Some(1),
+                tools: vec!["semantic_search".to_string()],
+                ..Default::default()
+            },
+        };
+        evaluate_standard_stage_with_turn(
+            Arc::clone(&ctx),
+            "redteam_classifier",
+            serde_json::to_string(&crate::redteam::ClassifierInput {
+                failing: vec!["store::tests::prune_zero".to_string()],
+                raw_output: "assertion failed: deleted > 0".to_string(),
+            })
+            .unwrap(),
+            Arc::new(classifier),
+        )
+        .await
+        .unwrap();
+
+        note(
+            &ctx,
+            "redteam",
+            &red(&["store::tests::prune_zero"], &["store::tests::prune"], 1),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let checkpoints = store.checkpoints_for_run("run-redteam-cost").await.unwrap();
+        let telemetry = &checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.node_name == "redteam")
+            .expect("the red team is checkpointed under `redteam`")
+            .telemetry;
+        assert_eq!(
+            telemetry.usage.input_tokens, 30,
+            "the record accounts for both halves, not whichever one recorded first"
+        );
+        assert_eq!(telemetry.usage.output_tokens, 300);
+        assert_eq!(telemetry.turns, Some(3));
+        assert_eq!(telemetry.duration_ms, Some(300));
+        // Neither route is asserted to be the one the node ran on: both are named, because both
+        // ran and the row covers both.
+        assert_eq!(
+            telemetry.model.as_deref(),
+            Some("anthropic/author-model, anthropic/classifier-model")
+        );
+        assert_eq!(telemetry.tools, ["Write", "semantic_search"]);
+        assert!(
+            ctx.ledger.unclaimed().is_empty(),
+            "nothing the red team spent is left for the run to discard"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -9690,7 +10002,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let run_id = "scripted-terminal-parity";
         terminal_plan(&store, run_id, true).await;
-        checkpoint(&store, run_id, "red_team", &red(&["old"], &[], 1))
+        checkpoint(&store, run_id, "redteam", &red(&["old"], &[], 1))
             .await
             .unwrap();
         let worktree = dir.join("worktree");

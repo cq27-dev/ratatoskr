@@ -607,6 +607,13 @@ fn touch(tx: &rusqlite::Transaction<'_>, key: &ProviderPauseKey) -> Result<(), S
 ///
 /// `PRAGMA user_version` is the whole marker: the rows themselves cannot say which rule wrote them,
 /// because the old spelling and the new one overlap for every name without an underscore.
+///
+/// Bump this — and clear the table below — whenever a change to `normalized_node_name` changes the
+/// key some live node hashes to, since a row nothing addresses is a Stop that silently fails to
+/// arrive. Not every change to that function does: dropping its `red_team` -> `redteam` fold left
+/// every stored key untouched, because the fold's output was already `redteam` and `redteam` is
+/// what the node is named. Work out which keys move before deciding, rather than bumping on the
+/// diff — a needless bump discards live Stops that are still doing their job.
 const NODE_KEY_SPELLING: i64 = 1;
 
 fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
@@ -1154,7 +1161,7 @@ mod tests {
             .register_for_node(&key, "redteam-waiter", "redteam", None)
             .await
             .unwrap();
-        pauses.stop(&key, "red_team").await.unwrap();
+        pauses.stop(&key, "redteam").await.unwrap();
         pauses
             .acknowledge(&key, 1, "redteam-waiter", "redteam")
             .await
@@ -1164,10 +1171,10 @@ mod tests {
             pauses.is_node_stopped(&key, "redteam").await.unwrap(),
             "acknowledging Stop delivers it; it does not restart the parked node"
         );
-        pauses.clear_stop(&key, "red_team").await.unwrap();
+        pauses.clear_stop(&key, "redteam").await.unwrap();
         assert!(
             !pauses.is_node_stopped(&key, "redteam").await.unwrap(),
-            "the control-name aliases share one durable Stop"
+            "Start clears the durable Stop a delivered acknowledgement left standing"
         );
     }
 }

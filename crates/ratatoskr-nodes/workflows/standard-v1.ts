@@ -33,7 +33,7 @@ defineWorkflow({
     { nodes: ["overseer"], optional: true },
     { nodes: ["context"] },
     { nodes: ["analyst"] },
-    { nodes: ["red_team", "implementer"] },
+    { nodes: ["redteam", "implementer"] },
     { nodes: ["verifier"], optional: true },
     { nodes: ["bookkeeper", "publisher"] },
   ],

@@ -585,9 +585,9 @@ repository-script globals.
 
 A workflow may override an imported stage by declaring it under the same id, but not every standard
 identifier is available. Refused when the workflow loads: selection, delivery, the workflow
-operations, the checkpoint identities the run reads back by name (`implementer`, `red_team`,
-`memory`), the records the run writes itself (`issue`, `clarification`), the red team's governance
-identity (`redteam`) and the internal gate (`referee`) — as is an override that changes an output
+operations, the checkpoint identities the run reads back by name (`implementer`, `redteam`,
+`memory`), the records the run writes itself (`issue`, `clarification`) and the internal gate
+(`referee`) — as is an override that changes an output
 contract the run deserializes. The header of
 [`nodes.ts`](crates/ratatoskr-nodes/workflows/nodes.ts) lists which exports a repository may
 declare.

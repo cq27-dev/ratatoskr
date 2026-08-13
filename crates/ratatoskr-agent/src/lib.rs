@@ -2459,6 +2459,46 @@ async fn park(controller: &Arc<dyn Controller>, node: &str) -> Vec<String> {
     }
 }
 
+tokio::task_local! {
+    /// The claim scope the running future belongs to; see [`claim_scope`].
+    static CLAIM_SCOPE: u64;
+}
+
+/// The scope of a turn recorded with no scope open — the sequential paths that run outside a
+/// workflow host, such as stage selection before a workflow exists.
+const UNSCOPED: u64 = 0;
+
+/// Scope ids are minted process-wide rather than per ledger: a claim only ever compares ids from
+/// its own run, and a shared counter needs no state on the ledger to be unique within one.
+static NEXT_CLAIM_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Run `work` as one claim scope: the turns it records are the turns a checkpoint written inside it
+/// claims.
+///
+/// A scope is what a claim is keyed on, because a node *name* never identified a turn. Two
+/// invocations of one stage record under the same name, so a name-keyed claim either takes one
+/// entry — and drops the second turn of every composite node — or takes all of them, and charges
+/// one invocation for what its concurrent sibling spent. A scope separates those without asking
+/// callers to carry turn handles back through what a stage returns: whatever a checkpointed
+/// invocation runs inside itself belongs to it, including the halves a composite folds and the
+/// summarising turn a compactor charges to the node it compacts for.
+///
+/// Scopes do not nest in practice and are not meant to: an invocation that produces no checkpoint
+/// of its own — a delegation child, a red-team half — runs inside its parent's scope, which is what
+/// folds its cost into the record that does get written.
+pub async fn claim_scope<F: Future>(work: F) -> F::Output {
+    CLAIM_SCOPE
+        .scope(
+            NEXT_CLAIM_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            work,
+        )
+        .await
+}
+
+fn current_claim_scope() -> u64 {
+    CLAIM_SCOPE.try_with(|scope| *scope).unwrap_or(UNSCOPED)
+}
+
 /// Where a run's node turns report what they cost.
 ///
 /// A node's `run` returns its typed output and nothing else — the graph vocabulary is about what a
@@ -2466,33 +2506,54 @@ async fn park(controller: &Arc<dyn Controller>, node: &str) -> Vec<String> {
 /// in the trait that models the work. Instead the executor creates one ledger per run, hands it to
 /// each node, and drains it when it writes that node's checkpoint.
 ///
-/// Entries are claimed oldest-first per node name, which is what makes the converge loop work: the
-/// implementer runs once per iteration, and each checkpoint takes the turn that preceded it. The
-/// fork's concurrent nodes have different names, so they never contend for the same entry.
+/// An entry stands under the name it ran as *and* the claim scope it ran in ([`claim_scope`]), and
+/// a claim takes every entry matching both. The scope is what separates one invocation from
+/// another; the name is what keeps two differently-named turns in one scope — the referee's and the
+/// implementer's, inside a single `iterate` — from claiming each other's cost.
 #[derive(Default)]
 pub struct RunLedger {
-    entries: Mutex<Vec<(String, NodeTelemetry)>>,
+    entries: Mutex<Vec<(u64, String, NodeTelemetry)>>,
     /// Local continuation belongs to a run, just like the telemetry beside it. Keeping it here
     /// lets rebuilt node values re-enter without every node type growing its own session field.
     compacted_sessions: Mutex<HashMap<String, CompactedSession>>,
 }
 
 impl RunLedger {
-    /// Record what one node turn cost.
+    /// Record what one node turn cost, against the claim scope the turn ran in.
     pub fn record(&self, node: &str, telemetry: NodeTelemetry) {
-        self.entries
-            .lock()
-            .expect("ledger mutex poisoned")
-            .push((node.to_string(), telemetry));
+        self.entries.lock().expect("ledger mutex poisoned").push((
+            current_claim_scope(),
+            node.to_string(),
+            telemetry,
+        ));
     }
 
-    /// Claim the oldest unclaimed entry for `node`, if it made a model turn at all. `None` is
-    /// ordinary for a node that ran no model — it means "nothing to report", not "something went
-    /// missing", which is what [`RunLedger::unclaimed`] is for.
+    /// Claim every unclaimed turn this scope recorded under `node`, folded into one, if it made a
+    /// model turn at all. `None` is ordinary for a node that ran no model — it means "nothing to
+    /// report", not "something went missing", which is what [`RunLedger::unclaimed`] is for.
+    ///
+    /// All of this scope's rather than the oldest, because a checkpoint is not one turn: the red
+    /// team's classifier and its test author both run under `redteam` within one invocation and
+    /// share a single record, and a node that compacts its history charges the summarising turn to
+    /// its own name too. See [`NodeTelemetry::fold`] for what a row covering several turns says.
+    ///
+    /// Scoped rather than name-wide, because two invocations of one stage run under one name: a
+    /// claim that took every entry under it charged the first checkpoint for both turns and left
+    /// the second reporting nothing.
     pub fn take(&self, node: &str) -> Option<NodeTelemetry> {
+        let scope = current_claim_scope();
         let mut entries = self.entries.lock().expect("ledger mutex poisoned");
-        let at = entries.iter().position(|(name, _)| name == node)?;
-        Some(entries.remove(at).1)
+        let (claimed, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *entries)
+            .into_iter()
+            .partition(|(entry, name, _)| *entry == scope && name == node);
+        *entries = rest;
+        claimed
+            .into_iter()
+            .map(|(_, _, telemetry)| telemetry)
+            .reduce(|mut folded, next| {
+                folded.fold(next);
+                folded
+            })
     }
 
     /// The names of turns nobody claimed.
@@ -2506,7 +2567,7 @@ impl RunLedger {
             .lock()
             .expect("ledger mutex poisoned")
             .iter()
-            .map(|(name, _)| name.clone())
+            .map(|(_, name, _)| name.clone())
             .collect()
     }
 
@@ -4258,32 +4319,53 @@ mod tests {
         assert!(parse_provider("moonshot").is_ok());
     }
 
-    #[test]
-    fn the_ledger_hands_each_checkpoint_its_own_turn() {
-        let ledger = RunLedger::default();
-        let cost = |n: u64| NodeTelemetry {
+    fn cost(n: u64) -> NodeTelemetry {
+        NodeTelemetry {
             usage: TokenUsage {
                 input_tokens: n,
                 ..Default::default()
             },
             ..Default::default()
-        };
-        // The converge loop runs the implementer repeatedly; each checkpoint must claim the turn
-        // that preceded it, not the newest one.
-        ledger.record("implementer", cost(1));
-        ledger.record("red_team", cost(9));
-        ledger.record("implementer", cost(2));
+        }
+    }
 
+    #[test]
+    fn the_ledger_hands_each_checkpoint_the_turns_recorded_since_the_last_one() {
+        let ledger = RunLedger::default();
+        // The converge loop runs the implementer repeatedly, checkpointing after each attempt; a
+        // checkpoint must claim the turn that preceded it, not the newest one.
+        ledger.record("implementer", cost(1));
+        ledger.record("redteam", cost(9));
         assert_eq!(ledger.take("implementer").unwrap().usage.input_tokens, 1);
+        ledger.record("implementer", cost(2));
         assert_eq!(ledger.take("implementer").unwrap().usage.input_tokens, 2);
         assert!(
             ledger.take("implementer").is_none(),
             "a claimed entry is not handed out twice"
         );
         // A different node's entry is untouched by the drain of another's.
-        assert_eq!(ledger.take("red_team").unwrap().usage.input_tokens, 9);
+        assert_eq!(ledger.take("redteam").unwrap().usage.input_tokens, 9);
         // A node that never ran a model turn reports nothing rather than someone else's numbers.
         assert!(ledger.take("bookkeeper").is_none());
+    }
+
+    #[test]
+    fn one_checkpoint_claims_every_turn_that_ran_under_its_name() {
+        let ledger = RunLedger::default();
+        // The red team's two halves both run under `redteam` and share one checkpoint; so does a
+        // node's compaction turn. All of it is charged to the row, or the run underreports what it
+        // spent by however many turns the claim left behind.
+        ledger.record("redteam", cost(9));
+        ledger.record("redteam", cost(5));
+        ledger.record("implementer", cost(1));
+
+        assert_eq!(ledger.take("redteam").unwrap().usage.input_tokens, 14);
+        assert!(ledger.take("redteam").is_none());
+        assert_eq!(
+            ledger.unclaimed(),
+            ["implementer"],
+            "another node's turn is not swept up by the claim"
+        );
     }
 
     #[test]

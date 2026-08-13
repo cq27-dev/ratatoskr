@@ -545,12 +545,13 @@ mod tests {
     #[test]
     fn declared_stages_cannot_take_a_lifecycle_checkpoint_identity() {
         // The run counts `implementer` checkpoints for the iteration ordinal and the ceiling gate,
-        // and deserializes `implementer`, `red_team` and `memory` into concrete types. A stage
+        // and deserializes `implementer`, `redteam` and `memory` into concrete types. A stage
         // checkpointing its own output under one of those names inflates the count, spends the
-        // ceiling recovery early, or fails deserialization in the middle of a run.
+        // ceiling recovery early, or fails deserialization in the middle of a run. `redteam` is
+        // refused too, under its governance-identity reservation — see the test below.
         let template = crate::stage::stage_fixture("analyst", "reason");
 
-        for reserved in ["implementer", "red_team", "memory"] {
+        for reserved in ["implementer", "memory"] {
             let mut stage = template.clone();
             stage.id = reserved.to_string();
             let error = validate_declarations(&[stage], "repo-workflow")
@@ -806,7 +807,7 @@ mod tests {
         // No stage is called any of these; the run writes them itself and the model turn behind
         // each one is recorded under the same name, so a column names the whole node.
         let stages = [crate::stage::stage_fixture("analyst", "reason")];
-        for identity in ["context", "implementer", "red_team"] {
+        for identity in ["context", "implementer", "redteam"] {
             assert!(
                 validate_layout(&column(identity), &stages, "ours").is_ok(),
                 "`{identity}` is a name a run records under"

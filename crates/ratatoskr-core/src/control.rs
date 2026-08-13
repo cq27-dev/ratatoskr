@@ -161,26 +161,22 @@ fn same_node(a: &str, b: &str) -> bool {
 
 /// The stable identity shared by every control delivery path for a node.
 ///
-/// One node is known by two spellings on the two sides of this exchange: the red team *runs* as
-/// `redteam` and *checkpoints* as `red_team`, and the dashboard names nodes the way its checkpoints
-/// do. Comparing literally would make its stop button a no-op — the command would sit waiting for a
-/// node that never asks by that name.
+/// Case, and nothing else. A node's name reaches this from two directions — the dashboard sends
+/// what the graph drew, a node polls with what it runs as — and both are the same lowercase machine
+/// name, so this is tolerance for a control target typed by hand against the API rather than a rule
+/// anything depends on. `validate::machine_name` admits only lowercase ASCII, digits and `_`, so
+/// lowercasing cannot collide two legal identities.
 ///
-/// That one pair is folded, and nothing else. Every other name is its own address, underscores
-/// included, because a workflow declares stage ids of its own and those are only checked for being
-/// distinct as written: folding underscores out of every name made `implement_er` and `implementer`
-/// one control target, so a stop aimed at one ended the other and steer text was taken by whichever
-/// polled first. Both spellings of the red team are reserved (`policy::STANDARD_IDENTIFIERS`), so
-/// no declared stage can reach the identity this does fold.
+/// Nothing further is folded. A workflow declares stage ids of its own and those are only checked
+/// for being distinct as written, so any folding wider than case merges two legal identities into
+/// one control address: folding underscores out of every name made `implement_er` and `implementer`
+/// one control target, and a stop aimed at one ended the other while steer text went to whichever
+/// polled first.
 ///
-/// The durable provider-pause ledger uses the same spelling rule.
+/// The durable provider-pause ledger keys its rows on this, so a change here changes durable keys —
+/// see `NODE_KEY_SPELLING` in ratatoskr-store.
 pub fn normalized_node_name(node: &str) -> String {
-    let node = node.to_ascii_lowercase();
-    if node == "red_team" {
-        "redteam".to_string()
-    } else {
-        node
-    }
+    node.to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -213,7 +209,7 @@ mod tests {
             node: "implementer".to_string(),
         });
         assert_eq!(control.poll("implementer").directive, Directive::Stop);
-        assert_eq!(control.poll("red_team").directive, Directive::Continue);
+        assert_eq!(control.poll("redteam").directive, Directive::Continue);
     }
 
     #[test]
@@ -256,14 +252,14 @@ mod tests {
         let mut control = RunControl::default();
         control.apply(steer("implementer", "first"));
         control.apply(steer("implementer", "second"));
-        control.apply(steer("red_team", "not yours"));
+        control.apply(steer("redteam", "not yours"));
 
         let taken = control.poll("implementer").steer;
         assert_eq!(taken, ["first", "second"]);
         // Delivered once: a message the model sees on every turn reads as the operator repeating
         // themselves, and would keep steering long after it was meant to.
         assert!(control.poll("implementer").steer.is_empty());
-        assert_eq!(control.poll("red_team").steer, ["not yours"]);
+        assert_eq!(control.poll("redteam").steer, ["not yours"]);
     }
 
     #[test]
@@ -279,31 +275,31 @@ mod tests {
     }
 
     #[test]
-    fn the_red_team_answers_to_both_of_its_names() {
-        // It runs as `redteam` and checkpoints as `red_team`; the dashboard shows the checkpoint
-        // name, so a stop issued from the graph arrives spelled the other way. Matching literally
-        // would leave the button doing nothing at all.
+    fn a_control_target_reaches_its_node_whatever_case_it_was_typed_in() {
+        // Stage ids are lowercase by construction, so a capital can only come from a target typed
+        // by hand against the API — where a command silently addressing nothing is the worst
+        // possible answer.
         let mut control = RunControl::default();
         control.apply(Command::Stop {
-            node: "red_team".to_string(),
+            node: "RedTeam".to_string(),
         });
         assert_eq!(control.poll("redteam").directive, Directive::Stop);
 
         control.apply(Command::Start {
-            node: "red_team".to_string(),
+            node: "REDTEAM".to_string(),
         });
         assert_eq!(control.poll("redteam").directive, Directive::Continue);
 
-        control.apply(steer("red_team", "check the baseline"));
+        control.apply(steer("RedTeam", "check the baseline"));
         assert_eq!(control.poll("redteam").steer, ["check the baseline"]);
     }
 
     #[test]
     fn a_workflow_stage_is_not_the_standard_node_it_is_spelled_like() {
-        // A workflow may declare a stage id of its own, and `implement_er` is a legal one. Only the
-        // red team's two spellings are one address: folding underscores out of every name made this
-        // stage the standard implementer's address too, so a stop aimed at one ended the other and
-        // steer text went to whichever polled first.
+        // A workflow may declare a stage id of its own, and `implement_er` is a legal one. Every
+        // name is its own address, underscores included: folding underscores out of every name made
+        // this stage the standard implementer's address too, so a stop aimed at one ended the other
+        // and steer text went to whichever polled first.
         let mut control = RunControl::default();
         control.apply(Command::Stop {
             node: "implementer".to_string(),
@@ -337,12 +333,12 @@ mod tests {
         control.apply(Command::Stop {
             node: "implementer".to_string(),
         });
-        control.apply(steer("red_team", "hi"));
+        control.apply(steer("redteam", "hi"));
 
         let view = control.view();
         assert!(view.paused);
         assert_eq!(view.stopped, ["implementer"]);
-        assert_eq!(view.steering, ["red_team"]);
+        assert_eq!(view.steering, ["redteam"]);
         assert!(!control.is_empty());
     }
 }

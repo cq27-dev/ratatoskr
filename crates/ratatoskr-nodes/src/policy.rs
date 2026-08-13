@@ -28,7 +28,7 @@ pub(crate) enum Reserved {
     Selection,
     /// A checkpoint identity the run's lifecycle reads back by name: the iteration ordinal and the
     /// ceiling gate count `implementer` records, `latest_checkpoint` deserializes `implementer`,
-    /// `red_team` and `memory` into concrete types, and `finish_full` reads the same rows. A stage
+    /// `redteam` and `memory` into concrete types, and `finish_full` reads the same rows. A stage
     /// checkpointing arbitrary output under one of these names inflates an iteration count, spends
     /// the ceiling recovery early, or fails deserialization mid-run.
     Lifecycle,
@@ -43,6 +43,10 @@ pub(crate) enum Reserved {
     /// declared under this name wins the lookups made *for* the standard stages that name it —
     /// their enablement, their route, their profile. It could then enable a red team whose own
     /// route resolution has nowhere to go, and the run would die on the name it just introduced.
+    ///
+    /// `redteam` is a lifecycle checkpoint identity as well — the run records the red team's output
+    /// under it and reads it back by name — and is classed here because shadowing the governance
+    /// lookups is the sharper of the two hazards and the one worth naming in the refusal.
     GovernanceIdentity,
 }
 
@@ -177,7 +181,6 @@ pub(crate) const STANDARD_IDENTIFIERS: &[(&str, Class)] = &[
     // are already reserved above for reasons of their own; `redteam` has no such cover.
     ("redteam", Class::Reserved(Reserved::GovernanceIdentity)),
     ("implementer", Class::Reserved(Reserved::Lifecycle)),
-    ("red_team", Class::Reserved(Reserved::Lifecycle)),
     ("memory", Class::Reserved(Reserved::Lifecycle)),
     ("issue", Class::Reserved(Reserved::Record)),
     ("clarification", Class::Reserved(Reserved::Record)),
@@ -268,7 +271,7 @@ pub(crate) fn reserved_for_governance(id: &str) -> Option<Reserved> {
 /// The identities a run writes a checkpoint under today, with no stage of that name to declare
 /// them.
 ///
-/// `latest_checkpoint` reads `implementer` and `red_team` back by name, so a run records under
+/// `latest_checkpoint` reads `implementer` and `redteam` back by name, so a run records under
 /// those whatever its registry calls the stages behind them, and a workflow's layout may place them
 /// for that reason. A list rather than a predicate because a refusal has to name what *is* allowed
 /// to be actionable, and a set the caller can print is the only way acceptance and the message
@@ -276,7 +279,7 @@ pub(crate) fn reserved_for_governance(id: &str) -> Option<Reserved> {
 ///
 /// These are also the names under which a run's *model events* for that work arrive, which is what
 /// makes them drawable rather than merely written: an `implementer_attempt` turn is recorded under
-/// `implementer` and a red-team turn under `redteam`, which the dashboard folds to `red_team`.
+/// `implementer`, and `redteam_classifier` and `redteam_author` turns under `redteam`.
 ///
 /// Written out rather than filtered over a [`Class`], because "the run owns this name" and "a run
 /// records under this name" are different questions and no one class answers both. `context` is
@@ -291,7 +294,7 @@ pub(crate) fn reserved_for_governance(id: &str) -> Option<Reserved> {
 ///
 /// `bundled_standard_full_sequences_revision_review_and_rust_terminal_actions` bolts this list to
 /// what a run of the bundled workflow records, so an entry cannot go stale here unnoticed.
-pub(crate) const RUN_CHECKPOINT_IDENTITIES: &[&str] = &["context", "implementer", "red_team"];
+pub(crate) const RUN_CHECKPOINT_IDENTITIES: &[&str] = &["context", "implementer", "redteam"];
 
 /// The output contract an override of `id` must keep, because Rust deserializes it.
 pub(crate) fn required_contract(id: &str) -> Option<&'static str> {

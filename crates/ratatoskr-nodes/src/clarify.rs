@@ -285,10 +285,10 @@ impl NodeClarifier {
             }
         }
 
-        let (answerer, checkpoint_name) = resolve_target(to);
+        let answerer = resolve_target(to);
 
         let mut context = format!("ISSUE:\n{}\n", self.issue);
-        if let Some(prior) = self.latest_output(checkpoint_name).await {
+        if let Some(prior) = self.latest_output(answerer).await {
             let _ = write!(
                 context,
                 "\nYOUR PRIOR OUTPUT:\n{}\n",
@@ -399,15 +399,15 @@ impl Clarifier for NodeClarifier {
     }
 }
 
-/// Map an `ask` target to (answerer node, its checkpoint name). `analyst` is the fallback for the
-/// user, unknown targets, and empty — it can answer from the issue alone. Note the `redteam` →
-/// `red_team` checkpoint-name mismatch.
-fn resolve_target(to: &str) -> (&'static str, &'static str) {
+/// Map an `ask` target to the node that answers it, which is also the name its prior output is
+/// checkpointed under. `analyst` is the fallback for the user, unknown targets, and empty — it can
+/// answer from the issue alone.
+fn resolve_target(to: &str) -> &'static str {
     match to.trim() {
-        "scout" => ("scout", "scout"),
-        "bookkeeper" => ("bookkeeper", "bookkeeper"),
-        "redteam" | "red_team" => ("redteam", "red_team"),
-        _ => ("analyst", "analyst"),
+        "scout" => "scout",
+        "bookkeeper" => "bookkeeper",
+        "redteam" => "redteam",
+        _ => "analyst",
     }
 }
 
@@ -426,13 +426,13 @@ mod tests {
 
     #[test]
     fn resolve_target_maps_names_and_falls_back_to_analyst() {
-        assert_eq!(resolve_target("scout"), ("scout", "scout"));
-        assert_eq!(resolve_target("redteam"), ("redteam", "red_team"));
-        assert_eq!(resolve_target("bookkeeper"), ("bookkeeper", "bookkeeper"));
+        assert_eq!(resolve_target("scout"), "scout");
+        assert_eq!(resolve_target("redteam"), "redteam");
+        assert_eq!(resolve_target("bookkeeper"), "bookkeeper");
         // user / unknown / empty → analyst fallback.
-        assert_eq!(resolve_target("user"), ("analyst", "analyst"));
-        assert_eq!(resolve_target("implementer"), ("analyst", "analyst"));
-        assert_eq!(resolve_target(""), ("analyst", "analyst"));
+        assert_eq!(resolve_target("user"), "analyst");
+        assert_eq!(resolve_target("implementer"), "analyst");
+        assert_eq!(resolve_target(""), "analyst");
     }
 
     /// An `ask` must be answered by the stage the run would run, on the route that run gave it.

@@ -1795,7 +1795,7 @@ mod access_tests {
             );
 
             assert_eq!(
-                ask_while_provider_paused(state.clone(), "r1", "red_team", "red-team")
+                ask_while_provider_paused(state.clone(), "r1", "redteam", "red-team")
                     .await
                     .directive,
                 ratatoskr_core::Directive::Continue
@@ -1917,7 +1917,7 @@ mod access_tests {
             );
 
             let after_restart = restarted(&before_restart);
-            for (node, waiter) in [("red_team", "red-team"), ("author", "author")] {
+            for (node, waiter) in [("redteam", "red-team"), ("author", "author")] {
                 assert_eq!(
                     ask_while_provider_paused(after_restart.clone(), "r1", node, waiter)
                         .await
@@ -1931,7 +1931,7 @@ mod access_tests {
                 command(after_restart.clone(), &cookie, r#"{"command":"resume"}"#).await,
                 StatusCode::OK
             );
-            for (node, waiter) in [("red_team", "red-team"), ("author", "author")] {
+            for (node, waiter) in [("redteam", "red-team"), ("author", "author")] {
                 assert_eq!(
                     ask_while_provider_paused(after_restart.clone(), "r1", node, waiter)
                         .await
@@ -2224,7 +2224,7 @@ mod access_tests {
                     .is_empty()
             );
             // And it was never for the other node in the fork.
-            assert!(ask(state, "r1", "red_team").await.steer.is_empty());
+            assert!(ask(state, "r1", "redteam").await.steer.is_empty());
         }
 
         #[tokio::test]

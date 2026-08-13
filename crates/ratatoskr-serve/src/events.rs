@@ -217,28 +217,13 @@ fn run_id_of(record: &Value) -> Option<&str> {
 /// Same idea for the node: a field on checkpoint records, the `agent` span for everything an
 /// agent emits.
 fn node_of(record: &Value) -> Option<&str> {
-    let raw = record.get("node").and_then(Value::as_str).or_else(|| {
+    record.get("node").and_then(Value::as_str).or_else(|| {
         record
             .get("spans")?
             .as_array()?
             .iter()
             .find_map(|span| span.get("node").and_then(Value::as_str))
-    })?;
-    Some(stage_name(raw))
-}
-
-/// The name the pipeline knows a node by.
-///
-/// The red team checkpoints as `red_team` and runs as `redteam` — a split the run itself relies
-/// on. Everything downstream of here keys on the stage name, so an event arriving under the other
-/// spelling belongs to no stage at all: it groups on its own in the feed, and the node it came
-/// from never lights up while it is working. Normalising once here is cheaper than every consumer
-/// remembering which side of the split it is on.
-fn stage_name(node: &str) -> &str {
-    match node {
-        "redteam" => "red_team",
-        other => other,
-    }
+    })
 }
 
 /// Normalise one log record, keeping only what a viewer can act on.
@@ -500,19 +485,19 @@ mod tests {
     }
 
     #[test]
-    fn the_red_teams_two_names_arrive_as_the_one_the_pipeline_knows() {
-        // It checkpoints as `red_team` and runs as `redteam`. Unnormalised, its events belong to
-        // no stage: the node stays dark while it is plainly working, which is what a live run
-        // showed with 36 events under the other spelling.
+    fn a_nodes_name_reaches_the_event_from_either_place_it_is_recorded() {
+        // Model events carry the node on the `agent` span; the run's own records carry it as a
+        // field. Both are the name the pipeline draws a box under, and neither is rewritten on the
+        // way: an event under a name no stage has belongs to no stage at all, so the node stays
+        // dark while it is plainly working.
         let running: Value = serde_json::from_str(&agent_line("r1", "redteam")).unwrap();
-        assert_eq!(to_event(&running).node.as_deref(), Some("red_team"));
+        assert_eq!(to_event(&running).node.as_deref(), Some("redteam"));
 
-        // The checkpoint side already uses the stage name and must pass through untouched.
         let done: Value = serde_json::from_str(
-            r#"{"timestamp":"t","kind":"checkpoint","node":"red_team","spans":[{"run_id":"r1"}]}"#,
+            r#"{"timestamp":"t","kind":"checkpoint","node":"redteam","spans":[{"run_id":"r1"}]}"#,
         )
         .unwrap();
-        assert_eq!(to_event(&done).node.as_deref(), Some("red_team"));
+        assert_eq!(to_event(&done).node.as_deref(), Some("redteam"));
     }
 
     #[test]
@@ -520,11 +505,11 @@ mod tests {
         // A suite takes minutes. Unattributed, the node running it reads as idle for the whole of
         // it, and a run rebuilt from the stream shows nothing happening while the tests run.
         let record: Value = serde_json::from_str(
-            r#"{"timestamp":"t","kind":"acceptance_step","node":"red_team","step":"tests",
+            r#"{"timestamp":"t","kind":"acceptance_step","node":"redteam","step":"tests",
                 "exit_code":0,"spans":[{"run_id":"r1"}]}"#,
         )
         .unwrap();
-        assert_eq!(to_event(&record).node.as_deref(), Some("red_team"));
+        assert_eq!(to_event(&record).node.as_deref(), Some("redteam"));
     }
 
     #[test]
