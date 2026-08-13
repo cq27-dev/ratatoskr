@@ -17,7 +17,7 @@ import {
 } from "@xyflow/react";
 import { Brain, Infinity as InfinityIcon, Repeat, Wrench } from "lucide-react";
 import { TOOL_GROUPS } from "../ui/tools";
-import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode } from "../api";
+import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode, SessionScope } from "../api";
 import { forkHandoff, handoffDrawn, type ConvergeLoops, type LiveNode } from "../derive";
 
 /*
@@ -95,9 +95,14 @@ function NodeFacts({
     : (live?.used ?? new Set<string>());
   const modelFull = telemetry?.model ?? live?.facts?.model ?? planned?.model ?? null;
   const thinking = telemetry?.thinking ?? live?.facts?.thinking ?? planned?.thinking ?? false;
-  const reuses =
-    telemetry?.reuses_session ?? live?.facts?.reuses_session ?? planned?.reuses_session ?? false;
-  const session = planned?.session ?? (reuses ? "reuse" : "fresh");
+  // Every scope this box's stages run under, so a box whose halves continue differently shows each
+  // of their marks rather than one of them winning. Config is the only source that can say WHICH: a
+  // recorded `reuses_session` is set by a compacted re-entry too, so on its own it can say no more
+  // than "something continued", and it is the last resort for a box config has no route for.
+  const scopes = new Set<SessionScope>(planned?.sessions ?? []);
+  if (!scopes.size && (telemetry?.reuses_session || live?.facts?.reuses_session)) {
+    scopes.add("reuse");
+  }
   const cycles = telemetry?.turns ?? live?.cycles ?? null;
   const groups = TOOL_GROUPS.filter((g) => tools.some(g.match));
   const ungrouped = tools.filter((t) => !TOOL_GROUPS.some((g) => g.match(t)));
@@ -130,7 +135,7 @@ function NodeFacts({
       </div>
       <div className="node-icons">
         {/* Lucide takes no `title`, and a wrapper is the better hover target anyway. */}
-        {session === "reuse" && (
+        {scopes.has("reuse") && (
           <span
             className="node-icon"
             data-tip="Endpoint continuation: this node keeps its endpoint session when it is re-entered"
@@ -138,7 +143,7 @@ function NodeFacts({
             <InfinityIcon size={13} aria-label="compounding" />
           </span>
         )}
-        {session === "compacted" && (
+        {scopes.has("compacted") && (
           <span
             className="node-icon"
             data-tip="Compacted continuation: a re-entered node receives a local summary of its previous attempt"

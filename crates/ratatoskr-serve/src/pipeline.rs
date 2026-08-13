@@ -125,15 +125,21 @@ pub struct PlannedNode {
     /// what it reports having run on read alike.
     pub model: String,
     pub thinking: bool,
-    pub reuses_session: bool,
-    /// Absent when the node's stages will run under scopes that differ, since no one answer is true
-    /// of the box. A reader falls back to [`Self::reuses_session`], which stays answerable: it says
-    /// whether any half carries its context across attempts.
+    /// Every distinct scope the node's stages will run under, in registry order.
+    ///
+    /// A set rather than one value, and rather than nothing when they differ. A route is one field
+    /// and two values of it are genuinely unsayable; a session scope is not the same question.
+    /// Compacted continuation is a property a MEMBER has — it receives a summary of its own last
+    /// attempt — and a box with a compacted member has it whatever its siblings do. Collapsing left
+    /// a reader with only a boolean, which a compacted re-entry sets too, so the box showed the
+    /// endpoint-reuse mark for a half that never touches an endpoint session.
     ///
     /// The scope each stage will RUN under, not its route's. A stage may declare its own, and
-    /// execution honours the declaration — so two stages on one route can still disagree.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session: Option<ratatoskr_core::SessionScope>,
+    /// execution honours the declaration — so two stages on one route can still differ.
+    ///
+    /// No `reuses_session` beside it: that is `sessions.contains(Reuse)`, and a second copy of one
+    /// fact is what a reader falls back to when the first stops answering.
+    pub sessions: Vec<ratatoskr_core::SessionScope>,
 }
 
 impl PlannedNode {
@@ -186,13 +192,7 @@ impl PlannedNode {
         Some(PlannedNode {
             model: models.join(", "),
             thinking: planned.iter().any(|(route, _)| thinking(route)),
-            reuses_session: sessions
-                .iter()
-                .any(|session| matches!(session, ratatoskr_core::SessionScope::Reuse)),
-            session: match sessions.as_slice() {
-                [only] => Some(*only),
-                _ => None,
-            },
+            sessions,
         })
     }
 }
@@ -1253,11 +1253,10 @@ mod tests {
         // Under `redteam`, though neither stage doing the work is called that: both halves govern
         // as the box, which is what a `[models.redteam]` entry routes.
         assert_eq!(planned.model, "anthropic/claude-sonnet-5");
-        assert!(planned.reuses_session);
         assert_eq!(
-            planned.session,
-            Some(ratatoskr_core::SessionScope::Reuse),
-            "one route, so the box's session scope is that route's"
+            planned.sessions,
+            [ratatoskr_core::SessionScope::Reuse],
+            "one route and no declaration, so the box's one scope is that route's"
         );
         assert!(planned.thinking, "nothing disabled it");
 
@@ -1331,7 +1330,7 @@ mod tests {
                     id: "redteam_author".to_string(),
                     node: "redteam".to_string(),
                     governed_by: Some("redteam".to_string()),
-                    session: Some(ratatoskr_core::SessionScope::Fresh),
+                    session: Some(ratatoskr_core::SessionScope::Compacted),
                 },
             ],
         };
@@ -1348,13 +1347,18 @@ mod tests {
         // One route, so one model — the disagreement is in what the stages declared, not in where
         // they run.
         assert_eq!(planned.model, "anthropic/claude-sonnet-5");
+        // Both scopes, not neither. A route is one field and two values of it collapse to nothing
+        // sayable; a session scope is not that question — compacted is a property a MEMBER has, and
+        // a box with a compacted member has it whatever its siblings do. Collapsing left the client
+        // reading `reuses_session`, which a compacted re-entry also sets, so the box drew the
+        // endpoint-reuse mark for a half that never reuses an endpoint.
         assert_eq!(
-            planned.session, None,
-            "the halves run on different scopes, so no one scope is true of the box"
-        );
-        assert!(
-            planned.reuses_session,
-            "the half that declared nothing keeps the route's `reuse`"
+            planned.sessions,
+            [
+                ratatoskr_core::SessionScope::Reuse,
+                ratatoskr_core::SessionScope::Compacted
+            ],
+            "each half's own scope, in registry order"
         );
 
         // And a lone stage's declaration is the box's, rather than being overwritten by the route.
@@ -1374,10 +1378,10 @@ mod tests {
             Some(&serde_json::to_string(&fresh).unwrap()),
         );
         let planned = view(&views, "redteam").planned.as_ref().unwrap();
-        assert_eq!(planned.session, Some(ratatoskr_core::SessionScope::Fresh));
-        assert!(
-            !planned.reuses_session,
-            "it declared itself out of the reuse"
+        assert_eq!(
+            planned.sessions,
+            [ratatoskr_core::SessionScope::Fresh],
+            "it declared itself out of the route's reuse"
         );
     }
 
@@ -1440,8 +1444,13 @@ mod tests {
         // one half carries its context. The session scope does not, so it is absent rather than
         // asserted, and a reader falls back to `reuses_session`.
         assert!(planned.thinking);
-        assert!(planned.reuses_session);
-        assert_eq!(planned.session, None);
+        assert_eq!(
+            planned.sessions,
+            [
+                ratatoskr_core::SessionScope::Reuse,
+                ratatoskr_core::SessionScope::Fresh
+            ]
+        );
     }
 
     #[test]

@@ -408,11 +408,14 @@ export interface PlannedNode {
   /** Every distinct route the node's stages resolve, comma-joined — as `NodeTelemetry.model` is. */
   model: string;
   thinking: boolean;
-  reuses_session: boolean;
-  /** Absent when the node's stages resolve routes whose session scopes differ, since no one answer
-   *  is true of the box. Fall back to `reuses_session`, which stays answerable. */
-  session?: "fresh" | "reuse" | "compacted";
+  /** Every distinct scope this node's stages will run under, in registry order — a set, because
+   *  compacted continuation is a property a MEMBER has and a box with a compacted member has it
+   *  whatever its siblings do. There is no `reuses_session` here: it is `sessions.includes("reuse")`,
+   *  and a boolean cannot tell endpoint reuse from a compacted re-entry. */
+  sessions: SessionScope[];
 }
+
+export type SessionScope = "fresh" | "reuse" | "compacted";
 
 /** Mirrors `events::LiveNodeFacts` — what a node announced when it started. */
 export interface NodeFacts {
