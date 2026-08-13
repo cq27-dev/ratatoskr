@@ -189,11 +189,55 @@ pub struct ScriptEngine {
     defaults: Defaults,
 }
 
+/// What makes a source a workflow rather than a ruleset, if anything.
+///
+/// Both live under `.ratatoskr/` as TypeScript, so dropping a workflow in the rules directory is an
+/// ordinary mistake — and the engine's answer to it was a token error at a generated-JavaScript
+/// position, naming no file. These two shapes are the whole difference and neither survives a plain
+/// script eval, so seeing either is a diagnosis rather than a guess.
+fn workflow_shape(src: &str) -> Option<&'static str> {
+    if src.contains("defineWorkflow") {
+        return Some("calls `defineWorkflow`");
+    }
+    src.lines()
+        .map(str::trim_start)
+        .any(|line| {
+            line.starts_with("import ")
+                || line.starts_with("import{")
+                || line.starts_with("import*")
+                || line.starts_with("export ")
+        })
+        .then_some("uses ES module `import`/`export`")
+}
+
+/// The line the engine reported, from a frame like `at eval_script:47:49`.
+fn evaluated_line(error: &str) -> Option<usize> {
+    let (_, rest) = error.split_once("eval_script:")?;
+    rest.split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The same failure, told which file it came from. The engine's own position is dropped: it counts
+/// generated JavaScript in one concatenated program, which is not a place the author can look.
+fn blame_file(path: &Path, error: &str) -> ScriptError {
+    let error = error
+        .lines()
+        .filter(|line| !line.contains("eval_script:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ScriptError::Eval(format!("{}: {}", path.display(), error.trim()))
+}
+
 impl ScriptEngine {
     /// Load and evaluate every `*.ts` in `rules_dir` (empty engine if the dir is absent).
     pub async fn load(rules_dir: &Path) -> Result<Arc<Self>, ScriptError> {
-        // Bootstrap + all transpiled scripts, concatenated into one eval.
+        // Bootstrap + all transpiled scripts, concatenated into one eval. `blamed_on` maps a
+        // position in that one program back to the file it came from, so an evaluation failure
+        // names a file the author can open rather than a line of generated JavaScript.
         let mut program = String::from(BOOTSTRAP);
+        let mut sources: Vec<(usize, std::path::PathBuf)> = Vec::new();
         if rules_dir.is_dir() {
             let mut paths: Vec<_> = std::fs::read_dir(rules_dir)
                 .map_err(|e| ScriptError::Io(rules_dir.display().to_string(), e))?
@@ -206,10 +250,30 @@ impl ScriptEngine {
                 // A rules file is repository TypeScript through the same parser a workflow uses, so
                 // it is held to the same source ceiling.
                 let src = crate::transpile::read_script_source(&path)?;
+                if let Some(shape) = workflow_shape(&src) {
+                    return Err(ScriptError::Eval(format!(
+                        "{} {shape}, so it is a workflow rather than a ruleset. Every `*.ts` in \
+                         {} is evaluated as one plain script, which a workflow is not — move it \
+                         to `.ratatoskr/workflows/`.",
+                        path.display(),
+                        rules_dir.display()
+                    )));
+                }
                 program.push('\n');
-                program.push_str(&transpile_ts(&src)?);
+                sources.push((program.lines().count(), path.clone()));
+                program
+                    .push_str(&transpile_ts(&src).map_err(|e| blame_file(&path, &e.to_string()))?);
             }
         }
+        let blamed_on = move |error: ScriptError| match error {
+            ScriptError::Eval(text) => match evaluated_line(&text)
+                .and_then(|line| sources.iter().rev().find(|(first, _)| *first <= line))
+            {
+                Some((_, path)) => blame_file(path, &text),
+                None => ScriptError::Eval(text),
+            },
+            other => other,
+        };
 
         let runtime = AsyncRuntime::new().map_err(|e| ScriptError::Eval(e.to_string()))?;
         let context = AsyncContext::full(&runtime)
@@ -230,7 +294,8 @@ impl ScriptEngine {
                     .catch(&ctx)
                     .map_err(|e| ScriptError::Eval(format!("{e}")))
             })
-            .await?;
+            .await
+            .map_err(blamed_on)?;
 
         let mut static_config: StaticConfig = serde_json::from_str(&agents_json)
             .map_err(|e| ScriptError::Eval(format!("static config parse: {e}")))?;
@@ -439,6 +504,51 @@ mod tests {
         ));
         // A node with no ruleset gets nothing to gate.
         assert!(engine.ruleset("analyst").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failing_rules_file_is_named_and_a_workflow_among_them_is_diagnosed() {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-rules-blame-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Several files, so "which one" is a real question.
+        std::fs::write(dir.join("a-scout.ts"), r#"defineAgent("scout", {});"#).unwrap();
+        std::fs::write(dir.join("b-analyst.ts"), r#"defineAgent("analyst", {});"#).unwrap();
+
+        // A workflow dropped in the rules directory: both live under `.ratatoskr/` as TypeScript,
+        // and the answer used to be a token error at a generated position, naming no file.
+        std::fs::write(
+            dir.join("c-workflow.ts"),
+            "import * as nodes from \"ratatoskr/nodes\";\n\
+             defineWorkflow({ name: \"ours\", stages: [] });\n\
+             export async function plan(input) { return input; }\n",
+        )
+        .unwrap();
+        let misplaced = ScriptEngine::load(&dir)
+            .await
+            .err()
+            .expect("a workflow is not a ruleset")
+            .to_string();
+        assert!(misplaced.contains("c-workflow.ts"), "{misplaced}");
+        assert!(misplaced.contains(".ratatoskr/workflows/"), "{misplaced}");
+        std::fs::remove_file(dir.join("c-workflow.ts")).unwrap();
+
+        // And an ordinary broken rule is named too, rather than reported at a line of the one
+        // concatenated program the engine actually evaluates.
+        std::fs::write(
+            dir.join("d-broken.ts"),
+            "throw new Error(\"rule is wrong\");",
+        )
+        .unwrap();
+        let broken = ScriptEngine::load(&dir)
+            .await
+            .err()
+            .expect("a throwing rules file fails the load")
+            .to_string();
+        assert!(broken.contains("d-broken.ts"), "{broken}");
+        assert!(!broken.contains("eval_script"), "{broken}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Load a ruleset directory from source, for the plugin-binding tests.
