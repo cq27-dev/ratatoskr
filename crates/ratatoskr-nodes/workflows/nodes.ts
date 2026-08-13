@@ -16,7 +16,7 @@
 //     run from Rust adapters after the run outcome is accepted, holding a push grant and the
 //     committed worktree that no workflow operation has.
 //
-// Two of the declarable stages — verifier, and the two write-authority ones — run only from their
+// Three of the declarable stages — verifier, and the two write-authority ones — run only from their
 // Rust adapters, so overriding one changes what that adapter runs but does not make it callable
 // from a workflow.
 //

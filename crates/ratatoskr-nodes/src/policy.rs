@@ -56,7 +56,7 @@ impl Reserved {
             Self::Terminal => {
                 "a terminal adapter owned by the run rather than a workflow operation"
             }
-            Self::Selection => "selects between workflows and so cannot be declared by one",
+            Self::Selection => "the selection between workflows, and so cannot be declared by one",
             Self::Lifecycle => {
                 "a lifecycle checkpoint identity the run reads back by name; choose a different \
                  stage identifier"

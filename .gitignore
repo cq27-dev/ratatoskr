@@ -2,6 +2,7 @@
 # Runtime state (logs, store, worktrees) is ignored; version-controlled agent scripts are not.
 /.ratatoskr/*
 !/.ratatoskr/rules/
+!/.ratatoskr/workflows/
 !/.ratatoskr/workflow.ts
 ratatoskr.toml
 .env

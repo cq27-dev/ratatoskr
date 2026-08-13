@@ -3405,7 +3405,7 @@ mod referee_governance_tests {
             ("publisher", "terminal adapter"),
             // Selection runs in its own pre-selection context, before any workflow runtime exists,
             // so a declaration of it could never reach the routing turn it appears to configure.
-            ("overseer", "selects between workflows"),
+            ("overseer", "the selection between workflows"),
         ];
         for (declared, expected) in cases {
             let (dir, found) = workflows_in(
