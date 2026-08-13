@@ -216,8 +216,10 @@ pub(crate) fn is_terminal(status: Option<&str>) -> bool {
 ///   implementer is then where it stopped, even though it has checkpoints from earlier iterations.
 ///   The inference is only sound while nothing after the fork [`can_fail_the_run`], because a
 ///   workflow may declare a fallible stage after the implementer — and a run that routed its
-///   verifier has a fallible one there already — and then the failure is as likely theirs, with
-///   nothing in the record to say which. It is left unattributed rather than guessed at.
+///   verifier has a fallible one there already. Where one does, *no* node is reported `Failed`:
+///   the implementer's re-entry and the stage after it leave the same record, which is the
+///   implementer's last checkpoint and nothing following it, so naming either is a guess. An
+///   unattributed failure is worse than a correct attribution and much better than a wrong one.
 ///
 /// `config` is what the run was started under, so a node that has not run yet can still say what it
 /// will run on.
@@ -257,6 +259,13 @@ pub fn derive_with(
             .all(|n| !can_fail_the_run(&n.name, config))
     });
     let converge_died = failed && fork_started && nothing_fallible_after_the_fork;
+    // And where that inference does not hold, nothing else may take its place. The implementer
+    // re-enters once per converge iteration and checkpoints once per attempt, so an attempt that
+    // died leaves exactly the record a later host dying leaves: the implementer's last checkpoint
+    // and nothing after it. The cursor is then on a stage that never started, and reporting the
+    // failure there is the same guess as reporting it on the implementer, made about whichever
+    // node happens to be next. Both stay unattributed; the run's own status still says it failed.
+    let unattributable = failed && fork_started && !converge_died;
 
     // A node has finished only if it checkpointed *and* isn't the implementer mid-converge —
     // otherwise the fork would look complete on iteration 1 and the run's activity would be
@@ -305,6 +314,9 @@ pub fn derive_with(
                     // A failure here belongs upstream: delivery runs past the terminal status, and
                     // an unrouted verifier reviews nothing.
                     _ if !can_fail_the_run(name, config) => NodeState::Idle,
+                    // Past a fork that ran, with something fallible after it: which of the two
+                    // died is not in the record, so neither is named.
+                    _ if unattributable => NodeState::Idle,
                     _ if failed => NodeState::Failed,
                     _ if !terminal => NodeState::Working,
                     _ => NodeState::Idle,
@@ -709,11 +721,12 @@ mod tests {
     }
 
     #[test]
-    fn a_routed_verifier_a_layout_always_runs_is_where_a_failed_run_stopped() {
-        // A column the layout does not mark optional says every run reaches it. With a route to
-        // review with and no checkpoint of its own on a failed run, the verifier is where the run
-        // stopped — the case the old classification could not report, because it held that the
-        // verifier is never what fails a run.
+    fn a_routed_verifier_after_a_fork_that_ran_is_not_where_a_failed_run_stopped_either() {
+        // A column the layout does not mark optional says every run reaches it, and a routed
+        // verifier can fail a run. It still may not be reported as the failure: the implementer
+        // re-enters on every converge iteration, so an attempt that died leaves this same record —
+        // the implementer's last checkpoint and no verifier one. Reading `failed` off the box that
+        // happens to be next is the mirror of pinning it on the implementer, and no more true.
         let shape = shape_of(&[
             (&["red_team", "implementer"], false),
             (&["verifier"], false),
@@ -726,11 +739,16 @@ mod tests {
             Some(&config),
             Some(&shape),
         );
-        assert_eq!(state_of(&views, "verifier"), NodeState::Failed);
+        assert_eq!(state_of(&views, "verifier"), NodeState::Idle);
         assert_eq!(state_of(&views, "implementer"), NodeState::Done);
+        assert!(
+            !views.iter().any(|v| v.state == NodeState::Failed),
+            "neither half of an ambiguous failure is named"
+        );
 
         // Unrouted, the same run reaches a `verify()` that answers "not configured" before it does
-        // anything of its own, so the fork is still the only thing that can have died.
+        // anything of its own, so the fork is still the only thing that can have died — evidence
+        // that does point somewhere is still reported.
         let unrouted = derive_with(
             Some("failed"),
             &[cp("red_team", "t1"), cp("implementer", "t2")],
@@ -742,11 +760,12 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_run_with_a_fallible_stage_after_the_fork_does_not_blame_the_implementer() {
+    fn a_failed_run_with_a_fallible_stage_after_the_fork_blames_neither_of_them() {
         // Blaming the implementer for any failed run that reached the fork is only sound where
         // nothing after it can fail a run. A declared layout may put an ordinary stage there — its
-        // host error propagates out of the workflow and fails the run — and then the implementer
-        // finished and the later stage is where it stopped.
+        // host error propagates out of the workflow and fails the run — but so does a later
+        // `iterate()` attempt, and that writes no checkpoint either. A reader of this graph must
+        // not be shown a stage that never started as the run's failure.
         let shape = shape_of(&[
             (&["red_team", "implementer"], false),
             (&["deploy"], false),
@@ -760,8 +779,28 @@ mod tests {
         );
         assert_eq!(state_of(&views, "implementer"), NodeState::Done);
         assert_eq!(state_of(&views, "red_team"), NodeState::Done);
-        assert_eq!(state_of(&views, "deploy"), NodeState::Failed);
-        assert_ne!(state_of(&views, "bookkeeper"), NodeState::Failed);
+        assert_eq!(state_of(&views, "deploy"), NodeState::Idle);
+        assert!(
+            !views.iter().any(|v| v.state == NodeState::Failed),
+            "an unattributed failure, not one pinned on the stage that happens to be next"
+        );
+    }
+
+    #[test]
+    fn a_failed_run_that_never_reached_the_fork_still_names_the_node_it_died_on() {
+        // The ambiguity above is the fork's: it comes from the implementer re-entering without a
+        // record. Before the fork there is nothing to re-enter, so the stage the run stopped at is
+        // the only candidate and is still reported — withholding that would lose the attribution
+        // the graph exists to show.
+        let shape = shape_of(&[
+            (&["analyst"], false),
+            (&["implementer"], false),
+            (&["deploy"], false),
+        ]);
+        let views = derive_with(Some("failed"), &[cp("analyst", "t1")], None, Some(&shape));
+        assert_eq!(state_of(&views, "analyst"), NodeState::Done);
+        assert_eq!(state_of(&views, "implementer"), NodeState::Failed);
+        assert_eq!(state_of(&views, "deploy"), NodeState::Idle);
     }
 
     #[test]
