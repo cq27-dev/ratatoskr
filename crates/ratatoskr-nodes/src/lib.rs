@@ -3510,6 +3510,58 @@ mod referee_governance_tests {
     }
 
     #[tokio::test]
+    async fn a_layout_naming_a_stage_the_run_folds_as_evidence_is_refused() {
+        // `implementer_attempt` runs as evidence for the `implementer` checkpoint and never appears
+        // under its own name, so a column naming it draws a box no record can ever reach.
+        let (dir, found) = workflows_in(
+            "layout-evidence",
+            &[(
+                "ours",
+                r#"defineWorkflow({
+                     name: "ours",
+                     layout: [{ nodes: ["analyst"] }, { nodes: ["implementer_attempt"] }],
+                   });
+                   export async function plan(input) { return input; }"#,
+            )],
+        )
+        .await;
+        let standard = workflow::standard_stages().await.unwrap();
+        let error =
+            validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
+                .expect_err("a stage folded as evidence records nothing under its own name")
+                .to_string();
+        assert!(error.contains("ours"), "{error}");
+        assert!(error.contains("implementer_attempt"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_layout_naming_one_node_twice_is_refused() {
+        // The viewer keys a box by its name, so a second column of the same name would replace the
+        // first's edges and state rather than drawing beside it.
+        let (dir, found) = workflows_in(
+            "layout-duplicate",
+            &[(
+                "ours",
+                r#"defineWorkflow({
+                     name: "ours",
+                     layout: [{ nodes: ["analyst"] }, { nodes: ["verifier", "analyst"] }],
+                   });
+                   export async function plan(input) { return input; }"#,
+            )],
+        )
+        .await;
+        let standard = workflow::standard_stages().await.unwrap();
+        let error =
+            validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
+                .expect_err("one name is one box")
+                .to_string();
+        assert!(error.contains("ours"), "{error}");
+        assert!(error.contains("analyst"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_workflow_may_lay_out_a_stage_it_declares_itself() {
         let (dir, found) = workflows_in(
             "layout-own-stage",

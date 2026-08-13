@@ -223,11 +223,21 @@ pub fn validate(
 
 /// Refuse a layout column naming a node the run has no way to produce.
 ///
-/// The layout is what a viewer places a run's records against, so a name nothing checkpoints is a
+/// The layout is what a viewer places a run's records against, so a name nothing records under is a
 /// box that stays empty forever — a typo and a genuinely missing stage look identical once the run
-/// is drawn. What a run can record under is a stage's id, a stage's governance identity, or one of
-/// the lifecycle identities the run writes itself (`red_team`, `implementer`, `memory`), so those
-/// are what a column may name.
+/// is drawn. A column may therefore only name something a run reports as:
+///
+/// - a stage's **governance identity**, which is what a model turn's `node_start` carries. This is
+///   why the standard layout's `context` column is legal: no stage is called `context`, but
+///   `context_distillation` governs as one.
+/// - a stage's **own id**, which is what the executor checkpoints under — but only for a stage that
+///   checkpoints at all. One the run folds into another stage's record as evidence never appears
+///   under its own name, so `implementer_attempt` and `redteam_author` are boxes nothing could fill.
+/// - a **lifecycle identity** the run writes itself (`red_team`, `implementer`, `memory`).
+///
+/// A name may appear once. Two columns naming it would draw two boxes with one identity, and the
+/// viewer keys nodes by name — the second would overwrite the first's edges and state rather than
+/// appearing beside it.
 pub fn validate_layout(
     layout: &[ratatoskr_script::workflow::WorkflowLayoutColumn],
     stages: &[Stage],
@@ -235,19 +245,27 @@ pub fn validate_layout(
 ) -> Result<(), PlanError> {
     let mut known: BTreeSet<&str> = BTreeSet::new();
     for stage in stages {
-        known.insert(stage.id.as_str());
         known.insert(stage.governance_id());
+        if !policy::folded_as_evidence(&stage.id) {
+            known.insert(stage.id.as_str());
+        }
     }
+    let mut placed: BTreeSet<&str> = BTreeSet::new();
     for column in layout {
         for node in &column.nodes {
-            if known.contains(node.as_str()) || policy::records_checkpoint(node) {
-                continue;
+            if !known.contains(node.as_str()) && !policy::records_checkpoint(node) {
+                return Err(PlanError::Configuration(format!(
+                    "workflow `{workflow}` lays out node `{node}`, which nothing it runs records \
+                     under; nodes that can be drawn: {}",
+                    known.iter().copied().collect::<Vec<_>>().join(", ")
+                )));
             }
-            return Err(PlanError::Configuration(format!(
-                "workflow `{workflow}` lays out node `{node}`, which no stage or operation of it \
-                 provides; nodes that can be drawn: {}",
-                known.iter().copied().collect::<Vec<_>>().join(", ")
-            )));
+            if !placed.insert(node.as_str()) {
+                return Err(PlanError::Configuration(format!(
+                    "workflow `{workflow}` lays out node `{node}` more than once; a run records \
+                     one box under that name, so the later column would replace the earlier"
+                )));
+            }
         }
     }
     Ok(())
