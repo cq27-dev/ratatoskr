@@ -108,7 +108,7 @@ globalThis.stage = Object.freeze(function (id, overrides) {
     }, overrides || {}, { id: id });
 });
 globalThis.__workflow = null;
-globalThis.__workflowRenderers = {};
+globalThis.__workflowRenderers = Object.create(null);
 globalThis.defineWorkflow = function (meta) {
     if (!meta || typeof meta.name !== "string" || meta.name === "") {
         throw new Error("defineWorkflow: `name` is required");
@@ -118,7 +118,7 @@ globalThis.defineWorkflow = function (meta) {
             throw new Error("defineWorkflow: unknown key '" + k + "'");
         }
     }
-    var renderers = {};
+    var renderers = Object.create(null);
     var stages = (meta.stages || []).map(function (stage) {
         if (!stage || typeof stage !== "object") return stage;
         var declared = {};
@@ -155,13 +155,17 @@ globalThis.__workflowMeta = function () {
     // obliges a workflow to call `defineWorkflow`, and a `__workflow` assigned directly reaches
     // here just the same. `questionRenderer` is the serialized form this function produces, so a
     // stage that spells it is refused rather than trusted.
-    var renderers = globalThis.__workflowRenderers || {};
+    var renderers = globalThis.__workflowRenderers || Object.create(null);
     var stages = (meta.stages || []).map(function (stage) {
         if (!stage || typeof stage !== "object") return stage;
         if (stage.questionRenderer !== undefined) {
             throw new Error("stage '" + stage.id + "' declares reserved key 'questionRenderer'; use renderQuestion");
         }
-        var source = renderers[stage.id];
+        // Own properties only: `__workflowRenderers` can be assigned by the workflow, so it
+        // may carry a prototype, and a stage id like `constructor` would inherit a function.
+        var source = Object.prototype.hasOwnProperty.call(renderers, stage.id)
+            ? renderers[stage.id]
+            : undefined;
         if (source === undefined) return stage;
         return Object.assign({}, stage, { questionRenderer: source });
     });
@@ -178,7 +182,7 @@ globalThis.__runEntry = async function (fn, inputJson) {
 /// Deliberately not part of [`BOOTSTRAP`]. These live where renderers run, which is not where
 /// stages are callable — see [`renderer_engine`].
 const RENDERER_BOOTSTRAP: &str = r#"
-globalThis.__stageQuestionRenderers = {};
+globalThis.__stageQuestionRenderers = Object.create(null);
 globalThis.__compileStageQuestionRenderer = function (name, source) {
     var renderer;
     try {
@@ -1450,6 +1454,93 @@ mod tests {
             "plan-v1"
         );
         assert!(runtime.meta().stages[0].question_renderer.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stage id is a repository's own word, so it can collide with `Object.prototype`.
+    ///
+    /// Both renderer tables are keyed by stage id. Built as `{}`, they answer `constructor`,
+    /// `toString` and every other inherited member with a function — so a stage that declared no
+    /// renderer would appear to have one, and the run would die rendering a question for it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stage_named_after_an_inherited_property_has_no_renderer() {
+        let dir = scratch("prototype-named-stage");
+        let runtime = load(
+            &dir,
+            r#"defineWorkflow({
+                 name: "review",
+                 stages: [
+                   { id: "constructor", agent: "reason" },
+                   { id: "toString", agent: "reason" },
+                   {
+                     id: "reviewer",
+                     agent: "reason",
+                     renderQuestion(input) { return `ASKED: ${input.issue}`; },
+                   },
+                 ],
+               });
+               export async function plan(input) {
+                 await constructor(input);
+                 await toString(input);
+                 return await reviewer(input);
+               }"#,
+        )
+        .await;
+
+        // Only `reviewer` declared one; the other two must carry none rather than inherit it.
+        let renderers: HashMap<String, String> = runtime
+            .meta()
+            .stages
+            .iter()
+            .filter_map(|stage| {
+                stage
+                    .question_renderer
+                    .clone()
+                    .map(|source| (stage.id.clone(), source))
+            })
+            .collect();
+        assert_eq!(
+            renderers.keys().collect::<Vec<_>>(),
+            vec!["reviewer"],
+            "only the stage that declared a renderer may have one"
+        );
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut hosts = HashMap::new();
+        for id in ["constructor", "toString", "reviewer"] {
+            let seen = Arc::clone(&calls);
+            hosts.insert(
+                id.to_string(),
+                host(move |arg| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        seen.lock()
+                            .expect("renderer calls mutex poisoned")
+                            .push(serde_json::from_str::<serde_json::Value>(&arg).unwrap());
+                        Ok("{}".to_string())
+                    }
+                }),
+            );
+        }
+        runtime
+            .run_with_question_renderers(
+                "plan",
+                serde_json::json!({ "issue": "keep the contract" }).to_string(),
+                hosts,
+                renderers,
+            )
+            .await
+            .expect("a stage named after an inherited property must run");
+
+        let calls = calls.lock().expect("renderer calls mutex poisoned");
+        assert_eq!(calls.len(), 3);
+        // The two inherited-name stages reach their host with the raw input, unrendered.
+        assert_eq!(calls[0]["issue"], "keep the contract");
+        assert_eq!(calls[1]["issue"], "keep the contract");
+        assert_eq!(
+            calls[2]["__ratatoskrRenderedQuestion"]["question"],
+            "ASKED: keep the contract"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
