@@ -2466,9 +2466,9 @@ async fn park(controller: &Arc<dyn Controller>, node: &str) -> Vec<String> {
 /// in the trait that models the work. Instead the executor creates one ledger per run, hands it to
 /// each node, and drains it when it writes that node's checkpoint.
 ///
-/// Entries are claimed oldest-first per node name, which is what makes the converge loop work: the
-/// implementer runs once per iteration, and each checkpoint takes the turn that preceded it. The
-/// fork's concurrent nodes have different names, so they never contend for the same entry.
+/// A claim takes every entry standing under the node's name, which is what makes the converge loop
+/// work: the implementer runs once per iteration, and each checkpoint takes the turns recorded
+/// since the last one. The fork's concurrent nodes have different names, so they never contend.
 #[derive(Default)]
 pub struct RunLedger {
     entries: Mutex<Vec<(String, NodeTelemetry)>>,
@@ -2486,13 +2486,28 @@ impl RunLedger {
             .push((node.to_string(), telemetry));
     }
 
-    /// Claim the oldest unclaimed entry for `node`, if it made a model turn at all. `None` is
-    /// ordinary for a node that ran no model — it means "nothing to report", not "something went
-    /// missing", which is what [`RunLedger::unclaimed`] is for.
+    /// Claim every unclaimed turn recorded under `node`, folded into one, if it made a model turn
+    /// at all. `None` is ordinary for a node that ran no model — it means "nothing to report", not
+    /// "something went missing", which is what [`RunLedger::unclaimed`] is for.
+    ///
+    /// All of them rather than the oldest, because a checkpoint is not one turn: the red team's
+    /// classifier and its test author both run under `redteam` and share a single record, and a
+    /// node that compacts its history charges the summarising turn to its own name too. Taking one
+    /// left the rest to be silently discarded at the end of the run — see [`NodeTelemetry::fold`]
+    /// for what a row covering several turns says.
     pub fn take(&self, node: &str) -> Option<NodeTelemetry> {
         let mut entries = self.entries.lock().expect("ledger mutex poisoned");
-        let at = entries.iter().position(|(name, _)| name == node)?;
-        Some(entries.remove(at).1)
+        let (claimed, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *entries)
+            .into_iter()
+            .partition(|(name, _)| name == node);
+        *entries = rest;
+        claimed
+            .into_iter()
+            .map(|(_, telemetry)| telemetry)
+            .reduce(|mut folded, next| {
+                folded.fold(next);
+                folded
+            })
     }
 
     /// The names of turns nobody claimed.
@@ -4258,23 +4273,25 @@ mod tests {
         assert!(parse_provider("moonshot").is_ok());
     }
 
-    #[test]
-    fn the_ledger_hands_each_checkpoint_its_own_turn() {
-        let ledger = RunLedger::default();
-        let cost = |n: u64| NodeTelemetry {
+    fn cost(n: u64) -> NodeTelemetry {
+        NodeTelemetry {
             usage: TokenUsage {
                 input_tokens: n,
                 ..Default::default()
             },
             ..Default::default()
-        };
-        // The converge loop runs the implementer repeatedly; each checkpoint must claim the turn
-        // that preceded it, not the newest one.
+        }
+    }
+
+    #[test]
+    fn the_ledger_hands_each_checkpoint_the_turns_recorded_since_the_last_one() {
+        let ledger = RunLedger::default();
+        // The converge loop runs the implementer repeatedly, checkpointing after each attempt; a
+        // checkpoint must claim the turn that preceded it, not the newest one.
         ledger.record("implementer", cost(1));
         ledger.record("redteam", cost(9));
-        ledger.record("implementer", cost(2));
-
         assert_eq!(ledger.take("implementer").unwrap().usage.input_tokens, 1);
+        ledger.record("implementer", cost(2));
         assert_eq!(ledger.take("implementer").unwrap().usage.input_tokens, 2);
         assert!(
             ledger.take("implementer").is_none(),
@@ -4284,6 +4301,25 @@ mod tests {
         assert_eq!(ledger.take("redteam").unwrap().usage.input_tokens, 9);
         // A node that never ran a model turn reports nothing rather than someone else's numbers.
         assert!(ledger.take("bookkeeper").is_none());
+    }
+
+    #[test]
+    fn one_checkpoint_claims_every_turn_that_ran_under_its_name() {
+        let ledger = RunLedger::default();
+        // The red team's two halves both run under `redteam` and share one checkpoint; so does a
+        // node's compaction turn. All of it is charged to the row, or the run underreports what it
+        // spent by however many turns the claim left behind.
+        ledger.record("redteam", cost(9));
+        ledger.record("redteam", cost(5));
+        ledger.record("implementer", cost(1));
+
+        assert_eq!(ledger.take("redteam").unwrap().usage.input_tokens, 14);
+        assert!(ledger.take("redteam").is_none());
+        assert_eq!(
+            ledger.unclaimed(),
+            ["implementer"],
+            "another node's turn is not swept up by the claim"
+        );
     }
 
     #[test]

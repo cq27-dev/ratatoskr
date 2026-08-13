@@ -3321,6 +3321,28 @@ mod tests {
         }
     }
 
+    /// A stage turn that charges the run's ledger the way a live one does, so what a checkpoint
+    /// reports about cost can be asserted without spending a model turn.
+    struct ChargingStageTurn {
+        output: String,
+        telemetry: ratatoskr_core::NodeTelemetry,
+    }
+
+    impl StageTurn for ChargingStageTurn {
+        fn run<'a>(
+            &'a self,
+            run: ratatoskr_agent::NodeRun<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, ratatoskr_agent::AgentError>> + Send + 'a>>
+        {
+            run.ledger
+                .as_ref()
+                .expect("the executor charges every turn to the run's ledger")
+                .record(run.node, self.telemetry.clone());
+            let output = self.output.clone();
+            Box::pin(async move { Ok(output) })
+        }
+    }
+
     struct SequencedStageTurn {
         outputs: Mutex<VecDeque<String>>,
         runs: Mutex<Vec<ObservedStageRun>>,
@@ -7766,6 +7788,147 @@ mod tests {
         assert_eq!(
             checkpoint_classifier.raw_output,
             "assertion failed: deleted > 0"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_run_with_both_red_team_halves_reports_what_both_of_them_cost() {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-redteam-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let author_root = dir.join("implementer-tree");
+        std::fs::create_dir_all(&author_root).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-redteam-cost", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "redteam".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-redteam-cost",
+            "add Store::prune",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+
+        // A run that enables the red team enables both halves, and both spend a turn before the
+        // one `redteam` record is written. They resolve their route through their own agent
+        // profile — `build` for the author, `reason` for the classifier — so the models they run
+        // on can genuinely differ.
+        let author = ChargingStageTurn {
+            output: json!({ "files": [], "tests": [], "covers": "no interface" }).to_string(),
+            telemetry: ratatoskr_core::NodeTelemetry {
+                model: Some("anthropic/author-model".to_string()),
+                duration_ms: Some(200),
+                usage: ratatoskr_core::TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 200,
+                    ..Default::default()
+                },
+                turns: Some(2),
+                tools: vec!["Write".to_string()],
+                ..Default::default()
+            },
+        };
+        evaluate_standard_stage_with_resources_and_turn(
+            Arc::clone(&ctx),
+            "redteam_author",
+            serde_json::to_string(&crate::redteam::TestAuthorInput {
+                issue: "add Store::prune".to_string(),
+                interface: Vec::new(),
+            })
+            .unwrap(),
+            StandardStageResources {
+                resource_root: author_root,
+                capability_ceiling: ratatoskr_core::Capability::Write,
+                rag_rat_worktree: None,
+                shell: None,
+                publish: None,
+                clarifier: None,
+                guidance: None,
+            },
+            Arc::new(author),
+        )
+        .await
+        .unwrap();
+        let classifier = ChargingStageTurn {
+            output: json!({ "classifications": [] }).to_string(),
+            telemetry: ratatoskr_core::NodeTelemetry {
+                model: Some("anthropic/classifier-model".to_string()),
+                duration_ms: Some(100),
+                usage: ratatoskr_core::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 100,
+                    ..Default::default()
+                },
+                turns: Some(1),
+                tools: vec!["semantic_search".to_string()],
+                ..Default::default()
+            },
+        };
+        evaluate_standard_stage_with_turn(
+            Arc::clone(&ctx),
+            "redteam_classifier",
+            serde_json::to_string(&crate::redteam::ClassifierInput {
+                failing: vec!["store::tests::prune_zero".to_string()],
+                raw_output: "assertion failed: deleted > 0".to_string(),
+            })
+            .unwrap(),
+            Arc::new(classifier),
+        )
+        .await
+        .unwrap();
+
+        note(
+            &ctx,
+            "redteam",
+            &red(&["store::tests::prune_zero"], &["store::tests::prune"], 1),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let checkpoints = store.checkpoints_for_run("run-redteam-cost").await.unwrap();
+        let telemetry = &checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.node_name == "redteam")
+            .expect("the red team is checkpointed under `redteam`")
+            .telemetry;
+        assert_eq!(
+            telemetry.usage.input_tokens, 30,
+            "the record accounts for both halves, not whichever one recorded first"
+        );
+        assert_eq!(telemetry.usage.output_tokens, 300);
+        assert_eq!(telemetry.turns, Some(3));
+        assert_eq!(telemetry.duration_ms, Some(300));
+        // Neither route is asserted to be the one the node ran on: both are named, because both
+        // ran and the row covers both.
+        assert_eq!(
+            telemetry.model.as_deref(),
+            Some("anthropic/author-model, anthropic/classifier-model")
+        );
+        assert_eq!(telemetry.tools, ["Write", "semantic_search"]);
+        assert!(
+            ctx.ledger.unclaimed().is_empty(),
+            "nothing the red team spent is left for the run to discard"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

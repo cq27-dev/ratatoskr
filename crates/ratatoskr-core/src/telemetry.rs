@@ -49,6 +49,9 @@ impl TokenUsage {
 /// Every field is what actually happened rather than what was configured: `model` is the resolved
 /// route, not the config alias that selected it, so a checkpoint stays readable after the alias is
 /// repointed at a different model.
+///
+/// A checkpoint may cover more than one turn — see [`NodeTelemetry::fold`] — in which case each
+/// field is what that doc says it is across all of them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeTelemetry {
     /// The resolved route as `provider/model`.
@@ -89,4 +92,130 @@ pub struct NodeTelemetry {
     /// endpoint decides, and several turn it on as soon as a request carries tools.
     #[serde(default)]
     pub thinking: bool,
+}
+
+impl NodeTelemetry {
+    /// Fold another turn recorded under the same node into this one.
+    ///
+    /// One checkpoint can cover several model turns: the red team's classifier and its test author
+    /// both run under `redteam`, and any node whose history is compacted charges the summarising
+    /// turn to its own name. Keeping one of them and dropping the rest reported less than the run
+    /// paid, and which one survived depended on the order they happened to finish in.
+    ///
+    /// The measurements sum. `duration_ms` sums with them, so on a folded row it is time spent on
+    /// this node's model calls rather than a wall-clock span — two turns that ran concurrently
+    /// spent both, and folded turns keep no start instant to reconstruct a span from.
+    ///
+    /// `model` names every distinct route it folded, comma-joined, rather than asserting one of
+    /// them: the halves of a node resolve their route through their own agent profile, so they
+    /// genuinely can differ. Emptying it on disagreement would be worse than the lie it avoids — a
+    /// null model reads as "this node ran no model", and readers drop the whole row's cost with it.
+    ///
+    /// `tools` is the union, which is the node's reach across the turns and not what any single one
+    /// was offered; per-turn fidelity needs per-stage records (#259/#260), not a different summary
+    /// here. `error` keeps every distinct failure, because a half whose failure is swallowed as
+    /// best-effort is exactly the one nothing else in the run records.
+    pub fn fold(&mut self, other: NodeTelemetry) {
+        self.usage.add(other.usage);
+        self.turns = sum(self.turns, other.turns);
+        self.duration_ms = sum(self.duration_ms, other.duration_ms);
+        self.model = join(self.model.take(), other.model, ", ");
+        self.error = join(self.error.take(), other.error, "; ");
+        extend_distinct(&mut self.tools, other.tools);
+        extend_distinct(&mut self.tools_used, other.tools_used);
+        self.reuses_session |= other.reuses_session;
+        self.thinking |= other.thinking;
+    }
+}
+
+/// `None` only when neither turn reported the figure at all: a turn that reported nothing is not a
+/// turn that reported zero, and one that did must not be erased by one that did not.
+fn sum(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (None, None) => None,
+        _ => Some(left.unwrap_or_default() + right.unwrap_or_default()),
+    }
+}
+
+/// Append `incoming` unless the same value is already named, so folding two turns on one model
+/// leaves one name rather than the same one twice.
+fn join(existing: Option<String>, incoming: Option<String>, separator: &str) -> Option<String> {
+    let Some(incoming) = incoming else {
+        return existing;
+    };
+    let Some(existing) = existing else {
+        return Some(incoming);
+    };
+    match existing.split(separator).any(|part| part == incoming) {
+        true => Some(existing),
+        false => Some(format!("{existing}{separator}{incoming}")),
+    }
+}
+
+fn extend_distinct(into: &mut Vec<String>, from: Vec<String>) {
+    for name in from {
+        if !into.contains(&name) {
+            into.push(name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn turn(model: &str, input_tokens: u64) -> NodeTelemetry {
+        NodeTelemetry {
+            model: Some(model.to_string()),
+            duration_ms: Some(100),
+            usage: TokenUsage {
+                input_tokens,
+                ..Default::default()
+            },
+            turns: Some(1),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_folded_row_accounts_for_every_turn_it_covers() {
+        let mut folded = NodeTelemetry {
+            tools: vec!["Read".to_string(), "Write".to_string()],
+            error: Some("the author gave up".to_string()),
+            thinking: true,
+            ..turn("anthropic/opus", 10)
+        };
+        folded.fold(NodeTelemetry {
+            tools: vec!["Read".to_string(), "semantic_search".to_string()],
+            ..turn("openai/gpt", 20)
+        });
+
+        assert_eq!(folded.usage.input_tokens, 30);
+        assert_eq!(folded.turns, Some(2));
+        assert_eq!(folded.duration_ms, Some(200));
+        // Both routes named, because the two turns genuinely resolved different ones. Picking one
+        // would depend on which finished first, and naming none takes the cost off the dashboard.
+        assert_eq!(folded.model.as_deref(), Some("anthropic/opus, openai/gpt"));
+        assert_eq!(folded.tools, ["Read", "Write", "semantic_search"]);
+        // A best-effort half's failure survives its checkpoint; nothing else records it.
+        assert_eq!(folded.error.as_deref(), Some("the author gave up"));
+        assert!(folded.thinking);
+    }
+
+    #[test]
+    fn folding_two_turns_on_one_model_names_it_once() {
+        let mut folded = turn("anthropic/opus", 10);
+        folded.fold(turn("anthropic/opus", 5));
+        assert_eq!(folded.model.as_deref(), Some("anthropic/opus"));
+        assert_eq!(folded.usage.input_tokens, 15);
+    }
+
+    #[test]
+    fn a_figure_nothing_reported_stays_unreported() {
+        let mut folded = NodeTelemetry::default();
+        folded.fold(NodeTelemetry::default());
+        assert_eq!(folded.turns, None, "no turn reported a count");
+        assert_eq!(folded.duration_ms, None);
+        assert_eq!(folded.model, None);
+    }
 }

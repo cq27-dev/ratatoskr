@@ -101,7 +101,10 @@ function NodeFacts({
   const cycles = telemetry?.turns ?? live?.cycles ?? null;
   const groups = TOOL_GROUPS.filter((g) => tools.some(g.match));
   const ungrouped = tools.filter((t) => !TOOL_GROUPS.some((g) => g.match(t)));
-  const model = modelFull?.split("/").pop() ?? "—";
+  // A node whose record covers more than one turn names every route it ran on, comma-separated —
+  // the red team's two halves resolve theirs separately. Shorten each, or the split swallows all
+  // but the last and the box asserts one of them.
+  const model = modelFull?.split(", ").map((m) => m.split("/").pop()).join(", ") ?? "—";
   const tokens = telemetry
     ? `${short(telemetry.input_tokens + telemetry.cached_input_tokens)} in / ${short(telemetry.output_tokens)} out`
     : "—";
