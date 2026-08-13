@@ -31,7 +31,8 @@ use rquickjs::loader::{BuiltinLoader, BuiltinResolver};
 use rquickjs::module::Evaluated;
 use rquickjs::promise::{Promise, Promised};
 use rquickjs::{
-    AsyncContext, AsyncRuntime, CatchResultExt, Ctx, Exception, Function, Module, Object, Value,
+    AsyncContext, AsyncRuntime, CatchResultExt, Context, Ctx, Exception, Function, Module, Object,
+    Runtime, Value,
 };
 
 use crate::ScriptError;
@@ -108,25 +109,6 @@ globalThis.stage = Object.freeze(function (id, overrides) {
 });
 globalThis.__workflow = null;
 globalThis.__workflowRenderers = {};
-globalThis.__stageQuestionRenderers = {};
-globalThis.__compileStageQuestionRenderer = function (name, source) {
-    var renderer;
-    try {
-        renderer = (0, eval)("(" + source + ")");
-    } catch (firstError) {
-        // Function.prototype.toString preserves object-method shorthand. It needs `function` when
-        // installed into another workflow runtime, while arrows and function expressions do not.
-        try {
-            renderer = (0, eval)("(function " + source + ")");
-        } catch (error) {
-            throw new Error("stage '" + name + "' renderQuestion could not be loaded: " + error);
-        }
-    }
-    if (typeof renderer !== "function") {
-        throw new Error("stage '" + name + "' renderQuestion must be a function");
-    }
-    return renderer;
-};
 globalThis.defineWorkflow = function (meta) {
     if (!meta || typeof meta.name !== "string" || meta.name === "") {
         throw new Error("defineWorkflow: `name` is required");
@@ -188,6 +170,32 @@ globalThis.__workflowMeta = function () {
 globalThis.__runEntry = async function (fn, inputJson) {
     var out = await fn(JSON.parse(inputJson));
     return JSON.stringify(out === undefined ? null : out);
+};
+"#;
+
+/// The renderer engine's whole prelude: the table and the compiler that fills it.
+///
+/// Deliberately not part of [`BOOTSTRAP`]. These live where renderers run, which is not where
+/// stages are callable — see [`renderer_engine`].
+const RENDERER_BOOTSTRAP: &str = r#"
+globalThis.__stageQuestionRenderers = {};
+globalThis.__compileStageQuestionRenderer = function (name, source) {
+    var renderer;
+    try {
+        renderer = (0, eval)("(" + source + ")");
+    } catch (firstError) {
+        // Function.prototype.toString preserves object-method shorthand. It needs `function` when
+        // installed into another workflow runtime, while arrows and function expressions do not.
+        try {
+            renderer = (0, eval)("(function " + source + ")");
+        } catch (error) {
+            throw new Error("stage '" + name + "' renderQuestion could not be loaded: " + error);
+        }
+    }
+    if (typeof renderer !== "function") {
+        throw new Error("stage '" + name + "' renderQuestion must be a function");
+    }
+    return renderer;
 };
 "#;
 
@@ -309,13 +317,6 @@ pub struct WorkflowRuntime {
     context: AsyncContext,
     /// Kept alive with the runtime whose interrupt handler reads it.
     budget: Arc<Budget>,
-    /// Set while a question renderer is running, and read by every stage call this context can
-    /// make. A renderer is repository JavaScript that a Rust-driven stage turn installs alongside
-    /// one host, so a renderer that could call a stage would buy model turns off an invocation no
-    /// JavaScript composed — turns nothing checkpoints, counts or audits. The flag is Rust's rather
-    /// than a global because a renderer owns `globalThis`, and it belongs to the context rather
-    /// than to one call so a wrapper left over from an earlier call is not a way around it.
-    rendering: Arc<std::sync::atomic::AtomicBool>,
     /// The name the workflow module is declared under — its path, or the bundled workflow's name.
     /// It is what an unresolved `import` names as the importing module, so it has to be the thing
     /// the author would go and edit.
@@ -356,7 +357,6 @@ impl WorkflowRuntime {
             runtime,
             context,
             budget,
-            rendering: Arc::default(),
             module_name: name.into(),
             source: source.into_boxed_str(),
             meta: Box::new(meta),
@@ -410,7 +410,6 @@ impl WorkflowRuntime {
             runtime,
             context,
             budget,
-            rendering: Arc::default(),
             module_name: module_name.into(),
             source: loaded.javascript.into_boxed_str(),
             meta: Box::new(meta),
@@ -536,8 +535,8 @@ impl WorkflowRuntime {
     ///
     /// A renderer runs synchronously, from Rust, before its host. It receives the original
     /// structured input and may return only a string; the host still owns the model call, output
-    /// validation, checkpointing, telemetry and every workflow gate. It may not call a stage: a
-    /// renderer is repository JavaScript, and a Rust-driven stage turn is not its to compose.
+    /// validation, checkpointing, telemetry and every workflow gate. It cannot call a stage: it
+    /// runs in [`renderer_engine`], where no stage exists to call.
     ///
     /// The map is installed exactly: a stage absent from it runs with no renderer and receives its
     /// structured input. Anything else would let a renderer left over from an earlier call — the
@@ -558,11 +557,14 @@ impl WorkflowRuntime {
             check_renderer_source(&self.module_name, stage, renderer)?;
         }
 
+        // Built here, outside the workflow's engine, and built fresh for this call: the table is
+        // this call's exactly, and a renderer left behind by an earlier one has nowhere to live.
+        let renderers = renderer_engine(&self.module_name, &self.budget, &question_renderers)?;
+
         let module_name = self.module_name.to_string();
         let source = self.source.to_string();
         let entry = entry.to_string();
         let budget = Arc::clone(&self.budget);
-        let rendering = Arc::clone(&self.rendering);
 
         within(
             &self.module_name,
@@ -582,24 +584,6 @@ impl WorkflowRuntime {
                     ))
                 })?;
 
-                // Cleared, not merged into: the context outlives one call and module evaluation is
-                // free to declare renderers of its own.
-                ctx.eval::<(), _>("globalThis.__stageQuestionRenderers = {};")
-                    .catch(&ctx)
-                    .map_err(|e| ScriptError::Eval(format!("{e}")))?;
-
-                for (name, source) in question_renderers {
-                    let install = format!(
-                        "globalThis.__stageQuestionRenderers[{name:?}] = \
-                         globalThis.__compileStageQuestionRenderer({name:?}, {});",
-                        serde_json::to_string(&source)
-                            .expect("a renderer source string always serializes")
-                    );
-                    ctx.eval::<(), _>(install)
-                        .catch(&ctx)
-                        .map_err(|e| ScriptError::Eval(format!("{e}")))?;
-                }
-
                 let wrap: Function = ctx
                     .eval(HOST_WRAPPER)
                     .catch(&ctx)
@@ -608,10 +592,11 @@ impl WorkflowRuntime {
                 for (name, hostfn) in hosts {
                     let hf = hostfn.clone();
                     let host_budget = Arc::clone(&budget);
-                    let rendering = Arc::clone(&rendering);
+                    let renderers = renderers.clone();
                     let stage = name.clone();
                     let call = Function::new(ctx.clone(), move |x: Value<'_>| {
-                        let arg = host_input(&x.ctx().clone(), &stage, &rendering, x.clone())?;
+                        let arg =
+                            host_input(&x.ctx().clone(), &stage, renderers.as_ref(), x.clone())?;
                         let hf = hf.clone();
                         // A host call is Rust's time, not the workflow's: the clock stops for as
                         // long as one is outstanding and restarts when the last returns.
@@ -723,22 +708,15 @@ fn declaration_error(module_name: &str, raw: &str, error: serde_json::Error) -> 
 /// What `stage`'s host receives for the call argument `x`, as JSON.
 ///
 /// A stage with a declared renderer gets the rendered envelope; one without gets its structured
-/// input. Rendering happens here, on the near side of the host, for two reasons: the renderer must
-/// run before the host is awaited (it writes the question the turn asks), and the ceiling below —
-/// no stage call from inside a renderer — has to be a fact Rust holds. A renderer is repository
-/// JavaScript with `globalThis` to itself, so a flag it can see is a flag it can clear.
+/// input. Rendering happens here, on the near side of the host, because the renderer must run
+/// before the host is awaited — it writes the question the turn asks — and it happens in
+/// `renderers`, a separate engine, because that is where a stage is not callable.
 fn host_input<'js>(
     ctx: &Ctx<'js>,
     stage: &str,
-    rendering: &std::sync::atomic::AtomicBool,
+    renderers: Option<&Context>,
     x: Value<'js>,
 ) -> rquickjs::Result<String> {
-    if rendering.load(Ordering::Relaxed) {
-        return Err(Exception::throw_message(
-            ctx,
-            &format!("stage '{stage}' must not be invoked from a renderQuestion"),
-        ));
-    }
     // What an argumentless call passes. `JSON.stringify(undefined)` is not JSON, so the host would
     // otherwise see nothing rather than an explicit absence.
     let input = if x.is_undefined() {
@@ -747,21 +725,16 @@ fn host_input<'js>(
         x
     };
 
-    let renderers: Object = ctx.globals().get("__stageQuestionRenderers")?;
-    let Some(renderer) = renderers.get::<_, Option<Function>>(stage)? else {
+    let Some(renderers) = renderers else {
         return stringify(ctx, input);
     };
-
-    rendering.store(true, Ordering::Relaxed);
-    let question = renderer.call::<_, Value>((input.clone(),));
-    rendering.store(false, Ordering::Relaxed);
-    let question = question?;
-    if !question.is_string() {
-        return Err(Exception::throw_message(
-            ctx,
-            &format!("stage '{stage}' renderQuestion must return a string"),
-        ));
-    }
+    // The marshaling the isolation costs, and all of it: a renderer takes JSON-able input and
+    // returns a string, so nothing has to cross as a live object.
+    let Some(question) = render(renderers, stage, &stringify(ctx, input.clone())?)
+        .map_err(|message| Exception::throw_message(ctx, &message))?
+    else {
+        return stringify(ctx, input);
+    };
 
     let rendered = Object::new(ctx.clone())?;
     rendered.set("input", input)?;
@@ -769,6 +742,88 @@ fn host_input<'js>(
     let envelope = Object::new(ctx.clone())?;
     envelope.set("__ratatoskrRenderedQuestion", rendered)?;
     stringify(ctx, envelope.into_value())
+}
+
+/// Run `stage`'s renderer over `input_json` in `renderers`, or `None` if it declares none.
+///
+/// Errors come back as text rather than as a `Value`: an exception belongs to the engine that
+/// threw it, and this one is not the engine the caller is in.
+fn render(renderers: &Context, stage: &str, input_json: &str) -> Result<Option<String>, String> {
+    renderers.with(|ctx| {
+        let table: Object = ctx
+            .globals()
+            .get("__stageQuestionRenderers")
+            .map_err(|e| e.to_string())?;
+        let Some(renderer) = table
+            .get::<_, Option<Function>>(stage)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        let input = ctx.json_parse(input_json).map_err(|e| e.to_string())?;
+        let question: Value = renderer
+            .call((input,))
+            .catch(&ctx)
+            .map_err(|e| e.to_string())?;
+        match question.as_string() {
+            Some(text) => text.to_string().map(Some).map_err(|e| e.to_string()),
+            None => Err(format!(
+                "stage '{stage}' renderQuestion must return a string"
+            )),
+        }
+    })
+}
+
+/// The engine a question renderer runs in: the renderer table and nothing else — no stage
+/// wrappers, at any depth and at any time.
+///
+/// Isolation by absence rather than by a check on when a stage may be called. A renderer is
+/// repository JavaScript, and JavaScript can always defer: a continuation a renderer queues runs
+/// after every frame that could have gated it, against globals that outlive the call, and its own
+/// continuations after that. No synchronous fact about the renderer bounds what a continuation
+/// reaches. What does is an engine where the capability was never installed, so `stage(x)` from any
+/// continuation at any depth is a `ReferenceError` into a promise nobody holds — and where a queued
+/// job never runs at all, because [`Context::with`] does not pump one.
+///
+/// Its own engine rather than a second context on the workflow's, so entering it from inside a
+/// native call — which already holds the workflow engine's lock — cannot deadlock. It shares the
+/// workflow's [`Budget`], because a render *is* part of the stretch of workflow JavaScript that
+/// asked for it, and the same memory and stack ceilings, because it runs the same kind of code.
+///
+/// `Ok(None)` when nothing declares a renderer: a run with no renderers builds no engine.
+fn renderer_engine(
+    workflow: &str,
+    budget: &Arc<Budget>,
+    renderers: &HashMap<String, String>,
+) -> Result<Option<Context>, ScriptError> {
+    if renderers.is_empty() {
+        return Ok(None);
+    }
+    let fail = |e: rquickjs::Error| ScriptError::Eval(format!("workflow `{workflow}`: {e}"));
+    let runtime = Runtime::new().map_err(fail)?;
+    runtime.set_memory_limit(MEMORY_LIMIT);
+    runtime.set_max_stack_size(MAX_STACK_SIZE);
+    let watched = Arc::clone(budget);
+    runtime.set_interrupt_handler(Some(Box::new(move || watched.expired())));
+    let context = Context::full(&runtime).map_err(fail)?;
+
+    context.with(|ctx| {
+        ctx.eval::<(), _>(RENDERER_BOOTSTRAP)
+            .catch(&ctx)
+            .map_err(|e| ScriptError::Eval(format!("workflow `{workflow}`: {e}")))?;
+        for (name, source) in renderers {
+            let install = format!(
+                "globalThis.__stageQuestionRenderers[{name:?}] = \
+                 globalThis.__compileStageQuestionRenderer({name:?}, {});",
+                serde_json::to_string(source).expect("a renderer source string always serializes")
+            );
+            ctx.eval::<(), _>(install)
+                .catch(&ctx)
+                .map_err(|e| ScriptError::Eval(format!("workflow `{workflow}`: {e}")))?;
+        }
+        Ok(())
+    })?;
+    Ok(Some(context))
 }
 
 /// The engine's own `JSON.stringify`, which is not the global a workflow could replace.
@@ -1584,6 +1639,98 @@ export async function plan(i) { return { entryRan: true }; }
             calls[0]["__ratatoskrRenderedQuestion"]["input"]["issue"],
             "keep the contract"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_renderer_cannot_defer_a_stage_call_to_after_it_returns() {
+        // The renderer returns an ordinary string and leaves a queued job behind. The job runs on
+        // the microtask queue, after the renderer's frame is gone, against wrappers that stay on
+        // `globalThis` for the whole run — so nothing about *when* a renderer is on the stack can
+        // bound what it reaches. Each forged turn renders in turn, and that renderer queues the
+        // next: the reachability is recursive, not one extra call.
+        //
+        // `verify` answers in a millisecond while the legitimate `review` turn takes 200 — a real
+        // model turn's proportions — so every forged turn is long finished when the entry returns
+        // and the outstanding-host refusal is not what could save this.
+        let dir = scratch("renderer-deferred-call");
+        let runtime = load(
+            &dir,
+            r#"defineWorkflow({
+                 name: "review",
+                 stages: [
+                   {
+                     id: "review",
+                     agent: "reason",
+                     renderQuestion(input) {
+                       Promise.resolve().then(() => globalThis.verify({ forged: 1 }));
+                       return "ORDINARY QUESTION";
+                     },
+                   },
+                   {
+                     id: "verify",
+                     agent: "reason",
+                     renderQuestion(input) {
+                       const depth = (input.forged || 0) + 1;
+                       if (depth <= 3) {
+                         Promise.resolve().then(() => globalThis.verify({ forged: depth }));
+                       }
+                       return "FORGED QUESTION";
+                     },
+                   },
+                 ],
+               });
+               export async function plan(input) {
+                 return await review(input);
+               }"#,
+        )
+        .await;
+
+        let turns = |name: &str| {
+            let counted = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&counted);
+            let delay = if name == "review" { 200 } else { 1 };
+            let host: HostFn = host(move |_| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    Ok("{}".to_string())
+                }
+            });
+            (counted, host)
+        };
+        let (reviews, review) = turns("review");
+        let (forged, verify) = turns("verify");
+        let hosts = HashMap::from([
+            ("review".to_string(), review),
+            ("verify".to_string(), verify),
+        ]);
+
+        let renderers: HashMap<String, String> = runtime
+            .meta()
+            .stages
+            .iter()
+            .map(|stage| {
+                (
+                    stage.id.clone(),
+                    stage.question_renderer.clone().expect("declared renderer"),
+                )
+            })
+            .collect();
+        let _ = runtime
+            .run_with_question_renderers(
+                "plan",
+                serde_json::json!({ "issue": "keep the contract" }).to_string(),
+                hosts,
+                renderers,
+            )
+            .await;
+
+        // The turn count is the assertion. A refused entry says a route was closed *after* the
+        // model turns were already bought; zero forged turns says the capability was never there.
+        assert_eq!(forged.load(Ordering::Relaxed), 0, "forged stage turns");
+        assert_eq!(reviews.load(Ordering::Relaxed), 1, "legitimate stage turns");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
