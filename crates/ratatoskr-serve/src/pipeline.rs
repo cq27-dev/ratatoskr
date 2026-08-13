@@ -402,7 +402,11 @@ pub fn derive_with(
     out
 }
 
-/// What a node that has checkpointed is doing, wherever it sits.
+/// What a node whose OWN record exists is doing, wherever it sits.
+///
+/// Its own, not a member's. A composed box's aggregate is written after its stages have run, so a
+/// member's row proves the box started and nothing more — see [`append_unknown`], which is the only
+/// place a box can be reached through a member and reads that case for itself.
 ///
 /// A checkpoint proves the node completed something — but the implementer is checkpointed once per
 /// converge iteration, so while the run is live one of its checkpoints says the opposite of
@@ -472,12 +476,29 @@ fn append_unknown(
     for (i, (name, first)) in extra.into_iter().enumerate() {
         let times = node_times(checkpoints, name);
         let stages = recorded.members(name);
+        // `Done` means the box's OWN record exists. A box arrives here because something it
+        // composes checkpointed, and that may be a member rather than the box: the red team's
+        // classifier finishes while its author is still writing tests, and the aggregate its host
+        // writes lands after both. Reading a member's row as the box's completion reports it done
+        // with no checkpoints of its own, which hides its controls while it is still working.
+        //
+        // With only members recorded, a live run has the box mid-flight — that is what a member
+        // having finished and the aggregate not having landed means. A stopped one never completed
+        // it, and which of failed, stopped and abandoned that was is not something these records
+        // carry, so nothing is claimed: `Idle` is this derivation's answer wherever the evidence
+        // does not name one, as it is for an unattributable failure above. A client holding the
+        // event stream answers it properly, from the node left working with nothing after it.
+        let state = match (times.is_empty(), terminal) {
+            (false, _) => checkpointed_state(name, terminal),
+            (true, false) => NodeState::Working,
+            (true, true) => NodeState::Idle,
+        };
         out.push(NodeView {
             telemetry: NodeTelemetryView::totalled(checkpoints, &stages),
             planned: PlannedNode::of(config, &stages, recorded),
             caller: caller_of(checkpoints, first),
             name: name.to_string(),
-            state: checkpointed_state(name, terminal),
+            state,
             stage: base + i,
             lane: 0,
             shaped: false,
@@ -762,6 +783,52 @@ mod tests {
         // The box's own record is what says how many times it ran, exactly as for a placed one:
         // the members' rows are turns inside it, not repeats of it.
         assert_eq!(view(&views, "redteam").checkpoints, 1);
+    }
+
+    #[test]
+    fn a_box_is_done_only_once_its_own_record_exists() {
+        // A box reaches `append_unknown` because SOMETHING it composes checkpointed, and that may
+        // be a member: the red team's classifier finishes while its author is still writing tests,
+        // and the aggregate its host writes lands after both. Reading a member's row as the box's
+        // completion reports `done` with `checkpoints: 0` — a client without usable event history
+        // then hides the box's controls and calls it finished while it is still working.
+        let unplaced = serde_json::to_string(&ratatoskr_core::shape::Recorded {
+            nodes: Vec::new(),
+            stages: registry_of(STANDARD_COLUMNS, STANDARD_COMPOSED),
+        })
+        .unwrap();
+        let midway = [cp("redteam_classifier", "t1")];
+        let live = derive_with(Some("running"), &midway, None, Some(&unplaced));
+        assert_eq!(
+            view(&live, "redteam").state,
+            NodeState::Working,
+            "a member has recorded and the box has not, on a run that is still going"
+        );
+        assert_eq!(view(&live, "redteam").checkpoints, 0);
+
+        // The aggregate lands and the box is done, by its own record.
+        let whole = [cp("redteam_classifier", "t1"), cp("redteam", "t2")];
+        assert_eq!(
+            state_of(
+                &derive_with(Some("running"), &whole, None, Some(&unplaced)),
+                "redteam"
+            ),
+            NodeState::Done
+        );
+
+        // And a run that STOPPED there never finished the box either. Which of failed, stopped and
+        // abandoned it was is not in the record, so nothing is claimed — but `done` is the one
+        // answer the record rules out.
+        for status in ["converged", "failed", "abandoned"] {
+            assert_eq!(
+                state_of(
+                    &derive_with(Some(status), &midway, None, Some(&unplaced)),
+                    "redteam"
+                ),
+                NodeState::Idle,
+                "a `{status}` run with only a member's row did not complete the box"
+            );
+        }
     }
 
     #[test]
