@@ -6,6 +6,7 @@ import {
   forkHandoff,
   handoffDrawn,
   inNodeBoxes,
+  liveNodes,
   nodesFromEvents,
   stagesOf,
   workingNodeNames,
@@ -570,6 +571,39 @@ test("a re-entry is counted from the box, whichever stage announced it", () => {
   ];
   expect(convergeLoops(events)).toEqual({ fix: 0, replan: 0, retry: 0 });
   expect(convergeLoops(inNodeBoxes(events, stages))).toEqual({ fix: 1, replan: 0, retry: 0 });
+});
+
+test("the live map is keyed by the box, so the box draws with what its member announced", () => {
+  // The pre-checkpoint window again, from the other side. `PipelineGraph` asks `live.get(box)`, so
+  // a map folded from the raw stream is keyed by the member and the box draws with no model, no
+  // tools and no cycle count for as long as the member is the one running — which is the whole of
+  // that window.
+  const stages = registry(["context", "context_distillation"]);
+  const announced = {
+    at: "2026-08-12T10:00:00Z",
+    kind: "node_start",
+    node: "context_distillation",
+    detail: "",
+    facts: { model: "anthropic/claude-sonnet-5", tools: ["Read"], thinking: true, reuses_session: false },
+  };
+  const called = {
+    at: "2026-08-12T10:00:01Z",
+    kind: "tool_call",
+    node: "context_distillation",
+    detail: "Read",
+  };
+  const events = [announced, called];
+
+  const raw = liveNodes(events);
+  expect([...raw.keys()]).toEqual(["context_distillation"]);
+  expect(raw.get("context")).toBeUndefined();
+
+  const boxed = liveNodes(inNodeBoxes(events, stages));
+  expect([...boxed.keys()]).toEqual(["context"]);
+  const box = boxed.get("context");
+  expect(box.facts.model).toBe("anthropic/claude-sonnet-5");
+  expect(box.cycles).toBe(1);
+  expect([...box.used]).toEqual(["Read"]);
 });
 
 test("a control is aimed at the box the stage runs inside", () => {

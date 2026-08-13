@@ -18,7 +18,7 @@ import {
 import { Brain, Infinity as InfinityIcon, Repeat, Wrench } from "lucide-react";
 import { TOOL_GROUPS } from "../ui/tools";
 import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode } from "../api";
-import { forkHandoff, handoffDrawn, type ConvergeLoops } from "../derive";
+import { forkHandoff, handoffDrawn, type ConvergeLoops, type LiveNode } from "../derive";
 
 /*
  * Positions are computed from the `stage` and `lane` the server sends with each node, not from a
@@ -451,14 +451,6 @@ function FitToPane({ count, moved }: { count: number; moved: boolean }) {
 
 const nodeTypes = { pipeline: PipelineNode };
 const edgeTypes = { converge: ConvergeEdge, backloop: BackLoopEdge };
-
-/** What a node has said about itself so far, before it has checkpointed anything. */
-export interface LiveNode {
-  facts?: NodeFacts;
-  cycles: number;
-  /** Tools called so far in this attempt. */
-  used: Set<string>;
-}
 
 interface Props {
   /**

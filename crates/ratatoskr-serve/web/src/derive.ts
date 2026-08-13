@@ -1,4 +1,12 @@
-import type { LiveEvent, NodeState, NodeTelemetry, NodeView, RunStage, RunStatus } from "./api";
+import type {
+  LiveEvent,
+  NodeFacts,
+  NodeState,
+  NodeTelemetry,
+  NodeView,
+  RunStage,
+  RunStatus,
+} from "./api";
 
 /**
  * A run's node state, rebuilt from its event stream.
@@ -299,6 +307,46 @@ export function inNodeBoxes(
     const drawn = e.node ? box.get(e.node) : undefined;
     return drawn ? { ...e, node: drawn } : e;
   });
+}
+
+/**
+ * What each node announced when it started, plus the tools it has reached for since.
+ *
+ * A checkpoint carries the same facts and carries them better, but only once the node has stopped.
+ * This is what fills a box while it works, and it is the only source there is for the whole of that
+ * window.
+ *
+ * Feed it the stream READ AS BOXES, exactly as `nodesFromEvents` is fed. A member announces itself
+ * under its own id, so a map built from the raw stream is keyed by `context_distillation` while the
+ * graph asks it for `context` — and the box then draws with no model, no tools and no cycle count
+ * for as long as the member is the one running.
+ */
+export function liveNodes(events: readonly LiveEvent[]): Map<string, LiveNode> {
+  const out = new Map<string, LiveNode>();
+  for (const e of events) {
+    if (!e.node) continue;
+    const at = out.get(e.node) ?? { cycles: 0, used: new Set<string>() };
+    // A node_start means a fresh attempt: its counts start again.
+    if (e.kind === "node_start" && e.facts) {
+      out.set(e.node, { facts: e.facts, cycles: 0, used: new Set() });
+      continue;
+    }
+    if (e.kind === "tool_call") {
+      at.cycles += 1;
+      // `detail` is the tool name for this kind.
+      if (e.detail) at.used.add(e.detail);
+    }
+    out.set(e.node, at);
+  }
+  return out;
+}
+
+/** What a node has said about itself so far, before it has checkpointed anything. */
+export interface LiveNode {
+  facts?: NodeFacts;
+  cycles: number;
+  /** Tools called so far in this attempt. */
+  used: Set<string>;
 }
 
 /**
