@@ -2450,6 +2450,12 @@ async fn run_full_scripted_with_actions<A: FullTerminalActions>(
         )),
     };
 
+    // Before the cleanup below, not at the end of the function: an abandoned host future is frozen
+    // in the runtime's spawner rather than cancelled, and dropping the runtime is what drops it —
+    // which is what kills a sandbox child still writing the tree. Removing the worktree first
+    // would remove it out from under that child.
+    drop(runtime);
+
     if result.is_err() {
         // Take the handle out before awaiting so the mutex guard isn't held across the await.
         let leftover = ctx.worktree.lock().unwrap().take();

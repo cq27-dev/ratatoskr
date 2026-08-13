@@ -1004,7 +1004,18 @@ async fn within<T>(
     };
     budget.disarm_idle();
     match outcome {
-        Ok(value) => Ok(value),
+        // A host call still outstanding when the operation resolves is a stage the workflow
+        // started and never awaited. That future is not cancelled — it freezes in the runtime's
+        // spawner until the whole runtime drops — so returning success here would let the caller's
+        // terminal commit and worktree cleanup race a stage that may still be writing files. The
+        // outstanding count is exactly this signal.
+        Ok(value) => match budget.outstanding.load(Ordering::Relaxed) {
+            0 => Ok(value),
+            in_flight => Err(ScriptError::Eval(format!(
+                "workflow `{workflow}` returned with {in_flight} stage call(s) still in flight; \
+                 every stage call must be awaited before the entry returns"
+            ))),
+        },
         // The engine reports its own allocation failure by throwing `out of memory`, which a
         // workflow can throw verbatim itself — and `InternalError`, the class the engine uses, is a
         // constructible global too. What a script cannot forge is the allocator's own count, so the
@@ -1738,6 +1749,54 @@ export async function plan(i) { return { entryRan: true }; }
             .expect_err("a spin with a host outstanding must be stopped");
         assert!(error.contains("spinner.ts"), "{error}");
         assert!(error.contains("without progress"), "{error}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_entry_that_returns_with_a_stage_still_running_is_refused() {
+        // An un-awaited host is neither completed nor cancelled: it freezes in the runtime's
+        // spawner until the whole runtime drops. Reporting success here would let the caller's
+        // terminal commit and worktree cleanup race a stage that may still be writing files.
+        let dir = scratch("abandoned-host");
+        let runtime = load(
+            &dir,
+            "export async function plan(input) {\n\
+             \x20   const abandoned = slow(input);\n\
+             \x20   return \"done\";\n\
+             }",
+        )
+        .await;
+        let mut hosts = HashMap::new();
+        hosts.insert(
+            "slow".to_string(),
+            host(|arg| async move {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Ok(arg)
+            }),
+        );
+        let error = runtime
+            .run("plan", "null".to_string(), hosts)
+            .await
+            .expect_err("an entry that abandons a stage call must not report success");
+        let error = error.to_string();
+        assert!(error.contains("workflow.ts"), "{error}");
+        assert!(error.contains("still in flight"), "{error}");
+
+        // And a workflow that awaits everything is untouched.
+        let awaited = load(
+            &dir,
+            "export async function plan(input) { return await tick(input); }",
+        )
+        .await;
+        let mut hosts = HashMap::new();
+        hosts.insert("tick".to_string(), host(|arg| async move { Ok(arg) }));
+        assert_eq!(
+            awaited
+                .run("plan", "\"ok\"".to_string(), hosts)
+                .await
+                .unwrap(),
+            "\"ok\""
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "current_thread")]
