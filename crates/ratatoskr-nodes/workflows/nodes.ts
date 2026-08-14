@@ -546,9 +546,19 @@ export const bookkeeper = {
   instructions: LOAD("prompts/bookkeeper.md").trim(),
   renderQuestion(input: any) {
     let question = "";
-    if (input.converged) {
+    if (input.status === "converged") {
       question +=
         "OUTCOME: the run CONVERGED — the change landed and the tests pass.\n\n";
+    } else if (input.status === "unreviewed") {
+      question +=
+        `OUTCOME: the run's tests pass, but its REVIEW NEVER FINISHED — after ${input.iterations} ` +
+        "implementer iterations the verifier ran out of room before reaching the end of what it " +
+        "set out to check" +
+        ((input.unchecked || []).length > 0
+          ? `: ${input.unchecked.join("; ")}. `
+          : ". ") +
+        "This is not a wall the change hit; it is something nobody has looked at. Record what a " +
+        "future run should know about reviewing this area, not about fixing it.\n\n";
     } else {
       question +=
         `OUTCOME: the run HIT A WALL — after ${input.iterations} implementer iterations ` +
@@ -659,6 +669,16 @@ export const publisher = {
           question += `    ${finding.failure_scenario}\n`;
         }
       }
+      question += "\n";
+    }
+
+    const unchecked = input.unchecked || [];
+    if (unchecked.length > 0) {
+      question +=
+        "AND THE REVIEW NEVER REACHED THESE. Not findings — nobody looked. Say so plainly and " +
+        "list them: a reader who assumes the whole change was reviewed has been misled by what " +
+        "you wrote, and this is what the next person has to pick up:\n";
+      for (const area of unchecked) question += `- ${area}\n`;
       question += "\n";
     }
 

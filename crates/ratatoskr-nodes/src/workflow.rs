@@ -422,16 +422,15 @@ fn scripted_review(checkpoints: &[ratatoskr_store::Checkpoint]) -> ScriptedRevie
     {
         return ScriptedReview::NotRun;
     }
-    let checkpoint = &checkpoints[reviewed_at];
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&checkpoint.output_json) else {
-        return ScriptedReview::Unavailable;
-    };
-    if value.get("error").is_some() {
-        return ScriptedReview::Unavailable;
-    }
-    // Folded across the chain, not read off this checkpoint alone: a continuation reviews only the
-    // gap it was handed, and the findings the passes before it established are still true of a tree
-    // nothing has changed since.
+    // Folded across the chain, not read off the last checkpoint alone: a continuation reviews only
+    // the gap it was handed, and the findings the passes before it established are still true of a
+    // tree nothing has changed since.
+    //
+    // Which is also why a failed turn is not decided here. A `{"error": ..}` record does not parse
+    // as a review and drops out of the chain, so an outage on a continuation leaves the passes that
+    // DID answer standing — reading availability off the last checkpoint instead reported
+    // `Unreviewed` for a run whose first pass had already found something blocking, while the
+    // published summary listed it. Unavailable is what is left when no pass in the chain answered.
     match tree_review(checkpoints) {
         Some(output) => ScriptedReview::Available(output),
         None => ScriptedReview::Unavailable,
@@ -947,7 +946,13 @@ fn review_correction(
     // continuations already spent BEFORE writing this checkpoint, so counting them here with it
     // included would reconstruct a different answer and refuse a script that supplied the right one.
     let (_, continuations_left) = review_continuations(&checkpoints[..review_position]);
-    let expected = verification_result(output.clone(), threshold, continuations_left);
+    // Folded exactly as the host folded it, or a script that supplied the answer it was given is
+    // refused for supplying it.
+    let expected = verification_result(
+        folded(&chain_ending_at(checkpoints, review_position)).unwrap_or_else(|| output.clone()),
+        threshold,
+        continuations_left,
+    );
     if !same_json(supplied, &expected) {
         return Err(
             "iterate() review does not match the latest Rust-validated verifier checkpoint"
@@ -1196,47 +1201,28 @@ fn verification_result(
 /// spend refusing to finish one.
 const REVIEW_CONTINUATIONS: usize = 2;
 
-/// Every pass of the review of the tree as it now stands, oldest first.
-///
-/// The chain ends at the last implementer checkpoint: an `iterate()` rewrites the tree under a
-/// review, so anything said before it was said about code that may no longer exist.
-pub(crate) fn review_chain(
-    checkpoints: &[ratatoskr_store::Checkpoint],
-) -> Vec<verifier::VerifierOutput> {
-    let start = checkpoints
-        .iter()
-        .rposition(|checkpoint| checkpoint.node_name == "implementer")
-        .map_or(0, |last| last + 1);
-    checkpoints[start..]
-        .iter()
-        .filter(|checkpoint| checkpoint.node_name == "verifier")
-        .filter_map(|checkpoint| serde_json::from_str(&checkpoint.output_json).ok())
-        .collect()
-}
-
-/// This tree's review: the passes that produced it, folded into one.
+/// Fold a chain of review passes into the one review they add up to.
 ///
 /// A continuation reviews only the gap the pass before it named, so its own checkpoint carries only
 /// what that gap turned up. Read alone it loses every finding the earlier passes established — and
-/// those are still true, because the tree has not changed under them. So the chain is folded:
-/// findings accumulate across it, and whether the review finished is the last pass's answer.
-///
-/// `None` when this tree has no review, which is not the same as a clean one.
-pub(crate) fn tree_review(
-    checkpoints: &[ratatoskr_store::Checkpoint],
-) -> Option<verifier::VerifierOutput> {
-    let chain = review_chain(checkpoints);
+/// those are still true, because the tree did not change under them, or the chain would have ended.
+/// So findings accumulate across the chain, and whether the review finished is the last pass's
+/// answer.
+fn folded(chain: &[verifier::VerifierOutput]) -> Option<verifier::VerifierOutput> {
     let last = chain.last()?.clone();
     let mut findings: Vec<verifier::Finding> = Vec::new();
-    for pass in &chain {
+    for pass in chain {
         for finding in &pass.findings {
             // A continuation may restate what it was handed; the same defect twice is one defect.
+            // `failure_scenario` is part of the identity: two findings can share a severity, a kind,
+            // a file, a line and a summary and still be about different failures.
             let seen = findings.iter().any(|kept: &verifier::Finding| {
                 kept.severity == finding.severity
                     && kept.kind == finding.kind
                     && kept.file == finding.file
                     && kept.line == finding.line
                     && kept.summary == finding.summary
+                    && kept.failure_scenario == finding.failure_scenario
             });
             if !seen {
                 findings.push(finding.clone());
@@ -1244,6 +1230,72 @@ pub(crate) fn tree_review(
         }
     }
     Some(verifier::VerifierOutput { findings, ..last })
+}
+
+/// The passes of the review that ends at `end`, oldest first.
+///
+/// A chain starts after the implementer checkpoint before it: an `iterate()` rewrites the tree under
+/// a review, so anything said before that was said about code which may no longer exist.
+/// Unparseable checkpoints — the `{"error": ..}` record a failed turn writes — are not passes.
+fn chain_ending_at(
+    checkpoints: &[ratatoskr_store::Checkpoint],
+    end: usize,
+) -> Vec<verifier::VerifierOutput> {
+    let start = checkpoints[..end]
+        .iter()
+        .rposition(|checkpoint| checkpoint.node_name == "implementer")
+        .map_or(0, |last| last + 1);
+    checkpoints[start..=end]
+        .iter()
+        .filter(|checkpoint| checkpoint.node_name == "verifier")
+        .filter_map(|checkpoint| serde_json::from_str(&checkpoint.output_json).ok())
+        .collect()
+}
+
+/// Every pass of the review of the tree as it now stands, oldest first.
+///
+/// Empty once an `iterate()` has run since the last review: that review describes a tree this run no
+/// longer has, so nothing in it can be continued.
+pub(crate) fn review_chain(
+    checkpoints: &[ratatoskr_store::Checkpoint],
+) -> Vec<verifier::VerifierOutput> {
+    match checkpoints
+        .iter()
+        .rposition(|checkpoint| checkpoint.node_name == "verifier")
+    {
+        Some(end)
+            if !checkpoints[end + 1..]
+                .iter()
+                .any(|c| c.node_name == "implementer") =>
+        {
+            chain_ending_at(checkpoints, end)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// This tree's review, folded. `None` when this tree has no review, which is not a clean one.
+pub(crate) fn tree_review(
+    checkpoints: &[ratatoskr_store::Checkpoint],
+) -> Option<verifier::VerifierOutput> {
+    folded(&review_chain(checkpoints))
+}
+
+/// The last review this run performed, folded, whatever happened after it.
+///
+/// Distinct from [`tree_review`], and the distinction is the point. Terminal status asks about the
+/// tree the run ended with, so a review the implementer has since edited under cannot decide it. The
+/// published summary asks a different question — what did this run's review still object to — and
+/// there the answer survives the edit: a run that reviewed, tried a fix, broke its tests and hit the
+/// ceiling ends on an implementer checkpoint, and reporting nothing unresolved would drop the very
+/// findings that drove the loop.
+pub(crate) fn last_review(
+    checkpoints: &[ratatoskr_store::Checkpoint],
+) -> Option<verifier::VerifierOutput> {
+    let end = checkpoints
+        .iter()
+        .rposition(|checkpoint| checkpoint.node_name == "verifier")?;
+    folded(&chain_ending_at(checkpoints, end))
 }
 
 /// What the review of THIS tree said it could not reach, and whether another pass may be spent.
@@ -1411,7 +1463,15 @@ async fn verify_host(
     };
     let out: verifier::VerifierOutput = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
 
-    serde_json::to_string(&verification_result(out, threshold, continuations_left))
+    // What the script is told is this tree's review, not this pass's. `infer_status` judges the
+    // fold, so answering with the pass alone let a workflow that continued a blocking review be
+    // told `blocking: []` while the finding still stood — the host and the status authority
+    // disagreeing about one review, which is the shape of defect this file exists to avoid. The
+    // chain here is the one loaded before the turn, plus the pass it just produced.
+    let mut chain = review_chain(&checkpoints);
+    chain.push(out);
+    let review = folded(&chain).expect("the chain holds the pass just produced");
+    serde_json::to_string(&verification_result(review, threshold, continuations_left))
         .map_err(|e| e.to_string())
 }
 
@@ -2918,7 +2978,10 @@ async fn finish_full<A: FullTerminalActions>(
                     implementer: None,
                     status: status.as_str().to_string(),
                     iterations: 0,
+                    // A run the analyst judged needs no code change never forks, so it never
+                    // reviews: nothing objected and nothing went unlooked-at.
                     unresolved: Vec::new(),
+                    unchecked: Vec::new(),
                 },
                 true,
                 None,
@@ -2984,6 +3047,9 @@ async fn finish_full<A: FullTerminalActions>(
     let status = status_with_review_availability(status, &review);
     actions.commit(ctx, &worktree, &implementer).await;
 
+    // Read once: both halves come from the same review, and asking twice could straddle a write.
+    let (unresolved, unchecked) = crate::unresolved_of(&ctx.store, &ctx.run_id).await;
+
     let terminal = matches!(
         status,
         RunStatus::Converged | RunStatus::MaxIterationsReached | RunStatus::Unreviewed
@@ -3001,7 +3067,8 @@ async fn finish_full<A: FullTerminalActions>(
                         analyst: plan.analyst.clone(),
                         implementer: implementer.clone(),
                         iterations,
-                        converged: status == RunStatus::Converged,
+                        status: status.as_str().to_string(),
+                        unchecked: unchecked.clone(),
                         friction: crate::friction_of(&ctx.store, &ctx.run_id).await,
                     },
                 )
@@ -3015,7 +3082,8 @@ async fn finish_full<A: FullTerminalActions>(
                 implementer: Some(implementer.clone()),
                 status: status.as_str().to_string(),
                 iterations,
-                unresolved: crate::unresolved_of(&ctx.store, &ctx.run_id).await,
+                unresolved,
+                unchecked: unchecked.clone(),
             },
             terminal,
             Some(&worktree),
@@ -3343,7 +3411,7 @@ mod tests {
                 .lock()
                 .expect("terminal calls mutex poisoned")
                 .push(TerminalCall::Bookkeep {
-                    converged: input.converged,
+                    converged: input.status == "converged",
                     iterations: input.iterations,
                 });
             self.bookkeeper.clone().map(|mut output| {
@@ -6290,7 +6358,8 @@ mod tests {
             RendererParityCase {
                 stage: "bookkeeper",
                 input: json!({
-                    "converged": true,
+                    "status": "converged",
+                    "unchecked": [],
                     "iterations": 1,
                     "issue": "x",
                     "analyst": { "impact_summary": "", "risks": [] },
@@ -6298,6 +6367,22 @@ mod tests {
                     "friction": { "diagnostics": [], "errors": [], "effort": [] }
                 }),
                 expected_question: "OUTCOME: the run CONVERGED — the change landed and the tests pass.\n\nTASK:\nx\n\n",
+            },
+            RendererParityCase {
+                stage: "bookkeeper",
+                // The outcome the branch made ordinary, and the one a boolean could not say: green
+                // tests, no unresolved failures, and a review that ran out of room. Narrated as a
+                // wall it told every later run the change could not be made to work.
+                input: json!({
+                    "status": "unreviewed",
+                    "unchecked": ["the error path in session.rs"],
+                    "iterations": 2,
+                    "issue": "x",
+                    "analyst": { "impact_summary": "", "risks": [] },
+                    "implementer": { "diff_summary": "", "narrative": null, "touched_files": [], "failing_tests": [] },
+                    "friction": { "diagnostics": [], "errors": [], "effort": [] }
+                }),
+                expected_question: "OUTCOME: the run's tests pass, but its REVIEW NEVER FINISHED — after 2 implementer iterations the verifier ran out of room before reaching the end of what it set out to check: the error path in session.rs. This is not a wall the change hit; it is something nobody has looked at. Record what a future run should know about reviewing this area, not about fixing it.\n\nTASK:\nx\n\n",
             },
             RendererParityCase {
                 stage: "publisher",
@@ -7129,7 +7214,8 @@ mod tests {
                 narrative: Some("The writer must remain deterministic.".to_string()),
             },
             iterations: 2,
-            converged: false,
+            status: "max_iterations_reached".to_string(),
+            unchecked: Vec::new(),
             friction: crate::bookkeeper::RunFriction {
                 diagnostics: vec!["The decision omitted its action.".to_string()],
                 errors: vec![crate::bookkeeper::NodeFailure {
@@ -7346,6 +7432,7 @@ mod tests {
                 summary: "the URLs can still run together".to_string(),
                 failure_scenario: "both links are returned in one field".to_string(),
             }],
+            unchecked: Vec::new(),
         };
         let input_json = serde_json::to_string(&input).unwrap();
         let captured = Arc::new(Mutex::new(None));
@@ -7926,6 +8013,7 @@ mod tests {
             status: "converged".to_string(),
             iterations: 1,
             unresolved: Vec::new(),
+            unchecked: Vec::new(),
         };
         let turn = Arc::new(OperatorCheckoutDirtyingTurn::default());
         let actions =
@@ -11630,6 +11718,86 @@ mod tests {
             left,
             "only reviews that could not finish spend continuations"
         );
+    }
+
+    #[test]
+    fn a_review_the_run_moved_on_from_is_still_what_it_objected_to() {
+        // Two questions that are not the same, and a fold that answered both with one rule lost the
+        // difference. Terminal status asks about the tree the run ENDED with: a review the
+        // implementer has since edited under cannot decide convergence. The published summary asks
+        // what this run's review still objected to, and there the answer survives the edit — a run
+        // that reviewed, tried the fix, broke its tests and hit the ceiling ends on an implementer
+        // checkpoint, and reporting nothing unresolved drops the very findings that drove the loop.
+        let blocking = verifier::VerifierOutput {
+            findings: vec![finding(verifier::Severity::P1)],
+            assessment: "found one".to_string(),
+            unchecked: vec!["the error path".to_string()],
+        };
+        let walled = vec![
+            review_checkpoint("verifier", &blocking, None::<&&str>),
+            review_checkpoint("implementer", &imp(&["a"], &[], 1), None::<&&str>),
+        ];
+
+        assert!(
+            tree_review(&walled).is_none(),
+            "the tree the run ended with has no review, so nothing may converge on one"
+        );
+        let last = last_review(&walled).expect("the run did review, and said something");
+        assert_eq!(
+            last.findings.len(),
+            1,
+            "what it objected to is still the record"
+        );
+        assert_eq!(last.unchecked, ["the error path"]);
+
+        // With no review at all there is nothing to report, which is not the same as clean.
+        let never = vec![review_checkpoint(
+            "implementer",
+            &imp(&[], &["a"], 0),
+            None::<&&str>,
+        )];
+        assert!(last_review(&never).is_none());
+    }
+
+    #[test]
+    fn an_outage_on_a_continuation_does_not_unsay_the_pass_that_answered() {
+        // A failed turn writes `{"error": ..}`, which is not a review: it does not parse and drops
+        // out of the chain. Deciding availability from the last checkpoint instead reported the run
+        // `Unreviewed` — "could not be asked" — although the verifier had already answered with
+        // something blocking, while the published summary listed that finding. Two surfaces
+        // contradicting each other about one review.
+        let blocking = verifier::VerifierOutput {
+            findings: vec![finding(verifier::Severity::P1)],
+            assessment: "found one, ran out of room".to_string(),
+            unchecked: vec!["the error path".to_string()],
+        };
+        let outage = serde_json::json!({ "error": "provider unavailable" });
+        let checkpoints = vec![
+            review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
+            review_checkpoint("verifier", &blocking, None::<&&str>),
+            review_checkpoint("verifier", &outage, None::<&&str>),
+        ];
+
+        match scripted_review(&checkpoints) {
+            ScriptedReview::Available(review) => {
+                assert_eq!(
+                    review.findings.len(),
+                    1,
+                    "the pass that answered still stands"
+                );
+            }
+            _ => panic!("a chain with a pass that answered is not unavailable"),
+        }
+
+        // Unavailable is what is left when NO pass in the chain answered.
+        let only_outage = vec![
+            review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
+            review_checkpoint("verifier", &outage, None::<&&str>),
+        ];
+        assert!(matches!(
+            scripted_review(&only_outage),
+            ScriptedReview::Unavailable
+        ));
     }
 
     #[test]

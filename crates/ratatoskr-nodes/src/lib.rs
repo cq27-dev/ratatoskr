@@ -1230,25 +1230,27 @@ pub struct RunOutcome {
     pub bookkeeper: Option<BookkeeperOutput>,
 }
 
-/// What the run's last review still objected to, read back from its checkpoints.
+/// What the run's last review still objected to, and what it never reached, from its checkpoints.
 ///
 /// Best-effort, and empty is the ordinary answer: a repository with no verifier route never
 /// reviews at all. The publisher is told to say what is unresolved, so this is where it finds out;
 /// a store read that fails costs a sentence in a pull request and must not cost the run.
-async fn unresolved_of(store: &Store, run_id: &str) -> Vec<verifier::Finding> {
+async fn unresolved_of(store: &Store, run_id: &str) -> (Vec<verifier::Finding>, Vec<String>) {
     let checkpoints = match store.checkpoints_for_run(run_id).await {
         Ok(checkpoints) => checkpoints,
         Err(e) => {
             tracing::warn!("could not read the run's checkpoints for publishing: {e}");
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
-    // This tree's review, which may have taken several passes. An earlier tree's findings were
-    // either fixed or raised again, and reporting a fixed one would be as misleading as reporting
-    // none — but a continuation of the SAME review carries only what its own gap turned up, and
-    // publishing that alone drops what the passes before it found on a tree nothing has changed.
-    workflow::tree_review(&checkpoints)
-        .map(|review| review.findings)
+    // The run's LAST review, folded across the passes that produced it — not the review of the tree
+    // the run ended with. A run that reviewed, tried the fix, broke its tests and hit the ceiling
+    // ends on an implementer checkpoint: that review no longer describes the tree, which is why
+    // terminal status will not rest on it, but it is still the last thing anyone said about this
+    // change and the only account of why the loop ran. Reporting nothing there would drop exactly
+    // the findings the run spent itself on.
+    workflow::last_review(&checkpoints)
+        .map(|review| (review.findings, review.unchecked))
         .unwrap_or_default()
 }
 
@@ -1565,9 +1567,13 @@ pub async fn run_bookkeeper(
         .iter()
         .filter(|c| c.node_name == "implementer")
         .count() as u32;
-    // A replay treats anything not recorded as `converged` as a wall hit.
-    let converged =
-        store.run_status(run_id).await?.as_deref() == Some(RunStatus::Converged.as_str());
+    // The status as recorded, so a replay narrates the outcome the run actually had rather than
+    // collapsing everything that is not `converged` into a wall.
+    let status = store
+        .run_status(run_id)
+        .await?
+        .unwrap_or_else(|| RunStatus::MaxIterationsReached.as_str().to_string());
+    let (_, unchecked) = unresolved_of(store, run_id).await;
 
     // Build the clarifier before `issue` is moved into the input (it clones the issue internally).
     // A replay runs no workflow, so this resolves to the bundled standard registry — the one the
@@ -1578,7 +1584,8 @@ pub async fn run_bookkeeper(
         analyst,
         implementer,
         iterations,
-        converged,
+        status,
+        unchecked,
         friction: bookkeeper::RunFriction::from_checkpoints(&checkpoints),
     };
     let context =

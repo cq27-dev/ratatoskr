@@ -66,6 +66,14 @@ pub struct PublisherInput {
     /// `max_iterations_reached` means — and a pull request written from the test result alone
     /// reads as a clean landing.
     pub unresolved: Vec<crate::verifier::Finding>,
+    /// What the last review could not reach, if it could not finish.
+    ///
+    /// Empty for a review that completed, and for a run that never reviewed. A run ends
+    /// `unreviewed` when its review ran out of room, and the areas it named are the one actionable
+    /// thing about that outcome — without them the pull request can say the run did not finish
+    /// clean and nothing about what a human still has to look at. The verifier is told naming a gap
+    /// is cheap because someone will act on it; this is where that promise is kept.
+    pub unchecked: Vec<String>,
 }
 
 #[cfg(test)]

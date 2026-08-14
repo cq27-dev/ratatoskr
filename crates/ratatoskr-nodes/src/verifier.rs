@@ -103,7 +103,6 @@ pub struct VerifierOutput {
 }
 
 impl VerifierOutput {
-    /// The findings that block, most severe first.
     /// Whether this review reached the end of what it set out to check.
     ///
     /// The one answer to it. A review that did not is not a clean one however few findings it
@@ -112,6 +111,7 @@ impl VerifierOutput {
         self.unchecked.is_empty()
     }
 
+    /// The findings that block, most severe first.
     pub fn blocking(&self, threshold: Severity) -> Vec<&Finding> {
         let mut found: Vec<&Finding> = self
             .findings
