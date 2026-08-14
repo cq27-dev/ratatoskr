@@ -505,23 +505,64 @@ export function inNodeBoxes(
  * under its own id, so a map built from the raw stream is keyed by `context_distillation` while the
  * graph asks it for `context` — and the box then draws with no model, no tools and no cycle count
  * for as long as the member is the one running.
+ *
+ * PER MEMBER, folded into the box, for the reason `nodesFromEvents` keeps its members apart: a
+ * workflow may have two stages of one box in flight at once, both announce under the box, and a
+ * single entry per box would have the later start throw away the cycles, tools and model of the
+ * member already working. Before any checkpoint this map is all the box has to draw with, so that
+ * activity does not move — it vanishes.
+ *
+ * A `node_start` is a fresh attempt of THAT member and restarts only its own counts. Which
+ * INVOCATION of a member the numbers belong to is not answered here — a stage invoked twice at once
+ * still folds into one state per member, and #285 is where that is resolved.
  */
 export function liveNodes(events: readonly BoxedEvent[]): Map<string, LiveNode> {
-  const out = new Map<string, LiveNode>();
+  const boxes = new Map<string, Map<string, LiveNode>>();
   for (const e of events) {
     if (!e.node) continue;
-    const at = out.get(e.node) ?? { cycles: 0, used: new Set<string>() };
-    // A node_start means a fresh attempt: its counts start again.
+    let members = boxes.get(e.node);
+    if (!members) boxes.set(e.node, (members = new Map()));
+    const name = e.member ?? e.node;
     if (e.kind === "node_start" && e.facts) {
-      out.set(e.node, { facts: e.facts, cycles: 0, used: new Set() });
+      members.set(name, { facts: e.facts, cycles: 0, used: new Set() });
       continue;
     }
+    let at = members.get(name);
+    if (!at) members.set(name, (at = { cycles: 0, used: new Set() }));
     if (e.kind === "tool_call") {
       at.cycles += 1;
       // `detail` is the tool name for this kind.
       if (e.detail) at.used.add(e.detail);
     }
-    out.set(e.node, at);
+  }
+
+  const out = new Map<string, LiveNode>();
+  for (const [box, members] of boxes) {
+    const all = [...members.values()];
+    // The same arithmetic the checkpointed fold uses on telemetry: counts add, tools are the union,
+    // and two profiles are both named rather than one overwriting the other.
+    const facts = all
+      .map((m) => m.facts)
+      .filter((f): f is NodeFacts => !!f)
+      .reduce<NodeFacts | undefined>(
+        (into, next) =>
+          into
+            ? {
+                model: [...new Set([...into.model.split(", "), ...next.model.split(", ")])].join(
+                  ", ",
+                ),
+                tools: [...new Set([...into.tools, ...next.tools])],
+                thinking: into.thinking || next.thinking,
+                reuses_session: into.reuses_session || next.reuses_session,
+              }
+            : next,
+        undefined,
+      );
+    out.set(box, {
+      ...(facts ? { facts } : {}),
+      cycles: all.reduce((n, m) => n + m.cycles, 0),
+      used: new Set(all.flatMap((m) => [...m.used])),
+    });
   }
   return out;
 }

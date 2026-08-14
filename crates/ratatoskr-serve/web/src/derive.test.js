@@ -735,6 +735,43 @@ test("the live map is keyed by the box, so the box draws with what its member an
   expect([...box.used]).toEqual(["Read"]);
 });
 
+test("the live map keeps a member's activity when a sibling starts beside it", () => {
+  // Two stages of one box in flight at once — `Promise.all([classify(x), author(y)])`, which the
+  // workflow may compose and the fold beside this one already handles. Both announce under the
+  // same box, so a map that keeps one entry per box lets the later start throw away everything the
+  // earlier member has done. This is the window before any checkpoint, where the live map is all
+  // the box has to draw with, so that work does not merely move — it disappears from the screen.
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const facts = (model) => ({ model, tools: ["Read"], thinking: false, reuses_session: false });
+  const announced = (name, model) => ({ ...start(name), facts: facts(model) });
+  const called = (name, tool) => ({
+    at: "2026-08-12T10:00:02Z",
+    kind: "tool_call",
+    node: name,
+    detail: tool,
+  });
+  const events = [
+    announced("redteam_classifier", "anthropic/claude-haiku-5"),
+    called("redteam_classifier", "Grep"),
+    announced("redteam_author", "anthropic/claude-sonnet-5"),
+    called("redteam_author", "Write"),
+  ];
+
+  const box = liveNodes(inNodeBoxes(events, stages)).get("redteam");
+  expect(box.cycles).toBe(2);
+  expect([...box.used].sort()).toEqual(["Grep", "Write"]);
+  // And the same for what they announced: a box running two profiles names both, exactly as the
+  // checkpointed fold beside this one does.
+  expect(box.facts.model).toBe("anthropic/claude-haiku-5, anthropic/claude-sonnet-5");
+
+  // Per MEMBER, not per invocation: a member re-entered starts its own counts again, and #285 is
+  // where a second invocation of one stage gets numbers of its own.
+  const again = [...events, announced("redteam_classifier", "anthropic/claude-haiku-5")];
+  const reentered = liveNodes(inNodeBoxes(again, stages)).get("redteam");
+  expect(reentered.cycles).toBe(1);
+  expect([...reentered.used]).toEqual(["Write"]);
+});
+
 test("a usage event costs the member whatever it reports, zero included", () => {
   // Scrub honesty, which is what this whole derivation exists for. `fromStream` keeps the server's
   // telemetry — the run's FINAL state — for a node the stream never costed, so a node left
