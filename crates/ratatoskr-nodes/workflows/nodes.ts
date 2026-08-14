@@ -709,11 +709,15 @@ export const verifier = {
   inputContract: "VerifierInput",
   outputContract: "VerifierOutput",
   outputSchema: schemaWithDefs(
+    // `unchecked` is required, alone among these. Optional, a turn that never mentions it validates
+    // and reads as complete — which is the silent convergence this field exists to stop, restored by
+    // a model that simply did not opt in. Required, an empty array is an assertion that the pass
+    // reached the end of what it set out to check, made deliberately every time.
     obj({
       assessment: str(),
       findings: arr({ "$ref": "#/$defs/Finding" }),
       unchecked: arr(str()),
-    }),
+    }, ["unchecked"]),
     {
       Finding: obj(
         {

@@ -10146,7 +10146,10 @@ mod tests {
         let turn = Arc::new(RecordingStageTurn {
             output: json!({
                 "findings": [],
-                "assessment": "checked the session key and its callers"
+                "assessment": "checked the session key and its callers",
+                // Required at the gate: a pass asserts it reached the end, rather than being read
+                // as complete for having said nothing.
+                "unchecked": []
             })
             .to_string(),
             ..Default::default()
@@ -10295,7 +10298,8 @@ mod tests {
                     "kind": "plan",
                     "summary": "missing the required failure scenario"
                 }],
-                "assessment": "reviewed"
+                "assessment": "reviewed",
+                "unchecked": []
             })
             .to_string(),
             ..Default::default()

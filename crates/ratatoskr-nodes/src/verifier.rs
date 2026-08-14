@@ -93,7 +93,12 @@ pub struct VerifierOutput {
     /// to continue over — and it makes honesty concrete: an incomplete answer that says what it
     /// missed costs a further pass, while claiming completeness it does not have is what this is
     /// meant to be cheaper than.
-    #[serde(default)]
+    ///
+    /// Required, alone among these, and deliberately not `#[serde(default)]`. A default makes the
+    /// field optional at the schema gate as well, so a turn that never mentions it validates and
+    /// reads as complete — which is the silent convergence this exists to stop, restored by a model
+    /// that simply did not opt in. Required, an empty list is an assertion that the pass reached the
+    /// end, made deliberately every time.
     pub unchecked: Vec<String>,
 }
 
@@ -238,14 +243,43 @@ mod tests {
     #[test]
     fn severity_and_kind_parse_from_the_shapes_a_model_writes() {
         let raw = r#"{"findings":[{"severity":"P1","kind":"plan","summary":"s",
-                      "failure_scenario":"f","file":"a.rs"}],"assessment":"looked at it"}"#;
+                      "failure_scenario":"f","file":"a.rs"}],"assessment":"looked at it",
+                      "unchecked":[]}"#;
         let out = parse_validated::<VerifierOutput>(raw).unwrap();
         assert_eq!(out.findings[0].severity, Severity::P1);
         assert_eq!(out.findings[0].kind, FindingKind::Plan);
         assert_eq!(out.findings[0].line, None);
 
         // A finding with no failure scenario is a preference; the schema refuses it.
-        let bad = r#"{"findings":[{"severity":"P1","kind":"plan","summary":"s"}]}"#;
+        let bad = r#"{"findings":[{"severity":"P1","kind":"plan","summary":"s"}],"unchecked":[]}"#;
         assert!(parse_validated::<VerifierOutput>(bad).is_err());
+    }
+
+    #[test]
+    fn a_review_that_never_says_whether_it_finished_is_refused_at_the_gate() {
+        // Optional, the field is a suggestion: a turn that never mentions it validates, defaults to
+        // empty, reads as complete, and the run converges on a review that never claimed to have
+        // finished — the silent convergence this whole field exists to stop, restored by a model
+        // that simply did not opt in. Required, an empty list is an assertion, made every time.
+        let silent = r#"{"findings":[],"assessment":"looked at some of it"}"#;
+        assert!(
+            parse_validated::<VerifierOutput>(silent).is_err(),
+            "a review must say whether it reached the end of what it set out to check"
+        );
+
+        let claimed = r#"{"findings":[],"assessment":"looked at all of it","unchecked":[]}"#;
+        assert!(
+            parse_validated::<VerifierOutput>(claimed)
+                .unwrap()
+                .complete()
+        );
+
+        let honest =
+            r#"{"findings":[],"assessment":"got part way","unchecked":["the error path"]}"#;
+        assert!(
+            !parse_validated::<VerifierOutput>(honest)
+                .unwrap()
+                .complete()
+        );
     }
 }
