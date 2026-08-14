@@ -405,32 +405,22 @@ enum ScriptedReview {
     Unavailable,
 }
 
-/// Whether a review is of the run as it now stands, or of something the run has moved past.
-///
-/// A review judges a TREE against a PLAN, so either moving invalidates it. An `iterate()` rewrites
-/// the tree under it; an `analyst()` revises the plan it was measuring against, and a finding of
-/// kind `plan` is then an objection to a requirement that no longer exists. A workflow may revise
-/// and review again without implementing in between, and folding across that carried the old plan's
-/// objections into a clean review of the new one — and spent its continuations on the old plan's
-/// gaps.
-fn superseded(checkpoints: &[ratatoskr_store::Checkpoint], review: usize) -> bool {
-    checkpoints[review + 1..]
-        .iter()
-        .any(|checkpoint| matches!(checkpoint.node_name.as_str(), "implementer" | "analyst"))
-}
-
 fn scripted_review(checkpoints: &[ratatoskr_store::Checkpoint]) -> ScriptedReview {
-    let Some(reviewed_at) = checkpoints
+    if !checkpoints
         .iter()
-        .rposition(|checkpoint| checkpoint.node_name == "verifier")
-    else {
+        .any(|checkpoint| checkpoint.node_name == "verifier")
+    {
         return ScriptedReview::NotRun;
-    };
+    }
     // A review the run has moved past describes a state this run no longer has, so it cannot be the
     // review terminal status rests on — not run, rather than run and clean. The bundled flow always
     // verifies after its last iterate, so it never lands here. What the run has not answered is
     // still held: `status_with_unanswered_gap` reads the last review wherever it sits.
-    if superseded(checkpoints, reviewed_at) {
+    // A review the run has moved past — edited or replanned — describes something this run no
+    // longer proposes, so it cannot be the review terminal status rests on: not run, rather than run
+    // and clean. What the run has not ANSWERED survives it either way, because
+    // `status_with_unanswered_gap` reads the last review wherever it sits.
+    if ReviewChain::of(checkpoints).attempts.is_empty() {
         return ScriptedReview::NotRun;
     }
     // Folded across the chain, not read off the last checkpoint alone: a continuation reviews only
@@ -973,14 +963,14 @@ fn review_correction(
     // Judged against the run as it stood when this review was produced: the host counted the
     // continuations already spent BEFORE writing this checkpoint, so counting them here with it
     // included would reconstruct a different answer and refuse a script that supplied the right one.
-    let (_, continuations_left) = review_continuations(&checkpoints[..review_position]);
+    let judged = ReviewChain::ending_at(checkpoints, review_position);
     // This tree's review, folded exactly as the host folded it — and used for everything below, not
     // only for the comparison. The correction is built from what the review says still stands, and
     // a continuation's own checkpoint holds only what its gap turned up: deriving the correction
     // from that alone refused a workflow that continued a blocking review and then asked to fix it,
     // telling it there was nothing to correct while the finding it was handed still stood.
-    let review = folded(&chain_ending_at(checkpoints, review_position)).unwrap_or(output);
-    let expected = verification_result(review.clone(), threshold, continuations_left);
+    let review = judged.review().unwrap_or(output);
+    let expected = verification_result(review.clone(), threshold, judged.may_continue(threshold));
     if !same_json(supplied, &expected) {
         return Err(
             "iterate() review does not match the latest Rust-validated verifier checkpoint"
@@ -1229,153 +1219,175 @@ fn verification_result(
 /// spend refusing to finish one.
 const REVIEW_CONTINUATIONS: usize = 2;
 
-/// Continuations already spent by `reviews`: the trailing run of passes that could not finish, less
-/// the one that began it.
+/// Every verifier attempt at the change the run is currently proposing.
 ///
-/// A first pass is not a continuation of anything, so a chain of one incomplete review has spent
-/// none — counting it made `REVIEW_CONTINUATIONS` allow one fewer continuation than it names.
-fn continuations_spent(chain: &[Option<verifier::VerifierOutput>]) -> usize {
-    chain
-        .iter()
-        .rev()
-        .take_while(|attempt| {
-            !attempt
-                .as_ref()
-                .is_some_and(verifier::VerifierOutput::complete)
-        })
-        .count()
-        .saturating_sub(1)
+/// One value for what used to be reconstructed through three separate proxies — checkpoint names
+/// for identity, `unchecked` for eligibility, `retryable` for budget — each of which had to be
+/// patched as its own failure surfaced. The chain answers all three from one place, so the guard
+/// before a turn and the `retryable` handed to a workflow cannot disagree.
+struct ReviewChain {
+    /// Oldest first. `None` for an attempt that did not answer — the `{"error": ..}` a failed turn
+    /// writes. It is not a review, so it must never fold into one; it IS an attempt, so it must
+    /// cost the run a continuation, or a workflow retrying an unavailable verifier spends turns
+    /// until the generic invocation ceiling.
+    attempts: Vec<Option<verifier::VerifierOutput>>,
 }
 
-/// Fold a chain of review passes into the one review they add up to.
-///
-/// A continuation reviews only the gap the pass before it named, so its own checkpoint carries only
-/// what that gap turned up. Read alone it loses every finding the earlier passes established — and
-/// those are still true, because the tree did not change under them, or the chain would have ended.
-/// So findings accumulate across the chain, and whether the review finished is the last pass's
-/// answer.
-fn folded(chain: &[Option<verifier::VerifierOutput>]) -> Option<verifier::VerifierOutput> {
-    let chain: Vec<&verifier::VerifierOutput> = chain.iter().flatten().collect();
-    let last = (*chain.last()?).clone();
-    let mut findings: Vec<verifier::Finding> = Vec::new();
-    for pass in &chain {
-        for finding in &pass.findings {
-            // A continuation may restate what it was handed; the same defect twice is one defect.
-            // `failure_scenario` is part of the identity: two findings can share a severity, a kind,
-            // a file, a line and a summary and still be about different failures.
-            let seen = findings.iter().any(|kept: &verifier::Finding| {
-                kept.severity == finding.severity
-                    && kept.kind == finding.kind
-                    && kept.file == finding.file
-                    && kept.line == finding.line
-                    && kept.summary == finding.summary
-                    && kept.failure_scenario == finding.failure_scenario
-            });
-            if !seen {
-                findings.push(finding.clone());
-            }
+impl ReviewChain {
+    /// The attempts judging what the run currently proposes: this tree, against this plan.
+    ///
+    /// A review judges a TREE against a PLAN, and either moving ends the chain. The tree moves at an
+    /// `implementer` checkpoint. The plan moves when the analyst produces something DIFFERENT — read
+    /// from what each review recorded it was judging, not from an `analyst` checkpoint existing,
+    /// because a workflow may re-run the analyst and get the same plan back, and treating that as a
+    /// change dropped a standing blocker and refreshed the budget on every call.
+    fn of(checkpoints: &[ratatoskr_store::Checkpoint]) -> Self {
+        let last_review = checkpoints
+            .iter()
+            .rposition(|checkpoint| checkpoint.node_name == "verifier");
+        let moved_on = |end: usize| {
+            checkpoints[end + 1..].iter().any(is_implementer)
+                || judged_plan(&checkpoints[end]).is_some_and(|judged| {
+                    // Only a plan we can actually read as different. Unknown on either side is not
+                    // evidence of a revision, the same way an unrecorded input is not.
+                    current_plan(checkpoints).is_some_and(|now| now != judged)
+                })
+        };
+        match last_review {
+            Some(end) if !moved_on(end) => Self::ending_at(checkpoints, end),
+            _ => Self {
+                attempts: Vec::new(),
+            },
         }
     }
-    Some(verifier::VerifierOutput { findings, ..last })
-}
 
-/// The passes of the review that ends at `end`, oldest first.
-///
-/// A chain starts after the implementer checkpoint before it: an `iterate()` rewrites the tree under
-/// a review, so anything said before that was said about code which may no longer exist.
-/// Unparseable checkpoints — the `{"error": ..}` record a failed turn writes — are not passes.
-fn chain_ending_at(
-    checkpoints: &[ratatoskr_store::Checkpoint],
-    end: usize,
-) -> Vec<Option<verifier::VerifierOutput>> {
-    let start = checkpoints[..end]
-        .iter()
-        .rposition(|checkpoint| matches!(checkpoint.node_name.as_str(), "implementer" | "analyst"))
-        .map_or(0, |last| last + 1);
-    checkpoints[start..=end]
-        .iter()
-        .filter(|checkpoint| checkpoint.node_name == "verifier")
-        // `None` for an attempt that did not answer — the `{"error": ..}` a failed turn writes. It
-        // is not a review, so it must not fold into one; it IS an attempt, so it must count against
-        // the continuation ceiling, or a workflow retrying a failing verifier spends model turns
-        // until the generic invocation ceiling and the cost bound means nothing.
-        .map(|checkpoint| serde_json::from_str(&checkpoint.output_json).ok())
-        .collect()
-}
+    /// The attempts of the review that ends at `end`, whatever the run did afterwards.
+    fn ending_at(checkpoints: &[ratatoskr_store::Checkpoint], end: usize) -> Self {
+        // Anchored on the plan the review at `end` judged, not the plan in force now. A chain is
+        // the passes that judged ONE plan; asking what the run said means asking about the plan it
+        // said it against, whatever the run revised afterwards.
+        let judged = judged_plan(&checkpoints[end]);
+        let after_edit = checkpoints[..end]
+            .iter()
+            .rposition(is_implementer)
+            .map_or(0, |last| last + 1);
+        let attempts = checkpoints[after_edit..=end]
+            .iter()
+            .filter(|checkpoint| checkpoint.node_name == "verifier")
+            // Only the passes that judged the plan now in force. One that judged an earlier plan
+            // objects to requirements that may no longer exist.
+            .filter(|checkpoint| {
+                judged_plan(checkpoint).is_none_or(|plan| Some(&plan) == judged.as_ref())
+            })
+            .map(|checkpoint| serde_json::from_str(&checkpoint.output_json).ok())
+            .collect();
+        Self { attempts }
+    }
 
-/// Every pass of the review of the tree as it now stands, oldest first.
-///
-/// Empty once an `iterate()` has run since the last review: that review describes a tree this run no
-/// longer has, so nothing in it can be continued.
-pub(crate) fn review_chain(
-    checkpoints: &[ratatoskr_store::Checkpoint],
-) -> Vec<Option<verifier::VerifierOutput>> {
-    match checkpoints
-        .iter()
-        .rposition(|checkpoint| checkpoint.node_name == "verifier")
-    {
-        Some(end) if !superseded(checkpoints, end) => chain_ending_at(checkpoints, end),
-        _ => Vec::new(),
+    /// The passes that answered, folded into the one review they add up to.
+    ///
+    /// A continuation reviews only the gap the pass before it named, so its own checkpoint carries
+    /// only what that gap turned up. Read alone it loses every finding the earlier passes
+    /// established — and those are still true, because neither the tree nor the plan moved under
+    /// them, or the chain would have ended. Findings accumulate; whether the review finished is the
+    /// last answering pass's word.
+    fn review(&self) -> Option<verifier::VerifierOutput> {
+        let answered: Vec<&verifier::VerifierOutput> = self.attempts.iter().flatten().collect();
+        let last = (*answered.last()?).clone();
+        let mut findings: Vec<verifier::Finding> = Vec::new();
+        for pass in &answered {
+            for finding in &pass.findings {
+                // A continuation may restate what it was handed; the same defect twice is one
+                // defect. `failure_scenario` is part of the identity — two findings can share a
+                // severity, a kind, a file, a line and a summary and be about different failures.
+                let seen = findings.iter().any(|kept: &verifier::Finding| {
+                    kept.severity == finding.severity
+                        && kept.kind == finding.kind
+                        && kept.file == finding.file
+                        && kept.line == finding.line
+                        && kept.summary == finding.summary
+                        && kept.failure_scenario == finding.failure_scenario
+                });
+                if !seen {
+                    findings.push(finding.clone());
+                }
+            }
+        }
+        Some(verifier::VerifierOutput { findings, ..last })
+    }
+
+    /// What the last pass that ANSWERED said it could not reach. A failed attempt reached nothing
+    /// and named nothing, so it leaves the open gap where it was.
+    fn gap(&self) -> Vec<String> {
+        self.attempts
+            .iter()
+            .flatten()
+            .next_back()
+            .filter(|review| !review.complete())
+            .map(|review| review.unchecked.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether another verifier turn on this same change is permitted — the ONE answer, asked by
+    /// the guard before a turn and reported to the workflow as `retryable`.
+    ///
+    /// Two ways to be ineligible, and both are about spending a turn that cannot help. The budget
+    /// is every attempt at this change, answered or not: completing does not refund it, because
+    /// three turns on one tree and plan cost three turns however they ended. And a standing
+    /// blocking finding means the next thing to do is fix it — reviewing again reviews an unchanged
+    /// change, and the fix will move the chain along anyway.
+    fn may_continue(&self, threshold: verifier::Severity) -> bool {
+        self.attempts.len() <= REVIEW_CONTINUATIONS
+            && !self
+                .review()
+                .is_some_and(|review| !review.blocking(threshold).is_empty())
     }
 }
 
-/// This tree's review, folded. `None` when this tree has no review, which is not a clean one.
+fn is_implementer(checkpoint: &ratatoskr_store::Checkpoint) -> bool {
+    checkpoint.node_name == "implementer"
+}
+
+/// The plan in force: the latest analyst output, as recorded.
+fn current_plan(checkpoints: &[ratatoskr_store::Checkpoint]) -> Option<serde_json::Value> {
+    checkpoints
+        .iter()
+        .rev()
+        .find(|checkpoint| checkpoint.node_name == "analyst")
+        .and_then(|checkpoint| serde_json::from_str(&checkpoint.output_json).ok())
+}
+
+/// The plan a review recorded that it was judging, or `None` when it did not record one — a fixture
+/// rather than a run, and not evidence that the plan differs.
+fn judged_plan(checkpoint: &ratatoskr_store::Checkpoint) -> Option<serde_json::Value> {
+    let input = checkpoint.input_json.as_deref()?;
+    serde_json::from_str::<serde_json::Value>(input)
+        .ok()?
+        .get("analyst")
+        .cloned()
+}
+
+/// This change's review, folded. `None` when it has none, which is not a clean one.
 pub(crate) fn tree_review(
     checkpoints: &[ratatoskr_store::Checkpoint],
 ) -> Option<verifier::VerifierOutput> {
-    folded(&review_chain(checkpoints))
+    ReviewChain::of(checkpoints).review()
 }
 
 /// The last review this run performed, folded, whatever happened after it.
 ///
-/// Distinct from [`tree_review`], and the distinction is the point. Terminal status asks about the
-/// tree the run ended with, so a review the implementer has since edited under cannot decide it. The
-/// published summary asks a different question — what did this run's review still object to — and
-/// there the answer survives the edit: a run that reviewed, tried a fix, broke its tests and hit the
-/// ceiling ends on an implementer checkpoint, and reporting nothing unresolved would drop the very
-/// findings that drove the loop.
+/// Distinct from [`tree_review`], and the distinction is the point. Terminal status asks about what
+/// the run ended with, so a review the run has edited or replanned past cannot decide it. The
+/// published summary asks what this run's review still objected to, and there the answer survives:
+/// a run that reviewed, tried a fix, broke its tests and hit the ceiling ends on an implementer
+/// checkpoint, and reporting nothing unresolved would drop the findings that drove the loop.
 pub(crate) fn last_review(
     checkpoints: &[ratatoskr_store::Checkpoint],
 ) -> Option<verifier::VerifierOutput> {
     let end = checkpoints
         .iter()
         .rposition(|checkpoint| checkpoint.node_name == "verifier")?;
-    folded(&chain_ending_at(checkpoints, end))
-}
-
-/// What the review of THIS tree said it could not reach, and whether another pass may be spent.
-///
-/// The chain is the reviews since the last implementer checkpoint, not every review in the run. An
-/// `iterate()` rewrites the tree under them, so a gap named against the old one is a gap in code
-/// that may no longer exist — pointing the next pass at it would focus it on something already
-/// gone — and the budget for reviewing a tree nobody has reviewed yet has not been spent. Without
-/// the reset, two incomplete passes before a fix left the fresh review with no continuations at
-/// all, reported `Unreviewed` on the first thing it could not finish.
-///
-/// Carried only from the review immediately before this one, and only if that one was incomplete: a
-/// review that finished ends the chain, and nothing after it is continuing anything.
-///
-/// Counted from the checkpoints rather than carried through the script, so a workflow that calls
-/// `verify()` in a shape nobody anticipated is bounded the same way the bundled one is.
-fn review_continuations(checkpoints: &[ratatoskr_store::Checkpoint]) -> (Vec<String>, bool) {
-    let reviews = review_chain(checkpoints);
-    // From the last pass that ANSWERED: a failed attempt reached nothing and named nothing, so what
-    // is still unreached is whatever the last real pass said it could not reach.
-    let unchecked = reviews
-        .iter()
-        .flatten()
-        .next_back()
-        .filter(|review| !review.complete())
-        .map(|review| review.unchecked.clone())
-        .unwrap_or_default();
-    // The TRAILING incomplete run, not every incomplete review in the chain. A completed review
-    // ends the chain for the budget exactly as it does for the carried gap, so a workflow that
-    // reviews again after one finished starts with its continuations back — counting through the
-    // completion would hand the fresh review `retryable: false` on its first gap.
-    (
-        unchecked,
-        continuations_spent(&reviews) < REVIEW_CONTINUATIONS,
-    )
+    ReviewChain::ending_at(checkpoints, end).review()
 }
 
 /// `verify({ analyst })` — read the worktree's diff against the plan.
@@ -1446,7 +1458,8 @@ async fn verify_host(
     if !same_json(&input.analyst, &checkpointed_analyst) {
         return Err("verify() analyst does not match the latest analyst checkpoint".to_string());
     }
-    let (unchecked, continuations_left) = review_continuations(&checkpoints);
+    let chain = ReviewChain::of(&checkpoints);
+    let unchecked = chain.gap();
     // The ceiling is Rust's, not the script's to observe. `retryable` tells a workflow what it may
     // do; a workflow that ignores it and calls `verify()` again was still spending a model turn per
     // call, so the bound was advice and the real limit was the generic invocation ceiling — 500
@@ -1454,16 +1467,27 @@ async fn verify_host(
     // erroring: the run is not wrong, it has simply had every continuation this tree gets, and the
     // review as it stands is the honest reply. `retryable` is false in it, so a loop that keeps
     // asking spends host calls and no turns.
-    if !unchecked.is_empty() && !continuations_left {
-        let standing = tree_review(&checkpoints)
-            .expect("a carried gap comes from a review in this tree's chain");
+    // Asked of the chain, not of a gap: every attempt costs, including ones that never answered and
+    // ones made while a blocking finding stood. Reading eligibility off `unchecked` let both slip
+    // past — a run whose every attempt failed carries no gap, and neither does one that should be
+    // fixing rather than reviewing.
+    if let Some(standing) = chain.review().filter(|_| !chain.may_continue(threshold)) {
         tracing::warn!(
+            attempts = chain.attempts.len(),
             unchecked = ?standing.unchecked,
-            "verify() asked to continue a review past its continuation ceiling; \
-             answering with the review as it stands"
+            "verify() asked for a turn this change has not earned; answering with the review as it \
+             stands"
         );
         return serde_json::to_string(&verification_result(standing, threshold, false))
             .map_err(|e| e.to_string());
+    }
+    // Every attempt failed: nothing to answer with, and no turn either.
+    if !chain.may_continue(threshold) {
+        tracing::warn!(
+            attempts = chain.attempts.len(),
+            "every review of this change failed to answer; not spending another turn"
+        );
+        return none(true, true);
     }
     let verifier_input = verifier::VerifierInput {
         previous_findings: previous_verifier_findings(&checkpoints, threshold),
@@ -1533,15 +1557,19 @@ async fn verify_host(
     // told `blocking: []` while the finding still stood — the host and the status authority
     // disagreeing about one review, which is the shape of defect this file exists to avoid. The
     // chain here is the one loaded before the turn, plus the pass it just produced.
-    let mut chain = review_chain(&checkpoints);
-    chain.push(Some(out));
-    let review = folded(&chain).expect("the chain holds the pass just produced");
+    let mut chain = chain;
+    chain.attempts.push(Some(out));
+    let review = chain
+        .review()
+        .expect("the chain holds the pass just produced");
     // Counted over the chain INCLUDING the pass just produced. `continuations_left` above answers
     // "may this call proceed"; what the script is told has to answer "may another follow", and
     // reusing the first said `retryable: true` on the pass that spent the last continuation — so
     // the loop made one more call that reviewed nothing, and one fewer pass actually ran than
     // `REVIEW_CONTINUATIONS` names.
-    let another_may_follow = continuations_spent(&chain) < REVIEW_CONTINUATIONS;
+    // Counted over the chain INCLUDING the pass just produced, and by the same rule the guard uses:
+    // what the script is told has to be what the next call will do.
+    let another_may_follow = chain.may_continue(threshold);
     serde_json::to_string(&verification_result(review, threshold, another_may_follow))
         .map_err(|e| e.to_string())
 }
@@ -10842,6 +10870,28 @@ mod tests {
         assert!(!first.unavailable);
         assert_eq!(first.blocking.len(), 1);
         assert!(!first.needs_replan);
+        // A second turn is not free while that finding stands: the host answers with the review as
+        // it is and spends nothing, because the next thing to do is fix it rather than look again.
+        let refused: VerifyResult =
+            serde_json::from_str(&verify(arg.clone()).await.unwrap()).unwrap();
+        assert_eq!(refused.blocking.len(), 1);
+        assert_eq!(
+            store
+                .checkpoints_for_run(run_id)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|c| c.node_name == "verifier")
+                .count(),
+            1,
+            "the refusal wrote no record of a review that did not happen"
+        );
+
+        // Once the tree moves, the next review is a fresh one — and it is handed what the last pass
+        // found, which is what this case is about.
+        note(&ctx, "implementer", &imp(&[], &["post"], 0), None)
+            .await
+            .unwrap();
         let second: VerifyResult = serde_json::from_str(&verify(arg).await.unwrap()).unwrap();
         assert_eq!(second.blocking.len(), 1);
 
@@ -11810,7 +11860,8 @@ mod tests {
             ..Default::default()
         };
 
-        let (carried, left) = review_continuations(&[]);
+        let chain = ReviewChain::of(&[]);
+        let (carried, left) = (chain.gap(), chain.may_continue(verifier::Severity::P2));
         assert!(carried.is_empty() && left, "a first pass continues nothing");
 
         let one = vec![review_checkpoint(
@@ -11818,7 +11869,8 @@ mod tests {
             &unfinished("path A"),
             None::<&&str>,
         )];
-        let (carried, left) = review_continuations(&one);
+        let chain = ReviewChain::of(&one);
+        let (carried, left) = (chain.gap(), chain.may_continue(verifier::Severity::P2));
         assert_eq!(
             carried,
             ["path A"],
@@ -11830,7 +11882,8 @@ mod tests {
             review_checkpoint("verifier", &unfinished("path A"), None::<&&str>),
             review_checkpoint("verifier", &unfinished("path B"), None::<&&str>),
         ];
-        let (carried, left) = review_continuations(&two);
+        let chain = ReviewChain::of(&two);
+        let (carried, left) = (chain.gap(), chain.may_continue(verifier::Severity::P2));
         assert_eq!(
             carried,
             ["path B"],
@@ -11848,7 +11901,8 @@ mod tests {
             &unfinished("path C"),
             None::<&&str>,
         ));
-        let (carried, left) = review_continuations(&spent);
+        let chain = ReviewChain::of(&spent);
+        let (carried, left) = (chain.gap(), chain.may_continue(verifier::Severity::P2));
         assert_eq!(carried, ["path C"]);
         assert!(!left, "the continuations this tree gets are spent");
 
@@ -11858,7 +11912,8 @@ mod tests {
             review_checkpoint("verifier", &unfinished("path A"), None::<&&str>),
             review_checkpoint("verifier", &finished, None::<&&str>),
         ];
-        let (carried, left) = review_continuations(&mixed);
+        let chain = ReviewChain::of(&mixed);
+        let (carried, left) = (chain.gap(), chain.may_continue(verifier::Severity::P2));
         assert!(
             carried.is_empty(),
             "a finished review carries no gap forward"
@@ -12015,7 +12070,11 @@ mod tests {
 
         // What the host would have answered the second call with.
         let supplied = verification_result(
-            folded(&[Some(first), Some(continued)]).unwrap(),
+            ReviewChain {
+                attempts: vec![Some(first), Some(continued)],
+            }
+            .review()
+            .unwrap(),
             verifier::Severity::P2,
             true,
         );
@@ -12174,6 +12233,80 @@ mod tests {
     }
 
     #[test]
+    fn eligibility_is_one_question_the_chain_answers() {
+        // Three ways a further turn buys nothing, and one place that says so. Reading eligibility
+        // off the carried gap answered only the first: a run whose every attempt failed carries no
+        // gap, and neither does one that should be fixing rather than looking again — so both kept
+        // being handed turns until the generic invocation ceiling.
+        let plan = review_plan();
+        let judging = verifier::VerifierInput {
+            issue: "x".to_string(),
+            analyst: plan.clone(),
+            diff: "+change".to_string(),
+            touched_files: Vec::new(),
+            previous_findings: Vec::new(),
+            unchecked: Vec::new(),
+        };
+        let planned = review_checkpoint("analyst", &plan, None::<&&str>);
+        let edit = review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>);
+        let outage = serde_json::json!({ "error": "provider unavailable" });
+
+        // 1. The gap is spent.
+        let unfinished = verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: String::new(),
+            unchecked: vec!["the error path".to_string()],
+        };
+        let mut gaps = vec![planned.clone(), edit.clone()];
+        for _ in 0..=REVIEW_CONTINUATIONS {
+            gaps.push(review_checkpoint("verifier", &unfinished, Some(&judging)));
+        }
+        assert!(!ReviewChain::of(&gaps).may_continue(verifier::Severity::P2));
+
+        // 2. Nothing ever answered — no gap to read, and the turns are gone all the same.
+        let mut failures = vec![planned.clone(), edit.clone()];
+        for _ in 0..=REVIEW_CONTINUATIONS {
+            failures.push(review_checkpoint("verifier", &outage, Some(&judging)));
+        }
+        let failed = ReviewChain::of(&failures);
+        assert!(failed.gap().is_empty(), "a failed attempt names nothing");
+        assert!(
+            !failed.may_continue(verifier::Severity::P2),
+            "but it spent the continuation it attempted"
+        );
+        assert!(
+            failed.review().is_none(),
+            "and there is no review to report"
+        );
+
+        // 3. A finding stands. Looking again reviews an unchanged change; the fix is what moves it.
+        let blocked = verifier::VerifierOutput {
+            findings: vec![finding(verifier::Severity::P1)],
+            assessment: String::new(),
+            unchecked: vec!["the error path".to_string()],
+        };
+        let standing = vec![
+            planned.clone(),
+            edit.clone(),
+            review_checkpoint("verifier", &blocked, Some(&judging)),
+        ];
+        let chain = ReviewChain::of(&standing);
+        assert!(!chain.gap().is_empty(), "it did leave a gap");
+        assert!(
+            !chain.may_continue(verifier::Severity::P2),
+            "and the gap is not the next thing to do while a P1 stands"
+        );
+
+        // The ordinary case still proceeds.
+        let first = vec![
+            planned,
+            edit,
+            review_checkpoint("verifier", &unfinished, Some(&judging)),
+        ];
+        assert!(ReviewChain::of(&first).may_continue(verifier::Severity::P2));
+    }
+
+    #[test]
     fn a_failed_attempt_is_not_a_review_but_it_is_still_an_attempt() {
         // Two things a `{"error": ..}` checkpoint must be at once. It is NOT a review: folding it
         // in would make a failed turn read as a clean complete one, which is the load-bearing
@@ -12195,7 +12328,8 @@ mod tests {
             checkpoints.push(review_checkpoint("verifier", &outage, None::<&&str>));
         }
 
-        let (carried, left) = review_continuations(&checkpoints);
+        let chain = ReviewChain::of(&checkpoints);
+        let (carried, left) = (chain.gap(), chain.may_continue(verifier::Severity::P2));
         assert_eq!(
             carried,
             ["the error path"],
@@ -12214,11 +12348,12 @@ mod tests {
     }
 
     #[test]
-    fn a_completed_review_gives_the_continuations_back() {
-        // A completed review ends the chain for the budget as well as for the carried gap. A
-        // compositional workflow that reviews again after one finished — on the same tree, for
-        // whatever reason of its own — otherwise met `retryable: false` on its first gap, because
-        // the count reached back through the completion to passes that are no longer the chain.
+    fn a_completion_frees_the_gap_but_not_the_turns_it_spent() {
+        // Two different things a completed review ends. There is nothing left to continue, so no
+        // gap is carried — a pass after it starts from the whole change again. But the turns are
+        // spent: three reviews of one unchanged tree and plan cost three turns however they ended,
+        // and refunding the budget on a completion let a workflow review without bound by finishing
+        // every other pass.
         let unfinished = |area: &str| verifier::VerifierOutput {
             findings: Vec::new(),
             assessment: String::new(),
@@ -12234,26 +12369,26 @@ mod tests {
             review_checkpoint("verifier", &unfinished("path B"), None::<&&str>),
             review_checkpoint("verifier", &finished, None::<&&str>),
         ];
-        let (carried, left) = review_continuations(&spent_then_finished);
+        let chain = ReviewChain::of(&spent_then_finished);
         assert!(
-            carried.is_empty(),
+            chain.gap().is_empty(),
             "nothing after a completed review is continuing anything"
         );
         assert!(
-            left,
-            "a completed review ends the chain, so the budget it spent is not the next one's"
+            !chain.may_continue(verifier::Severity::P2),
+            "and the turns it spent are still spent"
         );
 
-        // And the trailing run is still counted, so the bound is a bound where it applies.
-        let mut trailing = spent_then_finished.clone();
-        trailing.push(review_checkpoint(
-            "verifier",
-            &unfinished("path C"),
+        // An edit is what buys more, because that is a different change to review.
+        let mut edited = spent_then_finished.clone();
+        edited.push(review_checkpoint(
+            "implementer",
+            &imp(&[], &["a"], 0),
             None::<&&str>,
         ));
-        let (carried, left) = review_continuations(&trailing);
-        assert_eq!(carried, ["path C"]);
-        assert!(left, "one incomplete pass since the completion leaves room");
+        let fresh = ReviewChain::of(&edited);
+        assert!(fresh.attempts.is_empty());
+        assert!(fresh.may_continue(verifier::Severity::P2));
     }
 
     #[test]
@@ -12282,11 +12417,27 @@ mod tests {
             assessment: "the revised plan holds".to_string(),
             unchecked: Vec::new(),
         };
+        // The plan each pass judged, recorded the way `verify_host` records it. Read from the review
+        // itself, not from an `analyst` checkpoint existing: a workflow may re-run the analyst and
+        // get the same plan back, and treating that as a change dropped a standing blocker and
+        // handed the budget back on every call.
+        let judging = |plan: &AnalystOutput| verifier::VerifierInput {
+            issue: "preserve convergence".to_string(),
+            analyst: plan.clone(),
+            diff: "+change".to_string(),
+            touched_files: Vec::new(),
+            previous_findings: Vec::new(),
+            unchecked: Vec::new(),
+        };
+        let old_plan = review_plan();
+        let mut revised = old_plan.clone();
+        revised.requirements = vec!["a requirement the old review never saw".to_string()];
+
         let checkpoints = vec![
             review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
-            review_checkpoint("verifier", &objected, None::<&&str>),
-            review_checkpoint("analyst", &review_plan(), None::<&&str>),
-            review_checkpoint("verifier", &after_revision, None::<&&str>),
+            review_checkpoint("verifier", &objected, Some(&judging(&old_plan))),
+            review_checkpoint("analyst", &revised, None::<&&str>),
+            review_checkpoint("verifier", &after_revision, Some(&judging(&revised))),
         ];
 
         let review = tree_review(&checkpoints).expect("the revised plan was reviewed");
@@ -12298,12 +12449,26 @@ mod tests {
         assert!(review.complete(), "nor is the old plan's gap still open");
 
         // And the budget is the new plan's.
-        let (carried, left) = review_continuations(&checkpoints);
+        let chain = ReviewChain::of(&checkpoints);
+        let (carried, left) = (chain.gap(), chain.may_continue(verifier::Severity::P2));
         assert!(carried.is_empty());
         assert!(left);
 
         // The revision alone, with no review after it, leaves this plan unreviewed rather than
         // reviewed-clean — the same answer an edit gets.
+        // Re-running the analyst and getting the SAME plan back is not a revision: the blocker still
+        // stands, and the budget is not refreshed.
+        let unrevised = vec![
+            review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
+            review_checkpoint("verifier", &objected, Some(&judging(&old_plan))),
+            review_checkpoint("analyst", &old_plan, None::<&&str>),
+        ];
+        assert_eq!(
+            tree_review(&unrevised).map(|review| review.findings.len()),
+            Some(1),
+            "an unchanged plan leaves the objection standing"
+        );
+
         let unanswered = &checkpoints[..3];
         assert!(matches!(
             scripted_review(unanswered),
@@ -12339,7 +12504,8 @@ mod tests {
             review_checkpoint("verifier", &blocked, None::<&&str>),
             review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
         ];
-        let (carried, left) = review_continuations(&after_a_fix);
+        let chain = ReviewChain::of(&after_a_fix);
+        let (carried, left) = (chain.gap(), chain.may_continue(verifier::Severity::P2));
         assert!(
             carried.is_empty(),
             "the new tree's review must not be aimed at the old tree's gap: {carried:?}"
@@ -12356,7 +12522,8 @@ mod tests {
             review_checkpoint("verifier", &unfinished("path B"), None::<&&str>),
             review_checkpoint("verifier", &unfinished("path C"), None::<&&str>),
         ];
-        let (carried, left) = review_continuations(&same_tree);
+        let chain = ReviewChain::of(&same_tree);
+        let (carried, left) = (chain.gap(), chain.may_continue(verifier::Severity::P2));
         assert_eq!(carried, ["path C"]);
         assert!(!left);
     }
