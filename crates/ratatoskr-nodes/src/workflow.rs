@@ -750,7 +750,7 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
         .await
         .map_err(|e| e.to_string())?;
     // Checkpoint before the guard so a failed baseline stays inspectable.
-    note(&ctx, "redteam", &out, None).await?;
+    note(&ctx, crate::policy::REDTEAM_NODE, &out, None).await?;
     // The false-convergence guard is enforced here — the script cannot skip it.
     if !converge::test_command_ran(&out.failing_tests, out.passed_tests, out.exit_code) {
         return Err(format!(
@@ -828,7 +828,7 @@ async fn implement_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String
             return Err(error.to_string());
         }
     };
-    note(&ctx, "implementer", &out, Some(arg)).await?;
+    note(&ctx, crate::policy::IMPLEMENTER_NODE, &out, Some(arg)).await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -1085,7 +1085,13 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
         .map_err(|e| e.to_string())?;
     // The diagnostic, not the binding's argument: the script does not author it, so it is the one
     // thing that explains what this iteration was actually asked to fix.
-    note(&ctx, "implementer", &out, Some(diagnostic)).await?;
+    note(
+        &ctx,
+        crate::policy::IMPLEMENTER_NODE,
+        &out,
+        Some(diagnostic),
+    )
+    .await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -1558,7 +1564,7 @@ async fn context_host(
     let distilled: crate::context::Distillation =
         serde_json::from_str(&raw).map_err(|error| error.to_string())?;
     let out = crate::context::attach_evidence(distilled, memory);
-    note(&ctx, "context", &out, Some(arg)).await?;
+    note(&ctx, crate::policy::CONTEXT_NODE, &out, Some(arg)).await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -3891,6 +3897,33 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_bundled_definitions_declare_the_box_their_adapter_writes() {
+        // The other half of `required_node`'s bolt. Validation refuses an override that names a box
+        // its adapter does not write, and this is what keeps the table honest against the
+        // definitions that ship: a stage whose declaration and whose policy entry disagree would
+        // make the standard workflow itself unloadable, and nothing else would say so.
+        let stages = standard_stages().await.unwrap();
+        let mut checked = 0;
+        for stage in &stages {
+            let Some(required) = crate::policy::required_node(&stage.id) else {
+                continue;
+            };
+            assert_eq!(
+                stage.node_id(),
+                required,
+                "`{}` is declared in the box `{}` and its adapter writes `{required}`",
+                stage.id,
+                stage.node_id()
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 4,
+            "every stage a Rust caller folds into a box is checked here; found {checked}"
+        );
     }
 
     #[tokio::test]

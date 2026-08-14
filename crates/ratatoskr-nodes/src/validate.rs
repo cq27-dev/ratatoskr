@@ -47,17 +47,22 @@ pub fn validate_declarations(stages: &[Stage], workflow: &str) -> Result<(), Pla
             )));
         }
         // The same rule as the contract above, for the other half of what makes an override run
-        // where the standard stage did. A stage the run folds into another's record as evidence is
-        // invoked by its Rust adapter whatever a workflow declares, so an override that drops its
-        // membership becomes a node of its own, writes no row, and its cost goes to nobody — the
-        // failure `UNCLAIMED_BY_DESIGN` exists to keep to a named set. Refused at load, where the
-        // error can still name the declaration.
-        if policy::folded_as_evidence(&stage.id) && stage.is_own_node() {
+        // where the standard stage did. A Rust caller decides which box some standard stages' work
+        // lands in — it writes that box's aggregate under a name of its own — so the declaration
+        // must EQUAL that box, not merely differ from the stage's own id. A declaration naming a
+        // different box is the quiet failure: the adapter still checkpoints where it always did,
+        // while the recorded registry, the live turn's telemetry and Stop/Steer all attribute the
+        // work to a box that never touched it. Declaring nothing is the same defect with the
+        // stage's own name in the wrong place.
+        if let Some(required) = policy::required_node(&stage.id)
+            && stage.node_id() != required
+        {
             return Err(PlanError::Configuration(format!(
-                "workflow `{workflow}` declares stage `{}` without a node; the run {}, so a \
-                 declaration of it must say which node's work it is",
+                "workflow `{workflow}` declares stage `{}` as part of node `{}`, but the run \
+                 records its work under `{required}`; declare `node: \"{required}\"` or leave the \
+                 stage alone",
                 stage.id,
-                policy::FOLDED_AS_EVIDENCE_BECAUSE
+                stage.node_id(),
             )));
         }
         // `governedBy` is the identity the model turn is recorded under: its ruleset, its
@@ -472,28 +477,54 @@ mod tests {
     }
 
     #[test]
-    fn an_override_of_an_evidence_stage_keeps_its_membership_as_it_keeps_its_contract() {
-        // A from-scratch redeclaration is the shape this catches: `implementer_attempt` written out
-        // with its contract intact and no `node`. Every other gate passes it, the adapter invokes
-        // it as evidence exactly as before, and it silently becomes a node of its own — no member
-        // row, no claim, and a model turn charged to nobody.
-        let mut orphan = crate::stage::stage_fixture("implementer_attempt", "build");
-        orphan.output_contract = "Report".to_string();
-        let error = match validate_declarations(&[orphan.clone()], "custom") {
-            Ok(()) => panic!("an evidence stage that is its own node is unclaimable"),
+    fn an_override_keeps_the_box_its_adapter_writes_not_merely_some_other_box() {
+        // The adapter writes a FIXED box. `implement()` checkpoints under `implementer` whatever a
+        // declaration says, so a membership naming anything else is drawn, costed and controlled in
+        // one place while the work is recorded in another — and every other gate passes it, because
+        // `redteam` is a perfectly legitimate box for something to belong to.
+        let declared = |node: Option<&str>| {
+            let mut stage = crate::stage::stage_fixture("implementer_attempt", "build");
+            stage.output_contract = "Report".to_string();
+            stage.node = node.map(str::to_string);
+            stage
+        };
+        let refusal = |node: Option<&str>| match validate_declarations(&[declared(node)], "custom")
+        {
+            Ok(()) => panic!("`{node:?}` is not the box this stage's work lands in"),
             Err(error) => error.to_string(),
         };
+
+        // The wrong box, and the refusal has to name BOTH — an author who wrote `redteam` needs to
+        // be told where the work actually lands, not just that they are wrong.
+        let error = refusal(Some("redteam"));
         assert!(error.contains("implementer_attempt"), "{error}");
-        assert!(error.contains("without a node"), "{error}");
+        assert!(error.contains("`redteam`"), "{error}");
+        assert!(error.contains("`implementer`"), "{error}");
 
-        // Declaring the membership the bundled stage has is what makes the override run where it
-        // did, and that is accepted.
-        let mut member = orphan;
-        member.node = Some("implementer".to_string());
-        assert!(validate_declarations(&[member], "custom").is_ok());
+        // No box at all is the same defect with the stage's own name in the wrong place.
+        let error = refusal(None);
+        assert!(error.contains("`implementer_attempt`"), "{error}");
+        assert!(error.contains("`implementer`"), "{error}");
 
-        // An ordinary stage is unaffected: nothing folds it into anyone's record, so being its own
-        // node is what it is for.
+        // The box the bundled stage declares is what makes an override run where it ran.
+        assert!(validate_declarations(&[declared(Some("implementer"))], "custom").is_ok());
+
+        // The rule is not about being folded as evidence: `redteam_classifier` is an ordinary
+        // workflow host whose work the red team's operation still aggregates, and it is pinned the
+        // same way.
+        let mut classifier = crate::stage::stage_fixture("redteam_classifier", "reason");
+        classifier.output_contract = "Classification".to_string();
+        classifier.node = Some("context".to_string());
+        let error = match validate_declarations(&[classifier.clone()], "custom") {
+            Ok(()) => panic!("the classifier's work lands in the red team's box"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("`redteam`"), "{error}");
+        classifier.node = Some("redteam".to_string());
+        assert!(validate_declarations(&[classifier], "custom").is_ok());
+
+        // A repository's own stage is unaffected: no Rust caller decides where its work lands, so
+        // its membership is its author's to choose.
         let mut ordinary = crate::stage::stage_fixture("security_review", "reason");
         ordinary.output_contract = String::new();
         assert!(validate_declarations(&[ordinary], "custom").is_ok());

@@ -112,6 +112,17 @@ pub(crate) enum Invocation {
     AdapterEvidence,
 }
 
+/// The boxes a Rust operation host writes an aggregate checkpoint under.
+///
+/// One constant per box, referenced by the `note` call that writes it AND by the table below, so
+/// the adapter and the classification cannot say different things. They were two hand-written
+/// literals, and a stage's declared membership pointing at a box its adapter never writes is
+/// invisible: the run checkpoints under one name while the recorded registry, the live turn's
+/// telemetry and Stop/Steer all attribute to another.
+pub(crate) const CONTEXT_NODE: &str = "context";
+pub(crate) const REDTEAM_NODE: &str = "redteam";
+pub(crate) const IMPLEMENTER_NODE: &str = "implementer";
+
 /// What a workflow may do with one standard identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Class {
@@ -120,6 +131,13 @@ pub(crate) enum Class {
         /// changes it type-errors mid-run, so it is refused at load.
         contract: Option<&'static str>,
         invocation: Invocation,
+        /// The box this stage's work lands in, when a Rust caller decides it rather than the
+        /// declaration. `None` for a stage that is a node of its own.
+        ///
+        /// A declaration may not merely differ from the stage's own id here — it must EQUAL this.
+        /// The adapter writes its aggregate under a fixed name, so a stage claiming a different box
+        /// is drawn, costed and controlled in one place while its work is recorded in another.
+        node: Option<&'static str>,
     },
     Reserved(Reserved),
 }
@@ -128,6 +146,16 @@ const fn overridable(contract: &'static str) -> Class {
     Class::Overridable {
         contract: Some(contract),
         invocation: Invocation::Workflow,
+        node: None,
+    }
+}
+
+/// A workflow host whose work is part of a box some Rust operation aggregates.
+const fn part_of(contract: &'static str, node: &'static str) -> Class {
+    Class::Overridable {
+        contract: Some(contract),
+        invocation: Invocation::Workflow,
+        node: Some(node),
     }
 }
 
@@ -135,13 +163,15 @@ const fn adapter(contract: &'static str) -> Class {
     Class::Overridable {
         contract: Some(contract),
         invocation: Invocation::Adapter,
+        node: None,
     }
 }
 
-const fn adapter_evidence(contract: &'static str) -> Class {
+const fn adapter_evidence(contract: &'static str, node: &'static str) -> Class {
     Class::Overridable {
         contract: Some(contract),
         invocation: Invocation::AdapterEvidence,
+        node: Some(node),
     }
 }
 
@@ -154,8 +184,14 @@ pub(crate) const STANDARD_IDENTIFIERS: &[(&str, Class)] = &[
     ("scout", overridable("ScoutOutput")),
     ("analyst", overridable("AnalystOutput")),
     ("characterizer", overridable("CharacterizerOutput")),
-    ("redteam_classifier", overridable("Classification")),
-    ("context_distillation", overridable("Distillation")),
+    (
+        "redteam_classifier",
+        part_of("Classification", REDTEAM_NODE),
+    ),
+    (
+        "context_distillation",
+        part_of("Distillation", CONTEXT_NODE),
+    ),
     // Rust-invoked: the review gate reads the *last* `verifier` checkpoint, so a workflow able to
     // call `verifier(..)` after `verify()` could answer the gate that judges it.
     ("verifier", adapter("VerifierOutput")),
@@ -163,8 +199,14 @@ pub(crate) const STANDARD_IDENTIFIERS: &[(&str, Class)] = &[
     // owns. A generic host has no worktree from which to derive a safe resource root. Both are
     // evidence for the record their adapter writes — the red team's output and the implementer's
     // iteration — so neither is checkpointed under its own name.
-    ("redteam_author", adapter_evidence("AuthoredTests")),
-    ("implementer_attempt", adapter_evidence("Report")),
+    (
+        "redteam_author",
+        adapter_evidence("AuthoredTests", REDTEAM_NODE),
+    ),
+    (
+        "implementer_attempt",
+        adapter_evidence("Report", IMPLEMENTER_NODE),
+    ),
     // --- class 2: not declarable ---------------------------------------------------------------
     ("overseer", Class::Reserved(Reserved::Selection)),
     ("bookkeeper", Class::Reserved(Reserved::Terminal)),
@@ -208,7 +250,7 @@ pub(crate) const SELECTION_STAGE_ID: &str = "overseer";
 /// `bundled_standard_full_sequences_revision_review_and_rust_terminal_actions`: every name a full
 /// run checkpoints under that no stage of its registry carries is exactly this set, both ways. An
 /// entry nothing writes, and a host writing under a name absent here, each fail that case.
-pub(crate) const AGGREGATE_IDENTITIES: &[&str] = &["context", "implementer", "redteam"];
+pub(crate) const AGGREGATE_IDENTITIES: &[&str] = &[CONTEXT_NODE, IMPLEMENTER_NODE, REDTEAM_NODE];
 
 /// Whether `id` is a box a Rust operation host writes the aggregate record of.
 pub(crate) fn is_aggregate_identity(id: &str) -> bool {
@@ -294,6 +336,17 @@ pub(crate) fn reserved_for_governance(id: &str) -> Option<Reserved> {
 }
 
 /// The output contract an override of `id` must keep, because Rust deserializes it.
+/// The box `id`'s work lands in, when a Rust caller decides it and a declaration must agree.
+///
+/// `None` for a stage that is a node of its own and for a repository's own id, whose membership is
+/// its author's to choose.
+pub(crate) fn required_node(id: &str) -> Option<&'static str> {
+    match class(id)? {
+        Class::Overridable { node, .. } => node,
+        Class::Reserved(_) => None,
+    }
+}
+
 pub(crate) fn required_contract(id: &str) -> Option<&'static str> {
     match class(id)? {
         Class::Overridable { contract, .. } => contract,
