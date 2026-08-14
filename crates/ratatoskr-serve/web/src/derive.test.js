@@ -695,6 +695,63 @@ test("a usage event costs the member whatever it reports, zero included", () => 
   expect(drawn[0].telemetry.duration_ms).toBe(40);
 });
 
+test("a checkpoint is costed when a turn happened, not when it spent tokens", () => {
+  // Some endpoints make a real call and omit token accounting: the checkpoint carries `turns`, a
+  // model and a duration while all five counters read zero. Asking "did it spend" leaves that
+  // member uncosted, `fromStream` substitutes the store's FINAL telemetry, and scrubbing back to an
+  // earlier attempt of a repeated node shows a later attempt's model, tokens and tools.
+  //
+  // "Did a turn happen" is the actual question and the record answers it: the server omits `facts`
+  // from a checkpoint whose node ran no model (`LiveNodeFacts::of`), so their presence IS the turn.
+  // Token counters are the wrong basis anyway — `reasoning_tokens` is hardcoded to zero by the
+  // provider and `output_tokens` is under-reported.
+  const stages = registry(["analyst"]);
+  const noCounts = {
+    at: "t2",
+    kind: "checkpoint",
+    node: "analyst",
+    detail: "",
+    facts: { model: "an endpoint that counts nothing", tools: ["Read"], thinking: false, reuses_session: false },
+    turns: 1,
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      reasoning_tokens: 0,
+      duration_ms: 90,
+    },
+  };
+  const events = inNodeBoxes([start("analyst"), noCounts], stages);
+  expect(nodesFromEvents(events).get("analyst").costed).toBe(true);
+
+  const server = [
+    {
+      name: "analyst",
+      state: "done",
+      checkpoints: 2,
+      stage: 0,
+      lane: 0,
+      telemetry: { ...blankTelemetry, model: "the later attempt", input_tokens: 900 },
+    },
+  ];
+  const drawn = applyDerived(server, nodesFromEvents(events));
+  expect(drawn[0].telemetry.model).toBe("an endpoint that counts nothing");
+  expect(drawn[0].telemetry.input_tokens).toBe(0);
+
+  // And the box's own aggregate still is not a turn: it carries the usage keys as zeros because it
+  // covers nothing, and the server gives it no facts and no turns.
+  const aggregate = {
+    at: "t3",
+    kind: "checkpoint",
+    node: "redteam",
+    detail: "",
+    usage: { ...noCounts.usage, duration_ms: 0 },
+  };
+  const composed = registry(["redteam", "redteam_classifier"]);
+  expect(nodesFromEvents(inNodeBoxes([aggregate], composed)).get("redteam").costed).toBe(false);
+});
+
 test("a box's cost is the fold of its members, not whichever record landed last", () => {
   // Two defects in one: the box's own aggregate carries a `usage` block of zeros because it covers
   // no turn, and two members each carry their own. Overwriting on every checkpoint reported the
