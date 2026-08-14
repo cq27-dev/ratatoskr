@@ -246,18 +246,54 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
     Ok(())
 }
 
-/// Record what it would take to say two runs were the same experiment: the resolved config, a
-/// fingerprint of the graph that ran, and the commit it ran against.
+/// Record the graph this run will execute, then what it would take to say two runs were the same
+/// experiment: the resolved config, a fingerprint of the graph that ran, and the commit it ran
+/// against.
 ///
-/// Best-effort throughout. This is what makes runs comparable afterwards, which is never worth
-/// failing a run over — a run with no provenance is still a run, and one refused because `git` was
-/// slow is not.
+/// Two halves, and only one of them can fail a run.
+///
+/// The SHAPE is run initialization, because it carries the stage registry. A stage records under
+/// its own identity and the registry is what says which box that work belongs to — and the box is
+/// the name the runtime polls a Stop or a Steer under (`NodeRun.controlled_as`). Without it a
+/// reader draws every member as a box of its own and offers controls addressed to a name nothing
+/// answers to, which is a run nobody can steer. So a run whose registry does not land does not
+/// start.
+///
+/// The REST is best-effort. That half is what makes runs comparable afterwards, which is never
+/// worth failing a run over — a run with no provenance is still a run, and one refused because
+/// `git` was slow is not.
 async fn record_provenance(
     store: &Store,
     run_id: &str,
     config: &RatatoskrConfig,
     shape: &ratatoskr_core::shape::Recorded,
-) {
+) -> Result<(), PlanError> {
+    // The graph itself, not just a hash of it. A hash says two runs differed; the shape is what
+    // lets a run be drawn by something that never had this pipeline. It is the layout the
+    // *running* workflow declared — recording this build's own would draw every run against a
+    // pipeline it may never have executed.
+    let shape_json = serde_json::to_string(shape)?;
+    store
+        .record_run_provenance(run_id, None, None, None, Some(&shape_json), None)
+        .await?;
+    // Written AND landed. Provenance is recorded with an `UPDATE ... WHERE run_id = ?`, which
+    // matches nothing and reports success when the run row is absent — so asking the store back is
+    // the only thing that distinguishes a registry that is there from one that was merely sent.
+    let recorded = store
+        .run(run_id)
+        .await?
+        .is_some_and(|run| run.shape_json.is_some());
+    if !recorded {
+        return Err(PlanError::node(
+            "workflow",
+            NodeError::Failed(format!(
+                "the run's stage registry did not record against run `{run_id}`. Every control is \
+                 addressed to the box a stage belongs to, and that mapping is only in the \
+                 registry, so a run without it cannot be stopped or steered"
+            )),
+        ));
+    }
+
     let config_json = serde_json::to_string(config)
         .inspect_err(|e| tracing::warn!("could not record the run's config: {e}"))
         .ok();
@@ -269,17 +305,14 @@ async fn record_provenance(
             config_json.as_deref(),
             Some(&graph_fingerprint(&repo)),
             repo_sha.as_deref(),
-            // The graph itself, not just a hash of it. A hash says two runs differed; the shape is
-            // what lets a run be drawn by something that never had this pipeline. It is the layout
-            // the *running* workflow declared — recording this build's own would draw every run
-            // against a pipeline it may never have executed.
-            serde_json::to_string(shape).ok().as_deref(),
+            None,
             None,
         )
         .await
     {
         tracing::warn!("could not record run provenance: {e}");
     }
+    Ok(())
 }
 
 /// A fingerprint of the orchestration that ran: every workflow and every ruleset, in a fixed order.
@@ -2442,6 +2475,42 @@ mod agent_config_tests {
         // A stage that governs itself — every stage in an unmodified registry — is unaffected.
         let stages = workflow::standard_stages().await.unwrap();
         assert!(verifier_enabled(&engine, &config, &stages));
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_stage_registry_does_not_land_does_not_start() {
+        // The registry says which box a stage's records belong to, and the box is the name the
+        // runtime polls a Stop or a Steer under. A run that starts without it draws every member
+        // as a box of its own and offers controls addressed to a name nothing answers to — so
+        // this half of provenance is initialization, not the best-effort half the config, the
+        // fingerprint and the commit are.
+        let store = Store::open_in_memory().unwrap();
+        let config = RatatoskrConfig::default();
+        let shape = ratatoskr_core::shape::Recorded {
+            nodes: vec![],
+            stages: vec![ratatoskr_core::shape::RunStage {
+                id: "redteam_author".to_string(),
+                node: "redteam".to_string(),
+                governed_by: None,
+                session: None,
+            }],
+        };
+
+        // Provenance is an UPDATE, so with no run row to update the registry goes nowhere and the
+        // store reports success. That is the failure this refuses to start on.
+        record_provenance(&store, "no-such-run", &config, &shape)
+            .await
+            .expect_err("a registry that did not land fails the run");
+
+        // And where it does land, the run proceeds and a reader can resolve the box.
+        store.upsert_run("run-1", None, "running").await.unwrap();
+        record_provenance(&store, "run-1", &config, &shape)
+            .await
+            .unwrap();
+        let run = store.run("run-1").await.unwrap().unwrap();
+        let recorded: ratatoskr_core::shape::Recorded =
+            serde_json::from_str(&run.shape_json.unwrap()).unwrap();
+        assert_eq!(recorded.index().members("redteam"), ["redteam_author"]);
     }
 
     #[test]

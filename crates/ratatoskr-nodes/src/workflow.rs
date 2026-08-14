@@ -2478,14 +2478,15 @@ async fn run_plan_scripted_with_turn(
     // may name a node whose stages it never redeclared.
     let stages = install_execution_stages(&ctx, &runtime).await?;
     // A scripted run is measured the same way a built-in one is; the script picks the order, not
-    // whether the run is comparable to another afterwards.
+    // whether the run is comparable to another afterwards. Failing here fails the run: the shape
+    // carries the registry every control is addressed through.
     crate::record_provenance(
         &ctx.store,
         &ctx.run_id,
         &ctx.config,
         &crate::stage::shape_from_workflow(runtime.meta(), &stages),
     )
-    .await;
+    .await?;
     checkpoint(
         &ctx.store,
         &ctx.run_id,
@@ -2551,14 +2552,15 @@ async fn run_full_scripted_with_actions<A: FullTerminalActions>(
     // may name a node whose stages it never redeclared.
     let stages = install_execution_stages(&ctx, &runtime).await?;
     // A scripted run is measured the same way a built-in one is; the script picks the order, not
-    // whether the run is comparable to another afterwards.
+    // whether the run is comparable to another afterwards. Failing here fails the run: the shape
+    // carries the registry every control is addressed through.
     crate::record_provenance(
         &ctx.store,
         &ctx.run_id,
         &ctx.config,
         &crate::stage::shape_from_workflow(runtime.meta(), &stages),
     )
-    .await;
+    .await?;
     checkpoint(
         &ctx.store,
         &ctx.run_id,
