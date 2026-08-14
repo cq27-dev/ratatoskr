@@ -482,12 +482,15 @@ const SINGLE_FILE_WORKFLOW: &str = ".ratatoskr/workflow.ts";
 
 /// Every node any workflow in this repo may govern: the standard stages plus what each declares.
 ///
-/// The standard half is the identity each standard stage is *governed* under, read off the stages
-/// `nodes.ts` declares rather than listed here — a ruleset is keyed by
+/// Both halves are the identity each stage is *governed* under, read off the stages themselves
+/// rather than listed here — a ruleset is keyed by
 /// [`Stage::governance_id`](stage::Stage::governance_id), so that is the name a
-/// `.ratatoskr/rules/<node>.ts` has to match. `memory` is absent for the same reason it always was:
-/// it is a direct rag-rat call with no model or tool set to override, so it declares no stage and
-/// targeting it is a config error rather than a no-op.
+/// `.ratatoskr/rules/<node>.ts` has to match. Read the same way on both sides deliberately: reading
+/// the repository's half by stage id instead denied a repository the pattern the bundled
+/// definitions use, where `redteam` is governable because two stages declare `governedBy: "redteam"`
+/// and none is named that. `memory` is absent for the same reason it always was: it is a direct
+/// rag-rat call with no model or tool set to override, so it declares no stage and targeting it is
+/// a config error rather than a no-op.
 ///
 /// The union across all workflows, not just the one a run selects, because rulesets are loaded
 /// before a workflow is chosen — and a ruleset targeting a node that some workflow declares is
@@ -503,7 +506,11 @@ fn governable_from<'a>(
         .collect();
     for workflow in workflows {
         names.extend(workflow.meta().nodes.iter().cloned());
-        names.extend(workflow.meta().stages.iter().map(|stage| stage.id.clone()));
+        names.extend(
+            stage::stages_from_workflow(workflow.meta())
+                .iter()
+                .map(|stage| stage.governance_id().to_string()),
+        );
     }
     names.retain(|name| policy::reserved(name) != Some(policy::Reserved::InternalGate));
     names.sort();
@@ -2944,6 +2951,54 @@ mod agent_config_tests {
         // The implementer resolves through `node_agent_config` like every other node now that it
         // drives a model rather than a coding CLI, so a ruleset shapes it like any other.
         assert!(standard.contains(&"implementer".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_repository_may_govern_two_stages_under_one_name_as_the_built_ins_do() {
+        // The pattern `nodes.ts` uses for the red team: two stages declare `governedBy: "redteam"`
+        // and no stage is named that, so one ruleset and one `[models.*]` route shape both halves.
+        // A repository was denied it — the governable set read the repository's stages by id and
+        // never consulted `governedBy`, so `validate` refused the identity as unknown and the
+        // workflow did not load at all.
+        let dir = std::env::temp_dir().join(format!("ratatoskr-governance-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("review.ts"),
+            r#"defineWorkflow({
+                 name: "review",
+                 stages: [
+                   stage("style_review", { agent: "reason", governedBy: "reviewer" }),
+                   stage("logic_review", { agent: "reason", governedBy: "reviewer" }),
+                   stage("triage", { agent: "reason" }),
+                 ],
+               });
+               export async function plan(input) { return input; }"#,
+        )
+        .unwrap();
+        let found = defined_in(&dir, &dir.join("absent.ts")).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let standard = workflow::standard_stages().await.unwrap();
+        let governable = governable_from(&standard, &found);
+        assert!(
+            governable.contains(&"reviewer".to_string()),
+            "a name two stages are governed by must be governable: {governable:?}"
+        );
+        // A stage that declares no `governedBy` is governable by its own id, exactly as before —
+        // `governance_id()` is then the id itself.
+        assert!(governable.contains(&"triage".to_string()), "{governable:?}");
+        // And the two halves' own ids are not governance identities: their turns run under
+        // `reviewer`, so a `.ratatoskr/rules/style_review.ts` would shape nothing.
+        assert!(
+            !governable.contains(&"style_review".to_string()),
+            "{governable:?}"
+        );
+
+        // The whole point: it loads. This is the gate that refused it, and the refusal was fatal —
+        // the workflow was rejected at startup rather than quietly governed by nothing.
+        validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
+            .expect("a repository may share one governance identity across its stages");
     }
 
     #[test]
