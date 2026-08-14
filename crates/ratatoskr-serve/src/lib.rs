@@ -1101,20 +1101,27 @@ async fn run_detail(
     // well. Its own recorded config is the only honest answer, and `origin` is what separates the
     // two: `None` for a run produced here.
     //
-    // Best-effort either way: an unreadable, missing or unparseable config costs the planned facts
-    // and nothing else, and a dashboard that refused to show a run because its config moved would
-    // be worse than one that shows the run without them. An imported run that recorded none falls
-    // through to the live file, which is no worse than the nothing it would otherwise have.
-    let config = run
-        .as_ref()
-        .filter(|run| run.origin.is_some())
-        .and_then(|run| run.config_json.as_deref())
-        .and_then(|recorded| serde_json::from_str::<ratatoskr_core::RatatoskrConfig>(recorded).ok())
-        .or_else(|| {
-            std::fs::read_to_string(&config_path)
-                .ok()
-                .and_then(|t| ratatoskr_core::RatatoskrConfig::from_toml_str(&t).ok())
-        });
+    // Failing to read a config costs the planned facts and nothing else — a dashboard that refused
+    // to show a run because its config moved would be worse than one that shows the run without
+    // them. But for an imported run, recording NOTHING and recording something unreadable are not
+    // the same failure. Nothing makes no claim, so the live file is a guess that displaces no
+    // answer. A recording this build cannot parse — a corrupted bundle, a config shape from a
+    // newer one — is an answer that exists and was not read, and substituting another machine's
+    // for it recreates exactly the false attribution above. That one reports no planned facts.
+    let live = || {
+        std::fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|t| ratatoskr_core::RatatoskrConfig::from_toml_str(&t).ok())
+    };
+    let config = match run.as_ref().filter(|run| run.origin.is_some()) {
+        Some(imported) => match imported.config_json.as_deref() {
+            Some(recorded) => {
+                serde_json::from_str::<ratatoskr_core::RatatoskrConfig>(recorded).ok()
+            }
+            None => live(),
+        },
+        None => live(),
+    };
     let shape_json = run.as_ref().and_then(|r| r.shape_json.as_deref());
     let recorded = ratatoskr_core::shape::recorded(shape_json);
     let nodes = pipeline::derive_from(status.as_deref(), &checkpoints, config.as_ref(), &recorded);
@@ -1525,6 +1532,12 @@ mod access_tests {
 
     /// One project of each visibility, and an empty identity database.
     async fn state() -> AppState {
+        state_with_config(PathBuf::from("ratatoskr.toml")).await
+    }
+
+    /// [`state`], with the projects' `ratatoskr.toml` at a path of the caller's choosing — for the
+    /// cases that turn on what the reader's own config says, rather than on there being none.
+    async fn state_with_config(config_path: PathBuf) -> AppState {
         let mut projects = BTreeMap::new();
         for (slug, visibility) in [("open", Visibility::Public), ("shut", Visibility::Private)] {
             projects.insert(
@@ -1534,7 +1547,7 @@ mod access_tests {
                     repository: Some(format!("cq27-dev/{slug}")),
                     dir: PathBuf::from("/tmp").join(slug),
                     visibility,
-                    config_path: PathBuf::from("ratatoskr.toml"),
+                    config_path: config_path.clone(),
                     store: ratatoskr_store::Store::open_in_memory().expect("in-memory store"),
                     log_dir: PathBuf::from("/tmp").join(slug).join("logs"),
                     launcher: Arc::new(launch::Launcher::new(
@@ -2356,6 +2369,100 @@ mod access_tests {
                 ratatoskr_core::Directive::Continue
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_imported_runs_unreadable_recording_reports_nothing_rather_than_the_readers_config()
+    {
+        // Recording NOTHING and recording something unreadable are different failures. Nothing
+        // makes no claim, so the reader's own config displaces no answer. A recording this build
+        // cannot parse — a corrupted bundle, a shape from a newer one — is an answer that exists
+        // and was not read, and showing this machine's models in its place is the false
+        // attribution the whole change exists to remove, restored by the fallback.
+        //
+        // The reader's config is READABLE here, which is what makes the assertion mean anything:
+        // there is a wrong answer available to fall through to.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-reader-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("ratatoskr.toml");
+        // A whole config, because that is what one is: `from_toml_str` reads the shape the file
+        // has, not a fragment of it.
+        let mut ours = ratatoskr_core::RatatoskrConfig::default();
+        ours.models.insert(
+            "analyst".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "ours".to_string(),
+                model: "our-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        std::fs::write(&config_path, toml::to_string(&ours).unwrap()).unwrap();
+        let state = state_with_config(config_path).await;
+        let store = &state.projects["open"].store;
+        let shape = serde_json::json!({
+            "nodes": [],
+            "stages": [{"id": "analyst", "node": "analyst"}],
+        })
+        .to_string();
+        for (id, recorded) in [("unreadable", "{\"models\":"), ("silent", "")] {
+            store.upsert_run(id, None, "converged").await.unwrap();
+            store
+                .record_run_provenance(
+                    id,
+                    Some(recorded).filter(|raw| !raw.is_empty()),
+                    None,
+                    None,
+                    Some(&shape),
+                    None,
+                )
+                .await
+                .unwrap();
+            store
+                .insert_checkpoint(ratatoskr_store::CheckpointWrite {
+                    run_id: id,
+                    node_name: "analyst",
+                    output_json: "{}",
+                    input_json: None,
+                    iteration: None,
+                    telemetry: Default::default(),
+                })
+                .await
+                .unwrap();
+            store.set_origin(id, "someone-else").await.unwrap();
+        }
+
+        let planned = |id: &'static str| {
+            let state = state.clone();
+            async move {
+                let response = router(state, None)
+                    .oneshot(get(&format!("/api/projects/open/runs/{id}"), None))
+                    .await
+                    .expect("the router to answer");
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                    .await
+                    .expect("a run detail body");
+                let detail: serde_json::Value = serde_json::from_slice(&bytes).expect("run detail");
+                detail["nodes"][0]["planned"].clone()
+            }
+        };
+
+        assert!(
+            planned("unreadable").await.is_null(),
+            "a recording that could not be read was replaced by the reader's own config"
+        );
+        // And the absent case still falls through, which is the behaviour a run recorded before
+        // provenance travelled with it has always had.
+        assert_eq!(
+            planned("silent").await["model"],
+            serde_json::json!("ours/our-model")
+        );
     }
 
     #[tokio::test]
