@@ -222,7 +222,6 @@ pub(crate) const STANDARD_IDENTIFIERS: &[(&str, Class)] = &[
     // are already reserved above for reasons of their own; `redteam` has no such cover.
     ("redteam", Class::Reserved(Reserved::GovernanceIdentity)),
     ("implementer", Class::Reserved(Reserved::Lifecycle)),
-    ("memory", Class::Reserved(Reserved::Lifecycle)),
     ("issue", Class::Reserved(Reserved::Record)),
     ("clarification", Class::Reserved(Reserved::Record)),
     ("referee", Class::Reserved(Reserved::InternalGate)),
@@ -419,7 +418,7 @@ mod tests {
         // Being reserved is not the qualification, and reading it as one is how `issue` — the
         // run's input, checkpointed before any stage runs — came to pass as a node a stage could
         // declare itself part of.
-        for name in ["issue", "verify", "memory", "overseer", "publisher"] {
+        for name in ["issue", "verify", "overseer", "publisher"] {
             assert!(
                 reserved(name).is_some() && !is_aggregate_identity(name),
                 "`{name}` is reserved without being a box anything records under"

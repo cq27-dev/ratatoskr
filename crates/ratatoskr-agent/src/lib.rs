@@ -2124,7 +2124,7 @@ impl AgentHook for ClarificationHook {
             Err(e) => {
                 return ToolCallAction::Skip(format!(
                     "ask: invalid arguments ({e}); call it as \
-                     {{\"to\": \"scout|analyst|bookkeeper|redteam\", \"question\": \"...\"}}"
+                     {{\"to\": \"context|analyst|bookkeeper|redteam|user\", \"question\": \"...\"}}"
                 ));
             }
         };
