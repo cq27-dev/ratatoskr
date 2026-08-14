@@ -1159,11 +1159,19 @@ async fn node_checkpoints(
         .project_and_run(&project, &run_id, &caller, Access::Read)
         .await?;
     let all = found.store.checkpoints_for_run(&run_id).await?;
+    // Asked with the name of a *box*, which is what the graph draws and what a selection names. Its
+    // records are its members' as well as its own, so the run's registry resolves the name rather
+    // than matching it: a box whose members ran directly has no row under its own name at all, and
+    // matching would 404 a box the graph draws as done.
+    let shape_json = found.store.run(&run_id).await?.and_then(|r| r.shape_json);
+    let recorded = ratatoskr_core::shape::recorded(shape_json.as_deref());
+    let registry = recorded.index();
+    let names = registry.records_of(&node);
     // Every checkpoint, not just the latest: the implementer writes one per converge iteration and
     // the diagnostic progression between them is the interesting part.
     let views: Vec<CheckpointView> = all
         .into_iter()
-        .filter(|c| c.node_name == node)
+        .filter(|c| names.contains(&c.node_name.as_str()))
         .map(|c| CheckpointView {
             created_at: c.created_at,
             output: parse_or_raw(&c.output_json),
@@ -2321,6 +2329,64 @@ mod access_tests {
                 ratatoskr_core::Directive::Continue
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_boxs_records_are_read_under_the_boxs_name_however_its_members_ran() {
+        // The graph draws boxes, so a selection names a box — and `redteam` is not a stage id. Two
+        // ways a box's rows are not under its own name: a member wrote them (a workflow invoked the
+        // member directly, which is the same thing that makes the box read Done), or the aggregate
+        // and the member both wrote and only one matches. Matching the name instead of resolving it
+        // 404s the first case, on a box the graph draws as finished.
+        let state = state().await;
+        let store = &state.projects["open"].store;
+        store
+            .upsert_run("r9", None, "converged")
+            .await
+            .expect("a run row");
+        let shape = serde_json::json!({
+            "nodes": [],
+            "stages": [{"id": "redteam_classifier", "node": "redteam"}],
+        })
+        .to_string();
+        store
+            .record_run_provenance("r9", None, None, None, Some(&shape), None)
+            .await
+            .expect("the registry to record");
+        store
+            .insert_checkpoint(ratatoskr_store::CheckpointWrite {
+                run_id: "r9",
+                node_name: "redteam_classifier",
+                output_json: r#"{"verdict":"needs tests"}"#,
+                input_json: None,
+                iteration: None,
+                telemetry: Default::default(),
+            })
+            .await
+            .expect("the member's checkpoint");
+
+        let response = router(state, None)
+            .oneshot(get("/api/projects/open/runs/r9/nodes/redteam", None))
+            .await
+            .expect("the router to answer");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the red team's box has records; only their name differs from the box's"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("a checkpoint body");
+        let views: Vec<serde_json::Value> =
+            serde_json::from_slice(&bytes).expect("checkpoint views");
+        assert_eq!(
+            views
+                .iter()
+                .map(|v| v["node_name"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            ["redteam_classifier"],
+            "the member's row is the box's row"
+        );
     }
 
     #[tokio::test]

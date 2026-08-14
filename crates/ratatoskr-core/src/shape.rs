@@ -141,6 +141,22 @@ impl<'a> Registry<'a> {
             .unwrap_or_else(|| vec![node])
     }
 
+    /// Every name a record drawn in `node` can be written under: its members, and the box itself.
+    ///
+    /// Distinct from [`Self::members`], which answers "whose work is this box" — a question about
+    /// stages. This one answers "which rows are this box's", and a box's own name is not a stage id:
+    /// `redteam`, `implementer` and `context` are the names their operation host writes the
+    /// aggregate under. A members-only answer drops that row, which for the red team is nearly
+    /// everything it visibly did; a name-only answer drops the members, which is everything a box
+    /// whose members ran directly has.
+    pub fn records_of(&self, node: &'a str) -> Vec<&'a str> {
+        let mut names = self.members(node);
+        if !names.contains(&node) {
+            names.push(node);
+        }
+        names
+    }
+
     /// Which node each stage's records are drawn in, in registry order.
     ///
     /// The accessor for a reader that needs the whole mapping, rather than walking
