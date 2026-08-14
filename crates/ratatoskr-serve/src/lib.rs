@@ -1092,15 +1092,14 @@ async fn run_detail(
         .ok()
         .and_then(|t| ratatoskr_core::RatatoskrConfig::from_toml_str(&t).ok());
     let shape_json = run.as_ref().and_then(|r| r.shape_json.as_deref());
-    let nodes = pipeline::derive_with(status.as_deref(), &checkpoints, config.as_ref(), shape_json);
     let recorded = ratatoskr_core::shape::recorded(shape_json);
+    let nodes = pipeline::derive_from(status.as_deref(), &checkpoints, config.as_ref(), &recorded);
     let stages = recorded
-        .index()
-        .membership()
-        .into_iter()
-        .map(|(id, node)| StageMembership {
-            id: id.to_string(),
-            node: node.to_string(),
+        .stages
+        .iter()
+        .map(|stage| StageMembership {
+            id: stage.id.clone(),
+            node: stage.node.clone(),
         })
         .collect();
     let last_activity = checkpoints

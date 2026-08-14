@@ -100,16 +100,7 @@ impl Recorded {
                 .or_default()
                 .push(stage.id.as_str());
         }
-        let order = self
-            .stages
-            .iter()
-            .map(|stage| (stage.id.as_str(), stage.node.as_str()))
-            .collect();
-        Registry {
-            by_id,
-            members,
-            order,
-        }
+        Registry { by_id, members }
     }
 }
 
@@ -124,9 +115,6 @@ impl Recorded {
 pub struct Registry<'a> {
     by_id: HashMap<&'a str, &'a RunStage>,
     members: HashMap<&'a str, Vec<&'a str>>,
-    /// Every stage with its node, in the registry's own order — which is the order a box's members
-    /// are declared in, and so the order its feed reads.
-    order: Vec<(&'a str, &'a str)>,
 }
 
 impl<'a> Registry<'a> {
@@ -155,15 +143,6 @@ impl<'a> Registry<'a> {
             names.push(node);
         }
         names
-    }
-
-    /// Which node each stage's records are drawn in, in registry order.
-    ///
-    /// The accessor for a reader that needs the whole mapping, rather than walking
-    /// [`Recorded::stages`] and reading `.node` off each row — see this type's note on why that walk
-    /// is the thing that will have to change.
-    pub fn membership(&self) -> Vec<(&'a str, &'a str)> {
-        self.order.clone()
     }
 
     /// The node a record written under `stage` is drawn in — the stage itself unless it said

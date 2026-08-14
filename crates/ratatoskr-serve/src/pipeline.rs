@@ -337,6 +337,10 @@ fn ran_to_completion(status: Option<&str>) -> bool {
 ///
 /// `config` is what the run was started under, so a node that has not run yet can still say what it
 /// will run on.
+/// [`derive_from`], for a caller holding the recording still serialized.
+///
+/// The parse is the largest single pass over a document an imported run brought with it, so a
+/// caller that needs the recording for anything else parses once and calls `derive_from`.
 pub fn derive_with(
     status: Option<&str>,
     checkpoints: &[Checkpoint],
@@ -347,7 +351,20 @@ pub fn derive_with(
     // before the pipeline changed — is drawn against its own shape; one that recorded no layout is
     // placed entirely by `append_unknown`, from the records it has. Its membership still applies
     // there: which stages compose a node is the registry's, not the layout's.
-    let recorded = ratatoskr_core::shape::recorded(shape_json);
+    derive_from(
+        status,
+        checkpoints,
+        config,
+        &ratatoskr_core::shape::recorded(shape_json),
+    )
+}
+
+pub fn derive_from(
+    status: Option<&str>,
+    checkpoints: &[Checkpoint],
+    config: Option<&ratatoskr_core::RatatoskrConfig>,
+    recorded: &ratatoskr_core::shape::Recorded,
+) -> Vec<NodeView> {
     // Both lookups this derivation makes, indexed once: the registry it asks about every node, and
     // the log it asks about every name. Either scanned per question is quadratic over a document an
     // imported run brought with it.
@@ -372,7 +389,7 @@ pub fn derive_with(
     // A node has finished only if it checkpointed *and* isn't the implementer mid-converge —
     // otherwise the fork would look complete on iteration 1 and the run's activity would be
     // attributed to the bookkeeper, which by the invariant above hasn't started.
-    let finished = |name: &str| count(&rows, name) > 0 && !(name == "implementer" && !terminal);
+    let finished = |name: &str| count(&rows, name) > 0 && !(name == IMPLEMENTER_NODE && !terminal);
     // Where the run has got to: the first stage that has not finished and has nothing after it
     // checkpointed. Without that second half a skipped verifier would hold the position forever
     // and report every later node as not yet reached, on a run that has finished.
@@ -1044,7 +1061,7 @@ mod tests {
         let registry = recorded.index();
         assert_eq!(registry.members("n7"), ["s7"]);
         assert_eq!(registry.node_of("s7"), "n7");
-        assert_eq!(registry.membership().len(), N);
+        assert_eq!(recorded.stages.len(), N);
     }
 
     #[test]

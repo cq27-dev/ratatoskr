@@ -2725,6 +2725,11 @@ where
         ledger,
         produces,
     } = run;
+    // The address an operator aims a control at, resolved once. A stage that belongs to a box is
+    // controlled at the box's address while it records under its own name, so every control-facing
+    // use takes this and every record-facing use takes `node`. Resolving it at each use is what let
+    // one poll site keep the raw name while its siblings moved.
+    let controlled = controlled_as.unwrap_or(node);
     let model_name = format!("{}/{}", route.provider, route.model);
     // `SubagentStart` opens the node's conversation, `UserPromptSubmit` rides with the prompt —
     // where each lands in the format, and a cleaner place for a plugin to speak than a tool result.
@@ -2747,7 +2752,7 @@ where
     // hook boundary, but operator text sent while they are paused must still reach the node.
     let pending = pending_for_attempt(compacted_session.as_ref());
     let runtime_control = control.as_ref().map(|controller| RuntimeControl {
-        node: controlled_as.unwrap_or(node).to_string(),
+        node: controlled.to_string(),
         controller: Arc::clone(controller),
         pending: Arc::clone(&pending),
     });
@@ -2776,7 +2781,7 @@ where
             // The BOX, like `RuntimeControl` above and like the pause ledger: an operator addresses
             // what the graph draws, and a poll under the stage id answers `Continue` for a node
             // they have stopped.
-            node: controlled_as.unwrap_or(node).to_string(),
+            node: controlled.to_string(),
             controller: Arc::clone(controller),
             pending: Arc::clone(&pending),
         });
@@ -2893,7 +2898,7 @@ where
             );
             // The box again: parking polls for the start that releases it, and a name nothing was
             // stopped under is released immediately.
-            let said = park(controller, controlled_as.unwrap_or(node)).await;
+            let said = park(controller, controlled).await;
             // Anything the operator said to the stopped node belongs to the attempt that
             // replaces it — they were talking about this work, not the abandoned transcript.
             pending.steer.lock().expect("steer poisoned").extend(

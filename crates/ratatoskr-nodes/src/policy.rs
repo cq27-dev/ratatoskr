@@ -335,7 +335,6 @@ pub(crate) fn reserved_for_governance(id: &str) -> Option<Reserved> {
     reserved(id).filter(|reason| !reason.governable())
 }
 
-/// The output contract an override of `id` must keep, because Rust deserializes it.
 /// The box `id`'s work lands in, when a Rust caller decides it and a declaration must agree.
 ///
 /// `None` for a stage that is a node of its own and for a repository's own id, whose membership is
@@ -347,6 +346,7 @@ pub(crate) fn required_node(id: &str) -> Option<&'static str> {
     }
 }
 
+/// The output contract an override of `id` must keep, because Rust deserializes it.
 pub(crate) fn required_contract(id: &str) -> Option<&'static str> {
     match class(id)? {
         Class::Overridable { contract, .. } => contract,
