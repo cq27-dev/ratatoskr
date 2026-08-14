@@ -429,9 +429,12 @@ fn scripted_review(checkpoints: &[ratatoskr_store::Checkpoint]) -> ScriptedRevie
     if value.get("error").is_some() {
         return ScriptedReview::Unavailable;
     }
-    match serde_json::from_value(value) {
-        Ok(output) => ScriptedReview::Available(output),
-        Err(_) => ScriptedReview::Unavailable,
+    // Folded across the chain, not read off this checkpoint alone: a continuation reviews only the
+    // gap it was handed, and the findings the passes before it established are still true of a tree
+    // nothing has changed since.
+    match tree_review(checkpoints) {
+        Some(output) => ScriptedReview::Available(output),
+        None => ScriptedReview::Unavailable,
     }
 }
 
@@ -1193,6 +1196,56 @@ fn verification_result(
 /// spend refusing to finish one.
 const REVIEW_CONTINUATIONS: usize = 2;
 
+/// Every pass of the review of the tree as it now stands, oldest first.
+///
+/// The chain ends at the last implementer checkpoint: an `iterate()` rewrites the tree under a
+/// review, so anything said before it was said about code that may no longer exist.
+pub(crate) fn review_chain(
+    checkpoints: &[ratatoskr_store::Checkpoint],
+) -> Vec<verifier::VerifierOutput> {
+    let start = checkpoints
+        .iter()
+        .rposition(|checkpoint| checkpoint.node_name == "implementer")
+        .map_or(0, |last| last + 1);
+    checkpoints[start..]
+        .iter()
+        .filter(|checkpoint| checkpoint.node_name == "verifier")
+        .filter_map(|checkpoint| serde_json::from_str(&checkpoint.output_json).ok())
+        .collect()
+}
+
+/// This tree's review: the passes that produced it, folded into one.
+///
+/// A continuation reviews only the gap the pass before it named, so its own checkpoint carries only
+/// what that gap turned up. Read alone it loses every finding the earlier passes established — and
+/// those are still true, because the tree has not changed under them. So the chain is folded:
+/// findings accumulate across it, and whether the review finished is the last pass's answer.
+///
+/// `None` when this tree has no review, which is not the same as a clean one.
+pub(crate) fn tree_review(
+    checkpoints: &[ratatoskr_store::Checkpoint],
+) -> Option<verifier::VerifierOutput> {
+    let chain = review_chain(checkpoints);
+    let last = chain.last()?.clone();
+    let mut findings: Vec<verifier::Finding> = Vec::new();
+    for pass in &chain {
+        for finding in &pass.findings {
+            // A continuation may restate what it was handed; the same defect twice is one defect.
+            let seen = findings.iter().any(|kept: &verifier::Finding| {
+                kept.severity == finding.severity
+                    && kept.kind == finding.kind
+                    && kept.file == finding.file
+                    && kept.line == finding.line
+                    && kept.summary == finding.summary
+            });
+            if !seen {
+                findings.push(finding.clone());
+            }
+        }
+    }
+    Some(verifier::VerifierOutput { findings, ..last })
+}
+
 /// What the review of THIS tree said it could not reach, and whether another pass may be spent.
 ///
 /// The chain is the reviews since the last implementer checkpoint, not every review in the run. An
@@ -1208,15 +1261,7 @@ const REVIEW_CONTINUATIONS: usize = 2;
 /// Counted from the checkpoints rather than carried through the script, so a workflow that calls
 /// `verify()` in a shape nobody anticipated is bounded the same way the bundled one is.
 fn review_continuations(checkpoints: &[ratatoskr_store::Checkpoint]) -> (Vec<String>, bool) {
-    let chain = checkpoints
-        .iter()
-        .rposition(|checkpoint| checkpoint.node_name == "implementer")
-        .map_or(0, |last| last + 1);
-    let reviews: Vec<verifier::VerifierOutput> = checkpoints[chain..]
-        .iter()
-        .filter(|checkpoint| checkpoint.node_name == "verifier")
-        .filter_map(|checkpoint| serde_json::from_str(&checkpoint.output_json).ok())
-        .collect();
+    let reviews = review_chain(checkpoints);
     let unchecked = reviews
         .last()
         .filter(|review| !review.complete())
@@ -11585,6 +11630,72 @@ mod tests {
             left,
             "only reviews that could not finish spend continuations"
         );
+    }
+
+    #[test]
+    fn a_continuation_keeps_what_the_passes_before_it_found() {
+        // A continuation reviews only the gap it was handed, so its own checkpoint carries only what
+        // that gap turned up. Read alone — which is what the terminal gate and the publisher do — it
+        // loses every finding the earlier passes established, and those are still true: the tree has
+        // not changed under them, or the chain would have reset. A sub-threshold finding is the
+        // sharp case, because nothing else carries it forward: `previous_verifier_findings` hands
+        // the next pass only what blocks.
+        let nit = verifier::Finding {
+            severity: verifier::Severity::P3,
+            kind: verifier::FindingKind::Execution,
+            file: "a.rs".to_string(),
+            line: None,
+            summary: "a cosmetic label is awkward".to_string(),
+            failure_scenario: "a reader is briefly confused".to_string(),
+        };
+        let first = verifier::VerifierOutput {
+            findings: vec![nit.clone()],
+            assessment: "checked the happy path".to_string(),
+            unchecked: vec!["the error path".to_string()],
+        };
+        let continued = verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: "covered the error path".to_string(),
+            unchecked: Vec::new(),
+        };
+        let checkpoints = vec![
+            review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
+            review_checkpoint("verifier", &first, None::<&&str>),
+            review_checkpoint("verifier", &continued, None::<&&str>),
+        ];
+
+        let review = tree_review(&checkpoints).expect("this tree has been reviewed");
+        assert_eq!(
+            review.findings.len(),
+            1,
+            "the finding the first pass established is still true of an unchanged tree"
+        );
+        assert_eq!(review.findings[0].summary, nit.summary);
+        assert!(
+            review.complete(),
+            "whether the review finished is the last pass's answer, not the first's"
+        );
+
+        // Restating a finding it was handed does not double it.
+        let restated = verifier::VerifierOutput {
+            findings: vec![nit.clone()],
+            assessment: "covered the error path".to_string(),
+            unchecked: Vec::new(),
+        };
+        let repeated = vec![
+            review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
+            review_checkpoint("verifier", &first, None::<&&str>),
+            review_checkpoint("verifier", &restated, None::<&&str>),
+        ];
+        assert_eq!(tree_review(&repeated).unwrap().findings.len(), 1);
+
+        // And a tree the implementer has since rewritten carries nothing forward.
+        let after_a_fix = vec![
+            review_checkpoint("verifier", &first, None::<&&str>),
+            review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
+            review_checkpoint("verifier", &continued, None::<&&str>),
+        ];
+        assert!(tree_review(&after_a_fix).unwrap().findings.is_empty());
     }
 
     #[test]

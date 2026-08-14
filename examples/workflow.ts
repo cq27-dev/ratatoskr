@@ -29,7 +29,8 @@
 //   isConverged({baseline, post}) -> boolean
 //   testCommandRan(output) -> boolean
 //
-// `verify()` returns { configured, unavailable, findings, blocking, needsReplan }. Rust applies
+// `verify()` returns { configured, unavailable, findings, blocking, needsReplan, unchecked,
+// retryable }. Rust applies
 // `[implementer] verify_threshold` — a script decides *whether* to review and what to do about
 // findings, never what counts as blocking. `needsReplan` means a blocking finding faults the PLAN,
 // so the useful response is `analyst({...., previous, findings})` before
@@ -38,6 +39,12 @@
 //
 // A run that calls verify() and returns with blocking findings standing does NOT converge: the
 // terminal status is inferred from the verifier checkpoint, not from what the script returns.
+//
+// Nor does one that returns on a review which could not finish. `unchecked` names what a pass could
+// not reach, and `retryable` says calling verify() again would continue that review rather than
+// repeat it — Rust carries the named areas into the next call and bounds how many continuations a
+// tree may have. A script that breaks on `blocking.length === 0` alone accepts a review cut short,
+// and the run ends `Unreviewed` after one pass instead of covering the gap.
 //
 // `replanAtCeiling()` takes no workflow-supplied plan or evidence. Rust reconstructs both from the
 // checkpoint ledger and either performs one bounded analyst revision plus implementation attempt,
@@ -150,7 +157,11 @@ export async function run(input: { issue: string; maxIterations: number; alwaysF
       (await isConverged({ baseline: redTeamOut, post: impl }));
     if (testsClean) {
       const review = await verify({ analyst: analystOut });
-      if (!review.configured || review.unavailable || review.blocking.length === 0) break;
+      if (!review.configured || review.unavailable) break;
+      // Continue a review that could not finish before deciding anything about it: it returns
+      // exactly what a clean one returns, so accepting it here is accepting an unreviewed change.
+      if (review.retryable) continue;
+      if (review.blocking.length === 0) break;
       if (iterations >= input.maxIterations) {
         if (await recoverAtCeiling()) continue;
         break;

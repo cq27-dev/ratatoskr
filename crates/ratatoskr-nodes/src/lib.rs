@@ -1243,14 +1243,12 @@ async fn unresolved_of(store: &Store, run_id: &str) -> Vec<verifier::Finding> {
             return Vec::new();
         }
     };
-    // The last review is the one that still stands: an earlier pass's findings were either fixed
-    // or raised again, and reporting a fixed one would be as misleading as reporting none.
-    checkpoints
-        .iter()
-        .rev()
-        .find(|c| c.node_name == "verifier")
-        .and_then(|c| serde_json::from_str::<verifier::VerifierOutput>(&c.output_json).ok())
-        .map(|v| v.findings)
+    // This tree's review, which may have taken several passes. An earlier tree's findings were
+    // either fixed or raised again, and reporting a fixed one would be as misleading as reporting
+    // none — but a continuation of the SAME review carries only what its own gap turned up, and
+    // publishing that alone drops what the passes before it found on a tree nothing has changed.
+    workflow::tree_review(&checkpoints)
+        .map(|review| review.findings)
         .unwrap_or_default()
 }
 
