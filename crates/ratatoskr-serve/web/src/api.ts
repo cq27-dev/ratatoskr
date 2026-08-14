@@ -16,6 +16,8 @@ export type RunStatus =
   | "planned"
   | "converged"
   | "max_iterations_reached"
+  | "unreviewed"
+  | "no_code_change"
   | "failed"
   | "abandoned";
 
@@ -27,11 +29,6 @@ export interface NodeView {
   /** Position in the pipeline: stage is the column, lane the row within it. */
   stage: number;
   lane: number;
-  /** The stages whose work this node is — its own name for a node that is one stage, several for
-   *  one they compose. Members run under their own identities, so their events arrive under names
-   *  no box carries; this is what folds them into the box instead of drawing each beside it.
-   *  Absent only from a `NodeView` this client built itself. */
-  stages?: string[];
   /** Whether the run's recorded shape is what put it there. False means the server placed it from
    *  its checkpoints, in completion order — which `applyDerived` replaces with the stream's. */
   shaped?: boolean;
@@ -42,6 +39,18 @@ export interface NodeView {
   /** The node that ran this one. Only present for a node the shape does not place — a placed node's
    *  position already says what preceded it. */
   caller?: string;
+}
+
+/**
+ * Mirrors `StageMembership` — one stage of the run's registry, as the dashboard needs it.
+ *
+ * `node` is the box its work is drawn in, its own id unless it declared otherwise. A member records
+ * and announces itself under `id`, so this is what says those records belong in `node`'s box. The
+ * server records more about a stage than this; the rest is not the dashboard's business.
+ */
+export interface RunStage {
+  id: string;
+  node: string;
 }
 
 /** Mirrors `pipeline::NodeTelemetryView`. */
@@ -90,20 +99,6 @@ export interface Me {
 }
 
 /** Whether this role may start runs and answer clarifications. */
-/**
- * Whether a run has stopped executing. Mirrors `RunStatus::is_terminal` on the server, and the
- * same two-sided rule applies: a status this build has never heard of reads as still executing,
- * which shows a stale run rather than declaring a live one finished.
- */
-export function isTerminal(status: RunStatus | null): boolean {
-  return (
-    status !== null &&
-    status !== "pending" &&
-    status !== "running" &&
-    status !== "awaiting_clarification"
-  );
-}
-
 export function mayAct(role: Role | undefined): boolean {
   return role === "operator" || role === "admin";
 }
@@ -129,11 +124,19 @@ export interface RunDetail {
   run_id: string;
   /** Null for a run with checkpoints but no `runs` row. */
   status: RunStatus | null;
+  /** Whether `status` is one a run stops at, classified by the server against the enum that
+   *  defines it. A list kept here instead would have to be told about every new status, and would
+   *  be wrong until it was. */
+  terminal: boolean;
   issue_id: string | null;
   updated_at: string | null;
   issue: string | null;
   last_activity: string | null;
   nodes: NodeView[];
+  /** The run's own record of its registry. `nodes` is derived from checkpoints, so a box whose
+   *  stage is executing right now is not in it yet — this is, because it is a property of the run
+   *  rather than of what has finished. Empty for a run recorded before it travelled. */
+  stages: RunStage[];
   worktree: WorktreeView | null;
   /** The pull request the run opened, if any. Null for comment-only runs, runs that published
    * nothing, and runs that never reached the publisher. */
@@ -196,13 +199,6 @@ export interface CheckpointView {
   created_at: string;
   output: unknown;
 }
-
-/** Statuses that mean the run is still executing. */
-export const LIVE: ReadonlySet<string> = new Set([
-  "running",
-  "awaiting_clarification",
-  "pending",
-]);
 
 /**
  * Thrown when the server says who you are is the problem.
@@ -394,11 +390,17 @@ export const getNodeCheckpoints = (
 
 /** Mirrors `pipeline::PlannedNode` — a node's configured route, known before it runs. */
 export interface PlannedNode {
+  /** Every distinct route the node's stages resolve, comma-joined — as `NodeTelemetry.model` is. */
   model: string;
   thinking: boolean;
-  reuses_session: boolean;
-  session: "fresh" | "reuse" | "compacted";
+  /** Every distinct scope this node's stages will run under, in registry order — a set, because
+   *  compacted continuation is a property a MEMBER has and a box with a compacted member has it
+   *  whatever its siblings do. There is no `reuses_session` here: it is `sessions.includes("reuse")`,
+   *  and a boolean cannot tell endpoint reuse from a compacted re-entry. */
+  sessions: SessionScope[];
 }
+
+export type SessionScope = "fresh" | "reuse" | "compacted";
 
 /** Mirrors `events::LiveNodeFacts` — what a node announced when it started. */
 export interface NodeFacts {

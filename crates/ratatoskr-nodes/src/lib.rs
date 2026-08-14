@@ -246,18 +246,46 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
     Ok(())
 }
 
-/// Record what it would take to say two runs were the same experiment: the resolved config, a
-/// fingerprint of the graph that ran, and the commit it ran against.
+/// Record the graph this run will execute, then what it would take to say two runs were the same
+/// experiment: the resolved config, a fingerprint of the graph that ran, and the commit it ran
+/// against.
 ///
-/// Best-effort throughout. This is what makes runs comparable afterwards, which is never worth
-/// failing a run over — a run with no provenance is still a run, and one refused because `git` was
-/// slow is not.
+/// Two halves, and only one of them can fail a run.
+///
+/// The SHAPE is run initialization, because it carries the stage registry. A stage records under
+/// its own identity and the registry is what says which box that work belongs to — and the box is
+/// the name the runtime polls a Stop or a Steer under (`NodeRun.controlled_as`). Without it a
+/// reader draws every member as a box of its own and offers controls addressed to a name nothing
+/// answers to, which is a run nobody can steer. So a run whose registry does not land does not
+/// start.
+///
+/// The REST is best-effort. That half is what makes runs comparable afterwards, which is never
+/// worth failing a run over — a run with no provenance is still a run, and one refused because
+/// `git` was slow is not.
 async fn record_provenance(
     store: &Store,
     run_id: &str,
     config: &RatatoskrConfig,
-    shape: &[ratatoskr_core::shape::ShapeNode],
-) {
+    shape: &ratatoskr_core::shape::Recorded,
+) -> Result<(), PlanError> {
+    // The graph itself, not just a hash of it. A hash says two runs differed; the shape is what
+    // lets a run be drawn by something that never had this pipeline. It is the layout the
+    // *running* workflow declared — recording this build's own would draw every run against a
+    // pipeline it may never have executed.
+    let shape_json = serde_json::to_string(shape)?;
+    // The store refuses provenance for a run that is not there, so a write that returns is a write
+    // that landed. Every control is addressed to the box a stage belongs to, and that mapping is
+    // only in the registry, so a run without it cannot be stopped or steered.
+    store
+        .record_run_provenance(run_id, None, None, None, Some(&shape_json), None)
+        .await
+        .map_err(|e| {
+            PlanError::node(
+                "workflow",
+                NodeError::Failed(format!("the run's stage registry did not record: {e}")),
+            )
+        })?;
+
     let config_json = serde_json::to_string(config)
         .inspect_err(|e| tracing::warn!("could not record the run's config: {e}"))
         .ok();
@@ -269,17 +297,14 @@ async fn record_provenance(
             config_json.as_deref(),
             Some(&graph_fingerprint(&repo)),
             repo_sha.as_deref(),
-            // The graph itself, not just a hash of it. A hash says two runs differed; the shape is
-            // what lets a run be drawn by something that never had this pipeline. It is the layout
-            // the *running* workflow declared — recording this build's own would draw every run
-            // against a pipeline it may never have executed.
-            serde_json::to_string(shape).ok().as_deref(),
+            None,
             None,
         )
         .await
     {
         tracing::warn!("could not record run provenance: {e}");
     }
+    Ok(())
 }
 
 /// A fingerprint of the orchestration that ran: every workflow and every ruleset, in a fixed order.
@@ -2444,6 +2469,42 @@ mod agent_config_tests {
         assert!(verifier_enabled(&engine, &config, &stages));
     }
 
+    #[tokio::test]
+    async fn a_run_whose_stage_registry_does_not_land_does_not_start() {
+        // The registry says which box a stage's records belong to, and the box is the name the
+        // runtime polls a Stop or a Steer under. A run that starts without it draws every member
+        // as a box of its own and offers controls addressed to a name nothing answers to — so
+        // this half of provenance is initialization, not the best-effort half the config, the
+        // fingerprint and the commit are.
+        let store = Store::open_in_memory().unwrap();
+        let config = RatatoskrConfig::default();
+        let shape = ratatoskr_core::shape::Recorded {
+            nodes: vec![],
+            stages: vec![ratatoskr_core::shape::RunStage {
+                id: "redteam_author".to_string(),
+                node: "redteam".to_string(),
+                governed_by: None,
+                session: None,
+            }],
+        };
+
+        // Provenance is an UPDATE, so with no run row to update the registry goes nowhere and the
+        // store reports success. That is the failure this refuses to start on.
+        record_provenance(&store, "no-such-run", &config, &shape)
+            .await
+            .expect_err("a registry that did not land fails the run");
+
+        // And where it does land, the run proceeds and a reader can resolve the box.
+        store.upsert_run("run-1", None, "running").await.unwrap();
+        record_provenance(&store, "run-1", &config, &shape)
+            .await
+            .unwrap();
+        let run = store.run("run-1").await.unwrap().unwrap();
+        let recorded: ratatoskr_core::shape::Recorded =
+            serde_json::from_str(&run.shape_json.unwrap()).unwrap();
+        assert_eq!(recorded.index().members("redteam"), ["redteam_author"]);
+    }
+
     #[test]
     fn the_graph_fingerprint_tracks_the_scripts_and_nothing_else() {
         let root = std::env::temp_dir().join(format!("ratatoskr-fp-{}", std::process::id()));
@@ -3420,11 +3481,11 @@ mod referee_governance_tests {
         // records, and it names the stage it now has.
         let shape = stage::shape_from_workflow(runtime.meta(), &stages);
         assert!(
-            shape.iter().any(|node| node.name == "strategist"),
+            shape.nodes.iter().any(|node| node.name == "strategist"),
             "{shape:?}"
         );
         assert!(
-            !shape.iter().any(|node| node.name == "analyst"),
+            !shape.nodes.iter().any(|node| node.name == "analyst"),
             "{shape:?}"
         );
         // The rename is still judged against the registry it produced, so the column and the stage
@@ -3466,6 +3527,7 @@ mod referee_governance_tests {
         let shape = stage::shape_from_workflow(runtime.meta(), &stages);
         let at = |name: &str| {
             shape
+                .nodes
                 .iter()
                 .find(|node| node.name == name)
                 .unwrap_or_else(|| panic!("the standard layout places `{name}`"))
@@ -3479,13 +3541,17 @@ mod referee_governance_tests {
 
         // Each box says which stages do its work: one of its own name, or the several that compose
         // it. This is what lets the fork be one red-team box while both halves keep their identity.
-        assert_eq!(at("analyst").stages, ["analyst"]);
+        // It comes from the registry, so it is recorded whether or not the box was laid out.
+        assert_eq!(shape.index().members("analyst"), ["analyst"]);
         assert_eq!(
-            at("redteam").stages,
+            shape.index().members("redteam"),
             ["redteam_classifier", "redteam_author"]
         );
-        assert_eq!(at("implementer").stages, ["implementer_attempt"]);
-        assert_eq!(at("context").stages, ["context_distillation"]);
+        assert_eq!(
+            shape.index().members("implementer"),
+            ["implementer_attempt"]
+        );
+        assert_eq!(shape.index().members("context"), ["context_distillation"]);
 
         // And every node it lays out is one the run can record under, judged against the registry
         // the workflow actually runs.

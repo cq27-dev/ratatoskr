@@ -671,16 +671,53 @@ async fn note<T: serde::Serialize>(
 /// row accounts for — a node whose model turn ran under one name and was checkpointed under
 /// another, or a turn whose checkpoint never happened. Nothing else would say: a dropped number
 /// reads exactly like a node that never called a model (#262).
+/// Stage identities whose model turn no checkpoint claims, with the reason each is allowed to.
+///
+/// A turn is claimed by the checkpoint written under the same name in the same claim scope
+/// (`crate::record` -> `RunLedger::take`), and `execute_after_guard` writes one when the invocation
+/// checkpoints OR the stage belongs to another node. A stage that is folded into someone else's
+/// record as evidence AND is a node of its own therefore has nothing to claim its turn, and its
+/// cost lands in the bin — invisible, because a dropped number reads exactly like a node that never
+/// called a model.
+///
+/// Written out and bolted both ways by `nothing_records_under_a_name_nobody_claims`: a stage that
+/// acquires the property without being listed fails, and a listed name that no longer has it fails.
+/// The second direction is the one that matters when a fix lands — the list shrinks and the case
+/// says so.
+///
+/// The other shape this admits is a delegation target: the executor invokes one at the evidence
+/// disposition, so a target that is its own node is unclaimed for the same reason (#283). The
+/// bundled registry declares no delegation, so nothing is listed for it here; the rule below covers
+/// one the moment it appears.
+pub(crate) const UNCLAIMED_BY_DESIGN: &[(&str, &str)] = &[(
+    "characterizer",
+    "folded into another stage's record as evidence and declares no node, because which node ran \
+     it depends on the invocation (#244)",
+)];
+
 fn warn_about_unclaimed_turns(ctx: &WorkflowContext) {
-    let unclaimed = ctx.ledger.unclaimed();
+    // The by-design residents are filtered out rather than reported, so what is left is always
+    // something to act on. A warning an operator learns to expect is a warning nobody reads, and
+    // `nothing_records_under_a_name_nobody_claims` is what keeps the filter from hiding a real one.
+    let unclaimed: Vec<String> = ctx
+        .ledger
+        .unclaimed()
+        .into_iter()
+        .filter(|name| {
+            !UNCLAIMED_BY_DESIGN
+                .iter()
+                .any(|(known, _)| known == &name.as_str())
+        })
+        .collect();
     if unclaimed.is_empty() {
         return;
     }
     tracing::warn!(
         nodes = %unclaimed.join(", "),
         "these model turns cost the run and reached no checkpoint, so nothing reports what they \
-         spent; a node checkpointed under a different name than its turn ran under is the usual \
-         cause"
+         spent; a stage whose output is folded into another stage's record as evidence, while \
+         being a node of its own, is the usual cause — see UNCLAIMED_BY_DESIGN for the ones that \
+         are meant to be here"
     );
 }
 
@@ -713,7 +750,7 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
         .await
         .map_err(|e| e.to_string())?;
     // Checkpoint before the guard so a failed baseline stays inspectable.
-    note(&ctx, "redteam", &out, None).await?;
+    note(&ctx, crate::policy::REDTEAM_NODE, &out, None).await?;
     // The false-convergence guard is enforced here — the script cannot skip it.
     if !converge::test_command_ran(&out.failing_tests, out.passed_tests, out.exit_code) {
         return Err(format!(
@@ -791,7 +828,7 @@ async fn implement_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String
             return Err(error.to_string());
         }
     };
-    note(&ctx, "implementer", &out, Some(arg)).await?;
+    note(&ctx, crate::policy::IMPLEMENTER_NODE, &out, Some(arg)).await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -1048,7 +1085,13 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
         .map_err(|e| e.to_string())?;
     // The diagnostic, not the binding's argument: the script does not author it, so it is the one
     // thing that explains what this iteration was actually asked to fix.
-    note(&ctx, "implementer", &out, Some(diagnostic)).await?;
+    note(
+        &ctx,
+        crate::policy::IMPLEMENTER_NODE,
+        &out,
+        Some(diagnostic),
+    )
+    .await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -1521,7 +1564,7 @@ async fn context_host(
     let distilled: crate::context::Distillation =
         serde_json::from_str(&raw).map_err(|error| error.to_string())?;
     let out = crate::context::attach_evidence(distilled, memory);
-    note(&ctx, "context", &out, Some(arg)).await?;
+    note(&ctx, crate::policy::CONTEXT_NODE, &out, Some(arg)).await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -2146,13 +2189,6 @@ fn claiming(host: HostFn) -> HostFn {
     Arc::new(move |arg| Box::pin(ratatoskr_agent::claim_scope(host(arg))))
 }
 
-fn build_hosts(
-    ctx: &Arc<WorkflowContext>,
-    stages: &[Stage],
-) -> Result<HashMap<String, HostFn>, PlanError> {
-    build_hosts_with_turn(ctx, stages, Arc::new(LiveStageTurn))
-}
-
 fn stage_question_renderers(stages: &[Stage]) -> HashMap<String, String> {
     stages
         .iter()
@@ -2413,6 +2449,80 @@ async fn evaluate_standard_stage_with_turn_and_resources(
 
 // --- wrappers (own every status write, gate, and cleanup) -------------------
 
+/// Write the run's row and put everything in place that its workflow entry needs.
+///
+/// The row and the cleanup are one operation deliberately. Everything after the row is written
+/// belongs to a run that already exists and already reports itself running, so a failure there has
+/// to finish the run rather than return; a wrapper that took the row separately could — and, before
+/// this was one function, did — leave a run reading `running` forever with its plugin session never
+/// ended.
+async fn start_run(
+    ctx: &Arc<WorkflowContext>,
+    runtime: &WorkflowRuntime,
+    turn: Arc<dyn StageTurn>,
+) -> Result<(Arc<Vec<Stage>>, HashMap<String, HostFn>), PlanError> {
+    // The run row first: the issue checkpoint references it, and the schema enforces that.
+    ctx.store
+        .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
+        .await?;
+    match initialize_run(ctx, runtime, turn).await {
+        Ok(started) => Ok(started),
+        Err(e) => Err(fail_initialization(ctx, e).await),
+    }
+}
+
+/// Everything a run needs in place before its workflow entry is called. See [`start_run`], which is
+/// how this is reached — every failure here is one that has to finish the run.
+async fn initialize_run(
+    ctx: &Arc<WorkflowContext>,
+    runtime: &WorkflowRuntime,
+    turn: Arc<dyn StageTurn>,
+) -> Result<(Arc<Vec<Stage>>, HashMap<String, HostFn>), PlanError> {
+    // The registry first: a run's shape says which stages compose each of its nodes, and that is a
+    // property of what the run will execute rather than of what the workflow wrote down — a layout
+    // may name a node whose stages it never redeclared.
+    let stages = install_execution_stages(ctx, runtime).await?;
+    // A scripted run is measured the same way a built-in one is; the script picks the order, not
+    // whether the run is comparable to another afterwards. Failing here fails the run: the shape
+    // carries the registry every control is addressed through.
+    crate::record_provenance(
+        &ctx.store,
+        &ctx.run_id,
+        &ctx.config,
+        &crate::stage::shape_from_workflow(runtime.meta(), &stages),
+    )
+    .await?;
+    checkpoint(
+        &ctx.store,
+        &ctx.run_id,
+        "issue",
+        &json!({ "issue": ctx.issue }),
+    )
+    .await?;
+    let hosts = build_hosts_with_turn(ctx, &stages, turn)?;
+    Ok((stages, hosts))
+}
+
+/// Finish a run that failed before its workflow entry was ever called.
+///
+/// The row is written first and says the run is live, so an initialization failure that merely
+/// returned would leave it stuck at `Running` with nothing left to finish it — the same guarantee
+/// each wrapper's own finalization makes for a run that did start. Nothing has claimed a turn or
+/// taken a worktree yet, so the status and the plugin session are all there is to close.
+async fn fail_initialization(ctx: &WorkflowContext, error: PlanError) -> PlanError {
+    if let Err(e) = ctx
+        .store
+        .upsert_run(&ctx.run_id, None, RunStatus::Failed.as_str())
+        .await
+    {
+        tracing::warn!("failed to record final run status: {e}");
+    }
+    ctx.plugin_context
+        .session_end(RunStatus::Failed.as_str())
+        .await;
+    error
+}
+
 /// Scripted `plan`: scout → memory → analyst, composed by the script's `plan(input)` entry.
 pub async fn run_plan_scripted(
     runtime: WorkflowRuntime,
@@ -2426,33 +2536,7 @@ async fn run_plan_scripted_with_turn(
     ctx: Arc<WorkflowContext>,
     turn: Arc<dyn StageTurn>,
 ) -> Result<PlanOutcome, PlanError> {
-    // The run row first: the issue checkpoint references it, and the schema enforces that.
-    ctx.store
-        .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
-        .await?;
-    // The registry first: a run's shape says which stages compose each of its nodes, and that is a
-    // property of what the run will execute rather than of what the workflow wrote down — a layout
-    // may name a node whose stages it never redeclared.
-    let stages = install_execution_stages(&ctx, &runtime).await?;
-    // A scripted run is measured the same way a built-in one is; the script picks the order, not
-    // whether the run is comparable to another afterwards.
-    crate::record_provenance(
-        &ctx.store,
-        &ctx.run_id,
-        &ctx.config,
-        &crate::stage::shape_from_workflow(runtime.meta(), &stages),
-    )
-    .await;
-    checkpoint(
-        &ctx.store,
-        &ctx.run_id,
-        "issue",
-        &json!({ "issue": ctx.issue }),
-    )
-    .await?;
-
-    let stages = install_execution_stages(&ctx, &runtime).await?;
-    let hosts = build_hosts_with_turn(&ctx, &stages, turn)?;
+    let (stages, hosts) = start_run(&ctx, &runtime, turn).await?;
     let input = json!({ "issue": ctx.issue }).to_string();
     let result = runtime
         .run_with_question_renderers("plan", input, hosts, stage_question_renderers(&stages))
@@ -2499,32 +2583,7 @@ async fn run_full_scripted_with_actions<A: FullTerminalActions>(
     ctx: Arc<WorkflowContext>,
     actions: &A,
 ) -> Result<RunOutcome, PlanError> {
-    // The run row first: the issue checkpoint references it, and the schema enforces that.
-    ctx.store
-        .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
-        .await?;
-    // The registry first: a run's shape says which stages compose each of its nodes, and that is a
-    // property of what the run will execute rather than of what the workflow wrote down — a layout
-    // may name a node whose stages it never redeclared.
-    let stages = install_execution_stages(&ctx, &runtime).await?;
-    // A scripted run is measured the same way a built-in one is; the script picks the order, not
-    // whether the run is comparable to another afterwards.
-    crate::record_provenance(
-        &ctx.store,
-        &ctx.run_id,
-        &ctx.config,
-        &crate::stage::shape_from_workflow(runtime.meta(), &stages),
-    )
-    .await;
-    checkpoint(
-        &ctx.store,
-        &ctx.run_id,
-        "issue",
-        &json!({ "issue": ctx.issue }),
-    )
-    .await?;
-
-    let hosts = build_hosts(&ctx, &stages)?;
+    let (stages, hosts) = start_run(&ctx, &runtime, Arc::new(LiveStageTurn)).await?;
     let input = json!({
         "issue": ctx.issue,
         "maxIterations": ctx.config.implementer.max_iterations,
@@ -3462,6 +3521,18 @@ mod tests {
                         .as_ref()
                         .map(|ledger| Arc::as_ptr(ledger) as usize),
                 });
+            // What the live turn does at the end of a model call, and the reason a claim has
+            // anything to take: a turn is recorded under the name it RAN as, and claimed by the
+            // checkpoint written under that same name in the same scope.
+            if let Some(ledger) = run.ledger.as_ref() {
+                ledger.record(
+                    run.node,
+                    ratatoskr_core::NodeTelemetry {
+                        model: Some(run.route.model.clone()),
+                        ..Default::default()
+                    },
+                );
+            }
             let output = self
                 .outputs
                 .lock()
@@ -3589,7 +3660,7 @@ mod tests {
         );
         // And the run wrote down the layout the workflow it ran declared, which is what anything
         // drawing this run afterwards places its records against.
-        let shape: Vec<ratatoskr_core::shape::ShapeNode> = serde_json::from_str(
+        let shape: ratatoskr_core::shape::Recorded = serde_json::from_str(
             store
                 .run("run-standard-plan")
                 .await
@@ -3709,6 +3780,166 @@ mod tests {
             Some(RunStatus::Failed.as_str())
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_workflow_that_declares_no_layout_is_still_drawn_one_box_per_node() {
+        // A layout is optional and `examples/workflow.ts` declares none, so this is a supported
+        // configuration rather than a degenerate one. Such a run records no positions — nothing
+        // knows where its nodes belong — but its registry composes them exactly as a laid-out run's
+        // does, and the dashboard has to draw one box per node all the same.
+        //
+        // Read back through the real reader, because everything downstream of the record is name
+        // matching: a case on either side of the boundary alone passes its own fixture names in.
+        let runtime = WorkflowRuntime::bundled_with_includes(
+            "unplaced",
+            r#"defineWorkflow({ name: "unplaced" });
+               export async function plan(input) {
+                 const gathered = await context(input.issue);
+                 const analysis = await analyst({
+                   issue: input.issue,
+                   scout: gathered.scout,
+                   memory: gathered.memory,
+                 });
+                 return { context: gathered, analyst: analysis };
+               }"#,
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(
+            runtime.meta().layout.is_empty(),
+            "this case is about a workflow that lays out nothing"
+        );
+
+        let dir = std::env::temp_dir().join(format!("ratatoskr-unplaced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let run_id = "run-unplaced";
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("context".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            run_id,
+            "draw a run nobody laid out",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        run_plan_scripted_with_turn(
+            runtime,
+            Arc::clone(&ctx),
+            Arc::new(SequencedStageTurn::new([
+                json!({
+                    "brief": "no layout, same registry",
+                    "constraints": [],
+                    "prior_art": [],
+                    "papertrail_summary": "unplaced"
+                }),
+                json!({ "impact_summary": "draw the boxes", "changes_code": false }),
+            ])) as Arc<dyn StageTurn>,
+        )
+        .await
+        .unwrap();
+
+        let checkpoints = store.checkpoints_for_run(run_id).await.unwrap();
+        // The distillation is the context node's model turn and records under its own name; the
+        // box's aggregate is `context`. Two rows, one box — which is the whole problem here.
+        assert_eq!(
+            checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.node_name.as_str())
+                .collect::<Vec<_>>(),
+            ["issue", "context_distillation", "context", "analyst"]
+        );
+        let run = store.run(run_id).await.unwrap().unwrap();
+        let recorded = ratatoskr_core::shape::recorded(run.shape_json.as_deref());
+        assert!(
+            recorded.nodes.is_empty(),
+            "a workflow that laid nothing out places nothing"
+        );
+        assert_eq!(
+            recorded.index().members("context"),
+            ["context_distillation"]
+        );
+
+        let drawn = ratatoskr_serve::pipeline::derive_with(
+            Some(RunStatus::Planned.as_str()),
+            &checkpoints,
+            None,
+            run.shape_json.as_deref(),
+        );
+        // One box per node, not one per stage. `context_distillation` is the context node's work
+        // and is drawn inside it.
+        assert_eq!(
+            drawn
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["context", "analyst"]
+        );
+        // The record answers where the node list cannot. Before anything has checkpointed there
+        // are no nodes at all — the window in which a stage IS executing and an operator reaches
+        // for Stop — and the registry still says which box its events belong in. That is why it is
+        // shipped beside `nodes` rather than on them.
+        assert!(
+            ratatoskr_serve::pipeline::derive_with(
+                Some(RunStatus::Running.as_str()),
+                &[],
+                None,
+                run.shape_json.as_deref(),
+            )
+            .is_empty(),
+            "nothing has checkpointed, so nothing is placed"
+        );
+        assert_eq!(recorded.index().node_of("context_distillation"), "context");
+
+        // And the address a control is aimed at is the box the run answers under. `serve` polls
+        // for a stop by the name it draws, so a box drawn under a member's name reaches nothing.
+        for node in &drawn {
+            assert!(
+                crate::stage::for_node(&standard_stages().await.unwrap(), &node.name)
+                    .is_some_and(|stage| stage.node_id() == node.name)
+                    || checkpoints
+                        .iter()
+                        .any(|checkpoint| checkpoint.node_name == node.name),
+                "`{}` is drawn as a box nothing runs or records under",
+                node.name
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_bundled_definitions_declare_the_box_their_adapter_writes() {
+        // The other half of `required_node`'s bolt. Validation refuses an override that names a box
+        // its adapter does not write, and this is what keeps the table honest against the
+        // definitions that ship: a stage whose declaration and whose policy entry disagree would
+        // make the standard workflow itself unloadable, and nothing else would say so.
+        let stages = standard_stages().await.unwrap();
+        let mut checked = 0;
+        for stage in &stages {
+            let Some(required) = crate::policy::required_node(&stage.id) else {
+                continue;
+            };
+            assert_eq!(
+                stage.node_id(),
+                required,
+                "`{}` is declared in the box `{}` and its adapter writes `{required}`",
+                stage.id,
+                stage.node_id()
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 4,
+            "every stage a Rust caller folds into a box is checked here; found {checked}"
+        );
     }
 
     #[tokio::test]
@@ -3948,36 +4179,37 @@ mod tests {
                 "verifier",
             ]
         );
-        // The bolt for membership. A node its stages declare is drawable in a layout with no stage
-        // of that name behind it, on the strength of the run's own operation host writing the box's
-        // aggregate — a node nothing writes would pass startup and draw a permanently empty box.
-        // And the name must be one no workflow can declare a stage under, or one box would mean the
-        // run's own record here and some repository's stage there.
-        let composite = standard_stages()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|stage| !stage.is_own_node())
-            .map(|stage| stage.node_id().to_string())
+        // The bolt for `policy::AGGREGATE_IDENTITIES`, which cannot be derived: it is what says a
+        // membership or a layout column may name a box no stage carries the name of, so deriving it
+        // from membership would let a workflow authorize its own box. It is held to what a full run
+        // records instead, in both directions.
+        //
+        // Every name this run checkpointed under that no stage of its registry carries — the issue
+        // pseudo-node aside, which is the run's input and not a box — is a box a Rust operation
+        // host wrote the aggregate of, and so must be listed. A host writing under a new name fails
+        // here rather than silently becoming a box nothing will accept.
+        let registry = standard_stages().await.unwrap();
+        let aggregates = checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.node_name.clone())
+            .filter(|name| name != "issue" && !registry.iter().any(|stage| stage.id == *name))
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
-            composite,
-            ["context", "implementer", "redteam"]
-                .map(String::from)
-                .into_iter()
-                .collect()
+            aggregates,
+            crate::policy::AGGREGATE_IDENTITIES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            "a full run records under exactly the boxes policy calls aggregate identities"
         );
-        for identity in &composite {
+        // And every box the standard stages join is one of them, so a membership the bundled
+        // definitions declare is one this gate accepts.
+        for stage in registry.iter().filter(|stage| !stage.is_own_node()) {
             assert!(
-                checkpoints
-                    .iter()
-                    .any(|checkpoint| checkpoint.node_name == *identity),
-                "`{identity}` is drawable as a node its stages declare, but a full run recorded \
-                 nothing under it"
-            );
-            assert!(
-                crate::policy::reserved(identity).is_some(),
-                "`{identity}` is drawable as a run's own record, so a stage must not claim it"
+                crate::policy::is_aggregate_identity(stage.node_id()),
+                "`{}` joins `{}`, which nothing writes the aggregate of",
+                stage.id,
+                stage.node_id()
             );
         }
         let revision: analyst::AnalystInput = serde_json::from_str(
@@ -4541,86 +4773,220 @@ mod tests {
     /// The other half of the split: a stage that DOES belong to a node still answers the operator
     /// at that node's address, because the box is what the graph draws and what they can click.
     #[tokio::test]
-    async fn a_member_stage_is_controlled_at_its_nodes_address() {
+    async fn the_by_design_unclaimed_names_are_the_ones_a_run_actually_leaves() {
+        // The other direction of the guard, and the one that makes the list shrink visibly when a
+        // fix lands: a name is listed only if a real invocation really does leave it unclaimed.
+        //
+        // Behavioural, because there is nothing static to predict from. Whether a turn is claimed
+        // depends on the DISPOSITION its caller chose — `execute_after_guard` writes a checkpoint
+        // when the invocation checkpoints or the stage belongs to another node — and disposition is
+        // a property of the call site, not of the registry. `characterizer` is the proof: it is an
+        // ordinary workflow host that checkpoints when a workflow calls it, and `testrun.rs`
+        // invokes the same stage as evidence, where nothing claims it.
         let dir =
-            std::env::temp_dir().join(format!("ratatoskr-member-control-{}", std::process::id()));
+            std::env::temp_dir().join(format!("ratatoskr-unclaimed-listed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config
+            .models
+            .insert("characterizer".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-unclaimed-listed",
+            "characterize",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let turn = Arc::new(SequencedStageTurn::new([json!({
+            "checks": [],
+            "total": 0
+        })]));
+        let _ = evaluate_standard_stage_with_turn(
+            Arc::clone(&ctx),
+            "characterizer",
+            json!({ "outcomes": [] }).to_string(),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await;
+
+        assert_eq!(
+            ctx.ledger.unclaimed(),
+            ["characterizer"],
+            "the evidence invocation leaves its turn for nobody, which is why it is listed"
+        );
+        for name in ctx.ledger.unclaimed() {
+            assert!(
+                UNCLAIMED_BY_DESIGN
+                    .iter()
+                    .any(|(known, reason)| *known == name && reason.len() > 20),
+                "`{name}` goes unclaimed and is not listed with a reason"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_real_run_leaves_no_turn_unclaimed() {
+        // The same invariant against a run rather than the registry, on the path that drives real
+        // operation hosts. `SequencedStageTurn` records into the ledger exactly as the live turn
+        // does, so what the executor claims — and what it leaves behind — is the real arithmetic.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-unclaimed-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("context".to_string(), model_route());
+        config.models.insert("analyst".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-unclaimed-guard",
+            "leave nothing in the bin",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        let turn = Arc::new(SequencedStageTurn::new([
+            json!({
+                "brief": "b",
+                "constraints": [],
+                "prior_art": [],
+                "papertrail_summary": "p"
+            }),
+            json!({ "impact_summary": "i", "changes_code": false }),
+        ]));
+        run_plan_scripted_with_turn(
+            standard_runtime().await.unwrap(),
+            Arc::clone(&ctx),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            turn.runs
+                .lock()
+                .expect("sequenced runner mutex poisoned")
+                .len(),
+            2,
+            "both turns ran, so there was something to claim"
+        );
+        assert!(
+            ctx.ledger.unclaimed().is_empty(),
+            "a run left turns nobody claimed: {:?}",
+            ctx.ledger.unclaimed()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn every_standard_stage_is_controlled_at_the_address_its_run_draws() {
+        // The guard, not a case. A Stop is written under the name the dashboard offers — the box a
+        // run RECORDS for that stage — and the stage's turn has to be polled under that same name
+        // or the button reaches nothing. Both halves are read from the real thing here: the address
+        // comes from the recorded shape (`Registry::node_of`), which is what `serve` ships and what
+        // the pause ledger keys, and the identity the turn is given comes from running the stage
+        // through the executor. A member stage added tomorrow is covered without anyone
+        // remembering, because the registry is what this iterates.
+        //
+        // The other half of the chain — that a turn given an identity actually polls under it — is
+        // `ratatoskr-agent`'s `a_member_stage_is_polled_for_control_under_the_box_an_operator_addresses`,
+        // which drives the real hook. Two independent statements: this one cannot restate the
+        // executor's own expression, and that one cannot be satisfied by a field being set.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-control-guard-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let engine = ScriptEngine::load(&dir).await.unwrap();
         let store = Store::open_in_memory().unwrap();
         store
-            .upsert_run("run-member-control", None, RunStatus::Running.as_str())
+            .upsert_run("run-control-guard", None, RunStatus::Running.as_str())
             .await
             .unwrap();
+        let runtime = standard_runtime().await.unwrap();
+        let stages = standard_stages().await.unwrap();
+        let registry = crate::stage::shape_from_workflow(runtime.meta(), &stages);
+        let registry = registry.index();
+
+        // A route per governance identity, so no stage is turned away before its turn is built.
         let mut config = RatatoskrConfig::default();
-        config.models.insert(
-            "redteam".to_string(),
-            ratatoskr_core::ModelRoute {
-                provider: "anthropic".to_string(),
-                model: "test-model".to_string(),
-                max_tokens: None,
-                context_window: None,
-                temperature: None,
-                params: None,
-                session: ratatoskr_core::SessionScope::Fresh,
-            },
-        );
+        for stage in &stages {
+            config
+                .models
+                .insert(stage.governance_id().to_string(), model_route());
+        }
         let ctx = WorkflowContext::new(
             None,
             &config,
             &store,
-            "run-member-control",
-            "stop the red team",
+            "run-control-guard",
+            "stop anything",
             &engine,
             crate::PluginContext::default(),
         )
         .unwrap();
-        let stages = standard_stages().await.unwrap();
         let turn = Arc::new(RecordingStageTurn::default());
         let executor = StageExecutor::new(
             ctx,
             Arc::new(stages.clone()),
             Arc::clone(&turn) as Arc<dyn StageTurn>,
         );
-        let stage = stages
-            .iter()
-            .find(|stage| stage.id == "redteam_classifier")
-            .unwrap()
-            .clone();
-        executor
-            .execute(StageInvocation {
-                stage,
-                input_json: serde_json::to_string(&crate::redteam::ClassifierInput {
-                    failing: Vec::new(),
-                    raw_output: String::new(),
-                })
-                .unwrap(),
-                rendered_question: Some("classify these".to_string()),
-                resource_root: None,
-                capability_ceiling: ratatoskr_core::Capability::Read,
-                rag_rat_worktree: None,
-                shell: None,
-                publish: None,
-                clarifier: None,
-                invocation_guidance: None,
-                output: StageOutput::Evidence,
-            })
-            .await
-            .unwrap();
 
-        assert_eq!(
-            *turn.nodes.lock().expect("recording runner mutex poisoned"),
-            ["redteam_classifier"],
-            "the record says which half ran"
-        );
-        assert_eq!(
-            *turn
+        for stage in &stages {
+            // The result is not the subject: a stage's output gate may reject this generic answer,
+            // and the identity it was to be controlled under was decided before the turn ran.
+            let _ = executor
+                .execute(StageInvocation {
+                    stage: stage.clone(),
+                    input_json: "{}".to_string(),
+                    rendered_question: Some("anything".to_string()),
+                    resource_root: None,
+                    capability_ceiling: ratatoskr_core::Capability::Read,
+                    rag_rat_worktree: None,
+                    shell: None,
+                    publish: None,
+                    clarifier: None,
+                    invocation_guidance: None,
+                    output: StageOutput::Evidence,
+                })
+                .await;
+            let control = turn
                 .controls
                 .lock()
-                .expect("recording runner mutex poisoned"),
-            [Some("redteam".to_string())],
-            "and an operator stops the box the graph drew"
-        );
+                .expect("recording runner mutex poisoned")
+                .last()
+                .cloned()
+                .unwrap_or_else(|| panic!("`{}` never reached its turn", stage.id));
+            assert_eq!(
+                control.as_deref(),
+                Some(registry.node_of(&stage.id)),
+                "`{}` is controlled under a name the run does not draw a box for",
+                stage.id
+            );
+            // And the other identity is untouched by that: the turn is given the stage's own name,
+            // which is what its record is written under. A stage controlled at its box's address
+            // while recording under the box's would be one box's work with no way to tell the
+            // halves apart.
+            assert_eq!(
+                turn.nodes
+                    .lock()
+                    .expect("recording runner mutex poisoned")
+                    .last()
+                    .map(String::as_str),
+                Some(stage.id.as_str()),
+                "`{}` recorded its turn under another name",
+                stage.id
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5127,7 +5493,7 @@ mod tests {
         )
         .unwrap();
         let stages = install_execution_stages(&ctx, &runtime).await.unwrap();
-        let hosts = build_hosts(&ctx, &stages).unwrap();
+        let hosts = build_hosts_with_turn(&ctx, &stages, Arc::new(LiveStageTurn)).unwrap();
         assert!(!hosts.contains_key("publisher"));
         assert!(!hosts.contains_key("bookkeeper"));
 
@@ -10462,6 +10828,105 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A run that never starts still has a row saying it is running, and something has to close it.
+    ///
+    /// The row is written before anything else so the issue checkpoint has a run to reference, and
+    /// the registry, the provenance record, that checkpoint and the host table are all built after
+    /// it. A failure among them is a failure of a run that already exists — returning it would
+    /// leave the row reporting a live run that nothing will ever finish. Driven through both
+    /// wrappers, because the row and the finalization are the wrappers' own.
+    #[tokio::test]
+    async fn a_run_that_cannot_initialize_is_recorded_failed_rather_than_left_running() {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-init-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        // A stage under an operation host's name: the host table refuses it, which is an
+        // initialization failure a workflow can actually cause.
+        std::fs::write(
+            &workflow_path,
+            r#"defineWorkflow({
+                 name: "shadowing",
+                 stages: [
+                   stage("context", {
+                     agent: "reason",
+                     instructions: "shadow an operation host",
+                     outputSchema: { type: "object" },
+                   }),
+                 ],
+               });
+               export async function plan(input) { return input; }
+               export async function run(input) { return input; }"#,
+        )
+        .unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let config = RatatoskrConfig::default();
+        let load = || async {
+            let definitions = standard_definitions().unwrap();
+            WorkflowRuntime::load(
+                &workflow_path,
+                &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        let context = |run_id: &str| {
+            WorkflowContext::new(
+                None,
+                &config,
+                &store,
+                run_id,
+                "refuse to start",
+                &engine,
+                crate::PluginContext::default(),
+            )
+            .unwrap()
+        };
+
+        let error = match run_plan_scripted_with_turn(
+            load().await,
+            context("run-init-failure-plan"),
+            Arc::new(SequencedStageTurn::new([])),
+        )
+        .await
+        {
+            Ok(_) => panic!("a run whose host table is refused cannot plan"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("context"), "{error}");
+        assert_eq!(
+            store
+                .run_status("run-init-failure-plan")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(RunStatus::Failed.as_str()),
+        );
+
+        if run_full_scripted_with_actions(
+            load().await,
+            context("run-init-failure-full"),
+            &RecordingTerminalActions::new(false, false),
+        )
+        .await
+        .is_ok()
+        {
+            panic!("a run whose host table is refused cannot run");
+        }
+        assert_eq!(
+            store
+                .run_status("run-init-failure-full")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(RunStatus::Failed.as_str()),
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A failing first attempt must send the standard loop back to `iterate()`, not on to review.
     ///
     /// Every host is an `async function`, so a bare `testCommandRan(x) && isConverged(y)` is a
@@ -10837,6 +11302,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let engine = ScriptEngine::load(&dir).await.unwrap();
         let store = Store::open_in_memory().unwrap();
+        // The digest is pinned by writing it to the run's row, so the row has to exist — without it
+        // the write lands nowhere and the pin this test is named for is never taken.
+        store
+            .upsert_run("run-image-freeze", None, "running")
+            .await
+            .unwrap();
         let mut config = RatatoskrConfig::default();
         config.sandbox.backend = "container".to_string();
         config.sandbox.image = "ratatoskr-checks".to_string();
@@ -10883,6 +11354,19 @@ mod tests {
             inspections.lines().count(),
             1,
             "the image was inspected more than once in one run: {inspections}"
+        );
+
+        // And the pin is on the record, not just in the process: a run analysed later reads the
+        // digest it executed in from its own row.
+        assert_eq!(
+            store
+                .run("run-image-freeze")
+                .await
+                .unwrap()
+                .and_then(|run| run.image_digest)
+                .as_deref(),
+            Some(first_digest.as_str()),
+            "the resolved digest never reached the run's row"
         );
 
         // And what was resolved is what the implementer's sandbox is built from — the digest,

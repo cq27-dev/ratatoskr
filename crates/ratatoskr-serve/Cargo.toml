@@ -30,6 +30,8 @@ tower = { workspace = true, features = ["util"] }
 # Only so `every_run_status_is_classified` can enumerate the real variants: `is_terminal` matches
 # on strings, so without this a new status silently reads as still-executing.
 ratatoskr-core.workspace = true
+# Only to build a route's `params` in a case about two halves of one box reasoning differently.
+toml.workspace = true
 strum = { workspace = true, features = ["derive"] }
 
 [lints]

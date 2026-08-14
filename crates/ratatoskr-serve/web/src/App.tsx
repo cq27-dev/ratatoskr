@@ -4,6 +4,7 @@ import {
   applyDerived,
   convergeLoops,
   inNodeBoxes,
+  liveNodes,
   nodesFromEvents,
   stagesOf,
   workingNodeNames,
@@ -34,14 +35,12 @@ import {
   getRun,
   followRun,
   listProjects,
-  isTerminal,
   listRuns,
   mayAct,
   whoami,
   type CheckpointView,
   type ControlView,
   type LiveEvent,
-  type NodeFacts,
   type Me,
   type ProjectView,
   type RunDetail,
@@ -356,13 +355,33 @@ export default function App() {
   }, [history, events]);
 
   /**
+   * The timeline read as boxes — the ONE list everything that folds the stream into node state
+   * reads, so no two of them can disagree about which box an event belongs to.
+   *
+   * The raw `timeline` and `shownEvents` stay, and the feed reads those: a member's events belong
+   * to it and are shown under its own name, which is the whole point of the split. Every other
+   * consumer wants the box, and a consumer left on the raw list is silently keyed by a name the
+   * graph never asks for.
+   */
+  const boxedTimeline = useMemo(
+    () => inNodeBoxes(timeline, detail?.stages ?? []),
+    [timeline, detail],
+  );
+
+  /**
    * Which node each event belongs to, in timeline order — what colours the scrubber's track.
+   *
+   * By box, because the track's hue is the hue of that node's box in the graph above it: a stretch
+   * coloured for a member is a colour matching nothing on screen.
    *
    * Its own memo rather than derived inside `Scrubber`: the timeline is the longest list on the
    * page and this walks all of it, so recomputing on every cursor move would cost a pass per drag
    * frame for a value that does not change while dragging.
    */
-  const timelineNodes = useMemo(() => timeline.map((e) => e.node ?? null), [timeline]);
+  const timelineNodes = useMemo(
+    () => boxedTimeline.map((e) => e.node ?? null),
+    [boxedTimeline],
+  );
 
   /**
    * A run has been selected and its rows have not arrived.
@@ -378,6 +397,12 @@ export default function App() {
     [timeline, cursor],
   );
   const shownAt = cursor === null ? null : (shownEvents[shownEvents.length - 1]?.at ?? null);
+  /** The scrubbed prefix, as boxes. Sliced from `boxedTimeline` rather than boxed again, so the
+   *  two cannot drift and the whole timeline is walked once. */
+  const boxedShown = useMemo(
+    () => (cursor === null ? boxedTimeline : boxedTimeline.slice(0, cursor + 1)),
+    [boxedTimeline, cursor],
+  );
 
   /**
    * Every node's box, rebuilt from the stream rather than read from the store.
@@ -392,7 +417,7 @@ export default function App() {
    * the end of a run that has stopped, the store settles it. Passed only when the cursor is at the
    * live end — mid-run the stream is still the authority. See `applyDerived`.
    */
-  const ended = detail && cursor === null && isTerminal(detail.status) ? detail.status : null;
+  const ended = detail && cursor === null && detail.terminal ? detail.status : null;
   const graphNodes = useMemo(() => {
     if (!detail) return [];
     // Nothing until both halves are in. The detail arrives first and the history a moment later,
@@ -405,11 +430,8 @@ export default function App() {
     // is not a pipeline node, so the derivation is legitimately empty; falling back to the store
     // there showed every node finished, with its final counts, at step one of the run.
     if (!shownEvents.length) return detail.nodes;
-    // Read as boxes: a member stage's events are the box's, or the fold would place each half
-    // beside the node it belongs to.
-    const boxed = inNodeBoxes(shownEvents, detail.nodes);
-    return applyDerived(detail.nodes, nodesFromEvents(boxed), ended);
-  }, [detail, shownEvents, ended, loading]);
+    return applyDerived(detail.nodes, nodesFromEvents(boxedShown), ended);
+  }, [detail, shownEvents, boxedShown, ended, loading]);
 
   /**
    * Which nodes are working right now — what stop and steer can be aimed at.
@@ -421,8 +443,8 @@ export default function App() {
   const workingNodes = useMemo(
     // By box, matching what a Stop is addressed to: a stage that composes a node polls under that
     // node's name, so a control aimed at a half would reach nothing.
-    () => workingNodeNames(detail?.nodes ?? [], inNodeBoxes(timeline, detail?.nodes ?? [])),
-    [detail, timeline],
+    () => workingNodeNames(detail?.nodes ?? [], boxedTimeline),
+    [detail, boxedTimeline],
   );
 
   /**
@@ -459,25 +481,9 @@ export default function App() {
 
   // What a node announced when it started, plus its tool calls so far. A checkpoint carries the
   // same facts, but only once the node has stopped — this is what fills the box while it works.
-  const live = useMemo(() => {
-    const out = new Map<string, { facts?: NodeFacts; cycles: number; used: Set<string> }>();
-    for (const e of shownEvents) {
-      if (!e.node) continue;
-      const at = out.get(e.node) ?? { cycles: 0, used: new Set<string>() };
-      // A node_start means a fresh attempt: its counts start again.
-      if (e.kind === "node_start" && e.facts) {
-        out.set(e.node, { facts: e.facts, cycles: 0, used: new Set() });
-        continue;
-      }
-      if (e.kind === "tool_call") {
-        at.cycles += 1;
-        // `detail` is the tool name for this kind.
-        if (e.detail) at.used.add(e.detail);
-      }
-      out.set(e.node, at);
-    }
-    return out;
-  }, [shownEvents]);
+  // Keyed by box, like everything else the graph asks: `PipelineGraph` looks it up under the box's
+  // name, and a member's announcement is the box's.
+  const live = useMemo(() => liveNodes(boxedShown), [boxedShown]);
 
   /**
    * How many times the implementer was re-entered, split by the route that brought it back.
@@ -489,8 +495,8 @@ export default function App() {
    * `implement()` call.
    */
   const loops = useMemo(
-    () => convergeLoops(inNodeBoxes(shownEvents, detail?.nodes ?? [])),
-    [shownEvents, detail],
+    () => convergeLoops(boxedShown),
+    [boxedShown],
   );
 
   /*
@@ -601,7 +607,7 @@ export default function App() {
                 // Only for a run still executing. A finished run has nothing to pause, and
                 // controls that could never do anything are worse than none: they invite a click
                 // and then explain themselves.
-                project && runId && !isTerminal(detail.status) ? (
+                project && runId && !detail.terminal ? (
                   <Controls
                     project={project}
                     runId={runId}
@@ -646,7 +652,7 @@ export default function App() {
                 <Feed
                   events={shownEvents}
                   node={node}
-                  nodes={node ? stagesOf(detail?.nodes ?? [], node) : null}
+                  nodes={node ? stagesOf(detail?.stages ?? [], node) : null}
                   nameWidth={nameWidth}
                   loading={loading}
                 />

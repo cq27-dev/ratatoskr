@@ -1,15 +1,25 @@
-//! The shape of the graph a run executed: which nodes existed, and where they sat.
+//! The graph a run executed: which stages it had, which node's work each is, and where those
+//! nodes sat.
 //!
 //! This lives here, rather than in the dashboard that draws it, because a run has to be able to
-//! *record* its own shape. A viewer that reads the shape from its own build can only show runs
-//! from that build: change the pipeline, or drop the built-in one, and every run recorded before
-//! the change is drawn against a graph it did not execute. An imported run makes that immediate —
-//! it may come from a machine whose pipeline this one has never had.
+//! *record* its own graph. A viewer that reads it from its own build can only show runs from that
+//! build: change the pipeline, or drop the built-in one, and every run recorded before the change
+//! is drawn against a graph it did not execute. An imported run makes that immediate — it may come
+//! from a machine whose pipeline this one has never had.
 //!
-//! So the run writes its shape down when it starts, taken from the layout its workflow declared,
-//! and a viewer reads that and nothing else. There is deliberately no compiled-in default to fall
-//! back to: a second copy of the pipeline in Rust could only drift from the declaration that
-//! actually runs, and a run drawn against it would be drawn against a graph nothing executed.
+//! So the run writes it down when it starts and a viewer reads that and nothing else. There is
+//! deliberately no compiled-in default to fall back to: a second copy of the pipeline in Rust could
+//! only drift from the declaration that actually runs, and a run drawn against it would be drawn
+//! against a graph nothing executed.
+//!
+//! Two facts, from two sources, and keeping them apart is the point. Where a node sits comes from
+//! the workflow's `layout`, which is optional — a workflow that declares none records no positions,
+//! and a viewer places such a run's nodes from the records it has. Which stages compose a node
+//! comes from the *registry*, which every run has. Hanging membership off the positions is how a
+//! layout-less run came to record none at all, and then drew each member as a box of its own with
+//! controls addressed to a name the runtime never polls.
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -19,50 +29,237 @@ pub struct ShapeNode {
     pub name: String,
     pub stage: usize,
     pub lane: usize,
-    /// The stages whose work this node is, in declaration order.
-    ///
-    /// One box, and the turns inside it. A node that is a single stage names that stage and nothing
-    /// else; one composed of several — the red team's classifier and its test author — names each,
-    /// because they run on different profiles with different tool sets and each records its own
-    /// turn. Reading a box's cost means totalling these, and drawing it means folding their events
-    /// into one box rather than tacking each on as a node of its own.
-    ///
-    /// Recorded with the shape, for the same reason the shape is recorded at all: which stages
-    /// compose a node is a property of the workflow that ran, and a viewer reading it from its own
-    /// build would read an imported run against a composition nobody executed. Empty for a run
-    /// recorded before this was carried, which reads as "this box is just its own name".
-    #[serde(default)]
-    pub stages: Vec<String>,
     /// Whether the node runs at all is a property of configuration, not of the run — the overseer
     /// only runs where a workflow has to be chosen, the verifier and publisher only where the repo
     /// gave them a route. An optional node with no checkpoint has not stalled; it was never asked.
     pub optional: bool,
 }
 
-/// Read the shape a run recorded.
+/// One stage of the registry a run executed, and the node whose work it is.
 ///
-/// Empty when there is nothing readable to read: a workflow that declared no layout, a run from
-/// before shapes were stored, or a recording whose positions are not positions. Nothing is
-/// substituted for it — a viewer places such a run's nodes from the records it actually has, which
-/// is the most that can be said about where they sat.
+/// A stage records under its own identity, so the members of a composed node — the red team's
+/// classifier and its test author — write turns and emit events under names no column carries.
+/// This is what says they belong in one box: without it a reader draws each beside the node it is
+/// part of, and aims that box's controls at a name nothing answers to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunStage {
+    pub id: String,
+    /// The node this stage's work is drawn in. Its own id unless it declared otherwise.
+    pub node: String,
+    /// The identity this stage's `[models.*]` route, ruleset and plugin bindings resolve under.
+    /// `None` for a stage that governs as itself, which is nearly all of them.
+    ///
+    /// Recorded because a box's route is its stages', and a box need not be one of them: the
+    /// implementer's box runs `models.implementer` through `implementer_attempt`, and a stage drawn
+    /// under its own id may still govern as something else. Reading a route under the box's own
+    /// name reports the wrong one or none at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governed_by: Option<String>,
+    /// The attempt-continuation scope this stage DECLARED, if it declared one. `None` means it
+    /// takes whatever its route says, which is nearly every stage.
+    ///
+    /// The declaration rather than the resolved scope, because that is the half the recorder knows:
+    /// the other half is the route, which a reader has from config and which may have been
+    /// reconfigured since. Applying one to the other is `Stage::session_scope`, and a reader must
+    /// do the same — reading the route alone reports a box on a scope its stages will not run.
+    ///
+    /// Absent from a recording written before this travelled, which reads as "declared nothing" —
+    /// the same thing it means on a stage that declares nothing today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::SessionScope>,
+}
+
+/// What a run recorded about the graph it executed.
 ///
-/// The bound is here rather than at the writer because a shape does not only arrive from a workflow
-/// this machine validated: an imported bundle carries one another machine recorded, and it is
-/// written to the store as it came. A reader sizing anything from `stage` — grouping into columns
-/// is the obvious one — would be sizing it from a number the run's author chose. Positions index a
-/// shape's own nodes, so one at or past their count is not a position, and the whole recording is
-/// unreadable rather than partly trusted.
-pub fn recorded(shape_json: Option<&str>) -> Vec<ShapeNode> {
-    let nodes: Vec<ShapeNode> = shape_json
-        .and_then(|raw| serde_json::from_str::<Vec<ShapeNode>>(raw).ok())
-        .unwrap_or_default();
-    if nodes
-        .iter()
-        .any(|node| node.stage >= nodes.len() || node.lane >= nodes.len())
-    {
-        return Vec::new();
+/// Serialized into the run's `shape_json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recorded {
+    /// Where each node sat. Empty for a workflow that declared no layout.
+    #[serde(default)]
+    pub nodes: Vec<ShapeNode>,
+    /// Every stage the run could execute, and the node each belongs to.
+    #[serde(default)]
+    pub stages: Vec<RunStage>,
+}
+
+impl Recorded {
+    /// Index this recording's registry for lookup.
+    ///
+    /// Build it ONCE per read and ask it everything. The registry is a list, and a derivation asks
+    /// it a question per node and per record — over a document `Store::import` writes verbatim,
+    /// whose size is the run author's to choose, so a scan per question is quadratic work an
+    /// imported recording can dictate. The position bound in [`recorded`] caps the indices in such a
+    /// document; it says nothing about how many rows it has.
+    pub fn index(&self) -> Registry<'_> {
+        let mut by_id: HashMap<&str, &RunStage> = HashMap::with_capacity(self.stages.len());
+        let mut members: HashMap<&str, Vec<&str>> = HashMap::new();
+        for stage in &self.stages {
+            by_id.insert(stage.id.as_str(), stage);
+            members
+                .entry(stage.node.as_str())
+                .or_default()
+                .push(stage.id.as_str());
+        }
+        Registry { by_id, members }
     }
-    nodes
+}
+
+/// A run's recorded registry, indexed.
+///
+/// Every question about a stage is asked through here, and the answers — not the rows — are what
+/// callers see. That is deliberate: membership is one node per stage today, and becomes one per
+/// INVOCATION when it is resolved from span parentage (#244). `characterizer` already cannot answer
+/// the static form, which is why it declares none and is the one legitimate resident of the
+/// unclaimed-turn warning. A caller that asks [`Self::node_of`] survives that change; one handed the
+/// index to walk does not.
+pub struct Registry<'a> {
+    by_id: HashMap<&'a str, &'a RunStage>,
+    members: HashMap<&'a str, Vec<&'a str>>,
+}
+
+impl<'a> Registry<'a> {
+    /// The stages whose work `node` is, in registry order.
+    ///
+    /// A node no stage claims is exactly itself: a name from a recording that carries no registry,
+    /// and the ordinary answer for every node that is one stage.
+    pub fn members(&self, node: &'a str) -> Vec<&'a str> {
+        self.members
+            .get(node)
+            .cloned()
+            .unwrap_or_else(|| vec![node])
+    }
+
+    /// Every name a record drawn in `node` can be written under: its members, and the box itself.
+    ///
+    /// Distinct from [`Self::members`], which answers "whose work is this box" — a question about
+    /// stages. This one answers "which rows are this box's", and a box's own name is not a stage id:
+    /// `redteam`, `implementer` and `context` are the names their operation host writes the
+    /// aggregate under. A members-only answer drops that row, which for the red team is nearly
+    /// everything it visibly did; a name-only answer drops the members, which is everything a box
+    /// whose members ran directly has.
+    pub fn records_of(&self, node: &'a str) -> Vec<&'a str> {
+        let mut names = self.members(node);
+        if !names.contains(&node) {
+            names.push(node);
+        }
+        names
+    }
+
+    /// The node a record written under `stage` is drawn in — the stage itself unless it said
+    /// otherwise.
+    pub fn node_of(&self, stage: &'a str) -> &'a str {
+        self.by_id
+            .get(stage)
+            .map_or(stage, |known| known.node.as_str())
+    }
+
+    /// The attempt-continuation scope `stage` declared, if it declared one. `None` means it takes
+    /// its route's, which is what an absent declaration has always meant.
+    pub fn session_of(&self, stage: &str) -> Option<crate::SessionScope> {
+        self.by_id.get(stage).and_then(|known| known.session)
+    }
+
+    /// The identity `stage`'s route is configured under — the stage itself unless it said
+    /// otherwise, and the stage itself for a name no recorded registry knows.
+    pub fn governance_of(&self, stage: &'a str) -> &'a str {
+        self.by_id
+            .get(stage)
+            .and_then(|known| known.governed_by.as_deref())
+            .unwrap_or(stage)
+    }
+}
+
+/// Read the graph a run recorded.
+///
+/// One format, and anything else is unreadable — there is no decode path for a shape this build no
+/// longer writes. Empty when there is nothing readable to read: a run from before this was stored,
+/// a recording in some other shape, or one whose positions are not positions. Nothing is substituted for it — a viewer places such a run's
+/// nodes from the records it actually has, which is the most that can be said about where they sat.
+///
+/// The bounds are here rather than at the writer because a recording does not only arrive from a
+/// workflow this machine validated: an imported bundle carries one another machine wrote, and
+/// `Store::import` stores it as it came. Two things a reader does with it have to be bounded, and
+/// the second is the one that keeps being missed — **bound what a reader indexes BY, and also what
+/// it expands INTO**:
+///
+/// - *positions*, which a reader sizes a column grouping from. One at or past the node count is not
+///   a position.
+/// - *names*, which a reader expands through the registry. `Registry::members` returns every stage
+///   claiming a node and the derivation asks once per POSITION, so one name placed N times while N
+///   stages claim it is N² work on a document of size N. A repeated stage id is the same exposure
+///   read from the other side: `NodeTelemetryView::totalled` folds a box's members, so a duplicate
+///   charges one turn twice and the box reports a cost the run never paid.
+///
+/// Refused rather than deduplicated, and deliberately. There is no version to refuse a recording
+/// on, so the choice is between dropping what cannot be read and picking a winner among records
+/// that disagree — and a silent pick is a run drawn against a graph nobody executed, which is what
+/// this module exists to prevent. Refusing is also what the write side already says: a layout may
+/// name a node once (`validate_layout`) and a stage id is unique across a registry
+/// (`validate::validate`), so a recording with either duplicate was written by no workflow this
+/// build would have accepted.
+///
+/// Dropped whole rather than partly trusted, and the two halves are dropped independently: a
+/// recording whose placement is unreadable still draws its boxes out of the right stages, and one
+/// whose registry is unreadable still places its nodes, each of them exactly its own stage.
+pub fn recorded(shape_json: Option<&str>) -> Recorded {
+    let Some(raw) = shape_json else {
+        return Recorded::default();
+    };
+    let mut record = serde_json::from_str::<Recorded>(raw).unwrap_or_default();
+    let placed_once = distinct(record.nodes.iter().map(|node| node.name.as_str()));
+    if !placed_once
+        || record
+            .nodes
+            .iter()
+            .any(|node| node.stage >= record.nodes.len() || node.lane >= record.nodes.len())
+    {
+        record.nodes = Vec::new();
+    }
+    // Membership is one level deep: a stage is a member of a box, and a box is not a member of
+    // anything. A registry naming a member as some other stage's box — `x` in `y`, `z` in `x` —
+    // makes `x` both a row of `y` and a box with its own rows, so one checkpoint is `y`'s member and
+    // `x`'s own completion at once, and both boxes serve it. Refused whole, like a repeated id: what
+    // a reader would do with a partly-trusted registry is exactly the double-counting to avoid.
+    let nested = {
+        let members: std::collections::HashSet<&str> = record
+            .stages
+            .iter()
+            .filter(|stage| stage.node != stage.id)
+            .map(|stage| stage.id.as_str())
+            .collect();
+        record
+            .stages
+            .iter()
+            .any(|stage| stage.node != stage.id && members.contains(stage.node.as_str()))
+    };
+    if nested || !distinct(record.stages.iter().map(|stage| stage.id.as_str())) {
+        record.stages = Vec::new();
+    }
+    // The two halves are read independently but they answer about one set of names, and a box drawn
+    // under a name that is some OTHER box's stage is a row counted in both and drawn in neither
+    // consistently. A stage may of course carry the name of the box it is — that is every node that
+    // is one stage — so it is only a member's id colliding with a placed name that is refused, and
+    // the placement is what goes: the registry is what costs and controls are keyed by.
+    let member_names: std::collections::HashSet<&str> = record
+        .stages
+        .iter()
+        .filter(|stage| stage.node != stage.id)
+        .map(|stage| stage.id.as_str())
+        .collect();
+    if record
+        .nodes
+        .iter()
+        .any(|node| member_names.contains(node.name.as_str()))
+    {
+        record.nodes = Vec::new();
+    }
+    record
+}
+
+/// Whether every name is its own. A repeated one is what turns a lookup into an expansion.
+fn distinct<'a>(names: impl Iterator<Item = &'a str>) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    names.into_iter().all(|name| seen.insert(name))
 }
 
 #[cfg(test)]
@@ -70,55 +267,171 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_position_past_the_shape_it_indexes_makes_the_whole_recording_unreadable() {
-        // An imported bundle's shape was validated on the machine that wrote it, and is stored as
-        // it arrived. A reader that groups by `stage` sizes that grouping from the number in the
-        // record, so a shape claiming a position no node could occupy is refused outright rather
-        // than placed — the run is then drawn from its own records, as any unshaped run is.
-        let far = r#"[{"name":"x","stage":1000000000,"lane":0,"optional":false}]"#;
+    fn a_registry_that_makes_a_member_someone_elses_box_is_unreadable() {
+        // Membership is one level deep. `x` is a member of `y` and also the box `z` belongs to, so
+        // the row written under `x` is at once one of `y`'s member records and `x`'s own — which
+        // makes it `y`'s member work AND the thing that completes box `x`, and serves it under both
+        // names. Unique ids do not catch it: every id here is its own.
+        let nested = r#"{"nodes":[],"stages":[{"id":"x","node":"y"},{"id":"z","node":"x"}]}"#;
         assert!(
-            recorded(Some(far)).is_empty(),
-            "a position must index this shape's own nodes"
+            recorded(Some(nested)).stages.is_empty(),
+            "a registry nesting membership must not be read"
         );
 
-        let saturated = format!(
-            r#"[{{"name":"x","stage":{},"lane":0,"optional":false}}]"#,
-            usize::MAX
-        );
-        assert!(
-            recorded(Some(&saturated)).is_empty(),
-            "and must not be one that overflows"
-        );
-
-        let lane = r#"[{"name":"x","stage":0,"lane":9000,"optional":false}]"#;
-        assert!(recorded(Some(lane)).is_empty(), "a lane is a position too");
-
-        // The fork: two nodes, one column, two lanes. Every index is inside the node count, which
-        // is what a shape this build wrote always looks like.
-        let real = r#"[
-            {"name":"redteam","stage":0,"lane":0,"optional":false},
-            {"name":"implementer","stage":0,"lane":1,"optional":false}
-        ]"#;
-        assert_eq!(recorded(Some(real)).len(), 2);
+        // The ordinary composed registry is untouched: several members of one box, and that box is
+        // nobody's member.
+        let flat = r#"{"nodes":[],"stages":[{"id":"redteam_classifier","node":"redteam"},
+                                            {"id":"redteam_author","node":"redteam"},
+                                            {"id":"analyst","node":"analyst"}]}"#;
+        assert_eq!(recorded(Some(flat)).stages.len(), 3);
     }
 
     #[test]
-    fn a_run_is_drawn_against_the_shape_it_recorded_and_nothing_else() {
+    fn a_box_drawn_under_another_boxs_member_name_is_not_placed() {
+        // Refused across the two halves, not just within each. `x` is placed as a box of its own
+        // AND declared a member of `y`, so both boxes resolve their records to the rows written
+        // under `x`: its cost is counted twice, and the two boxes disagree about which of them is
+        // working. No workflow this build validates can write it — `validate_layout` refuses
+        // placing a member's id — so the way in is an imported recording, which is what this gate
+        // is for.
+        let collided = r#"{"nodes":[{"name":"x","stage":0,"lane":0,"optional":false},
+                                    {"name":"y","stage":1,"lane":0,"optional":false}],
+                           "stages":[{"id":"x","node":"y"}]}"#;
+        let read = recorded(Some(collided));
+        assert!(
+            read.nodes.is_empty(),
+            "a placement naming another box's member must not be drawn"
+        );
+        // The registry survives it: costs and controls are keyed by that, and the run is drawn from
+        // its own records the way any unplaced run is.
+        assert_eq!(read.stages.len(), 1);
+
+        // And the ordinary case is untouched — a stage that IS its box carries the box's name.
+        let own = r#"{"nodes":[{"name":"analyst","stage":0,"lane":0,"optional":false}],
+                      "stages":[{"id":"analyst","node":"analyst"}]}"#;
+        assert_eq!(recorded(Some(own)).nodes.len(), 1);
+    }
+
+    #[test]
+    fn a_position_past_the_shape_it_indexes_makes_the_whole_placement_unreadable() {
+        // An imported bundle's recording was validated on the machine that wrote it, and is stored
+        // as it arrived. A reader that groups by `stage` sizes that grouping from the number in the
+        // record, so a recording claiming a position no node could occupy is refused outright
+        // rather than placed — the run is then drawn from its own records, as any unplaced run is.
+        let far = r#"{"nodes":[{"name":"x","stage":1000000000,"lane":0,"optional":false}]}"#;
+        assert!(
+            recorded(Some(far)).nodes.is_empty(),
+            "a position must index this recording's own nodes"
+        );
+
+        let saturated = format!(
+            r#"{{"nodes":[{{"name":"x","stage":{},"lane":0,"optional":false}}]}}"#,
+            usize::MAX
+        );
+        assert!(
+            recorded(Some(&saturated)).nodes.is_empty(),
+            "and must not be one that overflows"
+        );
+
+        let lane = r#"{"nodes":[{"name":"x","stage":0,"lane":9000,"optional":false}]}"#;
+        assert!(
+            recorded(Some(lane)).nodes.is_empty(),
+            "a lane is a position too"
+        );
+
+        // Membership indexes nothing, so an unreadable placement does not cost it: the run is drawn
+        // from its records, and those still fold into the boxes the registry says they belong to.
+        let with_stages = r#"{
+            "nodes":[{"name":"x","stage":40,"lane":0,"optional":false}],
+            "stages":[{"id":"x_turn","node":"x"}]
+        }"#;
+        let record = recorded(Some(with_stages));
+        assert!(record.nodes.is_empty());
+        assert_eq!(record.index().members("x"), ["x_turn"]);
+
+        // The fork: two nodes, one column, two lanes. Every index is inside the node count, which
+        // is what a recording this build writes always looks like.
+        let real = r#"{"nodes":[
+            {"name":"redteam","stage":0,"lane":0,"optional":false},
+            {"name":"implementer","stage":0,"lane":1,"optional":false}
+        ]}"#;
+        assert_eq!(recorded(Some(real)).nodes.len(), 2);
+    }
+
+    #[test]
+    fn a_name_recorded_twice_makes_the_whole_recording_unreadable() {
+        // The read gate bounds what a reader INDEXES BY and must also bound what it EXPANDS INTO.
+        // `members` returns every stage claiming a node, and the derivation calls it once per
+        // POSITION — so a recording that places one name N times while N stages claim it does N²
+        // work on a document of size N. `Store::import` preserves foreign JSON, so the write-side
+        // guarantee that a layout names each node once does not reach here.
+        let repeated = r#"{"nodes":[
+            {"name":"x","stage":0,"lane":0,"optional":false},
+            {"name":"x","stage":1,"lane":0,"optional":false}
+        ],"stages":[{"id":"a","node":"x"},{"id":"b","node":"x"}]}"#;
+        let record = recorded(Some(repeated));
+        assert!(
+            record.nodes.is_empty(),
+            "a name placed twice is not a placement"
+        );
+
+        // A registry that names one stage twice is refused for the same reason from the other
+        // side: `totalled` folds a box's members, so a repeated id charges its turn twice and the
+        // box reports a cost the run never paid.
+        let twice = r#"{"stages":[{"id":"a","node":"x"},{"id":"a","node":"x"}]}"#;
+        assert!(recorded(Some(twice)).stages.is_empty());
+
+        // A registry naming several stages under one node is ordinary and stays: that is what a
+        // composed box IS.
+        let composed = r#"{"stages":[{"id":"a","node":"x"},{"id":"b","node":"x"}]}"#;
+        assert_eq!(recorded(Some(composed)).index().members("x"), ["a", "b"]);
+    }
+
+    #[test]
+    fn a_run_is_drawn_against_the_graph_it_recorded_and_nothing_else() {
         // The case this exists for: a run from a graph this build does not have. Reading it back
         // must give that graph — otherwise its nodes vanish from the view and the run appears to
         // have done nothing.
-        let foreign = r#"[
+        let foreign = r#"{"nodes":[
             {"name":"scout","stage":0,"lane":0,"optional":false},
             {"name":"custom","stage":1,"lane":0,"optional":false}
-        ]"#;
-        let shape = recorded(Some(foreign));
-        assert_eq!(shape.len(), 2);
-        assert_eq!(shape[1].name, "custom");
+        ]}"#;
+        let record = recorded(Some(foreign));
+        assert_eq!(record.nodes.len(), 2);
+        assert_eq!(record.nodes[1].name, "custom");
 
-        // Nothing to read is an empty shape, not a guess at one. A run whose workflow declared no
-        // layout is placed from its own records rather than from a pipeline it may never have run.
-        assert!(recorded(None).is_empty());
-        assert!(recorded(Some("not json")).is_empty());
-        assert!(recorded(Some("[]")).is_empty());
+        // Nothing to read is an empty recording, not a guess at one. A run whose workflow declared
+        // no layout is placed from its own records rather than from a pipeline it may never have
+        // run.
+        assert_eq!(recorded(None), Recorded::default());
+        assert_eq!(recorded(Some("not json")), Recorded::default());
+        assert_eq!(recorded(Some("[]")), Recorded::default());
+        assert_eq!(recorded(Some("{}")), Recorded::default());
+    }
+
+    #[test]
+    fn membership_is_read_from_the_registry_and_not_from_where_a_node_was_placed() {
+        // The layout-less case: no positions at all, and the boxes are still known. This is the
+        // whole reason the two are recorded apart — a run of a workflow that declares no layout has
+        // a registry like any other, and its composed nodes have to draw as one box each.
+        let record = recorded(Some(
+            r#"{"stages":[
+                {"id":"redteam_classifier","node":"redteam"},
+                {"id":"redteam_author","node":"redteam"},
+                {"id":"analyst","node":"analyst"}
+            ]}"#,
+        ));
+        assert!(record.nodes.is_empty());
+        assert_eq!(
+            record.index().members("redteam"),
+            ["redteam_classifier", "redteam_author"]
+        );
+        assert_eq!(record.index().members("analyst"), ["analyst"]);
+        assert_eq!(record.index().node_of("redteam_author"), "redteam");
+        assert_eq!(record.index().node_of("analyst"), "analyst");
+        // A name the registry never heard of is its own box, which is what an unplaced record of
+        // one is.
+        assert_eq!(record.index().members("clarification"), ["clarification"]);
+        assert_eq!(record.index().node_of("clarification"), "clarification");
     }
 }

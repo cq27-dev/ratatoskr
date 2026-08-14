@@ -973,6 +973,12 @@ struct RunDetail {
     /// `None` for a run with checkpoints but no `runs` row — possible because the schema's
     /// foreign key isn't enforced and the scripted path checkpoints the issue first.
     status: Option<String>,
+    /// Whether `status` is one a run stops at. Answered here because [`RunStatus`] is where the
+    /// classification lives and is exhaustive over it — a client keeping its own list has to be
+    /// told about every new status, and is wrong until it is. Open-world in the same direction the
+    /// enum is: a status this build does not know reads as still in flight, which shows a stale run
+    /// rather than declaring a live one finished.
+    terminal: bool,
     issue_id: Option<String>,
     updated_at: Option<String>,
     /// The run's subject, from the `issue` pseudo-checkpoint. `runs.issue_id` is unset by the
@@ -983,6 +989,19 @@ struct RunDetail {
     /// this can, by how stale it is.
     last_activity: Option<String>,
     nodes: Vec<NodeView>,
+    /// The run's own record of its registry: every stage it could execute, and the node whose work
+    /// each is. What folds a member's events into its box, and what a box's feed is filtered by.
+    ///
+    /// Shipped alongside `nodes` rather than inside them because it is a property of the RUN, not
+    /// of what has finished. `nodes` is derived from checkpoints, so a box whose stage is executing
+    /// right now is not in it yet — and that is precisely the window an operator reaches for Stop
+    /// in. Read from `nodes`, the mapping is empty exactly then, the client draws
+    /// `context_distillation` as its own box, and the Stop it offers is addressed to a name the
+    /// runtime never polls.
+    ///
+    /// Empty for a run recorded before the registry travelled with it, where every node is exactly
+    /// its own stage — which is what such a run's nodes were.
+    stages: Vec<StageMembership>,
     worktree: Option<WorktreeView>,
     /// The pull request the run opened, if it opened one. Absent for comment-only runs, for runs
     /// that published nothing, and for runs that never reached the publisher.
@@ -993,6 +1012,19 @@ struct RunDetail {
     /// boundary, which can be a minute away, and a button that sprang back until the run noticed
     /// would read as the click having been lost.
     control: ControlView,
+}
+
+/// One stage of a run's registry as the dashboard needs it: what it is called, and which box its
+/// records are drawn in.
+///
+/// A projection of what the run recorded, not the recorded row. `shape_json` gains fields as a run
+/// records more about a stage — its governance identity, the session scope it declared — and none
+/// of that is the dashboard's business. Shipping the stored row would put each of them on the wire
+/// as it arrived and make every storage change a client change.
+#[derive(Debug, Serialize)]
+struct StageMembership {
+    id: String,
+    node: String,
 }
 
 /// The implementer's worktree — the reviewable deliverable, kept on `converged` and
@@ -1065,12 +1097,17 @@ async fn run_detail(
     let config = std::fs::read_to_string(&config_path)
         .ok()
         .and_then(|t| ratatoskr_core::RatatoskrConfig::from_toml_str(&t).ok());
-    let nodes = pipeline::derive_with(
-        status.as_deref(),
-        &checkpoints,
-        config.as_ref(),
-        run.as_ref().and_then(|r| r.shape_json.as_deref()),
-    );
+    let shape_json = run.as_ref().and_then(|r| r.shape_json.as_deref());
+    let recorded = ratatoskr_core::shape::recorded(shape_json);
+    let nodes = pipeline::derive_from(status.as_deref(), &checkpoints, config.as_ref(), &recorded);
+    let stages = recorded
+        .stages
+        .iter()
+        .map(|stage| StageMembership {
+            id: stage.id.clone(),
+            node: stage.node.clone(),
+        })
+        .collect();
     let last_activity = checkpoints
         .iter()
         .map(|c| c.created_at.as_str())
@@ -1106,12 +1143,14 @@ async fn run_detail(
     Ok(Json(RunDetail {
         control,
         run_id,
+        terminal: pipeline::is_terminal(status.as_deref()),
         status,
         issue_id: run.as_ref().and_then(|r| r.issue_id.clone()),
         updated_at: run.as_ref().map(|r| r.updated_at.clone()),
         issue: issue_text(&checkpoints),
         last_activity,
         nodes,
+        stages,
         worktree: worktree_view(&checkpoints),
         pull_request: pull_request_view(&checkpoints),
     }))
@@ -1126,11 +1165,22 @@ async fn node_checkpoints(
         .project_and_run(&project, &run_id, &caller, Access::Read)
         .await?;
     let all = found.store.checkpoints_for_run(&run_id).await?;
+    // Asked with the name of a *box*, which is what the graph draws and what a selection names. Its
+    // records are its members' as well as its own, so the run's registry resolves the name rather
+    // than matching it: a box whose members ran directly has no row under its own name at all, and
+    // matching would 404 a box the graph draws as done.
+    let shape_json = found.store.run(&run_id).await?.and_then(|r| r.shape_json);
+    let recorded = ratatoskr_core::shape::recorded(shape_json.as_deref());
+    let registry = recorded.index();
+    // Indexed, not scanned: this is asked once per checkpoint, and an imported run brings both its
+    // registry and its log with it — a box of many members against a long log is the same quadratic
+    // exposure the derivation's own lookups are indexed against.
+    let names: std::collections::HashSet<&str> = registry.records_of(&node).into_iter().collect();
     // Every checkpoint, not just the latest: the implementer writes one per converge iteration and
     // the diagnostic progression between them is the interesting part.
     let views: Vec<CheckpointView> = all
         .into_iter()
-        .filter(|c| c.node_name == node)
+        .filter(|c| names.contains(&c.node_name.as_str()))
         .map(|c| CheckpointView {
             created_at: c.created_at,
             output: parse_or_raw(&c.output_json),
@@ -2288,6 +2338,64 @@ mod access_tests {
                 ratatoskr_core::Directive::Continue
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_boxs_records_are_read_under_the_boxs_name_however_its_members_ran() {
+        // The graph draws boxes, so a selection names a box — and `redteam` is not a stage id. Two
+        // ways a box's rows are not under its own name: a member wrote them (a workflow invoked the
+        // member directly, which is the same thing that makes the box read Done), or the aggregate
+        // and the member both wrote and only one matches. Matching the name instead of resolving it
+        // 404s the first case, on a box the graph draws as finished.
+        let state = state().await;
+        let store = &state.projects["open"].store;
+        store
+            .upsert_run("r9", None, "converged")
+            .await
+            .expect("a run row");
+        let shape = serde_json::json!({
+            "nodes": [],
+            "stages": [{"id": "redteam_classifier", "node": "redteam"}],
+        })
+        .to_string();
+        store
+            .record_run_provenance("r9", None, None, None, Some(&shape), None)
+            .await
+            .expect("the registry to record");
+        store
+            .insert_checkpoint(ratatoskr_store::CheckpointWrite {
+                run_id: "r9",
+                node_name: "redteam_classifier",
+                output_json: r#"{"verdict":"needs tests"}"#,
+                input_json: None,
+                iteration: None,
+                telemetry: Default::default(),
+            })
+            .await
+            .expect("the member's checkpoint");
+
+        let response = router(state, None)
+            .oneshot(get("/api/projects/open/runs/r9/nodes/redteam", None))
+            .await
+            .expect("the router to answer");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the red team's box has records; only their name differs from the box's"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("a checkpoint body");
+        let views: Vec<serde_json::Value> =
+            serde_json::from_slice(&bytes).expect("checkpoint views");
+        assert_eq!(
+            views
+                .iter()
+                .map(|v| v["node_name"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            ["redteam_classifier"],
+            "the member's row is the box's row"
+        );
     }
 
     #[tokio::test]

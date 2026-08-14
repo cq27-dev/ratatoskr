@@ -6,6 +6,7 @@ import {
   forkHandoff,
   handoffDrawn,
   inNodeBoxes,
+  liveNodes,
   nodesFromEvents,
   stagesOf,
   workingNodeNames,
@@ -240,6 +241,24 @@ function placed(name, stage) {
 }
 
 const applied = (shape, events) => applyDerived(shape, nodesFromEvents(events));
+
+/** What the server sends for a node that reported nothing, so a case can vary one field of it. */
+const blankTelemetry = {
+  model: null,
+  turns: null,
+  input_tokens: 0,
+  output_tokens: 0,
+  cached_input_tokens: 0,
+  cache_creation_input_tokens: 0,
+  reasoning_tokens: 0,
+  thinking: false,
+  duration_ms: null,
+  tools: [],
+  tools_used: [],
+  reuses_session: false,
+  first_at: null,
+  last_at: null,
+};
 
 // A workflow that declares no layout records an empty shape, so the server can only place a node
 // once it has checkpointed. Until then the stream is the only thing that knows it exists.
@@ -490,73 +509,489 @@ test("a partly shaped run keeps its shaped nodes and orders the rest by the stre
   ]);
 });
 
-/** A box drawn from several stages, and the stages that are its work. */
-function composed(name, state, stages) {
-  return { name, state, checkpoints: 0, stage: 0, lane: 0, stages };
+/** A box drawn from several stages, as the server places it once it has checkpointed. */
+function composed(name, state) {
+  return { name, state, checkpoints: 0, stage: 0, lane: 0 };
+}
+
+/**
+ * The run's recorded registry, from `[box, ...members]` entries.
+ *
+ * A box that is one stage names itself. This is what the run writes down, and it is written before
+ * the first stage runs — which is why membership is read from here and never from `nodes`.
+ */
+function registry(...boxes) {
+  return boxes.flatMap(([node, ...members]) =>
+    (members.length ? members : [node]).map((id) => ({ id, node })),
+  );
 }
 
 test("a box's member stages are folded into it rather than drawn beside it", () => {
   // The regression the whole pairing exists to prevent, and it is name-matched, so it fails
   // quietly: a red-team half starts under its own id, and without membership `applyDerived` gives
   // that name a trailing column of its own next to the box it belongs to.
-  const shape = [composed("redteam", "idle", ["redteam_classifier", "redteam_author"])];
+  const shape = [composed("redteam", "idle")];
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
   const events = [start("redteam_classifier"), checkpointed("redteam_classifier")];
 
   const strays = applied(shape, events);
   expect(strays.map((n) => n.name)).toEqual(["redteam", "redteam_classifier"]);
 
-  const drawn = applied(shape, inNodeBoxes(events, shape));
+  const drawn = applied(shape, inNodeBoxes(events, stages));
   expect(drawn.map((n) => n.name)).toEqual(["redteam"]);
+  // WORKING, not done: the classifier finishing is the box started, and the author has not run.
+  // This case asserted `done` while the server said otherwise for the same records — the box's own
+  // aggregate is what completes it, on both sides.
+  expect(drawn[0].state).toBe("working");
+  expect(drawn[0].checkpoints).toBe(0);
+});
+
+test("a box is done when its own record lands, and counts only its own", () => {
+  const shape = [composed("redteam", "idle")];
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const events = [
+    start("redteam_classifier"),
+    checkpointed("redteam_classifier"),
+    start("redteam_author"),
+    checkpointed("redteam_author"),
+    checkpointed("redteam"),
+  ];
+  const drawn = applied(shape, inNodeBoxes(events, stages));
   expect(drawn[0].state).toBe("done");
+  // One, not three. The server counts the box's own rows, and a number that changes when a log
+  // rotates away is a number nobody can read.
+  expect(drawn[0].checkpoints).toBe(1);
+});
+
+test("a box that is itself a stage keeps working while a peer composed into it runs", () => {
+  // A membership target may be "a stage of its own called `{node}`" (`ratatoskr-nodes/src/
+  // validate.rs`), so a workflow may compose `security` into the peer stage `review` and invoke
+  // both hosts at once. The box's own record is then ALSO one member's, and reading completion off
+  // the name alone marks the box done on whichever host finishes first — taking the Stop aimed at
+  // the one still running with it.
+  const shape = [composed("review", "idle")];
+  const stages = registry(["review", "review", "security"]);
+  const events = [start("review"), start("security"), checkpointed("review")];
+
+  const boxed = inNodeBoxes(events, stages);
+  const drawn = applied(shape, boxed);
+  expect(drawn.map((n) => n.name)).toEqual(["review"]);
+  expect(drawn[0].state).toBe("working");
+  // The control address, which is what a Stop is aimed at.
+  expect(workingNodeNames(shape, boxed)).toEqual(["review"]);
+
+  // And it completes when the peer lands: the box's own record exists and nothing is left running.
+  const whole = inNodeBoxes([...events, checkpointed("security")], stages);
+  expect(applied(shape, whole)[0].state).toBe("done");
+  expect(workingNodeNames(shape, whole)).toEqual([]);
+});
+
+test("a stage invoked twice at once is working until both invocations have returned", () => {
+  // `Promise.all([probe(a), probe(b)])` is two LIVE invocations of one stage, and both record
+  // under that stage's one name. The first checkpoint ends an invocation, never the stage: reading
+  // it as the stage finishing marks the box done and drops the Stop aimed at the one still going.
+  const shape = [composed("probe", "idle")];
+  const stages = registry(["probe"]);
+  const events = [start("probe"), start("probe"), checkpointed("probe")];
+
+  const boxed = inNodeBoxes(events, stages);
+  expect(applied(shape, boxed)[0].state).toBe("working");
+  // The control address: what Stop and Steer are offered against while the second one runs.
+  expect(workingNodeNames(shape, boxed)).toEqual(["probe"]);
+
+  // The negative control. One invocation and one checkpoint finish the box — without this the case
+  // above would read the same against a box that simply never finishes.
+  const once = inNodeBoxes([start("probe"), checkpointed("probe")], stages);
+  expect(applied(shape, once)[0].state).toBe("done");
+  expect(workingNodeNames(shape, once)).toEqual([]);
+
+  // And the second invocation's own record is what finishes the concurrent pair.
+  const both = inNodeBoxes([...events, checkpointed("probe")], stages);
+  expect(applied(shape, both)[0].state).toBe("done");
+  expect(workingNodeNames(shape, both)).toEqual([]);
+});
+
+test("a box whose aggregate has landed is still working where a member has re-entered", () => {
+  // The stale completion, and it is the same arithmetic: the implementer is re-driven per converge
+  // iteration, so its attempt can be running again by the time the aggregate for the previous one
+  // lands. The box's own record exists and the member's latest record says `done`, and neither
+  // fact is about the invocation currently executing.
+  const shape = [composed("implementer", "idle")];
+  const stages = registry(["implementer", "implementer_attempt"]);
+  const events = [
+    start("implementer_attempt"),
+    start("implementer_attempt"),
+    checkpointed("implementer_attempt"),
+    checkpointed("implementer"),
+  ];
+
+  const boxed = inNodeBoxes(events, stages);
+  const drawn = applied(shape, boxed);
+  expect(drawn[0].state).toBe("working");
+  expect(drawn[0].checkpoints).toBe(1);
+  expect(workingNodeNames(shape, boxed)).toEqual(["implementer"]);
+});
+
+test("a start the run died under does not keep a stopped run's box working", () => {
+  // The count is only as balanced as the stream, and a host that dies writes no checkpoint — so a
+  // box with an invocation still counted live reads working and the stream will say nothing more.
+  // That is the case the terminal settle already exists for, and it still reaches it: this is the
+  // same position as a stage that never checkpointed at all.
+  const shape = [composed("probe", "idle")];
+  const stages = registry(["probe"]);
+  const derived = nodesFromEvents(
+    inNodeBoxes([start("probe"), start("probe"), checkpointed("probe")], stages),
+  );
+  expect(derived.get("probe").state).toBe("working");
+  expect(applyDerived(shape, derived, "failed")[0].state).toBe("failed");
+});
+
+test("a stage executing with nothing checkpointed yet is already drawn in its box", () => {
+  // The live window, and the one that matters: an operator reaches for Stop while a stage is
+  // running. The server derives `nodes` from checkpoints, so the box it belongs to is NOT in that
+  // list yet — a mapping read from there is empty for exactly the box being looked at, the half
+  // draws as its own box, and the Stop offered goes to a name the runtime never polls. The
+  // registry is the run's own record and says so before anything has finished.
+  const stages = registry(["context", "context_distillation"], ["analyst"]);
+  const events = [start("context_distillation")];
+  // What the server has placed: nothing. No checkpoint has landed.
+  const shape = [];
+
+  const boxed = inNodeBoxes(events, stages);
+  const drawn = applied(shape, boxed);
+  expect(drawn.map((n) => n.name)).toEqual(["context"]);
+  expect(drawn[0].state).toBe("working");
+  // The control address, which is the half of this that reaches the run.
+  expect(workingNodeNames(shape, boxed)).toEqual(["context"]);
+  // And the feed filter for that box, asked while it has no row of its own: its member's name and
+  // its own, because the box's aggregate and its acceptance output are logged under the box.
+  expect(stagesOf(stages, "context")).toEqual(["context_distillation", "context"]);
 });
 
 test("reading events as boxes leaves the events themselves alone", () => {
   // The feed shows which half ran — that is what the split bought. Only the fold is renamed.
-  const shape = [composed("redteam", "idle", ["redteam_classifier", "redteam_author"])];
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
   const events = [start("redteam_author")];
   expect(events[0].node).toBe("redteam_author");
-  expect(inNodeBoxes(events, shape)[0].node).toBe("redteam");
+  expect(inNodeBoxes(events, stages)[0].node).toBe("redteam");
   expect(events[0].node).toBe("redteam_author");
 
-  // A node that is its own stage is not touched, and neither is a name no box claims.
-  const plain = [node("analyst", "idle"), composed("scout", "idle", ["scout"])];
+  // A stage that is its own box keeps its name, and so does one the registry never heard of. Both
+  // still carry `member`, because a fold has to be able to tell a member's record from its box's
+  // whether or not a rename happened.
+  const plain = registry(["analyst"], ["scout"]);
   const untouched = [start("analyst"), start("scout"), start("characterizer")];
-  expect(inNodeBoxes(untouched, plain)).toBe(untouched);
+  const read = inNodeBoxes(untouched, plain);
+  expect(read.map((e) => e.node)).toEqual(["analyst", "scout", "characterizer"]);
+  expect(read.map((e) => e.member)).toEqual(["analyst", "scout", "characterizer"]);
+  expect(untouched.some((e) => "member" in e)).toBe(false);
 });
 
 test("a re-entry is counted from the box, whichever stage announced it", () => {
   // `convergeLoops` reads `implementer` starts. The implementer's turn now announces itself as
   // `implementer_attempt`, so counting the raw stream would report a run that looped as one that
   // went straight through.
-  const shape = [
-    composed("implementer", "idle", ["implementer_attempt"]),
-    node("verifier", "idle"),
-  ];
+  const stages = registry(["implementer", "implementer_attempt"], ["verifier"]);
   const events = [
     start("implementer_attempt"),
     start("verifier"),
     start("implementer_attempt"),
   ];
   expect(convergeLoops(events)).toEqual({ fix: 0, replan: 0, retry: 0 });
-  expect(convergeLoops(inNodeBoxes(events, shape))).toEqual({ fix: 1, replan: 0, retry: 0 });
+  expect(convergeLoops(inNodeBoxes(events, stages))).toEqual({ fix: 1, replan: 0, retry: 0 });
+});
+
+test("the live map is keyed by the box, so the box draws with what its member announced", () => {
+  // The pre-checkpoint window again, from the other side. `PipelineGraph` asks `live.get(box)`, so
+  // a map folded from the raw stream is keyed by the member and the box draws with no model, no
+  // tools and no cycle count for as long as the member is the one running — which is the whole of
+  // that window.
+  const stages = registry(["context", "context_distillation"]);
+  const announced = {
+    at: "2026-08-12T10:00:00Z",
+    kind: "node_start",
+    node: "context_distillation",
+    detail: "",
+    facts: { model: "anthropic/claude-sonnet-5", tools: ["Read"], thinking: true, reuses_session: false },
+  };
+  const called = {
+    at: "2026-08-12T10:00:01Z",
+    kind: "tool_call",
+    node: "context_distillation",
+    detail: "Read",
+  };
+  const events = [announced, called];
+
+  const raw = liveNodes(events);
+  expect([...raw.keys()]).toEqual(["context_distillation"]);
+  expect(raw.get("context")).toBeUndefined();
+
+  const boxed = liveNodes(inNodeBoxes(events, stages));
+  expect([...boxed.keys()]).toEqual(["context"]);
+  const box = boxed.get("context");
+  expect(box.facts.model).toBe("anthropic/claude-sonnet-5");
+  expect(box.cycles).toBe(1);
+  expect([...box.used]).toEqual(["Read"]);
+});
+
+test("the live map keeps a member's activity when a sibling starts beside it", () => {
+  // Two stages of one box in flight at once — `Promise.all([classify(x), author(y)])`, which the
+  // workflow may compose and the fold beside this one already handles. Both announce under the
+  // same box, so a map that keeps one entry per box lets the later start throw away everything the
+  // earlier member has done. This is the window before any checkpoint, where the live map is all
+  // the box has to draw with, so that work does not merely move — it disappears from the screen.
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const facts = (model) => ({ model, tools: ["Read"], thinking: false, reuses_session: false });
+  const announced = (name, model) => ({ ...start(name), facts: facts(model) });
+  const called = (name, tool) => ({
+    at: "2026-08-12T10:00:02Z",
+    kind: "tool_call",
+    node: name,
+    detail: tool,
+  });
+  const events = [
+    announced("redteam_classifier", "anthropic/claude-haiku-5"),
+    called("redteam_classifier", "Grep"),
+    announced("redteam_author", "anthropic/claude-sonnet-5"),
+    called("redteam_author", "Write"),
+  ];
+
+  const box = liveNodes(inNodeBoxes(events, stages)).get("redteam");
+  expect(box.cycles).toBe(2);
+  expect([...box.used].sort()).toEqual(["Grep", "Write"]);
+  // And the same for what they announced: a box running two profiles names both, exactly as the
+  // checkpointed fold beside this one does.
+  expect(box.facts.model).toBe("anthropic/claude-haiku-5, anthropic/claude-sonnet-5");
+
+  // Per MEMBER, not per invocation: a member re-entered starts its own counts again, and #285 is
+  // where a second invocation of one stage gets numbers of its own.
+  const again = [...events, announced("redteam_classifier", "anthropic/claude-haiku-5")];
+  const reentered = liveNodes(inNodeBoxes(again, stages)).get("redteam");
+  expect(reentered.cycles).toBe(1);
+  expect([...reentered.used]).toEqual(["Write"]);
+});
+
+test("a member re-entering restarts its counts whether or not it announces facts", () => {
+  // `facts` is optional on a `node_start`. Restarting only when they are present made a re-entry
+  // that announced nothing accumulate onto the previous attempt, so the box drew a cycle count that
+  // was two attempts added together — while the checkpointed fold beside it, which restarts on
+  // every `node_start`, drew the second attempt alone. Same stream, two answers.
+  const stages = registry(["analyst"]);
+  const called = (tool) => ({ at: "t", kind: "tool_call", node: "analyst", detail: tool });
+  const events = [
+    { ...start("analyst"), facts: { model: "m", tools: [], thinking: false, reuses_session: false } },
+    called("Read"),
+    called("Grep"),
+    start("analyst"),
+    called("Write"),
+  ];
+
+  const boxed = inNodeBoxes(events, stages);
+  const live = liveNodes(boxed).get("analyst");
+  expect(live.cycles).toBe(1);
+  expect([...live.used]).toEqual(["Write"]);
+  // The two folds answer the same question the same way.
+  const derived = nodesFromEvents(boxed).get("analyst");
+  expect(live.cycles).toBe(derived.cycles);
+  expect([...live.used]).toEqual([...derived.used]);
+  // And what it announced first survives a restart that announced nothing — the model is a fact
+  // about the member, not about the attempt.
+  expect(live.facts.model).toBe("m");
+});
+
+test("a usage event costs the member whatever it reports, zero included", () => {
+  // Scrub honesty, which is what this whole derivation exists for. `fromStream` keeps the server's
+  // telemetry — the run's FINAL state — for a node the stream never costed, so a node left
+  // uncosted at an earlier position displays a later attempt's model, tokens and tools.
+  //
+  // A `usage` event is the endpoint's own report of a turn: its presence is the authority, and a
+  // zero is a measurement rather than an absence. Only a CHECKPOINT has to be doubted, because a
+  // box's turn-less aggregate carries the keys as zeros whether or not anything ran.
+  const stages = registry(["analyst"]);
+  const quiet = {
+    at: "t2",
+    kind: "usage",
+    node: "analyst",
+    detail: "",
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      reasoning_tokens: 0,
+      duration_ms: 40,
+    },
+  };
+  const derived = nodesFromEvents(inNodeBoxes([start("analyst"), quiet], stages)).get("analyst");
+  expect(derived.costed).toBe(true);
+
+  // And the fold is then what the box shows, rather than the run's end reaching back into an
+  // earlier position.
+  const server = [
+    {
+      name: "analyst",
+      state: "done",
+      checkpoints: 2,
+      stage: 0,
+      lane: 0,
+      telemetry: { ...blankTelemetry, model: "the later attempt", input_tokens: 900 },
+    },
+  ];
+  const drawn = applyDerived(server, nodesFromEvents(inNodeBoxes([start("analyst"), quiet], stages)));
+  expect(drawn[0].telemetry.input_tokens).toBe(0);
+  expect(drawn[0].telemetry.duration_ms).toBe(40);
+});
+
+test("a checkpoint is costed when a turn happened, not when it spent tokens", () => {
+  // Some endpoints make a real call and omit token accounting: the checkpoint carries `turns`, a
+  // model and a duration while all five counters read zero. Asking "did it spend" leaves that
+  // member uncosted, `fromStream` substitutes the store's FINAL telemetry, and scrubbing back to an
+  // earlier attempt of a repeated node shows a later attempt's model, tokens and tools.
+  //
+  // "Did a turn happen" is the actual question and the record answers it: the server omits `facts`
+  // from a checkpoint whose node ran no model (`LiveNodeFacts::of`), so their presence IS the turn.
+  // Token counters are the wrong basis anyway — `reasoning_tokens` is hardcoded to zero by the
+  // provider and `output_tokens` is under-reported.
+  const stages = registry(["analyst"]);
+  const noCounts = {
+    at: "t2",
+    kind: "checkpoint",
+    node: "analyst",
+    detail: "",
+    facts: { model: "an endpoint that counts nothing", tools: ["Read"], thinking: false, reuses_session: false },
+    turns: 1,
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      reasoning_tokens: 0,
+      duration_ms: 90,
+    },
+  };
+  const events = inNodeBoxes([start("analyst"), noCounts], stages);
+  expect(nodesFromEvents(events).get("analyst").costed).toBe(true);
+
+  const server = [
+    {
+      name: "analyst",
+      state: "done",
+      checkpoints: 2,
+      stage: 0,
+      lane: 0,
+      telemetry: { ...blankTelemetry, model: "the later attempt", input_tokens: 900 },
+    },
+  ];
+  const drawn = applyDerived(server, nodesFromEvents(events));
+  expect(drawn[0].telemetry.model).toBe("an endpoint that counts nothing");
+  expect(drawn[0].telemetry.input_tokens).toBe(0);
+
+  // And the box's own aggregate still is not a turn: it carries the usage keys as zeros because it
+  // covers nothing, and the server gives it no facts and no turns.
+  const aggregate = {
+    at: "t3",
+    kind: "checkpoint",
+    node: "redteam",
+    detail: "",
+    usage: { ...noCounts.usage, duration_ms: 0 },
+  };
+  const composed = registry(["redteam", "redteam_classifier"]);
+  expect(nodesFromEvents(inNodeBoxes([aggregate], composed)).get("redteam").costed).toBe(false);
+});
+
+test("a box's cost is the fold of its members, not whichever record landed last", () => {
+  // Two defects in one: the box's own aggregate carries a `usage` block of zeros because it covers
+  // no turn, and two members each carry their own. Overwriting on every checkpoint reported the
+  // zeros; replacing rather than folding reported only the last member.
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const spent = (node, at, input, model) => ({
+    at,
+    kind: "checkpoint",
+    node,
+    detail: "",
+    facts: { model, tools: ["Read"], thinking: false, reuses_session: false },
+    usage: {
+      input_tokens: input,
+      output_tokens: 1,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      reasoning_tokens: 0,
+      duration_ms: 10,
+    },
+    turns: 1,
+  });
+  const aggregate = {
+    at: "t3",
+    kind: "checkpoint",
+    node: "redteam",
+    detail: "",
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      reasoning_tokens: 0,
+      duration_ms: 0,
+    },
+  };
+  const events = [
+    spent("redteam_classifier", "t1", 20, "sonnet"),
+    spent("redteam_author", "t2", 10, "haiku"),
+    aggregate,
+  ];
+  const derived = nodesFromEvents(inNodeBoxes(events, stages)).get("redteam");
+  expect(derived.telemetry.input_tokens).toBe(30);
+  expect(derived.telemetry.output_tokens).toBe(2);
+  expect(derived.telemetry.turns).toBe(2);
+  // Both routes named, as the server names them, rather than the later one silently winning.
+  expect(derived.telemetry.model).toBe("sonnet, haiku");
+  // The aggregate's zeros are not a report of cost, so they neither establish `costed` nor let a
+  // zeroed row displace the server's folded figure.
+  expect(derived.costed).toBe(true);
+  expect(derived.state).toBe("done");
+  expect(derived.checkpoints).toBe(1);
+});
+
+test("a working box shows every member's model and tools, not the latest one's", () => {
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const announced = (node, at, model, tool) => ({
+    at,
+    kind: "node_start",
+    node,
+    detail: "",
+    facts: { model, tools: [tool], thinking: false, reuses_session: false },
+  });
+  const events = [
+    announced("redteam_classifier", "t1", "sonnet", "Read"),
+    announced("redteam_author", "t2", "haiku", "Write"),
+  ];
+  const derived = nodesFromEvents(inNodeBoxes(events, stages)).get("redteam");
+  expect(derived.telemetry.model).toBe("sonnet, haiku");
+  expect(derived.telemetry.tools).toEqual(["Read", "Write"]);
+  expect(derived.state).toBe("working");
 });
 
 test("a control is aimed at the box the stage runs inside", () => {
   // The run polls for a Stop under the node's name, so this has to name the same thing — a control
   // offered against `redteam_classifier` would be sent to an address nothing answers.
-  const shape = [composed("redteam", "idle", ["redteam_classifier", "redteam_author"])];
+  const shape = [composed("redteam", "idle")];
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
   const events = [start("redteam_classifier")];
-  expect(workingNodeNames(shape, inNodeBoxes(events, shape))).toEqual(["redteam"]);
+  expect(workingNodeNames(shape, inNodeBoxes(events, stages))).toEqual(["redteam"]);
 });
 
 test("the stages of a box are what its feed is filtered by", () => {
-  const shape = [
-    composed("redteam", "idle", ["redteam_classifier", "redteam_author"]),
-    node("analyst", "idle"),
-  ];
-  expect(stagesOf(shape, "redteam")).toEqual(["redteam_classifier", "redteam_author"]);
-  // A node the server describes as one stage, and a name it does not describe at all, are both
-  // exactly themselves.
-  expect(stagesOf(shape, "analyst")).toEqual(["analyst"]);
-  expect(stagesOf(shape, "characterizer")).toEqual(["characterizer"]);
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"], ["analyst"]);
+  // Its members AND its own name: `redteam` is not a stage id, so a members-only answer drops the
+  // aggregate rows and the acceptance suite, both logged under the box.
+  expect(stagesOf(stages, "redteam")).toEqual([
+    "redteam_classifier",
+    "redteam_author",
+    "redteam",
+  ]);
+  // A box that is one stage, and a name the registry does not carry at all, are both exactly
+  // themselves.
+  expect(stagesOf(stages, "analyst")).toEqual(["analyst"]);
+  expect(stagesOf(stages, "characterizer")).toEqual(["characterizer"]);
 });
+

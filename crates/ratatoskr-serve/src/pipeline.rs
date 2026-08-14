@@ -8,6 +8,22 @@
 use ratatoskr_store::Checkpoint;
 use serde::Serialize;
 
+/// A run's checkpoints grouped by the name each was written under, in order.
+///
+/// Built once per derivation, for the same reason the registry is indexed: every question this file
+/// asks of the log is "the rows under this name", it asks one per node and per stage, and the log is
+/// a run author's document that `Store::import` writes verbatim. A scan per question is quadratic
+/// work an imported run can dictate.
+type Rows<'a> = std::collections::HashMap<&'a str, Vec<&'a Checkpoint>>;
+
+fn rows_by_node(checkpoints: &[Checkpoint]) -> Rows<'_> {
+    let mut rows: Rows<'_> = Rows::with_capacity(checkpoints.len());
+    for c in checkpoints {
+        rows.entry(c.node_name.as_str()).or_default().push(c);
+    }
+    rows
+}
+
 /// Whether this node's own failure can be what made a run `failed`.
 ///
 /// A run fails when its workflow entry returns an error — any host call that returns `Err` and is
@@ -67,14 +83,6 @@ pub struct NodeView {
     /// positioned from these rather than from a table the frontend maintains in parallel.
     pub stage: usize,
     pub lane: usize,
-    /// The stages whose work this node is, in declaration order.
-    ///
-    /// One entry of the node's own name for the ordinary node, which is one stage. Several for a
-    /// node several stages compose — the red team's classifier and its test author — and then this
-    /// is the only thing that says so: the members run under their own identities, so their events
-    /// and their per-turn records arrive under names no column carries, and a client that did not
-    /// know they belonged here would draw each as a node of its own beside the box.
-    pub stages: Vec<String>,
     /// Whether the run's recorded shape is what put it there. False means [`append_unknown`]
     /// placed it, in first-checkpoint order — an order a client holding the event stream can
     /// better, since completion order is not start order once a workflow runs hosts concurrently.
@@ -86,8 +94,13 @@ pub struct NodeView {
     pub checkpoints: usize,
     pub first_at: Option<String>,
     pub last_at: Option<String>,
-    /// What the node ran on and cost, totalled over [`Self::stages`] — the latest record of each,
-    /// folded. Absent for a node that has not checkpointed, and for one that ran no model at all.
+    /// What the node ran on and cost, totalled over the stages composing it — the latest record of
+    /// each, folded. Absent for a node that has not checkpointed, and for one that ran no model at
+    /// all.
+    ///
+    /// Which stages those are is NOT repeated here. It is the run's recorded registry, shipped once
+    /// per run rather than once per box, because a box that has not checkpointed yet has no row in
+    /// this list at all and its membership is needed exactly then.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<NodeTelemetryView>,
     /// What this node *would* run on, read from config. Present before the node has run, so the
@@ -107,29 +120,99 @@ pub struct NodeView {
 /// the script engine and the servers. They arrive when the node announces itself.
 #[derive(Debug, Clone, Serialize)]
 pub struct PlannedNode {
+    /// Every distinct route the node's stages resolve, comma-joined — the same rule
+    /// `NodeTelemetry::fold` reports a folded row's models by, so what a box plans to run on and
+    /// what it reports having run on read alike.
     pub model: String,
     pub thinking: bool,
-    pub reuses_session: bool,
-    pub session: ratatoskr_core::SessionScope,
+    /// Every distinct scope the node's stages will run under, in registry order.
+    ///
+    /// A set rather than one value, and rather than nothing when they differ. A route is one field
+    /// and two values of it are genuinely unsayable; a session scope is not the same question.
+    /// Compacted continuation is a property a MEMBER has — it receives a summary of its own last
+    /// attempt — and a box with a compacted member has it whatever its siblings do. Collapsing left
+    /// a reader with only a boolean, which a compacted re-entry sets too, so the box showed the
+    /// endpoint-reuse mark for a half that never touches an endpoint session.
+    ///
+    /// The scope each stage will RUN under, not its route's. A stage may declare its own, and
+    /// execution honours the declaration — so two stages on one route can still differ.
+    ///
+    /// No `reuses_session` beside it: that is `sessions.contains(Reuse)`, and a second copy of one
+    /// fact is what a reader falls back to when the first stops answering.
+    pub sessions: Vec<ratatoskr_core::SessionScope>,
 }
 
 impl PlannedNode {
-    /// Read a node's route out of the config, if it has one. A node with no route never runs.
-    fn of(config: Option<&ratatoskr_core::RatatoskrConfig>, node: &str) -> Option<Self> {
-        let route = config?.models.get(node)?;
+    /// What a node would run on, read from config across the stages that do its work.
+    ///
+    /// A route is keyed by a stage's GOVERNANCE identity, which need not be the box's name and
+    /// often is not: the implementer's box runs `[models.implementer]` through
+    /// `implementer_attempt`, and a stage drawn under its own id may declare `governedBy` freely.
+    /// Reading the config under the box's own name reports the wrong route for the first and none
+    /// at all for the second, on a node execution routes perfectly well.
+    ///
+    /// A box whose stages resolve DIFFERENT routes names each of them, rather than picking one.
+    /// That can genuinely happen — a composed node's halves resolve through their own profiles
+    /// (#277) — and it is the same choice folded telemetry already makes for the same reason:
+    /// dropping the disagreement would report a route the box does not entirely have, and emptying
+    /// it would read as "this node has nowhere to run".
+    ///
+    /// `None` when no stage of the node has a route. A node with no route never runs.
+    fn of(
+        config: Option<&ratatoskr_core::RatatoskrConfig>,
+        stages: &[&str],
+        registry: &ratatoskr_core::shape::Registry<'_>,
+    ) -> Option<Self> {
+        let config = config?;
+        // Each stage's route, and the scope it will actually run under. `Stage::session_scope` is
+        // what execution applies — the stage's own declaration wins, an absent one preserves the
+        // route — so a box whose stages declared differently against ONE route still has no single
+        // scope, and reading `route.session` here would report one, confidently and wrongly.
+        let planned: Vec<(&ratatoskr_core::ModelRoute, ratatoskr_core::SessionScope)> = stages
+            .iter()
+            .filter_map(|stage| {
+                let route = config.models.get(registry.governance_of(stage))?;
+                Some((route, registry.session_of(stage).unwrap_or(route.session)))
+            })
+            .collect();
+        // A vector for the output and a set to decide what goes in it. The order is meaningful — a
+        // box lists every distinct route it runs on, in registry order — but asking the vector
+        // whether it already holds one rescans everything collected so far, once per member, and a
+        // workflow may compose a box out of as many stages as it likes.
+        let mut models: Vec<String> = Vec::new();
+        let mut named = std::collections::HashSet::new();
+        // `sessions` needs no set. `SessionScope` has three variants, so this vector is three long
+        // at worst and the scan is bounded by the enum rather than by the box.
+        let mut sessions: Vec<ratatoskr_core::SessionScope> = Vec::new();
+        for (route, session) in &planned {
+            let model = format!("{}/{}", route.provider, route.model);
+            if named.insert(model.clone()) {
+                models.push(model);
+            }
+            if !sessions.contains(session) {
+                sessions.push(*session);
+            }
+        }
+        if models.is_empty() {
+            return None;
+        }
         Some(PlannedNode {
-            model: format!("{}/{}", route.provider, route.model),
-            thinking: route
-                .params
-                .as_ref()
-                .and_then(|p| p.get("thinking"))
-                .and_then(|t| t.get("type"))
-                .and_then(|t| t.as_str())
-                != Some("disabled"),
-            reuses_session: matches!(route.session, ratatoskr_core::SessionScope::Reuse),
-            session: route.session,
+            model: models.join(", "),
+            thinking: planned.iter().any(|(route, _)| thinking(route)),
+            sessions,
         })
     }
+}
+
+/// Whether a route leaves the model free to reason. Configured, not observed.
+fn thinking(route: &ratatoskr_core::ModelRoute) -> bool {
+    route
+        .params
+        .as_ref()
+        .and_then(|p| p.get("thinking"))
+        .and_then(|t| t.get("type"))
+        .and_then(|t| t.as_str())
+        != Some("disabled")
 }
 
 /// A node's model, cost, and the two facts a reader cannot infer from either: which tools it could
@@ -172,7 +255,7 @@ impl NodeTelemetryView {
     ///
     /// `None` when no member recorded a model turn — the issue pseudo-node, one whose turn was
     /// never claimed, or a node that has not run.
-    fn totalled(checkpoints: &[Checkpoint], stages: &[String]) -> Option<Self> {
+    fn totalled(rows: &Rows<'_>, stages: &[&str]) -> Option<Self> {
         // `NodeTelemetry::fold` is the same arithmetic a multi-turn checkpoint is written with:
         // figures add, a figure nobody reported stays unreported, and the models and tool sets are
         // named distinctly rather than one overwriting the other. A box that ran two profiles
@@ -180,7 +263,7 @@ impl NodeTelemetryView {
         // turn.
         let t = stages
             .iter()
-            .filter_map(|stage| checkpoints.iter().rfind(|c| &c.node_name == stage))
+            .filter_map(|stage| rows.get(stage)?.last())
             .map(|c| c.telemetry.clone())
             .filter(|t| t.model.is_some())
             .reduce(|mut folded, next| {
@@ -217,6 +300,17 @@ pub(crate) fn is_terminal(status: Option<&str>) -> bool {
         .is_some_and(|s| s.is_terminal())
 }
 
+/// Whether the run reached its end under its own power — see `RunStatus::ran_to_completion`.
+///
+/// Read the same way as [`is_terminal`], and defaulting the same direction: a status this build
+/// cannot parse reads as interrupted, so nothing is claimed finished on the strength of a name
+/// nobody here classified.
+fn ran_to_completion(status: Option<&str>) -> bool {
+    status
+        .and_then(|s| s.parse::<ratatoskr_core::RunStatus>().ok())
+        .is_some_and(|s| s.ran_to_completion())
+}
+
 /// Derive each node's state from the run status and its checkpoints.
 ///
 /// Three non-uniformities are handled explicitly:
@@ -243,6 +337,10 @@ pub(crate) fn is_terminal(status: Option<&str>) -> bool {
 ///
 /// `config` is what the run was started under, so a node that has not run yet can still say what it
 /// will run on.
+/// [`derive_from`], for a caller holding the recording still serialized.
+///
+/// The parse is the largest single pass over a document an imported run brought with it, so a
+/// caller that needs the recording for anything else parses once and calls `derive_from`.
 pub fn derive_with(
     status: Option<&str>,
     checkpoints: &[Checkpoint],
@@ -250,11 +348,31 @@ pub fn derive_with(
     shape_json: Option<&str>,
 ) -> Vec<NodeView> {
     // The graph the run recorded, and only that. A run from another machine — or from this one
-    // before the pipeline changed — is drawn against its own shape; one that recorded none is
-    // placed entirely by `append_unknown`, from the records it has.
-    let shape = ratatoskr_core::shape::recorded(shape_json);
-    let stages = stages_of(&shape);
+    // before the pipeline changed — is drawn against its own shape; one that recorded no layout is
+    // placed entirely by `append_unknown`, from the records it has. Its membership still applies
+    // there: which stages compose a node is the registry's, not the layout's.
+    derive_from(
+        status,
+        checkpoints,
+        config,
+        &ratatoskr_core::shape::recorded(shape_json),
+    )
+}
+
+pub fn derive_from(
+    status: Option<&str>,
+    checkpoints: &[Checkpoint],
+    config: Option<&ratatoskr_core::RatatoskrConfig>,
+    recorded: &ratatoskr_core::shape::Recorded,
+) -> Vec<NodeView> {
+    // Both lookups this derivation makes, indexed once: the registry it asks about every node, and
+    // the log it asks about every name. Either scanned per question is quadratic over a document an
+    // imported run brought with it.
+    let registry = recorded.index();
+    let rows = rows_by_node(checkpoints);
+    let stages = stages_of(&recorded.nodes);
     let terminal = is_terminal(status);
+    let completed = ran_to_completion(status);
     let failed = status == Some("failed");
     // Once the implementer has checkpointed, a failure has two candidates and the record separates
     // neither. The implementer re-enters once per converge iteration without announcing it here, so
@@ -266,13 +384,12 @@ pub fn derive_with(
     // The implementer's OWN checkpoints, not its column's. A declared fork column may hold any
     // lanes a workflow likes, and a peer that checkpointed says nothing about whether the
     // implementer ever ran.
-    let unattributable = failed && count(checkpoints, IMPLEMENTER_NODE) > 0;
+    let unattributable = failed && count(&rows, IMPLEMENTER_NODE) > 0;
 
     // A node has finished only if it checkpointed *and* isn't the implementer mid-converge —
     // otherwise the fork would look complete on iteration 1 and the run's activity would be
     // attributed to the bookkeeper, which by the invariant above hasn't started.
-    let finished =
-        |name: &str| count(checkpoints, name) > 0 && !(name == "implementer" && !terminal);
+    let finished = |name: &str| count(&rows, name) > 0 && !(name == IMPLEMENTER_NODE && !terminal);
     // Where the run has got to: the first stage that has not finished and has nothing after it
     // checkpointed. Without that second half a skipped verifier would hold the position forever
     // and report every later node as not yet reached, on a run that has finished.
@@ -283,7 +400,7 @@ pub fn derive_with(
     // version of that guess.
     let last_seen = stages
         .iter()
-        .rposition(|nodes| nodes.iter().any(|n| count(checkpoints, &n.name) > 0));
+        .rposition(|nodes| nodes.iter().any(|n| count(&rows, &n.name) > 0));
     let current = stages.iter().enumerate().position(|(idx, nodes)| {
         !nodes.iter().all(|n| n.optional)
             && !(nodes.iter().all(|n| finished(&n.name))
@@ -295,7 +412,7 @@ pub fn derive_with(
     let candidates = current.map_or(0, |idx| {
         stages[idx]
             .iter()
-            .filter(|n| count(checkpoints, &n.name) == 0 && can_fail_the_run(&n.name))
+            .filter(|n| count(&rows, &n.name) == 0 && can_fail_the_run(&n.name))
             .count()
     });
 
@@ -303,13 +420,24 @@ pub fn derive_with(
     for (idx, nodes) in stages.iter().enumerate() {
         for node in nodes {
             let (lane, name) = (node.lane, &node.name);
-            let times: Vec<&str> = checkpoints
-                .iter()
-                .filter(|c| c.node_name == *name)
-                .map(|c| c.created_at.as_str())
-                .collect();
+            let times = node_times(&rows, name);
+            // What its members' records say, when it has none of its own — the same question
+            // `append_unknown` asks, asked through the same function.
+            let by_members = match times.is_empty() {
+                false => None,
+                true => from_members(
+                    registry
+                        .members(name)
+                        .iter()
+                        .any(|member| *member != name && count(&rows, member) > 0),
+                    terminal,
+                    completed,
+                ),
+            };
 
-            let state = if times.is_empty() {
+            let state = if let Some(state) = by_members {
+                state
+            } else if times.is_empty() {
                 match () {
                     // Later than where the run is: nothing to say about it yet.
                     _ if current != Some(idx) => NodeState::Idle,
@@ -328,15 +456,14 @@ pub fn derive_with(
                 checkpointed_state(name, terminal)
             };
 
-            let stages = composing(node);
+            let stages = registry.members(name);
             out.push(NodeView {
-                telemetry: NodeTelemetryView::totalled(checkpoints, &stages),
-                planned: PlannedNode::of(config, name),
+                telemetry: NodeTelemetryView::totalled(&rows, &stages),
+                planned: PlannedNode::of(config, &stages, &registry),
                 name: name.clone(),
                 state,
                 stage: idx,
                 lane,
-                stages,
                 shaped: true,
                 checkpoints: times.len(),
                 first_at: times.first().map(|s| s.to_string()),
@@ -346,23 +473,49 @@ pub fn derive_with(
             });
         }
     }
-    append_unknown(&mut out, checkpoints, config, terminal);
+    append_unknown(
+        &mut out,
+        checkpoints,
+        config,
+        terminal,
+        completed,
+        &registry,
+        &rows,
+    );
     out
 }
 
-/// The stages composing a shaped node.
+/// What a box with no record of its own is doing, from the fact that its MEMBERS have records.
 ///
-/// A shape recorded before membership was carried says nothing, and a node is then exactly itself —
-/// which is what every node of such a run was.
-fn composing(node: &ratatoskr_core::shape::ShapeNode) -> Vec<String> {
-    if node.stages.is_empty() {
-        vec![node.name.clone()]
-    } else {
-        node.stages.clone()
+/// `None` when the records say nothing and the caller's own rules apply — either because no member
+/// has recorded (the box has not started) or because the run stopped and what is missing proves
+/// nothing about what ran.
+///
+/// One function, called from both placements, because expressing this rule twice is exactly what
+/// produced the defect it now prevents: `append_unknown` was taught that a run which reached its
+/// end under its own power completes a member-only box, and the placed branch kept the old answer,
+/// so a laid-out pipeline drew finished work as never-started.
+///
+/// The rule itself: a member always writes its own row, so its presence cannot separate a workflow
+/// that called the member DIRECTLY — no aggregate is ever written for that box — from an operation
+/// host that died before writing one. The run's outcome separates them. Every operation host writes
+/// its aggregate before returning, so on a run that completed, a missing aggregate means no host
+/// ran and the member's work is the box's work, done. On a run still going the box is mid-flight.
+/// On one that failed or was abandoned, nothing is claimed here.
+fn from_members(members_recorded: bool, terminal: bool, completed: bool) -> Option<NodeState> {
+    match (members_recorded, terminal, completed) {
+        (false, ..) => None,
+        (true, false, _) => Some(NodeState::Working),
+        (true, true, true) => Some(NodeState::Done),
+        (true, true, false) => None,
     }
 }
 
-/// What a node that has checkpointed is doing, wherever it sits.
+/// What a node whose OWN record exists is doing, wherever it sits.
+///
+/// Its own, not a member's. A composed box's aggregate is written after its stages have run, so a
+/// member's row proves the box started and nothing more — see [`append_unknown`], which is the only
+/// place a box can be reached through a member and reads that case for itself.
 ///
 /// A checkpoint proves the node completed something — but the implementer is checkpointed once per
 /// converge iteration, so while the run is live one of its checkpoints says the opposite of
@@ -395,20 +548,25 @@ fn checkpointed_state(name: &str, terminal: bool) -> NodeState {
 /// available, where a shared column would assert nodes ran side by side that merely lack a layout. What each node is *doing*
 /// comes from [`checkpointed_state`], the same rule a placed node gets: a live implementer holds a
 /// checkpoint from an earlier converge iteration and is still working, wherever it was drawn.
+///
+/// A record is placed under the NODE it belongs to, not the stage that wrote it. A composed node's
+/// members each write their own row, so a layout-less run of the standard workflow has rows under
+/// `context_distillation`, `redteam_classifier`, `redteam_author` and `implementer_attempt` beside
+/// the three aggregates their operation hosts write — one box each here would draw four strays and,
+/// worse, offer each of them controls under a name the runtime never polls. The member's row folds
+/// into its box, exactly as it does for a node the layout placed.
 fn append_unknown(
     out: &mut Vec<NodeView>,
     checkpoints: &[Checkpoint],
     config: Option<&ratatoskr_core::RatatoskrConfig>,
     terminal: bool,
+    completed: bool,
+    registry: &ratatoskr_core::shape::Registry<'_>,
+    rows: &Rows<'_>,
 ) {
-    // A placed box accounts for its own name AND for every stage that composes it. A member writes
-    // its own per-turn row under its own id, which no column carries — without this the red team
-    // would be drawn as one box plus a floating `redteam_classifier` and `redteam_author` beside
-    // it, which is exactly the stray this membership exists to prevent.
-    let known: std::collections::HashSet<&str> = out
-        .iter()
-        .flat_map(|n| std::iter::once(n.name.as_str()).chain(n.stages.iter().map(String::as_str)))
-        .collect();
+    // A box the layout already placed. A member's row resolves to its box through
+    // `Recorded::node_of` below, so only the box names have to be listed here.
+    let known: std::collections::HashSet<&str> = out.iter().map(|n| n.name.as_str()).collect();
     let mut seen = std::collections::HashSet::new();
     // Each out-of-shape name with the position of its FIRST checkpoint, which is what its caller is
     // resolved from. One row aggregates every checkpoint of that name, so a run whose
@@ -416,7 +574,9 @@ fn append_unknown(
     // `caller`. Splitting a row per caller belongs to the placement work (#248), which owns layout.
     let mut extra: Vec<(&str, usize)> = Vec::new();
     for (idx, c) in checkpoints.iter().enumerate() {
-        let name = c.node_name.as_str();
+        // The box the record belongs to. A member's row is its node's, so the several rows a
+        // composed node's stages write claim one position between them — the first of them.
+        let name = registry.node_of(c.node_name.as_str());
         // The issue pseudo-node writes a checkpoint and is deliberately not a pipeline node: it
         // records what the run was asked to do, which is not a stage of doing it.
         if name != ISSUE_NODE && !known.contains(name) && seen.insert(name) {
@@ -425,18 +585,42 @@ fn append_unknown(
     }
     let base = out.iter().map(|n| n.stage).max().map_or(0, |s| s + 1);
     for (i, (name, first)) in extra.into_iter().enumerate() {
-        let times = node_times(checkpoints, name);
-        // Nothing places it, so nothing says it is anyone's work but its own.
-        let stages = vec![name.to_string()];
+        let times = node_times(rows, name);
+        let stages = registry.members(name);
+        // `Done` means the box's OWN record exists. A box arrives here because something it
+        // composes checkpointed, and that may be a member rather than the box: the red team's
+        // classifier finishes while its author is still writing tests, and the aggregate its host
+        // writes lands after both. Reading a member's row as the box's completion reports it done
+        // with no checkpoints of its own, which hides its controls while it is still working.
+        //
+        // With only members recorded, a live run has the box mid-flight — that is what a member
+        // having finished and the aggregate not having landed means.
+        //
+        // On a stopped run the same rows have two histories and the record does not separate them.
+        // A member ALWAYS writes its own row, so their presence proves nothing on its own: a
+        // workflow may call a member stage directly, whose generic host checkpoints under the stage
+        // id and never writes an aggregate at all, and an operation host that died partway leaves
+        // exactly the same trace. What separates them is the RUN's outcome. Every operation host
+        // writes its aggregate before returning, so on a run that reached its end under its own
+        // power a missing aggregate means no host ran — the members were invoked directly, and the
+        // box's work is done. On one that failed or was abandoned, nothing is claimed: `Idle` is
+        // this derivation's answer wherever the evidence names nobody, as it is for an
+        // unattributable failure above, and a client holding the event stream answers it properly.
+        // A box reaches here because something it composes recorded, so if it has no row of its
+        // own its members must have one. `Idle` is what is left when the records name nobody, as it
+        // is everywhere else in this derivation.
+        let state = match times.is_empty() {
+            false => checkpointed_state(name, terminal),
+            true => from_members(true, terminal, completed).unwrap_or(NodeState::Idle),
+        };
         out.push(NodeView {
-            telemetry: NodeTelemetryView::totalled(checkpoints, &stages),
-            planned: PlannedNode::of(config, name),
+            telemetry: NodeTelemetryView::totalled(rows, &stages),
+            planned: PlannedNode::of(config, &stages, registry),
             caller: caller_of(checkpoints, first),
             name: name.to_string(),
-            state: checkpointed_state(name, terminal),
+            state,
             stage: base + i,
             lane: 0,
-            stages,
             shaped: false,
             checkpoints: times.len(),
             first_at: times.first().map(|s| s.to_string()),
@@ -496,16 +680,14 @@ fn stages_of(
 }
 
 /// When each of `node`'s checkpoints was written, in order.
-fn node_times(checkpoints: &[Checkpoint], node: &str) -> Vec<String> {
-    checkpoints
-        .iter()
-        .filter(|c| c.node_name == node)
-        .map(|c| c.created_at.clone())
-        .collect()
+fn node_times<'a>(rows: &Rows<'a>, node: &str) -> Vec<&'a str> {
+    rows.get(node).map_or_else(Vec::new, |rows| {
+        rows.iter().map(|c| c.created_at.as_str()).collect()
+    })
 }
 
-fn count(checkpoints: &[Checkpoint], node: &str) -> usize {
-    checkpoints.iter().filter(|c| c.node_name == node).count()
+fn count(rows: &Rows<'_>, node: &str) -> usize {
+    rows.get(node).map_or(0, Vec::len)
 }
 
 #[cfg(test)]
@@ -521,56 +703,83 @@ mod tests {
     /// standard columns change; a stale fixture only makes these cases describe a pipeline that no
     /// longer exists, never a run drawn wrongly.
     fn standard_shape() -> String {
-        shape_with(
-            &[
-                (&["overseer"], true),
-                (&["context"], false),
-                (&["analyst"], false),
-                (&["redteam", "implementer"], false),
-                (&["verifier"], true),
-                (&["bookkeeper", "publisher"], false),
-            ],
-            // The three boxes the standard workflow composes out of stages that are not boxes of
-            // their own. Each member records its own turn; the box records the aggregate.
-            &[
-                ("context", &["context_distillation"]),
-                ("redteam", &["redteam_classifier", "redteam_author"]),
-                ("implementer", &["implementer_attempt"]),
-            ],
-        )
+        shape_with(STANDARD_COLUMNS, STANDARD_COMPOSED)
     }
 
-    /// A recorded shape from its columns, each a list of lane names and whether it may be skipped.
-    /// Every box is a single stage of its own name.
+    const STANDARD_COLUMNS: &[(&[&str], bool)] = &[
+        (&["overseer"], true),
+        (&["context"], false),
+        (&["analyst"], false),
+        (&["redteam", "implementer"], false),
+        (&["verifier"], true),
+        (&["bookkeeper", "publisher"], false),
+    ];
+
+    /// The three boxes the standard workflow composes out of stages that are not boxes of their
+    /// own. Each member records its own turn; the box records the aggregate.
+    const STANDARD_COMPOSED: &[(&str, &[&str])] = &[
+        ("context", &["context_distillation"]),
+        ("redteam", &["redteam_classifier", "redteam_author"]),
+        ("implementer", &["implementer_attempt"]),
+    ];
+
+    /// A recording from its columns, each a list of lane names and whether it may be skipped. Every
+    /// box is a single stage of its own name.
     fn shape_of(columns: &[(&[&str], bool)]) -> String {
         shape_with(columns, &[])
     }
 
     /// As [`shape_of`], with the stages composing the boxes that are made of more than themselves.
     fn shape_with(columns: &[(&[&str], bool)], composed: &[(&str, &[&str])]) -> String {
-        let nodes: Vec<ratatoskr_core::shape::ShapeNode> = columns
+        serde_json::to_string(&ratatoskr_core::shape::Recorded {
+            nodes: columns
+                .iter()
+                .enumerate()
+                .flat_map(|(stage, (names, optional))| {
+                    names.iter().enumerate().map(move |(lane, name)| {
+                        ratatoskr_core::shape::ShapeNode {
+                            name: (*name).to_string(),
+                            stage,
+                            lane,
+                            optional: *optional,
+                        }
+                    })
+                })
+                .collect(),
+            stages: registry_of(columns, composed),
+        })
+        .unwrap()
+    }
+
+    /// The registry such a run would have: every box that composes nothing is one stage of its own
+    /// name governing as itself, and a composed one is its members, each governing as the box —
+    /// which is what the three bundled composed nodes do, and why one `[models.redteam]` serves
+    /// both red-team halves.
+    fn registry_of(
+        columns: &[(&[&str], bool)],
+        composed: &[(&str, &[&str])],
+    ) -> Vec<ratatoskr_core::shape::RunStage> {
+        columns
             .iter()
-            .enumerate()
-            .flat_map(|(stage, (names, optional))| {
-                names
+            .flat_map(|(names, _)| names.iter())
+            .flat_map(|name| {
+                let members: Vec<String> = composed
                     .iter()
-                    .enumerate()
-                    .map(move |(lane, name)| ratatoskr_core::shape::ShapeNode {
-                        name: (*name).to_string(),
-                        stage,
-                        lane,
-                        optional: *optional,
-                        stages: composed
-                            .iter()
-                            .find(|(box_name, _)| box_name == name)
-                            .map_or_else(
-                                || vec![(*name).to_string()],
-                                |(_, members)| members.iter().map(|m| (*m).to_string()).collect(),
-                            ),
+                    .find(|(box_name, _)| box_name == name)
+                    .map_or_else(
+                        || vec![(*name).to_string()],
+                        |(_, members)| members.iter().map(|m| (*m).to_string()).collect(),
+                    );
+                members
+                    .into_iter()
+                    .map(|id| ratatoskr_core::shape::RunStage {
+                        governed_by: (id != *name).then(|| (*name).to_string()),
+                        id,
+                        node: (*name).to_string(),
+                        session: None,
                     })
             })
-            .collect();
-        serde_json::to_string(&nodes).unwrap()
+            .collect()
     }
 
     /// A run of the standard pipeline, which is what every case below is about unless it says
@@ -611,6 +820,18 @@ mod tests {
     const EXCHANGE: &str =
         r#"{"from":"analyst","to":"scout","question":"which one?","answer":"the first"}"#;
 
+    /// The membership `run_detail` ships beside the nodes — the run's recorded registry, which is
+    /// where the client reads a box's stages from. Not `NodeView`: a box that has not checkpointed
+    /// has no row there, and that is the window a control is used in.
+    fn membership(shape_json: &str, node: &str) -> Vec<String> {
+        ratatoskr_core::shape::recorded(Some(shape_json))
+            .index()
+            .members(node)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
     fn state_of(views: &[NodeView], name: &str) -> NodeState {
         views.iter().find(|v| v.name == name).unwrap().state
     }
@@ -637,6 +858,280 @@ mod tests {
             output_json: output_json.to_string(),
             ..cp(node, at)
         }
+    }
+
+    #[test]
+    fn a_run_that_laid_nothing_out_still_draws_one_box_per_node() {
+        // A workflow need not declare a layout, so its run records no positions — but it composes
+        // its nodes out of the same stages a laid-out run does, and membership is recorded whether
+        // or not anything was placed. Without it every member of the standard workflow's three
+        // composed nodes draws as a box of its own, and the dashboard offers each of those boxes a
+        // Stop under a name the runtime never polls for.
+        let unplaced = serde_json::to_string(&ratatoskr_core::shape::Recorded {
+            nodes: Vec::new(),
+            stages: registry_of(STANDARD_COLUMNS, STANDARD_COMPOSED),
+        })
+        .unwrap();
+        let views = derive_with(
+            Some("succeeded"),
+            &[
+                cp("context_distillation", "t1"),
+                cp("context", "t2"),
+                cp("analyst", "t3"),
+                cp("redteam_classifier", "t4"),
+                cp("redteam_author", "t5"),
+                cp("redteam", "t6"),
+                cp("implementer_attempt", "t7"),
+                cp("implementer", "t8"),
+                cp("verifier", "t9"),
+            ],
+            None,
+            Some(&unplaced),
+        );
+        assert_eq!(
+            views.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            ["context", "analyst", "redteam", "implementer", "verifier"],
+            "one box per node, in the order the run first recorded under each"
+        );
+        // And the membership the client folds the stream by comes from the same record, so it
+        // holds for a box drawn here as for one the layout placed.
+        assert_eq!(
+            membership(&unplaced, "redteam"),
+            ["redteam_classifier", "redteam_author"]
+        );
+        assert_eq!(
+            membership(&unplaced, "implementer"),
+            ["implementer_attempt"]
+        );
+        assert_eq!(membership(&unplaced, "analyst"), ["analyst"]);
+        // The box's own record is what says how many times it ran, exactly as for a placed one:
+        // the members' rows are turns inside it, not repeats of it.
+        assert_eq!(view(&views, "redteam").checkpoints, 1);
+    }
+
+    #[test]
+    fn a_placed_box_reads_its_members_the_way_an_unplaced_one_does() {
+        // The same records, the same run, the same answer — whether or not a layout placed the box.
+        // A workflow may call a member stage directly, and then no aggregate is ever written: the
+        // box's work is its member's, and on a run that reached its end under its own power that
+        // work is done. Deciding it only where `append_unknown` runs left a laid-out pipeline
+        // drawing finished work as never-started.
+        let midway = [cp("redteam_classifier", "t1")];
+        let placed = derive_with(Some("converged"), &midway, None, Some(&standard_shape()));
+        let unplaced = serde_json::to_string(&ratatoskr_core::shape::Recorded {
+            nodes: Vec::new(),
+            stages: registry_of(STANDARD_COLUMNS, STANDARD_COMPOSED),
+        })
+        .unwrap();
+        let appended = derive_with(Some("converged"), &midway, None, Some(&unplaced));
+        assert_eq!(
+            state_of(&placed, "redteam"),
+            NodeState::Done,
+            "a placed box completed by its member reads as completed"
+        );
+        assert_eq!(state_of(&placed, "redteam"), state_of(&appended, "redteam"));
+
+        // Live, both say working; stopped, neither claims anything. The rule is one rule.
+        for (status, expected) in [
+            (Some("running"), NodeState::Working),
+            (Some("abandoned"), NodeState::Idle),
+        ] {
+            let placed = derive_with(status, &midway, None, Some(&standard_shape()));
+            assert_eq!(
+                state_of(&placed, "redteam"),
+                expected,
+                "a placed box on a `{status:?}` run"
+            );
+        }
+    }
+
+    #[test]
+    fn a_box_is_done_only_once_its_own_record_exists() {
+        // A box reaches `append_unknown` because SOMETHING it composes checkpointed, and that may
+        // be a member: the red team's classifier finishes while its author is still writing tests,
+        // and the aggregate its host writes lands after both. Reading a member's row as the box's
+        // completion reports `done` with `checkpoints: 0` — a client without usable event history
+        // then hides the box's controls and calls it finished while it is still working.
+        let unplaced = serde_json::to_string(&ratatoskr_core::shape::Recorded {
+            nodes: Vec::new(),
+            stages: registry_of(STANDARD_COLUMNS, STANDARD_COMPOSED),
+        })
+        .unwrap();
+        let midway = [cp("redteam_classifier", "t1")];
+        let live = derive_with(Some("running"), &midway, None, Some(&unplaced));
+        assert_eq!(
+            view(&live, "redteam").state,
+            NodeState::Working,
+            "a member has recorded and the box has not, on a run that is still going"
+        );
+        assert_eq!(view(&live, "redteam").checkpoints, 0);
+
+        // The aggregate lands and the box is done, by its own record.
+        let whole = [cp("redteam_classifier", "t1"), cp("redteam", "t2")];
+        assert_eq!(
+            state_of(
+                &derive_with(Some("running"), &whole, None, Some(&unplaced)),
+                "redteam"
+            ),
+            NodeState::Done
+        );
+
+        // A run that RAN TO COMPLETION and left a member's row and no aggregate did finish that
+        // box: a workflow may call a member stage directly, whose generic host checkpoints under
+        // the stage id, and every operation host writes its aggregate before returning — so on a
+        // run that completed, a missing aggregate means no host ran, not that one died.
+        for status in [
+            "converged",
+            "planned",
+            "max_iterations_reached",
+            "unreviewed",
+        ] {
+            assert_eq!(
+                state_of(
+                    &derive_with(Some(status), &midway, None, Some(&unplaced)),
+                    "redteam"
+                ),
+                NodeState::Done,
+                "a `{status}` run reached the member's completion with nothing left to write"
+            );
+        }
+
+        // A run that STOPPED did not. Both leave the same rows — a member's, no aggregate — and
+        // only the run's own outcome separates them, so nothing is claimed for the ones that died.
+        for status in ["failed", "abandoned"] {
+            assert_eq!(
+                state_of(
+                    &derive_with(Some(status), &midway, None, Some(&unplaced)),
+                    "redteam"
+                ),
+                NodeState::Idle,
+                "a `{status}` run cannot say whether the box completed before it stopped"
+            );
+        }
+    }
+
+    #[test]
+    fn a_large_recording_is_derived_in_work_proportional_to_its_size() {
+        // `Store::import` writes `shape_json` and a run's checkpoints verbatim, so both are the run
+        // author's documents and both can be large. Every question this file asks — a box's members,
+        // a record's box, the rows under a name — used to be a scan of one of them, asked once per
+        // node and once per record, which is quadratic work an imported recording can dictate. The
+        // position bound in `shape::recorded` caps the indices in such a document; it says nothing
+        // about how many rows it has.
+        //
+        // Sized from measurement rather than guessed, and asserted as a ceiling rather than a
+        // window, which is what keeps it off the flaky list. At this size a debug build derives
+        // this in about 0.2s indexed and about 370s scanning, so the bound below sits ~25x above
+        // the first and ~74x below the second: neither a slow machine nor a loaded one moves the
+        // answer. Re-derive if it ever looks tight — the scan curve is 4x per doubling of N and the
+        // index curve is 2x, so the gap only widens.
+        const N: usize = 30_000;
+        let recorded = ratatoskr_core::shape::Recorded {
+            nodes: (0..N)
+                .map(|i| ratatoskr_core::shape::ShapeNode {
+                    name: format!("n{i}"),
+                    stage: i,
+                    lane: 0,
+                    optional: false,
+                })
+                .collect(),
+            stages: (0..N)
+                .map(|i| ratatoskr_core::shape::RunStage {
+                    id: format!("s{i}"),
+                    node: format!("n{i}"),
+                    governed_by: None,
+                    session: None,
+                })
+                .collect(),
+        };
+        let shape = serde_json::to_string(&recorded).unwrap();
+        let checkpoints: Vec<Checkpoint> = (0..N).map(|i| cp(&format!("s{i}"), "t")).collect();
+
+        let started = std::time::Instant::now();
+        let views = derive_with(Some("converged"), &checkpoints, None, Some(&shape));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "deriving {N} nodes over {N} records took {elapsed:?}, which is scan-shaped work"
+        );
+
+        // And it is derived correctly at that size, so an index that dropped or reordered entries
+        // is caught here too rather than only being fast.
+        assert_eq!(views.len(), N);
+        let registry = recorded.index();
+        assert_eq!(registry.members("n7"), ["s7"]);
+        assert_eq!(registry.node_of("s7"), "n7");
+        assert_eq!(recorded.stages.len(), N);
+    }
+
+    #[test]
+    fn a_box_of_many_stages_is_derived_in_work_proportional_to_its_members() {
+        // A DIFFERENT exposure from the wide registry above, and the one that case cannot reach: it
+        // gives every box one stage and supplies no config, so `PlannedNode::of` returns before its
+        // loop runs. A box's own metadata — every distinct route it will run on, and every distinct
+        // session scope — is collected per member, and testing membership by rescanning what has
+        // been collected so far is quadratic in the member count.
+        //
+        // A workflow may compose a box out of as many stages as it likes, and a recording may be
+        // imported. A wide REGISTRY and a wide BOX are different exposures and both are cheap, so
+        // both cases are kept.
+        //
+        // Sized from measurement and asserted as a ceiling, like its sibling: at this size a debug
+        // build plans this in about 0.24s deduplicating with a set and about 14.5s rescanning, so
+        // the bound sits ~8x above the first and ~7x below the second. Re-derive if it looks tight
+        // — the rescan curve is 4x per doubling of N and the set curve is 2x, so the gap widens.
+        const N: usize = 50_000;
+        let recorded = ratatoskr_core::shape::Recorded {
+            nodes: vec![ratatoskr_core::shape::ShapeNode {
+                name: "wide".to_string(),
+                stage: 0,
+                lane: 0,
+                optional: false,
+            }],
+            stages: (0..N)
+                .map(|i| ratatoskr_core::shape::RunStage {
+                    id: format!("s{i}"),
+                    node: "wide".to_string(),
+                    // Each member governs as itself, so each resolves its own route and none of
+                    // them dedupes away — the worst case, and the one a composed box can reach.
+                    governed_by: None,
+                    session: None,
+                })
+                .collect(),
+        };
+        let shape = serde_json::to_string(&recorded).unwrap();
+        let mut config = ratatoskr_core::RatatoskrConfig::default();
+        for i in 0..N {
+            let mut route = routed("x").models.remove("x").expect("a route");
+            route.model = format!("model-{i}");
+            config.models.insert(format!("s{i}"), route);
+        }
+
+        let started = std::time::Instant::now();
+        let views = derive_with(
+            Some("converged"),
+            &[cp("wide", "t")],
+            Some(&config),
+            Some(&shape),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "planning a box of {N} stages took {elapsed:?}, which is rescan-shaped work"
+        );
+
+        // And it still says what it is for: every distinct route, in registry order.
+        let planned = view(&views, "wide")
+            .planned
+            .as_ref()
+            .expect("every member is routed");
+        assert_eq!(planned.model.split(", ").count(), N);
+        assert!(
+            planned
+                .model
+                .starts_with("anthropic/model-0, anthropic/model-1, ")
+        );
+        assert_eq!(planned.sessions, [ratatoskr_core::SessionScope::Reuse]);
     }
 
     #[test]
@@ -927,9 +1422,14 @@ mod tests {
             .find(|v| v.name == "redteam")
             .and_then(|v| v.planned.as_ref())
             .expect("a routed node says what it will run on");
+        // Under `redteam`, though neither stage doing the work is called that: both halves govern
+        // as the box, which is what a `[models.redteam]` entry routes.
         assert_eq!(planned.model, "anthropic/claude-sonnet-5");
-        assert!(planned.reuses_session);
-        assert_eq!(planned.session, ratatoskr_core::SessionScope::Reuse);
+        assert_eq!(
+            planned.sessions,
+            [ratatoskr_core::SessionScope::Reuse],
+            "one route and no declaration, so the box's one scope is that route's"
+        );
         assert!(planned.thinking, "nothing disabled it");
 
         // A node with no route never runs, and claims nothing.
@@ -940,6 +1440,188 @@ mod tests {
                 .unwrap()
                 .planned
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_node_plans_on_the_route_its_stages_govern_under_not_the_one_its_name_would_read() {
+        // A stage is drawn under its own id and routed under its governance identity, and the two
+        // are independent. Reading the config under the box's name reports nothing for a stage that
+        // governs as something else, on a node execution routes perfectly well.
+        let recorded = ratatoskr_core::shape::Recorded {
+            nodes: vec![ratatoskr_core::shape::ShapeNode {
+                name: "strategist".to_string(),
+                stage: 0,
+                lane: 0,
+                optional: false,
+            }],
+            stages: vec![ratatoskr_core::shape::RunStage {
+                id: "strategist".to_string(),
+                node: "strategist".to_string(),
+                governed_by: Some("analyst".to_string()),
+                session: None,
+            }],
+        };
+        let views = derive_with(
+            None,
+            &[],
+            Some(&routed("analyst")),
+            Some(&serde_json::to_string(&recorded).unwrap()),
+        );
+        assert_eq!(
+            view(&views, "strategist")
+                .planned
+                .as_ref()
+                .map(|planned| planned.model.as_str()),
+            Some("anthropic/claude-sonnet-5"),
+            "the box runs `models.analyst`, because that is what its stage governs as"
+        );
+    }
+
+    #[test]
+    fn a_stage_that_declared_its_own_session_plans_on_that_and_not_on_its_routes() {
+        // Execution applies `Stage::session_scope`: a stage's own declaration wins over the route's,
+        // and an absent one preserves the route. Reading `route.session` alone reports the box on a
+        // scope its stages will not run, and — because it is one route — reports it confidently.
+        let recorded = ratatoskr_core::shape::Recorded {
+            nodes: vec![ratatoskr_core::shape::ShapeNode {
+                name: "redteam".to_string(),
+                stage: 0,
+                lane: 0,
+                optional: false,
+            }],
+            stages: vec![
+                // Both halves reach one `[models.redteam]`, and one of them declares `fresh`.
+                ratatoskr_core::shape::RunStage {
+                    id: "redteam_classifier".to_string(),
+                    node: "redteam".to_string(),
+                    governed_by: Some("redteam".to_string()),
+                    session: None,
+                },
+                ratatoskr_core::shape::RunStage {
+                    id: "redteam_author".to_string(),
+                    node: "redteam".to_string(),
+                    governed_by: Some("redteam".to_string()),
+                    session: Some(ratatoskr_core::SessionScope::Compacted),
+                },
+            ],
+        };
+        let views = derive_with(
+            None,
+            &[],
+            Some(&routed("redteam")),
+            Some(&serde_json::to_string(&recorded).unwrap()),
+        );
+        let planned = view(&views, "redteam")
+            .planned
+            .as_ref()
+            .expect("one route serves both halves");
+        // One route, so one model — the disagreement is in what the stages declared, not in where
+        // they run.
+        assert_eq!(planned.model, "anthropic/claude-sonnet-5");
+        // Both scopes, not neither. A route is one field and two values of it collapse to nothing
+        // sayable; a session scope is not that question — compacted is a property a MEMBER has, and
+        // a box with a compacted member has it whatever its siblings do. Collapsing left the client
+        // reading `reuses_session`, which a compacted re-entry also sets, so the box drew the
+        // endpoint-reuse mark for a half that never reuses an endpoint.
+        assert_eq!(
+            planned.sessions,
+            [
+                ratatoskr_core::SessionScope::Reuse,
+                ratatoskr_core::SessionScope::Compacted
+            ],
+            "each half's own scope, in registry order"
+        );
+
+        // And a lone stage's declaration is the box's, rather than being overwritten by the route.
+        let fresh = ratatoskr_core::shape::Recorded {
+            stages: vec![ratatoskr_core::shape::RunStage {
+                id: "redteam_classifier".to_string(),
+                node: "redteam".to_string(),
+                governed_by: Some("redteam".to_string()),
+                session: Some(ratatoskr_core::SessionScope::Fresh),
+            }],
+            ..recorded
+        };
+        let views = derive_with(
+            None,
+            &[],
+            Some(&routed("redteam")),
+            Some(&serde_json::to_string(&fresh).unwrap()),
+        );
+        let planned = view(&views, "redteam").planned.as_ref().unwrap();
+        assert_eq!(
+            planned.sessions,
+            [ratatoskr_core::SessionScope::Fresh],
+            "it declared itself out of the route's reuse"
+        );
+    }
+
+    #[test]
+    fn a_box_whose_stages_route_differently_names_every_route_it_would_run_on() {
+        // A composed node's halves resolve through their own profiles, so they genuinely can differ
+        // (#277). Naming one of them reports a route the box does not entirely have and naming none
+        // reads as "this node has nowhere to run" — the same reason folded telemetry names every
+        // model it covers.
+        let mut config = routed("redteam_classifier");
+        config.models.insert(
+            "redteam_author".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "anthropic".into(),
+                model: "claude-haiku-5".into(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: Some(toml::Value::Table(
+                    "thinking = { type = \"disabled\" }"
+                        .parse::<toml::Table>()
+                        .unwrap(),
+                )),
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        // Both halves governing as themselves, which is what a workflow gets by declaring `node`
+        // without `governedBy` — the split #277 established can carry two routes.
+        let recorded = ratatoskr_core::shape::Recorded {
+            nodes: vec![ratatoskr_core::shape::ShapeNode {
+                name: "redteam".to_string(),
+                stage: 0,
+                lane: 0,
+                optional: false,
+            }],
+            stages: ["redteam_classifier", "redteam_author"]
+                .map(|id| ratatoskr_core::shape::RunStage {
+                    id: id.to_string(),
+                    node: "redteam".to_string(),
+                    governed_by: None,
+                    session: None,
+                })
+                .to_vec(),
+        };
+        let views = derive_with(
+            None,
+            &[],
+            Some(&config),
+            Some(&serde_json::to_string(&recorded).unwrap()),
+        );
+        let planned = view(&views, "redteam")
+            .planned
+            .as_ref()
+            .expect("both halves are routed");
+        assert_eq!(
+            planned.model,
+            "anthropic/claude-sonnet-5, anthropic/claude-haiku-5"
+        );
+        // The two facts a reader needs stay answerable across the disagreement: one half reasons,
+        // one half carries its context. The session scope does not, so it is absent rather than
+        // asserted, and a reader falls back to `reuses_session`.
+        assert!(planned.thinking);
+        assert_eq!(
+            planned.sessions,
+            [
+                ratatoskr_core::SessionScope::Reuse,
+                ratatoskr_core::SessionScope::Fresh
+            ]
         );
     }
 
@@ -1086,7 +1768,18 @@ mod tests {
                 in_flight.contains(&s),
                 "`{s}` is either terminal or in flight — classify it in one and only one"
             );
+            // Completing is a strictly narrower thing than stopping, and a status that claimed to
+            // have run to completion while still in flight would report finished boxes mid-run.
+            assert!(
+                !ran_to_completion(Some(s)) || is_terminal(Some(s)),
+                "`{s}` claims to have run to completion without being terminal"
+            );
         }
+        // A status this build cannot parse is neither, so nothing is claimed finished on the
+        // strength of a name nobody here classified.
+        assert!(!is_terminal(Some("from_a_newer_build")));
+        assert!(!ran_to_completion(Some("from_a_newer_build")));
+        assert!(!ran_to_completion(None));
     }
 
     #[test]
@@ -1131,20 +1824,27 @@ mod tests {
         }
         assert!(views.iter().all(|view| view.shaped), "{views:?}");
         assert_eq!(
-            view(&views, "redteam").stages,
+            membership(&standard_shape(), "redteam"),
             ["redteam_classifier", "redteam_author"]
         );
         // A node that is one stage says so the same way, so a reader never special-cases.
-        assert_eq!(view(&views, "analyst").stages, ["analyst"]);
+        assert_eq!(membership(&standard_shape(), "analyst"), ["analyst"]);
     }
 
     #[test]
-    fn a_shape_recorded_before_membership_makes_every_node_its_own_stage() {
-        // An imported run, or one from before boxes carried their stages. Nothing is inferred: the
-        // node is exactly its own name, which is what every node of such a run was.
-        let bare = r#"[{"name":"analyst","stage":0,"lane":0,"optional":false}]"#;
-        let views = derive_with(Some("converged"), &[cp("analyst", "t")], None, Some(bare));
-        assert_eq!(view(&views, "analyst").stages, ["analyst"]);
+    fn a_recording_this_build_cannot_read_places_nothing_and_infers_nothing() {
+        // Not a fallback: there is one recorded format and anything else is unreadable. The run is
+        // then drawn from its own records, as any unplaced run is, and every node is exactly its
+        // own name — which is all a reader with no registry can say.
+        let views = derive_with(
+            Some("converged"),
+            &[cp("analyst", "t")],
+            None,
+            Some(r#"[{"name":"analyst","stage":0,"lane":0,"optional":false}]"#),
+        );
+        assert_eq!(view(&views, "analyst").state, NodeState::Done);
+        assert!(!view(&views, "analyst").shaped, "nothing placed it");
+        assert_eq!(membership("[]", "analyst"), ["analyst"]);
     }
 
     #[test]

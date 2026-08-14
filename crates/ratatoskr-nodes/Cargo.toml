@@ -24,5 +24,11 @@ schemars.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+# So one case can read a run of a real workflow back the way the dashboard does. Which stages
+# compose a node is name-matched across this boundary, and a test on either side of it alone passes
+# its own fixture names in.
+ratatoskr-serve.workspace = true
+
 [lints]
 workspace = true

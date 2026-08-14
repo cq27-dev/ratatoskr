@@ -1,4 +1,12 @@
-import type { LiveEvent, NodeState, NodeTelemetry, NodeView, RunStatus } from "./api";
+import type {
+  LiveEvent,
+  NodeFacts,
+  NodeState,
+  NodeTelemetry,
+  NodeView,
+  RunStage,
+  RunStatus,
+} from "./api";
 
 /**
  * A run's node state, rebuilt from its event stream.
@@ -42,40 +50,107 @@ const WORKING = new Set([
 ]);
 
 /**
+ * A stream event read as the box it is drawn in.
+ *
+ * `node` is the box; `member` is the stage that actually announced it, which for an ordinary
+ * one-stage node is the same name. The distinction is the point: renaming a member's event to its
+ * box and stopping there tells every fold below that the box did what the member did, and a fold
+ * that then treats each node as one stage marks a box finished on a member's checkpoint, counts a
+ * member's row as the box's, and lets the last member's model overwrite its sibling's.
+ *
+ * Branded, and `inNodeBoxes` is the only thing that can make one. That is what makes a fold's
+ * requirement checkable: `nodesFromEvents(rawEvents)` does not compile, and the seven rounds of
+ * defects this file has had were all a consumer reading a list nobody had boxed.
+ */
+declare const boxed: unique symbol;
+export type BoxedEvent = LiveEvent & {
+  /** The stage that announced this. Equal to `node` unless a box was folded around it. */
+  readonly member: string | null;
+  readonly [boxed]: true;
+};
+
+/**
  * Fold `events` into per-node state as of the last event given.
  *
  * Pass a prefix of the stream to see where the run was at that point — that is the whole mechanism
  * behind scrubbing, and why it needs no separate replay engine.
+ *
+ * A box's members are folded the way the server folds them, and the two must keep answering the
+ * same question the same way — a run's numbers should not change when its log rotates away:
+ *
+ * - **cost** is the latest record of each member, folded arithmetically. Not the latest record
+ *   overall: a box's own aggregate carries no turn and reports zeros, so overwriting with it wipes
+ *   what its members spent, and with two members the last one to finish would speak for both.
+ * - **completion** is the box's own record AND no member left working. A member's checkpoint alone
+ *   proves the box STARTED — the classifier finishes while the author is still writing tests —
+ *   which is `checkpointed_state`'s rule on the other side. The second half is what an aggregate
+ *   cannot tell you: a box may BE a stage with peers composed into it (`ratatoskr-nodes`'s
+ *   `validate.rs` accepts "a stage of its own called `{node}`" as a membership target), and that
+ *   stage's ordinary checkpoint is the box's own record and one member's at once. Deciding on the
+ *   record alone finishes such a box on whichever host returns first and drops the control aimed at
+ *   its peer. An operation host writes its aggregate only after its stages return, so for a box
+ *   that has one the two halves land together and nothing changes.
+ * - **working** is a COUNT of live invocations, not a flag. A workflow may invoke one stage several
+ *   times at once — `Promise.all([probe(a), probe(b)])` — and both invocations record under that
+ *   stage's one name, so a flag is cleared by whichever finishes first and the box drops the Stop
+ *   aimed at the other. Each `node_start` counts one more invocation live and each checkpoint one
+ *   fewer; the member is working while the count is above zero. This says nothing about WHICH
+ *   invocation a record belongs to — everything per-invocation (its cost, its cycles, its tools)
+ *   is still one state per member, and #285 is where that is resolved.
+ * - **the count** is the box's own rows, so a converge iteration is one, not one per member.
  */
-export function nodesFromEvents(events: readonly LiveEvent[]): Map<string, DerivedNode> {
-  const out = new Map<string, DerivedNode>();
-  const at = (name: string): DerivedNode => {
-    const found = out.get(name);
+export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, DerivedNode> {
+  /** One member's latest turn, kept apart so the box can be the fold of them rather than the last. */
+  interface Member {
+    /** Where this member's OWN records leave it. The box is the fold of these, never the last one. */
+    state: NodeState;
+    /**
+     * Invocations of this member that have started and not yet checkpointed.
+     *
+     * Arithmetic, because one stage may be invoked more than once at a time and every invocation
+     * records under the same name: a checkpoint ends AN invocation, not the member. Only zero here
+     * means the member has stopped.
+     */
+    live: number;
+    telemetry?: NodeTelemetry;
+    cycles: number;
+    used: Set<string>;
+    costed: boolean;
+  }
+  const boxes = new Map<string, { checkpoints: number; members: Map<string, Member> }>();
+  const at = (name: string) => {
+    const found = boxes.get(name);
     if (found) return found;
-    const made: DerivedNode = {
-      state: "idle",
-      checkpoints: 0,
-      cycles: 0,
-      used: new Set(),
-      costed: false,
-    };
-    out.set(name, made);
+    const made = { checkpoints: 0, members: new Map<string, Member>() };
+    boxes.set(name, made);
+    return made;
+  };
+  const memberOf = (box: { members: Map<string, Member> }, name: string): Member => {
+    const found = box.members.get(name);
+    if (found) return found;
+    const made: Member = { state: "idle", live: 0, cycles: 0, used: new Set(), costed: false };
+    box.members.set(name, made);
     return made;
   };
 
   for (const e of events) {
     if (!e.node) continue;
-    const node = at(e.node);
+    const box = at(e.node);
+    const name = e.member ?? e.node;
+    const own = name === e.node;
+    const member = memberOf(box, name);
 
     if (e.kind === "node_start") {
-      // A fresh attempt. Counts start again, but the checkpoints already recorded stand: the
-      // implementer is re-driven per converge iteration and each attempt is its own row.
-      node.state = "working";
-      node.cycles = 0;
-      node.used = new Set();
+      // A fresh attempt of THIS member. Its counts start again and its siblings' stand, which is
+      // what keeps a box that ran two halves from reporting only the second. The checkpoints
+      // already recorded stand too: the implementer is re-driven per converge iteration.
+      member.live += 1;
+      member.state = "working";
+      member.cycles = 0;
+      member.used = new Set();
       if (e.facts) {
-        node.telemetry = {
-          ...(node.telemetry ?? blank()),
+        member.telemetry = {
+          ...(member.telemetry ?? blank()),
           model: e.facts.model,
           tools: e.facts.tools,
           thinking: e.facts.thinking,
@@ -86,13 +161,24 @@ export function nodesFromEvents(events: readonly LiveEvent[]): Map<string, Deriv
     }
 
     if (e.kind === "checkpoint") {
-      node.checkpoints += 1;
-      // An error is the only thing that tells a failed node from a finished one: both write a
-      // checkpoint, and the fact of one proves only that the node stopped.
-      node.state = e.error ? "failed" : "done";
-      node.telemetry = {
-        ...(node.telemetry ?? blank()),
-        first_at: node.telemetry?.first_at ?? e.at,
+      // This record ends the MEMBER's turn, whoever it belongs to. What it means for the BOX is
+      // decided below, from every member at once — a member finishing is never on its own the box
+      // finished, and for a box that is itself a stage its own record is one member's too.
+      //
+      // An error is the only thing that tells a failed member from a finished one: both write a
+      // checkpoint, and the fact of one proves only that the member stopped. Only the box's own
+      // record can fail the box, as before.
+      //
+      // One invocation ended, not necessarily the member: a stage invoked twice at once writes two
+      // checkpoints and is live until the second. Floored at zero because a stream is not
+      // guaranteed balanced — an ingested log may begin mid-run, and a checkpoint whose start this
+      // view never saw must not push the count negative and make the member unstoppable.
+      member.live = Math.max(0, member.live - 1);
+      member.state = own && e.error ? "failed" : "done";
+      if (own) box.checkpoints += 1;
+      member.telemetry = {
+        ...(member.telemetry ?? blank()),
+        first_at: member.telemetry?.first_at ?? e.at,
         last_at: e.at,
         ...(e.facts
           ? {
@@ -112,17 +198,25 @@ export function nodesFromEvents(events: readonly LiveEvent[]): Map<string, Deriv
               duration_ms: e.usage.duration_ms,
             }
           : {}),
-        turns: e.turns ?? node.telemetry?.turns ?? null,
-        tools_used: [...node.used],
+        turns: e.turns ?? member.telemetry?.turns ?? null,
+        tools_used: [...member.used],
       };
-      if (e.usage) node.costed = true;
+      // A checkpoint always carries usage keys, and a box's own aggregate carries them as zeros
+      // because it covers no turn — so here, and ONLY here, the record has to say a turn happened
+      // before it counts as one. #284 stops the producer writing those keys at all for a turn-less
+      // checkpoint, and retires this guard with it: presence becomes the signal.
+      if (ranAModel(e)) member.costed = true;
       continue;
     }
 
     if (e.kind === "usage" && e.usage) {
-      node.costed = true;
-      node.telemetry = {
-        ...(node.telemetry ?? blank()),
+      // Unconditional, unlike the checkpoint above. A `usage` event is the endpoint's own report of
+      // a turn: its presence is the authority and a zero is a measurement, not an absence. Doubting
+      // it leaves the member uncosted, and `fromStream` then keeps the server's telemetry — the
+      // run's FINAL state — so scrubbing back to an earlier attempt shows a later one's numbers.
+      member.costed = true;
+      member.telemetry = {
+        ...(member.telemetry ?? blank()),
         input_tokens: e.usage.input_tokens,
         output_tokens: e.usage.output_tokens,
         cached_input_tokens: e.usage.cached_input_tokens,
@@ -134,14 +228,108 @@ export function nodesFromEvents(events: readonly LiveEvent[]): Map<string, Deriv
     }
 
     if (e.kind === "tool_call") {
-      node.cycles += 1;
+      member.cycles += 1;
       // `detail` carries the tool name for this kind.
-      if (e.detail) node.used.add(e.detail);
+      if (e.detail) member.used.add(e.detail);
     }
-    if (WORKING.has(e.kind) && node.state !== "working") node.state = "working";
+    if (WORKING.has(e.kind)) member.state = "working";
   }
 
+  const out = new Map<string, DerivedNode>();
+  for (const [name, box] of boxes) {
+    const members = [...box.members.values()];
+    // The box, from all of its members and its own rows. A member still working outranks
+    // everything, including a failure: that is the live half a Stop has to keep reaching, and it is
+    // what the box did on the way to the record it already has. Below that, the box's own record
+    // settles it — failed if it carried an error, done otherwise — and a member's record with no
+    // record of the box's own says only that the box started.
+    //
+    // A member is working while any invocation of it is live, which is what keeps a box whose
+    // aggregate already landed from reading finished when a member has been re-entered: the count
+    // is above zero again, and clause 1 outranks the checkpoints. `state` still carries the working
+    // case for a stream whose only evidence is a tool call or model text — one that reports no
+    // `node_start` has no invocation to count.
+    const working = (m: Member) => m.live > 0 || m.state === "working";
+    const state: NodeState = members.some(working)
+      ? "working"
+      : box.members.get(name)?.state === "failed"
+        ? "failed"
+        : box.checkpoints > 0
+          ? "done"
+          : members.some((m) => m.state !== "idle")
+            ? "working"
+            : "idle";
+    const folded = members
+      .map((m) => m.telemetry)
+      .filter((t): t is NodeTelemetry => !!t)
+      .reduce<NodeTelemetry | undefined>(
+        (into, next) => (into ? fold(into, next) : next),
+        undefined,
+      );
+    out.set(name, {
+      state,
+      checkpoints: box.checkpoints,
+      ...(folded ? { telemetry: folded } : {}),
+      cycles: members.reduce((n, m) => n + m.cycles, 0),
+      used: new Set(members.flatMap((m) => [...m.used])),
+      costed: members.some((m) => m.costed),
+    });
+  }
   return out;
+}
+
+/**
+ * Whether a checkpoint says a model turn happened at all.
+ *
+ * The turn's own evidence, never its cost. An endpoint may make a real call and report no token
+ * accounting — a checkpoint then carries a model, a `turns` count and a duration with every counter
+ * at zero — so "did it spend" answers no for work that happened. Counters are the wrong basis
+ * twice over: `reasoning_tokens` is hardcoded to zero by the provider and `output_tokens` is
+ * under-reported.
+ *
+ * The record already draws this line and the server already applies it: `LiveNodeFacts::of` omits
+ * `facts` from a checkpoint whose node ran no model, so their presence IS the turn. A box's own
+ * aggregate has no model, no turns and no duration, and stays uncosted — which is the whole reason
+ * this is asked.
+ *
+ * Only the checkpoint branch may ask. A `usage` event is the endpoint's own report and its presence
+ * is the authority; guarding that one is what broke scrub honesty last time.
+ */
+function ranAModel(e: BoxedEvent): boolean {
+  return !!e.facts || e.turns != null;
+}
+
+/**
+ * Fold one member's turn into another, as `NodeTelemetry::fold` does on the server.
+ *
+ * The same arithmetic on both sides, deliberately: figures add, a figure nobody reported stays
+ * unreported, models are named distinctly rather than one overwriting the other, and tool lists are
+ * the union. A box that ran two profiles names both — true of the box, while each member's own row
+ * stays true of its turn.
+ */
+function fold(into: NodeTelemetry, next: NodeTelemetry): NodeTelemetry {
+  const distinct = (a: string[], b: string[]) => [...new Set([...a, ...b])];
+  const names = (a: string | null, b: string | null) =>
+    a && b ? distinct(a.split(", "), b.split(", ")).join(", ") : (a ?? b);
+  const sum = (a: number | null, b: number | null) => (a === null && b === null ? null : (a ?? 0) + (b ?? 0));
+  const earliest = (a: string | null, b: string | null) => (a && b ? (a < b ? a : b) : (a ?? b));
+  const latest = (a: string | null, b: string | null) => (a && b ? (a > b ? a : b) : (a ?? b));
+  return {
+    model: names(into.model, next.model),
+    turns: sum(into.turns, next.turns),
+    input_tokens: into.input_tokens + next.input_tokens,
+    output_tokens: into.output_tokens + next.output_tokens,
+    cached_input_tokens: into.cached_input_tokens + next.cached_input_tokens,
+    cache_creation_input_tokens: into.cache_creation_input_tokens + next.cache_creation_input_tokens,
+    reasoning_tokens: into.reasoning_tokens + next.reasoning_tokens,
+    thinking: into.thinking || next.thinking,
+    duration_ms: sum(into.duration_ms, next.duration_ms),
+    tools: distinct(into.tools, next.tools),
+    tools_used: distinct(into.tools_used, next.tools_used),
+    reuses_session: into.reuses_session || next.reuses_session,
+    first_at: earliest(into.first_at, next.first_at),
+    last_at: latest(into.last_at, next.last_at),
+  };
 }
 
 /**
@@ -184,7 +372,7 @@ export interface ConvergeLoops {
  * and the counts are the counts as of that point, which is what keeps the edges honest while
  * someone scrubs.
  */
-export function convergeLoops(events: readonly LiveEvent[]): ConvergeLoops {
+export function convergeLoops(events: readonly BoxedEvent[]): ConvergeLoops {
   const out: ConvergeLoops = { fix: 0, replan: 0, retry: 0 };
   let entered = false;
   let since = new Set<string>();
@@ -256,41 +444,141 @@ export function handoffDrawn(source: NodeView, target: NodeView): boolean {
 /**
  * The stages whose records are `name`'s work — what to look for when the box is asked about.
  *
- * A box the server describes says so itself. One it does not — a name typed into the address bar,
- * or a run whose shape predates membership — is exactly itself, which is what it was.
+ * Its members and its own name, from the run's recorded REGISTRY and never from its `nodes`. A box is a box whether or not anything
+ * has checkpointed under it, and `nodes` only knows the ones that have; reading membership from
+ * there empties it for exactly the box currently executing, which is the one being looked at.
+ *
+ * A name the registry does not carry — one typed into the address bar, or a run recorded before the
+ * registry travelled with it — is exactly itself, which is what it was.
  */
-export function stagesOf(nodes: readonly NodeView[], name: string): string[] {
-  const found = nodes.find((n) => n.name === name);
-  return found?.stages?.length ? found.stages : [name];
+export function stagesOf(stages: readonly RunStage[], name: string): string[] {
+  const members = stages.filter((s) => s.node === name).map((s) => s.id);
+  if (!members.length) return [name];
+  // The box's own name as well as its members'. `redteam`, `implementer` and `context` are not
+  // stage ids, so a members-only answer drops everything logged under the box itself — its
+  // operation host's aggregate, and the acceptance suite, which is nearly all of the red team's
+  // visible work. Selecting a box then hides most of what it did.
+  return members.includes(name) ? members : [...members, name];
 }
 
 /**
  * Rename each event to the box it is drawn in.
  *
- * A stage keeps its own identity now, so a `node_start` from the red team says `redteam_author`
- * while the graph draws one `redteam` box. Everything that folds the stream into node state — the
- * boxes, the converge-loop edges, what a control can be aimed at — is about the box, and would
- * otherwise see a name it has never heard of and invent a node for it.
+ * A stage keeps its own identity, so a `node_start` from the red team says `redteam_author` while
+ * the graph draws one `redteam` box. Everything that folds the stream into node state — the boxes,
+ * the converge-loop edges, what a control can be aimed at — is about the box, and would otherwise
+ * see a name it has never heard of and invent a node for it.
+ *
+ * FROM THE REGISTRY, NOT FROM `nodes`. The mapping has to hold before anything has checkpointed:
+ * `node_start` for `context_distillation` with no checkpoint yet is the live window an operator
+ * reaches for Stop in, and the server has not placed the `context` box then — so a mapping built
+ * from `nodes` is empty at exactly that moment, the half draws as its own box, and the Stop it
+ * offers goes to a name the runtime never polls. It is dead until a checkpoint makes the real box
+ * appear, which is after the operator needed it.
  *
  * The events themselves are left alone: the feed shows which half actually ran, which is the whole
- * point of the split. Only this reading of them is renamed, and only where a box says a stage is
- * its work.
+ * point of the split. Only this reading of them is renamed.
  */
 export function inNodeBoxes(
   events: readonly LiveEvent[],
-  nodes: readonly NodeView[],
-): readonly LiveEvent[] {
+  stages: readonly RunStage[],
+): readonly BoxedEvent[] {
   const box = new Map<string, string>();
-  for (const node of nodes) {
-    for (const stage of node.stages ?? []) {
-      if (stage !== node.name) box.set(stage, node.name);
+  for (const stage of stages) {
+    if (stage.id !== stage.node) box.set(stage.id, stage.node);
+  }
+  // The one place a `BoxedEvent` is made. `member` keeps what `node` used to say, because a fold
+  // that cannot tell a member's record from its box's answers the box for the member.
+  return events.map(
+    (e) => ({ ...e, node: (e.node && box.get(e.node)) ?? e.node, member: e.node }) as BoxedEvent,
+  );
+}
+
+/**
+ * What each node announced when it started, plus the tools it has reached for since.
+ *
+ * A checkpoint carries the same facts and carries them better, but only once the node has stopped.
+ * This is what fills a box while it works, and it is the only source there is for the whole of that
+ * window.
+ *
+ * Feed it the stream READ AS BOXES, exactly as `nodesFromEvents` is fed. A member announces itself
+ * under its own id, so a map built from the raw stream is keyed by `context_distillation` while the
+ * graph asks it for `context` — and the box then draws with no model, no tools and no cycle count
+ * for as long as the member is the one running.
+ *
+ * PER MEMBER, folded into the box, for the reason `nodesFromEvents` keeps its members apart: a
+ * workflow may have two stages of one box in flight at once, both announce under the box, and a
+ * single entry per box would have the later start throw away the cycles, tools and model of the
+ * member already working. Before any checkpoint this map is all the box has to draw with, so that
+ * activity does not move — it vanishes.
+ *
+ * A `node_start` is a fresh attempt of THAT member and restarts only its own counts. Which
+ * INVOCATION of a member the numbers belong to is not answered here — a stage invoked twice at once
+ * still folds into one state per member, and #285 is where that is resolved.
+ */
+export function liveNodes(events: readonly BoxedEvent[]): Map<string, LiveNode> {
+  const boxes = new Map<string, Map<string, LiveNode>>();
+  for (const e of events) {
+    if (!e.node) continue;
+    let members = boxes.get(e.node);
+    if (!members) boxes.set(e.node, (members = new Map()));
+    const name = e.member ?? e.node;
+    let at = members.get(name);
+    if (!at) members.set(name, (at = { cycles: 0, used: new Set() }));
+    if (e.kind === "node_start") {
+      // Every `node_start`, not only one carrying facts — `facts` is optional, and restarting on
+      // its presence made a re-entry that announced nothing accumulate onto the previous attempt.
+      // What it announced survives the restart: the model is a fact about the member, not about
+      // the attempt, and a later start that says nothing has not changed it.
+      at.cycles = 0;
+      at.used = new Set();
+      if (e.facts) at.facts = e.facts;
+      continue;
+    }
+    if (e.kind === "tool_call") {
+      at.cycles += 1;
+      // `detail` is the tool name for this kind.
+      if (e.detail) at.used.add(e.detail);
     }
   }
-  if (box.size === 0) return events;
-  return events.map((e) => {
-    const drawn = e.node ? box.get(e.node) : undefined;
-    return drawn ? { ...e, node: drawn } : e;
-  });
+
+  const out = new Map<string, LiveNode>();
+  for (const [box, members] of boxes) {
+    const all = [...members.values()];
+    // The same arithmetic the checkpointed fold uses on telemetry: counts add, tools are the union,
+    // and two profiles are both named rather than one overwriting the other.
+    const facts = all
+      .map((m) => m.facts)
+      .filter((f): f is NodeFacts => !!f)
+      .reduce<NodeFacts | undefined>(
+        (into, next) =>
+          into
+            ? {
+                model: [...new Set([...into.model.split(", "), ...next.model.split(", ")])].join(
+                  ", ",
+                ),
+                tools: [...new Set([...into.tools, ...next.tools])],
+                thinking: into.thinking || next.thinking,
+                reuses_session: into.reuses_session || next.reuses_session,
+              }
+            : next,
+        undefined,
+      );
+    out.set(box, {
+      ...(facts ? { facts } : {}),
+      cycles: all.reduce((n, m) => n + m.cycles, 0),
+      used: new Set(all.flatMap((m) => [...m.used])),
+    });
+  }
+  return out;
+}
+
+/** What a node has said about itself so far, before it has checkpointed anything. */
+export interface LiveNode {
+  facts?: NodeFacts;
+  cycles: number;
+  /** Tools called so far in this attempt. */
+  used: Set<string>;
 }
 
 /**
@@ -303,7 +591,7 @@ export function inNodeBoxes(
  */
 export function workingNodeNames(
   nodes: readonly NodeView[],
-  events: readonly LiveEvent[],
+  events: readonly BoxedEvent[],
 ): string[] {
   const active = [...nodesFromEvents(events)]
     .filter(([, node]) => node.state === "working")
