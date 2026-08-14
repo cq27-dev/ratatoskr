@@ -1250,7 +1250,7 @@ impl ReviewChain {
                 || judged_plan(&checkpoints[end]).is_some_and(|judged| {
                     // Only a plan we can actually read as different. Unknown on either side is not
                     // evidence of a revision, the same way an unrecorded input is not.
-                    current_plan(checkpoints).is_some_and(|now| now != judged)
+                    current_plan(checkpoints).is_some_and(|now| !same_json(&now, &judged))
                 })
         };
         match last_review {
@@ -1277,7 +1277,10 @@ impl ReviewChain {
             // Only the passes that judged the plan now in force. One that judged an earlier plan
             // objects to requirements that may no longer exist.
             .filter(|checkpoint| {
-                judged_plan(checkpoint).is_none_or(|plan| Some(&plan) == judged.as_ref())
+                judged_plan(checkpoint).is_none_or(|plan| match judged.as_ref() {
+                    Some(anchor) => same_json(&plan, anchor),
+                    None => true,
+                })
             })
             .map(|checkpoint| serde_json::from_str(&checkpoint.output_json).ok())
             .collect();
@@ -1348,8 +1351,15 @@ fn is_implementer(checkpoint: &ratatoskr_store::Checkpoint) -> bool {
     checkpoint.node_name == "implementer"
 }
 
-/// The plan in force: the latest analyst output, as recorded.
-fn current_plan(checkpoints: &[ratatoskr_store::Checkpoint]) -> Option<serde_json::Value> {
+/// The plan in force: the latest analyst output, read as the type rather than as raw JSON.
+///
+/// Through [`AnalystOutput`] on both sides deliberately. The analyst is validated leniently — only
+/// `impact_summary` is required — so its checkpoint keeps whatever sparse object the model wrote,
+/// while `verify_host` records the same plan into `VerifierInput` after a round trip through the
+/// type, with every default present. Comparing those as raw JSON reported a plan change on a plan
+/// nobody had changed: an incomplete review lost its gap and its budget the moment it was written,
+/// and a blocking one was discarded as stale, which converged the run.
+fn current_plan(checkpoints: &[ratatoskr_store::Checkpoint]) -> Option<AnalystOutput> {
     checkpoints
         .iter()
         .rev()
@@ -1359,12 +1369,11 @@ fn current_plan(checkpoints: &[ratatoskr_store::Checkpoint]) -> Option<serde_jso
 
 /// The plan a review recorded that it was judging, or `None` when it did not record one — a fixture
 /// rather than a run, and not evidence that the plan differs.
-fn judged_plan(checkpoint: &ratatoskr_store::Checkpoint) -> Option<serde_json::Value> {
+fn judged_plan(checkpoint: &ratatoskr_store::Checkpoint) -> Option<AnalystOutput> {
     let input = checkpoint.input_json.as_deref()?;
-    serde_json::from_str::<serde_json::Value>(input)
-        .ok()?
-        .get("analyst")
-        .cloned()
+    serde_json::from_str::<verifier::VerifierInput>(input)
+        .ok()
+        .map(|input| input.analyst)
 }
 
 /// This change's review, folded. `None` when it has none, which is not a clean one.
@@ -12389,6 +12398,53 @@ mod tests {
         let fresh = ReviewChain::of(&edited);
         assert!(fresh.attempts.is_empty());
         assert!(fresh.may_continue(verifier::Severity::P2));
+    }
+
+    #[test]
+    fn a_sparse_plan_is_the_same_plan_once_it_has_been_read() {
+        // The analyst is validated leniently — `nodes.ts` requires only `impact_summary` — so its
+        // checkpoint keeps whatever sparse object the model wrote, while a review records the same
+        // plan after a round trip through the type, with every default present. Compared as raw
+        // JSON those differ, so a review looked superseded the instant it was written: an
+        // incomplete pass lost its gap and its budget, and a blocking pass was discarded as stale,
+        // which converged the run on a review it had thrown away.
+        let sparse = ratatoskr_store::Checkpoint {
+            node_name: "analyst".to_string(),
+            output_json: json!({ "impact_summary": "narrow the gate" }).to_string(),
+            ..review_checkpoint("analyst", &review_plan(), None::<&&str>)
+        };
+        let read_back: AnalystOutput =
+            serde_json::from_str(&sparse.output_json).expect("a sparse plan still reads");
+        let blocked = verifier::VerifierOutput {
+            findings: vec![finding(verifier::Severity::P1)],
+            assessment: String::new(),
+            unchecked: Vec::new(),
+        };
+        let checkpoints = vec![
+            sparse,
+            review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
+            review_checkpoint(
+                "verifier",
+                &blocked,
+                Some(&verifier::VerifierInput {
+                    issue: "x".to_string(),
+                    // What the host records: the plan, materialised.
+                    analyst: read_back,
+                    diff: "+change".to_string(),
+                    touched_files: Vec::new(),
+                    previous_findings: Vec::new(),
+                    unchecked: Vec::new(),
+                }),
+            ),
+        ];
+
+        let review = tree_review(&checkpoints)
+            .expect("the plan was not revised, so this review is of what the run proposes");
+        assert_eq!(
+            review.findings.len(),
+            1,
+            "a blocking review must not be discarded as judging a plan nobody changed"
+        );
     }
 
     #[test]
