@@ -1091,12 +1091,30 @@ async fn run_detail(
     }
 
     let status = run.as_ref().map(|r| r.status.clone());
-    // Best-effort: an unreadable or missing config costs the planned facts and nothing else, and a
-    // dashboard that refused to show a run because its config moved would be worse than one that
-    // shows the run without them.
-    let config = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|t| ratatoskr_core::RatatoskrConfig::from_toml_str(&t).ok());
+    // A run that happened here is drawn against the config as it stands. That is deliberate: a node
+    // that has not run yet should say what it WILL run on, and the live file is that answer even
+    // when it has drifted since the run started.
+    //
+    // A run that came from somewhere else has no such future here. Its nodes will never run on this
+    // machine's routes, so reading them made a foreign run claim models it never had — or report
+    // `planned: None`, "this node has nowhere to run", when the far machine routed it perfectly
+    // well. Its own recorded config is the only honest answer, and `origin` is what separates the
+    // two: `None` for a run produced here.
+    //
+    // Best-effort either way: an unreadable, missing or unparseable config costs the planned facts
+    // and nothing else, and a dashboard that refused to show a run because its config moved would
+    // be worse than one that shows the run without them. An imported run that recorded none falls
+    // through to the live file, which is no worse than the nothing it would otherwise have.
+    let config = run
+        .as_ref()
+        .filter(|run| run.origin.is_some())
+        .and_then(|run| run.config_json.as_deref())
+        .and_then(|recorded| serde_json::from_str::<ratatoskr_core::RatatoskrConfig>(recorded).ok())
+        .or_else(|| {
+            std::fs::read_to_string(&config_path)
+                .ok()
+                .and_then(|t| ratatoskr_core::RatatoskrConfig::from_toml_str(&t).ok())
+        });
     let shape_json = run.as_ref().and_then(|r| r.shape_json.as_deref());
     let recorded = ratatoskr_core::shape::recorded(shape_json);
     let nodes = pipeline::derive_from(status.as_deref(), &checkpoints, config.as_ref(), &recorded);
@@ -2338,6 +2356,90 @@ mod access_tests {
                 ratatoskr_core::Directive::Continue
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_imported_run_plans_against_the_config_it_recorded_not_the_readers() {
+        // Two runs identical but for `origin`. The reader's own `ratatoskr.toml` does not exist in
+        // this harness, so the live config contributes nothing — which is what makes the assertion
+        // sharp in both directions: the imported run's planned route can only have come from its
+        // own recording, and the local run's absence proves the recording was not read for it.
+        let state = state().await;
+        let store = &state.projects["open"].store;
+        // Serialized the same way `record_provenance` writes it: the run's whole resolved config,
+        // not a fragment, so what this reads back is what a real recording round-trips.
+        let mut theirs = ratatoskr_core::RatatoskrConfig::default();
+        theirs.models.insert(
+            "analyst".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "elsewhere".to_string(),
+                model: "their-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                // Not the default, so what the reader reports about the scope can only have come
+                // from this route: the recorded declaration is resolved against the recorded
+                // route, which is the other half of the same problem.
+                session: ratatoskr_core::SessionScope::Reuse,
+            },
+        );
+        let recorded = serde_json::to_string(&theirs).expect("a serializable config");
+        let shape = serde_json::json!({
+            "nodes": [],
+            "stages": [{"id": "analyst", "node": "analyst"}],
+        })
+        .to_string();
+        for id in ["imported", "local"] {
+            store.upsert_run(id, None, "converged").await.unwrap();
+            store
+                .record_run_provenance(id, Some(&recorded), None, None, Some(&shape), None)
+                .await
+                .unwrap();
+            store
+                .insert_checkpoint(ratatoskr_store::CheckpointWrite {
+                    run_id: id,
+                    node_name: "analyst",
+                    output_json: "{}",
+                    input_json: None,
+                    iteration: None,
+                    telemetry: Default::default(),
+                })
+                .await
+                .unwrap();
+        }
+        store.set_origin("imported", "someone-else").await.unwrap();
+
+        let planned = |id: &'static str| {
+            let state = state.clone();
+            async move {
+                let response = router(state, None)
+                    .oneshot(get(&format!("/api/projects/open/runs/{id}"), None))
+                    .await
+                    .expect("the router to answer");
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                    .await
+                    .expect("a run detail body");
+                let detail: serde_json::Value = serde_json::from_slice(&bytes).expect("run detail");
+                detail["nodes"][0]["planned"].clone()
+            }
+        };
+
+        assert_eq!(
+            planned("imported").await["model"],
+            serde_json::json!("elsewhere/their-model"),
+            "a foreign run's boxes must not claim this machine's routes"
+        );
+        assert_eq!(
+            planned("imported").await["sessions"],
+            serde_json::json!(["reuse"]),
+            "the recorded session declaration resolves against the recorded route"
+        );
+        assert!(
+            planned("local").await.is_null(),
+            "a local run is drawn against the config as it stands, not the one it recorded"
+        );
     }
 
     #[tokio::test]
