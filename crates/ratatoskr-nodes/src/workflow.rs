@@ -1705,20 +1705,12 @@ async fn replan_at_ceiling_with<R: CeilingRecovery>(
     ) && converge::unsatisfied(authored, &implementation.failing_tests)
         .is_empty()
         && converge::is_converged(&red_team.failing_tests, &implementation.failing_tests);
-    let current_review_blocks = checkpoints
-        .iter()
-        .rposition(|checkpoint| checkpoint.node_name == "implementer")
-        .and_then(|position| {
-            checkpoints
-                .iter()
-                .skip(position + 1)
-                .rev()
-                .find(|checkpoint| checkpoint.node_name == "verifier")
-        })
-        .and_then(|checkpoint| {
-            serde_json::from_str::<verifier::VerifierOutput>(&checkpoint.output_json).ok()
-        })
-        .is_some_and(|output| !output.blocking(threshold).is_empty());
+    // This tree's review, folded across the passes that produced it — the same value `verify()`
+    // handed the workflow. Read off the latest checkpoint alone, a continuation that turned up
+    // nothing new looked like a clean review, and the one recovery this run is allowed was skipped
+    // while the review the workflow was holding still blocked.
+    let current_review_blocks =
+        tree_review(&checkpoints).is_some_and(|review| !review.blocking(threshold).is_empty());
     if referee.is_empty() && tests_clean && !current_review_blocks {
         return Ok("null".to_string());
     }
@@ -4626,7 +4618,7 @@ mod tests {
             &verifier::VerifierOutput {
                 findings: vec![finding.clone()],
                 assessment: "the plan may be the common cause".to_string(),
-                ..Default::default()
+                unchecked: vec!["the retry path".to_string()],
             },
             None,
         )
@@ -4655,6 +4647,23 @@ mod tests {
             stages,
             Arc::new(RecordingStageTurn::default()),
         );
+
+        // A continuation of that review, covering the gap and turning up nothing new. It is the
+        // last verifier checkpoint, and read alone it looks like a clean review — the finding above
+        // still stands, and `verify()` hands the workflow the folded review that says so. Reading
+        // the raw checkpoint here skipped the one recovery this run is allowed.
+        note(
+            &ctx,
+            "verifier",
+            &verifier::VerifierOutput {
+                findings: Vec::new(),
+                assessment: "covered the area the first pass could not reach".to_string(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
 
         let first_recovery =
             replan_at_ceiling_with(Arc::clone(&ctx), Arc::clone(&executor), &recovery)
