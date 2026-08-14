@@ -2449,12 +2449,30 @@ async fn evaluate_standard_stage_with_turn_and_resources(
 
 // --- wrappers (own every status write, gate, and cleanup) -------------------
 
-/// Everything a run needs in place before its workflow entry is called.
+/// Write the run's row and put everything in place that its workflow entry needs.
 ///
-/// Runs with the run row already written, because the issue checkpoint references it and the
-/// schema enforces that — so every failure in here belongs to a run that already exists and
-/// already reports itself running. A caller must route them through [`fail_initialization`]
-/// rather than return them.
+/// The row and the cleanup are one operation deliberately. Everything after the row is written
+/// belongs to a run that already exists and already reports itself running, so a failure there has
+/// to finish the run rather than return; a wrapper that took the row separately could — and, before
+/// this was one function, did — leave a run reading `running` forever with its plugin session never
+/// ended.
+async fn start_run(
+    ctx: &Arc<WorkflowContext>,
+    runtime: &WorkflowRuntime,
+    turn: Arc<dyn StageTurn>,
+) -> Result<(Arc<Vec<Stage>>, HashMap<String, HostFn>), PlanError> {
+    // The run row first: the issue checkpoint references it, and the schema enforces that.
+    ctx.store
+        .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
+        .await?;
+    match initialize_run(ctx, runtime, turn).await {
+        Ok(started) => Ok(started),
+        Err(e) => Err(fail_initialization(ctx, e).await),
+    }
+}
+
+/// Everything a run needs in place before its workflow entry is called. See [`start_run`], which is
+/// how this is reached — every failure here is one that has to finish the run.
 async fn initialize_run(
     ctx: &Arc<WorkflowContext>,
     runtime: &WorkflowRuntime,
@@ -2518,14 +2536,7 @@ async fn run_plan_scripted_with_turn(
     ctx: Arc<WorkflowContext>,
     turn: Arc<dyn StageTurn>,
 ) -> Result<PlanOutcome, PlanError> {
-    // The run row first: the issue checkpoint references it, and the schema enforces that.
-    ctx.store
-        .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
-        .await?;
-    let (stages, hosts) = match initialize_run(&ctx, &runtime, turn).await {
-        Ok(started) => started,
-        Err(e) => return Err(fail_initialization(&ctx, e).await),
-    };
+    let (stages, hosts) = start_run(&ctx, &runtime, turn).await?;
     let input = json!({ "issue": ctx.issue }).to_string();
     let result = runtime
         .run_with_question_renderers("plan", input, hosts, stage_question_renderers(&stages))
@@ -2572,14 +2583,7 @@ async fn run_full_scripted_with_actions<A: FullTerminalActions>(
     ctx: Arc<WorkflowContext>,
     actions: &A,
 ) -> Result<RunOutcome, PlanError> {
-    // The run row first: the issue checkpoint references it, and the schema enforces that.
-    ctx.store
-        .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
-        .await?;
-    let (stages, hosts) = match initialize_run(&ctx, &runtime, Arc::new(LiveStageTurn)).await {
-        Ok(started) => started,
-        Err(e) => return Err(fail_initialization(&ctx, e).await),
-    };
+    let (stages, hosts) = start_run(&ctx, &runtime, Arc::new(LiveStageTurn)).await?;
     let input = json!({
         "issue": ctx.issue,
         "maxIterations": ctx.config.implementer.max_iterations,
