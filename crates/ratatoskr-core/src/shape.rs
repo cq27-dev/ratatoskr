@@ -218,6 +218,24 @@ pub fn recorded(shape_json: Option<&str>) -> Recorded {
     if !distinct(record.stages.iter().map(|stage| stage.id.as_str())) {
         record.stages = Vec::new();
     }
+    // The two halves are read independently but they answer about one set of names, and a box drawn
+    // under a name that is some OTHER box's stage is a row counted in both and drawn in neither
+    // consistently. A stage may of course carry the name of the box it is — that is every node that
+    // is one stage — so it is only a member's id colliding with a placed name that is refused, and
+    // the placement is what goes: the registry is what costs and controls are keyed by.
+    let member_names: std::collections::HashSet<&str> = record
+        .stages
+        .iter()
+        .filter(|stage| stage.node != stage.id)
+        .map(|stage| stage.id.as_str())
+        .collect();
+    if record
+        .nodes
+        .iter()
+        .any(|node| member_names.contains(node.name.as_str()))
+    {
+        record.nodes = Vec::new();
+    }
     record
 }
 
@@ -230,6 +248,32 @@ fn distinct<'a>(names: impl Iterator<Item = &'a str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_box_drawn_under_another_boxs_member_name_is_not_placed() {
+        // Refused across the two halves, not just within each. `x` is placed as a box of its own
+        // AND declared a member of `y`, so both boxes resolve their records to the rows written
+        // under `x`: its cost is counted twice, and the two boxes disagree about which of them is
+        // working. No workflow this build validates can write it — `validate_layout` refuses
+        // placing a member's id — so the way in is an imported recording, which is what this gate
+        // is for.
+        let collided = r#"{"nodes":[{"name":"x","stage":0,"lane":0,"optional":false},
+                                    {"name":"y","stage":1,"lane":0,"optional":false}],
+                           "stages":[{"id":"x","node":"y"}]}"#;
+        let read = recorded(Some(collided));
+        assert!(
+            read.nodes.is_empty(),
+            "a placement naming another box's member must not be drawn"
+        );
+        // The registry survives it: costs and controls are keyed by that, and the run is drawn from
+        // its own records the way any unplaced run is.
+        assert_eq!(read.stages.len(), 1);
+
+        // And the ordinary case is untouched — a stage that IS its box carries the box's name.
+        let own = r#"{"nodes":[{"name":"analyst","stage":0,"lane":0,"optional":false}],
+                      "stages":[{"id":"analyst","node":"analyst"}]}"#;
+        assert_eq!(recorded(Some(own)).nodes.len(), 1);
+    }
 
     #[test]
     fn a_position_past_the_shape_it_indexes_makes_the_whole_placement_unreadable() {

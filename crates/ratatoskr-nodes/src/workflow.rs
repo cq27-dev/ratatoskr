@@ -4968,91 +4968,21 @@ mod tests {
                 "`{}` is controlled under a name the run does not draw a box for",
                 stage.id
             );
+            // And the other identity is untouched by that: the turn is given the stage's own name,
+            // which is what its record is written under. A stage controlled at its box's address
+            // while recording under the box's would be one box's work with no way to tell the
+            // halves apart.
+            assert_eq!(
+                turn.nodes
+                    .lock()
+                    .expect("recording runner mutex poisoned")
+                    .last()
+                    .map(String::as_str),
+                Some(stage.id.as_str()),
+                "`{}` recorded its turn under another name",
+                stage.id
+            );
         }
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn a_member_stage_is_controlled_at_its_nodes_address() {
-        let dir =
-            std::env::temp_dir().join(format!("ratatoskr-member-control-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let engine = ScriptEngine::load(&dir).await.unwrap();
-        let store = Store::open_in_memory().unwrap();
-        store
-            .upsert_run("run-member-control", None, RunStatus::Running.as_str())
-            .await
-            .unwrap();
-        let mut config = RatatoskrConfig::default();
-        config.models.insert(
-            "redteam".to_string(),
-            ratatoskr_core::ModelRoute {
-                provider: "anthropic".to_string(),
-                model: "test-model".to_string(),
-                max_tokens: None,
-                context_window: None,
-                temperature: None,
-                params: None,
-                session: ratatoskr_core::SessionScope::Fresh,
-            },
-        );
-        let ctx = WorkflowContext::new(
-            None,
-            &config,
-            &store,
-            "run-member-control",
-            "stop the red team",
-            &engine,
-            crate::PluginContext::default(),
-        )
-        .unwrap();
-        let stages = standard_stages().await.unwrap();
-        let turn = Arc::new(RecordingStageTurn::default());
-        let executor = StageExecutor::new(
-            ctx,
-            Arc::new(stages.clone()),
-            Arc::clone(&turn) as Arc<dyn StageTurn>,
-        );
-        let stage = stages
-            .iter()
-            .find(|stage| stage.id == "redteam_classifier")
-            .unwrap()
-            .clone();
-        executor
-            .execute(StageInvocation {
-                stage,
-                input_json: serde_json::to_string(&crate::redteam::ClassifierInput {
-                    failing: Vec::new(),
-                    raw_output: String::new(),
-                })
-                .unwrap(),
-                rendered_question: Some("classify these".to_string()),
-                resource_root: None,
-                capability_ceiling: ratatoskr_core::Capability::Read,
-                rag_rat_worktree: None,
-                shell: None,
-                publish: None,
-                clarifier: None,
-                invocation_guidance: None,
-                output: StageOutput::Evidence,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            *turn.nodes.lock().expect("recording runner mutex poisoned"),
-            ["redteam_classifier"],
-            "the record says which half ran"
-        );
-        assert_eq!(
-            *turn
-                .controls
-                .lock()
-                .expect("recording runner mutex poisoned"),
-            [Some("redteam".to_string())],
-            "and an operator stops the box the graph drew"
-        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
