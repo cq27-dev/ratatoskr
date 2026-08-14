@@ -2189,13 +2189,6 @@ fn claiming(host: HostFn) -> HostFn {
     Arc::new(move |arg| Box::pin(ratatoskr_agent::claim_scope(host(arg))))
 }
 
-fn build_hosts(
-    ctx: &Arc<WorkflowContext>,
-    stages: &[Stage],
-) -> Result<HashMap<String, HostFn>, PlanError> {
-    build_hosts_with_turn(ctx, stages, Arc::new(LiveStageTurn))
-}
-
 fn stage_question_renderers(stages: &[Stage]) -> HashMap<String, String> {
     stages
         .iter()
@@ -2456,27 +2449,21 @@ async fn evaluate_standard_stage_with_turn_and_resources(
 
 // --- wrappers (own every status write, gate, and cleanup) -------------------
 
-/// Scripted `plan`: scout → memory → analyst, composed by the script's `plan(input)` entry.
-pub async fn run_plan_scripted(
-    runtime: WorkflowRuntime,
-    ctx: Arc<WorkflowContext>,
-) -> Result<PlanOutcome, PlanError> {
-    run_plan_scripted_with_turn(runtime, ctx, Arc::new(LiveStageTurn)).await
-}
-
-async fn run_plan_scripted_with_turn(
-    runtime: WorkflowRuntime,
-    ctx: Arc<WorkflowContext>,
+/// Everything a run needs in place before its workflow entry is called.
+///
+/// Runs with the run row already written, because the issue checkpoint references it and the
+/// schema enforces that — so every failure in here belongs to a run that already exists and
+/// already reports itself running. A caller must route them through [`fail_initialization`]
+/// rather than return them.
+async fn initialize_run(
+    ctx: &Arc<WorkflowContext>,
+    runtime: &WorkflowRuntime,
     turn: Arc<dyn StageTurn>,
-) -> Result<PlanOutcome, PlanError> {
-    // The run row first: the issue checkpoint references it, and the schema enforces that.
-    ctx.store
-        .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
-        .await?;
+) -> Result<(Arc<Vec<Stage>>, HashMap<String, HostFn>), PlanError> {
     // The registry first: a run's shape says which stages compose each of its nodes, and that is a
     // property of what the run will execute rather than of what the workflow wrote down — a layout
     // may name a node whose stages it never redeclared.
-    let stages = install_execution_stages(&ctx, &runtime).await?;
+    let stages = install_execution_stages(ctx, runtime).await?;
     // A scripted run is measured the same way a built-in one is; the script picks the order, not
     // whether the run is comparable to another afterwards. Failing here fails the run: the shape
     // carries the registry every control is addressed through.
@@ -2494,9 +2481,51 @@ async fn run_plan_scripted_with_turn(
         &json!({ "issue": ctx.issue }),
     )
     .await?;
+    let hosts = build_hosts_with_turn(ctx, &stages, turn)?;
+    Ok((stages, hosts))
+}
 
-    let stages = install_execution_stages(&ctx, &runtime).await?;
-    let hosts = build_hosts_with_turn(&ctx, &stages, turn)?;
+/// Finish a run that failed before its workflow entry was ever called.
+///
+/// The row is written first and says the run is live, so an initialization failure that merely
+/// returned would leave it stuck at `Running` with nothing left to finish it — the same guarantee
+/// each wrapper's own finalization makes for a run that did start. Nothing has claimed a turn or
+/// taken a worktree yet, so the status and the plugin session are all there is to close.
+async fn fail_initialization(ctx: &WorkflowContext, error: PlanError) -> PlanError {
+    if let Err(e) = ctx
+        .store
+        .upsert_run(&ctx.run_id, None, RunStatus::Failed.as_str())
+        .await
+    {
+        tracing::warn!("failed to record final run status: {e}");
+    }
+    ctx.plugin_context
+        .session_end(RunStatus::Failed.as_str())
+        .await;
+    error
+}
+
+/// Scripted `plan`: scout → memory → analyst, composed by the script's `plan(input)` entry.
+pub async fn run_plan_scripted(
+    runtime: WorkflowRuntime,
+    ctx: Arc<WorkflowContext>,
+) -> Result<PlanOutcome, PlanError> {
+    run_plan_scripted_with_turn(runtime, ctx, Arc::new(LiveStageTurn)).await
+}
+
+async fn run_plan_scripted_with_turn(
+    runtime: WorkflowRuntime,
+    ctx: Arc<WorkflowContext>,
+    turn: Arc<dyn StageTurn>,
+) -> Result<PlanOutcome, PlanError> {
+    // The run row first: the issue checkpoint references it, and the schema enforces that.
+    ctx.store
+        .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
+        .await?;
+    let (stages, hosts) = match initialize_run(&ctx, &runtime, turn).await {
+        Ok(started) => started,
+        Err(e) => return Err(fail_initialization(&ctx, e).await),
+    };
     let input = json!({ "issue": ctx.issue }).to_string();
     let result = runtime
         .run_with_question_renderers("plan", input, hosts, stage_question_renderers(&stages))
@@ -2547,29 +2576,10 @@ async fn run_full_scripted_with_actions<A: FullTerminalActions>(
     ctx.store
         .upsert_run(&ctx.run_id, None, RunStatus::Running.as_str())
         .await?;
-    // The registry first: a run's shape says which stages compose each of its nodes, and that is a
-    // property of what the run will execute rather than of what the workflow wrote down — a layout
-    // may name a node whose stages it never redeclared.
-    let stages = install_execution_stages(&ctx, &runtime).await?;
-    // A scripted run is measured the same way a built-in one is; the script picks the order, not
-    // whether the run is comparable to another afterwards. Failing here fails the run: the shape
-    // carries the registry every control is addressed through.
-    crate::record_provenance(
-        &ctx.store,
-        &ctx.run_id,
-        &ctx.config,
-        &crate::stage::shape_from_workflow(runtime.meta(), &stages),
-    )
-    .await?;
-    checkpoint(
-        &ctx.store,
-        &ctx.run_id,
-        "issue",
-        &json!({ "issue": ctx.issue }),
-    )
-    .await?;
-
-    let hosts = build_hosts(&ctx, &stages)?;
+    let (stages, hosts) = match initialize_run(&ctx, &runtime, Arc::new(LiveStageTurn)).await {
+        Ok(started) => started,
+        Err(e) => return Err(fail_initialization(&ctx, e).await),
+    };
     let input = json!({
         "issue": ctx.issue,
         "maxIterations": ctx.config.implementer.max_iterations,
@@ -5549,7 +5559,7 @@ mod tests {
         )
         .unwrap();
         let stages = install_execution_stages(&ctx, &runtime).await.unwrap();
-        let hosts = build_hosts(&ctx, &stages).unwrap();
+        let hosts = build_hosts_with_turn(&ctx, &stages, Arc::new(LiveStageTurn)).unwrap();
         assert!(!hosts.contains_key("publisher"));
         assert!(!hosts.contains_key("bookkeeper"));
 
@@ -10880,6 +10890,105 @@ mod tests {
         assert_eq!(
             store.run_status(run_id).await.unwrap().as_deref(),
             Some(RunStatus::Failed.as_str())
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A run that never starts still has a row saying it is running, and something has to close it.
+    ///
+    /// The row is written before anything else so the issue checkpoint has a run to reference, and
+    /// the registry, the provenance record, that checkpoint and the host table are all built after
+    /// it. A failure among them is a failure of a run that already exists — returning it would
+    /// leave the row reporting a live run that nothing will ever finish. Driven through both
+    /// wrappers, because the row and the finalization are the wrappers' own.
+    #[tokio::test]
+    async fn a_run_that_cannot_initialize_is_recorded_failed_rather_than_left_running() {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-init-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("workflow.ts");
+        // A stage under an operation host's name: the host table refuses it, which is an
+        // initialization failure a workflow can actually cause.
+        std::fs::write(
+            &workflow_path,
+            r#"defineWorkflow({
+                 name: "shadowing",
+                 stages: [
+                   stage("context", {
+                     agent: "reason",
+                     instructions: "shadow an operation host",
+                     outputSchema: { type: "object" },
+                   }),
+                 ],
+               });
+               export async function plan(input) { return input; }
+               export async function run(input) { return input; }"#,
+        )
+        .unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let config = RatatoskrConfig::default();
+        let load = || async {
+            let definitions = standard_definitions().unwrap();
+            WorkflowRuntime::load(
+                &workflow_path,
+                &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        let context = |run_id: &str| {
+            WorkflowContext::new(
+                None,
+                &config,
+                &store,
+                run_id,
+                "refuse to start",
+                &engine,
+                crate::PluginContext::default(),
+            )
+            .unwrap()
+        };
+
+        let error = match run_plan_scripted_with_turn(
+            load().await,
+            context("run-init-failure-plan"),
+            Arc::new(SequencedStageTurn::new([])),
+        )
+        .await
+        {
+            Ok(_) => panic!("a run whose host table is refused cannot plan"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("context"), "{error}");
+        assert_eq!(
+            store
+                .run_status("run-init-failure-plan")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(RunStatus::Failed.as_str()),
+        );
+
+        if run_full_scripted_with_actions(
+            load().await,
+            context("run-init-failure-full"),
+            &RecordingTerminalActions::new(false, false),
+        )
+        .await
+        .is_ok()
+        {
+            panic!("a run whose host table is refused cannot run");
+        }
+        assert_eq!(
+            store
+                .run_status("run-init-failure-full")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(RunStatus::Failed.as_str()),
         );
         let _ = std::fs::remove_dir_all(dir);
     }
