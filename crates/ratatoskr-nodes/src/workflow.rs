@@ -946,13 +946,13 @@ fn review_correction(
     // continuations already spent BEFORE writing this checkpoint, so counting them here with it
     // included would reconstruct a different answer and refuse a script that supplied the right one.
     let (_, continuations_left) = review_continuations(&checkpoints[..review_position]);
-    // Folded exactly as the host folded it, or a script that supplied the answer it was given is
-    // refused for supplying it.
-    let expected = verification_result(
-        folded(&chain_ending_at(checkpoints, review_position)).unwrap_or_else(|| output.clone()),
-        threshold,
-        continuations_left,
-    );
+    // This tree's review, folded exactly as the host folded it — and used for everything below, not
+    // only for the comparison. The correction is built from what the review says still stands, and
+    // a continuation's own checkpoint holds only what its gap turned up: deriving the correction
+    // from that alone refused a workflow that continued a blocking review and then asked to fix it,
+    // telling it there was nothing to correct while the finding it was handed still stood.
+    let review = folded(&chain_ending_at(checkpoints, review_position)).unwrap_or(output);
+    let expected = verification_result(review.clone(), threshold, continuations_left);
     if !same_json(supplied, &expected) {
         return Err(
             "iterate() review does not match the latest Rust-validated verifier checkpoint"
@@ -960,7 +960,7 @@ fn review_correction(
         );
     }
 
-    let blocking = output.blocking(threshold);
+    let blocking = review.blocking(threshold);
     if blocking.is_empty() {
         return Err("iterate() review has no blocking findings to correct".to_string());
     }
@@ -6382,7 +6382,23 @@ mod tests {
                     "implementer": { "diff_summary": "", "narrative": null, "touched_files": [], "failing_tests": [] },
                     "friction": { "diagnostics": [], "errors": [], "effort": [] }
                 }),
-                expected_question: "OUTCOME: the run's tests pass, but its REVIEW NEVER FINISHED — after 2 implementer iterations the verifier ran out of room before reaching the end of what it set out to check: the error path in session.rs. This is not a wall the change hit; it is something nobody has looked at. Record what a future run should know about reviewing this area, not about fixing it.\n\nTASK:\nx\n\n",
+                expected_question: "OUTCOME: the run's tests pass, but IT WAS NOT REVIEWED — after 2 implementer iterations the review ran out of room before reaching: the error path in session.rs. This is not a wall the change hit; it is something nobody has looked at. Record what a future run should know about reviewing this area, not about fixing it.\n\nTASK:\nx\n\n",
+            },
+            RendererParityCase {
+                stage: "bookkeeper",
+                // The other cause of the same status, and the reason the areas decide the wording:
+                // a verifier nobody could reach named nothing, and diagnosing that as a review too
+                // large to finish is a false claim written where every later run reads it.
+                input: json!({
+                    "status": "unreviewed",
+                    "unchecked": [],
+                    "iterations": 2,
+                    "issue": "x",
+                    "analyst": { "impact_summary": "", "risks": [] },
+                    "implementer": { "diff_summary": "", "narrative": null, "touched_files": [], "failing_tests": [] },
+                    "friction": { "diagnostics": [], "errors": [], "effort": [] }
+                }),
+                expected_question: "OUTCOME: the run's tests pass, but IT WAS NOT REVIEWED — after 2 implementer iterations no review of the change was obtained; the verifier could not be reached, or its answer never landed. Nothing here says the change is wrong. This is not a wall the change hit; it is something nobody has looked at. Record what a future run should know about reviewing this area, not about fixing it.\n\nTASK:\nx\n\n",
             },
             RendererParityCase {
                 stage: "publisher",
@@ -11717,6 +11733,54 @@ mod tests {
         assert!(
             left,
             "only reviews that could not finish spend continuations"
+        );
+    }
+
+    #[test]
+    fn a_correction_is_built_from_the_review_the_host_handed_out() {
+        // `verify()` answers with this tree's review, folded across its passes. The correction has
+        // to be derived from the same thing: a continuation's own checkpoint holds only what its
+        // gap turned up, so reading the correction off that alone told a workflow there was
+        // nothing to fix while the finding it had just been handed still stood. The workflow did
+        // exactly the right thing — covered the gap first, then asked to fix — and was refused.
+        let plan = review_plan();
+        let defect = review_finding(verifier::FindingKind::Execution, "the key omitted the run");
+        let verifier_input = verifier::VerifierInput {
+            issue: "preserve convergence".to_string(),
+            analyst: plan.clone(),
+            diff: "+change".to_string(),
+            touched_files: vec!["workflow.rs".to_string()],
+            previous_findings: Vec::new(),
+            unchecked: Vec::new(),
+        };
+        let first = verifier::VerifierOutput {
+            findings: vec![defect.clone()],
+            assessment: "found one, ran out of room".to_string(),
+            unchecked: vec!["the error path".to_string()],
+        };
+        let continued = verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: "covered the error path".to_string(),
+            unchecked: Vec::new(),
+        };
+        let checkpoints = vec![
+            review_checkpoint("analyst", &plan, None::<&&str>),
+            review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
+            review_checkpoint("verifier", &first, Some(&verifier_input)),
+            review_checkpoint("verifier", &continued, Some(&verifier_input)),
+        ];
+
+        // What the host would have answered the second call with.
+        let supplied = verification_result(
+            folded(&[first, continued]).unwrap(),
+            verifier::Severity::P2,
+            true,
+        );
+        let correction = review_correction(&checkpoints, &supplied, verifier::Severity::P2)
+            .expect("the review handed out still has something to correct");
+        assert!(
+            correction.contains("the key omitted the run"),
+            "the correction must carry the finding that still stands: {correction}"
         );
     }
 

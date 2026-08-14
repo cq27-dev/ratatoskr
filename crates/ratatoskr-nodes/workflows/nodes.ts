@@ -550,13 +550,18 @@ export const bookkeeper = {
       question +=
         "OUTCOME: the run CONVERGED — the change landed and the tests pass.\n\n";
     } else if (input.status === "unreviewed") {
+      // Two causes reach this status and they are different diagnoses. A review that ran out of
+      // room named what it could not reach; a verifier that could not be reached at all named
+      // nothing. Asserting the first for both wrote a durable memory diagnosing an outage as a
+      // review too large to finish, and the areas are the only evidence that separates them.
+      const gaps = input.unchecked || [];
       question +=
-        `OUTCOME: the run's tests pass, but its REVIEW NEVER FINISHED — after ${input.iterations} ` +
-        "implementer iterations the verifier ran out of room before reaching the end of what it " +
-        "set out to check" +
-        ((input.unchecked || []).length > 0
-          ? `: ${input.unchecked.join("; ")}. `
-          : ". ") +
+        `OUTCOME: the run's tests pass, but IT WAS NOT REVIEWED — after ${input.iterations} ` +
+        "implementer iterations" +
+        (gaps.length > 0
+          ? ` the review ran out of room before reaching: ${gaps.join("; ")}. `
+          : " no review of the change was obtained; the verifier could not be reached, or its " +
+            "answer never landed. Nothing here says the change is wrong. ") +
         "This is not a wall the change hit; it is something nobody has looked at. Record what a " +
         "future run should know about reviewing this area, not about fixing it.\n\n";
     } else {
