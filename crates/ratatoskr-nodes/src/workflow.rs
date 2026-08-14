@@ -1400,6 +1400,24 @@ async fn verify_host(
         return Err("verify() analyst does not match the latest analyst checkpoint".to_string());
     }
     let (unchecked, continuations_left) = review_continuations(&checkpoints);
+    // The ceiling is Rust's, not the script's to observe. `retryable` tells a workflow what it may
+    // do; a workflow that ignores it and calls `verify()` again was still spending a model turn per
+    // call, so the bound was advice and the real limit was the generic invocation ceiling — 500
+    // review turns of somebody's money. Refused here instead, and refused by answering rather than
+    // erroring: the run is not wrong, it has simply had every continuation this tree gets, and the
+    // review as it stands is the honest reply. `retryable` is false in it, so a loop that keeps
+    // asking spends host calls and no turns.
+    if !unchecked.is_empty() && !continuations_left {
+        let standing = tree_review(&checkpoints)
+            .expect("a carried gap comes from a review in this tree's chain");
+        tracing::warn!(
+            unchecked = ?standing.unchecked,
+            "verify() asked to continue a review past its continuation ceiling; \
+             answering with the review as it stands"
+        );
+        return serde_json::to_string(&verification_result(standing, threshold, false))
+            .map_err(|e| e.to_string());
+    }
     let verifier_input = verifier::VerifierInput {
         previous_findings: previous_verifier_findings(&checkpoints, threshold),
         issue: ctx.issue.clone(),
@@ -11734,6 +11752,114 @@ mod tests {
             left,
             "only reviews that could not finish spend continuations"
         );
+    }
+
+    #[tokio::test]
+    async fn continuing_past_the_ceiling_spends_no_turn_and_answers_with_the_review_as_it_stands() {
+        // `retryable` tells a workflow what it may do; nothing made it obey. A workflow that
+        // ignored it and called `verify()` again spent a model turn per call, so the ceiling was
+        // advice and the real bound was the generic invocation ceiling — hundreds of review turns.
+        // Refused by answering, not by erroring: the run is not wrong, it has simply had every
+        // continuation this tree gets.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-review-ceiling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-review-ceiling", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.models.insert("verifier".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-review-ceiling",
+            "review this",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        *ctx.worktree.lock().unwrap() = Some(WorktreePath(dir.join("worktree")));
+
+        let plan = review_plan();
+        note(&ctx, "analyst", &plan, None).await.unwrap();
+        note(&ctx, "implementer", &imp(&[], &["a"], 0), None)
+            .await
+            .unwrap();
+        // The ceiling's worth of passes, each naming a gap it could not reach.
+        let unfinished = verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: "got part way".to_string(),
+            unchecked: vec!["the error path".to_string()],
+        };
+        for _ in 0..REVIEW_CONTINUATIONS {
+            note(&ctx, "verifier", &unfinished, None).await.unwrap();
+        }
+
+        let stages = standard_stages().await.unwrap();
+        // A turn that would SUCCEED if it ran, so "no turn was spent" is what the assertion below
+        // actually distinguishes — a stub whose output fails the schema errors before the turn and
+        // would pass that assertion either way.
+        let turn = Arc::new(RecordingStageTurn {
+            output: json!({
+                "findings": [],
+                "assessment": "covered everything",
+                "unchecked": []
+            })
+            .to_string(),
+            ..Default::default()
+        });
+        let executor = StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::new(stages),
+            Arc::clone(&turn) as Arc<dyn StageTurn>,
+        );
+        let answer = verify_host(
+            Arc::clone(&ctx),
+            executor,
+            json!({ "analyst": plan }).to_string(),
+        )
+        .await
+        .expect("the ceiling answers rather than failing the run");
+
+        // The record is the passes that actually ran — no further checkpoint of any kind. This is
+        // the assertion that discriminates: without the guard the stage is entered and fails, and
+        // failing writes an `{"error": ..}` record of its own.
+        let reviews = store
+            .checkpoints_for_run("run-review-ceiling")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.node_name == "verifier")
+            .count();
+        assert_eq!(
+            reviews, REVIEW_CONTINUATIONS,
+            "a call past the ceiling must leave the record as it found it"
+        );
+        assert!(
+            turn.nodes
+                .lock()
+                .expect("recording runner mutex poisoned")
+                .is_empty(),
+            "and must not spend a model turn"
+        );
+
+        let result: serde_json::Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(
+            result["retryable"], false,
+            "the answer must not invite another: {result}"
+        );
+        assert_eq!(
+            result["unchecked"],
+            json!(["the error path"]),
+            "and must be the review as it stands — still incomplete, which is what makes the run \
+             unreviewed rather than a review nobody could obtain"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
