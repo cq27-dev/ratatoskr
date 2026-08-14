@@ -405,6 +405,20 @@ enum ScriptedReview {
     Unavailable,
 }
 
+/// Whether a review is of the run as it now stands, or of something the run has moved past.
+///
+/// A review judges a TREE against a PLAN, so either moving invalidates it. An `iterate()` rewrites
+/// the tree under it; an `analyst()` revises the plan it was measuring against, and a finding of
+/// kind `plan` is then an objection to a requirement that no longer exists. A workflow may revise
+/// and review again without implementing in between, and folding across that carried the old plan's
+/// objections into a clean review of the new one — and spent its continuations on the old plan's
+/// gaps.
+fn superseded(checkpoints: &[ratatoskr_store::Checkpoint], review: usize) -> bool {
+    checkpoints[review + 1..]
+        .iter()
+        .any(|checkpoint| matches!(checkpoint.node_name.as_str(), "implementer" | "analyst"))
+}
+
 fn scripted_review(checkpoints: &[ratatoskr_store::Checkpoint]) -> ScriptedReview {
     let Some(reviewed_at) = checkpoints
         .iter()
@@ -412,14 +426,11 @@ fn scripted_review(checkpoints: &[ratatoskr_store::Checkpoint]) -> ScriptedRevie
     else {
         return ScriptedReview::NotRun;
     };
-    // An implementer checkpoint written after the review means the tree moved on since it was
-    // judged: that review describes a state this run no longer has, so it cannot be the review
-    // terminal status rests on. Unreviewed, not reviewed-clean. The bundled flow always verifies
-    // after its last iterate, so it never lands here.
-    if checkpoints[reviewed_at + 1..]
-        .iter()
-        .any(|checkpoint| checkpoint.node_name == "implementer")
-    {
+    // A review the run has moved past describes a state this run no longer has, so it cannot be the
+    // review terminal status rests on — not run, rather than run and clean. The bundled flow always
+    // verifies after its last iterate, so it never lands here. What the run has not answered is
+    // still held: `status_with_unanswered_gap` reads the last review wherever it sits.
+    if superseded(checkpoints, reviewed_at) {
         return ScriptedReview::NotRun;
     }
     // Folded across the chain, not read off the last checkpoint alone: a continuation reviews only
@@ -1274,7 +1285,7 @@ fn chain_ending_at(
 ) -> Vec<verifier::VerifierOutput> {
     let start = checkpoints[..end]
         .iter()
-        .rposition(|checkpoint| checkpoint.node_name == "implementer")
+        .rposition(|checkpoint| matches!(checkpoint.node_name.as_str(), "implementer" | "analyst"))
         .map_or(0, |last| last + 1);
     checkpoints[start..=end]
         .iter()
@@ -1294,13 +1305,7 @@ pub(crate) fn review_chain(
         .iter()
         .rposition(|checkpoint| checkpoint.node_name == "verifier")
     {
-        Some(end)
-            if !checkpoints[end + 1..]
-                .iter()
-                .any(|c| c.node_name == "implementer") =>
-        {
-            chain_ending_at(checkpoints, end)
-        }
+        Some(end) if !superseded(checkpoints, end) => chain_ending_at(checkpoints, end),
         _ => Vec::new(),
     }
 }
@@ -12196,6 +12201,66 @@ mod tests {
         let (carried, left) = review_continuations(&trailing);
         assert_eq!(carried, ["path C"]);
         assert!(left, "one incomplete pass since the completion leaves room");
+    }
+
+    #[test]
+    fn a_review_of_a_plan_the_analyst_has_since_revised_is_not_carried_either() {
+        // A review judges a tree against a PLAN, and a workflow may revise the plan and review
+        // again without implementing in between — the bundled loop always iterates after a replan,
+        // but nothing makes a repository one do that. Folding across the revision carried the old
+        // plan's objections into a clean review of the new one, so a `plan` finding about a
+        // requirement that no longer exists still blocked, and the continuations the old plan's
+        // gaps had spent were gone.
+        let plan_fault = verifier::Finding {
+            severity: verifier::Severity::P1,
+            kind: verifier::FindingKind::Plan,
+            file: "src/lib.rs".to_string(),
+            line: None,
+            summary: "the requirement cannot be satisfied".to_string(),
+            failure_scenario: "the plan asks for two incompatible things".to_string(),
+        };
+        let objected = verifier::VerifierOutput {
+            findings: vec![plan_fault],
+            assessment: "the plan is the fault".to_string(),
+            unchecked: vec!["the retry path".to_string()],
+        };
+        let after_revision = verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: "the revised plan holds".to_string(),
+            unchecked: Vec::new(),
+        };
+        let checkpoints = vec![
+            review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
+            review_checkpoint("verifier", &objected, None::<&&str>),
+            review_checkpoint("analyst", &review_plan(), None::<&&str>),
+            review_checkpoint("verifier", &after_revision, None::<&&str>),
+        ];
+
+        let review = tree_review(&checkpoints).expect("the revised plan was reviewed");
+        assert!(
+            review.findings.is_empty(),
+            "an objection to a requirement that no longer exists is not a finding: {:?}",
+            review.findings
+        );
+        assert!(review.complete(), "nor is the old plan's gap still open");
+
+        // And the budget is the new plan's.
+        let (carried, left) = review_continuations(&checkpoints);
+        assert!(carried.is_empty());
+        assert!(left);
+
+        // The revision alone, with no review after it, leaves this plan unreviewed rather than
+        // reviewed-clean — the same answer an edit gets.
+        let unanswered = &checkpoints[..3];
+        assert!(matches!(
+            scripted_review(unanswered),
+            ScriptedReview::NotRun
+        ));
+        // What it could not reach is still held against the run, wherever that review sits.
+        assert_eq!(
+            last_review(unanswered).map(|review| review.unchecked),
+            Some(vec!["the retry path".to_string()])
+        );
     }
 
     #[test]
