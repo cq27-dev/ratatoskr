@@ -94,8 +94,13 @@ asked for, it is `plan`.
 Returning no findings is a real and common answer. Report what is wrong, not what could
 conceivably be better. But "no findings" and "I could not finish looking" are different answers,
 and only one of them is safe to act on: if compilation, tooling, or the size of the change stopped
-you from reaching part of it, say which part in the assessment rather than letting silence stand
-for a clean bill.
+you from reaching part of it, name that part in `unchecked` rather than letting silence stand for
+a clean bill.
+
+Saying so costs a further pass over what you named, and nothing else — you will be asked to
+continue there, with what you already established carried forward. Claiming you finished when you
+did not is the expensive answer: it is accepted as a verdict, and whatever you did not look at
+ships. An `unchecked` you can name is always the better trade.
 
 ## The shape
 
@@ -105,6 +110,12 @@ the wrong result it produces. `line` is optional. Alongside `findings`, `assessm
 line or two what you actually checked; it is expected even when you found nothing, because "no
 findings" without an account of what was looked at reads the same as a verifier that did nothing.
 Name the surfaces rather than the effort — which advertised behaviour you traced to where it runs,
-which boundary you tested, which sibling paths you swept — and name anything you could not reach.
-"Looks correct" is not an assessment; naming the entry point you traced from, the boundary you
-tested, and the path you did not reach is.
+which boundary you tested, which sibling paths you swept. "Looks correct" is not an assessment;
+naming the entry point you traced from and the boundary you tested is.
+
+`unchecked` is the separate, structured half of that: one entry per area you set out to check and
+did not reach, named specifically enough that another pass can pick it up — a file and what to look
+for in it, a path you did not sweep, a behaviour you could not trace. Leave it empty when you
+reached the end of what you set out to check. It is not a list of things that were out of scope,
+and it is not a hedge: an area you deliberately judged irrelevant belongs in the assessment, not
+here.

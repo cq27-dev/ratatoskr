@@ -712,6 +712,7 @@ export const verifier = {
     obj({
       assessment: str(),
       findings: arr({ "$ref": "#/$defs/Finding" }),
+      unchecked: arr(str()),
     }),
     {
       Finding: obj(

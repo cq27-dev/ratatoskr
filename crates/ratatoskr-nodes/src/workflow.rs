@@ -469,6 +469,17 @@ fn infer_status(
             );
             return RunStatus::MaxIterationsReached;
         }
+        // An empty `findings` from a review that could not finish is not a verdict. Reading it as
+        // one is how a run converged on a review cut short — and it is the same shape as a verifier
+        // that could not be reached, so it gets the same answer: the work may well be sound, but
+        // nothing here reviewed it. `Converged` would claim a review that did not happen.
+        if !review.complete() {
+            tracing::warn!(
+                unchecked = ?review.unchecked,
+                "the review did not reach the end of what it set out to check; unreviewed"
+            );
+            return RunStatus::Unreviewed;
+        }
     }
     // The tests written for this change, before it existed. They fail in the baseline by
     // construction, so `is_converged` alone would pass a change that satisfied none of them.
@@ -925,7 +936,11 @@ fn review_correction(
     }
     let output: verifier::VerifierOutput = serde_json::from_value(output_value)
         .map_err(|_| "iterate() cannot correct an unavailable verifier result".to_string())?;
-    let expected = verification_result(output.clone(), threshold);
+    // Judged against the run as it stood when this review was produced: the host counted the
+    // continuations already spent BEFORE writing this checkpoint, so counting them here with it
+    // included would reconstruct a different answer and refuse a script that supplied the right one.
+    let (_, continuations_left) = review_continuations(&checkpoints[..review_position]);
+    let expected = verification_result(output.clone(), threshold, continuations_left);
     if !same_json(supplied, &expected) {
         return Err(
             "iterate() review does not match the latest Rust-validated verifier checkpoint"
@@ -1130,11 +1145,22 @@ struct VerifyResult {
     /// re-analyse before re-driving the implementer, instead of sending it back at a requirement
     /// already shown to be wrong.
     needs_replan: bool,
+    /// What the review said it could not reach. Empty for a review that finished.
+    unchecked: Vec<String>,
+    /// Whether calling `verify()` again would continue this review rather than repeat it.
+    ///
+    /// The script's cue to review again instead of accepting or correcting. True only when the
+    /// review named unreached areas, left nothing blocking, and has continuations left: with
+    /// blocking findings standing the fix comes first, and the bound is what stops an incomplete
+    /// review that never finishes from spending the run. Reaching it is not a pass — the review is
+    /// still incomplete, and `infer_status` reads that off the checkpoint.
+    retryable: bool,
 }
 
 fn verification_result(
     out: verifier::VerifierOutput,
     threshold: verifier::Severity,
+    continuations_left: bool,
 ) -> VerifyResult {
     let blocking: Vec<verifier::Finding> = out.blocking(threshold).into_iter().cloned().collect();
     let needs_replan = blocking
@@ -1143,10 +1169,47 @@ fn verification_result(
     VerifyResult {
         configured: true,
         unavailable: false,
+        // A review with blocking findings is corrected first, whatever it did not reach: the next
+        // pass reviews a changed tree anyway, so continuing over the old one's gaps would be
+        // reviewing something that no longer exists.
+        retryable: blocking.is_empty() && !out.complete() && continuations_left,
+        unchecked: out.unchecked,
         findings: out.findings,
         blocking,
         needs_replan,
     }
+}
+
+/// How many times a review may be continued over what it could not reach.
+///
+/// A bound rather than a loop, because an incomplete review that never finishes is its own failure
+/// and would otherwise spend a run without ever touching the iteration ceiling — `verify()` does
+/// not implement, so nothing else counts these passes. Held in Rust rather than the script for the
+/// same reason every other ceiling is: a workflow chooses when to review, not how long the run may
+/// spend refusing to finish one.
+const REVIEW_CONTINUATIONS: usize = 2;
+
+/// What earlier passes in this run said they could not reach, and whether another may be spent.
+///
+/// Counted from the checkpoints rather than carried through the script, so a workflow that calls
+/// `verify()` in a shape nobody anticipated is bounded the same way the bundled one is.
+fn review_continuations(checkpoints: &[ratatoskr_store::Checkpoint]) -> (Vec<String>, bool) {
+    let incomplete: Vec<&ratatoskr_store::Checkpoint> = checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.node_name == "verifier")
+        .filter(|checkpoint| {
+            serde_json::from_str::<verifier::VerifierOutput>(&checkpoint.output_json)
+                .is_ok_and(|out| !out.complete())
+        })
+        .collect();
+    let unchecked = incomplete
+        .last()
+        .and_then(|checkpoint| {
+            serde_json::from_str::<verifier::VerifierOutput>(&checkpoint.output_json).ok()
+        })
+        .map(|out| out.unchecked)
+        .unwrap_or_default();
+    (unchecked, incomplete.len() < REVIEW_CONTINUATIONS)
 }
 
 /// `verify({ analyst })` — read the worktree's diff against the plan.
@@ -1180,6 +1243,10 @@ async fn verify_host(
             findings: Vec::new(),
             blocking: Vec::new(),
             needs_replan: false,
+            // A review that did not happen has nothing it failed to reach, and continuing it would
+            // continue nothing. `configured` and `unavailable` are what say a verdict is missing.
+            unchecked: Vec::new(),
+            retryable: false,
         })
         .map_err(|e| e.to_string())
     };
@@ -1213,18 +1280,22 @@ async fn verify_host(
     if !same_json(&input.analyst, &checkpointed_analyst) {
         return Err("verify() analyst does not match the latest analyst checkpoint".to_string());
     }
+    let (unchecked, continuations_left) = review_continuations(&checkpoints);
     let verifier_input = verifier::VerifierInput {
         previous_findings: previous_verifier_findings(&checkpoints, threshold),
         issue: ctx.issue.clone(),
         analyst: checkpointed_analyst,
         diff,
         touched_files: implementer.touched_files.clone(),
+        unchecked,
     };
     let input_json = serde_json::to_string(&verifier_input).map_err(|e| e.to_string())?;
     let raw = if verifier_input.diff.trim().is_empty() {
         let out = verifier::VerifierOutput {
             findings: Vec::new(),
             assessment: "there was no diff to review".to_string(),
+            // Nothing to review is a finished review of nothing, not a review cut short.
+            unchecked: Vec::new(),
         };
         note(&ctx, "verifier", &out, Some(input_json)).await?;
         serde_json::to_string(&out).map_err(|e| e.to_string())?
@@ -1273,7 +1344,8 @@ async fn verify_host(
     };
     let out: verifier::VerifierOutput = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
 
-    serde_json::to_string(&verification_result(out, threshold)).map_err(|e| e.to_string())
+    serde_json::to_string(&verification_result(out, threshold, continuations_left))
+        .map_err(|e| e.to_string())
 }
 
 #[derive(serde::Serialize, Deserialize)]
@@ -4084,10 +4156,12 @@ mod tests {
             verifier::VerifierOutput {
                 findings: vec![plan_finding],
                 assessment: "revise the plan".to_string(),
+                ..Default::default()
             },
             verifier::VerifierOutput {
                 findings: Vec::new(),
                 assessment: "the corrected change is clean".to_string(),
+                ..Default::default()
             },
         ])));
         let verify_calls = Arc::clone(&calls);
@@ -4119,6 +4193,7 @@ mod tests {
                         diff: "diff --git a/old b/new".to_string(),
                         touched_files: vec!["src/lib.rs".to_string()],
                         previous_findings: Vec::new(),
+                        unchecked: Vec::new(),
                     };
                     note(
                         &ctx,
@@ -4127,8 +4202,12 @@ mod tests {
                         Some(serde_json::to_string(&verifier_input).unwrap()),
                     )
                     .await?;
-                    serde_json::to_string(&verification_result(output, verifier::Severity::P2))
-                        .map_err(|error| error.to_string())
+                    serde_json::to_string(&verification_result(
+                        output,
+                        verifier::Severity::P2,
+                        true,
+                    ))
+                    .map_err(|error| error.to_string())
                 }
             }),
         );
@@ -4357,6 +4436,7 @@ mod tests {
             &verifier::VerifierOutput {
                 findings: vec![finding.clone()],
                 assessment: "the plan may be the common cause".to_string(),
+                ..Default::default()
             },
             None,
         )
@@ -10030,6 +10110,7 @@ mod tests {
             },
             diff: "diff --git a/session.rs b/session.rs\n+scope by run id".to_string(),
             touched_files: vec!["session.rs".to_string(), "workflow.rs".to_string()],
+            unchecked: Vec::new(),
             previous_findings: vec![verifier::Finding {
                 severity: verifier::Severity::P2,
                 kind: verifier::FindingKind::Execution,
@@ -10260,9 +10341,10 @@ mod tests {
                 },
             ],
             assessment: "checked both findings".to_string(),
+            ..Default::default()
         };
 
-        let result = verification_result(output, verifier::Severity::P2);
+        let result = verification_result(output, verifier::Severity::P2, true);
 
         assert_eq!(result.findings.len(), 2, "all findings remain recorded");
         assert_eq!(result.blocking.len(), 1, "P3 stays below the P2 gate");
@@ -10319,6 +10401,7 @@ mod tests {
             diff: "+change".to_string(),
             touched_files: vec!["workflow.rs".to_string()],
             previous_findings: Vec::new(),
+            unchecked: Vec::new(),
         };
         let output = verifier::VerifierOutput {
             findings: vec![review_finding(
@@ -10326,12 +10409,13 @@ mod tests {
                 "the retry omits the review",
             )],
             assessment: "the code needs correction".to_string(),
+            ..Default::default()
         };
         let checkpoints = vec![
             review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
             review_checkpoint("verifier", &output, Some(&verifier_input)),
         ];
-        let supplied = verification_result(output.clone(), verifier::Severity::P2);
+        let supplied = verification_result(output.clone(), verifier::Severity::P2, true);
 
         assert_eq!(
             review_correction(&checkpoints, &supplied, verifier::Severity::P2).unwrap(),
@@ -10344,6 +10428,8 @@ mod tests {
             findings: Vec::new(),
             blocking: Vec::new(),
             needs_replan: false,
+            unchecked: Vec::new(),
+            retryable: false,
         };
         let error =
             review_correction(&checkpoints, &fabricated, verifier::Severity::P2).unwrap_err();
@@ -10363,12 +10449,14 @@ mod tests {
             diff: "+change".to_string(),
             touched_files: vec!["workflow.rs".to_string()],
             previous_findings: Vec::new(),
+            unchecked: Vec::new(),
         };
         let output = verifier::VerifierOutput {
             findings: vec![finding.clone()],
             assessment: "the plan needs revision".to_string(),
+            ..Default::default()
         };
-        let supplied = verification_result(output.clone(), verifier::Severity::P2);
+        let supplied = verification_result(output.clone(), verifier::Severity::P2, true);
         let mut checkpoints = vec![
             review_checkpoint("analyst", &plan, None::<&&str>),
             review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
@@ -10412,6 +10500,7 @@ mod tests {
                 "first blocking defect",
             )],
             assessment: String::new(),
+            ..Default::default()
         };
         let below_threshold = verifier::VerifierOutput {
             findings: vec![verifier::Finding {
@@ -10419,6 +10508,7 @@ mod tests {
                 ..review_finding(verifier::FindingKind::Execution, "cosmetic nit")
             }],
             assessment: String::new(),
+            ..Default::default()
         };
         let checkpoints = vec![
             review_checkpoint("verifier", &blocking, None::<&&str>),
@@ -10478,6 +10568,7 @@ mod tests {
             output: serde_json::to_string(&verifier::VerifierOutput {
                 findings: vec![finding.clone()],
                 assessment: "the attempt needs correction".to_string(),
+                ..Default::default()
             })
             .unwrap(),
             ..Default::default()
@@ -10578,6 +10669,7 @@ mod tests {
         let clean = verifier::VerifierOutput {
             findings: Vec::new(),
             assessment: "nothing blocking".to_string(),
+            ..Default::default()
         };
         let implementer = json!({ "summary": "edited" });
         let none: Option<&()> = None;
@@ -11114,6 +11206,87 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_loop_reviews_again_over_a_gap_and_stops_when_rust_says_the_budget_is_spent() {
+        // The script half. `verify()` answering "I could not finish" must send the loop back into
+        // review rather than out of it, and must not send it to the implementer — there is nothing
+        // to correct. The budget is Rust's: the script stops when `retryable` goes false, so a
+        // review that never finishes cannot spend the run here.
+        let runtime = standard_runtime().await.unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let reviews = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut hosts: HashMap<String, HostFn> = HashMap::new();
+        let mut bind = |name: &str, reply: fn(serde_json::Value) -> serde_json::Value| {
+            let calls = Arc::clone(&calls);
+            let recorded = name.to_string();
+            let host: HostFn = Arc::new(move |arg: String| {
+                let calls = Arc::clone(&calls);
+                let recorded = recorded.clone();
+                Box::pin(async move {
+                    calls.lock().expect("call log poisoned").push(recorded);
+                    let arg: serde_json::Value = serde_json::from_str(&arg).unwrap();
+                    Ok(reply(arg).to_string())
+                })
+            });
+            hosts.insert(name.to_string(), host);
+        };
+        bind("context", |_| json!({ "scout": {}, "memory": {} }));
+        bind("analyst", |_| json!({ "changes_code": true }));
+        bind("redTeam", |_| json!({ "failing_tests": [] }));
+        bind(
+            "implement",
+            |_| json!({ "failing_tests": [], "passed_tests": 1, "exit_code": 0 }),
+        );
+        bind(
+            "iterate",
+            |_| json!({ "failing_tests": [], "passed_tests": 1, "exit_code": 0 }),
+        );
+        bind("testCommandRan", |_| json!(true));
+        bind("isConverged", |_| json!(true));
+        bind("replanAtCeiling", |_| serde_json::Value::Null);
+
+        // Two continuations, then the bound: exactly what `REVIEW_CONTINUATIONS` allows.
+        let spent = Arc::clone(&reviews);
+        let verify: HostFn = Arc::new(move |_arg: String| {
+            let calls = Arc::clone(&calls);
+            let spent = Arc::clone(&spent);
+            Box::pin(async move {
+                calls
+                    .lock()
+                    .expect("call log poisoned")
+                    .push("verify".to_string());
+                let n = spent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(json!({
+                    "configured": true,
+                    "unavailable": false,
+                    "findings": [],
+                    "blocking": [],
+                    "needsReplan": false,
+                    "unchecked": ["the error path"],
+                    "retryable": n < REVIEW_CONTINUATIONS,
+                })
+                .to_string())
+            })
+        });
+        hosts.insert("verify".to_string(), verify);
+
+        runtime
+            .run(
+                "run",
+                json!({ "issue": "x", "maxIterations": 3, "alwaysFork": false }).to_string(),
+                hosts,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reviews.load(std::sync::atomic::Ordering::SeqCst),
+            REVIEW_CONTINUATIONS + 1,
+            "the review is continued until Rust says the budget is spent, then once more never"
+        );
+    }
+
     /// Guards the whole class the behavioural test above catches one instance of.
     ///
     /// A host call is an `async function` call, so its value is a Promise until awaited — and a
@@ -11199,6 +11372,142 @@ mod tests {
     }
 
     #[test]
+    fn a_run_cannot_converge_on_a_review_that_did_not_finish() {
+        // A review cut short returns exactly what a clean one returns: no findings. Reading that as
+        // a verdict is how a run converged on a review that never happened — and it is the failure
+        // that gets WORSE as reviews get more thorough, because the more a verifier is asked to
+        // check, the more often "I ran out of room" is the honest answer.
+        let baseline = red(&["a"], &["b"], 1);
+        let clean_tests = imp(&["a"], &["b", "c"], 0);
+        let cut_short = verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: "traced the entry point".to_string(),
+            unchecked: vec!["the error path in session.rs".to_string()],
+        };
+        assert_eq!(
+            infer_status(
+                &baseline,
+                &clean_tests,
+                &[],
+                Some(&cut_short),
+                verifier::Severity::P2
+            ),
+            RunStatus::Unreviewed,
+            "an empty findings list from a review that could not finish is not a verdict"
+        );
+
+        // Not `Converged` and not `MaxIterationsReached`: the work may well be sound and the tests
+        // pass, so nothing here says the change is wrong. What is missing is the review, which is
+        // the same thing a verifier nobody could reach leaves missing.
+        let finished = verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: "traced every advertised path".to_string(),
+            unchecked: Vec::new(),
+        };
+        assert_eq!(
+            infer_status(
+                &baseline,
+                &clean_tests,
+                &[],
+                Some(&finished),
+                verifier::Severity::P2
+            ),
+            RunStatus::Converged,
+            "a review that finished and found nothing converges exactly as before"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_review_is_continued_over_what_it_named_until_its_bound() {
+        let unfinished = |area: &str| verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: "got part way".to_string(),
+            unchecked: vec![area.to_string()],
+        };
+
+        // Continuable while there is room: no findings to correct, an area named, budget left.
+        let first = verification_result(unfinished("the error path"), verifier::Severity::P2, true);
+        assert!(first.retryable, "a review that named a gap is continued");
+        assert_eq!(first.unchecked, ["the error path"]);
+
+        // At the bound it is not. Still not a pass: `unchecked` stands on the checkpoint, and
+        // `infer_status` reads it — so the script stops looping and the run reports `Unreviewed`.
+        let spent =
+            verification_result(unfinished("the error path"), verifier::Severity::P2, false);
+        assert!(!spent.retryable, "the continuation budget is finite");
+        assert_eq!(spent.unchecked, ["the error path"]);
+
+        // Blocking findings come first, whatever went unreached: the next pass reviews a changed
+        // tree, so continuing over this one's gaps would review something that no longer exists.
+        let blocked = verifier::VerifierOutput {
+            findings: vec![finding(verifier::Severity::P1)],
+            assessment: "found one and ran out of room".to_string(),
+            unchecked: vec!["the error path".to_string()],
+        };
+        let result = verification_result(blocked, verifier::Severity::P2, true);
+        assert!(
+            !result.retryable,
+            "a blocking finding is corrected before a gap is filled"
+        );
+        assert!(!result.blocking.is_empty());
+    }
+
+    #[test]
+    fn the_continuation_budget_is_counted_from_the_run_own_checkpoints() {
+        // Counted from the record rather than carried through the script, so a workflow calling
+        // `verify()` in a shape nobody anticipated is bounded the same way the bundled one is.
+        let unfinished = |area: &str| verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: String::new(),
+            unchecked: vec![area.to_string()],
+        };
+        let finished = verifier::VerifierOutput {
+            assessment: "done".to_string(),
+            ..Default::default()
+        };
+
+        let (carried, left) = review_continuations(&[]);
+        assert!(carried.is_empty() && left, "a first pass continues nothing");
+
+        let one = vec![review_checkpoint(
+            "verifier",
+            &unfinished("path A"),
+            None::<&&str>,
+        )];
+        let (carried, left) = review_continuations(&one);
+        assert_eq!(
+            carried,
+            ["path A"],
+            "the next pass is told what to continue over"
+        );
+        assert!(left);
+
+        let two = vec![
+            review_checkpoint("verifier", &unfinished("path A"), None::<&&str>),
+            review_checkpoint("verifier", &unfinished("path B"), None::<&&str>),
+        ];
+        let (carried, left) = review_continuations(&two);
+        assert_eq!(
+            carried,
+            ["path B"],
+            "the most recent gap is the one still open"
+        );
+        assert!(!left, "two incomplete reviews spend the budget");
+
+        // A review that finished does not count against it, and does not carry a gap forward.
+        let mixed = vec![
+            review_checkpoint("verifier", &unfinished("path A"), None::<&&str>),
+            review_checkpoint("verifier", &finished, None::<&&str>),
+        ];
+        let (carried, left) = review_continuations(&mixed);
+        assert_eq!(carried, ["path A"]);
+        assert!(
+            left,
+            "only reviews that could not finish spend continuations"
+        );
+    }
+
+    #[test]
     fn a_script_cannot_converge_over_a_review_it_ignored() {
         // Calling verify(), leaving blocking findings standing and returning is not convergence.
         // The status is inferred from the checkpoint, so ignoring the result is not an option the
@@ -11208,6 +11517,7 @@ mod tests {
         let blocked = verifier::VerifierOutput {
             findings: vec![finding(verifier::Severity::P1)],
             assessment: String::new(),
+            ..Default::default()
         };
         assert_eq!(
             infer_status(
@@ -11225,6 +11535,7 @@ mod tests {
         let nits = verifier::VerifierOutput {
             findings: vec![finding(verifier::Severity::P3)],
             assessment: String::new(),
+            ..Default::default()
         };
         assert_eq!(
             infer_status(
