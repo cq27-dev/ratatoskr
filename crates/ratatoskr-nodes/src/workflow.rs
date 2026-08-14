@@ -34,8 +34,8 @@ use serde_json::json;
 
 use crate::{
     AnalystOutput, BookkeeperInput, BookkeeperOutput, ChildTask, ImplementerNode,
-    ImplementerOutput, MemoryOutput, PlanError, PlanOutcome, RedTeamNode, RedTeamOutput,
-    RunOutcome, ScoutOutput, Stage, bookkeeper, checkpoint, converge,
+    ImplementerOutput, PlanError, PlanOutcome, RedTeamNode, RedTeamOutput, RunOutcome, Stage,
+    bookkeeper, checkpoint, converge,
     publisher::{PublisherInput, PublisherOutput},
     redteam, referee, verifier,
 };
@@ -539,7 +539,7 @@ fn status_with_unanswered_gap(
 /// converge loop, naming neither itself nor the calls it skipped.
 fn plan_entry_omitted(workflow: &str, error: PlanError) -> PlanError {
     match error {
-        PlanError::MissingCheckpoint(_, node @ ("scout" | "memory" | "analyst")) => {
+        PlanError::MissingCheckpoint(_, node @ ("context" | "analyst")) => {
             PlanError::Configuration(format!(
                 "workflow `{workflow}` returned from its `plan` entry with no `{node}` \
                  checkpoint. A `plan` entry must drive `context()` and `analyst()`: the plan is \
@@ -551,20 +551,17 @@ fn plan_entry_omitted(workflow: &str, error: PlanError) -> PlanError {
 }
 
 async fn reconstruct_plan(store: &Store, run_id: &str) -> Result<PlanOutcome, PlanError> {
-    // A run may have gathered context either way: one `context` checkpoint, or the separate
-    // `scout` and `memory` ones a script composing the older bindings still writes. Preferring the
-    // merged one and falling back keeps both replayable.
-    let merged: Option<crate::ContextOutput> =
-        latest_checkpoint(store, run_id, "context").await.ok();
-    let (scout, memory, brief, constraints) = match merged {
-        Some(c) => (c.scout, c.memory, c.brief, c.constraints),
-        None => (
-            latest_checkpoint::<ScoutOutput>(store, run_id, "scout").await?,
-            latest_checkpoint::<MemoryOutput>(store, run_id, "memory").await?,
-            String::new(),
-            Vec::new(),
-        ),
-    };
+    // One `context` checkpoint, and only that. The separate `scout` and `memory` checkpoints this
+    // used to fall back to are written by nothing: both stages were superseded by the composite
+    // `context` operation, and neither is a host a workflow can call. The fallback's only remaining
+    // effect was to report a missing `context` as a missing `scout`.
+    let gathered: crate::ContextOutput = latest_checkpoint(store, run_id, "context").await?;
+    let (scout, memory, brief, constraints) = (
+        gathered.scout,
+        gathered.memory,
+        gathered.brief,
+        gathered.constraints,
+    );
     let analyst: AnalystOutput = latest_checkpoint(store, run_id, "analyst").await?;
 
     let mut state = RunState::new(run_id, None);
@@ -3527,20 +3524,23 @@ mod tests {
             .upsert_run(run_id, None, RunStatus::Running.as_str())
             .await
             .unwrap();
+        // What a run actually writes: one `context` record holding both.
         checkpoint(
             store,
             run_id,
-            "scout",
-            &ScoutOutput {
-                related_items: Vec::new(),
-                papertrail_summary: String::new(),
+            "context",
+            &crate::ContextOutput {
+                brief: String::new(),
+                constraints: Vec::new(),
+                scout: crate::ScoutOutput {
+                    related_items: Vec::new(),
+                    papertrail_summary: String::new(),
+                },
+                memory: crate::MemoryOutput::default(),
             },
         )
         .await
         .unwrap();
-        checkpoint(store, run_id, "memory", &MemoryOutput::default())
-            .await
-            .unwrap();
         let analyst = AnalystOutput {
             impact_summary: "exercise terminal parity".to_string(),
             touched: Vec::new(),
@@ -4079,7 +4079,7 @@ mod tests {
         let error = error.to_string();
         for expected in [
             "incomplete-standard-plan",
-            "`scout`",
+            "`context`",
             "context()",
             "analyst()",
         ] {
@@ -4321,11 +4321,11 @@ mod tests {
                 says: "Rust owns terminal side effects".to_string(),
                 from_memory_id: "memory-terminal-boundary".to_string(),
             }],
-            scout: ScoutOutput {
+            scout: crate::ScoutOutput {
                 related_items: Vec::new(),
                 papertrail_summary: "standard-v1 is the built-in runtime".to_string(),
             },
-            memory: MemoryOutput::default(),
+            memory: crate::MemoryOutput::default(),
         };
         let context_calls = Arc::clone(&calls);
         let context_value = context_out.clone();
@@ -4609,11 +4609,11 @@ mod tests {
         let gathered = crate::ContextOutput {
             brief: "three fixes exposed three different faults".to_string(),
             constraints: Vec::new(),
-            scout: ScoutOutput {
+            scout: crate::ScoutOutput {
                 related_items: Vec::new(),
                 papertrail_summary: String::new(),
             },
-            memory: MemoryOutput::default(),
+            memory: crate::MemoryOutput::default(),
         };
         note(
             &ctx,
@@ -4801,11 +4801,11 @@ mod tests {
         let context_out = crate::ContextOutput {
             brief: String::new(),
             constraints: Vec::new(),
-            scout: ScoutOutput {
+            scout: crate::ScoutOutput {
                 related_items: Vec::new(),
                 papertrail_summary: String::new(),
             },
-            memory: MemoryOutput::default(),
+            memory: crate::MemoryOutput::default(),
         };
         hosts.insert(
             "context".to_string(),
@@ -10915,27 +10915,22 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_run("r1", None, "running").await.unwrap();
 
-        // No scout checkpoint yet → the script can't claim a plan without having run it.
+        // No context checkpoint yet → the script can't claim a plan without having gathered one.
         let missing = reconstruct_plan(&store, "r1").await;
         assert!(matches!(
             missing,
-            Err(PlanError::MissingCheckpoint(_, "scout"))
+            Err(PlanError::MissingCheckpoint(_, "context"))
         ));
 
+        // One record holding what the run gathered — the separate `scout` and `memory` rows this
+        // used to accept are written by nothing.
         store
             .insert_checkpoint(ratatoskr_store::CheckpointWrite {
                 run_id: "r1",
-                node_name: "scout",
-                output_json: r#"{"related_items":[],"papertrail_summary":"s"}"#,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        store
-            .insert_checkpoint(ratatoskr_store::CheckpointWrite {
-                run_id: "r1",
-                node_name: "memory",
-                output_json: r#"{"memories":[]}"#,
+                node_name: "context",
+                output_json: r#"{"brief":"b","constraints":[],
+                    "scout":{"related_items":[],"papertrail_summary":"s"},
+                    "memory":{"memories":[]}}"#,
                 ..Default::default()
             })
             .await

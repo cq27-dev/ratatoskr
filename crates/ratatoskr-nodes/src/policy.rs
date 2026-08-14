@@ -282,7 +282,6 @@ fn reads_as<T: serde::de::DeserializeOwned>(
 }
 
 const CONTRACT_CHECKS: &[(&str, ContractCheck)] = &[
-    ("ScoutOutput", reads_as::<crate::scout::ScoutOutput>),
     ("AnalystOutput", reads_as::<crate::analyst::AnalystOutput>),
     (
         "CharacterizerOutput",
