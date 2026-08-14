@@ -1091,12 +1091,37 @@ async fn run_detail(
     }
 
     let status = run.as_ref().map(|r| r.status.clone());
-    // Best-effort: an unreadable or missing config costs the planned facts and nothing else, and a
-    // dashboard that refused to show a run because its config moved would be worse than one that
-    // shows the run without them.
-    let config = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|t| ratatoskr_core::RatatoskrConfig::from_toml_str(&t).ok());
+    // A run that happened here is drawn against the config as it stands. That is deliberate: a node
+    // that has not run yet should say what it WILL run on, and the live file is that answer even
+    // when it has drifted since the run started.
+    //
+    // A run that came from somewhere else has no such future here. Its nodes will never run on this
+    // machine's routes, so reading them made a foreign run claim models it never had — or report
+    // `planned: None`, "this node has nowhere to run", when the far machine routed it perfectly
+    // well. Its own recorded config is the only honest answer, and `origin` is what separates the
+    // two: `None` for a run produced here.
+    //
+    // Failing to read a config costs the planned facts and nothing else — a dashboard that refused
+    // to show a run because its config moved would be worse than one that shows the run without
+    // them. But for an imported run, recording NOTHING and recording something unreadable are not
+    // the same failure. Nothing makes no claim, so the live file is a guess that displaces no
+    // answer. A recording this build cannot parse — a corrupted bundle, a config shape from a
+    // newer one — is an answer that exists and was not read, and substituting another machine's
+    // for it recreates exactly the false attribution above. That one reports no planned facts.
+    let live = || {
+        std::fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|t| ratatoskr_core::RatatoskrConfig::from_toml_str(&t).ok())
+    };
+    let config = match run.as_ref().filter(|run| run.origin.is_some()) {
+        Some(imported) => match imported.config_json.as_deref() {
+            Some(recorded) => {
+                serde_json::from_str::<ratatoskr_core::RatatoskrConfig>(recorded).ok()
+            }
+            None => live(),
+        },
+        None => live(),
+    };
     let shape_json = run.as_ref().and_then(|r| r.shape_json.as_deref());
     let recorded = ratatoskr_core::shape::recorded(shape_json);
     let nodes = pipeline::derive_from(status.as_deref(), &checkpoints, config.as_ref(), &recorded);
@@ -1507,6 +1532,12 @@ mod access_tests {
 
     /// One project of each visibility, and an empty identity database.
     async fn state() -> AppState {
+        state_with_config(PathBuf::from("ratatoskr.toml")).await
+    }
+
+    /// [`state`], with the projects' `ratatoskr.toml` at a path of the caller's choosing — for the
+    /// cases that turn on what the reader's own config says, rather than on there being none.
+    async fn state_with_config(config_path: PathBuf) -> AppState {
         let mut projects = BTreeMap::new();
         for (slug, visibility) in [("open", Visibility::Public), ("shut", Visibility::Private)] {
             projects.insert(
@@ -1516,7 +1547,7 @@ mod access_tests {
                     repository: Some(format!("cq27-dev/{slug}")),
                     dir: PathBuf::from("/tmp").join(slug),
                     visibility,
-                    config_path: PathBuf::from("ratatoskr.toml"),
+                    config_path: config_path.clone(),
                     store: ratatoskr_store::Store::open_in_memory().expect("in-memory store"),
                     log_dir: PathBuf::from("/tmp").join(slug).join("logs"),
                     launcher: Arc::new(launch::Launcher::new(
@@ -2338,6 +2369,184 @@ mod access_tests {
                 ratatoskr_core::Directive::Continue
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_imported_runs_unreadable_recording_reports_nothing_rather_than_the_readers_config()
+    {
+        // Recording NOTHING and recording something unreadable are different failures. Nothing
+        // makes no claim, so the reader's own config displaces no answer. A recording this build
+        // cannot parse — a corrupted bundle, a shape from a newer one — is an answer that exists
+        // and was not read, and showing this machine's models in its place is the false
+        // attribution the whole change exists to remove, restored by the fallback.
+        //
+        // The reader's config is READABLE here, which is what makes the assertion mean anything:
+        // there is a wrong answer available to fall through to.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-reader-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("ratatoskr.toml");
+        // A whole config, because that is what one is: `from_toml_str` reads the shape the file
+        // has, not a fragment of it.
+        let mut ours = ratatoskr_core::RatatoskrConfig::default();
+        ours.models.insert(
+            "analyst".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "ours".to_string(),
+                model: "our-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: ratatoskr_core::SessionScope::Fresh,
+            },
+        );
+        std::fs::write(&config_path, toml::to_string(&ours).unwrap()).unwrap();
+        let state = state_with_config(config_path).await;
+        let store = &state.projects["open"].store;
+        let shape = serde_json::json!({
+            "nodes": [],
+            "stages": [{"id": "analyst", "node": "analyst"}],
+        })
+        .to_string();
+        for (id, recorded) in [("unreadable", "{\"models\":"), ("silent", "")] {
+            store.upsert_run(id, None, "converged").await.unwrap();
+            store
+                .record_run_provenance(
+                    id,
+                    Some(recorded).filter(|raw| !raw.is_empty()),
+                    None,
+                    None,
+                    Some(&shape),
+                    None,
+                )
+                .await
+                .unwrap();
+            store
+                .insert_checkpoint(ratatoskr_store::CheckpointWrite {
+                    run_id: id,
+                    node_name: "analyst",
+                    output_json: "{}",
+                    input_json: None,
+                    iteration: None,
+                    telemetry: Default::default(),
+                })
+                .await
+                .unwrap();
+            store.set_origin(id, "someone-else").await.unwrap();
+        }
+
+        let planned = |id: &'static str| {
+            let state = state.clone();
+            async move {
+                let response = router(state, None)
+                    .oneshot(get(&format!("/api/projects/open/runs/{id}"), None))
+                    .await
+                    .expect("the router to answer");
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                    .await
+                    .expect("a run detail body");
+                let detail: serde_json::Value = serde_json::from_slice(&bytes).expect("run detail");
+                detail["nodes"][0]["planned"].clone()
+            }
+        };
+
+        assert!(
+            planned("unreadable").await.is_null(),
+            "a recording that could not be read was replaced by the reader's own config"
+        );
+        // And the absent case still falls through, which is the behaviour a run recorded before
+        // provenance travelled with it has always had.
+        assert_eq!(
+            planned("silent").await["model"],
+            serde_json::json!("ours/our-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_imported_run_plans_against_the_config_it_recorded_not_the_readers() {
+        // Two runs identical but for `origin`. The reader's own `ratatoskr.toml` does not exist in
+        // this harness, so the live config contributes nothing — which is what makes the assertion
+        // sharp in both directions: the imported run's planned route can only have come from its
+        // own recording, and the local run's absence proves the recording was not read for it.
+        let state = state().await;
+        let store = &state.projects["open"].store;
+        // Serialized the same way `record_provenance` writes it: the run's whole resolved config,
+        // not a fragment, so what this reads back is what a real recording round-trips.
+        let mut theirs = ratatoskr_core::RatatoskrConfig::default();
+        theirs.models.insert(
+            "analyst".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "elsewhere".to_string(),
+                model: "their-model".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                // Not the default, so what the reader reports about the scope can only have come
+                // from this route: the recorded declaration is resolved against the recorded
+                // route, which is the other half of the same problem.
+                session: ratatoskr_core::SessionScope::Reuse,
+            },
+        );
+        let recorded = serde_json::to_string(&theirs).expect("a serializable config");
+        let shape = serde_json::json!({
+            "nodes": [],
+            "stages": [{"id": "analyst", "node": "analyst"}],
+        })
+        .to_string();
+        for id in ["imported", "local"] {
+            store.upsert_run(id, None, "converged").await.unwrap();
+            store
+                .record_run_provenance(id, Some(&recorded), None, None, Some(&shape), None)
+                .await
+                .unwrap();
+            store
+                .insert_checkpoint(ratatoskr_store::CheckpointWrite {
+                    run_id: id,
+                    node_name: "analyst",
+                    output_json: "{}",
+                    input_json: None,
+                    iteration: None,
+                    telemetry: Default::default(),
+                })
+                .await
+                .unwrap();
+        }
+        store.set_origin("imported", "someone-else").await.unwrap();
+
+        let planned = |id: &'static str| {
+            let state = state.clone();
+            async move {
+                let response = router(state, None)
+                    .oneshot(get(&format!("/api/projects/open/runs/{id}"), None))
+                    .await
+                    .expect("the router to answer");
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                    .await
+                    .expect("a run detail body");
+                let detail: serde_json::Value = serde_json::from_slice(&bytes).expect("run detail");
+                detail["nodes"][0]["planned"].clone()
+            }
+        };
+
+        assert_eq!(
+            planned("imported").await["model"],
+            serde_json::json!("elsewhere/their-model"),
+            "a foreign run's boxes must not claim this machine's routes"
+        );
+        assert_eq!(
+            planned("imported").await["sessions"],
+            serde_json::json!(["reuse"]),
+            "the recorded session declaration resolves against the recorded route"
+        );
+        assert!(
+            planned("local").await.is_null(),
+            "a local run is drawn against the config as it stands, not the one it recorded"
+        );
     }
 
     #[tokio::test]
