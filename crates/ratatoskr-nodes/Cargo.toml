@@ -29,6 +29,9 @@ tracing.workspace = true
 # compose a node is name-matched across this boundary, and a test on either side of it alone passes
 # its own fixture names in.
 ratatoskr-serve.workspace = true
+# So the checkpoint event's own shape can be asserted: what a record omits is a contract, and
+# reading it back off a hand-written fixture would pin the reader rather than the producer.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

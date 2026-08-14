@@ -265,7 +265,9 @@ impl NodeTelemetryView {
             .iter()
             .filter_map(|stage| rows.get(stage)?.last())
             .map(|c| c.telemetry.clone())
-            .filter(|t| t.model.is_some())
+            // The same question the event contract asks, asked through the same predicate: a row an
+            // operation host wrote covers no turn, and its zeros are defaults rather than figures.
+            .filter(ratatoskr_core::NodeTelemetry::ran_a_model)
             .reduce(|mut folded, next| {
                 folded.fold(next);
                 folded

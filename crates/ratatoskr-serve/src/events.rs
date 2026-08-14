@@ -91,10 +91,18 @@ pub struct LiveUsage {
 }
 
 impl LiveUsage {
-    /// Read them off a `usage` record. `None` for every other kind.
+    /// Read them off a `usage` or `checkpoint` record. `None` for every other kind, and `None` for
+    /// a record that reports no cost at all.
     ///
     /// The keys are dotted OpenTelemetry names (`gen_ai.usage.input_tokens`), which are flat keys
     /// in the JSON rather than nested objects — a `pointer()` lookup would find nothing.
+    ///
+    /// Absence and zero are different answers and must stay so. A checkpoint written by an
+    /// operation host covers no turn, so it carries none of these keys; returning a zeroed struct
+    /// for it would say the node used nothing, which is a claim. That claim is what let a fold
+    /// overwrite a composed box's real numbers with an aggregate's zeros (#124), and returning
+    /// `None` here is what stops the next reader reintroducing it — a zero that IS present is a
+    /// measurement and still reads as one.
     fn of(record: &Value) -> Option<Self> {
         if !matches!(
             record.get("kind").and_then(Value::as_str)?,
@@ -102,14 +110,26 @@ impl LiveUsage {
         ) {
             return None;
         }
-        let n = |k: &str| record.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let n = |k: &str| record.get(k).and_then(Value::as_u64);
+        let spent = [
+            "gen_ai.usage.input_tokens",
+            "gen_ai.usage.output_tokens",
+            "gen_ai.usage.cached_input_tokens",
+            "gen_ai.usage.cache_creation_input_tokens",
+            "gen_ai.usage.reasoning_tokens",
+        ];
+        // Any of them, rather than one chosen as the sentinel: a producer that reported output
+        // without input would otherwise have its cost read as no cost at all.
+        if !spent.iter().any(|key| record.get(key).is_some()) {
+            return None;
+        }
         Some(LiveUsage {
-            input_tokens: n("gen_ai.usage.input_tokens"),
-            output_tokens: n("gen_ai.usage.output_tokens"),
-            cached_input_tokens: n("gen_ai.usage.cached_input_tokens"),
-            cache_creation_input_tokens: n("gen_ai.usage.cache_creation_input_tokens"),
-            reasoning_tokens: n("gen_ai.usage.reasoning_tokens"),
-            duration_ms: n("duration_ms"),
+            input_tokens: n(spent[0]).unwrap_or(0),
+            output_tokens: n(spent[1]).unwrap_or(0),
+            cached_input_tokens: n(spent[2]).unwrap_or(0),
+            cache_creation_input_tokens: n(spent[3]).unwrap_or(0),
+            reasoning_tokens: n(spent[4]).unwrap_or(0),
+            duration_ms: n("duration_ms").unwrap_or(0),
         })
     }
 }
@@ -261,10 +281,9 @@ fn to_event(record: &Value) -> LiveEvent {
         question_id: str_field("question_id").map(str::to_string),
         facts: LiveNodeFacts::of(record),
         usage: LiveUsage::of(record),
-        turns: record
-            .get("turns")
-            .and_then(Value::as_u64)
-            .filter(|t| *t > 0),
+        // No `> 0` filter: the producer omits `turns` entirely when it has none, so a zero that
+        // arrives is one a turn actually reported rather than a default standing in for absence.
+        turns: record.get("turns").and_then(Value::as_u64),
         error: str_field("error")
             .filter(|e| !e.is_empty())
             .map(str::to_string),
@@ -541,6 +560,45 @@ mod tests {
         let usage = e.usage.expect("a checkpoint reports what it cost");
         assert_eq!(usage.cached_input_tokens, 1_065_945);
         assert_eq!(usage.duration_ms, 339_000);
+    }
+
+    #[test]
+    fn a_record_that_reports_no_cost_is_told_apart_from_one_that_cost_nothing() {
+        // The distinction the whole cost contract rests on. A checkpoint an operation host wrote —
+        // the aggregate under `redteam`, `implementer` or `context` — covers no model turn, so it
+        // carries none of the usage keys and reports no cost. Reading a zeroed struct for it says
+        // the node used nothing, which is a claim; that claim is what let a fold overwrite a
+        // composed box's real numbers with an aggregate's zeros.
+        let aggregate: Value = serde_json::from_str(
+            r#"{"timestamp":"t","kind":"checkpoint","node":"redteam","bytes":120,
+                "tools":"","tools_used":"","thinking":false,"reuses_session":false,
+                "spans":[{"run_id":"r1"}]}"#,
+        )
+        .unwrap();
+        let e = to_event(&aggregate);
+        assert!(e.usage.is_none(), "a turn-less record must report no cost");
+        assert!(e.turns.is_none(), "nor a turn count it does not have");
+        assert!(e.facts.is_none(), "nor a route it never resolved");
+
+        // And a turn that genuinely spent nothing still reports: the keys are there, and a zero
+        // among them is a measurement. An endpoint that makes a real call and counts nothing must
+        // not read as a node that never ran.
+        let free: Value = serde_json::from_str(
+            r#"{"timestamp":"t","kind":"checkpoint","node":"analyst","model":"p/m","turns":1,
+                "tools":"","tools_used":"","thinking":false,"reuses_session":false,
+                "duration_ms":90,"gen_ai.usage.input_tokens":0,
+                "gen_ai.usage.output_tokens":0,"gen_ai.usage.cached_input_tokens":0,
+                "gen_ai.usage.cache_creation_input_tokens":0,
+                "gen_ai.usage.reasoning_tokens":0,"spans":[{"run_id":"r1"}]}"#,
+        )
+        .unwrap();
+        let e = to_event(&free);
+        let usage = e
+            .usage
+            .expect("a turn that cost nothing still reports cost");
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.duration_ms, 90);
+        assert_eq!(e.turns, Some(1));
     }
 
     #[test]

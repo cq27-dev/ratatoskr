@@ -886,14 +886,15 @@ test("a checkpoint is costed when a turn happened, not when it spent tokens", ()
   expect(drawn[0].telemetry.model).toBe("an endpoint that counts nothing");
   expect(drawn[0].telemetry.input_tokens).toBe(0);
 
-  // And the box's own aggregate still is not a turn: it carries the usage keys as zeros because it
-  // covers nothing, and the server gives it no facts and no turns.
+  // And the box's own aggregate still is not a turn — now because it reports no cost at all rather
+  // than because a guard doubted the zeros it used to carry. A record covering no turn carries none
+  // of the usage keys, so the server sends no `usage` for it, and there is nothing to mistake for a
+  // measurement of nothing.
   const aggregate = {
     at: "t3",
     kind: "checkpoint",
     node: "redteam",
     detail: "",
-    usage: { ...noCounts.usage, duration_ms: 0 },
   };
   const composed = registry(["redteam", "redteam_classifier"]);
   expect(nodesFromEvents(inNodeBoxes([aggregate], composed)).get("redteam").costed).toBe(false);

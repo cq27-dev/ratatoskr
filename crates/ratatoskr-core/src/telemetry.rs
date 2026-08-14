@@ -95,6 +95,20 @@ pub struct NodeTelemetry {
 }
 
 impl NodeTelemetry {
+    /// Whether this record covers a model turn at all.
+    ///
+    /// The one answer to it, because the question is asked in several places and two spellings of
+    /// it drift. A record written by an operation host — the aggregate under `redteam`,
+    /// `implementer` or `context` — covers no turn of its own, and every cost field on it is a
+    /// default rather than a measurement.
+    ///
+    /// Read off the route rather than the turn count: a turn that failed before completing a call
+    /// still resolved a route and may still have been billed, and reporting nothing for it would
+    /// lose real cost. [`Self::usage`] is only a claim when this is true.
+    pub fn ran_a_model(&self) -> bool {
+        self.model.is_some()
+    }
+
     /// Fold another turn recorded under the same node into this one.
     ///
     /// One checkpoint can cover several model turns: the red team's classifier and its test author

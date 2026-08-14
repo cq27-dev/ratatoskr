@@ -223,24 +223,33 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
         .await?;
     // The third structured event: a node produced output. Tool calls and model text come from
     // the agent's observability hook; this is what says a node actually finished.
+    // What the record does not have, the event does not claim. A `None` field records nothing at
+    // all — tracing drops it rather than writing a default — so absent stays absent all the way to
+    // the JSON, and a reader can tell "this turn cost nothing" from "this record reports no cost".
+    //
+    // The cost group hangs on `ran_a_model` because `TokenUsage` has no absent state of its own:
+    // its zeros are what a checkpoint written by an operation host would otherwise assert, and a
+    // node that used zero tokens is a claim rather than an absence. Everything else is already
+    // optional and simply travels as it is.
+    let spent = logged.ran_a_model().then_some(&logged.usage);
     tracing::info!(
         kind = "checkpoint",
         node = r.node,
         bytes = json.len(),
         iteration = r.iteration,
-        model = logged.model.as_deref().unwrap_or_default(),
+        model = logged.model.as_deref(),
         tools = logged.tools.join(","),
         tools_used = logged.tools_used.join(","),
         thinking = logged.thinking,
         reuses_session = logged.reuses_session,
-        turns = logged.turns.unwrap_or_default(),
-        error = logged.error.as_deref().unwrap_or_default(),
-        duration_ms = logged.duration_ms.unwrap_or_default(),
-        "gen_ai.usage.input_tokens" = logged.usage.input_tokens,
-        "gen_ai.usage.output_tokens" = logged.usage.output_tokens,
-        "gen_ai.usage.cached_input_tokens" = logged.usage.cached_input_tokens,
-        "gen_ai.usage.cache_creation_input_tokens" = logged.usage.cache_creation_input_tokens,
-        "gen_ai.usage.reasoning_tokens" = logged.usage.reasoning_tokens,
+        turns = logged.turns,
+        error = logged.error.as_deref(),
+        duration_ms = logged.duration_ms,
+        "gen_ai.usage.input_tokens" = spent.map(|u| u.input_tokens),
+        "gen_ai.usage.output_tokens" = spent.map(|u| u.output_tokens),
+        "gen_ai.usage.cached_input_tokens" = spent.map(|u| u.cached_input_tokens),
+        "gen_ai.usage.cache_creation_input_tokens" = spent.map(|u| u.cache_creation_input_tokens),
+        "gen_ai.usage.reasoning_tokens" = spent.map(|u| u.reasoning_tokens),
         "checkpoint"
     );
     Ok(())
@@ -998,6 +1007,122 @@ pub(crate) fn with_conventions(node: &str, conventions: Option<&str>, base: Stri
         "repository conventions injected into node preamble"
     );
     format!("{conventions}\n\n{base}")
+}
+
+#[cfg(test)]
+mod checkpoint_event_tests {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("buffer mutex").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+        type Writer = Buffer;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Emit one checkpoint through the real path and read back the JSON it produced.
+    ///
+    /// `None` is the aggregate case: an operation host writes its record with no turn to claim, so
+    /// `record` folds in a default telemetry exactly as it does in a run.
+    async fn checkpoint_record(
+        telemetry: Option<ratatoskr_core::NodeTelemetry>,
+    ) -> serde_json::Value {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let store = ratatoskr_store::Store::open_in_memory().expect("in-memory store");
+        store
+            .upsert_run("r1", None, "running")
+            .await
+            .expect("a run row");
+        let ledger = std::sync::Arc::new(ratatoskr_agent::RunLedger::default());
+        if let Some(telemetry) = telemetry {
+            ledger.record("redteam", telemetry);
+        }
+        let buf = Buffer::default();
+        // The same layer options `init_logging` installs — a shape assertion against a differently
+        // configured sink would pin nothing that ships.
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(true)
+            .with_writer(buf.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let guard = tracing::subscriber::set_default(subscriber);
+        super::record(super::Record {
+            store: &store,
+            run_id: "r1",
+            node: "redteam",
+            output: &serde_json::json!({ "ok": true }),
+            input: None,
+            iteration: None,
+            ledger: Some(&ledger),
+        })
+        .await
+        .expect("the checkpoint to be written");
+        drop(guard);
+
+        let raw = String::from_utf8(buf.0.lock().expect("buffer mutex").clone()).expect("utf-8");
+        raw.lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("one JSON object"))
+            .find(|record| record["kind"] == "checkpoint")
+            .expect("a checkpoint record")
+    }
+
+    #[tokio::test]
+    async fn a_turn_less_checkpoint_reports_no_cost_rather_than_zero() {
+        // What the record does not have, the event must not claim. A checkpoint an operation host
+        // writes covers no model turn of its own, so every cost field on it would be a default
+        // standing in for a measurement — and "this node used zero tokens" is a claim, not an
+        // absence. A reader cannot tell the two apart once the keys are there.
+        let record = checkpoint_record(None).await;
+        for key in [
+            "gen_ai.usage.input_tokens",
+            "gen_ai.usage.output_tokens",
+            "gen_ai.usage.cached_input_tokens",
+            "gen_ai.usage.cache_creation_input_tokens",
+            "gen_ai.usage.reasoning_tokens",
+            "turns",
+            "duration_ms",
+            "model",
+            "error",
+        ] {
+            assert!(
+                record.get(key).is_none(),
+                "a turn-less checkpoint claimed `{key}`: {record}"
+            );
+        }
+        // It still says a node produced output, which is the whole point of the event.
+        assert_eq!(record["node"], "redteam");
+
+        // And a turn that genuinely spent nothing reports every figure, because each is then a
+        // measurement. An endpoint that makes a real call and counts nothing must not be
+        // indistinguishable from a node that never ran.
+        let free = checkpoint_record(Some(ratatoskr_core::NodeTelemetry {
+            model: Some("p/m".to_string()),
+            turns: Some(1),
+            duration_ms: Some(90),
+            ..Default::default()
+        }))
+        .await;
+        assert_eq!(free["gen_ai.usage.input_tokens"], 0);
+        assert_eq!(free["gen_ai.usage.reasoning_tokens"], 0);
+        assert_eq!(free["turns"], 1);
+        assert_eq!(free["model"], "p/m");
+    }
 }
 
 #[cfg(test)]
