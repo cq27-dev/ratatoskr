@@ -778,6 +778,19 @@ export const verifier = {
       }
       question += "\n";
     }
+    const unchecked = input.unchecked || [];
+    if (unchecked.length > 0) {
+      question +=
+        "YOU ARE CONTINUING A REVIEW. An earlier pass over this same change reached the end of " +
+        "what it could and named these as unreached. The session is fresh, so this list is all " +
+        "that survived of it — start here rather than beginning the change again:\n";
+      for (const area of unchecked) question += `- ${area}\n`;
+      question +=
+        "\nCover these first. Report anything else you notice, but this is what the pass exists " +
+        "for. If you again cannot reach the end, name what remains in `unchecked` — the same " +
+        "answer is still better than a clean bill you cannot support. Leave `unchecked` empty " +
+        "only when nothing above is outstanding.\n\n";
+    }
     question += `THE CHANGE:\n${input.diff}\n`;
     return question;
   },

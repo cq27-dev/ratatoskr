@@ -1189,27 +1189,37 @@ fn verification_result(
 /// spend refusing to finish one.
 const REVIEW_CONTINUATIONS: usize = 2;
 
-/// What earlier passes in this run said they could not reach, and whether another may be spent.
+/// What the review of THIS tree said it could not reach, and whether another pass may be spent.
+///
+/// The chain is the reviews since the last implementer checkpoint, not every review in the run. An
+/// `iterate()` rewrites the tree under them, so a gap named against the old one is a gap in code
+/// that may no longer exist — pointing the next pass at it would focus it on something already
+/// gone — and the budget for reviewing a tree nobody has reviewed yet has not been spent. Without
+/// the reset, two incomplete passes before a fix left the fresh review with no continuations at
+/// all, reported `Unreviewed` on the first thing it could not finish.
+///
+/// Carried only from the review immediately before this one, and only if that one was incomplete: a
+/// review that finished ends the chain, and nothing after it is continuing anything.
 ///
 /// Counted from the checkpoints rather than carried through the script, so a workflow that calls
 /// `verify()` in a shape nobody anticipated is bounded the same way the bundled one is.
 fn review_continuations(checkpoints: &[ratatoskr_store::Checkpoint]) -> (Vec<String>, bool) {
-    let incomplete: Vec<&ratatoskr_store::Checkpoint> = checkpoints
+    let chain = checkpoints
+        .iter()
+        .rposition(|checkpoint| checkpoint.node_name == "implementer")
+        .map_or(0, |last| last + 1);
+    let reviews: Vec<verifier::VerifierOutput> = checkpoints[chain..]
         .iter()
         .filter(|checkpoint| checkpoint.node_name == "verifier")
-        .filter(|checkpoint| {
-            serde_json::from_str::<verifier::VerifierOutput>(&checkpoint.output_json)
-                .is_ok_and(|out| !out.complete())
-        })
+        .filter_map(|checkpoint| serde_json::from_str(&checkpoint.output_json).ok())
         .collect();
-    let unchecked = incomplete
+    let unchecked = reviews
         .last()
-        .and_then(|checkpoint| {
-            serde_json::from_str::<verifier::VerifierOutput>(&checkpoint.output_json).ok()
-        })
-        .map(|out| out.unchecked)
+        .filter(|review| !review.complete())
+        .map(|review| review.unchecked.clone())
         .unwrap_or_default();
-    (unchecked, incomplete.len() < REVIEW_CONTINUATIONS)
+    let spent = reviews.iter().filter(|review| !review.complete()).count();
+    (unchecked, spent < REVIEW_CONTINUATIONS)
 }
 
 /// `verify({ analyst })` — read the worktree's diff against the plan.
@@ -11371,6 +11381,36 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn the_shipped_verifier_renders_the_gap_it_is_being_asked_to_continue_over() {
+        // The carried areas reach the model only if the renderer puts them in the question. The
+        // verifier's session is `fresh`, so nothing else survives from the pass that named them:
+        // a renderer that ignores `unchecked` leaves the continuation reviewing the original task
+        // and diff again, free to return complete without ever looking at the gap — and the run
+        // then converges on exactly the review this whole change exists to refuse.
+        let runtime = standard_runtime().await.unwrap();
+        let verifier = runtime
+            .meta()
+            .stages
+            .iter()
+            .find(|stage| stage.id == "verifier")
+            .expect("the bundled registry declares a verifier");
+        let renderer = verifier
+            .question_renderer
+            .as_deref()
+            .expect("the verifier renders its own question");
+        assert!(
+            renderer.contains("unchecked"),
+            "the verifier's question renderer drops the areas it is being asked to continue over"
+        );
+        assert_eq!(
+            verifier.session,
+            Some(ratatoskr_core::SessionScope::Fresh),
+            "if this stops being fresh, the carried areas are no longer the only thing that \
+             survives a pass — revisit what the renderer has to say"
+        );
+    }
+
     #[test]
     fn a_run_cannot_converge_on_a_review_that_did_not_finish() {
         // A review cut short returns exactly what a clean one returns: no findings. Reading that as
@@ -11494,17 +11534,65 @@ mod tests {
         );
         assert!(!left, "two incomplete reviews spend the budget");
 
-        // A review that finished does not count against it, and does not carry a gap forward.
+        // A review that finished ends the chain: nothing after it is continuing anything, and it
+        // does not spend a continuation.
         let mixed = vec![
             review_checkpoint("verifier", &unfinished("path A"), None::<&&str>),
             review_checkpoint("verifier", &finished, None::<&&str>),
         ];
         let (carried, left) = review_continuations(&mixed);
-        assert_eq!(carried, ["path A"]);
+        assert!(
+            carried.is_empty(),
+            "a finished review carries no gap forward"
+        );
         assert!(
             left,
             "only reviews that could not finish spend continuations"
         );
+    }
+
+    #[test]
+    fn a_gap_named_against_a_tree_the_implementer_has_since_rewritten_is_not_carried() {
+        // `iterate()` rewrites the tree under a review. A gap named against the old one is a gap in
+        // code that may no longer exist, so pointing the next pass at it would focus it on
+        // something already gone — and the budget for reviewing a tree nobody has reviewed yet has
+        // not been spent. Without the reset, two incomplete passes before a fix left the fresh
+        // review with no continuations at all and reported `Unreviewed` on the first gap it hit.
+        let unfinished = |area: &str| verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: String::new(),
+            unchecked: vec![area.to_string()],
+        };
+        let blocked = verifier::VerifierOutput {
+            findings: vec![finding(verifier::Severity::P1)],
+            assessment: String::new(),
+            unchecked: vec!["the old tree's error path".to_string()],
+        };
+
+        let after_a_fix = vec![
+            review_checkpoint("verifier", &unfinished("path A"), None::<&&str>),
+            review_checkpoint("verifier", &blocked, None::<&&str>),
+            review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
+        ];
+        let (carried, left) = review_continuations(&after_a_fix);
+        assert!(
+            carried.is_empty(),
+            "the new tree's review must not be aimed at the old tree's gap: {carried:?}"
+        );
+        assert!(
+            left,
+            "passes on a tree that has since been rewritten must not exhaust the budget for the new one"
+        );
+
+        // And within one tree the chain still accumulates, so the bound is a bound.
+        let same_tree = vec![
+            review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
+            review_checkpoint("verifier", &unfinished("path A"), None::<&&str>),
+            review_checkpoint("verifier", &unfinished("path B"), None::<&&str>),
+        ];
+        let (carried, left) = review_continuations(&same_tree);
+        assert_eq!(carried, ["path B"]);
+        assert!(!left);
     }
 
     #[test]
