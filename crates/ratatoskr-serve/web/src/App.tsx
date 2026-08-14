@@ -35,7 +35,6 @@ import {
   getRun,
   followRun,
   listProjects,
-  isTerminal,
   listRuns,
   mayAct,
   whoami,
@@ -418,7 +417,7 @@ export default function App() {
    * the end of a run that has stopped, the store settles it. Passed only when the cursor is at the
    * live end — mid-run the stream is still the authority. See `applyDerived`.
    */
-  const ended = detail && cursor === null && isTerminal(detail.status) ? detail.status : null;
+  const ended = detail && cursor === null && detail.terminal ? detail.status : null;
   const graphNodes = useMemo(() => {
     if (!detail) return [];
     // Nothing until both halves are in. The detail arrives first and the history a moment later,
@@ -608,7 +607,7 @@ export default function App() {
                 // Only for a run still executing. A finished run has nothing to pause, and
                 // controls that could never do anything are worse than none: they invite a click
                 // and then explain themselves.
-                project && runId && !isTerminal(detail.status) ? (
+                project && runId && !detail.terminal ? (
                   <Controls
                     project={project}
                     runId={runId}

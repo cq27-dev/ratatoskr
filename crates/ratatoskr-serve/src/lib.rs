@@ -973,6 +973,12 @@ struct RunDetail {
     /// `None` for a run with checkpoints but no `runs` row — possible because the schema's
     /// foreign key isn't enforced and the scripted path checkpoints the issue first.
     status: Option<String>,
+    /// Whether `status` is one a run stops at. Answered here because [`RunStatus`] is where the
+    /// classification lives and is exhaustive over it — a client keeping its own list has to be
+    /// told about every new status, and is wrong until it is. Open-world in the same direction the
+    /// enum is: a status this build does not know reads as still in flight, which shows a stale run
+    /// rather than declaring a live one finished.
+    terminal: bool,
     issue_id: Option<String>,
     updated_at: Option<String>,
     /// The run's subject, from the `issue` pseudo-checkpoint. `runs.issue_id` is unset by the
@@ -1137,6 +1143,7 @@ async fn run_detail(
     Ok(Json(RunDetail {
         control,
         run_id,
+        terminal: pipeline::is_terminal(status.as_deref()),
         status,
         issue_id: run.as_ref().and_then(|r| r.issue_id.clone()),
         updated_at: run.as_ref().map(|r| r.updated_at.clone()),

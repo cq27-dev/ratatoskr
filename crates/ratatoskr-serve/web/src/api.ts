@@ -99,29 +99,6 @@ export interface Me {
 }
 
 /** Whether this role may start runs and answer clarifications. */
-/**
- * Whether a run has stopped executing. Mirrors `RunStatus::is_terminal` on the server, and the
- * same two-sided rule applies: a status this build has never heard of reads as still executing,
- * which shows a stale run rather than declaring a live one finished.
- *
- * So the terminal ones are listed, and everything else — including a status from a newer server —
- * is in flight. Excluding the in-flight names instead read every unknown as finished, which is the
- * direction that hides a live run's controls.
- */
-const TERMINAL: ReadonlySet<string> = new Set<RunStatus>([
-  "planned",
-  "converged",
-  "max_iterations_reached",
-  "unreviewed",
-  "no_code_change",
-  "failed",
-  "abandoned",
-]);
-
-export function isTerminal(status: RunStatus | null): boolean {
-  return status !== null && TERMINAL.has(status);
-}
-
 export function mayAct(role: Role | undefined): boolean {
   return role === "operator" || role === "admin";
 }
@@ -147,6 +124,10 @@ export interface RunDetail {
   run_id: string;
   /** Null for a run with checkpoints but no `runs` row. */
   status: RunStatus | null;
+  /** Whether `status` is one a run stops at, classified by the server against the enum that
+   *  defines it. A list kept here instead would have to be told about every new status, and would
+   *  be wrong until it was. */
+  terminal: boolean;
   issue_id: string | null;
   updated_at: string | null;
   issue: string | null;
