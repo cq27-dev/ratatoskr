@@ -273,26 +273,18 @@ async fn record_provenance(
     // *running* workflow declared — recording this build's own would draw every run against a
     // pipeline it may never have executed.
     let shape_json = serde_json::to_string(shape)?;
+    // The store refuses provenance for a run that is not there, so a write that returns is a write
+    // that landed. Every control is addressed to the box a stage belongs to, and that mapping is
+    // only in the registry, so a run without it cannot be stopped or steered.
     store
         .record_run_provenance(run_id, None, None, None, Some(&shape_json), None)
-        .await?;
-    // Written AND landed. Provenance is recorded with an `UPDATE ... WHERE run_id = ?`, which
-    // matches nothing and reports success when the run row is absent — so asking the store back is
-    // the only thing that distinguishes a registry that is there from one that was merely sent.
-    let recorded = store
-        .run(run_id)
-        .await?
-        .is_some_and(|run| run.shape_json.is_some());
-    if !recorded {
-        return Err(PlanError::node(
-            "workflow",
-            NodeError::Failed(format!(
-                "the run's stage registry did not record against run `{run_id}`. Every control is \
-                 addressed to the box a stage belongs to, and that mapping is only in the \
-                 registry, so a run without it cannot be stopped or steered"
-            )),
-        ));
-    }
+        .await
+        .map_err(|e| {
+            PlanError::node(
+                "workflow",
+                NodeError::Failed(format!("the run's stage registry did not record: {e}")),
+            )
+        })?;
 
     let config_json = serde_json::to_string(config)
         .inspect_err(|e| tracing::warn!("could not record the run's config: {e}"))

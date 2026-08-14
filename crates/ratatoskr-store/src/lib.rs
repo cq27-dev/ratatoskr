@@ -60,6 +60,8 @@ pub enum StoreError {
     Bundle(String),
     #[error("`{0}` names more than one run — use more of the id")]
     AmbiguousRun(String),
+    #[error("no run `{0}` to record provenance against")]
+    NoSuchRun(String),
     #[error(
         "this bundle is format version {found}; this build reads up to {}. Update ratatoskr to read it",
         crate::bundle::FORMAT_VERSION
@@ -319,7 +321,7 @@ impl Store {
             let conn = conn.lock().expect("store mutex poisoned");
             // COALESCE on the stored side, for the same reason `upsert_run` uses it on the incoming
             // side: provenance is written once, and a later call that knows less must not erase it.
-            conn.execute(
+            let changed = conn.execute(
                 "UPDATE runs SET
                      config_json = COALESCE(config_json, ?2),
                      graph_hash  = COALESCE(graph_hash, ?3),
@@ -336,7 +338,15 @@ impl Store {
                     image_digest
                 ],
             )?;
-            Ok::<_, StoreError>(())
+            // `UPDATE ... WHERE run_id = ?` matches nothing and reports success when the run row is
+            // absent, so the row count is the only thing separating provenance that landed from
+            // provenance that was merely sent. Answered here rather than by each caller reading the
+            // run back: there is no legitimate provenance for a run that does not exist, and a
+            // caller that has to notice on its own is a caller that can forget to.
+            match changed {
+                0 => Err(StoreError::NoSuchRun(run_id)),
+                _ => Ok(()),
+            }
         })
         .await?
     }

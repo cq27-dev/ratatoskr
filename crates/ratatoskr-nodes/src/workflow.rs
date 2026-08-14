@@ -11368,6 +11368,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let engine = ScriptEngine::load(&dir).await.unwrap();
         let store = Store::open_in_memory().unwrap();
+        // The digest is pinned by writing it to the run's row, so the row has to exist — without it
+        // the write lands nowhere and the pin this test is named for is never taken.
+        store
+            .upsert_run("run-image-freeze", None, "running")
+            .await
+            .unwrap();
         let mut config = RatatoskrConfig::default();
         config.sandbox.backend = "container".to_string();
         config.sandbox.image = "ratatoskr-checks".to_string();
@@ -11414,6 +11420,19 @@ mod tests {
             inspections.lines().count(),
             1,
             "the image was inspected more than once in one run: {inspections}"
+        );
+
+        // And the pin is on the record, not just in the process: a run analysed later reads the
+        // digest it executed in from its own row.
+        assert_eq!(
+            store
+                .run("run-image-freeze")
+                .await
+                .unwrap()
+                .and_then(|run| run.image_digest)
+                .as_deref(),
+            Some(first_digest.as_str()),
+            "the resolved digest never reached the run's row"
         );
 
         // And what was resolved is what the implementer's sandbox is built from — the digest,
