@@ -104,7 +104,13 @@ async function full(input: {
       (await isConverged({ baseline, post: implementation }));
     if (testsClean) {
       const review = await verify({ analyst: analysis });
-      if (!review.configured || review.unavailable || review.blocking.length === 0) break;
+      if (!review.configured || review.unavailable) break;
+      // A review that could not reach the end of what it set out to check is not a clean one, and
+      // it returns exactly what a clean one returns: no findings. Continue it over the parts it
+      // named — Rust carries those into the next call and bounds how many times this may happen,
+      // so a review that never finishes cannot spend the run here.
+      if (review.retryable) continue;
+      if (review.blocking.length === 0) break;
       if (iterations >= input.maxIterations) {
         if (await recoverAtCeiling()) continue;
         break;

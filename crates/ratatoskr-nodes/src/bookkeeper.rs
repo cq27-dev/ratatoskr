@@ -201,9 +201,16 @@ pub struct BookkeeperInput {
     pub analyst: AnalystOutput,
     pub implementer: ImplementerOutput,
     pub iterations: u32,
-    /// Whether the run converged. `false` means it exhausted its iteration budget with unresolved
-    /// failures — the memory is framed as a wall hit and tagged `unresolved`.
-    pub converged: bool,
+    /// How the run ended, as the persisted status token.
+    ///
+    /// Not a boolean. A run that ends `unreviewed` has green tests and no unresolved failures — its
+    /// review ran out of room — and collapsing that to "did not converge" narrated it as an
+    /// iteration-budget wall with an empty list of tests it could not fix, then wrote that as a
+    /// durable memory every later run reads. A status token cannot be told a story it does not
+    /// support, and a new one narrates as itself rather than as a wall.
+    pub status: String,
+    /// What the review never reached, when the run ended `unreviewed`.
+    pub unchecked: Vec<String>,
     /// What the run struggled with. The diff says what changed; this says what nobody knew, and
     /// it is usually where the memory worth writing comes from.
     #[serde(default)]
@@ -235,7 +242,7 @@ pub(crate) fn skipped_before_compose(
         tracing::info!("no memory index in this repository; recording no memory");
         return Some(input.nothing_recorded("this repository keeps no memory index"));
     }
-    if input.converged
+    if input.status == "converged"
         && input.implementer.touched_files.is_empty()
         && input.implementer.diff_summary.trim().is_empty()
         && input.friction.is_empty()
@@ -353,11 +360,13 @@ impl MemoryApplication<'_> {
             .filter(|a| !a.is_empty())
             .map(str::to_string)
             .or_else(|| input.implementer.touched_files.first().cloned());
-        // Tag unresolved (max-iterations) runs so they're distinguishable from success write-backs.
-        let tags: &[&str] = if input.converged {
-            &["ratatoskr", "bookkeeper"]
-        } else {
-            &["ratatoskr", "bookkeeper", "unresolved"]
+        // Tag by what actually happened, so a search for walls finds walls. A run whose review
+        // could not finish is not one that could not fix its tests, and tagging it `unresolved`
+        // put it in front of every later run as a failure of the same kind.
+        let tags: &[&str] = match input.status.as_str() {
+            "converged" => &["ratatoskr", "bookkeeper"],
+            "unreviewed" => &["ratatoskr", "bookkeeper", "unreviewed"],
+            _ => &["ratatoskr", "bookkeeper", "unresolved"],
         };
 
         let memory_id = self
@@ -566,7 +575,13 @@ mod tests {
                 commit_subject: String::new(),
             },
             iterations: 1,
-            converged,
+            status: if converged {
+                "converged"
+            } else {
+                "max_iterations_reached"
+            }
+            .to_string(),
+            unchecked: Vec::new(),
             friction: RunFriction::default(),
         }
     }
@@ -586,7 +601,7 @@ mod tests {
         // Converged-and-untouched is a no-op; walled-and-untouched is a wall worth recording.
         let walled = input(false, &[], "");
         assert!(
-            !(walled.converged
+            !(walled.status == "converged"
                 && walled.implementer.touched_files.is_empty()
                 && walled.implementer.diff_summary.trim().is_empty()),
             "the skip must not swallow a run that failed to get started"

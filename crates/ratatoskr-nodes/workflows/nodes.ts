@@ -546,9 +546,24 @@ export const bookkeeper = {
   instructions: LOAD("prompts/bookkeeper.md").trim(),
   renderQuestion(input: any) {
     let question = "";
-    if (input.converged) {
+    if (input.status === "converged") {
       question +=
         "OUTCOME: the run CONVERGED — the change landed and the tests pass.\n\n";
+    } else if (input.status === "unreviewed") {
+      // Two causes reach this status and they are different diagnoses. A review that ran out of
+      // room named what it could not reach; a verifier that could not be reached at all named
+      // nothing. Asserting the first for both wrote a durable memory diagnosing an outage as a
+      // review too large to finish, and the areas are the only evidence that separates them.
+      const gaps = input.unchecked || [];
+      question +=
+        `OUTCOME: the run's tests pass, but IT WAS NOT REVIEWED — after ${input.iterations} ` +
+        "implementer iterations" +
+        (gaps.length > 0
+          ? ` the review ran out of room before reaching: ${gaps.join("; ")}. `
+          : " no review of the change was obtained; the verifier could not be reached, or its " +
+            "answer never landed. Nothing here says the change is wrong. ") +
+        "This is not a wall the change hit; it is something nobody has looked at. Record what a " +
+        "future run should know about reviewing this area, not about fixing it.\n\n";
     } else {
       question +=
         `OUTCOME: the run HIT A WALL — after ${input.iterations} implementer iterations ` +
@@ -662,6 +677,16 @@ export const publisher = {
       question += "\n";
     }
 
+    const unchecked = input.unchecked || [];
+    if (unchecked.length > 0) {
+      question +=
+        "AND THE REVIEW NEVER REACHED THESE. Not findings — nobody looked. Say so plainly and " +
+        "list them: a reader who assumes the whole change was reviewed has been misled by what " +
+        "you wrote, and this is what the next person has to pick up:\n";
+      for (const area of unchecked) question += `- ${area}\n`;
+      question += "\n";
+    }
+
     const analyst = input.analyst;
     if (analyst.impact_summary) {
       question += `WHAT THE PLAN SAID:\n${analyst.impact_summary}\n\n`;
@@ -709,10 +734,15 @@ export const verifier = {
   inputContract: "VerifierInput",
   outputContract: "VerifierOutput",
   outputSchema: schemaWithDefs(
+    // `unchecked` is required, alone among these. Optional, a turn that never mentions it validates
+    // and reads as complete — which is the silent convergence this field exists to stop, restored by
+    // a model that simply did not opt in. Required, an empty array is an assertion that the pass
+    // reached the end of what it set out to check, made deliberately every time.
     obj({
       assessment: str(),
       findings: arr({ "$ref": "#/$defs/Finding" }),
-    }),
+      unchecked: arr(str()),
+    }, ["unchecked"]),
     {
       Finding: obj(
         {
@@ -776,6 +806,19 @@ export const verifier = {
           `- [${finding.severity}/${kind}] ${finding.file}: ${finding.summary}\n`;
       }
       question += "\n";
+    }
+    const unchecked = input.unchecked || [];
+    if (unchecked.length > 0) {
+      question +=
+        "YOU ARE CONTINUING A REVIEW. An earlier pass over this same change reached the end of " +
+        "what it could and named these as unreached. The session is fresh, so this list is all " +
+        "that survived of it — start here rather than beginning the change again:\n";
+      for (const area of unchecked) question += `- ${area}\n`;
+      question +=
+        "\nCover these first. Report anything else you notice, but this is what the pass exists " +
+        "for. If you again cannot reach the end, name what remains in `unchecked` — the same " +
+        "answer is still better than a clean bill you cannot support. Leave `unchecked` empty " +
+        "only when nothing above is outstanding.\n\n";
     }
     question += `THE CHANGE:\n${input.diff}\n`;
     return question;

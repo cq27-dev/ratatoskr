@@ -71,7 +71,7 @@ pub struct Finding {
 }
 
 /// What the verifier concluded.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct VerifierOutput {
     #[serde(default)]
     pub findings: Vec<Finding>,
@@ -79,9 +79,38 @@ pub struct VerifierOutput {
     /// with no account of what was looked at is indistinguishable from a verifier that did nothing.
     #[serde(default)]
     pub assessment: String,
+    /// What this pass could not reach, named so the next one can continue over it. Empty for a
+    /// review that finished.
+    ///
+    /// A review cut short — by a change larger than the context it was given, a tool that failed,
+    /// a sweep it ran out of room for — otherwise returns exactly what a clean review returns: no
+    /// findings. The loop then reads it as "nothing wrong" and the run converges on a review that
+    /// never happened. That is the one failure mode that gets WORSE as reviews get more thorough,
+    /// because the more a verifier is asked to check, the more often "I ran out of room" is the
+    /// honest answer.
+    ///
+    /// Naming areas rather than setting a flag, because the continuation has to be given something
+    /// to continue over — and it makes honesty concrete: an incomplete answer that says what it
+    /// missed costs a further pass, while claiming completeness it does not have is what this is
+    /// meant to be cheaper than.
+    ///
+    /// Required, alone among these, and deliberately not `#[serde(default)]`. A default makes the
+    /// field optional at the schema gate as well, so a turn that never mentions it validates and
+    /// reads as complete — which is the silent convergence this exists to stop, restored by a model
+    /// that simply did not opt in. Required, an empty list is an assertion that the pass reached the
+    /// end, made deliberately every time.
+    pub unchecked: Vec<String>,
 }
 
 impl VerifierOutput {
+    /// Whether this review reached the end of what it set out to check.
+    ///
+    /// The one answer to it. A review that did not is not a clean one however few findings it
+    /// carries, and nothing may read an empty `findings` as a verdict without asking this first.
+    pub fn complete(&self) -> bool {
+        self.unchecked.is_empty()
+    }
+
     /// The findings that block, most severe first.
     pub fn blocking(&self, threshold: Severity) -> Vec<&Finding> {
         let mut found: Vec<&Finding> = self
@@ -109,6 +138,14 @@ pub struct VerifierInput {
     /// a fresh defect to patch, it is the plan being wrong, and saying so is the only way the run
     /// stops trading one symptom for the next.
     pub previous_findings: Vec<Finding>,
+    /// What an earlier pass in this run said it could not reach, when this call is continuing that
+    /// review. Empty for a first pass, and for a continuation of a review that finished.
+    ///
+    /// Carried as input rather than left to the prompt, because a continuation that re-reviewed the
+    /// whole change would spend a pass re-deriving what the last one already established — and
+    /// would be as likely to run out of room in the same place.
+    #[serde(default)]
+    pub unchecked: Vec<String>,
 }
 
 /// Run and schema-validate a judgement node.
@@ -183,6 +220,7 @@ mod tests {
                 finding(Severity::P1, FindingKind::Plan),
             ],
             assessment: String::new(),
+            ..Default::default()
         };
         let blocking = out.blocking(Severity::P2);
         assert_eq!(blocking.len(), 2, "the nit is recorded but does not block");
@@ -205,14 +243,43 @@ mod tests {
     #[test]
     fn severity_and_kind_parse_from_the_shapes_a_model_writes() {
         let raw = r#"{"findings":[{"severity":"P1","kind":"plan","summary":"s",
-                      "failure_scenario":"f","file":"a.rs"}],"assessment":"looked at it"}"#;
+                      "failure_scenario":"f","file":"a.rs"}],"assessment":"looked at it",
+                      "unchecked":[]}"#;
         let out = parse_validated::<VerifierOutput>(raw).unwrap();
         assert_eq!(out.findings[0].severity, Severity::P1);
         assert_eq!(out.findings[0].kind, FindingKind::Plan);
         assert_eq!(out.findings[0].line, None);
 
         // A finding with no failure scenario is a preference; the schema refuses it.
-        let bad = r#"{"findings":[{"severity":"P1","kind":"plan","summary":"s"}]}"#;
+        let bad = r#"{"findings":[{"severity":"P1","kind":"plan","summary":"s"}],"unchecked":[]}"#;
         assert!(parse_validated::<VerifierOutput>(bad).is_err());
+    }
+
+    #[test]
+    fn a_review_that_never_says_whether_it_finished_is_refused_at_the_gate() {
+        // Optional, the field is a suggestion: a turn that never mentions it validates, defaults to
+        // empty, reads as complete, and the run converges on a review that never claimed to have
+        // finished — the silent convergence this whole field exists to stop, restored by a model
+        // that simply did not opt in. Required, an empty list is an assertion, made every time.
+        let silent = r#"{"findings":[],"assessment":"looked at some of it"}"#;
+        assert!(
+            parse_validated::<VerifierOutput>(silent).is_err(),
+            "a review must say whether it reached the end of what it set out to check"
+        );
+
+        let claimed = r#"{"findings":[],"assessment":"looked at all of it","unchecked":[]}"#;
+        assert!(
+            parse_validated::<VerifierOutput>(claimed)
+                .unwrap()
+                .complete()
+        );
+
+        let honest =
+            r#"{"findings":[],"assessment":"got part way","unchecked":["the error path"]}"#;
+        assert!(
+            !parse_validated::<VerifierOutput>(honest)
+                .unwrap()
+                .complete()
+        );
     }
 }

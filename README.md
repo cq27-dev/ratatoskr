@@ -21,8 +21,9 @@ flowchart LR
     tests -->|clean| verifier[verifier]
     verifier -->|execution findings| impl
     verifier -->|plan findings| analyst
-    verifier -->|nothing blocking| bookkeeper[bookkeeper]
-    verifier -->|nothing blocking| publisher[publisher]
+    verifier -->|could not finish| verifier
+    verifier -->|reviewed, nothing blocking| bookkeeper[bookkeeper]
+    verifier -->|reviewed, nothing blocking| publisher[publisher]
     bookkeeper -.->|informs the next run| context
     publisher -.->|pull request or comment| tracker([tracker])
 
