@@ -201,11 +201,13 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
         turns: e.turns ?? member.telemetry?.turns ?? null,
         tools_used: [...member.used],
       };
-      // A checkpoint always carries usage keys, and a box's own aggregate carries them as zeros
-      // because it covers no turn — so here, and ONLY here, the record has to say a turn happened
-      // before it counts as one. #284 stops the producer writing those keys at all for a turn-less
-      // checkpoint, and retires this guard with it: presence becomes the signal.
-      if (ranAModel(e)) member.costed = true;
+      // Presence is the signal, the same as for a `usage` event below. A checkpoint covering no
+      // turn — a box's own aggregate — carries no cost keys at all now, so the server reports no
+      // usage for it rather than a zeroed one. The counters themselves are never the basis: an
+      // endpoint may make a real call and report no accounting, and `reasoning_tokens` is
+      // hardcoded to zero by one provider while `output_tokens` is under-reported. A zero that
+      // arrives is a measurement; what a turn-less record has is nothing to read.
+      if (e.usage) member.costed = true;
       continue;
     }
 
@@ -276,27 +278,6 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     });
   }
   return out;
-}
-
-/**
- * Whether a checkpoint says a model turn happened at all.
- *
- * The turn's own evidence, never its cost. An endpoint may make a real call and report no token
- * accounting — a checkpoint then carries a model, a `turns` count and a duration with every counter
- * at zero — so "did it spend" answers no for work that happened. Counters are the wrong basis
- * twice over: `reasoning_tokens` is hardcoded to zero by the provider and `output_tokens` is
- * under-reported.
- *
- * The record already draws this line and the server already applies it: `LiveNodeFacts::of` omits
- * `facts` from a checkpoint whose node ran no model, so their presence IS the turn. A box's own
- * aggregate has no model, no turns and no duration, and stays uncosted — which is the whole reason
- * this is asked.
- *
- * Only the checkpoint branch may ask. A `usage` event is the endpoint's own report and its presence
- * is the authority; guarding that one is what broke scrub honesty last time.
- */
-function ranAModel(e: BoxedEvent): boolean {
-  return !!e.facts || e.turns != null;
 }
 
 /**
