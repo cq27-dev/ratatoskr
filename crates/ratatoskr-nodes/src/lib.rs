@@ -1903,7 +1903,7 @@ mod agent_config_tests {
         std::fs::write(
             dir.join("agents.ts"),
             r#"
-            defineAgent("scout", {
+            defineAgent("characterizer", {
                 model: { provider: "openai", model: "gpt-5" },
                 systemPrompt: "Be brief.",
             });
@@ -2215,14 +2215,14 @@ mod agent_config_tests {
     async fn ruleset_model_replaces_the_toml_route() {
         let engine = engine("model-override").await;
         let mut config = RatatoskrConfig::default();
-        // The whole point: no `[models.scout]` entry at all.
-        config.models.remove("scout");
+        // The whole point: no `[models.characterizer]` entry at all.
+        config.models.remove("characterizer");
 
         let cfg = plugins::declared_stage_agent_config(
             &engine,
             &config,
             ToolSet::default(),
-            &standard_stage("scout").await,
+            &standard_stage("characterizer").await,
             &[],
             &NodePlugins::default(),
             ratatoskr_core::Capability::Publish,
@@ -3472,7 +3472,6 @@ mod referee_governance_tests {
             "overseer",
             "publisher",
             "context",
-            "scout",
             "analyst",
             "implementer",
             "bookkeeper",
@@ -3485,6 +3484,15 @@ mod referee_governance_tests {
                 "{name} must stay governable"
             );
         }
+
+        // And a name no stage declares is not governable, so a ruleset written for one is refused
+        // rather than loaded to govern nothing. `scout` is the case that made this worth asserting:
+        // it was declared, unreachable, and its identity kept `.ratatoskr/rules/scout.ts` silently
+        // valid — the residue a deleted stage leaves when only half of it goes.
+        assert!(
+            !standard.contains(&"scout".to_string()),
+            "a stage the run does not declare must not be governable"
+        );
 
         // governable_nodes() reports the built-ins plus whatever this checkout's workflows
         // declare — none in the crate directory these tests run in — so the same two claims
@@ -3500,7 +3508,6 @@ mod referee_governance_tests {
             "overseer",
             "publisher",
             "context",
-            "scout",
             "analyst",
             "implementer",
             "bookkeeper",
@@ -3513,6 +3520,10 @@ mod referee_governance_tests {
                 "{name} must stay governable: {governable:?}"
             );
         }
+        assert!(
+            !governable.iter().any(|n| n == "scout"),
+            "nor may the set `load_rules` consults: {governable:?}"
+        );
     }
 
     #[tokio::test]

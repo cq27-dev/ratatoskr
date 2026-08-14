@@ -181,7 +181,6 @@ const fn adapter_evidence(contract: &'static str, node: &'static str) -> Class {
 /// A new standard stage is classified here, once, and every gate follows.
 pub(crate) const STANDARD_IDENTIFIERS: &[(&str, Class)] = &[
     // --- class 1: overridable, with the contract the Rust side deserializes ------------------
-    ("scout", overridable("ScoutOutput")),
     ("analyst", overridable("AnalystOutput")),
     ("characterizer", overridable("CharacterizerOutput")),
     (

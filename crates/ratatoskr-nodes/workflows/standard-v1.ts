@@ -11,7 +11,6 @@ defineWorkflow({
     stage("redteam_author", nodes.redteam_author),
     stage("implementer_attempt", nodes.implementer_attempt),
     stage("context_distillation", nodes.context_distillation),
-    stage("scout", nodes.scout),
     stage("analyst", nodes.analyst),
     stage("bookkeeper", nodes.bookkeeper),
     stage("publisher", nodes.publisher),

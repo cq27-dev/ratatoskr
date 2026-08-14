@@ -61,7 +61,7 @@ pub(crate) fn ask_tool() -> Tool {
         "properties": {
             "to": {
                 "type": "string",
-                "enum": ["scout", "analyst", "bookkeeper", "redteam", "user"],
+                "enum": ["context", "analyst", "bookkeeper", "redteam", "user"],
                 "description": "Which node to ask. `user` reaches the human operator when one is \
                     watching the dashboard, and is answered by the `analyst` when nobody is — so \
                     prefer a peer node when one actually holds the answer."
@@ -412,7 +412,10 @@ impl Clarifier for NodeClarifier {
 /// answer from the issue alone.
 fn resolve_target(to: &str) -> &'static str {
     match to.trim() {
-        "scout" => "scout",
+        // `context`, not `scout`: what the scout used to produce is a field of the context box's
+        // record now, and the box is what answers. Offering a target the run has no stage for left
+        // the model addressing something that resolves to nothing.
+        "context" => "context",
         "bookkeeper" => "bookkeeper",
         "redteam" => "redteam",
         _ => "analyst",
@@ -434,7 +437,9 @@ mod tests {
 
     #[test]
     fn resolve_target_maps_names_and_falls_back_to_analyst() {
-        assert_eq!(resolve_target("scout"), "scout");
+        assert_eq!(resolve_target("context"), "context");
+        // The name it replaced falls through to the analyst like any other unknown.
+        assert_eq!(resolve_target("scout"), "analyst");
         assert_eq!(resolve_target("redteam"), "redteam");
         assert_eq!(resolve_target("bookkeeper"), "bookkeeper");
         // user / unknown / empty → analyst fallback.

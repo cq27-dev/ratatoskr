@@ -5,7 +5,7 @@
 // Not every export is yours to declare. The run owns some of these identities, and declaring one is
 // refused when the workflow loads:
 //
-//   declarable — scout, analyst, characterizer, redteam_classifier, redteam_author,
+//   declarable — analyst, characterizer, redteam_classifier, redteam_author,
 //     implementer_attempt, context_distillation, verifier. Declaring one under its own id overrides
 //     the standard stage. `outputContract` is the exception: the run deserializes each of these
 //     into a concrete type, so an override has to keep the contract it found.
@@ -354,43 +354,6 @@ export const context_distillation = {
   arrayNormalization: [
     {
       field: "prior_art",
-      defaultEmpty: true,
-      retainWhenAnyNonBlank: ["item_key", "title"],
-    },
-  ],
-};
-
-export const scout = {
-  agent: "explore",
-  inputContract: "String",
-  outputContract: "ScoutOutput",
-  outputSchema: schemaWithDefs(
-    obj(
-      {
-        related_items: arr({ "$ref": "#/$defs/RelatedItem" }),
-        papertrail_summary: str(),
-      },
-      ["papertrail_summary"],
-    ),
-    {
-      RelatedItem: obj({
-        item_key: str(),
-        title: str(),
-        url: str(),
-        relation: str(),
-        summary: str(),
-      }),
-    },
-  ),
-  instructions: LOAD("prompts/scout.md").trim(),
-  capabilities: ["read"],
-  tools: ["papertrail_issue_search", "semantic_search"],
-  // Null defers to the selected route's session policy.
-  session: null,
-  appendRepositoryGuidance: false,
-  arrayNormalization: [
-    {
-      field: "related_items",
       defaultEmpty: true,
       retainWhenAnyNonBlank: ["item_key", "title"],
     },
