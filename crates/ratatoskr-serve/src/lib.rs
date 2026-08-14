@@ -1172,7 +1172,10 @@ async fn node_checkpoints(
     let shape_json = found.store.run(&run_id).await?.and_then(|r| r.shape_json);
     let recorded = ratatoskr_core::shape::recorded(shape_json.as_deref());
     let registry = recorded.index();
-    let names = registry.records_of(&node);
+    // Indexed, not scanned: this is asked once per checkpoint, and an imported run brings both its
+    // registry and its log with it — a box of many members against a long log is the same quadratic
+    // exposure the derivation's own lookups are indexed against.
+    let names: std::collections::HashSet<&str> = registry.records_of(&node).into_iter().collect();
     // Every checkpoint, not just the latest: the implementer writes one per converge iteration and
     // the diagnostic progression between them is the interesting part.
     let views: Vec<CheckpointView> = all

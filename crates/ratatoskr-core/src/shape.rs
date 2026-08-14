@@ -215,7 +215,24 @@ pub fn recorded(shape_json: Option<&str>) -> Recorded {
     {
         record.nodes = Vec::new();
     }
-    if !distinct(record.stages.iter().map(|stage| stage.id.as_str())) {
+    // Membership is one level deep: a stage is a member of a box, and a box is not a member of
+    // anything. A registry naming a member as some other stage's box — `x` in `y`, `z` in `x` —
+    // makes `x` both a row of `y` and a box with its own rows, so one checkpoint is `y`'s member and
+    // `x`'s own completion at once, and both boxes serve it. Refused whole, like a repeated id: what
+    // a reader would do with a partly-trusted registry is exactly the double-counting to avoid.
+    let nested = {
+        let members: std::collections::HashSet<&str> = record
+            .stages
+            .iter()
+            .filter(|stage| stage.node != stage.id)
+            .map(|stage| stage.id.as_str())
+            .collect();
+        record
+            .stages
+            .iter()
+            .any(|stage| stage.node != stage.id && members.contains(stage.node.as_str()))
+    };
+    if nested || !distinct(record.stages.iter().map(|stage| stage.id.as_str())) {
         record.stages = Vec::new();
     }
     // The two halves are read independently but they answer about one set of names, and a box drawn
@@ -248,6 +265,26 @@ fn distinct<'a>(names: impl Iterator<Item = &'a str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_registry_that_makes_a_member_someone_elses_box_is_unreadable() {
+        // Membership is one level deep. `x` is a member of `y` and also the box `z` belongs to, so
+        // the row written under `x` is at once one of `y`'s member records and `x`'s own — which
+        // makes it `y`'s member work AND the thing that completes box `x`, and serves it under both
+        // names. Unique ids do not catch it: every id here is its own.
+        let nested = r#"{"nodes":[],"stages":[{"id":"x","node":"y"},{"id":"z","node":"x"}]}"#;
+        assert!(
+            recorded(Some(nested)).stages.is_empty(),
+            "a registry nesting membership must not be read"
+        );
+
+        // The ordinary composed registry is untouched: several members of one box, and that box is
+        // nobody's member.
+        let flat = r#"{"nodes":[],"stages":[{"id":"redteam_classifier","node":"redteam"},
+                                            {"id":"redteam_author","node":"redteam"},
+                                            {"id":"analyst","node":"analyst"}]}"#;
+        assert_eq!(recorded(Some(flat)).stages.len(), 3);
+    }
 
     #[test]
     fn a_box_drawn_under_another_boxs_member_name_is_not_placed() {
