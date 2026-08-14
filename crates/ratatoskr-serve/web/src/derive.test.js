@@ -772,6 +772,34 @@ test("the live map keeps a member's activity when a sibling starts beside it", (
   expect([...reentered.used]).toEqual(["Write"]);
 });
 
+test("a member re-entering restarts its counts whether or not it announces facts", () => {
+  // `facts` is optional on a `node_start`. Restarting only when they are present made a re-entry
+  // that announced nothing accumulate onto the previous attempt, so the box drew a cycle count that
+  // was two attempts added together — while the checkpointed fold beside it, which restarts on
+  // every `node_start`, drew the second attempt alone. Same stream, two answers.
+  const stages = registry(["analyst"]);
+  const called = (tool) => ({ at: "t", kind: "tool_call", node: "analyst", detail: tool });
+  const events = [
+    { ...start("analyst"), facts: { model: "m", tools: [], thinking: false, reuses_session: false } },
+    called("Read"),
+    called("Grep"),
+    start("analyst"),
+    called("Write"),
+  ];
+
+  const boxed = inNodeBoxes(events, stages);
+  const live = liveNodes(boxed).get("analyst");
+  expect(live.cycles).toBe(1);
+  expect([...live.used]).toEqual(["Write"]);
+  // The two folds answer the same question the same way.
+  const derived = nodesFromEvents(boxed).get("analyst");
+  expect(live.cycles).toBe(derived.cycles);
+  expect([...live.used]).toEqual([...derived.used]);
+  // And what it announced first survives a restart that announced nothing — the model is a fact
+  // about the member, not about the attempt.
+  expect(live.facts.model).toBe("m");
+});
+
 test("a usage event costs the member whatever it reports, zero included", () => {
   // Scrub honesty, which is what this whole derivation exists for. `fromStream` keeps the server's
   // telemetry — the run's FINAL state — for a node the stream never costed, so a node left

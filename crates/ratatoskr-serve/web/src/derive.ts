@@ -523,12 +523,18 @@ export function liveNodes(events: readonly BoxedEvent[]): Map<string, LiveNode> 
     let members = boxes.get(e.node);
     if (!members) boxes.set(e.node, (members = new Map()));
     const name = e.member ?? e.node;
-    if (e.kind === "node_start" && e.facts) {
-      members.set(name, { facts: e.facts, cycles: 0, used: new Set() });
-      continue;
-    }
     let at = members.get(name);
     if (!at) members.set(name, (at = { cycles: 0, used: new Set() }));
+    if (e.kind === "node_start") {
+      // Every `node_start`, not only one carrying facts — `facts` is optional, and restarting on
+      // its presence made a re-entry that announced nothing accumulate onto the previous attempt.
+      // What it announced survives the restart: the model is a fact about the member, not about
+      // the attempt, and a later start that says nothing has not changed it.
+      at.cycles = 0;
+      at.used = new Set();
+      if (e.facts) at.facts = e.facts;
+      continue;
+    }
     if (e.kind === "tool_call") {
       at.cycles += 1;
       // `detail` is the tool name for this kind.
