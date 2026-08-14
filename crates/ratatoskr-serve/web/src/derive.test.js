@@ -564,6 +564,29 @@ test("a box is done when its own record lands, and counts only its own", () => {
   expect(drawn[0].checkpoints).toBe(1);
 });
 
+test("a box that is itself a stage keeps working while a peer composed into it runs", () => {
+  // A membership target may be "a stage of its own called `{node}`" (`ratatoskr-nodes/src/
+  // validate.rs`), so a workflow may compose `security` into the peer stage `review` and invoke
+  // both hosts at once. The box's own record is then ALSO one member's, and reading completion off
+  // the name alone marks the box done on whichever host finishes first — taking the Stop aimed at
+  // the one still running with it.
+  const shape = [composed("review", "idle")];
+  const stages = registry(["review", "review", "security"]);
+  const events = [start("review"), start("security"), checkpointed("review")];
+
+  const boxed = inNodeBoxes(events, stages);
+  const drawn = applied(shape, boxed);
+  expect(drawn.map((n) => n.name)).toEqual(["review"]);
+  expect(drawn[0].state).toBe("working");
+  // The control address, which is what a Stop is aimed at.
+  expect(workingNodeNames(shape, boxed)).toEqual(["review"]);
+
+  // And it completes when the peer lands: the box's own record exists and nothing is left running.
+  const whole = inNodeBoxes([...events, checkpointed("security")], stages);
+  expect(applied(shape, whole)[0].state).toBe("done");
+  expect(workingNodeNames(shape, whole)).toEqual([]);
+});
+
 test("a stage executing with nothing checkpointed yet is already drawn in its box", () => {
   // The live window, and the one that matters: an operator reaches for Stop while a stage is
   // running. The server derives `nodes` from checkpoints, so the box it belongs to is NOT in that

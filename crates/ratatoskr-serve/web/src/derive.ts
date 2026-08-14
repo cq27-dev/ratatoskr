@@ -81,31 +81,39 @@ export type BoxedEvent = LiveEvent & {
  * - **cost** is the latest record of each member, folded arithmetically. Not the latest record
  *   overall: a box's own aggregate carries no turn and reports zeros, so overwriting with it wipes
  *   what its members spent, and with two members the last one to finish would speak for both.
- * - **completion** is the box's own record and nothing else. A member's checkpoint proves the box
- *   STARTED — the classifier finishes while the author is still writing tests — which is
- *   `checkpointed_state`'s rule on the other side.
+ * - **completion** is the box's own record AND no member left working. A member's checkpoint alone
+ *   proves the box STARTED — the classifier finishes while the author is still writing tests —
+ *   which is `checkpointed_state`'s rule on the other side. The second half is what an aggregate
+ *   cannot tell you: a box may BE a stage with peers composed into it (`ratatoskr-nodes`'s
+ *   `validate.rs` accepts "a stage of its own called `{node}`" as a membership target), and that
+ *   stage's ordinary checkpoint is the box's own record and one member's at once. Deciding on the
+ *   record alone finishes such a box on whichever host returns first and drops the control aimed at
+ *   its peer. An operation host writes its aggregate only after its stages return, so for a box
+ *   that has one the two halves land together and nothing changes.
  * - **the count** is the box's own rows, so a converge iteration is one, not one per member.
  */
 export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, DerivedNode> {
   /** One member's latest turn, kept apart so the box can be the fold of them rather than the last. */
   interface Member {
+    /** Where this member's OWN records leave it. The box is the fold of these, never the last one. */
+    state: NodeState;
     telemetry?: NodeTelemetry;
     cycles: number;
     used: Set<string>;
     costed: boolean;
   }
-  const boxes = new Map<string, { state: NodeState; checkpoints: number; members: Map<string, Member> }>();
+  const boxes = new Map<string, { checkpoints: number; members: Map<string, Member> }>();
   const at = (name: string) => {
     const found = boxes.get(name);
     if (found) return found;
-    const made = { state: "idle" as NodeState, checkpoints: 0, members: new Map<string, Member>() };
+    const made = { checkpoints: 0, members: new Map<string, Member>() };
     boxes.set(name, made);
     return made;
   };
   const memberOf = (box: { members: Map<string, Member> }, name: string): Member => {
     const found = box.members.get(name);
     if (found) return found;
-    const made: Member = { cycles: 0, used: new Set(), costed: false };
+    const made: Member = { state: "idle", cycles: 0, used: new Set(), costed: false };
     box.members.set(name, made);
     return made;
   };
@@ -121,7 +129,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // A fresh attempt of THIS member. Its counts start again and its siblings' stand, which is
       // what keeps a box that ran two halves from reporting only the second. The checkpoints
       // already recorded stand too: the implementer is re-driven per converge iteration.
-      box.state = "working";
+      member.state = "working";
       member.cycles = 0;
       member.used = new Set();
       if (e.facts) {
@@ -137,15 +145,15 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     }
 
     if (e.kind === "checkpoint") {
-      if (own) {
-        box.checkpoints += 1;
-        // An error is the only thing that tells a failed node from a finished one: both write a
-        // checkpoint, and the fact of one proves only that the node stopped.
-        box.state = e.error ? "failed" : "done";
-      } else if (box.state !== "failed") {
-        // A member finishing is the box working, never the box finished.
-        box.state = "working";
-      }
+      // This record ends the MEMBER's turn, whoever it belongs to. What it means for the BOX is
+      // decided below, from every member at once — a member finishing is never on its own the box
+      // finished, and for a box that is itself a stage its own record is one member's too.
+      //
+      // An error is the only thing that tells a failed member from a finished one: both write a
+      // checkpoint, and the fact of one proves only that the member stopped. Only the box's own
+      // record can fail the box, as before.
+      member.state = own && e.error ? "failed" : "done";
+      if (own) box.checkpoints += 1;
       member.telemetry = {
         ...(member.telemetry ?? blank()),
         first_at: member.telemetry?.first_at ?? e.at,
@@ -202,12 +210,26 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // `detail` carries the tool name for this kind.
       if (e.detail) member.used.add(e.detail);
     }
-    if (WORKING.has(e.kind) && box.state !== "working") box.state = "working";
+    if (WORKING.has(e.kind)) member.state = "working";
   }
 
   const out = new Map<string, DerivedNode>();
   for (const [name, box] of boxes) {
     const members = [...box.members.values()];
+    // The box, from all of its members and its own rows. A member still working outranks
+    // everything, including a failure: that is the live half a Stop has to keep reaching, and it is
+    // what the box did on the way to the record it already has. Below that, the box's own record
+    // settles it — failed if it carried an error, done otherwise — and a member's record with no
+    // record of the box's own says only that the box started.
+    const state: NodeState = members.some((m) => m.state === "working")
+      ? "working"
+      : box.members.get(name)?.state === "failed"
+        ? "failed"
+        : box.checkpoints > 0
+          ? "done"
+          : members.some((m) => m.state !== "idle")
+            ? "working"
+            : "idle";
     const folded = members
       .map((m) => m.telemetry)
       .filter((t): t is NodeTelemetry => !!t)
@@ -216,7 +238,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
         undefined,
       );
     out.set(name, {
-      state: box.state,
+      state,
       checkpoints: box.checkpoints,
       ...(folded ? { telemetry: folded } : {}),
       cycles: members.reduce((n, m) => n + m.cycles, 0),
