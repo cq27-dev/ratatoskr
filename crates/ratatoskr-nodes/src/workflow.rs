@@ -469,17 +469,6 @@ fn infer_status(
             );
             return RunStatus::MaxIterationsReached;
         }
-        // An empty `findings` from a review that could not finish is not a verdict. Reading it as
-        // one is how a run converged on a review cut short — and it is the same shape as a verifier
-        // that could not be reached, so it gets the same answer: the work may well be sound, but
-        // nothing here reviewed it. `Converged` would claim a review that did not happen.
-        if !review.complete() {
-            tracing::warn!(
-                unchecked = ?review.unchecked,
-                "the review did not reach the end of what it set out to check; unreviewed"
-            );
-            return RunStatus::Unreviewed;
-        }
     }
     // The tests written for this change, before it existed. They fail in the baseline by
     // construction, so `is_converged` alone would pass a change that satisfied none of them.
@@ -502,7 +491,22 @@ fn infer_status(
         implementer.exit_code,
     );
     if post_ran && converge::is_converged(&red_team.failing_tests, &implementer.failing_tests) {
-        RunStatus::Converged
+        // Only once everything deterministic has held. An empty `findings` from a review that could
+        // not finish is not a verdict, and reading it as one is how a run converged on a review cut
+        // short — but `Unreviewed` says the work stands and only the review is missing, so it must
+        // not be reached while something else is missing too. A workflow may call `verify()`
+        // whenever it likes, including before the tests are clean, and downgrading here rather than
+        // at the review reported such a run as merely unreviewed.
+        match review.filter(|review| !review.complete()) {
+            Some(review) => {
+                tracing::warn!(
+                    unchecked = ?review.unchecked,
+                    "the review did not reach the end of what it set out to check; unreviewed"
+                );
+                RunStatus::Unreviewed
+            }
+            None => RunStatus::Converged,
+        }
     } else {
         RunStatus::MaxIterationsReached
     }
@@ -1218,7 +1222,15 @@ fn review_continuations(checkpoints: &[ratatoskr_store::Checkpoint]) -> (Vec<Str
         .filter(|review| !review.complete())
         .map(|review| review.unchecked.clone())
         .unwrap_or_default();
-    let spent = reviews.iter().filter(|review| !review.complete()).count();
+    // The TRAILING incomplete run, not every incomplete review in the chain. A completed review
+    // ends the chain for the budget exactly as it does for the carried gap, so a workflow that
+    // reviews again after one finished starts with its continuations back — counting through the
+    // completion would hand the fresh review `retryable: false` on its first gap.
+    let spent = reviews
+        .iter()
+        .rev()
+        .take_while(|review| !review.complete())
+        .count();
     (unchecked, spent < REVIEW_CONTINUATIONS)
 }
 
@@ -11436,6 +11448,26 @@ mod tests {
             "an empty findings list from a review that could not finish is not a verdict"
         );
 
+        // `Unreviewed` says the work stands and only the review is missing, so it must not be
+        // reached while something else is missing too. A workflow may call `verify()` whenever it
+        // likes — including before the tests are clean, which the bundled loop never does but a
+        // repository one may — and reporting that run as merely unreviewed hides a deterministic
+        // failure behind a softer word.
+        // `c` fails and did not fail in the baseline, so this is a genuine regression rather than
+        // a pre-existing failure the change is not responsible for.
+        let authored_failing = imp(&["a", "c"], &[], 1);
+        assert_eq!(
+            infer_status(
+                &baseline,
+                &authored_failing,
+                &[],
+                Some(&cut_short),
+                verifier::Severity::P2
+            ),
+            RunStatus::MaxIterationsReached,
+            "an incomplete review must not downgrade a run whose tests never went clean"
+        );
+
         // Not `Converged` and not `MaxIterationsReached`: the work may well be sound and the tests
         // pass, so nothing here says the change is wrong. What is missing is the review, which is
         // the same thing a verifier nobody could reach leaves missing.
@@ -11549,6 +11581,49 @@ mod tests {
             left,
             "only reviews that could not finish spend continuations"
         );
+    }
+
+    #[test]
+    fn a_completed_review_gives_the_continuations_back() {
+        // A completed review ends the chain for the budget as well as for the carried gap. A
+        // compositional workflow that reviews again after one finished — on the same tree, for
+        // whatever reason of its own — otherwise met `retryable: false` on its first gap, because
+        // the count reached back through the completion to passes that are no longer the chain.
+        let unfinished = |area: &str| verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: String::new(),
+            unchecked: vec![area.to_string()],
+        };
+        let finished = verifier::VerifierOutput {
+            assessment: "reached the end".to_string(),
+            ..Default::default()
+        };
+
+        let spent_then_finished = vec![
+            review_checkpoint("verifier", &unfinished("path A"), None::<&&str>),
+            review_checkpoint("verifier", &unfinished("path B"), None::<&&str>),
+            review_checkpoint("verifier", &finished, None::<&&str>),
+        ];
+        let (carried, left) = review_continuations(&spent_then_finished);
+        assert!(
+            carried.is_empty(),
+            "nothing after a completed review is continuing anything"
+        );
+        assert!(
+            left,
+            "a completed review ends the chain, so the budget it spent is not the next one's"
+        );
+
+        // And the trailing run is still counted, so the bound is a bound where it applies.
+        let mut trailing = spent_then_finished.clone();
+        trailing.push(review_checkpoint(
+            "verifier",
+            &unfinished("path C"),
+            None::<&&str>,
+        ));
+        let (carried, left) = review_continuations(&trailing);
+        assert_eq!(carried, ["path C"]);
+        assert!(left, "one incomplete pass since the completion leaves room");
     }
 
     #[test]
