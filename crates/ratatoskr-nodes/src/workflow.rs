@@ -1234,11 +1234,15 @@ const REVIEW_CONTINUATIONS: usize = 2;
 ///
 /// A first pass is not a continuation of anything, so a chain of one incomplete review has spent
 /// none — counting it made `REVIEW_CONTINUATIONS` allow one fewer continuation than it names.
-fn continuations_spent(reviews: &[verifier::VerifierOutput]) -> usize {
-    reviews
+fn continuations_spent(chain: &[Option<verifier::VerifierOutput>]) -> usize {
+    chain
         .iter()
         .rev()
-        .take_while(|review| !review.complete())
+        .take_while(|attempt| {
+            !attempt
+                .as_ref()
+                .is_some_and(verifier::VerifierOutput::complete)
+        })
         .count()
         .saturating_sub(1)
 }
@@ -1250,10 +1254,11 @@ fn continuations_spent(reviews: &[verifier::VerifierOutput]) -> usize {
 /// those are still true, because the tree did not change under them, or the chain would have ended.
 /// So findings accumulate across the chain, and whether the review finished is the last pass's
 /// answer.
-fn folded(chain: &[verifier::VerifierOutput]) -> Option<verifier::VerifierOutput> {
-    let last = chain.last()?.clone();
+fn folded(chain: &[Option<verifier::VerifierOutput>]) -> Option<verifier::VerifierOutput> {
+    let chain: Vec<&verifier::VerifierOutput> = chain.iter().flatten().collect();
+    let last = (*chain.last()?).clone();
     let mut findings: Vec<verifier::Finding> = Vec::new();
-    for pass in chain {
+    for pass in &chain {
         for finding in &pass.findings {
             // A continuation may restate what it was handed; the same defect twice is one defect.
             // `failure_scenario` is part of the identity: two findings can share a severity, a kind,
@@ -1282,7 +1287,7 @@ fn folded(chain: &[verifier::VerifierOutput]) -> Option<verifier::VerifierOutput
 fn chain_ending_at(
     checkpoints: &[ratatoskr_store::Checkpoint],
     end: usize,
-) -> Vec<verifier::VerifierOutput> {
+) -> Vec<Option<verifier::VerifierOutput>> {
     let start = checkpoints[..end]
         .iter()
         .rposition(|checkpoint| matches!(checkpoint.node_name.as_str(), "implementer" | "analyst"))
@@ -1290,7 +1295,11 @@ fn chain_ending_at(
     checkpoints[start..=end]
         .iter()
         .filter(|checkpoint| checkpoint.node_name == "verifier")
-        .filter_map(|checkpoint| serde_json::from_str(&checkpoint.output_json).ok())
+        // `None` for an attempt that did not answer — the `{"error": ..}` a failed turn writes. It
+        // is not a review, so it must not fold into one; it IS an attempt, so it must count against
+        // the continuation ceiling, or a workflow retrying a failing verifier spends model turns
+        // until the generic invocation ceiling and the cost bound means nothing.
+        .map(|checkpoint| serde_json::from_str(&checkpoint.output_json).ok())
         .collect()
 }
 
@@ -1300,7 +1309,7 @@ fn chain_ending_at(
 /// longer has, so nothing in it can be continued.
 pub(crate) fn review_chain(
     checkpoints: &[ratatoskr_store::Checkpoint],
-) -> Vec<verifier::VerifierOutput> {
+) -> Vec<Option<verifier::VerifierOutput>> {
     match checkpoints
         .iter()
         .rposition(|checkpoint| checkpoint.node_name == "verifier")
@@ -1350,8 +1359,12 @@ pub(crate) fn last_review(
 /// `verify()` in a shape nobody anticipated is bounded the same way the bundled one is.
 fn review_continuations(checkpoints: &[ratatoskr_store::Checkpoint]) -> (Vec<String>, bool) {
     let reviews = review_chain(checkpoints);
+    // From the last pass that ANSWERED: a failed attempt reached nothing and named nothing, so what
+    // is still unreached is whatever the last real pass said it could not reach.
     let unchecked = reviews
-        .last()
+        .iter()
+        .flatten()
+        .next_back()
         .filter(|review| !review.complete())
         .map(|review| review.unchecked.clone())
         .unwrap_or_default();
@@ -1521,7 +1534,7 @@ async fn verify_host(
     // disagreeing about one review, which is the shape of defect this file exists to avoid. The
     // chain here is the one loaded before the turn, plus the pass it just produced.
     let mut chain = review_chain(&checkpoints);
-    chain.push(out);
+    chain.push(Some(out));
     let review = folded(&chain).expect("the chain holds the pass just produced");
     // Counted over the chain INCLUDING the pass just produced. `continuations_left` above answers
     // "may this call proceed"; what the script is told has to answer "may another follow", and
@@ -12002,7 +12015,7 @@ mod tests {
 
         // What the host would have answered the second call with.
         let supplied = verification_result(
-            folded(&[first, continued]).unwrap(),
+            folded(&[Some(first), Some(continued)]).unwrap(),
             verifier::Severity::P2,
             true,
         );
@@ -12158,6 +12171,46 @@ mod tests {
             review_checkpoint("verifier", &continued, None::<&&str>),
         ];
         assert!(tree_review(&after_a_fix).unwrap().findings.is_empty());
+    }
+
+    #[test]
+    fn a_failed_attempt_is_not_a_review_but_it_is_still_an_attempt() {
+        // Two things a `{"error": ..}` checkpoint must be at once. It is NOT a review: folding it
+        // in would make a failed turn read as a clean complete one, which is the load-bearing
+        // reason the chain drops what does not parse. It IS an attempt: dropping it from the count
+        // too let a workflow retrying a failing verifier spend model turns until the generic
+        // invocation ceiling, with the Rust-owned cost bound never advancing.
+        let unfinished = verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: "got part way".to_string(),
+            unchecked: vec!["the error path".to_string()],
+        };
+        let outage = serde_json::json!({ "error": "provider unavailable" });
+        let mut checkpoints = vec![
+            review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
+            review_checkpoint("verifier", &unfinished, None::<&&str>),
+        ];
+        // Every continuation this tree gets, all of them spent on turns that never answered.
+        for _ in 0..REVIEW_CONTINUATIONS {
+            checkpoints.push(review_checkpoint("verifier", &outage, None::<&&str>));
+        }
+
+        let (carried, left) = review_continuations(&checkpoints);
+        assert_eq!(
+            carried,
+            ["the error path"],
+            "what is still unreached is what the last pass that ANSWERED could not reach"
+        );
+        assert!(
+            !left,
+            "attempts that failed still spent the continuations they attempted"
+        );
+
+        // And the fold is unchanged by them: the run holds one incomplete review, not three, and
+        // certainly not a complete one.
+        let review = tree_review(&checkpoints).expect("one pass answered");
+        assert!(!review.complete());
+        assert_eq!(review.unchecked, ["the error path"]);
     }
 
     #[test]
