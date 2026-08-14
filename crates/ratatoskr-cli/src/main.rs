@@ -1692,6 +1692,33 @@ mod tests {
         }
     }
 
+    /// This repository's own rulesets target nodes this build governs.
+    ///
+    /// `.ratatoskr/rules/` is version-controlled — the one part of `.ratatoskr/` that is — so a
+    /// ruleset here is configuration every `plan`, `run` and `bookkeep` from the repository root
+    /// loads. Removing a stage without removing the ruleset written for it left startup failing
+    /// with `targets a node no workflow governs`, and nothing in the suite noticed: the governable
+    /// set is tested against its own fixtures, and the committed rules are read only by a real
+    /// command.
+    #[tokio::test]
+    async fn this_repositorys_own_rulesets_target_nodes_it_governs() {
+        let rules = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(".ratatoskr/rules");
+        let engine = ratatoskr_script::ScriptEngine::load(&rules)
+            .await
+            .expect("the committed rulesets load");
+        let governable = ratatoskr_nodes::governable_nodes()
+            .await
+            .expect("reading the workflow registry");
+        for name in engine.declared_agents() {
+            assert!(
+                governable.iter().any(|n| n == name),
+                "`.ratatoskr/rules` governs `{name}`, which this build does not: {governable:?}"
+            );
+        }
+    }
+
     /// Pins the record shape `init_logging`'s JSON sink produces, because it is a contract the
     /// dashboard parses: `kind` and the event's own fields at the top level, and `run_id` reachable
     /// through `spans`. The layer options here mirror `init_logging`; change them together.
