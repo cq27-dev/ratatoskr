@@ -90,6 +90,13 @@ export type BoxedEvent = LiveEvent & {
  *   record alone finishes such a box on whichever host returns first and drops the control aimed at
  *   its peer. An operation host writes its aggregate only after its stages return, so for a box
  *   that has one the two halves land together and nothing changes.
+ * - **working** is a COUNT of live invocations, not a flag. A workflow may invoke one stage several
+ *   times at once — `Promise.all([probe(a), probe(b)])` — and both invocations record under that
+ *   stage's one name, so a flag is cleared by whichever finishes first and the box drops the Stop
+ *   aimed at the other. Each `node_start` counts one more invocation live and each checkpoint one
+ *   fewer; the member is working while the count is above zero. This says nothing about WHICH
+ *   invocation a record belongs to — everything per-invocation (its cost, its cycles, its tools)
+ *   is still one state per member, and #285 is where that is resolved.
  * - **the count** is the box's own rows, so a converge iteration is one, not one per member.
  */
 export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, DerivedNode> {
@@ -97,6 +104,14 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
   interface Member {
     /** Where this member's OWN records leave it. The box is the fold of these, never the last one. */
     state: NodeState;
+    /**
+     * Invocations of this member that have started and not yet checkpointed.
+     *
+     * Arithmetic, because one stage may be invoked more than once at a time and every invocation
+     * records under the same name: a checkpoint ends AN invocation, not the member. Only zero here
+     * means the member has stopped.
+     */
+    live: number;
     telemetry?: NodeTelemetry;
     cycles: number;
     used: Set<string>;
@@ -113,7 +128,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
   const memberOf = (box: { members: Map<string, Member> }, name: string): Member => {
     const found = box.members.get(name);
     if (found) return found;
-    const made: Member = { state: "idle", cycles: 0, used: new Set(), costed: false };
+    const made: Member = { state: "idle", live: 0, cycles: 0, used: new Set(), costed: false };
     box.members.set(name, made);
     return made;
   };
@@ -129,6 +144,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // A fresh attempt of THIS member. Its counts start again and its siblings' stand, which is
       // what keeps a box that ran two halves from reporting only the second. The checkpoints
       // already recorded stand too: the implementer is re-driven per converge iteration.
+      member.live += 1;
       member.state = "working";
       member.cycles = 0;
       member.used = new Set();
@@ -152,6 +168,12 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // An error is the only thing that tells a failed member from a finished one: both write a
       // checkpoint, and the fact of one proves only that the member stopped. Only the box's own
       // record can fail the box, as before.
+      //
+      // One invocation ended, not necessarily the member: a stage invoked twice at once writes two
+      // checkpoints and is live until the second. Floored at zero because a stream is not
+      // guaranteed balanced — an ingested log may begin mid-run, and a checkpoint whose start this
+      // view never saw must not push the count negative and make the member unstoppable.
+      member.live = Math.max(0, member.live - 1);
       member.state = own && e.error ? "failed" : "done";
       if (own) box.checkpoints += 1;
       member.telemetry = {
@@ -221,7 +243,14 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     // what the box did on the way to the record it already has. Below that, the box's own record
     // settles it — failed if it carried an error, done otherwise — and a member's record with no
     // record of the box's own says only that the box started.
-    const state: NodeState = members.some((m) => m.state === "working")
+    //
+    // A member is working while any invocation of it is live, which is what keeps a box whose
+    // aggregate already landed from reading finished when a member has been re-entered: the count
+    // is above zero again, and clause 1 outranks the checkpoints. `state` still carries the working
+    // case for a stream whose only evidence is a tool call or model text — one that reports no
+    // `node_start` has no invocation to count.
+    const working = (m: Member) => m.live > 0 || m.state === "working";
+    const state: NodeState = members.some(working)
       ? "working"
       : box.members.get(name)?.state === "failed"
         ? "failed"

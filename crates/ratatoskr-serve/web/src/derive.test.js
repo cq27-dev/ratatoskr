@@ -587,6 +587,66 @@ test("a box that is itself a stage keeps working while a peer composed into it r
   expect(workingNodeNames(shape, whole)).toEqual([]);
 });
 
+test("a stage invoked twice at once is working until both invocations have returned", () => {
+  // `Promise.all([probe(a), probe(b)])` is two LIVE invocations of one stage, and both record
+  // under that stage's one name. The first checkpoint ends an invocation, never the stage: reading
+  // it as the stage finishing marks the box done and drops the Stop aimed at the one still going.
+  const shape = [composed("probe", "idle")];
+  const stages = registry(["probe"]);
+  const events = [start("probe"), start("probe"), checkpointed("probe")];
+
+  const boxed = inNodeBoxes(events, stages);
+  expect(applied(shape, boxed)[0].state).toBe("working");
+  // The control address: what Stop and Steer are offered against while the second one runs.
+  expect(workingNodeNames(shape, boxed)).toEqual(["probe"]);
+
+  // The negative control. One invocation and one checkpoint finish the box — without this the case
+  // above would read the same against a box that simply never finishes.
+  const once = inNodeBoxes([start("probe"), checkpointed("probe")], stages);
+  expect(applied(shape, once)[0].state).toBe("done");
+  expect(workingNodeNames(shape, once)).toEqual([]);
+
+  // And the second invocation's own record is what finishes the concurrent pair.
+  const both = inNodeBoxes([...events, checkpointed("probe")], stages);
+  expect(applied(shape, both)[0].state).toBe("done");
+  expect(workingNodeNames(shape, both)).toEqual([]);
+});
+
+test("a box whose aggregate has landed is still working where a member has re-entered", () => {
+  // The stale completion, and it is the same arithmetic: the implementer is re-driven per converge
+  // iteration, so its attempt can be running again by the time the aggregate for the previous one
+  // lands. The box's own record exists and the member's latest record says `done`, and neither
+  // fact is about the invocation currently executing.
+  const shape = [composed("implementer", "idle")];
+  const stages = registry(["implementer", "implementer_attempt"]);
+  const events = [
+    start("implementer_attempt"),
+    start("implementer_attempt"),
+    checkpointed("implementer_attempt"),
+    checkpointed("implementer"),
+  ];
+
+  const boxed = inNodeBoxes(events, stages);
+  const drawn = applied(shape, boxed);
+  expect(drawn[0].state).toBe("working");
+  expect(drawn[0].checkpoints).toBe(1);
+  expect(workingNodeNames(shape, boxed)).toEqual(["implementer"]);
+});
+
+test("a start the run died under does not keep a stopped run's box working", () => {
+  // The count is only as balanced as the stream, and a host that dies writes no checkpoint — so a
+  // box with an invocation still counted live reads working and the stream will say nothing more.
+  // That is the case the terminal settle already exists for, and it still reaches it: this is the
+  // same position as a stage that never checkpointed at all.
+  const shape = [composed("probe", "idle")];
+  const stages = registry(["probe"]);
+  const derived = nodesFromEvents(
+    inNodeBoxes([start("probe"), start("probe"), checkpointed("probe")], stages),
+  );
+  expect(derived.get("probe").state).toBe("working");
+  expect(applyDerived(shape, derived, "failed")[0].state).toBe("failed");
+});
+
 test("a stage executing with nothing checkpointed yet is already drawn in its box", () => {
   // The live window, and the one that matters: an operator reaches for Stop while a stage is
   // running. The server derives `nodes` from checkpoints, so the box it belongs to is NOT in that
