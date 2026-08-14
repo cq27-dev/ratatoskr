@@ -493,24 +493,41 @@ fn infer_status(
         implementer.exit_code,
     );
     if post_ran && converge::is_converged(&red_team.failing_tests, &implementer.failing_tests) {
-        // Only once everything deterministic has held. An empty `findings` from a review that could
-        // not finish is not a verdict, and reading it as one is how a run converged on a review cut
-        // short — but `Unreviewed` says the work stands and only the review is missing, so it must
-        // not be reached while something else is missing too. A workflow may call `verify()`
-        // whenever it likes, including before the tests are clean, and downgrading here rather than
-        // at the review reported such a run as merely unreviewed.
-        match review.filter(|review| !review.complete()) {
-            Some(review) => {
-                tracing::warn!(
-                    unchecked = ?review.unchecked,
-                    "the review did not reach the end of what it set out to check; unreviewed"
-                );
-                RunStatus::Unreviewed
-            }
-            None => RunStatus::Converged,
-        }
+        RunStatus::Converged
     } else {
         RunStatus::MaxIterationsReached
+    }
+}
+
+/// Refuse to call a run converged while it holds a review that never finished.
+///
+/// An empty `findings` from a review cut short is not a verdict, and reading it as one is how a run
+/// converged on a review that never happened. The evidence is the run's LAST review, wherever it
+/// sits: a workflow may review before its tests are clean, edit once more, and return — the review
+/// then describes a tree the run no longer has, so `infer_status` rightly will not rest on it, and
+/// discarding it entirely let the run converge with a named gap nobody ever covered.
+///
+/// Only its COMPLETENESS is read here. Its findings are about the older tree and say nothing about
+/// what shipped, so they neither block nor clear the change; a later pass that finished ends the
+/// matter, because then the run's last review is that one.
+///
+/// Applied to `Converged` alone, which is what keeps it from masking something worse: a run whose
+/// tests never went clean is already `MaxIterationsReached` and stays there. Shaped like
+/// [`status_with_review_availability`] for the same reason — the run may be sound and only the
+/// review missing, and that is a different sentence from "this did not work".
+fn status_with_unanswered_gap(
+    status: RunStatus,
+    last_review: Option<&verifier::VerifierOutput>,
+) -> RunStatus {
+    match last_review {
+        Some(review) if status == RunStatus::Converged && !review.complete() => {
+            tracing::warn!(
+                unchecked = ?review.unchecked,
+                "the run's last review did not reach the end of what it set out to check; unreviewed"
+            );
+            RunStatus::Unreviewed
+        }
+        _ => status,
     }
 }
 
@@ -1201,6 +1218,20 @@ fn verification_result(
 /// spend refusing to finish one.
 const REVIEW_CONTINUATIONS: usize = 2;
 
+/// Continuations already spent by `reviews`: the trailing run of passes that could not finish, less
+/// the one that began it.
+///
+/// A first pass is not a continuation of anything, so a chain of one incomplete review has spent
+/// none — counting it made `REVIEW_CONTINUATIONS` allow one fewer continuation than it names.
+fn continuations_spent(reviews: &[verifier::VerifierOutput]) -> usize {
+    reviews
+        .iter()
+        .rev()
+        .take_while(|review| !review.complete())
+        .count()
+        .saturating_sub(1)
+}
+
 /// Fold a chain of review passes into the one review they add up to.
 ///
 /// A continuation reviews only the gap the pass before it named, so its own checkpoint carries only
@@ -1323,12 +1354,10 @@ fn review_continuations(checkpoints: &[ratatoskr_store::Checkpoint]) -> (Vec<Str
     // ends the chain for the budget exactly as it does for the carried gap, so a workflow that
     // reviews again after one finished starts with its continuations back — counting through the
     // completion would hand the fresh review `retryable: false` on its first gap.
-    let spent = reviews
-        .iter()
-        .rev()
-        .take_while(|review| !review.complete())
-        .count();
-    (unchecked, spent < REVIEW_CONTINUATIONS)
+    (
+        unchecked,
+        continuations_spent(&reviews) < REVIEW_CONTINUATIONS,
+    )
 }
 
 /// `verify({ analyst })` — read the worktree's diff against the plan.
@@ -1489,7 +1518,13 @@ async fn verify_host(
     let mut chain = review_chain(&checkpoints);
     chain.push(out);
     let review = folded(&chain).expect("the chain holds the pass just produced");
-    serde_json::to_string(&verification_result(review, threshold, continuations_left))
+    // Counted over the chain INCLUDING the pass just produced. `continuations_left` above answers
+    // "may this call proceed"; what the script is told has to answer "may another follow", and
+    // reusing the first said `retryable: true` on the pass that spent the last continuation — so
+    // the loop made one more call that reviewed nothing, and one fewer pass actually ran than
+    // `REVIEW_CONTINUATIONS` names.
+    let another_may_follow = continuations_spent(&chain) < REVIEW_CONTINUATIONS;
+    serde_json::to_string(&verification_result(review, threshold, another_may_follow))
         .map_err(|e| e.to_string())
 }
 
@@ -3063,6 +3098,8 @@ async fn finish_full<A: FullTerminalActions>(
         crate::parse_threshold(&ctx.config.implementer.verify_threshold),
     );
     let status = status_with_review_availability(status, &review);
+    // Whatever the run did after it, a review that could not finish is evidence the run holds.
+    let status = status_with_unanswered_gap(status, last_review(&checkpoints).as_ref());
     actions.commit(ctx, &worktree, &implementer).await;
 
     // Read once: both halves come from the same review, and asking twice could straddle a write.
@@ -11608,15 +11645,46 @@ mod tests {
             unchecked: vec!["the error path in session.rs".to_string()],
         };
         assert_eq!(
-            infer_status(
-                &baseline,
-                &clean_tests,
-                &[],
-                Some(&cut_short),
-                verifier::Severity::P2
+            status_with_unanswered_gap(
+                infer_status(
+                    &baseline,
+                    &clean_tests,
+                    &[],
+                    Some(&cut_short),
+                    verifier::Severity::P2
+                ),
+                Some(&cut_short)
             ),
             RunStatus::Unreviewed,
             "an empty findings list from a review that could not finish is not a verdict"
+        );
+
+        // And the ordering that matters: the run edits once more after the incomplete review and
+        // returns without re-reviewing. `infer_status` rightly will not rest on a review of a tree
+        // the run no longer has — but discarding the evidence entirely let the run converge with a
+        // named gap nobody ever covered, which is the whole failure this exists to stop. Only the
+        // completeness is read; the stale findings say nothing about what shipped.
+        assert_eq!(
+            status_with_unanswered_gap(
+                infer_status(&baseline, &clean_tests, &[], None, verifier::Severity::P2),
+                Some(&cut_short)
+            ),
+            RunStatus::Unreviewed,
+            "a run that edited past an unfinished review and never re-reviewed has not been reviewed"
+        );
+
+        // A later pass that finished ends the matter — then the run's last review is that one.
+        let answered = verifier::VerifierOutput {
+            findings: Vec::new(),
+            assessment: "covered it".to_string(),
+            unchecked: Vec::new(),
+        };
+        assert_eq!(
+            status_with_unanswered_gap(
+                infer_status(&baseline, &clean_tests, &[], None, verifier::Severity::P2),
+                Some(&answered)
+            ),
+            RunStatus::Converged
         );
 
         // `Unreviewed` says the work stands and only the review is missing, so it must not be
@@ -11628,12 +11696,15 @@ mod tests {
         // a pre-existing failure the change is not responsible for.
         let authored_failing = imp(&["a", "c"], &[], 1);
         assert_eq!(
-            infer_status(
-                &baseline,
-                &authored_failing,
-                &[],
-                Some(&cut_short),
-                verifier::Severity::P2
+            status_with_unanswered_gap(
+                infer_status(
+                    &baseline,
+                    &authored_failing,
+                    &[],
+                    Some(&cut_short),
+                    verifier::Severity::P2
+                ),
+                Some(&cut_short)
             ),
             RunStatus::MaxIterationsReached,
             "an incomplete review must not downgrade a run whose tests never went clean"
@@ -11648,12 +11719,15 @@ mod tests {
             unchecked: Vec::new(),
         };
         assert_eq!(
-            infer_status(
-                &baseline,
-                &clean_tests,
-                &[],
-                Some(&finished),
-                verifier::Severity::P2
+            status_with_unanswered_gap(
+                infer_status(
+                    &baseline,
+                    &clean_tests,
+                    &[],
+                    Some(&finished),
+                    verifier::Severity::P2
+                ),
+                Some(&finished)
             ),
             RunStatus::Converged,
             "a review that finished and found nothing converges exactly as before"
@@ -11735,7 +11809,21 @@ mod tests {
             ["path B"],
             "the most recent gap is the one still open"
         );
-        assert!(!left, "two incomplete reviews spend the budget");
+        assert!(
+            left,
+            "a first pass is not a continuation, so one continuation is still owed"
+        );
+
+        // The first pass, plus every continuation it is owed, and then no more.
+        let mut spent = two.clone();
+        spent.push(review_checkpoint(
+            "verifier",
+            &unfinished("path C"),
+            None::<&&str>,
+        ));
+        let (carried, left) = review_continuations(&spent);
+        assert_eq!(carried, ["path C"]);
+        assert!(!left, "the continuations this tree gets are spent");
 
         // A review that finished ends the chain: nothing after it is continuing anything, and it
         // does not spend a continuation.
@@ -11796,7 +11884,9 @@ mod tests {
             assessment: "got part way".to_string(),
             unchecked: vec!["the error path".to_string()],
         };
-        for _ in 0..REVIEW_CONTINUATIONS {
+        // The first pass plus every continuation it is owed.
+        let passes = REVIEW_CONTINUATIONS + 1;
+        for _ in 0..passes {
             note(&ctx, "verifier", &unfinished, None).await.unwrap();
         }
 
@@ -11837,7 +11927,7 @@ mod tests {
             .filter(|c| c.node_name == "verifier")
             .count();
         assert_eq!(
-            reviews, REVIEW_CONTINUATIONS,
+            reviews, passes,
             "a call past the ceiling must leave the record as it found it"
         );
         assert!(
@@ -12137,9 +12227,10 @@ mod tests {
             review_checkpoint("implementer", &imp(&[], &["a"], 0), None::<&&str>),
             review_checkpoint("verifier", &unfinished("path A"), None::<&&str>),
             review_checkpoint("verifier", &unfinished("path B"), None::<&&str>),
+            review_checkpoint("verifier", &unfinished("path C"), None::<&&str>),
         ];
         let (carried, left) = review_continuations(&same_tree);
-        assert_eq!(carried, ["path B"]);
+        assert_eq!(carried, ["path C"]);
         assert!(!left);
     }
 
