@@ -665,36 +665,34 @@ async fn note<T: serde::Serialize>(
     .map_err(|e| e.to_string())
 }
 
-/// Say so when a run ends still holding model turns nobody claimed.
-///
-/// A turn is claimed by the checkpoint it belongs to. Whatever is left is cost the run paid that no
-/// row accounts for — a node whose model turn ran under one name and was checkpointed under
-/// another, or a turn whose checkpoint never happened. Nothing else would say: a dropped number
-/// reads exactly like a node that never called a model (#262).
 /// Stage identities whose model turn no checkpoint claims, with the reason each is allowed to.
 ///
 /// A turn is claimed by the checkpoint written under the same name in the same claim scope
 /// (`crate::record` -> `RunLedger::take`), and `execute_after_guard` writes one when the invocation
-/// checkpoints OR the stage belongs to another node. A stage that is folded into someone else's
-/// record as evidence AND is a node of its own therefore has nothing to claim its turn, and its
-/// cost lands in the bin — invisible, because a dropped number reads exactly like a node that never
-/// called a model.
+/// checkpoints OR the stage belongs to another node. A stage a workflow host invokes as evidence
+/// while being a node of its own therefore has nothing to claim its turn, and its cost lands in the
+/// bin — invisible, because a dropped number reads exactly like a node that never called a model.
+///
+/// A delegation child is invoked at the same disposition but is not this shape: the executor folds
+/// its turn into the parent's name before the parent claims, so the record the delegation writes
+/// covers both (#283). Only an evidence invocation a *host* makes reaches this list.
 ///
 /// Written out and bolted both ways by `nothing_records_under_a_name_nobody_claims`: a stage that
 /// acquires the property without being listed fails, and a listed name that no longer has it fails.
 /// The second direction is the one that matters when a fix lands — the list shrinks and the case
 /// says so.
-///
-/// The other shape this admits is a delegation target: the executor invokes one at the evidence
-/// disposition, so a target that is its own node is unclaimed for the same reason (#283). The
-/// bundled registry declares no delegation, so nothing is listed for it here; the rule below covers
-/// one the moment it appears.
 pub(crate) const UNCLAIMED_BY_DESIGN: &[(&str, &str)] = &[(
     "characterizer",
     "folded into another stage's record as evidence and declares no node, because which node ran \
      it depends on the invocation (#244)",
 )];
 
+/// Say so when a run ends still holding model turns nobody claimed.
+///
+/// A turn is claimed by the checkpoint it belongs to. Whatever is left is cost the run paid that no
+/// row accounts for — a node whose model turn ran under one name and was checkpointed under
+/// another, or a turn whose checkpoint never happened. Nothing else would say: a dropped number
+/// reads exactly like a node that never called a model (#262).
 fn warn_about_unclaimed_turns(ctx: &WorkflowContext) {
     // The by-design residents are filtered out rather than reported, so what is left is always
     // something to act on. A warning an operator learns to expect is a warning nobody reads, and
@@ -715,9 +713,10 @@ fn warn_about_unclaimed_turns(ctx: &WorkflowContext) {
     tracing::warn!(
         nodes = %unclaimed.join(", "),
         "these model turns cost the run and reached no checkpoint, so nothing reports what they \
-         spent; a stage whose output is folded into another stage's record as evidence, while \
-         being a node of its own, is the usual cause — see UNCLAIMED_BY_DESIGN for the ones that \
-         are meant to be here"
+         spent; the usual cause is a stage a workflow host invokes as evidence while it is a node \
+         of its own, which leaves no record to claim it — a delegation child is not this, its turn \
+         is folded into its parent's — see UNCLAIMED_BY_DESIGN for the ones that are meant to be \
+         here"
     );
 }
 
@@ -1945,6 +1944,7 @@ impl StageExecutor {
                 .ok_or_else(|| format!("stage `{}` has no agent `{}`", target.id, target.agent))?;
             let task = ChildTask::spawn(&stage, &profile, &target, &target_profile, input.clone())
                 .map_err(|e| e.to_string())?;
+            let child_id = target.id.clone();
             let child = Box::pin(self.execute(StageInvocation {
                 stage: target,
                 input_json: serde_json::to_string(&task.input).map_err(|e| e.to_string())?,
@@ -1958,9 +1958,22 @@ impl StageExecutor {
                 invocation_guidance: None,
                 output: StageOutput::Evidence,
             }))
-            .await?;
+            .await;
+            // The child's turn becomes the parent's cost. It runs inside the parent's claim scope,
+            // but a claim is keyed by (scope, NAME) — deliberately, so the referee's turn and the
+            // implementer's inside one `iterate` cannot take each other's — and the child writes no
+            // checkpoint to claim under its own. Left as it ran, its turn is one nobody ever takes:
+            // it reads identically to a stage that called no model, which is precisely what
+            // `RunLedger::unclaimed` exists to make visible.
+            //
+            // Re-recorded before the child's result is unwrapped, so a delegation that fails leaves
+            // its cost under the parent, the same as any other invocation that ran a turn and never
+            // reached its checkpoint.
+            if let Some(spent) = self.ctx.ledger.take(&child_id) {
+                self.ctx.ledger.record(&stage.id, spent);
+            }
             let child_output: serde_json::Value =
-                serde_json::from_str(&child).map_err(|e| e.to_string())?;
+                serde_json::from_str(&child?).map_err(|e| e.to_string())?;
             let evidence: serde_json::Value =
                 task.evidence(child_output).map_err(|e| e.to_string())?;
             json!({ "input": input, "child_evidence": evidence })
@@ -5288,6 +5301,103 @@ mod tests {
         assert!(
             ctx.ledger.unclaimed().is_empty(),
             "both turns were claimed by a checkpoint"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_delegation_childs_turn_is_charged_to_the_record_the_delegation_writes() {
+        // A child is evidence inside its parent's call: it writes no checkpoint of its own, and the
+        // parent's is the only record the delegation produces. So the child's turn has to be
+        // claimed by that record — a claim is keyed by (scope, name), and a turn left standing
+        // under the child's name is one nobody ever takes. It then reads identically to a stage
+        // that called no model at all, which is the failure the ledger exists to make visible.
+        let dir = std::env::temp_dir().join(format!("ratatoskr-child-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-child-cost", None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        let mut config = RatatoskrConfig::default();
+        config
+            .models
+            .insert("probe_parent".to_string(), model_route());
+        config
+            .models
+            .insert("probe_child".to_string(), model_route());
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-child-cost",
+            "delegate and pay for it",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+
+        let mut child = crate::stage::stage_fixture("probe_child", "reason");
+        child.output_contract = "Evidence".to_string();
+        child.output_schema = Some(json!({
+            "type": "object",
+            "required": ["ok"],
+            "properties": { "ok": { "type": "boolean" } }
+        }));
+        let mut parent = crate::stage::stage_fixture("probe_parent", "reason");
+        parent.output_contract = "Evidence".to_string();
+        parent.output_schema = child.output_schema.clone();
+        parent.delegation = Some(crate::stage::Delegation {
+            target: "probe_child".to_string(),
+            evidence_contract: "Evidence".to_string(),
+            input_limit: 65536,
+        });
+
+        let turn = ChargingStageTurn {
+            output: json!({ "ok": true }).to_string(),
+            telemetry: ratatoskr_core::NodeTelemetry {
+                model: Some("anthropic/test-model".to_string()),
+                duration_ms: Some(50),
+                usage: ratatoskr_core::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 100,
+                    ..Default::default()
+                },
+                turns: Some(1),
+                ..Default::default()
+            },
+            barrier: None,
+        };
+        let hosts =
+            build_hosts_with_turn(&ctx, &[parent, child], Arc::new(turn) as Arc<dyn StageTurn>)
+                .unwrap();
+        hosts.get("probe_parent").unwrap()("{}".to_string())
+            .await
+            .unwrap();
+
+        let checkpoints = store.checkpoints_for_run("run-child-cost").await.unwrap();
+        assert_eq!(
+            checkpoints
+                .iter()
+                .map(|c| c.node_name.as_str())
+                .collect::<Vec<_>>(),
+            ["probe_parent"],
+            "a child is evidence, not a second checkpointed stage"
+        );
+        let record = &checkpoints[0].telemetry;
+        assert_eq!(
+            record.turns,
+            Some(2),
+            "the record covers the parent's turn and the child's"
+        );
+        assert_eq!(record.usage.input_tokens, 20);
+        assert_eq!(record.usage.output_tokens, 200);
+        assert!(
+            ctx.ledger.unclaimed().is_empty(),
+            "the child's turn went in the bin: {:?}",
+            ctx.ledger.unclaimed()
         );
         let _ = std::fs::remove_dir_all(dir);
     }

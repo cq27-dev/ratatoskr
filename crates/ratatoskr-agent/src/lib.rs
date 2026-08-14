@@ -2484,8 +2484,13 @@ static NEXT_CLAIM_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// summarising turn a compactor charges to the node it compacts for.
 ///
 /// Scopes do not nest in practice and are not meant to: an invocation that produces no checkpoint
-/// of its own — a delegation child, a red-team half — runs inside its parent's scope, which is what
-/// folds its cost into the record that does get written.
+/// of its own runs inside its parent's scope, which is what keeps its turn reachable to the claim
+/// that will pay for it. The scope alone does not fold it — a claim is keyed by name as well, so
+/// the parent re-records the child's turn under its own name before claiming. See the delegation
+/// branch of `execute_after_guard`.
+///
+/// A stage that merely belongs to another node is a different case and needs none of this: it
+/// writes its own checkpoint row inside its box, so it claims its own turn under its own name.
 pub async fn claim_scope<F: Future>(work: F) -> F::Output {
     CLAIM_SCOPE
         .scope(
