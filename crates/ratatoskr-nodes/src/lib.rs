@@ -3084,6 +3084,34 @@ mod agent_config_tests {
     }
 
     #[tokio::test]
+    async fn the_starter_config_routes_what_a_plan_needs_and_nothing_that_is_gone() {
+        // `ratatoskr init` serializes this, so it is the first config a repository runs — and a
+        // stage with no route fails when it is reached. `scout` kept a route here after the stage
+        // was deleted: a section a fresh config invites you to edit, governing nothing, while
+        // `context` had none and `plan` could not run at all. Nothing covered the pair, because the
+        // governable set is tested against fixtures and the starter config against parsing.
+        let starter = RatatoskrConfig::default();
+        let governable = governable_nodes()
+            .await
+            .expect("reading the workflow registry");
+
+        for name in starter.models.keys() {
+            // `ask` is the clarification route, not a stage — every other key names one.
+            assert!(
+                name == "ask" || governable.iter().any(|n| n == name),
+                "the starter config routes `{name}`, which no stage governs: {governable:?}"
+            );
+        }
+        // What a `plan` entry must drive, and therefore what a first run needs to reach at all.
+        for required in ["context", "analyst"] {
+            assert!(
+                starter.models.contains_key(required),
+                "a fresh config cannot run `plan` without a `{required}` route"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_repository_may_govern_two_stages_under_one_name_as_the_built_ins_do() {
         // The pattern `nodes.ts` uses for the red team: two stages declare `governedBy: "redteam"`
         // and no stage is named that, so one ruleset and one `[models.*]` route shape both halves.

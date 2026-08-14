@@ -932,10 +932,14 @@ impl Default for RatatoskrConfig {
             },
             agents: HashMap::new(),
             models: HashMap::from([
-                // `ask` is the only route consumed in Phase 1; the rest are illustrative,
-                // forward-looking node routes (Phase 2+).
+                // What `ratatoskr init` writes, so it has to be a config the standard pipeline can
+                // actually run: `context` and `analyst` are what a `plan` entry must drive, and a
+                // stage with no route fails when it is reached. The rest of the standard stages are
+                // deliberately absent — an unrouted `verifier` is a run that does not review, which
+                // is a choice a repository makes by adding the section.
                 ("ask".to_string(), route("anthropic", "claude-sonnet-4-6")),
-                ("scout".to_string(), route("moonshot", "kimi-k2.5")),
+                // Retrieval and summarising, not judgement — the cheap tier is the right default.
+                ("context".to_string(), route("moonshot", "kimi-k2.5")),
                 (
                     "analyst".to_string(),
                     route("anthropic", "claude-sonnet-4-6"),
