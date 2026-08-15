@@ -315,6 +315,25 @@ export interface LiveEvent {
   error?: string;
   /** Which attempt this was, on a `checkpoint`. */
   iteration?: number;
+  /**
+   * Which execution produced this, and what invoked that one.
+   *
+   * A name is not an execution: one stage is invoked once per converge pass and may be invoked
+   * concurrently, so two records under one name are two invocations and only this says which.
+   * Absent on records written before executions had identities; `parent_span_id` absent means the
+   * run drove this execution, which is not a gap.
+   */
+  span_id?: string;
+  parent_span_id?: string;
+  /**
+   * On `span_start` and `span_end`: what kind of execution it is (`host`, `node`, `clarification`)
+   * and what it is called.
+   *
+   * The name is deliberately not `node` — a host call is an execution the shape cannot place, and
+   * folding it into node state would draw a box for it.
+   */
+  execution?: string;
+  execution_name?: string;
 }
 
 /** What one attempt cost, off the event stream. */

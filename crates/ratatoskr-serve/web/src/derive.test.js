@@ -1115,3 +1115,114 @@ test("a stage two nodes died in is not a stage the run skipped", () => {
   expect(at("implementer").entered).toBe(true);
   expect(skippedSpans(view)).toEqual([]);
 });
+
+/** A `node_start` for one execution, with the model and cost that attempt will report. */
+function attemptStart(name, span, model) {
+  return {
+    at: "2026-08-12T10:00:00Z",
+    kind: "node_start",
+    node: name,
+    detail: "node started",
+    span_id: span,
+    facts: { model, tools: ["Read"], thinking: false, reuses_session: false },
+  };
+}
+
+function attemptCheckpoint(name, span, tokens) {
+  return {
+    at: "2026-08-12T10:00:05Z",
+    kind: "checkpoint",
+    node: name,
+    detail: "checkpoint",
+    span_id: span,
+    turns: 1,
+    usage: {
+      input_tokens: tokens,
+      output_tokens: tokens,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      reasoning_tokens: 0,
+      duration_ms: tokens,
+    },
+  };
+}
+
+test("an attempt's figures are its own, not the ones the attempt before it reported", () => {
+  // The implementer is re-driven once per converge pass, and every attempt records under the one
+  // name. Keyed by name, a second attempt opened holding the first one's model, tokens and duration
+  // — so a viewer scrubbed back to the moment the second one started saw the first one's figures
+  // against it, and the box's cost was two attempts added together.
+  const stages = registry(["implementer"]);
+  const first = "00000000000000a1";
+  const second = "00000000000000b2";
+  const events = [
+    attemptStart("implementer", first, "opus"),
+    attemptCheckpoint("implementer", first, 100),
+    attemptStart("implementer", second, "sonnet"),
+    attemptCheckpoint("implementer", second, 7),
+  ];
+
+  const of = (prefix) =>
+    nodesFromEvents(inNodeBoxes(prefix, stages)).get("implementer").telemetry;
+
+  // Where the run WAS: the first attempt, and nothing of the second.
+  const one = of(events.slice(0, 2));
+  expect(one.model).toBe("opus");
+  expect(one.input_tokens).toBe(100);
+
+  // The moment the second starts: its own model, and none of the first's cost carried into it.
+  const opened = of(events.slice(0, 3));
+  expect(opened.model).toBe("sonnet");
+  expect(opened.input_tokens).toBe(0);
+  // Nothing measured yet reads as nothing measured: a fresh attempt has no duration, and `null`
+  // is how this fold says that — a zero would be a claim that it took no time.
+  expect(opened.duration_ms).toBe(null);
+
+  // And when it finishes, its own figures — not the two attempts added together.
+  const both = of(events);
+  expect(both.model).toBe("sonnet");
+  expect(both.input_tokens).toBe(7);
+  expect(both.duration_ms).toBe(7);
+});
+
+test("two invocations of one stage keep their own figures while both are live", () => {
+  // `Promise.all([probe(a), probe(b)])`. Both record under one name at once, so without an identity
+  // on each record there is nothing to say which invocation a cost belongs to — the later record
+  // simply overwrote the earlier one's.
+  const stages = registry(["probe"]);
+  const a = "00000000000000aa";
+  const b = "00000000000000bb";
+  const events = [
+    attemptStart("probe", a, "opus"),
+    attemptStart("probe", b, "sonnet"),
+    attemptCheckpoint("probe", a, 50),
+  ];
+  const boxed = inNodeBoxes(events, stages);
+
+  // The box is still working: one invocation returned, the other has not.
+  expect(nodesFromEvents(boxed).get("probe").state).toBe("working");
+  expect(workingNodeNames([composed("probe", "idle")], boxed)).toEqual(["probe"]);
+
+  // The current invocation is the one still running, and it reports what IT was given — the
+  // returning sibling's cost is not attributed to it.
+  const live = nodesFromEvents(boxed).get("probe").telemetry;
+  expect(live.model).toBe("sonnet");
+  expect(live.input_tokens).toBe(0);
+});
+
+test("a record whose start this view never saw gets its own attempt", () => {
+  // An ingested log may begin mid-run. A checkpoint for an execution with no `node_start` in view
+  // must not be charged to whichever attempt happens to be open — that attributes a turn to an
+  // invocation that did not run it.
+  const stages = registry(["analyst"]);
+  const events = [
+    attemptStart("analyst", "00000000000000a1", "opus"),
+    attemptCheckpoint("analyst", "00000000000000c3", 42),
+  ];
+  const box = nodesFromEvents(inNodeBoxes(events, stages)).get("analyst");
+  // The attempt that arrived without a start is the current one, and carries its own cost.
+  expect(box.telemetry.input_tokens).toBe(42);
+  expect(box.telemetry.model).toBe(null);
+  // The one that started and never returned is still live, so the box is still working.
+  expect(box.state).toBe("working");
+});

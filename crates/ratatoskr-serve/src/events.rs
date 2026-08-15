@@ -77,6 +77,25 @@ pub struct LiveEvent {
     /// a viewer most wants them is while it is still working.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facts: Option<LiveNodeFacts>,
+    /// Which execution produced this, and what invoked that one.
+    ///
+    /// A name is not an execution: one stage is invoked once per converge pass and may be invoked
+    /// concurrently, so two records under one name are two invocations and only this says which.
+    /// Absent on records written before executions had identities, and `parent_span_id` is absent
+    /// for an execution the run itself drove — which is not a gap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<String>,
+    /// Set on `span_start` and `span_end`: what kind of execution it is, and what it is called.
+    ///
+    /// The name is NOT `node`, deliberately: a workflow host call is an execution with a name the
+    /// shape cannot place, and anything folding every event carrying `node` into node state would
+    /// give a run a trailing column per host it invoked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_name: Option<String>,
 }
 
 /// What one attempt of a node cost.
@@ -288,6 +307,10 @@ fn to_event(record: &Value) -> LiveEvent {
             .filter(|e| !e.is_empty())
             .map(str::to_string),
         iteration: record.get("iteration").and_then(Value::as_u64),
+        span_id: str_field("span_id").map(str::to_string),
+        parent_span_id: str_field("parent_span_id").map(str::to_string),
+        execution: str_field("execution").map(str::to_string),
+        execution_name: str_field("execution_name").map(str::to_string),
         kind,
         node: node_of(record).map(str::to_string),
         detail,
@@ -749,6 +772,10 @@ mod tests {
             turns: None,
             error: None,
             iteration: None,
+            span_id: None,
+            parent_span_id: None,
+            execution: None,
+            execution_name: None,
         };
         let noise = LiveEvent {
             at: "t1".into(),
@@ -764,6 +791,10 @@ mod tests {
             turns: None,
             error: None,
             iteration: None,
+            span_id: None,
+            parent_span_id: None,
+            execution: None,
+            execution_name: None,
         };
 
         // The question is the oldest event, well outside the replay window.
