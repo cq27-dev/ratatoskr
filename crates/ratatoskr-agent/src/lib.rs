@@ -569,8 +569,11 @@ where
     tracing::info!(
         kind = "usage",
         calls,
-        // Which execution spent it. A turn's cost is the one record that must not be filed under
-        // another invocation of the same name, and an event carrying only a name cannot say.
+        // The name and the identity together, or neither. This runs inside the ASKING node's span,
+        // so an identity on its own is read against the asker's name — which files an answerer's
+        // cost under the asker, in an invocation of the asker that never happened. What ran here is
+        // the answerer, and both halves of that say so.
+        node,
         span_id = current_execution().map(|i| i.span_id.to_string()),
         "gen_ai.usage.input_tokens" = usage.input_tokens,
         "gen_ai.usage.output_tokens" = usage.output_tokens,

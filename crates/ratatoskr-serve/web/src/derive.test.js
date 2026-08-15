@@ -1117,6 +1117,17 @@ test("a stage two nodes died in is not a stage the run skipped", () => {
 });
 
 /** A `node_start` for one execution, with the model and cost that attempt will report. */
+/** A tool call, optionally from a named execution. */
+function called(name, tool, span) {
+  return {
+    at: "2026-08-12T10:00:02Z",
+    kind: "tool_call",
+    node: name,
+    detail: tool,
+    ...(span ? { span_id: span } : {}),
+  };
+}
+
 function attemptStart(name, span, model) {
   return {
     at: "2026-08-12T10:00:00Z",
@@ -1220,11 +1231,22 @@ test("a record whose start this view never saw gets its own attempt", () => {
     attemptCheckpoint("analyst", "00000000000000c3", 42),
   ];
   const box = nodesFromEvents(inNodeBoxes(events, stages)).get("analyst");
-  // The attempt that arrived without a start is the current one, and carries its own cost.
-  expect(box.telemetry.input_tokens).toBe(42);
-  expect(box.telemetry.model).toBe(null);
-  // The one that started and never returned is still live, so the box is still working.
+  // The invocation this view watched start is still running, so it is what the box shows — and the
+  // stray record's cost is NOT charged to it, which is the whole point.
   expect(box.state).toBe("working");
+  expect(box.telemetry.model).toBe("opus");
+  expect(box.telemetry.input_tokens).toBe(0);
+
+  // And a record about an invocation is not evidence that the invocation is running: the stray
+  // opened no LIVE attempt, so once the one that started ends, the box ends with it. Nothing can
+  // ever close an attempt this view never saw start, and one left live works forever.
+  const after = nodesFromEvents(
+    inNodeBoxes([...events, attemptCheckpoint("analyst", "00000000000000a1", 3)], stages),
+  ).get("analyst");
+  expect(after.state).toBe("done");
+  // Whichever of the two it shows, it shows ONE of them. 45 would mean two invocations added
+  // together, which is what keying by name did.
+  expect([3, 42]).toContain(after.telemetry.input_tokens);
 });
 
 test("a tool call from the older of two live invocations is not shown against the newer", () => {
@@ -1262,4 +1284,135 @@ test("a tool call from the older of two live invocations is not shown against th
   const derived = nodesFromEvents(boxed).get("probe");
   expect(derived.cycles).toBe(live.cycles);
   expect([...derived.used]).toEqual([...live.used]);
+});
+
+test("a running attempt shows its own pending figures, not the finished one's", () => {
+  // The last hop, and the one that decided what a viewer actually sees. A fresh attempt has
+  // reported no cost yet, and reading that as "the stream cannot say" hands the box back the
+  // SERVER's telemetry — which is the run's final state. The graph then drew the first attempt's
+  // model, tokens and duration against the second while it ran.
+  const stages = registry(["implementer"]);
+  const first = "00000000000000a1";
+  const second = "00000000000000b2";
+  const events = [
+    attemptStart("implementer", first, "opus"),
+    attemptCheckpoint("implementer", first, 100),
+    attemptStart("implementer", second, "sonnet"),
+  ];
+  // What the server holds is the run's final state: the first attempt's record.
+  const served = [
+    {
+      name: "implementer",
+      state: "done",
+      checkpoints: 1,
+      stage: 0,
+      lane: 0,
+      shaped: true,
+      telemetry: { ...blankTelemetry, model: "opus", input_tokens: 100, duration_ms: 100 },
+    },
+  ];
+
+  const drawn = applyDerived(served, nodesFromEvents(inNodeBoxes(events, stages)))[0];
+  expect(drawn.state).toBe("working");
+  expect(drawn.telemetry.model).toBe("sonnet");
+  expect(drawn.telemetry.input_tokens).toBe(0);
+
+  // And where the stream genuinely cannot answer — an ingested tail with no start in view — the
+  // server's record is still what fills the gap.
+  const tail = applyDerived(
+    served,
+    nodesFromEvents(inNodeBoxes([called("implementer", "Read")], stages)),
+  )[0];
+  expect(tail.telemetry.model).toBe("opus");
+});
+
+test("an event about a running node does not open an invocation nothing can close", () => {
+  // `acceptance_step` names a node and, before the host recorded one, no execution. It opened an
+  // attempt that no checkpoint matched — the aggregate carries the host call's identity — and that
+  // attempt stayed live, so the box read working for the rest of the run with its controls still
+  // offered. A record ABOUT an invocation is not evidence that one is running.
+  const stages = registry(["implementer"]);
+  const host = "00000000000000e5";
+  const events = [
+    { at: "t", kind: "acceptance_step", node: "implementer", detail: "cargo test" },
+    attemptCheckpoint("implementer", host, 10),
+  ];
+  const box = nodesFromEvents(inNodeBoxes(events, stages)).get("implementer");
+  expect(box.checkpoints).toBe(1);
+  expect(box.state).toBe("done");
+});
+
+test("an invocation that writes no checkpoint is ended by its own span_end", () => {
+  // An evidence-only stage, a turn whose failure the workflow recovered from, an answerer: all
+  // executions that end without a record of their own. Nothing in the stream could close them, so
+  // the box they belong to stayed working with its controls offered for the rest of the run.
+  //
+  // The lifecycle event is what closes them. It names an execution and no node — a host call is an
+  // execution the shape cannot place — so it is matched by identity wherever that execution is.
+  const shape = [composed("redteam", "idle")];
+  const stages = registry(["redteam", "redteam_author"]);
+  const span = "00000000000000f6";
+  const ran = [attemptStart("redteam_author", span, "opus"), checkpointed("redteam")];
+
+  // The box's own aggregate has landed, and the member is still going: still working, and the Stop
+  // is still aimed at it. That is the case this must not break.
+  const working = inNodeBoxes(ran, stages);
+  expect(applied(shape, working)[0].state).toBe("working");
+  expect(workingNodeNames(shape, working)).toEqual(["redteam"]);
+
+  // Once the member's execution ends — with no checkpoint of its own, ever — the box is finished.
+  const ended = inNodeBoxes(
+    [
+      ...ran,
+      { at: "t", kind: "span_end", span_id: span, execution: "node", execution_name: "redteam_author" },
+    ],
+    stages,
+  );
+  expect(applied(shape, ended)[0].state).toBe("done");
+  expect(workingNodeNames(shape, ended)).toEqual([]);
+});
+
+test("a finished invocation does not stand in for one still running", () => {
+  // Two invocations overlap and the SECOND finishes first. Taking the newest attempt outright drew
+  // its model and its tools while the one still going went unseen — and its later tool calls landed
+  // on an attempt nobody was looking at.
+  const stages = registry(["probe"]);
+  const a = "00000000000000aa";
+  const b = "00000000000000bb";
+  const events = [
+    attemptStart("probe", a, "opus"),
+    attemptStart("probe", b, "sonnet"),
+    attemptCheckpoint("probe", b, 5),
+    called("probe", "Read", a),
+  ];
+  const boxed = inNodeBoxes(events, stages);
+
+  const box = nodesFromEvents(boxed).get("probe");
+  expect(box.state).toBe("working");
+  expect(box.telemetry.model).toBe("opus");
+  const live = liveNodes(boxed).get("probe");
+  expect([...live.used]).toEqual(["Read"]);
+  expect(live.facts.model).toBe("opus");
+});
+
+test("folding a long history costs what the history costs", () => {
+  // An imported bundle has no bound on how many times a stage was invoked. Searching a member's
+  // attempts per record is quadratic in that number, and both folds run on every render and every
+  // scrub of the timeline.
+  const stages = registry(["implementer"]);
+  const many = 20_000;
+  const events = [];
+  for (let n = 1; n <= many; n += 1) {
+    const span = `${n}`.padStart(16, "0");
+    events.push(attemptStart("implementer", span, "opus"), attemptCheckpoint("implementer", span, 1));
+  }
+  const boxed = inNodeBoxes(events, stages);
+
+  const started = performance.now();
+  const box = nodesFromEvents(boxed).get("implementer");
+  liveNodes(boxed);
+  expect(performance.now() - started).toBeLessThan(500);
+  expect(box.checkpoints).toBe(many);
+  // The last invocation's own figures, not the sum of twenty thousand.
+  expect(box.telemetry.input_tokens).toBe(1);
 });

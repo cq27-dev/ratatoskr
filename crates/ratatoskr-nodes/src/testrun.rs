@@ -139,6 +139,11 @@ pub async fn run_acceptance(a: Acceptance<'_>) -> Result<Vec<StepOutcome>, Strin
         tracing::info!(
             kind = "acceptance_step",
             node,
+            // The execution running the suite, so this lands on the invocation that is running it
+            // rather than opening one of its own. A record naming a node and no execution is filed
+            // under whichever invocation is in flight, and a suite runs from a host call whose
+            // aggregate names a different one.
+            span_id = ratatoskr_agent::current_execution().map(|i| i.span_id.to_string()),
             step = %step.name,
             command = %step.command.join(" "),
             exit_code = out.exit_code,

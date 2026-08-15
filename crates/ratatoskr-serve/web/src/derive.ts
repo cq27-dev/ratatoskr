@@ -37,6 +37,15 @@ export interface DerivedNode {
    * than saying nothing: a node that plainly worked would read as having cost nothing.
    */
   costed: boolean;
+  /**
+   * Whether this view saw the invocation being shown START.
+   *
+   * Distinct from [`costed`], and the distinction matters at exactly one moment: a fresh attempt
+   * has reported no cost yet, and treating that as "the stream cannot say" hands the box back the
+   * server's telemetry — which is the run's FINAL state, so a second attempt renders holding the
+   * first one's model, tokens and duration.
+   */
+  started: boolean;
 }
 
 /** The event kinds that mean a node is doing something. */
@@ -81,26 +90,72 @@ function keyOf(e: BoxedEvent, member: string): string {
   return e.span_id ?? `unidentified:${member}`;
 }
 
-/**
- * The attempt a record belongs to. One rule, obeyed by every fold over the stream.
- *
- * With an identity, the attempt that IS it — and a fresh one if this view never saw it start, since
- * an ingested log may begin mid-run and filing the record under some other attempt would charge
- * that attempt for a turn it did not run.
- *
- * Without one, the newest invocation still live, else the newest seen. Not the oldest: a record
- * that cannot say which invocation it belongs to belongs to the one in flight, and a re-entry that
- * announced no identity has to restart the counts rather than add to the attempt before it.
- */
-function attemptOf<A extends { span: string; live: boolean }>(
-  attempts: readonly A[],
-  e: BoxedEvent,
-  span: string,
-  open: () => A,
-): A {
-  if (e.span_id) return attempts.find((a) => a.span === span) ?? open();
-  return attempts.filter((a) => a.live).at(-1) ?? attempts.at(-1) ?? open();
+/** What every fold needs of an attempt, whatever else it keeps on one. */
+interface Tracked {
+  span: string;
+  /** Started and not yet ended. Only a `node_start` opens a live one. */
+  live: boolean;
+  /** Opened by a `node_start` in this view, rather than inferred from a record about it. */
+  started: boolean;
 }
+
+/**
+ * One member's invocations: indexed by identity, in order, with the live ones to hand.
+ *
+ * Indexed because a stage may be invoked any number of times — an imported history has no bound on
+ * it — and searching a growing list per record is quadratic in that number. The live list is short
+ * by construction: it holds only what is running at once.
+ */
+function attempts<A extends Tracked>() {
+  const list: A[] = [];
+  const byId = new Map<string, A>();
+  const live: A[] = [];
+  const add = (made: A) => {
+    list.push(made);
+    byId.set(made.span, made);
+    if (made.live) live.push(made);
+    return made;
+  };
+  const end = (attempt: A) => {
+    if (!attempt.live) return;
+    attempt.live = false;
+    const at = live.indexOf(attempt);
+    if (at >= 0) live.splice(at, 1);
+  };
+  return {
+    list,
+    add,
+    end,
+    of: (span: string) => byId.get(span),
+    /**
+     * The attempt a record belongs to.
+     *
+     * With an identity, the attempt that IS it — and a fresh one if this view never saw it start,
+     * since an ingested log may begin mid-run and filing the record under some other attempt would
+     * charge that attempt for a turn it did not run. That fresh one is NOT live: a record about an
+     * invocation is not evidence that it is still running, and an attempt nothing can ever close
+     * leaves its box working for the rest of the run.
+     *
+     * Without one, the newest invocation still live, else the newest seen. Not the oldest: a record
+     * that cannot say which invocation it belongs to belongs to the one in flight, and a re-entry
+     * that announced no identity has to restart the counts rather than add to the attempt before
+     * it.
+     */
+    for: (e: BoxedEvent, span: string, make: (live: boolean) => A): A => {
+      if (e.span_id) return byId.get(span) ?? add(make(false));
+      return live.at(-1) ?? list.at(-1) ?? add(make(false));
+    },
+    /**
+     * The invocation a viewer is looking at: the newest still live, else the newest seen.
+     *
+     * Newest LIVE first, because two invocations may overlap and the one that finished first is not
+     * what the box is doing. Taking the newest outright drew a finished sibling's model and tools
+     * while the one still running went unseen.
+     */
+    current: (): A | undefined => live.at(-1) ?? list.at(-1),
+  };
+}
+type Attempts<A extends Tracked> = ReturnType<typeof attempts<A>>;
 
 /**
  * Fold `events` into per-node state as of the last event given.
@@ -142,19 +197,14 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
    * against an earlier moment. Each invocation now carries its own, and the member is whichever of
    * them is current.
    */
-  interface Attempt {
-    /** The execution this is. `span_id` where the producer recorded one; see `keyOf`. */
-    span: string;
-    live: boolean;
+  interface Attempt extends Tracked {
     state: NodeState;
     telemetry?: NodeTelemetry;
     cycles: number;
     used: Set<string>;
     costed: boolean;
   }
-  interface Member {
-    attempts: Attempt[];
-  }
+  type Member = Attempts<Attempt>;
   const boxes = new Map<string, { checkpoints: number; members: Map<string, Member> }>();
   const at = (name: string) => {
     const found = boxes.get(name);
@@ -166,27 +216,51 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
   const memberOf = (box: { members: Map<string, Member> }, name: string): Member => {
     const found = box.members.get(name);
     if (found) return found;
-    const made: Member = { attempts: [] };
+    const made: Member = attempts<Attempt>();
     box.members.set(name, made);
     return made;
   };
+  /**
+   * Every attempt in the run by identity, so an execution's own end can close it.
+   *
+   * A `span_end` names an execution and no node — deliberately, since a host call is an execution
+   * the shape cannot place — so it is matched here rather than through a member. It is what closes
+   * an invocation that writes no checkpoint of its own: an answerer's turn, a stage whose evidence
+   * is its only output, a turn whose failure the workflow recovered from.
+   */
+  const everywhere = new Map<string, { member: Member; attempt: Attempt }>();
 
+  const make = (span: string, live: boolean, started: boolean): Attempt => ({
+    span,
+    live,
+    started,
+    state: "working",
+    cycles: 0,
+    used: new Set(),
+    costed: false,
+  });
   const open = (member: Member, span: string): Attempt => {
-    const made: Attempt = {
-      span,
-      live: true,
-      state: "working",
-      cycles: 0,
-      used: new Set(),
-      costed: false,
-    };
-    member.attempts.push(made);
+    const made = member.add(make(span, true, true));
+    everywhere.set(span, { member, attempt: made });
     return made;
   };
-  const attemptFor = (member: Member, e: BoxedEvent, span: string): Attempt =>
-    attemptOf(member.attempts, e, span, () => open(member, span));
+  const attemptFor = (member: Member, e: BoxedEvent, span: string): Attempt => {
+    const found = member.for(e, span, (live) => make(span, live, false));
+    if (!everywhere.has(found.span)) everywhere.set(found.span, { member, attempt: found });
+    return found;
+  };
 
   for (const e of events) {
+    // An execution's own end, which names no node. It closes the invocation it names wherever that
+    // is — the only thing that can, for an invocation that writes no checkpoint.
+    if (e.kind === "span_end" && e.span_id) {
+      const found = everywhere.get(e.span_id);
+      if (found) {
+        found.member.end(found.attempt);
+        if (found.attempt.state === "working") found.attempt.state = "done";
+      }
+      continue;
+    }
     if (!e.node) continue;
     const box = at(e.node);
     const name = e.member ?? e.node;
@@ -199,7 +273,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // the attempt before it carries over, which is what a name-keyed fold could not express. Its
       // siblings stand, and so do the checkpoints already recorded — the implementer is re-driven
       // once per converge iteration.
-      const before = member.attempts.at(-1)?.telemetry;
+      const before = member.current()?.telemetry;
       const attempt = open(member, span);
       // What it RAN ON carries across a re-entry; what it SPENT does not. The model, its tools and
       // its session are configuration — a start that announces nothing has not changed them — while
@@ -230,7 +304,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // checkpoint, and the fact of one proves only that the invocation stopped. Only the box's own
       // record can fail the box, as before.
       const attempt = attemptFor(member, e, span);
-      attempt.live = false;
+      member.end(attempt);
       attempt.state = own && e.error ? "failed" : "done";
       if (own) box.checkpoints += 1;
       attempt.telemetry = {
@@ -313,12 +387,11 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     // A member is whichever of its invocations is current: the last one to start, which is the one
     // a viewer is looking at. Its earlier attempts are what they were and are not merged into it —
     // that merge is how a second attempt came to report the first one's model and tokens.
-    const current = (m: Member) => m.attempts.at(-1);
-    const working = (m: Member) =>
-      m.attempts.some((a) => a.live) || current(m)?.state === "working";
+    const current = (m: Member) => m.current();
+    const working = (m: Member) => m.list.some((a) => a.live) || current(m)?.state === "working";
     const state: NodeState = members.some(working)
       ? "working"
-      : current(box.members.get(name) ?? { attempts: [] })?.state === "failed"
+      : current(box.members.get(name) ?? attempts<Attempt>())?.state === "failed"
         ? "failed"
         : box.checkpoints > 0
           ? "done"
@@ -339,6 +412,10 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       cycles: members.reduce((n, m) => n + (current(m)?.cycles ?? 0), 0),
       used: new Set(members.flatMap((m) => [...(current(m)?.used ?? [])])),
       costed: members.some((m) => current(m)?.costed ?? false),
+      // Whether the stream OPENED the invocation being shown, which is not the same question as
+      // whether it has reported a cost yet. A started attempt that has spent nothing so far is this
+      // view's answer and stands; one this view never saw start is a gap the server's record fills.
+      started: members.some((m) => current(m)?.started ?? false),
     });
   }
   return out;
@@ -615,39 +692,53 @@ export function inNodeBoxes(
  */
 export function liveNodes(events: readonly BoxedEvent[]): Map<string, LiveNode> {
   /** One invocation's live counts. Same shape as `LiveNode`, plus what it takes to be one of many. */
-  interface Attempt extends LiveNode {
-    span: string;
-    live: boolean;
-  }
-  const boxes = new Map<string, Map<string, Attempt[]>>();
+  interface Attempt extends LiveNode, Tracked {}
+  type Member = Attempts<Attempt>;
+
+  const boxes = new Map<string, Map<string, Member>>();
+  const everywhere = new Map<string, { member: Member; attempt: Attempt }>();
+  const made = (span: string, live: boolean, started: boolean): Attempt => ({
+    span,
+    live,
+    started,
+    cycles: 0,
+    used: new Set(),
+  });
+
   for (const e of events) {
+    // An execution's own end names no node, and is what closes an invocation that never
+    // checkpoints. Matched by identity, exactly as the checkpointed fold matches it.
+    if (e.kind === "span_end" && e.span_id) {
+      const found = everywhere.get(e.span_id);
+      if (found) found.member.end(found.attempt);
+      continue;
+    }
     if (!e.node) continue;
     let members = boxes.get(e.node);
     if (!members) boxes.set(e.node, (members = new Map()));
     const name = e.member ?? e.node;
-    let attempts = members.get(name);
-    if (!attempts) members.set(name, (attempts = []));
+    let member = members.get(name);
+    if (!member) members.set(name, (member = attempts<Attempt>()));
     const span = keyOf(e, name);
-    const open = () => {
-      const made: Attempt = { span, live: true, cycles: 0, used: new Set() };
-      attempts.push(made);
-      return made;
+    const remember = (attempt: Attempt) => {
+      if (!everywhere.has(attempt.span)) everywhere.set(attempt.span, { member, attempt });
+      return attempt;
     };
 
     if (e.kind === "node_start") {
       // Every `node_start`, not only one carrying facts — `facts` is optional, and restarting on
       // its presence made a re-entry that announced nothing accumulate onto the previous attempt.
-      // The same rule as the checkpointed fold: what the member runs on carries across a restart
-      // that announces nothing, and its counts do not.
-      const before = attempts.at(-1)?.facts;
-      const started = open();
+      // What the member RUNS ON carries across a restart that announces nothing, the same rule the
+      // checkpointed fold follows; its counts do not.
+      const before = member.current()?.facts;
+      const started = remember(member.add(made(span, true, true)));
       const facts = e.facts ?? before;
       if (facts) started.facts = facts;
       continue;
     }
-    const at = attemptOf(attempts, e, span, open);
+    const at = remember(member.for(e, span, (live) => made(span, live, false)));
     if (e.kind === "checkpoint") {
-      at.live = false;
+      member.end(at);
       continue;
     }
     if (e.kind === "tool_call") {
@@ -663,8 +754,8 @@ export function liveNodes(events: readonly BoxedEvent[]): Map<string, LiveNode> 
     // what they were: this is the same selection `nodesFromEvents` makes, and the two folds have to
     // answer the same question the same way or a box's live counts and its checkpointed ones
     // describe different attempts.
-    const all = [...members.values()].flatMap((attempts) => {
-      const current = attempts.at(-1);
+    const all = [...members.values()].flatMap((member) => {
+      const current = member.current();
       return current ? [current] : [];
     });
     // The same arithmetic the checkpointed fold uses on telemetry: counts add, tools are the union,
@@ -830,7 +921,14 @@ function fromStream(
     const { telemetry: _dropped, ...rest } = n;
     return { ...rest, state: "idle" as NodeState, checkpoints: 0, entered: false };
   }
-  const telemetry = d.costed ? d.telemetry : (n.telemetry ?? d.telemetry);
+  // Whose numbers to show. The stream's, once it has either reported a cost or watched the current
+  // invocation start — a fresh attempt that has spent nothing yet IS this view's answer, and
+  // handing the box back the server's record there shows the run's FINAL state against a moment it
+  // had not reached: a second attempt rendering the first one's model, tokens and duration.
+  //
+  // The server's only where the stream cannot answer at all: an ingested tail whose starts are in a
+  // rotated file, or a run recorded before checkpoints carried telemetry.
+  const telemetry = d.costed || d.started ? d.telemetry : (n.telemetry ?? d.telemetry);
   const settled: NodeState = died ? "failed" : n.state;
   return {
     ...n,
