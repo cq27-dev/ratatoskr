@@ -2430,6 +2430,7 @@ mod access_tests {
                     output_json: "{}",
                     input_json: None,
                     iteration: None,
+                    invocation: None,
                     telemetry: Default::default(),
                 })
                 .await
@@ -2510,6 +2511,7 @@ mod access_tests {
                     output_json: "{}",
                     input_json: None,
                     iteration: None,
+                    invocation: None,
                     telemetry: Default::default(),
                 })
                 .await
@@ -2578,6 +2580,7 @@ mod access_tests {
                 output_json: r#"{"verdict":"needs tests"}"#,
                 input_json: None,
                 iteration: None,
+                invocation: None,
                 telemetry: Default::default(),
             })
             .await

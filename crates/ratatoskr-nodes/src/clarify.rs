@@ -401,22 +401,32 @@ impl Clarifier for NodeClarifier {
         question: &'a str,
         control: Option<RuntimeControl>,
     ) -> Pin<Box<dyn Future<Output = ClarificationAnswer> + Send + 'a>> {
-        Box::pin(async move {
-            // Charge the budget; each completed exchange, including an exhausted one, is recorded.
-            let answer = if self.budget.fetch_add(1, Ordering::SeqCst) >= ASK_BUDGET {
-                ClarificationAnswer::Text(
-                    "The clarification budget for this run is exhausted. Proceed with your best \
-                     assumption and note it as a residual risk."
-                        .to_string(),
-                )
-            } else {
-                self.answer_inner(from, to, question, control).await
-            };
-            if let ClarificationAnswer::Text(answer) = &answer {
-                self.record(from, to, question, answer).await;
-            }
-            answer
-        })
+        // The exchange is its own execution, and the record is written INSIDE it. Written after,
+        // the row falls back to the asking node's execution and the two share a span id — which
+        // says the asker produced the clarification, and loses the only place the answerer's
+        // parentage was ever going to come from. The answering turn opens its own execution inside
+        // this one, so the exchange, the turn and the asker form the tree they actually make.
+        Box::pin(ratatoskr_agent::execution(
+            to,
+            ratatoskr_agent::ExecutionKind::Clarification,
+            async move {
+                // Charge the budget; each completed exchange, including an exhausted one, is
+                // recorded.
+                let answer = if self.budget.fetch_add(1, Ordering::SeqCst) >= ASK_BUDGET {
+                    ClarificationAnswer::Text(
+                        "The clarification budget for this run is exhausted. Proceed with your \
+                         best assumption and note it as a residual risk."
+                            .to_string(),
+                    )
+                } else {
+                    self.answer_inner(from, to, question, control).await
+                };
+                if let ClarificationAnswer::Text(answer) = &answer {
+                    self.record(from, to, question, answer).await;
+                }
+                answer
+            },
+        ))
     }
 }
 
@@ -465,6 +475,71 @@ mod tests {
     /// Resolving the answerer out of the compiled-in stage table instead means one run routes the
     /// analyst two ways: the executor through the overlaid registry and its governance id, the
     /// clarifier through a map the workflow never touched.
+    #[tokio::test]
+    async fn a_clarification_row_names_the_exchange_and_hangs_under_the_asker() {
+        // The exchange writes its record INSIDE its own execution. Written after it, the row falls
+        // back to the asking node's execution: the clarification and the asker then share one span
+        // id — which says the asker produced the clarification — and the answerer's parentage, the
+        // only thing that could ever place a clarification in the run, is gone.
+        //
+        // Driven through the exhausted-budget path, which records a real exchange without a model.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-clarify-identity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_run("run-clarify", None, "running")
+            .await
+            .unwrap();
+        let registry: crate::workflow::ExecutionStages = Arc::default();
+        registry
+            .set(Arc::new(crate::workflow::standard_stages().await.unwrap()))
+            .unwrap();
+        let clarifier = NodeClarifier::new(
+            &ratatoskr_core::RatatoskrConfig::default(),
+            &store,
+            &engine,
+            "run-clarify",
+            "an issue",
+            registry,
+        );
+        clarifier.budget.store(ASK_BUDGET, Ordering::SeqCst);
+
+        // The asking node's turn is the execution the exchange happens inside.
+        let asker = ratatoskr_agent::execution(
+            "implementer",
+            ratatoskr_agent::ExecutionKind::Node,
+            async {
+                let asker = ratatoskr_agent::current_execution().expect("the asker's execution");
+                clarifier
+                    .answer("implementer", "analyst", "which invariant applies?", None)
+                    .await;
+                asker
+            },
+        )
+        .await;
+
+        let rows = store.checkpoints_for_run("run-clarify").await.unwrap();
+        let row = rows
+            .iter()
+            .find(|c| c.node_name == "clarification")
+            .expect("the exchange was recorded");
+        let invocation = row.invocation.expect("and names an execution");
+        assert_ne!(
+            invocation.span_id, asker.span_id,
+            "the exchange is not the asking node's turn"
+        );
+        assert_eq!(
+            invocation.parent_span_id,
+            Some(asker.span_id),
+            "it is something the asking node invoked, and says so"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn the_clarifier_reaches_the_analyst_the_run_routes() {
         let dir = std::env::temp_dir().join(format!(

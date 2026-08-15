@@ -2265,7 +2265,7 @@ impl StageExecutor {
             // its cost under the parent, the same as any other invocation that ran a turn and never
             // reached its checkpoint.
             if let Some(spent) = self.ctx.ledger.take(&child_id) {
-                self.ctx.ledger.record(&stage.id, spent);
+                self.ctx.ledger.record_cost(&stage.id, spent.telemetry);
             }
             let child_output: serde_json::Value =
                 serde_json::from_str(&child?).map_err(|e| e.to_string())?;
@@ -2488,13 +2488,24 @@ fn build_hosts_with_turn(
     // and a nested stage whose own checkpoint claims under its own name.
     Ok(hosts
         .into_iter()
-        .map(|(name, host)| (name, claiming(host)))
+        .map(|(name, host)| {
+            let claimed = claiming(&name, host);
+            (name, claimed)
+        })
         .collect())
 }
 
-/// Wrap a host so its call is one claim scope.
-fn claiming(host: HostFn) -> HostFn {
-    Arc::new(move |arg| Box::pin(ratatoskr_agent::claim_scope(host(arg))))
+/// Wrap a host so its call is one claim scope, and one execution named for what it invokes.
+///
+/// The name matters as much as the scope: the node executions inside a host call name it as their
+/// parent, and a parent nothing ever recorded is a reference a reader cannot resolve.
+fn claiming(name: &str, host: HostFn) -> HostFn {
+    let name = name.to_string();
+    Arc::new(move |arg| {
+        let name = name.clone();
+        let call = host(arg);
+        Box::pin(async move { ratatoskr_agent::claim_scope(&name, call).await })
+    })
 }
 
 fn stage_question_renderers(stages: &[Stage]) -> HashMap<String, String> {
