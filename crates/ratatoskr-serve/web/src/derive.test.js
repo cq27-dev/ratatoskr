@@ -8,6 +8,7 @@ import {
   inNodeBoxes,
   liveNodes,
   nodesFromEvents,
+  skippedSpans,
   stagesOf,
   workingNodeNames,
 } from "./derive";
@@ -265,7 +266,16 @@ const blankTelemetry = {
 test("a node the shape does not place still gets a box while it works", () => {
   // Marked unshaped: the column is this side's ordering, and what is drawn into it turns on that.
   expect(applied([], [start("analyst")])).toEqual([
-    { name: "analyst", state: "working", checkpoints: 0, stage: 0, lane: 0, shaped: false },
+    {
+      name: "analyst",
+      state: "working",
+      checkpoints: 0,
+      stage: 0,
+      lane: 0,
+      shaped: false,
+      // What the stream saw, kept apart from `state` so a settle cannot take it back.
+      entered: true,
+    },
   ]);
 });
 
@@ -996,3 +1006,112 @@ test("the stages of a box are what its feed is filtered by", () => {
   expect(stagesOf(stages, "characterizer")).toEqual(["characterizer"]);
 });
 
+
+/** A node at a column, with a state. */
+function at(name, stage, state) {
+  return { name, state, checkpoints: 0, stage, lane: 0 };
+}
+
+test("a run that skipped a stage spans the gap it actually jumped", () => {
+  // The no-code-change shortcut: the analyst decides there is nothing to build, and the run goes
+  // straight to delivery. An edge joins adjacent columns only, so the graph drew a break exactly
+  // where the run made its hand-off.
+  const nodes = [
+    at("analyst", 0, "done"),
+    at("redteam", 1, "idle"),
+    at("implementer", 2, "idle"),
+    at("verifier", 3, "idle"),
+    at("publisher", 4, "done"),
+  ];
+  expect(skippedSpans(nodes)).toEqual([{ from: "analyst", to: "publisher" }]);
+});
+
+test("a stage that has not run yet is not a stage that was skipped", () => {
+  // Mid-flight, and the same shape scrubbing back through a finished run: everything ahead is idle
+  // for the ordinary reason. Nothing later has started, so there is no jump to assert.
+  const nodes = [
+    at("analyst", 0, "done"),
+    at("redteam", 1, "working"),
+    at("implementer", 2, "idle"),
+    at("verifier", 3, "idle"),
+    at("publisher", 4, "idle"),
+  ];
+  expect(skippedSpans(nodes)).toEqual([]);
+});
+
+test("a stage that looked skipped and then ran is spanned no longer", () => {
+  const skipped = [
+    at("analyst", 0, "done"),
+    at("verifier", 1, "idle"),
+    at("publisher", 2, "done"),
+  ];
+  expect(skippedSpans(skipped)).toEqual([{ from: "analyst", to: "publisher" }]);
+
+  const ranAfterAll = skipped.map((n) => (n.name === "verifier" ? { ...n, state: "done" } : n));
+  expect(skippedSpans(ranAfterAll)).toEqual([]);
+});
+
+test("a run that used every stage spans nothing", () => {
+  const nodes = [
+    at("analyst", 0, "done"),
+    at("redteam", 1, "done"),
+    at("implementer", 2, "done"),
+    at("publisher", 3, "done"),
+  ];
+  expect(skippedSpans(nodes)).toEqual([]);
+});
+
+test("a span joins every box of one column to every box of the next that ran", () => {
+  // The same relation an adjacent-column edge draws: a fork rejoining is many-to-many, and a
+  // skipped stage does not change what a hand-off between two columns means.
+  const nodes = [
+    at("analyst", 0, "done"),
+    at("redteam", 1, "idle"),
+    { ...at("bookkeeper", 2, "done"), lane: 0 },
+    { ...at("publisher", 2, "done"), lane: 1 },
+  ];
+  expect(skippedSpans(nodes)).toEqual([
+    { from: "analyst", to: "bookkeeper" },
+    { from: "analyst", to: "publisher" },
+  ]);
+});
+
+test("a box the run never entered is not an endpoint of a span", () => {
+  // Two boxes share the column the run jumped to, and only one of them ran.
+  const nodes = [
+    at("analyst", 0, "done"),
+    at("redteam", 1, "idle"),
+    { ...at("bookkeeper", 2, "idle"), lane: 0 },
+    { ...at("publisher", 2, "done"), lane: 1 },
+  ];
+  expect(skippedSpans(nodes)).toEqual([{ from: "analyst", to: "publisher" }]);
+});
+
+test("a stage two nodes died in is not a stage the run skipped", () => {
+  // A failed run with two uncheckpointed nodes in flight blames neither — attribution would be a
+  // guess — so `applyDerived` settles both back to their stored state, which is `idle`. Their
+  // `node_start` events still prove the stage ran, and reading rendered state alone would assert a
+  // hand-off straight across it: the one thing that certainly did not happen, drawn over the boxes
+  // where the run actually died.
+  const shape = [
+    { name: "analyst", state: "done", checkpoints: 1, stage: 0, lane: 0, shaped: true },
+    { name: "redteam", state: "idle", checkpoints: 0, stage: 1, lane: 0, shaped: true },
+    { name: "implementer", state: "idle", checkpoints: 0, stage: 1, lane: 1, shaped: true },
+    { name: "publisher", state: "done", checkpoints: 1, stage: 2, lane: 0, shaped: true },
+  ];
+  const stages = registry(["analyst"], ["redteam"], ["implementer"], ["publisher"]);
+  const events = [
+    checkpointed("analyst"),
+    start("redteam"),
+    start("implementer"),
+    checkpointed("publisher"),
+  ];
+  const view = applyDerived(shape, nodesFromEvents(inNodeBoxes(events, stages)), "failed");
+
+  const at = (name) => view.find((n) => n.name === name);
+  expect(at("redteam").state).toBe("idle");
+  expect(at("implementer").state).toBe("idle");
+  expect(at("redteam").entered).toBe(true);
+  expect(at("implementer").entered).toBe(true);
+  expect(skippedSpans(view)).toEqual([]);
+});

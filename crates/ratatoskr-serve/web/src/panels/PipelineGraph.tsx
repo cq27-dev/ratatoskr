@@ -6,6 +6,7 @@ import {
   Position,
   ReactFlow,
   useEdgesState,
+  getNodesBounds,
   useNodesInitialized,
   useNodesState,
   useReactFlow,
@@ -17,8 +18,27 @@ import {
 } from "@xyflow/react";
 import { Brain, Infinity as InfinityIcon, Repeat, Wrench } from "lucide-react";
 import { TOOL_GROUPS } from "../ui/tools";
+import {
+  COLUMN_GAP,
+  LANE_GAP,
+  LOOP_SHELF_STEP,
+  NODE_SIZE,
+  LOOP_BAND,
+  SPAN_BAND,
+  SPAN_RADIUS,
+  fittedBounds,
+  position,
+  spanRiser,
+  spanShelf,
+} from "./layout";
 import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode, SessionScope } from "../api";
-import { forkHandoff, handoffDrawn, type ConvergeLoops, type LiveNode } from "../derive";
+import {
+  forkHandoff,
+  handoffDrawn,
+  skippedSpans,
+  type ConvergeLoops,
+  type LiveNode,
+} from "../derive";
 
 /*
  * Positions are computed from the `stage` and `lane` the server sends with each node, not from a
@@ -30,16 +50,6 @@ import { forkHandoff, handoffDrawn, type ConvergeLoops, type LiveNode } from "..
  * is not a general graph layout — elkjs/dagre exist for graphs whose edges aren't known until
  * runtime, and here every edge is "the stage before it".
  */
-/* Pitch is the box plus the room an edge needs to turn in. Derived from NODE_SIZE rather than
- * written as a literal: the two drifted apart once already, leaving 20px for a right-angled edge
- * to route through, and the edges rendered as smears. */
-// Wide and tall enough that the meta line still fits on one row inside `.node`'s padding: the
-// cycles and token counts wrapped when the padding grew, and a wrapped count reads as two facts.
-const NODE_SIZE = { width: 202, height: 104 };
-const COLUMN_GAP = 96;
-const LANE_GAP = 62;
-const COLUMN_PITCH = NODE_SIZE.width + COLUMN_GAP;
-const LANE_PITCH = NODE_SIZE.height + LANE_GAP;
 
 function stageLabel(id: string): string {
   return id
@@ -48,13 +58,6 @@ function stageLabel(id: string): string {
     .join(" ");
 }
 
-function position(node: NodeView, lanesInStage: number, maxLanes: number) {
-  const offset = (maxLanes - lanesInStage) / 2;
-  return {
-    x: node.stage * COLUMN_PITCH,
-    y: (node.lane + offset) * LANE_PITCH,
-  };
-}
 
 /**
  * Declared up front rather than measured. React Flow keeps a node `visibility: hidden` until a
@@ -319,7 +322,14 @@ function ConvergeEdge({ id, sourceX, sourceY, label, markerEnd, style }: EdgePro
  * loops are evenly spaced whether or not the self-loop is drawn, and the spacing follows the
  * layout constants rather than being a number that has to be re-measured when they change.
  */
-const LOOP_SHELF_STEP = LANE_GAP / 2;
+
+/**
+ * How deep the band of span shelves reaches above the row.
+ *
+ * The depth the loop shelves occupy below it, so the graph is no taller above than below and
+ * `fitView`'s padding covers both. Fixed: the spans divide this band between them however many
+ * there are, rather than each taking a step and pushing the outermost out of the fitted view.
+ */
 
 /** What a back-edge needs beyond its endpoints: its caption, its shelf, and its riser's offset. */
 type BackLoopData = { label: string; shelfY: number; takeoff: number };
@@ -440,22 +450,127 @@ function Magnification() {
   return null;
 }
 
-function FitToPane({ count, moved }: { count: number; moved: boolean }) {
+function FitToPane({
+  count,
+  reserveTop,
+  reserveBottom,
+  moved,
+}: {
+  count: number;
+  reserveTop: number;
+  reserveBottom: number;
+  moved: boolean;
+}) {
   const initialized = useNodesInitialized();
-  const { fitView } = useReactFlow();
+  const { fitView, fitBounds, getNodes } = useReactFlow();
   // React Flow measures its own pane; taking the size from its store rather than observing the
   // DOM means refitting on exactly the changes it has already noticed.
   const width = useStore((s) => s.width);
   const height = useStore((s) => s.height);
   useEffect(() => {
     if (moved || !initialized || count === 0 || width === 0 || height === 0) return;
+    // `fitView` fits NODE bounds, and the span shelves hang above them. Padding is a fraction of
+    // what is being fitted, so a short row leaves less room above it than a tall one — a
+    // three-column graph fits with about 40px of headroom while the band wants 93, and the shelves
+    // are clipped until someone pans. Worse, adding a span changes no node, so nothing refits.
+    //
+    // Fitting explicit bounds says what the graph actually occupies. The loop shelves below have
+    // always ridden on padding and still do: they hang under the deepest lane, which grows with the
+    // layout the padding is measured from.
+    if (reserveTop > 0 || reserveBottom > 0) {
+      void fitBounds(fittedBounds(getNodesBounds(getNodes()), reserveTop, reserveBottom), {
+        padding: 0.15,
+      });
+      return;
+    }
     void fitView({ padding: 0.3 });
-  }, [initialized, count, width, height, moved, fitView]);
+  }, [
+    initialized,
+    count,
+    width,
+    height,
+    moved,
+    reserveTop,
+    reserveBottom,
+    fitView,
+    fitBounds,
+    getNodes,
+  ]);
   return null;
 }
 
 const nodeTypes = { pipeline: PipelineNode };
-const edgeTypes = { converge: ConvergeEdge, backloop: BackLoopEdge };
+/** What a span needs beyond its endpoints: its shelf, and where each riser stands. */
+type SpanData = { shelfY: number; takeoff: number; landing: number };
+type SpanEdgeType = Edge<SpanData, "span">;
+
+/**
+ * A hand-off across stages the run never entered: out of the source, up a column gap, along a shelf
+ * above the row, down the gap before the target, and in.
+ *
+ * Routed rather than left to `smoothstep`, for the reason `BackLoopEdge` is: the span crosses whole
+ * columns of boxes, and a self-routing edge would trace through them.
+ *
+ * The risers stand in the COLUMN GAPS, not on the boxes' centre line. Every lane of a column shares
+ * one centre x, so a riser leaving a box in a lower lane would pass behind every sibling above it —
+ * the standard `implementer -> publisher` skip has exactly that shape, with `redteam` over one end
+ * and `bookkeeper` over the other, and the edge would vanish and reappear through boxes it has
+ * nothing to do with. A gap is empty by construction.
+ *
+ * Above the row rather than below because the band underneath is the loop shelves', and an edge
+ * sharing their space reads as one of them.
+ */
+/**
+ * The corner radius a span turns on, and the clearance its risers need at both ends of the gap.
+ *
+ * A riser closer to its box than this puts the corner's control point BEHIND the handle — the path
+ * then enters the node it just left and doubles back out. Named here because the geometry and the
+ * distribution have to agree about it: eight lanes across a 96px gap put risers 10.7px out, inside
+ * a 14px corner.
+ */
+
+function SpanEdge({
+  id,
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  data,
+  markerEnd,
+  style,
+}: EdgeProps<SpanEdgeType>) {
+  const { shelfY, takeoff, landing } = data ?? { shelfY: sourceY, takeoff: 0, landing: 0 };
+  const r = SPAN_RADIUS;
+  // A span runs forwards, so the target is normally to the right — but a workflow declares its own
+  // column order, and a hardcoded direction would turn the corners inside out.
+  const dir = targetX >= sourceX ? 1 : -1;
+  const up = sourceX + takeoff * dir;
+  const down = targetX - landing * dir;
+  const path = [
+    `M ${sourceX},${sourceY}`,
+    `L ${up - r * dir},${sourceY}`,
+    `Q ${up},${sourceY} ${up},${sourceY - r}`,
+    `L ${up},${shelfY + r}`,
+    `Q ${up},${shelfY} ${up + r * dir},${shelfY}`,
+    `L ${down - r * dir},${shelfY}`,
+    `Q ${down},${shelfY} ${down},${shelfY + r}`,
+    `L ${down},${targetY - r}`,
+    `Q ${down},${targetY} ${down + r * dir},${targetY}`,
+    `L ${targetX},${targetY}`,
+  ].join(" ");
+
+  return (
+    <BaseEdge
+      id={id}
+      path={path}
+      interactionWidth={0}
+      {...(style ? { style } : {})}
+      {...(markerEnd ? { markerEnd } : {})}
+    />
+  );
+}
+
+const edgeTypes = { converge: ConvergeEdge, backloop: BackLoopEdge, span: SpanEdge };
 
 interface Props {
   /**
@@ -576,11 +691,68 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
     // The shelves hang under the whole layout, not under one box, so two of them cannot cross a
     // node in a deeper lane. Measured off the positions actually being drawn.
     const maxLanes = Math.max(1, ...columns.map((c) => c.length));
-    const rowBottom =
-      Math.max(
-        0,
-        ...columns.flatMap((lanes) => lanes.map((n) => position(n, lanes.length, maxLanes).y)),
-      ) + NODE_SIZE.height;
+    const laneTops = columns.flatMap((lanes) =>
+      lanes.map((n) => position(n, lanes.length, maxLanes).y),
+    );
+    const rowBottom = Math.max(0, ...laneTops) + NODE_SIZE.height;
+    // The spans hang over the whole layout for the same reason the loops hang under it: one that
+    // cleared only its own box would cross a box in a shallower lane.
+    const rowTop = Math.min(0, ...laneTops);
+
+    /*
+     * Hand-offs across stages the run never entered. An ordinary edge joins adjacent columns, so
+     * without these a run that skipped a stage draws a break exactly where it made its hand-off.
+     * Which jumps happened is `skippedSpans`; all that is decided here is where the line goes.
+     *
+     * Offset per pair, so two spans leaving one box do not trace the same line — the same reason
+     * the loop shelves are offset from each other.
+     */
+    /*
+     * Every hand-off gets its own shelf, and they are DISTRIBUTED across a fixed band above the row
+     * rather than stepped upward one by one. Both halves matter. Stepping had no ceiling — enough
+     * spans and the outer shelves sat outside what `fitView` fits, which is node bounds plus a
+     * fixed padding. Sharing one shelf per jump was bounded but illegible: the horizontal segments
+     * coincide exactly, so four hand-offs drew as one line and sixty-four drew as one line.
+     *
+     * A band of the same depth the loop shelves occupy below the row, divided by the number of
+     * spans, is bounded whatever a workflow declares and separates them whenever there is room.
+     */
+    const spans = skippedSpans(nodes);
+    const band = new Map<number, NodeView[]>();
+    for (const lanes of columns) if (lanes[0]) band.set(lanes[0].stage, lanes);
+    /*
+     * Where a box's riser stands in the gap beside its column: distributed across the gap by the
+     * box's position among its lanes, never measured inward from one edge. Subtracting a fixed step
+     * per lane runs out — a column of eight lanes put the eighth riser past the gap and inside the
+     * box, crossing it and its siblings, and nothing caps how wide a column may be. A fraction of
+     * the gap is strictly inside it for any number of lanes.
+     */
+    const riser = (node: NodeView) => {
+      const lanes = band.get(node.stage) ?? [node];
+      return spanRiser(
+        lanes.findIndex((lane) => lane.name === node.name),
+        lanes.length,
+      );
+    };
+    spans.forEach(({ from, to }, i) => {
+      const source = byName.get(from);
+      const target = byName.get(to);
+      if (!source || !target) return;
+      edges.push({
+        id: `span-${from}-${to}`,
+        source: from,
+        target: to,
+        sourceHandle: "out",
+        targetHandle: "in",
+        type: "span",
+        data: {
+          shelfY: spanShelf(i, spans.length, rowTop),
+          takeoff: riser(source),
+          landing: riser(target),
+        },
+      });
+    });
+
     const loop = (target: string): Partial<Edge> => ({
       sourceHandle: "loop-out",
       targetHandle: "loop-in",
@@ -695,7 +867,17 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
       maxZoom={1.6}
       colorMode="dark"
     >
-      <FitToPane count={rfNodes.length} moved={moved.current} />
+      <FitToPane
+        count={rfNodes.length}
+        // What hangs off the boxes and has to be fitted with them. Both ends: the loop shelves
+        // below were riding on `fitView`'s padding, and reserving only the span band above took
+        // that padding away from them.
+        reserveTop={rfEdges.some((e) => e.type === "span") ? SPAN_BAND : 0}
+        reserveBottom={
+          rfEdges.some((e) => e.type === "backloop" || e.type === "converge") ? LOOP_BAND : 0
+        }
+        moved={moved.current}
+      />
       <Magnification />
     </ReactFlow>
   );
