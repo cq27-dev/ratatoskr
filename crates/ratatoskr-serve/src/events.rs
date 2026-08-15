@@ -240,6 +240,25 @@ async fn replay_from(dir: &Path) -> Option<PathBuf> {
     logs.pop()
 }
 
+/// Read a field off a record, falling back to the innermost enclosing span that carries it.
+///
+/// A node's turn runs inside a span holding its identity, so everything the turn emits — every tool
+/// call, every line of model text — carries that identity there rather than on the record. Reading
+/// the record alone leaves those events unidentified, and an unidentified record is filed under
+/// whichever invocation is in flight: with two invocations of one stage overlapping, that is the
+/// wrong one.
+fn field_or_span<'a>(record: &'a Value, key: &str) -> Option<&'a str> {
+    if let Some(found) = record.get(key).and_then(Value::as_str) {
+        return Some(found);
+    }
+    record
+        .get("spans")?
+        .as_array()?
+        .iter()
+        .rev()
+        .find_map(|span| span.get(key).and_then(Value::as_str))
+}
+
 /// Pull `run_id` out of a record: a plain field first (how the dashboard's own launch and reap
 /// lines carry it, since they are emitted outside any run), then the enclosing spans.
 fn run_id_of(record: &Value) -> Option<&str> {
@@ -307,8 +326,10 @@ fn to_event(record: &Value) -> LiveEvent {
             .filter(|e| !e.is_empty())
             .map(str::to_string),
         iteration: record.get("iteration").and_then(Value::as_u64),
-        span_id: str_field("span_id").map(str::to_string),
-        parent_span_id: str_field("parent_span_id").map(str::to_string),
+        // Innermost first: a turn's own span is nearer than the host call's, and what a record
+        // belongs to is the execution it was emitted inside.
+        span_id: field_or_span(record, "span_id").map(str::to_string),
+        parent_span_id: field_or_span(record, "parent_span_id").map(str::to_string),
         execution: str_field("execution").map(str::to_string),
         execution_name: str_field("execution_name").map(str::to_string),
         kind,
@@ -637,6 +658,54 @@ mod tests {
             to_event(&failed).error.as_deref(),
             Some("verifier agent failed: UnknownToolCall")
         );
+    }
+
+    #[test]
+    fn every_record_of_a_turn_carries_the_execution_that_produced_it() {
+        // A name is not an execution, so the fold on the other side files a record with no identity
+        // under whichever invocation is in flight. With two invocations of one stage overlapping,
+        // that is the wrong one — and most of a turn's records do not carry the identity on
+        // themselves at all. A tool call carries it on the span it was emitted inside.
+        let in_a_turn = serde_json::json!({
+            "kind": "tool_call",
+            "node": "implementer",
+            "tool": "Bash",
+            "spans": [
+                { "run_id": "r1" },
+                { "node": "implementer", "span_id": "00000000000000a1" },
+            ],
+        });
+        let event = to_event(&in_a_turn);
+        assert_eq!(event.span_id.as_deref(), Some("00000000000000a1"));
+
+        // The record's own field wins over the span's: a checkpoint names the execution it covers,
+        // which is not always the one it is written inside.
+        let own = serde_json::json!({
+            "kind": "checkpoint",
+            "node": "implementer",
+            "span_id": "00000000000000b2",
+            "spans": [{ "node": "implementer", "span_id": "00000000000000a1" }],
+        });
+        assert_eq!(to_event(&own).span_id.as_deref(), Some("00000000000000b2"));
+
+        // Innermost first, so a turn inside a host call reports the turn.
+        let nested = serde_json::json!({
+            "kind": "model_text",
+            "node": "implementer",
+            "text": "thinking",
+            "spans": [
+                { "span_id": "00000000000000c3", "execution": "host" },
+                { "span_id": "00000000000000d4", "execution": "node" },
+            ],
+        });
+        assert_eq!(
+            to_event(&nested).span_id.as_deref(),
+            Some("00000000000000d4")
+        );
+
+        // And a record from before executions had identities still reads, naming none.
+        let old = serde_json::json!({ "kind": "tool_call", "node": "analyst", "tool": "Read" });
+        assert_eq!(to_event(&old).span_id, None);
     }
 
     #[test]

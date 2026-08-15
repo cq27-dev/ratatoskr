@@ -569,6 +569,9 @@ where
     tracing::info!(
         kind = "usage",
         calls,
+        // Which execution spent it. A turn's cost is the one record that must not be filed under
+        // another invocation of the same name, and an event carrying only a name cannot say.
+        span_id = current_execution().map(|i| i.span_id.to_string()),
         "gen_ai.usage.input_tokens" = usage.input_tokens,
         "gen_ai.usage.output_tokens" = usage.output_tokens,
         "gen_ai.usage.cached_input_tokens" = usage.cached_input_tokens,
@@ -3199,6 +3202,7 @@ where
         tracing::info!(
             kind = "usage",
             node,
+            span_id = current_execution().map(|i| i.span_id.to_string()),
             "gen_ai.usage.input_tokens" = telemetry.usage.input_tokens,
             "gen_ai.usage.output_tokens" = telemetry.usage.output_tokens,
             "gen_ai.usage.cached_input_tokens" = telemetry.usage.cached_input_tokens,

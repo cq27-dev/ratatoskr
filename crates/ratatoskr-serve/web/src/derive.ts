@@ -70,6 +70,39 @@ export type BoxedEvent = LiveEvent & {
 };
 
 /**
+ * What to file a record under.
+ *
+ * The producer's `span_id` when it recorded one. Otherwise a key standing for "the one attempt in
+ * flight": a stream from before executions had identities, or a record written outside every
+ * execution, still has to fold — and folding it into one attempt is what the fold did for all of
+ * them before.
+ */
+function keyOf(e: BoxedEvent, member: string): string {
+  return e.span_id ?? `unidentified:${member}`;
+}
+
+/**
+ * The attempt a record belongs to. One rule, obeyed by every fold over the stream.
+ *
+ * With an identity, the attempt that IS it — and a fresh one if this view never saw it start, since
+ * an ingested log may begin mid-run and filing the record under some other attempt would charge
+ * that attempt for a turn it did not run.
+ *
+ * Without one, the newest invocation still live, else the newest seen. Not the oldest: a record
+ * that cannot say which invocation it belongs to belongs to the one in flight, and a re-entry that
+ * announced no identity has to restart the counts rather than add to the attempt before it.
+ */
+function attemptOf<A extends { span: string; live: boolean }>(
+  attempts: readonly A[],
+  e: BoxedEvent,
+  span: string,
+  open: () => A,
+): A {
+  if (e.span_id) return attempts.find((a) => a.span === span) ?? open();
+  return attempts.filter((a) => a.live).at(-1) ?? attempts.at(-1) ?? open();
+}
+
+/**
  * Fold `events` into per-node state as of the last event given.
  *
  * Pass a prefix of the stream to see where the run was at that point — that is the whole mechanism
@@ -138,16 +171,6 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     return made;
   };
 
-  /**
-   * What to file this record under.
-   *
-   * The producer's `span_id` when it recorded one. Otherwise a key standing for "the one attempt in
-   * flight": a stream from before executions had identities, or a record written outside every
-   * execution, still has to fold — and folding it into one attempt is what the fold did for all of
-   * them before.
-   */
-  const keyOf = (e: BoxedEvent, member: string) => e.span_id ?? `unidentified:${member}`;
-
   const open = (member: Member, span: string): Attempt => {
     const made: Attempt = {
       span,
@@ -160,27 +183,8 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     member.attempts.push(made);
     return made;
   };
-  /**
-   * The attempt a record belongs to.
-   *
-   * With an identity, the attempt that IS it — and a fresh one if this view never saw it start,
-   * since an ingested log may begin mid-run and filing the record under some other attempt would
-   * charge that attempt for a turn it did not run.
-   *
-   * Without one, the newest invocation still live, else the newest seen. Not the oldest: a record
-   * that cannot say which invocation it belongs to belongs to the one in flight, and a re-entry
-   * that announced no identity has to restart the counts rather than add to the attempt before it.
-   */
-  const attemptFor = (member: Member, e: BoxedEvent, span: string): Attempt => {
-    if (e.span_id) {
-      return member.attempts.find((a) => a.span === span) ?? open(member, span);
-    }
-    return (
-      member.attempts.filter((a) => a.live).at(-1) ??
-      member.attempts.at(-1) ??
-      open(member, span)
-    );
-  };
+  const attemptFor = (member: Member, e: BoxedEvent, span: string): Attempt =>
+    attemptOf(member.attempts, e, span, () => open(member, span));
 
   for (const e of events) {
     if (!e.node) continue;
@@ -195,14 +199,23 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // the attempt before it carries over, which is what a name-keyed fold could not express. Its
       // siblings stand, and so do the checkpoints already recorded — the implementer is re-driven
       // once per converge iteration.
+      const before = member.attempts.at(-1)?.telemetry;
       const attempt = open(member, span);
-      if (e.facts) {
+      // What it RAN ON carries across a re-entry; what it SPENT does not. The model, its tools and
+      // its session are configuration — a start that announces nothing has not changed them — while
+      // tokens, turns and duration belong to the attempt that spent them, which is the whole reason
+      // this fold is keyed per invocation.
+      const ran_on = e.facts ?? (before ? { ...before } : undefined);
+      // Only when there is something to say. A start that announces nothing, with nothing announced
+      // before it, leaves the attempt with no telemetry at all — a blank one would report zero
+      // tokens and no duration, which is a measurement rather than the absence of one.
+      if (ran_on) {
         attempt.telemetry = {
           ...blank(),
-          model: e.facts.model,
-          tools: e.facts.tools,
-          thinking: e.facts.thinking,
-          reuses_session: e.facts.reuses_session,
+          model: ran_on.model,
+          tools: ran_on.tools,
+          thinking: ran_on.thinking,
+          reuses_session: ran_on.reuses_session,
         };
       }
       continue;
@@ -601,22 +614,40 @@ export function inNodeBoxes(
  * still folds into one state per member, and #285 is where that is resolved.
  */
 export function liveNodes(events: readonly BoxedEvent[]): Map<string, LiveNode> {
-  const boxes = new Map<string, Map<string, LiveNode>>();
+  /** One invocation's live counts. Same shape as `LiveNode`, plus what it takes to be one of many. */
+  interface Attempt extends LiveNode {
+    span: string;
+    live: boolean;
+  }
+  const boxes = new Map<string, Map<string, Attempt[]>>();
   for (const e of events) {
     if (!e.node) continue;
     let members = boxes.get(e.node);
     if (!members) boxes.set(e.node, (members = new Map()));
     const name = e.member ?? e.node;
-    let at = members.get(name);
-    if (!at) members.set(name, (at = { cycles: 0, used: new Set() }));
+    let attempts = members.get(name);
+    if (!attempts) members.set(name, (attempts = []));
+    const span = keyOf(e, name);
+    const open = () => {
+      const made: Attempt = { span, live: true, cycles: 0, used: new Set() };
+      attempts.push(made);
+      return made;
+    };
+
     if (e.kind === "node_start") {
       // Every `node_start`, not only one carrying facts — `facts` is optional, and restarting on
       // its presence made a re-entry that announced nothing accumulate onto the previous attempt.
-      // What it announced survives the restart: the model is a fact about the member, not about
-      // the attempt, and a later start that says nothing has not changed it.
-      at.cycles = 0;
-      at.used = new Set();
-      if (e.facts) at.facts = e.facts;
+      // The same rule as the checkpointed fold: what the member runs on carries across a restart
+      // that announces nothing, and its counts do not.
+      const before = attempts.at(-1)?.facts;
+      const started = open();
+      const facts = e.facts ?? before;
+      if (facts) started.facts = facts;
+      continue;
+    }
+    const at = attemptOf(attempts, e, span, open);
+    if (e.kind === "checkpoint") {
+      at.live = false;
       continue;
     }
     if (e.kind === "tool_call") {
@@ -628,7 +659,14 @@ export function liveNodes(events: readonly BoxedEvent[]): Map<string, LiveNode> 
 
   const out = new Map<string, LiveNode>();
   for (const [box, members] of boxes) {
-    const all = [...members.values()];
+    // A member is its current invocation — the one a viewer is looking at. Its earlier attempts are
+    // what they were: this is the same selection `nodesFromEvents` makes, and the two folds have to
+    // answer the same question the same way or a box's live counts and its checkpointed ones
+    // describe different attempts.
+    const all = [...members.values()].flatMap((attempts) => {
+      const current = attempts.at(-1);
+      return current ? [current] : [];
+    });
     // The same arithmetic the checkpointed fold uses on telemetry: counts add, tools are the union,
     // and two profiles are both named rather than one overwriting the other.
     const facts = all

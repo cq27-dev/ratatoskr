@@ -1226,3 +1226,40 @@ test("a record whose start this view never saw gets its own attempt", () => {
   // The one that started and never returned is still live, so the box is still working.
   expect(box.state).toBe("working");
 });
+
+test("a tool call from the older of two live invocations is not shown against the newer", () => {
+  // The graph draws live cycles and tools from `liveNodes`, so a fold that is invocation-aware in
+  // one place and member-keyed in the other still shows the wrong thing. `Promise.all` overlaps two
+  // invocations of one stage: A's tool call arrives after B has started, and keyed by name it lands
+  // on B — which is drawn as the box's live activity.
+  const stages = registry(["probe"]);
+  const a = "00000000000000aa";
+  const b = "00000000000000bb";
+  const called = (span, tool) => ({
+    at: "2026-08-12T10:00:02Z",
+    kind: "tool_call",
+    node: "probe",
+    detail: tool,
+    span_id: span,
+  });
+  const events = [
+    attemptStart("probe", a, "opus"),
+    called(a, "Read"),
+    attemptStart("probe", b, "sonnet"),
+    called(a, "Grep"),
+    called(b, "Write"),
+  ];
+  const boxed = inNodeBoxes(events, stages);
+
+  // The current invocation is B, and what it has done is its own — one call, not three.
+  const live = liveNodes(boxed).get("probe");
+  expect(live.cycles).toBe(1);
+  expect([...live.used]).toEqual(["Write"]);
+  expect(live.facts.model).toBe("sonnet");
+
+  // The two folds answer the same question the same way, which is what keeps a box's live counts
+  // and its checkpointed ones describing one attempt.
+  const derived = nodesFromEvents(boxed).get("probe");
+  expect(derived.cycles).toBe(live.cycles);
+  expect([...derived.used]).toEqual([...live.used]);
+});
