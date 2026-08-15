@@ -327,6 +327,15 @@ function ConvergeEdge({ id, sourceX, sourceY, label, markerEnd, style }: EdgePro
  */
 const LOOP_SHELF_STEP = LANE_GAP / 2;
 
+/**
+ * How deep the band of span shelves reaches above the row.
+ *
+ * The depth the loop shelves occupy below it, so the graph is no taller above than below and
+ * `fitView`'s padding covers both. Fixed: the spans divide this band between them however many
+ * there are, rather than each taking a step and pushing the outermost out of the fitted view.
+ */
+const SPAN_BAND = 3 * LOOP_SHELF_STEP;
+
 /** What a back-edge needs beyond its endpoints: its caption, its shelf, and its riser's offset. */
 type BackLoopData = { label: string; shelfY: number; takeoff: number };
 type BackLoopEdgeType = Edge<BackLoopData, "backloop">;
@@ -661,13 +670,16 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
      * the loop shelves are offset from each other.
      */
     /*
-     * One shelf per JUMP, not per pair. A jump between two columns of two boxes each is four
-     * hand-offs and one claim — the run went from that column to this one — so they share a shelf
-     * and fan out from it. Per-pair shelves stacked one above the other, and `fitView` fits node
-     * bounds with a fixed padding: enough shelves and the outer ones sit outside the pane until
-     * someone pans. The jumps a run can make are bounded by its columns; its box pairs are not.
+     * Every hand-off gets its own shelf, and they are DISTRIBUTED across a fixed band above the row
+     * rather than stepped upward one by one. Both halves matter. Stepping had no ceiling — enough
+     * spans and the outer shelves sat outside what `fitView` fits, which is node bounds plus a
+     * fixed padding. Sharing one shelf per jump was bounded but illegible: the horizontal segments
+     * coincide exactly, so four hand-offs drew as one line and sixty-four drew as one line.
+     *
+     * A band of the same depth the loop shelves occupy below the row, divided by the number of
+     * spans, is bounded whatever a workflow declares and separates them whenever there is room.
      */
-    const jumps = new Map<string, number>();
+    const spans = skippedSpans(nodes);
     const band = new Map<number, NodeView[]>();
     for (const lanes of columns) if (lanes[0]) band.set(lanes[0].stage, lanes);
     /*
@@ -682,13 +694,10 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
       const k = lanes.findIndex((lane) => lane.name === node.name);
       return (COLUMN_GAP * (Math.max(0, k) + 1)) / (lanes.length + 1);
     };
-    for (const { from, to } of skippedSpans(nodes)) {
+    spans.forEach(({ from, to }, i) => {
       const source = byName.get(from);
       const target = byName.get(to);
-      if (!source || !target) continue;
-      const jump = `${source.stage}-${target.stage}`;
-      if (!jumps.has(jump)) jumps.set(jump, jumps.size);
-      const shelf = jumps.get(jump)!;
+      if (!source || !target) return;
       edges.push({
         id: `span-${from}-${to}`,
         source: from,
@@ -697,12 +706,12 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
         targetHandle: "in",
         type: "span",
         data: {
-          shelfY: rowTop - (shelf + 1) * LOOP_SHELF_STEP,
+          shelfY: rowTop - (SPAN_BAND * (i + 1)) / (spans.length + 1),
           takeoff: riser(source),
           landing: riser(target),
         },
       });
-    }
+    });
 
     const loop = (target: string): Partial<Edge> => ({
       sourceHandle: "loop-out",
