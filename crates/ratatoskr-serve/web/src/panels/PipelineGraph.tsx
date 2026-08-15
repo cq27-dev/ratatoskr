@@ -23,8 +23,10 @@ import {
   LANE_GAP,
   LOOP_SHELF_STEP,
   NODE_SIZE,
+  LOOP_BAND,
   SPAN_BAND,
   SPAN_RADIUS,
+  fittedBounds,
   position,
   spanRiser,
   spanShelf,
@@ -451,10 +453,12 @@ function Magnification() {
 function FitToPane({
   count,
   reserveTop,
+  reserveBottom,
   moved,
 }: {
   count: number;
   reserveTop: number;
+  reserveBottom: number;
   moved: boolean;
 }) {
   const initialized = useNodesInitialized();
@@ -473,21 +477,25 @@ function FitToPane({
     // Fitting explicit bounds says what the graph actually occupies. The loop shelves below have
     // always ridden on padding and still do: they hang under the deepest lane, which grows with the
     // layout the padding is measured from.
-    if (reserveTop > 0) {
-      const bounds = getNodesBounds(getNodes());
-      void fitBounds(
-        {
-          x: bounds.x,
-          y: bounds.y - reserveTop,
-          width: bounds.width,
-          height: bounds.height + reserveTop,
-        },
-        { padding: 0.15 },
-      );
+    if (reserveTop > 0 || reserveBottom > 0) {
+      void fitBounds(fittedBounds(getNodesBounds(getNodes()), reserveTop, reserveBottom), {
+        padding: 0.15,
+      });
       return;
     }
     void fitView({ padding: 0.3 });
-  }, [initialized, count, width, height, moved, reserveTop, fitView, fitBounds, getNodes]);
+  }, [
+    initialized,
+    count,
+    width,
+    height,
+    moved,
+    reserveTop,
+    reserveBottom,
+    fitView,
+    fitBounds,
+    getNodes,
+  ]);
   return null;
 }
 
@@ -861,8 +869,13 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
     >
       <FitToPane
         count={rfNodes.length}
-        // What hangs above the boxes and has to be fitted with them.
+        // What hangs off the boxes and has to be fitted with them. Both ends: the loop shelves
+        // below were riding on `fitView`'s padding, and reserving only the span band above took
+        // that padding away from them.
         reserveTop={rfEdges.some((e) => e.type === "span") ? SPAN_BAND : 0}
+        reserveBottom={
+          rfEdges.some((e) => e.type === "backloop" || e.type === "converge") ? LOOP_BAND : 0
+        }
         moved={moved.current}
       />
       <Magnification />

@@ -30,11 +30,19 @@ export const LANE_PITCH = NODE_SIZE.height + LANE_GAP;
 export const LOOP_SHELF_STEP = LANE_GAP / 2;
 
 /**
+ * How deep the loop shelves reach below the deepest row of boxes.
+ *
+ * Three steps: the two back-edges take the outer two, and `ConvergeEdge`'s self-loop drops within
+ * the first. Their captions sit just under each shelf, so a little more is reserved for the text.
+ */
+export const LOOP_BAND = 3 * LOOP_SHELF_STEP + 16;
+
+/**
  * How deep the band of span shelves reaches above the row.
  *
- * The depth the loop shelves occupy below it, so the graph is no taller above than below and the
- * fitted view covers both. Fixed: the spans divide this band between them however many there are,
- * rather than each taking a step and pushing the outermost out of view.
+ * The depth the loop shelves occupy below it, so the graph is no taller above than below. Fixed:
+ * the spans divide this band between them however many there are, rather than each taking a step
+ * and pushing the outermost out of view.
  */
 export const SPAN_BAND = 3 * LOOP_SHELF_STEP;
 
@@ -77,4 +85,27 @@ export function spanRiser(k: number, lanes: number): number {
  */
 export function spanShelf(i: number, count: number, rowTop: number): number {
   return rowTop - (SPAN_BAND * (i + 1)) / (Math.max(1, count) + 1);
+}
+
+/** A rectangle, in the flow's own coordinates. */
+export type Bounds = { x: number; y: number; width: number; height: number };
+
+/**
+ * The rectangle a fit has to cover: the boxes, plus whatever hangs off them.
+ *
+ * `fitView` fits node bounds and leaves the rest to padding, which is a FRACTION of what it fits —
+ * so a short row gets proportionally less room around it than a fixed band needs, and the outermost
+ * shelf is clipped until someone pans. Adding a span or a loop changes no node, so nothing refits
+ * to reveal it either.
+ *
+ * Both directions, because reserving only one is how the loops came to be clipped: the span band
+ * went into the bounds and the padding that had been covering the loops was reduced to pay for it.
+ */
+export function fittedBounds(nodes: Bounds, above: number, below: number): Bounds {
+  return {
+    x: nodes.x,
+    y: nodes.y - above,
+    width: nodes.width,
+    height: nodes.height + above + below,
+  };
 }
