@@ -248,12 +248,6 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
       {/* Where a hand-off from the lane above lands. Its own handle because `in` is on the left,
           where the stage edges arrive, and a step down a lane comes in from the top. */}
       <Handle type="target" id="lane-in" position={Position.Top} isConnectable={false} />
-      {/* Where a span across skipped stages leaves and lands. Its own pair rather than reusing
-          `lane-in`: that one means a step down the lane gap from the box above, and a span means
-          the run jumped a column — reading them off one handle would make the graph say the same
-          thing about two different hand-offs. */}
-      <Handle type="source" id="span-out" position={Position.Top} isConnectable={false} />
-      <Handle type="target" id="span-in" position={Position.Top} isConnectable={false} />
       <div className="node-name">
         <span>{stageLabel(node.name)}</span>
         <span className="dot" aria-hidden="true" />
@@ -467,18 +461,25 @@ function FitToPane({ count, moved }: { count: number; moved: boolean }) {
 }
 
 const nodeTypes = { pipeline: PipelineNode };
-/** What a span needs beyond its endpoints: its shelf, and its riser's offset. */
-type SpanData = { shelfY: number; takeoff: number };
+/** What a span needs beyond its endpoints: its shelf, and where each riser stands. */
+type SpanData = { shelfY: number; takeoff: number; landing: number };
 type SpanEdgeType = Edge<SpanData, "span">;
 
 /**
- * A hand-off across stages the run never entered: up out of the source, along a shelf above the
- * row, and down into the target.
+ * A hand-off across stages the run never entered: out of the source, up a column gap, along a shelf
+ * above the row, down the gap before the target, and in.
  *
- * `BackLoopEdge` mirrored. It has to be routed rather than left to `smoothstep`, for the same
- * reason: the span crosses whole columns of boxes, and a self-routing edge would trace straight
- * through them. Above rather than below because the band under the row is the loop shelves', and an
- * edge sharing their space reads as one of them.
+ * Routed rather than left to `smoothstep`, for the reason `BackLoopEdge` is: the span crosses whole
+ * columns of boxes, and a self-routing edge would trace through them.
+ *
+ * The risers stand in the COLUMN GAPS, not on the boxes' centre line. Every lane of a column shares
+ * one centre x, so a riser leaving a box in a lower lane would pass behind every sibling above it —
+ * the standard `implementer -> publisher` skip has exactly that shape, with `redteam` over one end
+ * and `bookkeeper` over the other, and the edge would vanish and reappear through boxes it has
+ * nothing to do with. A gap is empty by construction.
+ *
+ * Above the row rather than below because the band underneath is the loop shelves', and an edge
+ * sharing their space reads as one of them.
  */
 function SpanEdge({
   id,
@@ -490,19 +491,24 @@ function SpanEdge({
   markerEnd,
   style,
 }: EdgeProps<SpanEdgeType>) {
-  const { shelfY, takeoff } = data ?? { shelfY: sourceY, takeoff: 0 };
+  const { shelfY, takeoff, landing } = data ?? { shelfY: sourceY, takeoff: 0, landing: 0 };
   // Matches the loop shelves', which match the stage edges' rounding.
   const r = 14;
-  const sx = sourceX + takeoff;
   // A span runs forwards, so the target is normally to the right — but a workflow declares its own
   // column order, and a hardcoded direction would turn the corners inside out.
-  const dir = targetX > sx ? 1 : -1;
+  const dir = targetX >= sourceX ? 1 : -1;
+  const up = sourceX + takeoff * dir;
+  const down = targetX - landing * dir;
   const path = [
-    `M ${sx},${sourceY}`,
-    `L ${sx},${shelfY + r}`,
-    `Q ${sx},${shelfY} ${sx + r * dir},${shelfY}`,
-    `L ${targetX - r * dir},${shelfY}`,
-    `Q ${targetX},${shelfY} ${targetX},${shelfY + r}`,
+    `M ${sourceX},${sourceY}`,
+    `L ${up - r * dir},${sourceY}`,
+    `Q ${up},${sourceY} ${up},${sourceY - r}`,
+    `L ${up},${shelfY + r}`,
+    `Q ${up},${shelfY} ${up + r * dir},${shelfY}`,
+    `L ${down - r * dir},${shelfY}`,
+    `Q ${down},${shelfY} ${down},${shelfY + r}`,
+    `L ${down},${targetY - r}`,
+    `Q ${down},${targetY} ${down + r * dir},${targetY}`,
     `L ${targetX},${targetY}`,
   ].join(" ");
 
@@ -654,20 +660,39 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
      * Offset per pair, so two spans leaving one box do not trace the same line — the same reason
      * the loop shelves are offset from each other.
      */
-    skippedSpans(nodes).forEach(({ from, to }, i) => {
+    /*
+     * One shelf per JUMP, not per pair. A jump between two columns of two boxes each is four
+     * hand-offs and one claim — the run went from that column to this one — so they share a shelf
+     * and fan out from it. Per-pair shelves stacked one above the other, and `fitView` fits node
+     * bounds with a fixed padding: enough shelves and the outer ones sit outside the pane until
+     * someone pans. The jumps a run can make are bounded by its columns; its box pairs are not.
+     */
+    const jumps = new Map<string, number>();
+    const byNameSpan = (name: string) => nodes.find((n) => n.name === name);
+    for (const { from, to } of skippedSpans(nodes)) {
+      const source = byNameSpan(from);
+      const target = byNameSpan(to);
+      if (!source || !target) continue;
+      const jump = `${source.stage}-${target.stage}`;
+      if (!jumps.has(jump)) jumps.set(jump, jumps.size);
+      const shelf = jumps.get(jump)!;
+      // Risers stand in the column gaps, offset per lane so two spans of one jump do not trace the
+      // same vertical line.
+      const gap = COLUMN_GAP / 2;
       edges.push({
         id: `span-${from}-${to}`,
         source: from,
         target: to,
-        sourceHandle: "span-out",
-        targetHandle: "span-in",
+        sourceHandle: "out",
+        targetHandle: "in",
         type: "span",
         data: {
-          shelfY: rowTop - (i + 1) * LOOP_SHELF_STEP,
-          takeoff: 0,
+          shelfY: rowTop - (shelf + 1) * LOOP_SHELF_STEP,
+          takeoff: gap - source.lane * 8,
+          landing: gap - target.lane * 8,
         },
       });
-    });
+    }
 
     const loop = (target: string): Partial<Edge> => ({
       sourceHandle: "loop-out",
