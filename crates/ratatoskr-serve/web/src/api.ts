@@ -32,6 +32,11 @@ export interface NodeView {
   /** Whether the run's recorded shape is what put it there. False means the server placed it from
    *  its checkpoints, in completion order — which `applyDerived` replaces with the stream's. */
   shaped?: boolean;
+  /** Whether the stream ever saw this node run, kept apart from `state` because the two can
+   *  disagree: at the terminal end of a failed run a node that started and never checkpointed is
+   *  settled back to its stored state, which is `idle`. Set by `applyDerived`; the server does not
+   *  send it. Anything asking whether a stage was ENTERED must read this, never `state`. */
+  entered?: boolean;
   /** Absent for a node that has not run, or that ran no model. */
   telemetry?: NodeTelemetry;
   /** What the node *would* run on, from config. Present before it has run. */

@@ -266,7 +266,16 @@ const blankTelemetry = {
 test("a node the shape does not place still gets a box while it works", () => {
   // Marked unshaped: the column is this side's ordering, and what is drawn into it turns on that.
   expect(applied([], [start("analyst")])).toEqual([
-    { name: "analyst", state: "working", checkpoints: 0, stage: 0, lane: 0, shaped: false },
+    {
+      name: "analyst",
+      state: "working",
+      checkpoints: 0,
+      stage: 0,
+      lane: 0,
+      shaped: false,
+      // What the stream saw, kept apart from `state` so a settle cannot take it back.
+      entered: true,
+    },
   ]);
 });
 
@@ -1076,4 +1085,33 @@ test("a box the run never entered is not an endpoint of a span", () => {
     { ...at("publisher", 2, "done"), lane: 1 },
   ];
   expect(skippedSpans(nodes)).toEqual([{ from: "analyst", to: "publisher" }]);
+});
+
+test("a stage two nodes died in is not a stage the run skipped", () => {
+  // A failed run with two uncheckpointed nodes in flight blames neither — attribution would be a
+  // guess — so `applyDerived` settles both back to their stored state, which is `idle`. Their
+  // `node_start` events still prove the stage ran, and reading rendered state alone would assert a
+  // hand-off straight across it: the one thing that certainly did not happen, drawn over the boxes
+  // where the run actually died.
+  const shape = [
+    { name: "analyst", state: "done", checkpoints: 1, stage: 0, lane: 0, shaped: true },
+    { name: "redteam", state: "idle", checkpoints: 0, stage: 1, lane: 0, shaped: true },
+    { name: "implementer", state: "idle", checkpoints: 0, stage: 1, lane: 1, shaped: true },
+    { name: "publisher", state: "done", checkpoints: 1, stage: 2, lane: 0, shaped: true },
+  ];
+  const stages = registry(["analyst"], ["redteam"], ["implementer"], ["publisher"]);
+  const events = [
+    checkpointed("analyst"),
+    start("redteam"),
+    start("implementer"),
+    checkpointed("publisher"),
+  ];
+  const view = applyDerived(shape, nodesFromEvents(inNodeBoxes(events, stages)), "failed");
+
+  const at = (name) => view.find((n) => n.name === name);
+  expect(at("redteam").state).toBe("idle");
+  expect(at("implementer").state).toBe("idle");
+  expect(at("redteam").entered).toBe(true);
+  expect(at("implementer").entered).toBe(true);
+  expect(skippedSpans(view)).toEqual([]);
 });

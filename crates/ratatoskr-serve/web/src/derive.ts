@@ -430,20 +430,25 @@ export function skippedSpans(nodes: readonly NodeView[]): { from: string; to: st
     else columns.set(node.stage, [node]);
   }
   const ordered = [...columns.keys()].sort((a, b) => a - b);
-  const ran = (stage: number) => (columns.get(stage) ?? []).some((n) => n.state !== "idle");
+  // `entered`, never `state`. They agree except where it matters most: at the terminal end of a
+  // failed run, two uncheckpointed nodes in flight are blamed on neither, so both settle back to
+  // `idle` while their `node_start` events prove the stage ran. Reading state there would invent a
+  // span straight across it — the very hand-off that did not happen.
+  const ran = (node: NodeView) => node.entered ?? node.state !== "idle";
+  const columnRan = (stage: number) => (columns.get(stage) ?? []).some(ran);
 
   const spans: { from: string; to: string }[] = [];
   for (let i = 0; i < ordered.length; i += 1) {
-    if (!ran(ordered[i]!)) continue;
+    if (!columnRan(ordered[i]!)) continue;
     // The next column that ran. Everything between is unentered, or this is not a span.
     let next = i + 1;
-    while (next < ordered.length && !ran(ordered[next]!)) next += 1;
+    while (next < ordered.length && !columnRan(ordered[next]!)) next += 1;
     if (next >= ordered.length || next === i + 1) continue;
     // One edge per pair of boxes, the same relation an adjacent-column edge draws.
     for (const source of columns.get(ordered[i]!) ?? []) {
-      if (source.state === "idle") continue;
+      if (!ran(source)) continue;
       for (const target of columns.get(ordered[next]!) ?? []) {
-        if (target.state === "idle") continue;
+        if (!ran(target)) continue;
         if (!handoffDrawn(source, target)) continue;
         spans.push({ from: source.name, to: target.name });
       }
@@ -734,7 +739,7 @@ function fromStream(
 ): NodeView {
   if (!d) {
     const { telemetry: _dropped, ...rest } = n;
-    return { ...rest, state: "idle" as NodeState, checkpoints: 0 };
+    return { ...rest, state: "idle" as NodeState, checkpoints: 0, entered: false };
   }
   const telemetry = d.costed ? d.telemetry : (n.telemetry ?? d.telemetry);
   const settled: NodeState = died ? "failed" : n.state;
@@ -742,6 +747,11 @@ function fromStream(
     ...n,
     state: ended && d.state === "working" ? settled : d.state,
     checkpoints: d.checkpoints,
+    // What the STREAM saw, before the settling above can take it back. A failed run with two
+    // uncheckpointed nodes in flight blames neither, so both render `idle` although their
+    // `node_start` proves they ran — and a reader inferring that their stage was never entered
+    // would assert a hand-off across a stage that did.
+    entered: d.state !== "idle",
     ...(telemetry ? { telemetry } : {}),
   };
 }
