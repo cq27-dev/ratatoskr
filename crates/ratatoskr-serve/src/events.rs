@@ -240,23 +240,39 @@ async fn replay_from(dir: &Path) -> Option<PathBuf> {
     logs.pop()
 }
 
-/// Read a field off a record, falling back to the innermost enclosing span that carries it.
+/// The execution a record belongs to and the one that invoked it, read from a single place.
 ///
 /// A node's turn runs inside a span holding its identity, so everything the turn emits — every tool
 /// call, every line of model text — carries that identity there rather than on the record. Reading
 /// the record alone leaves those events unidentified, and an unidentified record is filed under
 /// whichever invocation is in flight: with two invocations of one stage overlapping, that is the
 /// wrong one.
-fn field_or_span<'a>(record: &'a Value, key: &str) -> Option<&'a str> {
-    if let Some(found) = record.get(key).and_then(Value::as_str) {
-        return Some(found);
+///
+/// Atomically, because the two halves only mean anything together. A record stating its own
+/// identity states its own parentage or has none — reading the parent off the span that encloses it
+/// takes it from a DIFFERENT execution, which is a parent this record never had. Only where the
+/// record says nothing does the enclosing span answer, and then it answers both.
+fn invocation_of(record: &Value) -> (Option<&str>, Option<&str>) {
+    if let Some(span_id) = record.get("span_id").and_then(Value::as_str) {
+        return (
+            Some(span_id),
+            record.get("parent_span_id").and_then(Value::as_str),
+        );
     }
     record
-        .get("spans")?
-        .as_array()?
-        .iter()
+        .get("spans")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
         .rev()
-        .find_map(|span| span.get(key).and_then(Value::as_str))
+        .find_map(|span| {
+            let span_id = span.get("span_id").and_then(Value::as_str)?;
+            Some((
+                Some(span_id),
+                span.get("parent_span_id").and_then(Value::as_str),
+            ))
+        })
+        .unwrap_or((None, None))
 }
 
 /// Pull `run_id` out of a record: a plain field first (how the dashboard's own launch and reap
@@ -292,6 +308,7 @@ fn to_event(record: &Value) -> LiveEvent {
         .unwrap_or("event")
         .to_string();
     let str_field = |key: &str| record.get(key).and_then(Value::as_str);
+    let invocation = invocation_of(record);
     let detail = match kind.as_str() {
         "tool_call" => str_field("tool").unwrap_or("tool"),
         "model_text" => str_field("text").unwrap_or_default(),
@@ -326,10 +343,11 @@ fn to_event(record: &Value) -> LiveEvent {
             .filter(|e| !e.is_empty())
             .map(str::to_string),
         iteration: record.get("iteration").and_then(Value::as_u64),
-        // Innermost first: a turn's own span is nearer than the host call's, and what a record
-        // belongs to is the execution it was emitted inside.
-        span_id: field_or_span(record, "span_id").map(str::to_string),
-        parent_span_id: field_or_span(record, "parent_span_id").map(str::to_string),
+        // One execution, both halves. Looked up independently, a record carrying its own identity
+        // and no parent took the parent off the span that encloses it — which belongs to a
+        // different execution, so the pair described a parentage that never existed.
+        span_id: invocation.0.map(str::to_string),
+        parent_span_id: invocation.1.map(str::to_string),
         execution: str_field("execution").map(str::to_string),
         execution_name: str_field("execution_name").map(str::to_string),
         kind,
@@ -706,6 +724,47 @@ mod tests {
         // And a record from before executions had identities still reads, naming none.
         let old = serde_json::json!({ "kind": "tool_call", "node": "analyst", "tool": "Read" });
         assert_eq!(to_event(&old).span_id, None);
+    }
+
+    #[test]
+    fn an_identity_and_its_parent_come_from_one_execution() {
+        // The two halves only mean anything together. A record stating its own identity states its
+        // own parentage or has none — taking the parent off the span that encloses it describes a
+        // parentage that never existed, which is exactly what a nested turn's records would get:
+        // the answerer's id under the asker's parent.
+        let own_id_no_parent = serde_json::json!({
+            "kind": "usage",
+            "node": "analyst",
+            "span_id": "00000000000000b2",
+            "spans": [{
+                "node": "implementer",
+                "span_id": "00000000000000a1",
+                "parent_span_id": "00000000000000c3",
+            }],
+        });
+        let event = to_event(&own_id_no_parent);
+        assert_eq!(event.span_id.as_deref(), Some("00000000000000b2"));
+        assert_eq!(
+            event.parent_span_id, None,
+            "a record that names its own execution and no parent has none"
+        );
+
+        // Both halves off the same span when the record says nothing.
+        let from_span = serde_json::json!({
+            "kind": "tool_call",
+            "node": "implementer",
+            "tool": "Bash",
+            "spans": [{
+                "span_id": "00000000000000a1",
+                "parent_span_id": "00000000000000c3",
+            }],
+        });
+        let inherited = to_event(&from_span);
+        assert_eq!(inherited.span_id.as_deref(), Some("00000000000000a1"));
+        assert_eq!(
+            inherited.parent_span_id.as_deref(),
+            Some("00000000000000c3")
+        );
     }
 
     #[test]

@@ -519,6 +519,7 @@ async fn ask(question: &str, config_path: &Path) -> anyhow::Result<()> {
         ratatoskr_mcp::ToolSet::from_servers(client.iter().map(|c| c.offer()).collect()),
         None,
         None,
+        None,
     )
     .await;
 

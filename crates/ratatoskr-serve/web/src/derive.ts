@@ -97,6 +97,14 @@ interface Tracked {
   live: boolean;
   /** Opened by a `node_start` in this view, rather than inferred from a record about it. */
   started: boolean;
+  /**
+   * The execution said it was over — its own checkpoint, or its `span_end`.
+   *
+   * Distinct from `!live`, which an attempt inferred from a record about an invocation is born as.
+   * This is positive evidence that the work finished, and it is what tells a box whose members have
+   * all ENDED from one that has merely been entered.
+   */
+  ended: boolean;
 }
 
 /**
@@ -234,6 +242,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     span,
     live,
     started,
+    ended: false,
     state: "working",
     cycles: 0,
     used: new Set(),
@@ -257,6 +266,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       const found = everywhere.get(e.span_id);
       if (found) {
         found.member.end(found.attempt);
+        found.attempt.ended = true;
         if (found.attempt.state === "working") found.attempt.state = "done";
       }
       continue;
@@ -395,9 +405,18 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
         ? "failed"
         : box.checkpoints > 0
           ? "done"
-          : members.some((m) => current(m) && current(m)?.state !== "idle")
-            ? "working"
-            : "idle";
+          : // No record of the box's own, and every member's execution has ANNOUNCED its end.
+            // Nothing is running and nothing more is coming: an evidence-only stage and a turn
+            // whose failure the workflow recovered from write no aggregate ever, so a box waiting
+            // for one works for the rest of the run with its Stop still offered.
+            //
+            // A member's CHECKPOINT is not this. That says the box STARTED — a peer may still be to
+            // run, and the box's own record is what finishes it.
+            members.length > 0 && members.every((m) => current(m)?.ended)
+            ? "done"
+            : members.some((m) => current(m) && current(m)?.state !== "idle")
+              ? "working"
+              : "idle";
     const folded = members
       .map((m) => current(m)?.telemetry)
       .filter((t): t is NodeTelemetry => !!t)
@@ -701,6 +720,7 @@ export function liveNodes(events: readonly BoxedEvent[]): Map<string, LiveNode> 
     span,
     live,
     started,
+    ended: false,
     cycles: 0,
     used: new Set(),
   });
@@ -710,7 +730,10 @@ export function liveNodes(events: readonly BoxedEvent[]): Map<string, LiveNode> 
     // checkpoints. Matched by identity, exactly as the checkpointed fold matches it.
     if (e.kind === "span_end" && e.span_id) {
       const found = everywhere.get(e.span_id);
-      if (found) found.member.end(found.attempt);
+      if (found) {
+        found.member.end(found.attempt);
+        found.attempt.ended = true;
+      }
       continue;
     }
     if (!e.node) continue;

@@ -359,6 +359,9 @@ impl NodeClarifier {
             ToolSet::default(),
             Some(ANSWER_MAX_TURNS),
             control.clone(),
+            // The control is the ASKER's — a Stop here ends the asking node's turn — but what runs
+            // is the answerer, and every record of this turn has to say so.
+            Some(answerer),
         )
         .instrument(span);
         let response = match control.as_ref() {

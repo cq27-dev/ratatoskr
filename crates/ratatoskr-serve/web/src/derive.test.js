@@ -1372,6 +1372,36 @@ test("an invocation that writes no checkpoint is ended by its own span_end", () 
   expect(workingNodeNames(shape, ended)).toEqual([]);
 });
 
+test("a box with no record of its own finishes only when its members ANNOUNCE they are over", () => {
+  // The distinction this turns on, and getting it wrong either way is visible. A member's
+  // checkpoint says the BOX STARTED — its peer may still be to run, and the box's own aggregate is
+  // what finishes it. Only an execution announcing its end says nothing more is coming, which is
+  // the one case where no aggregate will ever arrive.
+  const shape = [composed("redteam", "idle")];
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const span = "0000000000000a11";
+
+  // The classifier has finished and the author has not started. Still working: the box has no
+  // record of its own, and a member's checkpoint is not one.
+  const half = inNodeBoxes(
+    [attemptStart("redteam_classifier", span, "opus"), attemptCheckpoint("redteam_classifier", span, 5)],
+    stages,
+  );
+  expect(applied(shape, half)[0].state).toBe("working");
+
+  // The same member, its execution announcing it is over. Now nothing is running and nothing is
+  // coming, so the Stop is not still offered against it.
+  const over = inNodeBoxes(
+    [
+      attemptStart("redteam_classifier", span, "opus"),
+      { at: "t", kind: "span_end", span_id: span, execution: "node", execution_name: "redteam_classifier" },
+    ],
+    stages,
+  );
+  expect(applied(shape, over)[0].state).toBe("done");
+  expect(workingNodeNames(shape, over)).toEqual([]);
+});
+
 test("a finished invocation does not stand in for one still running", () => {
   // Two invocations overlap and the SECOND finishes first. Taking the newest attempt outright drew
   // its model and its tools while the one still going went unseen — and its later tool calls landed

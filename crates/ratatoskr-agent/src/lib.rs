@@ -449,6 +449,14 @@ fn openai_client() -> Result<(openai::Client<TelemetryHttp>, ProviderCallQueue),
 ///
 /// `preamble` is the system prompt; `route` picks the provider/model. Returns the agent's final
 /// text after its tool-calling loop settles.
+/// One turn against a model, outside any node's own run.
+///
+/// `answerer` is what is ANSWERING, when that is not what `control` addresses. A clarification runs
+/// on the ASKER's control — a Stop during one ends the asking node's turn, which is the whole point
+/// of blocking it — while the turn itself is the answerer's. Taking the name from the control puts
+/// the answerer's cost and its execution under the asker: an invocation of the asker that never
+/// happened, whose figures then stand in for its real one. The same split `NodeRun` keeps between
+/// `node` and `controlled_as`, from the other side.
 pub async fn ask(
     route: &ModelRoute,
     preamble: &str,
@@ -456,10 +464,13 @@ pub async fn ask(
     tools: ToolSet,
     max_turns: Option<usize>,
     control: Option<RuntimeControl>,
+    answerer: Option<&str>,
 ) -> Result<String, AgentError> {
-    let node = control
-        .as_ref()
-        .map_or_else(|| "ask".to_string(), |control| control.node.clone());
+    let node = answerer.map(str::to_string).unwrap_or_else(|| {
+        control
+            .as_ref()
+            .map_or_else(|| "ask".to_string(), |control| control.node.clone())
+    });
     match parse_provider(&route.provider)? {
         Provider::Anthropic => {
             let session = uuid::Uuid::new_v4().to_string();
