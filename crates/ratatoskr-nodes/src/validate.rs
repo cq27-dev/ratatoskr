@@ -559,7 +559,7 @@ mod tests {
         // stage runs, so a box under it reads complete before its stage has started; `verify` is an
         // operation host that checkpoints nothing of its own, so a box under it stays empty for the
         // whole run. Both are names a workflow may not declare a stage under, and neither is a box.
-        for reserved in ["issue", "verify", "memory", "overseer"] {
+        for reserved in ["issue", "verify", "overseer"] {
             let error = match validate(&[member(reserved)], &crate::built_in_agents(), &[]) {
                 Ok(()) => panic!("`{reserved}` is not a box anything records under"),
                 Err(error) => error.to_string(),
@@ -717,24 +717,22 @@ mod tests {
     #[test]
     fn declared_stages_cannot_take_a_lifecycle_checkpoint_identity() {
         // The run counts `implementer` checkpoints for the iteration ordinal and the ceiling gate,
-        // and deserializes `implementer`, `redteam` and `memory` into concrete types. A stage
+        // and deserializes `implementer` and `redteam` into concrete types. A stage
         // checkpointing its own output under one of those names inflates the count, spends the
         // ceiling recovery early, or fails deserialization in the middle of a run. `redteam` is
         // refused too, under its governance-identity reservation — see the test below.
         let template = crate::stage::stage_fixture("analyst", "reason");
 
-        for reserved in ["implementer", "memory"] {
-            let mut stage = template.clone();
-            stage.id = reserved.to_string();
-            let error = validate_declarations(&[stage], "repo-workflow")
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains("lifecycle checkpoint identity"),
-                "`{reserved}` must be reserved: {error}"
-            );
-            assert!(error.contains(reserved), "{error}");
-        }
+        let mut stage = template.clone();
+        stage.id = "implementer".to_string();
+        let error = validate_declarations(&[stage], "repo-workflow")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("lifecycle checkpoint identity"),
+            "`implementer` must be reserved: {error}"
+        );
+        assert!(error.contains("implementer"), "{error}");
     }
 
     #[test]
@@ -1002,15 +1000,14 @@ mod tests {
 
     #[test]
     fn a_reserved_identity_nothing_records_under_is_not_drawable() {
-        // `memory` is a lifecycle checkpoint identity — `reconstruct_plan` reads one back for a run
-        // recorded before the merged `context` checkpoint existed — so no workflow may declare a
-        // stage under it. That is not the same as being drawable: no stage says it belongs to
-        // `memory`, so a column naming it is a box that stays empty for the whole run.
+        // `verify` is an operation host, so no workflow may declare a stage under it. That is not
+        // the same as being drawable: it checkpoints nothing of its own and no stage says it
+        // belongs there, so a column naming it is a box that stays empty for the whole run.
         let stages = [crate::stage::stage_fixture("analyst", "reason")];
-        let error = validate_layout(&column("memory"), &stages, "ours")
+        let error = validate_layout(&column("verify"), &stages, "ours")
             .expect_err("a name nothing records under draws an empty box")
             .to_string();
         assert!(error.contains("no stage it runs is"), "{error}");
-        assert!(error.contains("memory"), "{error}");
+        assert!(error.contains("verify"), "{error}");
     }
 }

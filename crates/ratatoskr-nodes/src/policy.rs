@@ -181,7 +181,6 @@ const fn adapter_evidence(contract: &'static str, node: &'static str) -> Class {
 /// A new standard stage is classified here, once, and every gate follows.
 pub(crate) const STANDARD_IDENTIFIERS: &[(&str, Class)] = &[
     // --- class 1: overridable, with the contract the Rust side deserializes ------------------
-    ("scout", overridable("ScoutOutput")),
     ("analyst", overridable("AnalystOutput")),
     ("characterizer", overridable("CharacterizerOutput")),
     (
@@ -223,7 +222,6 @@ pub(crate) const STANDARD_IDENTIFIERS: &[(&str, Class)] = &[
     // are already reserved above for reasons of their own; `redteam` has no such cover.
     ("redteam", Class::Reserved(Reserved::GovernanceIdentity)),
     ("implementer", Class::Reserved(Reserved::Lifecycle)),
-    ("memory", Class::Reserved(Reserved::Lifecycle)),
     ("issue", Class::Reserved(Reserved::Record)),
     ("clarification", Class::Reserved(Reserved::Record)),
     ("referee", Class::Reserved(Reserved::InternalGate)),
@@ -283,7 +281,6 @@ fn reads_as<T: serde::de::DeserializeOwned>(
 }
 
 const CONTRACT_CHECKS: &[(&str, ContractCheck)] = &[
-    ("ScoutOutput", reads_as::<crate::scout::ScoutOutput>),
     ("AnalystOutput", reads_as::<crate::analyst::AnalystOutput>),
     (
         "CharacterizerOutput",
@@ -421,7 +418,7 @@ mod tests {
         // Being reserved is not the qualification, and reading it as one is how `issue` — the
         // run's input, checkpointed before any stage runs — came to pass as a node a stage could
         // declare itself part of.
-        for name in ["issue", "verify", "memory", "overseer", "publisher"] {
+        for name in ["issue", "verify", "overseer", "publisher"] {
             assert!(
                 reserved(name).is_some() && !is_aggregate_identity(name),
                 "`{name}` is reserved without being a box anything records under"

@@ -34,8 +34,8 @@ use serde_json::json;
 
 use crate::{
     AnalystOutput, BookkeeperInput, BookkeeperOutput, ChildTask, ImplementerNode,
-    ImplementerOutput, MemoryOutput, PlanError, PlanOutcome, RedTeamNode, RedTeamOutput,
-    RunOutcome, ScoutOutput, Stage, bookkeeper, checkpoint, converge,
+    ImplementerOutput, PlanError, PlanOutcome, RedTeamNode, RedTeamOutput, RunOutcome, Stage,
+    bookkeeper, checkpoint, converge,
     publisher::{PublisherInput, PublisherOutput},
     redteam, referee, verifier,
 };
@@ -81,7 +81,6 @@ pub(crate) const STANDARD_WORKFLOW_INCLUDES: &[(&str, &str)] = &[
         "prompts/redteam-classifier.md",
         include_str!("../prompts/redteam-classifier.md"),
     ),
-    ("prompts/scout.md", include_str!("../prompts/scout.md")),
     (
         "prompts/verifier.md",
         include_str!("../prompts/verifier.md"),
@@ -540,7 +539,7 @@ fn status_with_unanswered_gap(
 /// converge loop, naming neither itself nor the calls it skipped.
 fn plan_entry_omitted(workflow: &str, error: PlanError) -> PlanError {
     match error {
-        PlanError::MissingCheckpoint(_, node @ ("scout" | "memory" | "analyst")) => {
+        PlanError::MissingCheckpoint(_, node @ ("context" | "analyst")) => {
             PlanError::Configuration(format!(
                 "workflow `{workflow}` returned from its `plan` entry with no `{node}` \
                  checkpoint. A `plan` entry must drive `context()` and `analyst()`: the plan is \
@@ -552,20 +551,17 @@ fn plan_entry_omitted(workflow: &str, error: PlanError) -> PlanError {
 }
 
 async fn reconstruct_plan(store: &Store, run_id: &str) -> Result<PlanOutcome, PlanError> {
-    // A run may have gathered context either way: one `context` checkpoint, or the separate
-    // `scout` and `memory` ones a script composing the older bindings still writes. Preferring the
-    // merged one and falling back keeps both replayable.
-    let merged: Option<crate::ContextOutput> =
-        latest_checkpoint(store, run_id, "context").await.ok();
-    let (scout, memory, brief, constraints) = match merged {
-        Some(c) => (c.scout, c.memory, c.brief, c.constraints),
-        None => (
-            latest_checkpoint::<ScoutOutput>(store, run_id, "scout").await?,
-            latest_checkpoint::<MemoryOutput>(store, run_id, "memory").await?,
-            String::new(),
-            Vec::new(),
-        ),
-    };
+    // One `context` checkpoint, and only that. The separate `scout` and `memory` checkpoints this
+    // used to fall back to are written by nothing: both stages were superseded by the composite
+    // `context` operation, and neither is a host a workflow can call. The fallback's only remaining
+    // effect was to report a missing `context` as a missing `scout`.
+    let gathered: crate::ContextOutput = latest_checkpoint(store, run_id, "context").await?;
+    let (scout, memory, brief, constraints) = (
+        gathered.scout,
+        gathered.memory,
+        gathered.brief,
+        gathered.constraints,
+    );
     let analyst: AnalystOutput = latest_checkpoint(store, run_id, "analyst").await?;
 
     let mut state = RunState::new(run_id, None);
@@ -3528,20 +3524,23 @@ mod tests {
             .upsert_run(run_id, None, RunStatus::Running.as_str())
             .await
             .unwrap();
+        // What a run actually writes: one `context` record holding both.
         checkpoint(
             store,
             run_id,
-            "scout",
-            &ScoutOutput {
-                related_items: Vec::new(),
-                papertrail_summary: String::new(),
+            "context",
+            &crate::ContextOutput {
+                brief: String::new(),
+                constraints: Vec::new(),
+                scout: crate::ScoutOutput {
+                    related_items: Vec::new(),
+                    papertrail_summary: String::new(),
+                },
+                memory: crate::MemoryOutput::default(),
             },
         )
         .await
         .unwrap();
-        checkpoint(store, run_id, "memory", &MemoryOutput::default())
-            .await
-            .unwrap();
         let analyst = AnalystOutput {
             impact_summary: "exercise terminal parity".to_string(),
             touched: Vec::new(),
@@ -4080,7 +4079,7 @@ mod tests {
         let error = error.to_string();
         for expected in [
             "incomplete-standard-plan",
-            "`scout`",
+            "`context`",
             "context()",
             "analyst()",
         ] {
@@ -4322,11 +4321,11 @@ mod tests {
                 says: "Rust owns terminal side effects".to_string(),
                 from_memory_id: "memory-terminal-boundary".to_string(),
             }],
-            scout: ScoutOutput {
+            scout: crate::ScoutOutput {
                 related_items: Vec::new(),
                 papertrail_summary: "standard-v1 is the built-in runtime".to_string(),
             },
-            memory: MemoryOutput::default(),
+            memory: crate::MemoryOutput::default(),
         };
         let context_calls = Arc::clone(&calls);
         let context_value = context_out.clone();
@@ -4610,11 +4609,11 @@ mod tests {
         let gathered = crate::ContextOutput {
             brief: "three fixes exposed three different faults".to_string(),
             constraints: Vec::new(),
-            scout: ScoutOutput {
+            scout: crate::ScoutOutput {
                 related_items: Vec::new(),
                 papertrail_summary: String::new(),
             },
-            memory: MemoryOutput::default(),
+            memory: crate::MemoryOutput::default(),
         };
         note(
             &ctx,
@@ -4802,11 +4801,11 @@ mod tests {
         let context_out = crate::ContextOutput {
             brief: String::new(),
             constraints: Vec::new(),
-            scout: ScoutOutput {
+            scout: crate::ScoutOutput {
                 related_items: Vec::new(),
                 papertrail_summary: String::new(),
             },
-            memory: MemoryOutput::default(),
+            memory: crate::MemoryOutput::default(),
         };
         hosts.insert(
             "context".to_string(),
@@ -6051,128 +6050,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standard_scout_uses_generic_dispatch_and_checkpoints_normalized_output() {
-        let dir =
-            std::env::temp_dir().join(format!("ratatoskr-standard-scout-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let engine = ScriptEngine::load(&dir).await.unwrap();
-        let store = Store::open_in_memory().unwrap();
-        store
-            .upsert_run("run-standard-scout", None, RunStatus::Running.as_str())
-            .await
-            .unwrap();
-        let mut config = RatatoskrConfig::default();
-        config.models.get_mut("scout").unwrap().session = ratatoskr_core::SessionScope::Compacted;
-        let ctx = WorkflowContext::new(
-            None,
-            &config,
-            &store,
-            "run-standard-scout",
-            "find prior work",
-            &engine,
-            crate::PluginContext::default(),
-        )
-        .unwrap();
-        let stages = standard_stages().await.unwrap();
-        let scout = stages
-            .iter()
-            .find(|stage| stage.id == "scout")
-            .unwrap()
-            .clone();
-        assert_eq!(scout.agent, "explore");
-        assert_eq!(scout.capabilities, [ratatoskr_core::Capability::Read]);
-        assert_eq!(scout.tools, ["papertrail_issue_search", "semantic_search"]);
-        let mut declared = scout.output_schema.clone().unwrap();
-        let mut generated =
-            serde_json::to_value(schemars::schema_for!(crate::scout::ScoutOutput)).unwrap();
-        without_schema_annotations(&mut declared);
-        without_schema_annotations(&mut generated);
-        assert_eq!(declared, generated, "schema drift for scout");
-        assert_eq!(scout.session, None, "TOML retains the session decision");
-
-        let turn = Arc::new(RecordingStageTurn {
-            output: json!({
-                "related_items": [
-                    {
-                        "item_key": "  ",
-                        "title": "",
-                        "url": "",
-                        "relation": "",
-                        "summary": ""
-                    },
-                    {
-                        "item_key": "214",
-                        "title": "Reusable stages",
-                        "url": "https://example.test/214",
-                        "relation": "same execution seam",
-                        "summary": "introduced declared stages"
-                    }
-                ],
-                "papertrail_summary": "One related change."
-            })
-            .to_string(),
-            ..Default::default()
-        });
-        let mut hosts =
-            build_hosts_with_turn(&ctx, &stages, Arc::clone(&turn) as Arc<dyn StageTurn>).unwrap();
-        let host = hosts.remove(&scout.id).unwrap();
-
-        let raw = host(serde_json::to_string("find prior work").unwrap())
-            .await
-            .unwrap();
-        let output: ScoutOutput = serde_json::from_str(&raw).unwrap();
-        assert_eq!(output.related_items.len(), 1);
-        assert_eq!(output.related_items[0].item_key, "214");
-
-        let checkpoints = store
-            .checkpoints_for_run("run-standard-scout")
-            .await
-            .unwrap();
-        assert_eq!(checkpoints.len(), 1);
-        assert_eq!(checkpoints[0].node_name, "scout");
-        let checkpoint: ScoutOutput = serde_json::from_str(&checkpoints[0].output_json).unwrap();
-        assert_eq!(checkpoint.related_items.len(), 1);
-
-        assert_eq!(
-            *turn.nodes.lock().expect("recording runner mutex poisoned"),
-            ["scout"]
-        );
-        assert_eq!(
-            *turn
-                .sessions
-                .lock()
-                .expect("recording runner mutex poisoned"),
-            [ratatoskr_core::SessionScope::Compacted]
-        );
-        assert!(
-            turn.has_ledger
-                .lock()
-                .expect("recording runner mutex poisoned")[0],
-            "generic dispatch must report telemetry to the run ledger"
-        );
-        let offered = &turn.tools.lock().expect("recording runner mutex poisoned")[0];
-        assert!(offered.contains(&"Read".to_string()));
-        assert!(offered.contains(&"Grep".to_string()));
-        assert!(!offered.iter().any(|tool| tool == "Write" || tool == "Edit"));
-        let preamble = &turn
-            .preambles
-            .lock()
-            .expect("recording runner mutex poisoned")[0];
-        assert!(
-            preamble.find("Return JSON") < preamble.find("You are the scout"),
-            "platform guidance must precede the bundled scout prompt"
-        );
-        let question = &turn
-            .questions
-            .lock()
-            .expect("recording runner mutex poisoned")[0];
-        assert!(question.ends_with(r#""find prior work""#));
-        assert!(!preamble.contains("find prior work"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
     async fn standard_analyst_renders_revisions_and_reuses_its_compacted_run_session() {
         let dir =
             std::env::temp_dir().join(format!("ratatoskr-standard-analyst-{}", std::process::id()));
@@ -6391,7 +6268,6 @@ mod tests {
                 "redteam_classifier",
                 include_str!("../prompts/redteam-classifier.md"),
             ),
-            ("scout", include_str!("../prompts/scout.md")),
             ("verifier", include_str!("../prompts/verifier.md")),
         ];
         assert_eq!(stages.len(), expected_prompts.len());
@@ -6610,6 +6486,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_declared_standard_stage_can_actually_be_invoked() {
+        // A stage the dispatch has no case for validates, governs, carries a prompt, and throws
+        // `unknown standard stage` the moment anything calls it. `scout` was that for as long as
+        // `context` has existed: declared, unreachable, and governable — so a
+        // `.ratatoskr/rules/scout.ts` loaded without complaint and shaped nothing.
+        //
+        // Read off the shipped source rather than a list here: a list is the third place to
+        // remember, which is how the last one survived.
+        let dispatch: std::collections::BTreeSet<String> = STANDARD_WORKFLOW_V1
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("case \""))
+            .filter_map(|rest| rest.split('"').next())
+            .map(str::to_string)
+            .collect();
+        let declared: std::collections::BTreeSet<String> = standard_stages()
+            .await
+            .unwrap()
+            .iter()
+            .map(|stage| stage.id.clone())
+            .collect();
+        assert_eq!(
+            declared, dispatch,
+            "every declared standard stage needs a dispatch case, and every case a stage"
+        );
+    }
+
+    #[tokio::test]
     async fn bundled_default_renderer_ownership_is_explicit_and_complete() {
         // Both direct declared-stage calls and Rust-owned lifecycle adapters enter the bundled
         // renderer before StageExecutor. Scout accepts its issue string directly and has no
@@ -6637,12 +6540,6 @@ mod tests {
             .collect::<Vec<_>>();
         owned.sort();
         assert_eq!(owned, declared, "every bundled renderer needs one owner");
-        assert!(
-            stages
-                .iter()
-                .find(|stage| stage.id == "scout")
-                .is_some_and(|stage| stage.question_renderer.is_none())
-        );
     }
 
     #[tokio::test]
@@ -11018,27 +10915,22 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_run("r1", None, "running").await.unwrap();
 
-        // No scout checkpoint yet → the script can't claim a plan without having run it.
+        // No context checkpoint yet → the script can't claim a plan without having gathered one.
         let missing = reconstruct_plan(&store, "r1").await;
         assert!(matches!(
             missing,
-            Err(PlanError::MissingCheckpoint(_, "scout"))
+            Err(PlanError::MissingCheckpoint(_, "context"))
         ));
 
+        // One record holding what the run gathered — the separate `scout` and `memory` rows this
+        // used to accept are written by nothing.
         store
             .insert_checkpoint(ratatoskr_store::CheckpointWrite {
                 run_id: "r1",
-                node_name: "scout",
-                output_json: r#"{"related_items":[],"papertrail_summary":"s"}"#,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        store
-            .insert_checkpoint(ratatoskr_store::CheckpointWrite {
-                run_id: "r1",
-                node_name: "memory",
-                output_json: r#"{"memories":[]}"#,
+                node_name: "context",
+                output_json: r#"{"brief":"b","constraints":[],
+                    "scout":{"related_items":[],"papertrail_summary":"s"},
+                    "memory":{"memories":[]}}"#,
                 ..Default::default()
             })
             .await

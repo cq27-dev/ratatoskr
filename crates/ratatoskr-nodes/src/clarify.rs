@@ -61,7 +61,7 @@ pub(crate) fn ask_tool() -> Tool {
         "properties": {
             "to": {
                 "type": "string",
-                "enum": ["scout", "analyst", "bookkeeper", "redteam", "user"],
+                "enum": ["context", "analyst", "bookkeeper", "redteam", "user"],
                 "description": "Which node to ask. `user` reaches the human operator when one is \
                     watching the dashboard, and is answered by the `analyst` when nobody is — so \
                     prefer a peer node when one actually holds the answer."
@@ -250,20 +250,33 @@ impl NodeClarifier {
         let by_governance = stages
             .iter()
             .filter(|stage| stage.id != answerer && stage.governance_id() == answerer);
-        by_id.chain(by_governance).find_map(|stage| {
-            let (cfg, profile) = crate::plugins::declared_stage_agent_config(
-                &self.engine,
-                &self.config,
-                ToolSet::default(),
-                stage,
-                // Answer mode runs with no tools at all, so no skills either.
-                &[],
-                &crate::NodePlugins::default(),
-                ratatoskr_core::Capability::Read,
-            )
-            .ok()?;
-            Some((cfg, profile.base_prompt))
-        })
+        // Then by MEMBERSHIP, which is the only thing that resolves a box whose member routes under
+        // a name of its own. `context` is the case that made this necessary: the bundled
+        // `context_distillation` declares `governedBy: "context"` and is found above, but a
+        // repository may override it with the same `node` and a route of its own — and then
+        // `context()` still runs it and still checkpoints the box, while an `ask("context", ..)`
+        // reported that nothing is configured. The name a clarification is addressed to is a BOX's,
+        // and a box's work is its members'.
+        let by_membership = stages.iter().filter(|stage| {
+            stage.id != answerer && stage.governance_id() != answerer && stage.node_id() == answerer
+        });
+        by_id
+            .chain(by_governance)
+            .chain(by_membership)
+            .find_map(|stage| {
+                let (cfg, profile) = crate::plugins::declared_stage_agent_config(
+                    &self.engine,
+                    &self.config,
+                    ToolSet::default(),
+                    stage,
+                    // Answer mode runs with no tools at all, so no skills either.
+                    &[],
+                    &crate::NodePlugins::default(),
+                    ratatoskr_core::Capability::Read,
+                )
+                .ok()?;
+                Some((cfg, profile.base_prompt))
+            })
     }
 
     async fn answer_inner(
@@ -412,7 +425,10 @@ impl Clarifier for NodeClarifier {
 /// answer from the issue alone.
 fn resolve_target(to: &str) -> &'static str {
     match to.trim() {
-        "scout" => "scout",
+        // `context`, not `scout`: what the scout used to produce is a field of the context box's
+        // record now, and the box is what answers. Offering a target the run has no stage for left
+        // the model addressing something that resolves to nothing.
+        "context" => "context",
         "bookkeeper" => "bookkeeper",
         "redteam" => "redteam",
         _ => "analyst",
@@ -434,7 +450,9 @@ mod tests {
 
     #[test]
     fn resolve_target_maps_names_and_falls_back_to_analyst() {
-        assert_eq!(resolve_target("scout"), "scout");
+        assert_eq!(resolve_target("context"), "context");
+        // The name it replaced falls through to the analyst like any other unknown.
+        assert_eq!(resolve_target("scout"), "analyst");
         assert_eq!(resolve_target("redteam"), "redteam");
         assert_eq!(resolve_target("bookkeeper"), "bookkeeper");
         // user / unknown / empty → analyst fallback.
@@ -551,6 +569,67 @@ mod tests {
             .answerer_agent("redteam")
             .await
             .expect("a routed red-team half answers for `redteam`");
+        assert_eq!(cfg.route.model, "gpt-5");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_clarifier_reaches_a_box_whose_member_routes_under_its_own_name() {
+        // A box is what a clarification is addressed to, and a box's work is its members'. The
+        // bundled `context_distillation` governs as `context`, so governance alone finds it — but a
+        // repository may keep the membership and route under a name of its own, and then nothing
+        // is called `context` and nothing governs as it. `context()` still runs the stage and still
+        // checkpoints the box, so an answer is exactly what the record supports; resolving by id
+        // and governance alone reported that no model route is configured.
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-clarifier-membership-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+
+        let mut config = ratatoskr_core::RatatoskrConfig::default();
+        config.models.remove("context");
+        config.models.insert(
+            "distill".to_string(),
+            ratatoskr_core::ModelRoute {
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                max_tokens: None,
+                context_window: None,
+                temperature: None,
+                params: None,
+                session: Default::default(),
+            },
+        );
+
+        let mut stages = crate::workflow::standard_stages().await.unwrap();
+        let distillation = stages
+            .iter_mut()
+            .find(|stage| stage.id == "context_distillation")
+            .expect("the bundled registry declares it");
+        // Same box, a route of its own — which is what a repository override may legitimately do.
+        distillation.governed_by = Some("distill".to_string());
+        assert_eq!(distillation.node_id(), "context");
+
+        let registry: crate::workflow::ExecutionStages = Arc::default();
+        registry.set(Arc::new(stages)).unwrap();
+
+        let clarifier = NodeClarifier::new(
+            &config,
+            &store,
+            &engine,
+            "run-clarify-membership",
+            "an issue",
+            registry,
+        );
+        let (cfg, _) = clarifier
+            .answerer_agent("context")
+            .await
+            .expect("the box's member answers for the box");
         assert_eq!(cfg.route.model, "gpt-5");
 
         let _ = std::fs::remove_dir_all(dir);
