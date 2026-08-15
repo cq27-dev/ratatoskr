@@ -35,33 +35,67 @@ pub struct Bundle {
 /// Refuse a run whose executions do not form a graph, before any of it is written.
 ///
 /// One span id names one span: it is what a consumer resolves a parent against and what tells two
-/// invocations of a stage apart, so two rows claiming one id collapse two executions into one and
-/// leave the reader no way to notice. An execution invoked by itself is a cycle, and a consumer
-/// walking to a root would not terminate.
+/// invocations of a stage apart, so two rows claiming one id collapse two executions and leave the
+/// reader no way to notice. And parentage must terminate — a consumer walking from a record to the
+/// execution that drove it has to arrive somewhere. A cycle of any length is what stops that, not
+/// only the one-edge case where an execution is its own parent.
 ///
-/// Checked at the boundary rather than trusted, because a bundle is the one checkpoint path whose
-/// contents this process did not produce.
+/// A parent this run has no record for is NOT a cycle and not an error: most parents are host calls
+/// and nested turns, which announce themselves in the event stream and write no checkpoint of their
+/// own. Walking simply ends there.
+///
+/// Checked at the boundary rather than trusted, because a bundle is the one checkpoint path this
+/// process did not produce.
 fn check_execution_graph(run_id: &str, checkpoints: &[Checkpoint]) -> Result<(), StoreError> {
-    let mut seen = std::collections::HashSet::new();
+    let bad = |problem: String| StoreError::BadExecutionGraph {
+        run_id: run_id.to_string(),
+        problem,
+    };
+
+    let mut parents = std::collections::HashMap::new();
     for checkpoint in checkpoints {
         let Some(invocation) = checkpoint.invocation else {
             continue;
         };
-        if invocation.parent_span_id == Some(invocation.span_id) {
-            return Err(StoreError::BadExecutionGraph {
-                run_id: run_id.to_string(),
-                problem: format!("execution {} is its own parent", invocation.span_id),
-            });
+        if parents
+            .insert(invocation.span_id, invocation.parent_span_id)
+            .is_some()
+        {
+            return Err(bad(format!(
+                "execution {} names more than one record",
+                invocation.span_id
+            )));
         }
-        if !seen.insert(invocation.span_id) {
-            return Err(StoreError::BadExecutionGraph {
-                run_id: run_id.to_string(),
-                problem: format!(
-                    "execution {} names more than one record",
-                    invocation.span_id
-                ),
-            });
+    }
+
+    // Walk each execution's ancestry. Everything already walked is known to terminate, so each
+    // execution is visited once and the whole check is linear in the run.
+    let mut terminates = std::collections::HashSet::new();
+    for start in parents.keys() {
+        let mut walked = Vec::new();
+        let mut at = *start;
+        loop {
+            if terminates.contains(&at) {
+                break;
+            }
+            if walked.contains(&at) {
+                return Err(bad(format!(
+                    "executions {} form a cycle, so nothing they contain has a root",
+                    walked
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" → ")
+                )));
+            }
+            walked.push(at);
+            // A parent with no record of its own — a host call, a nested turn — ends the walk.
+            match parents.get(&at).copied().flatten() {
+                Some(parent) => at = parent,
+                None => break,
+            }
         }
+        terminates.extend(walked);
     }
     Ok(())
 }
@@ -282,10 +316,38 @@ mod tests {
             Err(StoreError::BadExecutionGraph { .. })
         ));
 
+        // And a cycle that is not a self-edge. A→B→A has two distinct ids and neither execution is
+        // its own parent, yet a consumer walking to a root goes round it forever.
+        let a = SpanId::parse("00000000000000aa").unwrap();
+        let b = SpanId::parse("00000000000000bb").unwrap();
+        let ring = bundle_of(vec![
+            imported_checkpoint(
+                "analyst",
+                Invocation {
+                    span_id: a,
+                    parent_span_id: Some(b),
+                },
+            ),
+            imported_checkpoint(
+                "implementer",
+                Invocation {
+                    span_id: b,
+                    parent_span_id: Some(a),
+                },
+            ),
+        ]);
+        assert!(matches!(
+            store.import(&ring).await,
+            Err(StoreError::BadExecutionGraph { .. })
+        ));
+
         // Refused before anything is written: a run half-imported is worse than one refused.
         assert!(store.run("imported").await.unwrap().is_none());
 
-        // And the shape a run actually produces goes in.
+        // And the shape a run actually produces goes in — including the ordinary case of a parent
+        // this run has no checkpoint for, since host calls and nested turns announce themselves in
+        // the event stream and write no row. A walk that ends there has ended, not failed.
+        let host = SpanId::parse("00000000000000d4").unwrap();
         let parent = Invocation::root(SpanId::parse("00000000000000b2").unwrap());
         let ok = bundle_of(vec![
             imported_checkpoint("analyst", parent),
@@ -293,8 +355,15 @@ mod tests {
                 "implementer",
                 parent.child(SpanId::parse("00000000000000c3").unwrap()),
             ),
+            imported_checkpoint(
+                "referee",
+                Invocation {
+                    span_id: SpanId::parse("00000000000000e5").unwrap(),
+                    parent_span_id: Some(host),
+                },
+            ),
         ]);
-        assert_eq!(store.import(&ok).await.unwrap()[0].checkpoints, 2);
+        assert_eq!(store.import(&ok).await.unwrap()[0].checkpoints, 3);
     }
 
     #[tokio::test]

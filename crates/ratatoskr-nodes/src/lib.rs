@@ -1156,10 +1156,10 @@ mod checkpoint_event_tests {
         })
         .await;
 
-        let of = |kind: &str, node: &str| -> Vec<serde_json::Value> {
+        let of = |kind: &str, name: &str| -> Vec<serde_json::Value> {
             events
                 .iter()
-                .filter(|e| e["kind"] == kind && e["node"] == node)
+                .filter(|e| e["kind"] == kind && e["execution_name"] == name)
                 .cloned()
                 .collect()
         };
@@ -1192,6 +1192,48 @@ mod checkpoint_event_tests {
                 .get("parent_span_id")
                 .is_none(),
             "and the host call itself was driven by the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lifecycle_record_names_an_execution_and_never_a_box() {
+        // Everything that folds the event stream into nodes keys on `node`, and an unknown name
+        // becomes a trailing column. Operation hosts are executions with names — `redTeam`,
+        // `isConverged` — that the shape cannot place, so putting their name in `node` gives every
+        // ordinary run a row of boxes for machinery it called.
+        let events = events_of(async {
+            ratatoskr_agent::claim_scope("isConverged", async {
+                ratatoskr_agent::execution(
+                    "verifier",
+                    ratatoskr_agent::ExecutionKind::Node,
+                    async {},
+                )
+                .await;
+            })
+            .await;
+        })
+        .await;
+
+        let lifecycle: Vec<_> = events
+            .iter()
+            .filter(|e| e["kind"] == "span_start" || e["kind"] == "span_end")
+            .collect();
+        assert_eq!(lifecycle.len(), 4, "two executions, each started and ended");
+        for event in &lifecycle {
+            assert!(
+                event.get("node").is_none(),
+                "a lifecycle record says which execution ran, not which box it belongs to: {event}"
+            );
+            assert!(
+                event["execution_name"].is_string(),
+                "and it does say which: {event}"
+            );
+        }
+        assert!(
+            lifecycle
+                .iter()
+                .any(|e| e["execution_name"] == "isConverged"),
+            "including the host, whose span a node's parent reference resolves to"
         );
     }
 
@@ -1241,11 +1283,12 @@ mod checkpoint_event_tests {
         })
         .await;
 
-        // A composite: two turns under ONE name, in two executions, folded into one row. There is
-        // no honest choice between them, so the row names neither and falls back to the execution
-        // that did write it — the host call. Picking the first would put a span id on a record that
-        // execution did not produce.
+        // A composite: turns under ONE name, in several executions, folded into one row. There is
+        // no honest choice between them, so the row names none and falls back to the execution that
+        // did write it — the host call. Three of them, not two: a conflict is not something a later
+        // entry can resolve, and folding A with B and then with C must not come out as C.
         ratatoskr_agent::claim_scope("redteam", async {
+            turn("redteam").await;
             turn("redteam").await;
             turn("redteam").await;
             write("redteam").await;

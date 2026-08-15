@@ -2523,7 +2523,7 @@ impl Drop for SpanEnd {
         tracing::info!(
             kind = "span_end",
             span_id = %self.span_id,
-            node = %self.name,
+            execution_name = %self.name,
             execution = self.kind.as_str(),
             "execution ended"
         );
@@ -2551,11 +2551,15 @@ pub async fn execution_as<F: Future>(
     // writes no checkpoint — an evidence-only stage, a turn whose failure the workflow recovers
     // from — is still an execution that happened, and a parent named by a child has to be findable
     // whether or not it produced a row of its own.
+    // `execution_name`, never `node`. An operation host is an execution and has a name, but it is
+    // not a box: the shape cannot place `redTeam` or `isConverged`, and a reader that folds every
+    // event carrying `node` into node state would give a run a trailing column per host it called.
+    // What a lifecycle record says is which execution began, not which box it belongs to.
     tracing::info!(
         kind = "span_start",
         span_id = %invocation.span_id,
         parent_span_id = invocation.parent_span_id.map(|p| p.to_string()),
-        node = %name,
+        execution_name = %name,
         execution = kind.as_str(),
         "execution started"
     );
@@ -2724,21 +2728,24 @@ impl RunLedger {
             .into_iter()
             .partition(|(entry, name, _)| *entry == scope && name == node);
         *entries = rest;
+        // The one execution every claimed turn ran as, if there is one.
+        let mut executions = claimed.iter().filter_map(|(_, _, claim)| claim.invocation);
+        let first = executions.next();
+        let single = first.filter(|first| executions.all(|next| next == *first));
         claimed
             .into_iter()
             .map(|(_, _, claim)| claim)
             .reduce(|mut folded, next| {
                 folded.telemetry.fold(next.telemetry);
-                // Cost folds; identity does not. Where two executions are folded into one row, the
-                // row names neither — picking one would put a span id on a record that execution
-                // did not produce, and the folded turns are each announced under their own span
-                // anyway. The row then falls back to the host call it was written inside, which is
-                // the execution that actually produced it.
-                folded.invocation = match (folded.invocation, next.invocation) {
-                    (Some(one), Some(other)) if one != other => None,
-                    (Some(one), _) => Some(one),
-                    (None, other) => other,
-                };
+                // Cost folds; identity does not. Where the claimed turns ran as more than one
+                // execution the row names none of them — picking one would put a span id on a
+                // record that execution did not produce — and the row falls back to the host call
+                // it was written inside, which is the execution that did.
+                //
+                // Ambiguity is decided over ALL the claims at once rather than pairwise, because a
+                // conflict is not something a later entry can resolve: folding A with B leaves no
+                // identity, and folding that with C must not read as C.
+                folded.invocation = single;
                 folded
             })
     }
