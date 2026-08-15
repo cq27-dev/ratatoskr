@@ -514,8 +514,6 @@ function FitToPane({
     return bottom > top ? bottom - top : 0;
   });
   useEffect(() => {
-    // @ts-expect-error debug
-    (window.__fit ??= []).push({ depth, initialized, count, moved });
     if (moved || !initialized || count === 0 || width === 0 || height === 0) return;
     // `fitView` fits NODE bounds, and the span shelves hang above them. Padding is a fraction of
     // what is being fitted, so a short row leaves less room above it than a tall one — a
