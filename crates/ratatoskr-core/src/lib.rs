@@ -9,6 +9,7 @@ pub mod config;
 pub mod control;
 pub mod policy;
 pub mod shape;
+pub mod span;
 pub mod state;
 pub mod telemetry;
 

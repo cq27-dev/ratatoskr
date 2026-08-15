@@ -211,6 +211,7 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
     // deriving a past moment from it shows final numbers against a historical position. Everything
     // the row records, the event has to be able to prove.
     let logged = telemetry.clone();
+    let invocation = ratatoskr_agent::current_invocation();
     r.store
         .insert_checkpoint(ratatoskr_store::CheckpointWrite {
             run_id: r.run_id,
@@ -218,6 +219,11 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
             output_json: &json,
             input_json: input_json.as_deref(),
             iteration: r.iteration,
+            // Which execution this row came out of, taken from the host call it is being written
+            // inside — the same boundary the turn was claimed against, so the identity on the row
+            // and the cost on the row are the same invocation's by construction. `None` outside a
+            // host call: the sequential paths that run before a workflow exists.
+            invocation,
             telemetry,
         })
         .await?;
@@ -235,6 +241,13 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
     tracing::info!(
         kind = "checkpoint",
         node = r.node,
+        // The event carries the identity for the same reason the row does, and because a live
+        // reader has nothing else: it sees a name and a moment, and two invocations of one stage
+        // are the same name at two moments.
+        span_id = invocation.map(|i| i.span_id.to_string()),
+        parent_span_id = invocation
+            .and_then(|i| i.parent_span_id)
+            .map(|p| p.to_string()),
         bytes = json.len(),
         iteration = r.iteration,
         model = logged.model.as_deref(),
@@ -1080,6 +1093,120 @@ mod checkpoint_event_tests {
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("one JSON object"))
             .find(|record| record["kind"] == "checkpoint")
             .expect("a checkpoint record")
+    }
+
+    #[tokio::test]
+    async fn the_checkpoint_event_carries_the_identity_the_row_carries() {
+        // The store holds the latest state of each node; a reader reconstructing where a run WAS
+        // reads the log. So the identity has to be on the event too, or a live reader is back to a
+        // name and a moment — and two invocations of one stage are one name at two moments.
+        let root = ratatoskr_agent::claim_scope(checkpoint_record(None)).await;
+        let id = root["span_id"]
+            .as_str()
+            .expect("the event names its execution");
+        assert!(
+            ratatoskr_core::span::SpanId::parse(id).is_some(),
+            "written as the sixteen hex characters it is read back from, not as a debug shape: {id}"
+        );
+        assert!(
+            root.get("parent_span_id").is_none(),
+            "a stage the run drove has no parent, and absent is how that is said: {root}"
+        );
+
+        let nested =
+            ratatoskr_agent::claim_scope(ratatoskr_agent::claim_scope(checkpoint_record(None)))
+                .await;
+        let parent = nested["parent_span_id"]
+            .as_str()
+            .expect("a nested execution names the one that invoked it");
+        assert!(ratatoskr_core::span::SpanId::parse(parent).is_some());
+        assert_ne!(parent, nested["span_id"].as_str().expect("its own"));
+
+        // Outside every host call there is no execution to name, and the keys are absent rather
+        // than present-and-empty — the same rule the cost fields follow.
+        let unscoped = checkpoint_record(None).await;
+        assert!(unscoped.get("span_id").is_none(), "{unscoped}");
+        assert!(unscoped.get("parent_span_id").is_none(), "{unscoped}");
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_names_the_execution_that_wrote_it_and_what_invoked_that_one() {
+        // A name never identified an execution. One stage is invoked repeatedly — once per converge
+        // pass — and a workflow may invoke it concurrently, so two rows under one name are two
+        // invocations and nothing on them said which. A nested execution had it worse: no place in
+        // the shape at all, and no way to say whose it was.
+        //
+        // The identity comes from the host call the record is written inside, which is the same
+        // boundary the turn was claimed against — so the cost on a row and the identity on it are
+        // the same invocation's by construction rather than by agreement.
+        let store = ratatoskr_store::Store::open_in_memory().expect("in-memory store");
+        store.upsert_run("r1", None, "running").await.expect("run");
+        let ledger = std::sync::Arc::new(ratatoskr_agent::RunLedger::default());
+        let write = async |node: &'static str| {
+            super::record(super::Record {
+                store: &store,
+                run_id: "r1",
+                node,
+                output: &serde_json::json!({ "ok": true }),
+                input: None,
+                iteration: None,
+                ledger: Some(&ledger),
+            })
+            .await
+            .expect("the checkpoint to be written");
+        };
+
+        // A stage the run drove, and an execution invoked from inside it.
+        ratatoskr_agent::claim_scope(async {
+            write("implementer").await;
+            ratatoskr_agent::claim_scope(write("referee")).await;
+        })
+        .await;
+        // Twice more, concurrently, under ONE name: the shape a workflow makes with
+        // `Promise.all([probe(a), probe(b)])`, and the one a name cannot describe.
+        tokio::join!(
+            ratatoskr_agent::claim_scope(write("probe")),
+            ratatoskr_agent::claim_scope(write("probe")),
+        );
+        // And a record written outside every host call — stage selection, before a workflow exists.
+        write("issue").await;
+
+        let rows = store.checkpoints_for_run("r1").await.expect("rows");
+        let of = |name: &str| {
+            rows.iter()
+                .find(|c| c.node_name == name)
+                .unwrap_or_else(|| panic!("a {name} row"))
+                .invocation
+        };
+        let implementer = of("implementer").expect("a stage the run drove has an identity");
+        assert_eq!(
+            implementer.parent_span_id, None,
+            "the run is the trace, not a span: a stage it drove has no parent"
+        );
+        assert_eq!(
+            of("referee")
+                .expect("a nested execution has one too")
+                .parent_span_id,
+            Some(implementer.span_id),
+            "an execution invoked from inside another names it"
+        );
+
+        let probes: Vec<_> = rows
+            .iter()
+            .filter(|c| c.node_name == "probe")
+            .map(|c| c.invocation.expect("an identity").span_id)
+            .collect();
+        assert_eq!(probes.len(), 2);
+        assert_ne!(
+            probes[0], probes[1],
+            "two invocations of one stage are two executions, however alike their rows look"
+        );
+
+        assert_eq!(
+            of("issue"),
+            None,
+            "a record written outside every host call names no execution, and must not invent one"
+        );
     }
 
     #[tokio::test]

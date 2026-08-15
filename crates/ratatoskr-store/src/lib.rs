@@ -45,6 +45,11 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("checkpoints", "thinking", "INTEGER"),
     ("checkpoints", "tools_used_json", "TEXT"),
     ("checkpoints", "error", "TEXT"),
+    // Which execution wrote this row, and which execution invoked that one. Null for a row written
+    // before an execution had an identity, and null in `parent_span_id` for a stage the run itself
+    // drove — which is most of them, and not a gap.
+    ("checkpoints", "span_id", "TEXT"),
+    ("checkpoints", "parent_span_id", "TEXT"),
 ];
 
 /// Errors from the checkpoint store.
@@ -83,6 +88,11 @@ pub struct Checkpoint {
     pub input_json: Option<String>,
     /// Which pass of the converge loop this row came from; `None` for a node that runs once.
     pub iteration: Option<u32>,
+    /// Which execution wrote this row, and what invoked it.
+    ///
+    /// `None` for a row written before executions had identities. A row that HAS an identity and no
+    /// parent is a stage the run itself drove — the ordinary case, and not the same statement.
+    pub invocation: Option<ratatoskr_core::span::Invocation>,
     pub telemetry: NodeTelemetry,
 }
 
@@ -98,6 +108,9 @@ pub struct CheckpointWrite<'a> {
     /// the input, a checkpoint shows what came out and gives no way to ask why.
     pub input_json: Option<&'a str>,
     pub iteration: Option<u32>,
+    /// Which execution is writing this row, and what invoked it. `None` only where there is no
+    /// execution to name — an import replaying a row that was written without one.
+    pub invocation: Option<ratatoskr_core::span::Invocation>,
     pub telemetry: NodeTelemetry,
 }
 
@@ -361,6 +374,7 @@ impl Store {
             output_json,
             input_json,
             iteration,
+            invocation,
             telemetry,
         } = write;
         let (run_id, node_name, output_json, input_json) = (
@@ -378,9 +392,9 @@ impl Store {
                      model, duration_ms, turns, error,
                      input_tokens, output_tokens, cached_input_tokens,
                      cache_creation_input_tokens, reasoning_tokens, tools_json, reuses_session,
-                     thinking, tools_used_json
+                     thinking, tools_used_json, span_id, parent_span_id
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                           ?17, ?18)",
+                           ?17, ?18, ?19, ?20)",
                 params![
                     run_id,
                     node_name,
@@ -400,6 +414,12 @@ impl Store {
                     telemetry.reuses_session,
                     telemetry.thinking,
                     serde_json::to_string(&telemetry.tools_used).unwrap_or_default(),
+                    // Written as the sixteen hex characters they are read back from, so the column
+                    // holds what an exporter and a human both expect to see.
+                    invocation.map(|i| i.span_id.to_string()),
+                    invocation
+                        .and_then(|i| i.parent_span_id)
+                        .map(|p| p.to_string()),
                 ],
             )?;
             Ok::<_, StoreError>(())
@@ -419,7 +439,7 @@ impl Store {
                         model, duration_ms, turns, error,
                         input_tokens, output_tokens, cached_input_tokens,
                         cache_creation_input_tokens, reasoning_tokens, tools_json, reuses_session,
-                        thinking, tools_used_json
+                        thinking, tools_used_json, span_id, parent_span_id
                  FROM checkpoints WHERE run_id = ?1 ORDER BY id ASC",
             )?;
             let rows = stmt
@@ -430,6 +450,23 @@ impl Store {
                         created_at: row.get(2)?,
                         input_json: row.get(3)?,
                         iteration: row.get(4)?,
+                        // A row with no identity, or one whose column holds something that is not
+                        // an identity, reports none. Nothing is invented from a name here: a reader
+                        // that cannot tell two executions apart must be told that, not given a
+                        // plausible answer.
+                        invocation: row
+                            .get::<_, Option<String>>(18)?
+                            .as_deref()
+                            .and_then(ratatoskr_core::span::SpanId::parse)
+                            .map(|span_id| ratatoskr_core::span::Invocation {
+                                span_id,
+                                parent_span_id: row
+                                    .get::<_, Option<String>>(19)
+                                    .ok()
+                                    .flatten()
+                                    .as_deref()
+                                    .and_then(ratatoskr_core::span::SpanId::parse),
+                            }),
                         telemetry: NodeTelemetry {
                             model: row.get(5)?,
                             duration_ms: row.get(6)?,
@@ -991,6 +1028,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_checkpoint_says_which_execution_wrote_it_and_what_invoked_that_one() {
+        // A name is not an execution: a stage is invoked once per converge pass, and may be invoked
+        // concurrently, so a reader with only names cannot tell two live invocations apart or say
+        // what a nested one belongs to. The row has to carry the identity, and carry the absence of
+        // one as an absence.
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("run-1", None, "running").await.unwrap();
+        let parent = ratatoskr_core::span::SpanId::parse("00000000000000a1").unwrap();
+        let child = ratatoskr_core::span::SpanId::parse("fedcba9876543210").unwrap();
+
+        // A stage the run drove: an identity of its own, no parent.
+        store
+            .insert_checkpoint(CheckpointWrite {
+                run_id: "run-1",
+                node_name: "implementer",
+                output_json: "{}",
+                invocation: Some(ratatoskr_core::span::Invocation::root(parent)),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // An execution invoked from inside it.
+        store
+            .insert_checkpoint(CheckpointWrite {
+                run_id: "run-1",
+                node_name: "referee",
+                output_json: "{}",
+                invocation: Some(ratatoskr_core::span::Invocation::root(parent).child(child)),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // And a row written with no execution to name, which must not read as one.
+        store
+            .insert_checkpoint(CheckpointWrite {
+                run_id: "run-1",
+                node_name: "issue",
+                output_json: "{}",
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let rows = store.checkpoints_for_run("run-1").await.unwrap();
+        let of = |name: &str| {
+            rows.iter()
+                .find(|c| c.node_name == name)
+                .unwrap()
+                .invocation
+        };
+        assert_eq!(of("implementer").unwrap().span_id, parent);
+        assert_eq!(of("implementer").unwrap().parent_span_id, None);
+        assert_eq!(of("referee").unwrap().span_id, child);
+        assert_eq!(
+            of("referee").unwrap().parent_span_id,
+            Some(parent),
+            "a nested execution names the one that invoked it, not its own name"
+        );
+        assert_eq!(of("issue"), None, "no identity is not the invalid identity");
+    }
+
+    #[tokio::test]
     async fn a_checkpoint_carries_its_input_cost_and_model() {
         let store = Store::open_in_memory().unwrap();
         store.upsert_run("run-1", None, "running").await.unwrap();
@@ -1002,6 +1101,12 @@ mod tests {
                 output_json: r#"{"out":1}"#,
                 input_json: Some(r#"{"issue":"issue-6"}"#),
                 iteration: Some(2),
+                invocation: Some(
+                    ratatoskr_core::span::Invocation::root(
+                        ratatoskr_core::span::SpanId::parse("00000000000000a1").unwrap(),
+                    )
+                    .child(ratatoskr_core::span::SpanId::parse("00000000000000b2").unwrap()),
+                ),
                 telemetry: NodeTelemetry {
                     model: Some("anthropic/claude-opus-4".into()),
                     duration_ms: Some(4200),

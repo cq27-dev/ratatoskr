@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use ratatoskr_core::{
     Control, Directive, ModelRoute, NodeTelemetry, TokenUsage, ToolDecision, ToolPolicy,
+    span::{Invocation, SpanId},
 };
 use ratatoskr_mcp::{self, ToolSet};
 use rig_agent::AgentBuilder;
@@ -2461,16 +2462,39 @@ async fn park(controller: &Arc<dyn Controller>, node: &str) -> Vec<String> {
 
 tokio::task_local! {
     /// The claim scope the running future belongs to; see [`claim_scope`].
-    static CLAIM_SCOPE: u64;
+    static CLAIM_SCOPE: Invocation;
 }
 
-/// The scope of a turn recorded with no scope open — the sequential paths that run outside a
-/// workflow host, such as stage selection before a workflow exists.
-const UNSCOPED: u64 = 0;
+/// Run `work` as one claim scope, under an identity you supply.
+///
+/// [`claim_scope`] with the id chosen by the caller, for a test that has to be able to say what it
+/// minted. Production mints at the boundary rather than carrying an id through the JS host call.
+pub async fn claim_scope_as<F: Future>(span_id: SpanId, work: F) -> F::Output {
+    let invocation = match CLAIM_SCOPE.try_with(|enclosing| *enclosing) {
+        // A scope opened inside another is an execution the enclosing one invoked — the shape a
+        // node's subagents and its clarification answerer have, and the only way a record of one
+        // can say where it belongs.
+        Ok(enclosing) => enclosing.child(span_id),
+        Err(_) => Invocation::root(span_id),
+    };
+    CLAIM_SCOPE.scope(invocation, work).await
+}
 
-/// Scope ids are minted process-wide rather than per ledger: a claim only ever compares ids from
-/// its own run, and a shared counter needs no state on the ledger to be unique within one.
-static NEXT_CLAIM_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// A fresh span id.
+///
+/// Random rather than counted: a run's records are exported as a trace, and a counter restarted by
+/// a process restart would collide inside one. The low eight bytes of a v4 UUID are eight random
+/// bytes, which is exactly what a span id is — and `Uuid::new_v4` is the workspace's one source of
+/// them. The all-zero id is OpenTelemetry's *invalid* one and is refused by [`SpanId::new`]; drawing
+/// again is the honest response to a value that cannot be an identity.
+fn mint_span_id() -> SpanId {
+    loop {
+        let (_, low) = uuid::Uuid::new_v4().as_u64_pair();
+        if let Some(id) = SpanId::new(low.to_be_bytes()) {
+            return id;
+        }
+    }
+}
 
 /// Run `work` as one claim scope: the turns it records are the turns a checkpoint written inside it
 /// claims.
@@ -2492,16 +2516,22 @@ static NEXT_CLAIM_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// A stage that merely belongs to another node is a different case and needs none of this: it
 /// writes its own checkpoint row inside its box, so it claims its own turn under its own name.
 pub async fn claim_scope<F: Future>(work: F) -> F::Output {
-    CLAIM_SCOPE
-        .scope(
-            NEXT_CLAIM_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            work,
-        )
-        .await
+    claim_scope_as(mint_span_id(), work).await
 }
 
-fn current_claim_scope() -> u64 {
-    CLAIM_SCOPE.try_with(|scope| *scope).unwrap_or(UNSCOPED)
+/// Which execution the running future belongs to, and what invoked it.
+///
+/// `None` outside every scope — the sequential paths that run before a workflow exists, such as
+/// stage selection. A record written there names no execution, which is the truth about it and not
+/// a gap to fill with a plausible id.
+pub fn current_invocation() -> Option<Invocation> {
+    CLAIM_SCOPE.try_with(|invocation| *invocation).ok()
+}
+
+/// The identity a claim is keyed on. `None` outside every scope, which is its own key: turns
+/// recorded outside a scope are claimed by a checkpoint written outside one.
+fn current_claim_scope() -> Option<SpanId> {
+    current_invocation().map(|invocation| invocation.span_id)
 }
 
 /// Where a run's node turns report what they cost.
@@ -2517,7 +2547,7 @@ fn current_claim_scope() -> u64 {
 /// implementer's, inside a single `iterate` — from claiming each other's cost.
 #[derive(Default)]
 pub struct RunLedger {
-    entries: Mutex<Vec<(u64, String, NodeTelemetry)>>,
+    entries: Mutex<Vec<(Option<SpanId>, String, NodeTelemetry)>>,
     /// Local continuation belongs to a run, just like the telemetry beside it. Keeping it here
     /// lets rebuilt node values re-enter without every node type growing its own session field.
     compacted_sessions: Mutex<HashMap<String, CompactedSession>>,
@@ -2866,13 +2896,24 @@ where
         "gen_ai.operation.name" = "invoke_agent",
         "gen_ai.agent.name" = node,
         "gen_ai.request.model" = %model_name,
+        span_id = current_invocation().map(|i| i.span_id.to_string()),
+        parent_span_id = current_invocation()
+            .and_then(|i| i.parent_span_id)
+            .map(|p| p.to_string()),
     );
     // Announced at the start, because a checkpoint only exists once the node has finished — and
     // the moment a reader most wants to know what a node is running on is while it is still
     // running. The facts here are the configured ones; cost arrives with the checkpoint.
+    let invocation = current_invocation();
     tracing::info!(
         kind = "node_start",
         node,
+        // Which execution is starting, so a live reader can pair this with the checkpoint that
+        // closes it — and tell a second attempt from the first, which shares its name.
+        span_id = invocation.map(|i| i.span_id.to_string()),
+        parent_span_id = invocation
+            .and_then(|i| i.parent_span_id)
+            .map(|p| p.to_string()),
         model = %model_name,
         tools = %tool_names.join(","),
         thinking = thinking_left_on(route),
