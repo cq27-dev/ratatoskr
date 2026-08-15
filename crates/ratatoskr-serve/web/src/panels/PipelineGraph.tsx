@@ -18,7 +18,13 @@ import {
 import { Brain, Infinity as InfinityIcon, Repeat, Wrench } from "lucide-react";
 import { TOOL_GROUPS } from "../ui/tools";
 import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode, SessionScope } from "../api";
-import { forkHandoff, handoffDrawn, type ConvergeLoops, type LiveNode } from "../derive";
+import {
+  forkHandoff,
+  handoffDrawn,
+  skippedSpans,
+  type ConvergeLoops,
+  type LiveNode,
+} from "../derive";
 
 /*
  * Positions are computed from the `stage` and `lane` the server sends with each node, not from a
@@ -242,6 +248,12 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
       {/* Where a hand-off from the lane above lands. Its own handle because `in` is on the left,
           where the stage edges arrive, and a step down a lane comes in from the top. */}
       <Handle type="target" id="lane-in" position={Position.Top} isConnectable={false} />
+      {/* Where a span across skipped stages leaves and lands. Its own pair rather than reusing
+          `lane-in`: that one means a step down the lane gap from the box above, and a span means
+          the run jumped a column — reading them off one handle would make the graph say the same
+          thing about two different hand-offs. */}
+      <Handle type="source" id="span-out" position={Position.Top} isConnectable={false} />
+      <Handle type="target" id="span-in" position={Position.Top} isConnectable={false} />
       <div className="node-name">
         <span>{stageLabel(node.name)}</span>
         <span className="dot" aria-hidden="true" />
@@ -455,7 +467,57 @@ function FitToPane({ count, moved }: { count: number; moved: boolean }) {
 }
 
 const nodeTypes = { pipeline: PipelineNode };
-const edgeTypes = { converge: ConvergeEdge, backloop: BackLoopEdge };
+/** What a span needs beyond its endpoints: its shelf, and its riser's offset. */
+type SpanData = { shelfY: number; takeoff: number };
+type SpanEdgeType = Edge<SpanData, "span">;
+
+/**
+ * A hand-off across stages the run never entered: up out of the source, along a shelf above the
+ * row, and down into the target.
+ *
+ * `BackLoopEdge` mirrored. It has to be routed rather than left to `smoothstep`, for the same
+ * reason: the span crosses whole columns of boxes, and a self-routing edge would trace straight
+ * through them. Above rather than below because the band under the row is the loop shelves', and an
+ * edge sharing their space reads as one of them.
+ */
+function SpanEdge({
+  id,
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  data,
+  markerEnd,
+  style,
+}: EdgeProps<SpanEdgeType>) {
+  const { shelfY, takeoff } = data ?? { shelfY: sourceY, takeoff: 0 };
+  // Matches the loop shelves', which match the stage edges' rounding.
+  const r = 14;
+  const sx = sourceX + takeoff;
+  // A span runs forwards, so the target is normally to the right — but a workflow declares its own
+  // column order, and a hardcoded direction would turn the corners inside out.
+  const dir = targetX > sx ? 1 : -1;
+  const path = [
+    `M ${sx},${sourceY}`,
+    `L ${sx},${shelfY + r}`,
+    `Q ${sx},${shelfY} ${sx + r * dir},${shelfY}`,
+    `L ${targetX - r * dir},${shelfY}`,
+    `Q ${targetX},${shelfY} ${targetX},${shelfY + r}`,
+    `L ${targetX},${targetY}`,
+  ].join(" ");
+
+  return (
+    <BaseEdge
+      id={id}
+      path={path}
+      interactionWidth={0}
+      {...(style ? { style } : {})}
+      {...(markerEnd ? { markerEnd } : {})}
+    />
+  );
+}
+
+const edgeTypes = { converge: ConvergeEdge, backloop: BackLoopEdge, span: SpanEdge };
 
 interface Props {
   /**
@@ -576,11 +638,37 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
     // The shelves hang under the whole layout, not under one box, so two of them cannot cross a
     // node in a deeper lane. Measured off the positions actually being drawn.
     const maxLanes = Math.max(1, ...columns.map((c) => c.length));
-    const rowBottom =
-      Math.max(
-        0,
-        ...columns.flatMap((lanes) => lanes.map((n) => position(n, lanes.length, maxLanes).y)),
-      ) + NODE_SIZE.height;
+    const laneTops = columns.flatMap((lanes) =>
+      lanes.map((n) => position(n, lanes.length, maxLanes).y),
+    );
+    const rowBottom = Math.max(0, ...laneTops) + NODE_SIZE.height;
+    // The spans hang over the whole layout for the same reason the loops hang under it: one that
+    // cleared only its own box would cross a box in a shallower lane.
+    const rowTop = Math.min(0, ...laneTops);
+
+    /*
+     * Hand-offs across stages the run never entered. An ordinary edge joins adjacent columns, so
+     * without these a run that skipped a stage draws a break exactly where it made its hand-off.
+     * Which jumps happened is `skippedSpans`; all that is decided here is where the line goes.
+     *
+     * Offset per pair, so two spans leaving one box do not trace the same line — the same reason
+     * the loop shelves are offset from each other.
+     */
+    skippedSpans(nodes).forEach(({ from, to }, i) => {
+      edges.push({
+        id: `span-${from}-${to}`,
+        source: from,
+        target: to,
+        sourceHandle: "span-out",
+        targetHandle: "span-in",
+        type: "span",
+        data: {
+          shelfY: rowTop - (i + 1) * LOOP_SHELF_STEP,
+          takeoff: 0,
+        },
+      });
+    });
+
     const loop = (target: string): Partial<Edge> => ({
       sourceHandle: "loop-out",
       targetHandle: "loop-in",

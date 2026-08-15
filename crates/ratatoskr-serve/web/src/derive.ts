@@ -406,6 +406,53 @@ export function forkHandoff(nodes: readonly NodeView[]): boolean {
 }
 
 /**
+ * The hand-offs a run made across stages it never entered.
+ *
+ * An ordinary edge joins adjacent columns, so a run that skipped a stage draws a break exactly
+ * where it made a hand-off: the no-code-change shortcut goes `analyst` straight to `publisher`, and
+ * a run that never forks or never reviews does the same. Each pair here is one such jump — from the
+ * last column that ran to the next column that ran, with nothing but unentered stages between.
+ *
+ * "Ran" is `state !== "idle"`, the same thing every other edge asks. A stage that has not run YET is
+ * not a stage that was skipped, which is why a span needs a LATER column to have started before it
+ * may be drawn: mid-flight, and while scrubbing back through a finished run, the columns ahead are
+ * idle for the ordinary reason and nothing spans them. A stage that looked skipped and then runs
+ * simply stops being spanned, because the fold is over the stream as it stands.
+ *
+ * Pairs, not a boolean, because where the edge goes is the renderer's business and which hand-offs
+ * happened is this one's — the same split `forkHandoff` keeps.
+ */
+export function skippedSpans(nodes: readonly NodeView[]): { from: string; to: string }[] {
+  const columns = new Map<number, NodeView[]>();
+  for (const node of nodes) {
+    const at = columns.get(node.stage);
+    if (at) at.push(node);
+    else columns.set(node.stage, [node]);
+  }
+  const ordered = [...columns.keys()].sort((a, b) => a - b);
+  const ran = (stage: number) => (columns.get(stage) ?? []).some((n) => n.state !== "idle");
+
+  const spans: { from: string; to: string }[] = [];
+  for (let i = 0; i < ordered.length; i += 1) {
+    if (!ran(ordered[i]!)) continue;
+    // The next column that ran. Everything between is unentered, or this is not a span.
+    let next = i + 1;
+    while (next < ordered.length && !ran(ordered[next]!)) next += 1;
+    if (next >= ordered.length || next === i + 1) continue;
+    // One edge per pair of boxes, the same relation an adjacent-column edge draws.
+    for (const source of columns.get(ordered[i]!) ?? []) {
+      if (source.state === "idle") continue;
+      for (const target of columns.get(ordered[next]!) ?? []) {
+        if (target.state === "idle") continue;
+        if (!handoffDrawn(source, target)) continue;
+        spans.push({ from: source.name, to: target.name });
+      }
+    }
+  }
+  return spans;
+}
+
+/**
  * Whether a forward hand-off from `source` to `target` is a claim the record supports.
  *
  * Adjacent columns are drawn joined, so every stage edge asserts that the earlier column ran the
