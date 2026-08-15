@@ -637,6 +637,9 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
    */
   const placed = useMemo(() => place(columns), [columns]);
   const extent = useMemo(() => rowExtent(placed.values()), [placed]);
+  // How far a scrubbed box may grow before it covers the one under it. Off the placement, since
+  // that is what says which boxes are neighbours and how tall they are.
+  const crowd = useMemo(() => crowdLimit(tallestNeighbours(placed.values())), [placed]);
 
   const desiredNodes = useMemo<PipelineNodeType[]>(() => {
     return columns.flatMap((lanes) =>
@@ -913,7 +916,7 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
         }
         moved={moved.current}
       />
-      <Magnification crowd={crowdLimit(tallestNeighbours(placed.values()))} />
+      <Magnification crowd={crowd} />
     </ReactFlow>
   );
 }

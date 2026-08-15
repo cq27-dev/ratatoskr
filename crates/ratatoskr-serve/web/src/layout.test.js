@@ -327,9 +327,29 @@ test("the pair that bounds it is read off the boxes as placed", () => {
 
   // 60 + 200 are adjacent and 300 + 60 are adjacent; 300 + 200 are not.
   expect(tallestNeighbours(placed.values())).toBe(360);
-  // A lone box in its column is bounded by the column gap beside it, not by a lane gap.
-  expect(tallestNeighbours([{ x: 0, y: 0, width: NODE_SIZE.width, height: 400 }])).toBe(400);
+
+  // A box with nothing under or over it is in no pair, however tall: there is no lane gap for it to
+  // grow into. Counting it would hold a lone grown node down to a magnification it never needed —
+  // the column gap beside it is what bounds it, and `crowdLimit` applies that anyway.
+  const lone = [{ x: 0, y: 0, width: NODE_SIZE.width, height: 900 }];
+  expect(tallestNeighbours(lone)).toBe(0);
   expect(tallestNeighbours([])).toBe(0);
-  // Nothing placed is not a licence to magnify past what the columns allow.
-  expect(crowdLimit(0)).toBeLessThanOrEqual(1 + (COLUMN_GAP * 0.7) / NODE_SIZE.width);
+  const columnCap = 1 + (COLUMN_GAP * 0.7) / NODE_SIZE.width;
+  expect(crowdLimit(tallestNeighbours(lone))).toBeCloseTo(columnCap, 12);
+  expect(crowdLimit(0)).toBeCloseTo(columnCap, 12);
+});
+
+test("finding the pair costs what the boxes cost", () => {
+  // The same mistake as materialising lanes, one function along: rebuilding each column as it is
+  // accumulated copies it once per box, which is quadratic in a column the read gate accepts.
+  const deep = 3000;
+  const tall = Array.from({ length: deep }, (_, lane) => ({
+    x: 0,
+    y: lane * LANE_PITCH,
+    width: NODE_SIZE.width,
+    height: NODE_SIZE.height,
+  }));
+  const started = performance.now();
+  expect(tallestNeighbours(tall)).toBe(2 * NODE_SIZE.height);
+  expect(performance.now() - started).toBeLessThan(60);
 });

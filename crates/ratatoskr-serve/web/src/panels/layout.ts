@@ -200,17 +200,27 @@ export function fittedBounds(nodes: Bounds, above: number, below: number): Bound
  * them, so what matters is the tallest adjacent pair rather than the tallest box. Boxes with an
  * empty lane between them are counted as neighbours too, which only over-reserves — they have that
  * lane's room as well.
+ *
+ * A box with no box under or over it is in no pair and contributes nothing, however tall it is:
+ * there is no lane gap for it to grow into, and counting it against the lane bound holds a lone
+ * grown node down to a magnification it never needed. Zero when no column holds two, which leaves
+ * `crowdLimit` to the column gap.
  */
 export function tallestNeighbours(placed: Iterable<Bounds>): number {
   const columns = new Map<number, Bounds[]>();
-  for (const box of placed) columns.set(box.x, [...(columns.get(box.x) ?? []), box]);
+  for (const box of placed) {
+    // Appended, not rebuilt: a spread here re-copies the column for every box in it, which is
+    // quadratic in a column the read gate is happy to accept.
+    const column = columns.get(box.x);
+    if (column) column.push(box);
+    else columns.set(box.x, [box]);
+  }
   let tallest = 0;
   for (const column of columns.values()) {
     const heights = column.sort((a, b) => a.y - b.y).map((box) => box.height);
-    // A column of one has no pair, and is bounded by the column gap beside it rather than a lane gap.
-    heights.forEach((height, i) => {
-      tallest = Math.max(tallest, height + (heights[i - 1] ?? 0));
-    });
+    for (let i = 1; i < heights.length; i += 1) {
+      tallest = Math.max(tallest, (heights[i - 1] ?? 0) + (heights[i] ?? 0));
+    }
   }
   return tallest;
 }
