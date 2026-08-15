@@ -668,17 +668,27 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
      * someone pans. The jumps a run can make are bounded by its columns; its box pairs are not.
      */
     const jumps = new Map<string, number>();
-    const byNameSpan = (name: string) => nodes.find((n) => n.name === name);
+    const band = new Map<number, NodeView[]>();
+    for (const lanes of columns) if (lanes[0]) band.set(lanes[0].stage, lanes);
+    /*
+     * Where a box's riser stands in the gap beside its column: distributed across the gap by the
+     * box's position among its lanes, never measured inward from one edge. Subtracting a fixed step
+     * per lane runs out — a column of eight lanes put the eighth riser past the gap and inside the
+     * box, crossing it and its siblings, and nothing caps how wide a column may be. A fraction of
+     * the gap is strictly inside it for any number of lanes.
+     */
+    const riser = (node: NodeView) => {
+      const lanes = band.get(node.stage) ?? [node];
+      const k = lanes.findIndex((lane) => lane.name === node.name);
+      return (COLUMN_GAP * (Math.max(0, k) + 1)) / (lanes.length + 1);
+    };
     for (const { from, to } of skippedSpans(nodes)) {
-      const source = byNameSpan(from);
-      const target = byNameSpan(to);
+      const source = byName.get(from);
+      const target = byName.get(to);
       if (!source || !target) continue;
       const jump = `${source.stage}-${target.stage}`;
       if (!jumps.has(jump)) jumps.set(jump, jumps.size);
       const shelf = jumps.get(jump)!;
-      // Risers stand in the column gaps, offset per lane so two spans of one jump do not trace the
-      // same vertical line.
-      const gap = COLUMN_GAP / 2;
       edges.push({
         id: `span-${from}-${to}`,
         source: from,
@@ -688,8 +698,8 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
         type: "span",
         data: {
           shelfY: rowTop - (shelf + 1) * LOOP_SHELF_STEP,
-          takeoff: gap - source.lane * 8,
-          landing: gap - target.lane * 8,
+          takeoff: riser(source),
+          landing: riser(target),
         },
       });
     }
