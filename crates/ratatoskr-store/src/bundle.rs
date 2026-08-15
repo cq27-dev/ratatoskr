@@ -70,15 +70,22 @@ fn check_execution_graph(run_id: &str, checkpoints: &[Checkpoint]) -> Result<(),
 
     // Walk each execution's ancestry. Everything already walked is known to terminate, so each
     // execution is visited once and the whole check is linear in the run.
+    //
+    // Two records of one walk, because they answer different questions: the set says whether this
+    // walk has been here, in one comparison rather than one per step already taken, and the list
+    // says in what order — which is the only thing that makes a reported cycle readable. Scanning
+    // the list for membership made the walk quadratic in a chain's length, which is exactly the
+    // shape an unbounded bundle would have to exploit.
     let mut terminates = std::collections::HashSet::new();
     for start in parents.keys() {
         let mut walked = Vec::new();
+        let mut on_this_walk = std::collections::HashSet::new();
         let mut at = *start;
         loop {
             if terminates.contains(&at) {
                 break;
             }
-            if walked.contains(&at) {
+            if !on_this_walk.insert(at) {
                 return Err(bad(format!(
                     "executions {} form a cycle, so nothing they contain has a root",
                     walked
@@ -364,6 +371,38 @@ mod tests {
             ),
         ]);
         assert_eq!(store.import(&ok).await.unwrap()[0].checkpoints, 3);
+    }
+
+    #[tokio::test]
+    async fn a_long_ancestry_costs_what_its_length_costs() {
+        // The walk asks "have I been here on this walk" once per hop. Asked by scanning the steps
+        // already taken, that is quadratic in the chain's length — and a bundle is the one
+        // checkpoint path this process did not produce, so its shape is whatever an author chose.
+        use ratatoskr_core::span::{Invocation, SpanId};
+        let deep = 20_000u64;
+        let id = |n: u64| SpanId::new(n.to_be_bytes()).expect("nonzero");
+        let chain: Vec<Checkpoint> = (1..=deep)
+            .map(|n| {
+                imported_checkpoint(
+                    "node",
+                    Invocation {
+                        span_id: id(n),
+                        // Each names the one before it, so the first walk is the whole chain.
+                        parent_span_id: (n > 1).then(|| id(n - 1)),
+                    },
+                )
+            })
+            .collect();
+
+        let started = std::time::Instant::now();
+        let store = Store::open_in_memory().unwrap();
+        super::check_execution_graph("deep", &chain).expect("a chain is not a cycle");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "checking a chain of {deep} took {:?}",
+            started.elapsed()
+        );
+        drop(store);
     }
 
     #[tokio::test]
