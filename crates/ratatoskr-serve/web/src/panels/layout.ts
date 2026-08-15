@@ -192,3 +192,49 @@ export function fittedBounds(nodes: Bounds, above: number, below: number): Bound
     height: nodes.height + above + below,
   };
 }
+
+/**
+ * The largest pair of boxes that sit next to each other in a column, added together.
+ *
+ * What the scrub magnification is bounded by: two neighbours both growing share the gap between
+ * them, so what matters is the tallest adjacent pair rather than the tallest box. Boxes with an
+ * empty lane between them are counted as neighbours too, which only over-reserves — they have that
+ * lane's room as well.
+ */
+export function tallestNeighbours(placed: Iterable<Bounds>): number {
+  const columns = new Map<number, Bounds[]>();
+  for (const box of placed) columns.set(box.x, [...(columns.get(box.x) ?? []), box]);
+  let tallest = 0;
+  for (const column of columns.values()) {
+    const heights = column.sort((a, b) => a.y - b.y).map((box) => box.height);
+    // A column of one has no pair, and is bounded by the column gap beside it rather than a lane gap.
+    heights.forEach((height, i) => {
+      tallest = Math.max(tallest, height + (heights[i - 1] ?? 0));
+    });
+  }
+  return tallest;
+}
+
+/**
+ * The most a node can grow while its neighbours grow too, before they touch.
+ *
+ * Hovering does not need this: it enlarges one box and lifts it above the others, so covering a
+ * neighbour is the point. Scrubbing enlarges every node that was working at that moment, and two of
+ * those can be adjacent — with no one on top, they have to fit. Growth is centred, so a pair reaches
+ * half its own added height into the gap between them, and `0.7` of the gap leaves a visible sliver
+ * rather than letting them meet edge to edge.
+ *
+ * Taken from the heights actually placed rather than from `NODE_SIZE`, because the pair is what the
+ * bound is about: a 300px box beside a collapsed one eats 67px of a 62px lane gap at the magnifica-
+ * tion two collapsed boxes are safe at. With every box the same height this is exactly the constant
+ * it replaces.
+ *
+ * The horizontal half needs no such care — every box is `NODE_SIZE.width` wide, and columns are a
+ * whole gap apart whatever is in them.
+ */
+export function crowdLimit(neighbours: number): number {
+  return Math.min(
+    1 + (COLUMN_GAP * 0.7) / NODE_SIZE.width,
+    1 + (2 * LANE_GAP * 0.7) / Math.max(1, neighbours),
+  );
+}

@@ -19,16 +19,17 @@ import {
 import { Brain, Infinity as InfinityIcon, Repeat, Wrench } from "lucide-react";
 import { TOOL_GROUPS } from "../ui/tools";
 import {
-  COLUMN_GAP,
   LANE_GAP,
   LOOP_SHELF_STEP,
   NODE_SIZE,
+  crowdLimit,
   place,
   rowExtent,
   LOOP_BAND,
   SPAN_BAND,
   SPAN_RADIUS,
   fittedBounds,
+  tallestNeighbours,
   spanRiser,
   spanShelf,
 } from "./layout";
@@ -445,24 +446,7 @@ function BackLoopEdge({
  *
  * Must be rendered INSIDE `<ReactFlow>` — that is what puts it in the provider's context.
  */
-/**
- * The most a node can grow while its neighbours grow too, before they touch.
- *
- * Hovering does not need this: it enlarges one box and lifts it above the others, so covering a
- * neighbour is the point. Scrubbing enlarges every node that was working at that moment, and two of
- * those can be adjacent — with no one on top, they have to fit. Growth is centred, so each of two
- * neighbours reaches half the gap; the pair therefore has the whole gap to share, and `0.7` of it
- * leaves a visible sliver rather than letting them meet edge to edge.
- *
- * Derived from the layout constants rather than written as a number, because it is a fact *about*
- * them: change the pitch and the safe magnification changes with it.
- */
-const CROWD_LIMIT = Math.min(
-  1 + (COLUMN_GAP * 0.7) / NODE_SIZE.width,
-  1 + (LANE_GAP * 0.7) / NODE_SIZE.height,
-);
-
-function Magnification() {
+function Magnification({ crowd }: { crowd: number }) {
   const zoom = useStore((s) => s.transform[2]);
   useEffect(() => {
     // Clamped: under 1.2 it is not worth the movement, and past 3 the node covers its whole
@@ -472,8 +456,8 @@ function Magnification() {
     root.setProperty("--mag", mag.toFixed(2));
     // Tracks `--mag` where there is room and stops where there is not, so a narrow pane — which is
     // exactly where `--mag` is largest — does not turn the working nodes into one merged block.
-    root.setProperty("--mag-scrub", Math.min(1 + (mag - 1) * 0.7, CROWD_LIMIT).toFixed(2));
-  }, [zoom]);
+    root.setProperty("--mag-scrub", Math.min(1 + (mag - 1) * 0.7, crowd).toFixed(2));
+  }, [zoom, crowd]);
   return null;
 }
 
@@ -929,7 +913,7 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
         }
         moved={moved.current}
       />
-      <Magnification />
+      <Magnification crowd={crowdLimit(tallestNeighbours(placed.values()))} />
     </ReactFlow>
   );
 }

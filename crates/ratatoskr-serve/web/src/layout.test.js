@@ -9,11 +9,13 @@ import {
   LOOP_BAND,
   SPAN_BAND,
   SPAN_RADIUS,
+  crowdLimit,
   fittedBounds,
   place,
   rowExtent,
   spanRiser,
   spanShelf,
+  tallestNeighbours,
 } from "./panels/layout";
 import { carryMeasurement } from "./panels/PipelineGraph";
 
@@ -287,4 +289,47 @@ test("a box that changed size does not keep the measurement of the one it replac
 
   // Nothing to carry from.
   expect(carryMeasurement(undefined, box(NODE_SIZE.height, "first")).measured).toBeUndefined();
+});
+
+test("the scrub magnification is bounded by the pair that has to share a gap", () => {
+  // Scrubbing enlarges every box that was working at that moment, centred, so two adjacent ones
+  // each reach half their own height into the gap between them. What bounds it is therefore the
+  // tallest adjacent PAIR, not the tallest box — and not a constant, once a box can grow.
+  const encroachment = (scale, a, b) => ((scale - 1) * (a + b)) / 2;
+
+  // The pin: with every box the height it is today, this is the constant it replaces.
+  const uniform = crowdLimit(2 * NODE_SIZE.height);
+  expect(uniform).toBeCloseTo(
+    Math.min(1 + (COLUMN_GAP * 0.7) / NODE_SIZE.width, 1 + (LANE_GAP * 0.7) / NODE_SIZE.height),
+    12,
+  );
+  expect(encroachment(uniform, NODE_SIZE.height, NODE_SIZE.height)).toBeLessThan(LANE_GAP);
+
+  // And the case that is not covered by a constant: a grown box beside a collapsed one.
+  for (const grown of [140, 300, 900]) {
+    const pair = grown + NODE_SIZE.height;
+    // The pair never meets, and never eats more than the sliver rule allows. It may eat less: for
+    // a modest growth the column gap is the binding half, exactly as it is today.
+    expect(encroachment(crowdLimit(pair), grown, NODE_SIZE.height)).toBeLessThan(LANE_GAP);
+    expect(encroachment(crowdLimit(pair), grown, NODE_SIZE.height)).toBeLessThan(
+      LANE_GAP * 0.7 + 1e-9,
+    );
+    // Still a magnification worth having, and never more than the columns can take.
+    expect(crowdLimit(pair)).toBeGreaterThan(1);
+    expect(crowdLimit(pair)).toBeLessThanOrEqual(1 + (COLUMN_GAP * 0.7) / NODE_SIZE.width);
+  }
+});
+
+test("the pair that bounds it is read off the boxes as placed", () => {
+  const columns = [column(0, [0]), column(1, [0, 1, 2])];
+  const heights = { s1l0: 300, s1l1: 60, s1l2: 200 };
+  const placed = place(columns, (n) => heights[n.name] ?? NODE_SIZE.height);
+
+  // 60 + 200 are adjacent and 300 + 60 are adjacent; 300 + 200 are not.
+  expect(tallestNeighbours(placed.values())).toBe(360);
+  // A lone box in its column is bounded by the column gap beside it, not by a lane gap.
+  expect(tallestNeighbours([{ x: 0, y: 0, width: NODE_SIZE.width, height: 400 }])).toBe(400);
+  expect(tallestNeighbours([])).toBe(0);
+  // Nothing placed is not a licence to magnify past what the columns allow.
+  expect(crowdLimit(0)).toBeLessThanOrEqual(1 + (COLUMN_GAP * 0.7) / NODE_SIZE.width);
 });
