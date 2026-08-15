@@ -533,7 +533,7 @@ async fn run<M>(run: AskRun<'_, M>) -> Result<String, AgentError>
 where
     M: CompletionModel + 'static,
 {
-    execution(ask_turn(run)).await
+    execution(run.node, ExecutionKind::Node, ask_turn(run)).await
 }
 
 async fn ask_turn<M>(run: AskRun<'_, M>) -> Result<String, AgentError>
@@ -2484,17 +2484,85 @@ const UNSCOPED: u64 = 0;
 /// its own run, and a shared counter needs no state on the ledger to be unique within one.
 static NEXT_CLAIM_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// What kind of thing an execution is, so a reader can tell one span from another without knowing
+/// the run's vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionKind {
+    /// One invocation of a stage: the boundary a workflow crosses, and what the graph draws.
+    Host,
+    /// One node's model turn.
+    Node,
+    /// One clarification exchange, question through answer.
+    Clarification,
+}
+
+impl ExecutionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Node => "node",
+            Self::Clarification => "clarification",
+        }
+    }
+}
+
+/// Emits `span_end` however its execution leaves — returned, errored, or dropped mid-flight when
+/// the run is cancelled.
+///
+/// A `Drop` guard rather than a line after the `.await`, because a cancelled future never reaches
+/// that line, and an execution that started and never ended is exactly what a reader cannot tell
+/// from one still running.
+struct SpanEnd {
+    span_id: SpanId,
+    name: String,
+    kind: ExecutionKind,
+}
+
+impl Drop for SpanEnd {
+    fn drop(&mut self) {
+        tracing::info!(
+            kind = "span_end",
+            span_id = %self.span_id,
+            node = %self.name,
+            execution = self.kind.as_str(),
+            "execution ended"
+        );
+    }
+}
+
 /// Run `work` as one execution, under an identity you supply.
 ///
 /// [`execution`] with the id chosen by the caller, for a test that has to be able to say what it
 /// minted.
-pub async fn execution_as<F: Future>(span_id: SpanId, work: F) -> F::Output {
+pub async fn execution_as<F: Future>(
+    span_id: SpanId,
+    name: &str,
+    kind: ExecutionKind,
+    work: F,
+) -> F::Output {
     let invocation = match EXECUTION.try_with(|enclosing| *enclosing) {
         // An execution opened inside another was invoked by it — a node's turn inside the host call
         // that drove it, a clarification answerer inside the node that asked, a subagent inside the
         // node that spawned it. This is the only place parentage comes from.
         Ok(enclosing) => enclosing.child(span_id),
         Err(_) => Invocation::root(span_id),
+    };
+    // Announced by the execution itself, not by whatever it goes on to record. An execution that
+    // writes no checkpoint — an evidence-only stage, a turn whose failure the workflow recovers
+    // from — is still an execution that happened, and a parent named by a child has to be findable
+    // whether or not it produced a row of its own.
+    tracing::info!(
+        kind = "span_start",
+        span_id = %invocation.span_id,
+        parent_span_id = invocation.parent_span_id.map(|p| p.to_string()),
+        node = %name,
+        execution = kind.as_str(),
+        "execution started"
+    );
+    let _end = SpanEnd {
+        span_id: invocation.span_id,
+        name: name.to_string(),
+        kind,
     };
     EXECUTION.scope(invocation, work).await
 }
@@ -2507,8 +2575,8 @@ pub async fn execution_as<F: Future>(span_id: SpanId, work: F) -> F::Output {
 /// its own checkpoint — so a scope-wide identity would give two different executions one span id.
 /// And a node the run drives outside every host call, such as the overseer, is an execution with no
 /// scope at all, which would leave it with no identity.
-pub async fn execution<F: Future>(work: F) -> F::Output {
-    execution_as(mint_span_id(), work).await
+pub async fn execution<F: Future>(name: &str, kind: ExecutionKind, work: F) -> F::Output {
+    execution_as(mint_span_id(), name, kind, work).await
 }
 
 /// Which execution the running future is, and what invoked it.
@@ -2554,7 +2622,7 @@ fn mint_span_id() -> SpanId {
 ///
 /// A stage that merely belongs to another node is a different case and needs none of this: it
 /// writes its own checkpoint row inside its box, so it claims its own turn under its own name.
-pub async fn claim_scope<F: Future>(work: F) -> F::Output {
+pub async fn claim_scope<F: Future>(host: &str, work: F) -> F::Output {
     // A host call is an execution as well as a claim scope: it is one invocation of a stage, which
     // is what the graph draws and what a workflow can start twice at once. The node executions it
     // drives open their own scopes inside this one and hang under it — and an aggregate record,
@@ -2562,7 +2630,7 @@ pub async fn claim_scope<F: Future>(work: F) -> F::Output {
     CLAIM_SCOPE
         .scope(
             NEXT_CLAIM_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            execution(work),
+            execution(host, ExecutionKind::Host, work),
         )
         .await
 }
@@ -2597,12 +2665,12 @@ pub struct RunLedger {
 #[derive(Debug, Clone, Default)]
 pub struct Claim {
     pub telemetry: NodeTelemetry,
-    /// The execution the first claimed turn ran as. `None` for a turn recorded outside every
-    /// execution.
+    /// The execution that ran the claimed turn.
     ///
-    /// The first, because a record may cover several turns — the halves a composite folds — and
-    /// they are separate executions under one row. The row names the one it began with; each still
-    /// has its own identity, and both hang under the same host call.
+    /// `None` when there is no single answer: a turn recorded outside every execution, a cost
+    /// transferred from another execution, or a fold of turns that ran as different executions.
+    /// Never a choice between two — a row that named one of the executions it folded would assert
+    /// that execution produced it.
     pub invocation: Option<Invocation>,
 }
 
@@ -2610,25 +2678,30 @@ impl RunLedger {
     /// Record what one node turn cost, against the claim scope the turn ran in and the execution
     /// that ran it.
     pub fn record(&self, node: &str, telemetry: NodeTelemetry) {
-        self.record_claim(
-            node,
+        self.entries.lock().expect("ledger mutex poisoned").push((
+            current_claim_scope(),
+            node.to_string(),
             Claim {
                 telemetry,
                 invocation: current_execution(),
             },
-        );
+        ));
     }
 
-    /// Re-record a claim under another name, keeping the execution that ran it.
+    /// Re-record what a turn COST under another name, without its identity.
     ///
     /// What a delegating stage does with its child's turn: the cost becomes the parent's, because
-    /// the child writes no checkpoint to claim it, but the execution that spent it is still the
-    /// child's and re-stamping it with the parent's would name a turn the parent never ran.
-    pub fn record_claim(&self, node: &str, claim: Claim) {
+    /// the child writes no checkpoint to claim it. The identity does not travel with it — the child
+    /// was its own execution, announced and ended under its own span, and stamping the parent's row
+    /// with it would name an execution that did not produce that row.
+    pub fn record_cost(&self, node: &str, telemetry: NodeTelemetry) {
         self.entries.lock().expect("ledger mutex poisoned").push((
             current_claim_scope(),
             node.to_string(),
-            claim,
+            Claim {
+                telemetry,
+                invocation: None,
+            },
         ));
     }
 
@@ -2656,6 +2729,16 @@ impl RunLedger {
             .map(|(_, _, claim)| claim)
             .reduce(|mut folded, next| {
                 folded.telemetry.fold(next.telemetry);
+                // Cost folds; identity does not. Where two executions are folded into one row, the
+                // row names neither — picking one would put a span id on a record that execution
+                // did not produce, and the folded turns are each announced under their own span
+                // anyway. The row then falls back to the host call it was written inside, which is
+                // the execution that actually produced it.
+                folded.invocation = match (folded.invocation, next.invocation) {
+                    (Some(one), Some(other)) if one != other => None,
+                    (Some(one), _) => Some(one),
+                    (None, other) => other,
+                };
                 folded
             })
     }
@@ -2813,7 +2896,12 @@ async fn run_typed_with_control<M>(
 where
     M: CompletionModel + 'static,
 {
-    execution(run_turn(model, run, provider_calls, control)).await
+    execution(
+        run.node,
+        ExecutionKind::Node,
+        run_turn(model, run, provider_calls, control),
+    )
+    .await
 }
 
 async fn run_turn<M>(
@@ -4226,7 +4314,7 @@ mod tests {
         };
 
         // One host call, two nodes.
-        let (referee, implementer) = claim_scope(async {
+        let (referee, implementer) = claim_scope("iterate", async {
             turn("referee").await;
             turn("implementer").await;
             (

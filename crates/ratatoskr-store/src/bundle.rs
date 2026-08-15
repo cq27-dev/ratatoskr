@@ -32,6 +32,40 @@ pub struct Bundle {
     pub runs: Vec<RunBundle>,
 }
 
+/// Refuse a run whose executions do not form a graph, before any of it is written.
+///
+/// One span id names one span: it is what a consumer resolves a parent against and what tells two
+/// invocations of a stage apart, so two rows claiming one id collapse two executions into one and
+/// leave the reader no way to notice. An execution invoked by itself is a cycle, and a consumer
+/// walking to a root would not terminate.
+///
+/// Checked at the boundary rather than trusted, because a bundle is the one checkpoint path whose
+/// contents this process did not produce.
+fn check_execution_graph(run_id: &str, checkpoints: &[Checkpoint]) -> Result<(), StoreError> {
+    let mut seen = std::collections::HashSet::new();
+    for checkpoint in checkpoints {
+        let Some(invocation) = checkpoint.invocation else {
+            continue;
+        };
+        if invocation.parent_span_id == Some(invocation.span_id) {
+            return Err(StoreError::BadExecutionGraph {
+                run_id: run_id.to_string(),
+                problem: format!("execution {} is its own parent", invocation.span_id),
+            });
+        }
+        if !seen.insert(invocation.span_id) {
+            return Err(StoreError::BadExecutionGraph {
+                run_id: run_id.to_string(),
+                problem: format!(
+                    "execution {} names more than one record",
+                    invocation.span_id
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The version this build writes and is willing to read.
 ///
 /// One version is one shape: a bundle claiming this version carries every field of it, so adding a
@@ -101,6 +135,7 @@ impl Store {
                 });
                 continue;
             }
+            check_execution_graph(id, &one.checkpoints)?;
             self.insert_imported_run(&one.run, &bundle.exported_by)
                 .await?;
             for c in &one.checkpoints {
@@ -175,6 +210,91 @@ mod tests {
             .unwrap();
         store.tag_run("r1", vec!["arm-a".into()]).await.unwrap();
         store
+    }
+
+    /// A bundle carrying one run with these checkpoints.
+    fn bundle_of(checkpoints: Vec<Checkpoint>) -> Bundle {
+        Bundle {
+            version: FORMAT_VERSION,
+            exported_at: "2026-08-15T00:00:00Z".into(),
+            exported_by: "test".into(),
+            runs: vec![RunBundle {
+                run: crate::Run {
+                    run_id: "imported".into(),
+                    issue_id: None,
+                    status: "converged".into(),
+                    updated_at: "2026-08-15T00:00:00Z".into(),
+                    config_json: None,
+                    graph_hash: None,
+                    repo_sha: None,
+                    image_digest: None,
+                    origin: None,
+                    shape_json: None,
+                    tags: Vec::new(),
+                },
+                checkpoints,
+                events: Vec::new(),
+            }],
+        }
+    }
+
+    fn imported_checkpoint(node: &str, invocation: ratatoskr_core::span::Invocation) -> Checkpoint {
+        Checkpoint {
+            node_name: node.into(),
+            output_json: "{}".into(),
+            created_at: "2026-08-15T00:00:00Z".into(),
+            input_json: None,
+            iteration: None,
+            invocation: Some(invocation),
+            telemetry: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bundle_whose_executions_are_not_a_graph_is_refused_before_anything_is_written() {
+        // One span id names one span: it is what a parent reference resolves against and what tells
+        // two invocations of a stage apart. Two rows claiming one id collapse two executions with
+        // nothing to notice it by, and an execution invoked by itself is a cycle a consumer walking
+        // to a root would not escape. A bundle is the one checkpoint path this process did not
+        // produce, so it is checked rather than trusted.
+        use ratatoskr_core::span::{Invocation, SpanId};
+        let shared = SpanId::parse("00000000000000a1").unwrap();
+
+        let store = Store::open_in_memory().unwrap();
+        let twice = bundle_of(vec![
+            imported_checkpoint("analyst", Invocation::root(shared)),
+            imported_checkpoint("implementer", Invocation::root(shared)),
+        ]);
+        assert!(matches!(
+            store.import(&twice).await,
+            Err(StoreError::BadExecutionGraph { .. })
+        ));
+
+        let cycle = bundle_of(vec![imported_checkpoint(
+            "analyst",
+            Invocation {
+                span_id: shared,
+                parent_span_id: Some(shared),
+            },
+        )]);
+        assert!(matches!(
+            store.import(&cycle).await,
+            Err(StoreError::BadExecutionGraph { .. })
+        ));
+
+        // Refused before anything is written: a run half-imported is worse than one refused.
+        assert!(store.run("imported").await.unwrap().is_none());
+
+        // And the shape a run actually produces goes in.
+        let parent = Invocation::root(SpanId::parse("00000000000000b2").unwrap());
+        let ok = bundle_of(vec![
+            imported_checkpoint("analyst", parent),
+            imported_checkpoint(
+                "implementer",
+                parent.child(SpanId::parse("00000000000000c3").unwrap()),
+            ),
+        ]);
+        assert_eq!(store.import(&ok).await.unwrap()[0].checkpoints, 2);
     }
 
     #[tokio::test]

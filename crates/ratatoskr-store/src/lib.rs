@@ -72,6 +72,10 @@ pub enum StoreError {
         crate::bundle::FORMAT_VERSION
     )]
     Unsupported { found: u32 },
+    /// A bundle whose executions do not form a graph: an id naming two of them, or one invoked by
+    /// itself.
+    #[error("run {run_id} in this bundle has an unusable execution graph: {problem}")]
+    BadExecutionGraph { run_id: String, problem: String },
 }
 
 pub mod auth;
@@ -450,23 +454,15 @@ impl Store {
                         created_at: row.get(2)?,
                         input_json: row.get(3)?,
                         iteration: row.get(4)?,
-                        // A row with no identity, or one whose column holds something that is not
-                        // an identity, reports none. Nothing is invented from a name here: a reader
-                        // that cannot tell two executions apart must be told that, not given a
-                        // plausible answer.
-                        invocation: row
-                            .get::<_, Option<String>>(18)?
-                            .as_deref()
-                            .and_then(ratatoskr_core::span::SpanId::parse)
-                            .map(|span_id| ratatoskr_core::span::Invocation {
-                                span_id,
-                                parent_span_id: row
-                                    .get::<_, Option<String>>(19)
-                                    .ok()
-                                    .flatten()
-                                    .as_deref()
-                                    .and_then(ratatoskr_core::span::SpanId::parse),
-                            }),
+                        // A row with no identity reports none. Nothing is invented: a reader that
+                        // cannot tell two executions apart must be told so, not given a plausible
+                        // answer.
+                        //
+                        // And a parent that is PRESENT but unreadable takes the identity down with
+                        // it. Reading it as absent would turn a nested execution whose parentage
+                        // cannot be recovered into a top-level one — a claim about the run's shape,
+                        // made out of a value nobody could parse.
+                        invocation: read_invocation(row.get(18)?, row.get(19)?),
                         telemetry: NodeTelemetry {
                             model: row.get(5)?,
                             duration_ms: row.get(6)?,
@@ -726,6 +722,28 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         // Filled by the caller when it wants them: a join on every listing would cost every reader
         // for a column most of them do not look at.
         tags: Vec::new(),
+    })
+}
+
+/// The execution a row names, from its two columns.
+///
+/// `None` unless the identity is readable and the parentage is unambiguous: absent, or present and
+/// readable. A present-but-unreadable parent invalidates the whole thing, because the alternatives
+/// are both worse — reporting it as a root asserts a shape the row does not carry, and reporting the
+/// identity without the parent hides that something was lost.
+fn read_invocation(
+    span_id: Option<String>,
+    parent_span_id: Option<String>,
+) -> Option<ratatoskr_core::span::Invocation> {
+    use ratatoskr_core::span::SpanId;
+    let span_id = SpanId::parse(span_id.as_deref()?)?;
+    let parent = match parent_span_id.as_deref() {
+        None => None,
+        Some(hex) => Some(SpanId::parse(hex)?),
+    };
+    Some(ratatoskr_core::span::Invocation {
+        span_id,
+        parent_span_id: parent,
     })
 }
 
@@ -1025,6 +1043,43 @@ mod tests {
         assert_eq!(checkpoints[1].node_name, "analyst");
         assert_eq!(checkpoints[1].output_json, r#"{"b":2}"#);
         assert!(store.checkpoints_for_run("other").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_record_whose_parent_cannot_be_read_is_not_promoted_to_a_root() {
+        // Present-but-unreadable and absent are different states, and the difference is the run's
+        // shape: absent means the run drove this execution, so reading a parent nobody can parse as
+        // absent asserts a top-level execution out of a value that was lost. The identity goes with
+        // it — reporting one without its parentage hides that anything was missing.
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_run("run-1", None, "running").await.unwrap();
+        store
+            .insert_checkpoint(CheckpointWrite {
+                run_id: "run-1",
+                node_name: "referee",
+                output_json: "{}",
+                invocation: Some(ratatoskr_core::span::Invocation::root(
+                    ratatoskr_core::span::SpanId::parse("00000000000000a1").unwrap(),
+                )),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Corrupt the parent the way a hand-edited store or a half-written value would.
+        {
+            let conn = store.conn.lock().expect("store mutex poisoned");
+            conn.execute(
+                "UPDATE checkpoints SET parent_span_id = 'not-a-span' WHERE node_name = 'referee'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let rows = store.checkpoints_for_run("run-1").await.unwrap();
+        assert_eq!(
+            rows[0].invocation, None,
+            "an unreadable parent invalidates the identity rather than becoming no parent at all"
+        );
     }
 
     #[tokio::test]
