@@ -203,6 +203,32 @@ function NodeFacts({
   );
 }
 
+/**
+ * A node update, keeping what React Flow measured on the last one.
+ *
+ * The same box in the same place with new `data` keeps its measurement: React Flow owns measurement
+ * and writes it back through `onNodesChange`, and replacing the object it is working on makes it
+ * re-measure on every render and drop the edges it cannot route until both endpoints are measured.
+ *
+ * A box that changed SIZE is not the same box: its measurement describes something that no longer
+ * exists, and React Flow would go on fitting, routing and hit-testing the size it used to be. Only
+ * the measurement is replaced. Handing back the bare node instead takes its handle bounds away with
+ * it, and a node without those reads as uninitialised — the condition the fit waits on, so the graph
+ * would never refit around the box that grew.
+ */
+export function carryMeasurement(
+  previous: PipelineNodeType | undefined,
+  next: PipelineNodeType,
+): PipelineNodeType {
+  if (!previous) return next;
+  const size = { width: next.width, height: next.height };
+  if (previous.width === size.width && previous.height === size.height) {
+    return { ...previous, ...next };
+  }
+  if (size.width === undefined || size.height === undefined) return next;
+  return { ...previous, ...next, measured: { width: size.width, height: size.height } };
+}
+
 /** Nodes grouped into their stages, in pipeline order, from what the server sent. */
 function stages(nodes: NodeView[]): NodeView[][] {
   const byStage = new Map<number, NodeView[]>();
@@ -453,14 +479,11 @@ function Magnification() {
 
 function FitToPane({
   count,
-  depth,
   reserveTop,
   reserveBottom,
   moved,
 }: {
   count: number;
-  /** How deep the layout reaches. A box growing changes no count and no pane size. */
-  depth: number;
   reserveTop: number;
   reserveBottom: number;
   moved: boolean;
@@ -471,7 +494,28 @@ function FitToPane({
   // DOM means refitting on exactly the changes it has already noticed.
   const width = useStore((s) => s.width);
   const height = useStore((s) => s.height);
+  /*
+   * How deep the graph reaches, read from the nodes React Flow has actually committed.
+   *
+   * A box growing changes neither the node count nor the pane size, so without this nothing refits
+   * and the taller graph stays fitted to the bounds it had before. Taken from the store rather than
+   * from the layout the component just computed, because that number changes a render EARLIER than
+   * the nodes do: fitting on it would fit the old boxes, and by the time the new ones land nothing
+   * has changed to fit again.
+   */
+  const depth = useStore((s) => {
+    let top = Infinity;
+    let bottom = -Infinity;
+    for (const node of s.nodeLookup.values()) {
+      const y = node.internals.positionAbsolute.y;
+      top = Math.min(top, y);
+      bottom = Math.max(bottom, y + (node.measured.height ?? 0));
+    }
+    return bottom > top ? bottom - top : 0;
+  });
   useEffect(() => {
+    // @ts-expect-error debug
+    (window.__fit ??= []).push({ depth, initialized, count, moved });
     if (moved || !initialized || count === 0 || width === 0 || height === 0) return;
     // `fitView` fits NODE bounds, and the span shelves hang above them. Padding is a fraction of
     // what is being fitted, so a short row leaves less room above it than a tall one — a
@@ -838,10 +882,8 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
 
   useEffect(() => {
     setRfNodes((prev) => {
-      const measured = new Map(prev.map((n) => [n.id, n]));
-      // Carry each node's existing measurement across a data update: it is the same box in the
-      // same place, and only `data` has changed.
-      return desiredNodes.map((n) => ({ ...measured.get(n.id), ...n }));
+      const previous = new Map(prev.map((n) => [n.id, n]));
+      return desiredNodes.map((n) => carryMeasurement(previous.get(n.id), n));
     });
   }, [desiredNodes, setRfNodes]);
 
@@ -880,7 +922,6 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
     >
       <FitToPane
         count={rfNodes.length}
-        depth={extent.bottom - extent.top}
         // What hangs off the boxes and has to be fitted with them. Both ends: the loop shelves
         // below were riding on `fitView`'s padding, and reserving only the span band above took
         // that padding away from them.

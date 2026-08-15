@@ -15,6 +15,7 @@ import {
   spanRiser,
   spanShelf,
 } from "./panels/layout";
+import { carryMeasurement } from "./panels/PipelineGraph";
 
 /**
  * The span geometry, over every shape a workflow may declare rather than the ones that happened to
@@ -159,12 +160,36 @@ test("with every box the same height, the layout is the fixed pitch it has alway
   }
 });
 
-test("a lane a column does not fill still takes its room", () => {
+test("a lane a column does not fill still takes its room, and is centred as if it were filled", () => {
   // `lane` is a declared position, not an index into whoever turned up. A hole that closed up would
   // move every box under it somewhere the workflow's layout did not ask for.
-  const placed = place([column(0, [0, 2])]);
+  //
+  // Both halves matter, and the second is the one that is easy to lose: a column reaching lane 2 is
+  // as deep as any other column reaching lane 2, so the two sit level. Charging the hole when
+  // drawing but not when measuring the column drops it half a lane below its neighbours — which is
+  // what a sparse array does, since `reduce` skips its holes and `for...of` walks them.
+  const placed = place([column(0, [0, 2]), column(1, [0, 1, 2])]);
   expect(placed.get("s0l2").y - placed.get("s0l0").y).toBe(2 * LANE_PITCH);
-  expect(placed.size).toBe(2);
+  expect(placed.get("s0l0").y).toBe(placed.get("s1l0").y);
+  expect(placed.get("s0l2").y).toBe(placed.get("s1l2").y);
+  expect(placed.size).toBe(5);
+});
+
+test("placing costs what the boxes cost, not what their lane numbers say", () => {
+  // `lane` is bounded by the run's node count and nothing else, so a recording the read gate accepts
+  // may put a single box at lane N-1 in each of N columns. Giving every lane a slot draws that in
+  // time quadratic in the node count — measured at 172ms here against 4ms for the arithmetic, and
+  // it is the node count that squares, so the gap widens with the shape.
+  const deep = 3000;
+  const columns = Array.from({ length: deep }, (_, stage) => column(stage, [deep - 1]));
+  const started = performance.now();
+  const placed = place(columns);
+  expect(performance.now() - started).toBeLessThan(60);
+
+  // And it places them where a filled column would: every box is at the same depth, so they are
+  // level, and each is as far down as its lane says.
+  expect(placed.size).toBe(deep);
+  for (const box of placed.values()) expect(box.y).toBe((deep - 1) * LANE_PITCH);
 });
 
 test("a taller box moves the lanes under it rather than drawing over them", () => {
@@ -227,4 +252,39 @@ test("the row's extent covers every box, whatever grew", () => {
     // The bands hang off these, so they have to be the boxes' own edges and not a floor.
     expect(bottom).toBe(Math.max(...boxes(placed).map((b) => b.y + b.height)));
   }
+});
+
+test("a box that changed size does not keep the measurement of the one it replaced", () => {
+  // React Flow owns measurement, so an update carries the last one across — otherwise it re-measures
+  // every render and drops the edges it cannot route yet. But a measurement of a box that no longer
+  // exists is worse than none: it is what the view is fitted to and what the edges are routed by.
+  const box = (height, data) => ({
+    id: "implementer",
+    type: "pipeline",
+    position: { x: 0, y: 0 },
+    data,
+    width: NODE_SIZE.width,
+    height,
+  });
+  const mounted = {
+    ...box(NODE_SIZE.height, "first"),
+    measured: { width: NODE_SIZE.width, height: NODE_SIZE.height },
+    internals: { handleBounds: "measured by react flow" },
+  };
+
+  // Same size, new data: everything React Flow worked out is still true.
+  const updated = carryMeasurement(mounted, box(NODE_SIZE.height, "second"));
+  expect(updated.data).toBe("second");
+  expect(updated.measured).toEqual({ width: NODE_SIZE.width, height: NODE_SIZE.height });
+  expect(updated.internals).toBe(mounted.internals);
+
+  // Grown: the measurement follows the box, and the handle bounds survive — a node without those
+  // reads as uninitialised, which is the condition the refit waits on.
+  const grown = carryMeasurement(mounted, box(NODE_SIZE.height + 160, "third"));
+  expect(grown.height).toBe(NODE_SIZE.height + 160);
+  expect(grown.measured).toEqual({ width: NODE_SIZE.width, height: NODE_SIZE.height + 160 });
+  expect(grown.internals).toBe(mounted.internals);
+
+  // Nothing to carry from.
+  expect(carryMeasurement(undefined, box(NODE_SIZE.height, "first")).measured).toBeUndefined();
 });

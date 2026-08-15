@@ -91,28 +91,45 @@ export function place(
   columns: readonly (readonly NodeView[])[],
   heightOf: (node: NodeView) => number = nodeHeight,
 ): Map<string, Bounds> {
-  // A column as its lanes are drawn: every slot up to its deepest lane, empty ones included.
-  const slots = (lanes: readonly NodeView[]) => {
-    const filled = new Array<NodeView | undefined>(
-      lanes.reduce((deepest, n) => Math.max(deepest, n.lane + 1), 0),
-    );
-    for (const n of lanes) filled[n.lane] = n;
-    return filled;
-  };
-  const depth = (lanes: readonly NodeView[]) =>
-    slots(lanes).reduce(
-      (total, n, i) => total + (n ? heightOf(n) : NODE_SIZE.height) + (i > 0 ? LANE_GAP : 0),
-      0,
-    );
-
-  const tallest = Math.max(0, ...columns.map(depth));
-  const placed = new Map<string, Bounds>();
-  for (const lanes of columns) {
-    let y = (tallest - depth(lanes)) / 2;
-    for (const n of slots(lanes)) {
-      const height = n ? heightOf(n) : NODE_SIZE.height;
-      if (n) placed.set(n.name, { x: n.stage * COLUMN_PITCH, y, width: NODE_SIZE.width, height });
+  /*
+   * One column, top to bottom: where each of its boxes sits relative to the column's own top, and
+   * how deep it reaches.
+   *
+   * The lanes it leaves empty are charged for arithmetically rather than materialised as slots.
+   * `lane` is a declared position bounded only by the run's node count, so a recording may put one
+   * box at lane N-1 in each of N columns, and a slot per lane would make drawing it quadratic in a
+   * shape the read gate accepts. It also removes a disagreement that put a column off centre: a
+   * sparse array's holes are skipped by `reduce` and visited by `for...of`, so the depth a column
+   * was centred by and the depth it was drawn at were different numbers.
+   */
+  const stack = (lanes: readonly NodeView[]) => {
+    const boxes: { node: NodeView; y: number; height: number }[] = [];
+    let y = 0;
+    let filled = 0; // the lowest lane not yet accounted for
+    for (const node of [...lanes].sort((a, b) => a.lane - b.lane)) {
+      const empty = Math.max(0, node.lane - filled);
+      y += empty * (NODE_SIZE.height + LANE_GAP);
+      const height = heightOf(node);
+      boxes.push({ node, y, height });
       y += height + LANE_GAP;
+      filled = node.lane + 1;
+    }
+    // `y` has a trailing gap on it — a column is as deep as its last box, not the room after it.
+    return { boxes, depth: Math.max(0, y - LANE_GAP) };
+  };
+
+  const stacked = columns.map(stack);
+  const tallest = Math.max(0, ...stacked.map((column) => column.depth));
+  const placed = new Map<string, Bounds>();
+  for (const column of stacked) {
+    const top = (tallest - column.depth) / 2;
+    for (const { node, y, height } of column.boxes) {
+      placed.set(node.name, {
+        x: node.stage * COLUMN_PITCH,
+        y: top + y,
+        width: NODE_SIZE.width,
+        height,
+      });
     }
   }
   return placed;
