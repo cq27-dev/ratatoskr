@@ -527,7 +527,16 @@ struct AskRun<'a, M> {
 }
 
 /// Provider-agnostic core: build the agent with the MCP tools bound, then prompt.
+/// One ask execution — the same boundary as a node's turn, and the one that most needs a parent:
+/// a clarification answerer has no place in the pipeline shape at all.
 async fn run<M>(run: AskRun<'_, M>) -> Result<String, AgentError>
+where
+    M: CompletionModel + 'static,
+{
+    execution(ask_turn(run)).await
+}
+
+async fn ask_turn<M>(run: AskRun<'_, M>) -> Result<String, AgentError>
 where
     M: CompletionModel + 'static,
 {
@@ -2462,22 +2471,52 @@ async fn park(controller: &Arc<dyn Controller>, node: &str) -> Vec<String> {
 
 tokio::task_local! {
     /// The claim scope the running future belongs to; see [`claim_scope`].
-    static CLAIM_SCOPE: Invocation;
+    static CLAIM_SCOPE: u64;
+    /// The execution the running future belongs to; see [`execution`].
+    static EXECUTION: Invocation;
 }
 
-/// Run `work` as one claim scope, under an identity you supply.
+/// The scope of a turn recorded with no scope open — the sequential paths that run outside a
+/// workflow host, such as stage selection before a workflow exists.
+const UNSCOPED: u64 = 0;
+
+/// Scope ids are minted process-wide rather than per ledger: a claim only ever compares ids from
+/// its own run, and a shared counter needs no state on the ledger to be unique within one.
+static NEXT_CLAIM_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Run `work` as one execution, under an identity you supply.
 ///
-/// [`claim_scope`] with the id chosen by the caller, for a test that has to be able to say what it
-/// minted. Production mints at the boundary rather than carrying an id through the JS host call.
-pub async fn claim_scope_as<F: Future>(span_id: SpanId, work: F) -> F::Output {
-    let invocation = match CLAIM_SCOPE.try_with(|enclosing| *enclosing) {
-        // A scope opened inside another is an execution the enclosing one invoked — the shape a
-        // node's subagents and its clarification answerer have, and the only way a record of one
-        // can say where it belongs.
+/// [`execution`] with the id chosen by the caller, for a test that has to be able to say what it
+/// minted.
+pub async fn execution_as<F: Future>(span_id: SpanId, work: F) -> F::Output {
+    let invocation = match EXECUTION.try_with(|enclosing| *enclosing) {
+        // An execution opened inside another was invoked by it — a node's turn inside the host call
+        // that drove it, a clarification answerer inside the node that asked, a subagent inside the
+        // node that spawned it. This is the only place parentage comes from.
         Ok(enclosing) => enclosing.child(span_id),
         Err(_) => Invocation::root(span_id),
     };
-    CLAIM_SCOPE.scope(invocation, work).await
+    EXECUTION.scope(invocation, work).await
+}
+
+/// Run `work` as one execution: everything it records names this identity, and everything it
+/// invokes names this one as its parent.
+///
+/// Distinct from [`claim_scope`], which is about *cost*. A host call is one claim scope and may hold
+/// several executions — `iterate` runs the referee and then the implementer, each its own node with
+/// its own checkpoint — so a scope-wide identity would give two different executions one span id.
+/// And a node the run drives outside every host call, such as the overseer, is an execution with no
+/// scope at all, which would leave it with no identity.
+pub async fn execution<F: Future>(work: F) -> F::Output {
+    execution_as(mint_span_id(), work).await
+}
+
+/// Which execution the running future is, and what invoked it.
+///
+/// `None` outside every execution, which is the truth about a record written there rather than a gap
+/// to fill with a plausible id.
+pub fn current_execution() -> Option<Invocation> {
+    EXECUTION.try_with(|invocation| *invocation).ok()
 }
 
 /// A fresh span id.
@@ -2516,22 +2555,20 @@ fn mint_span_id() -> SpanId {
 /// A stage that merely belongs to another node is a different case and needs none of this: it
 /// writes its own checkpoint row inside its box, so it claims its own turn under its own name.
 pub async fn claim_scope<F: Future>(work: F) -> F::Output {
-    claim_scope_as(mint_span_id(), work).await
+    // A host call is an execution as well as a claim scope: it is one invocation of a stage, which
+    // is what the graph draws and what a workflow can start twice at once. The node executions it
+    // drives open their own scopes inside this one and hang under it — and an aggregate record,
+    // which covers no turn of its own, names this one, because the host call is what produced it.
+    CLAIM_SCOPE
+        .scope(
+            NEXT_CLAIM_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            execution(work),
+        )
+        .await
 }
 
-/// Which execution the running future belongs to, and what invoked it.
-///
-/// `None` outside every scope — the sequential paths that run before a workflow exists, such as
-/// stage selection. A record written there names no execution, which is the truth about it and not
-/// a gap to fill with a plausible id.
-pub fn current_invocation() -> Option<Invocation> {
-    CLAIM_SCOPE.try_with(|invocation| *invocation).ok()
-}
-
-/// The identity a claim is keyed on. `None` outside every scope, which is its own key: turns
-/// recorded outside a scope are claimed by a checkpoint written outside one.
-fn current_claim_scope() -> Option<SpanId> {
-    current_invocation().map(|invocation| invocation.span_id)
+fn current_claim_scope() -> u64 {
+    CLAIM_SCOPE.try_with(|scope| *scope).unwrap_or(UNSCOPED)
 }
 
 /// Where a run's node turns report what they cost.
@@ -2547,19 +2584,51 @@ fn current_claim_scope() -> Option<SpanId> {
 /// implementer's, inside a single `iterate` — from claiming each other's cost.
 #[derive(Default)]
 pub struct RunLedger {
-    entries: Mutex<Vec<(Option<SpanId>, String, NodeTelemetry)>>,
+    entries: Mutex<Vec<(u64, String, Claim)>>,
     /// Local continuation belongs to a run, just like the telemetry beside it. Keeping it here
     /// lets rebuilt node values re-enter without every node type growing its own session field.
     compacted_sessions: Mutex<HashMap<String, CompactedSession>>,
 }
 
+/// What a checkpoint takes from the ledger: what the turns cost, and which execution ran them.
+///
+/// Together because they answer about the same turns. A checkpoint that claimed one node's cost and
+/// named another's execution would be worse than one that named none.
+#[derive(Debug, Clone, Default)]
+pub struct Claim {
+    pub telemetry: NodeTelemetry,
+    /// The execution the first claimed turn ran as. `None` for a turn recorded outside every
+    /// execution.
+    ///
+    /// The first, because a record may cover several turns — the halves a composite folds — and
+    /// they are separate executions under one row. The row names the one it began with; each still
+    /// has its own identity, and both hang under the same host call.
+    pub invocation: Option<Invocation>,
+}
+
 impl RunLedger {
-    /// Record what one node turn cost, against the claim scope the turn ran in.
+    /// Record what one node turn cost, against the claim scope the turn ran in and the execution
+    /// that ran it.
     pub fn record(&self, node: &str, telemetry: NodeTelemetry) {
+        self.record_claim(
+            node,
+            Claim {
+                telemetry,
+                invocation: current_execution(),
+            },
+        );
+    }
+
+    /// Re-record a claim under another name, keeping the execution that ran it.
+    ///
+    /// What a delegating stage does with its child's turn: the cost becomes the parent's, because
+    /// the child writes no checkpoint to claim it, but the execution that spent it is still the
+    /// child's and re-stamping it with the parent's would name a turn the parent never ran.
+    pub fn record_claim(&self, node: &str, claim: Claim) {
         self.entries.lock().expect("ledger mutex poisoned").push((
             current_claim_scope(),
             node.to_string(),
-            telemetry,
+            claim,
         ));
     }
 
@@ -2575,7 +2644,7 @@ impl RunLedger {
     /// Scoped rather than name-wide, because two invocations of one stage run under one name: a
     /// claim that took every entry under it charged the first checkpoint for both turns and left
     /// the second reporting nothing.
-    pub fn take(&self, node: &str) -> Option<NodeTelemetry> {
+    pub fn take(&self, node: &str) -> Option<Claim> {
         let scope = current_claim_scope();
         let mut entries = self.entries.lock().expect("ledger mutex poisoned");
         let (claimed, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *entries)
@@ -2584,9 +2653,9 @@ impl RunLedger {
         *entries = rest;
         claimed
             .into_iter()
-            .map(|(_, _, telemetry)| telemetry)
+            .map(|(_, _, claim)| claim)
             .reduce(|mut folded, next| {
-                folded.fold(next);
+                folded.telemetry.fold(next.telemetry);
                 folded
             })
     }
@@ -2725,7 +2794,29 @@ where
     run_typed_with_control(model, run, provider_calls, CONTROL.get().cloned()).await
 }
 
+/// One node execution: its turn, its identity, and everything it invokes from inside itself.
+///
+/// The identity is minted HERE rather than at the host call around it, because a host call may run
+/// several nodes — `iterate` runs the referee and then the implementer, each its own node with its
+/// own checkpoint — and a scope-wide id would give two different executions one span id. A node the
+/// run drives outside every host call, the overseer and the publisher and the bookkeeper, is an
+/// execution all the same and gets one here too.
+///
+/// What this node invokes from inside its turn — a clarification answerer today, a subagent later —
+/// opens its own execution inside this one, and is its child without being told.
 async fn run_typed_with_control<M>(
+    model: M,
+    run: NodeRun<'_>,
+    provider_calls: ProviderCallQueue,
+    control: Option<Arc<dyn Controller>>,
+) -> Result<String, AgentError>
+where
+    M: CompletionModel + 'static,
+{
+    execution(run_turn(model, run, provider_calls, control)).await
+}
+
+async fn run_turn<M>(
     model: M,
     run: NodeRun<'_>,
     provider_calls: ProviderCallQueue,
@@ -2896,15 +2987,15 @@ where
         "gen_ai.operation.name" = "invoke_agent",
         "gen_ai.agent.name" = node,
         "gen_ai.request.model" = %model_name,
-        span_id = current_invocation().map(|i| i.span_id.to_string()),
-        parent_span_id = current_invocation()
+        span_id = current_execution().map(|i| i.span_id.to_string()),
+        parent_span_id = current_execution()
             .and_then(|i| i.parent_span_id)
             .map(|p| p.to_string()),
     );
     // Announced at the start, because a checkpoint only exists once the node has finished — and
     // the moment a reader most wants to know what a node is running on is while it is still
     // running. The facts here are the configured ones; cost arrives with the checkpoint.
-    let invocation = current_invocation();
+    let invocation = current_execution();
     tracing::info!(
         kind = "node_start",
         node,
@@ -4083,6 +4174,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_node_turn_is_its_own_execution_under_the_host_call_that_drove_it() {
+        // The two shapes a run actually makes, both of which a host-call-wide identity gets wrong.
+        //
+        // `iterate` is ONE host call that runs the referee and then the implementer — two nodes,
+        // two checkpoints — so an identity taken from the scope would put one span id on two
+        // different executions. And the overseer, the publisher and the bookkeeper run outside
+        // every host call, so an identity that only exists inside one would leave them without.
+        let route = ModelRoute {
+            provider: "test".to_string(),
+            model: "test-model".to_string(),
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        };
+        let ledger = Arc::new(RunLedger::default());
+        let turn = async |node: &'static str| {
+            run_typed_with_control(
+                EmptyThenAnswer {
+                    attempts: Arc::new(AtomicU64::new(1)),
+                    provider_calls: None,
+                },
+                NodeRun {
+                    node,
+                    controlled_as: None,
+                    route: &route,
+                    preamble: "Answer.",
+                    question: "Answer.",
+                    tools: ToolSet::default(),
+                    output_schema: schemars::schema_for!(String),
+                    policy: None,
+                    max_turns: Some(2),
+                    clarifier: None,
+                    observer: None,
+                    skills: Vec::new(),
+                    files: None,
+                    rag_rat_worktree: None,
+                    shell: None,
+                    push: None,
+                    conversation: None,
+                    ledger: Some(Arc::clone(&ledger)),
+                    produces: None,
+                },
+                ProviderCallQueue::default(),
+                None,
+            )
+            .await
+            .expect("the mock answers")
+        };
+
+        // One host call, two nodes.
+        let (referee, implementer) = claim_scope(async {
+            turn("referee").await;
+            turn("implementer").await;
+            (
+                ledger.take("referee").expect("the referee's turn"),
+                ledger.take("implementer").expect("the implementer's turn"),
+            )
+        })
+        .await;
+        let referee = referee.invocation.expect("the referee names its execution");
+        let implementer = implementer
+            .invocation
+            .expect("the implementer names its own");
+        assert_ne!(
+            referee.span_id, implementer.span_id,
+            "two nodes in one host call are two executions, and a span id names one span"
+        );
+        assert_eq!(
+            referee.parent_span_id, implementer.parent_span_id,
+            "both were invoked by the same host call"
+        );
+        assert!(
+            referee.parent_span_id.is_some(),
+            "and they say which one, rather than reading as run-driven"
+        );
+
+        // A node the run drives directly, with no host call around it.
+        turn("overseer").await;
+        let overseer = ledger
+            .take("overseer")
+            .expect("the overseer's turn")
+            .invocation
+            .expect("a node outside every host call is still an execution");
+        assert_eq!(overseer.parent_span_id, None, "the run is the trace");
+        assert_ne!(overseer.span_id, referee.span_id);
+    }
+
+    #[tokio::test]
     async fn a_restarted_node_can_correct_its_schema_again() {
         #[derive(serde::Deserialize, schemars::JsonSchema)]
         struct Done {
@@ -4496,15 +4677,34 @@ mod tests {
         // checkpoint must claim the turn that preceded it, not the newest one.
         ledger.record("implementer", cost(1));
         ledger.record("redteam", cost(9));
-        assert_eq!(ledger.take("implementer").unwrap().usage.input_tokens, 1);
+        assert_eq!(
+            ledger
+                .take("implementer")
+                .unwrap()
+                .telemetry
+                .usage
+                .input_tokens,
+            1
+        );
         ledger.record("implementer", cost(2));
-        assert_eq!(ledger.take("implementer").unwrap().usage.input_tokens, 2);
+        assert_eq!(
+            ledger
+                .take("implementer")
+                .unwrap()
+                .telemetry
+                .usage
+                .input_tokens,
+            2
+        );
         assert!(
             ledger.take("implementer").is_none(),
             "a claimed entry is not handed out twice"
         );
         // A different node's entry is untouched by the drain of another's.
-        assert_eq!(ledger.take("redteam").unwrap().usage.input_tokens, 9);
+        assert_eq!(
+            ledger.take("redteam").unwrap().telemetry.usage.input_tokens,
+            9
+        );
         // A node that never ran a model turn reports nothing rather than someone else's numbers.
         assert!(ledger.take("bookkeeper").is_none());
     }
@@ -4519,7 +4719,10 @@ mod tests {
         ledger.record("redteam", cost(5));
         ledger.record("implementer", cost(1));
 
-        assert_eq!(ledger.take("redteam").unwrap().usage.input_tokens, 14);
+        assert_eq!(
+            ledger.take("redteam").unwrap().telemetry.usage.input_tokens,
+            14
+        );
         assert!(ledger.take("redteam").is_none());
         assert_eq!(
             ledger.unclaimed(),
@@ -4924,7 +5127,10 @@ mod tests {
         .await
         .expect("the live run should complete");
 
-        let telemetry = ledger.take("usagetest").expect("the turn was recorded");
+        let telemetry = ledger
+            .take("usagetest")
+            .expect("the turn was recorded")
+            .telemetry;
         let parsed: Answer = serde_json::from_str(
             answer
                 .find('{')

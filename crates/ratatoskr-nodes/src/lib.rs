@@ -185,7 +185,8 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
     let input_json = r.input;
     // Claimed rather than borrowed: the ledger holds one entry per model turn, and taking it here
     // is what keeps the converge loop's repeated implementer turns matched to their own rows.
-    let telemetry = r.ledger.and_then(|l| l.take(r.node)).unwrap_or_default();
+    let claimed = r.ledger.and_then(|l| l.take(r.node)).unwrap_or_default();
+    let telemetry = claimed.telemetry;
     // Only for a node that actually ran a model — one with no `model` reported no usage because it
     // had none, which is ordinary.
     if telemetry.model.is_some() {
@@ -211,7 +212,15 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
     // deriving a past moment from it shows final numbers against a historical position. Everything
     // the row records, the event has to be able to prove.
     let logged = telemetry.clone();
-    let invocation = ratatoskr_agent::current_invocation();
+    // The execution that ran the turns this row covers — taken with the cost, so the identity on a
+    // row and the cost on it are the same execution's rather than two lookups agreeing.
+    //
+    // A row that covers no turn has none to take from, and falls back to the execution it is being
+    // written inside: an aggregate an operation host writes belongs to that host call, and the
+    // run's own `issue` row, written before any execution exists, belongs to nothing.
+    let invocation = claimed
+        .invocation
+        .or_else(ratatoskr_agent::current_execution);
     r.store
         .insert_checkpoint(ratatoskr_store::CheckpointWrite {
             run_id: r.run_id,
@@ -1136,40 +1145,50 @@ mod checkpoint_event_tests {
         // invocations and nothing on them said which. A nested execution had it worse: no place in
         // the shape at all, and no way to say whose it was.
         //
-        // The identity comes from the host call the record is written inside, which is the same
-        // boundary the turn was claimed against — so the cost on a row and the identity on it are
-        // the same invocation's by construction rather than by agreement.
+        // This is the persistence half: the shapes a run makes — a host call that runs TWO nodes, a
+        // node the run drives with no host call at all, one stage invoked twice at once — reach the
+        // row as distinct identities. That each node TURN opens its own execution, which is what
+        // produces those shapes in a run, is pinned where the turn is: see
+        // `each_node_turn_is_its_own_execution_under_the_host_call_that_drove_it`.
         let store = ratatoskr_store::Store::open_in_memory().expect("in-memory store");
         store.upsert_run("r1", None, "running").await.expect("run");
         let ledger = std::sync::Arc::new(ratatoskr_agent::RunLedger::default());
-        let write = async |node: &'static str| {
-            super::record(super::Record {
-                store: &store,
-                run_id: "r1",
-                node,
-                output: &serde_json::json!({ "ok": true }),
-                input: None,
-                iteration: None,
-                ledger: Some(&ledger),
+        // A node execution: a turn recorded under its own execution, then its checkpoint. This is
+        // what `run_structured` wraps, and the identity comes from that wrapping.
+        let node = async |name: &'static str| {
+            ratatoskr_agent::execution(async {
+                ledger.record(name, ratatoskr_core::NodeTelemetry::default());
+                super::record(super::Record {
+                    store: &store,
+                    run_id: "r1",
+                    node: name,
+                    output: &serde_json::json!({ "ok": true }),
+                    input: None,
+                    iteration: None,
+                    ledger: Some(&ledger),
+                })
+                .await
+                .expect("the checkpoint to be written");
             })
             .await
-            .expect("the checkpoint to be written");
         };
 
-        // A stage the run drove, and an execution invoked from inside it.
+        // `iterate`: ONE host call, two node executions, two checkpoints. The claim scope cannot be
+        // the identity here — it would give the referee and the implementer the same span id.
         ratatoskr_agent::claim_scope(async {
-            write("implementer").await;
-            ratatoskr_agent::claim_scope(write("referee")).await;
+            node("referee").await;
+            node("implementer").await;
         })
         .await;
-        // Twice more, concurrently, under ONE name: the shape a workflow makes with
-        // `Promise.all([probe(a), probe(b)])`, and the one a name cannot describe.
+        // The overseer, the publisher and the bookkeeper run outside every host call. They are
+        // executions all the same, and an identity that came from the host call would leave them
+        // with none.
+        node("overseer").await;
+        // One stage invoked twice at once — `Promise.all([probe(a), probe(b)])`.
         tokio::join!(
-            ratatoskr_agent::claim_scope(write("probe")),
-            ratatoskr_agent::claim_scope(write("probe")),
+            ratatoskr_agent::claim_scope(node("probe")),
+            ratatoskr_agent::claim_scope(node("probe")),
         );
-        // And a record written outside every host call — stage selection, before a workflow exists.
-        write("issue").await;
 
         let rows = store.checkpoints_for_run("r1").await.expect("rows");
         let of = |name: &str| {
@@ -1177,18 +1196,26 @@ mod checkpoint_event_tests {
                 .find(|c| c.node_name == name)
                 .unwrap_or_else(|| panic!("a {name} row"))
                 .invocation
+                .unwrap_or_else(|| panic!("{name} names its execution"))
         };
-        let implementer = of("implementer").expect("a stage the run drove has an identity");
-        assert_eq!(
-            implementer.parent_span_id, None,
-            "the run is the trace, not a span: a stage it drove has no parent"
+        assert_ne!(
+            of("referee").span_id,
+            of("implementer").span_id,
+            "two nodes inside one host call are two executions"
         );
         assert_eq!(
-            of("referee")
-                .expect("a nested execution has one too")
-                .parent_span_id,
-            Some(implementer.span_id),
-            "an execution invoked from inside another names it"
+            of("referee").parent_span_id,
+            of("implementer").parent_span_id,
+            "and both hang under the host call that drove them"
+        );
+        assert!(
+            of("referee").parent_span_id.is_some(),
+            "a node driven by a host call names it"
+        );
+        assert_eq!(
+            of("overseer").parent_span_id,
+            None,
+            "a node the run drives directly has an identity and no parent"
         );
 
         let probes: Vec<_> = rows
@@ -1202,11 +1229,13 @@ mod checkpoint_event_tests {
             "two invocations of one stage are two executions, however alike their rows look"
         );
 
-        assert_eq!(
-            of("issue"),
-            None,
-            "a record written outside every host call names no execution, and must not invent one"
-        );
+        // Every identity in the run is distinct: a span id names one span, and a reader resolving
+        // "which execution wrote this" must never land on two.
+        let ids: std::collections::HashSet<_> = rows
+            .iter()
+            .filter_map(|c| c.invocation.map(|i| i.span_id))
+            .collect();
+        assert_eq!(ids.len(), rows.len(), "{rows:#?}");
     }
 
     #[tokio::test]

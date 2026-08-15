@@ -2265,7 +2265,7 @@ impl StageExecutor {
             // its cost under the parent, the same as any other invocation that ran a turn and never
             // reached its checkpoint.
             if let Some(spent) = self.ctx.ledger.take(&child_id) {
-                self.ctx.ledger.record(&stage.id, spent);
+                self.ctx.ledger.record_claim(&stage.id, spent);
             }
             let child_output: serde_json::Value =
                 serde_json::from_str(&child?).map_err(|e| e.to_string())?;
