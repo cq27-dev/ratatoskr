@@ -6,6 +6,7 @@ import {
   Position,
   ReactFlow,
   useEdgesState,
+  getNodesBounds,
   useNodesInitialized,
   useNodesState,
   useReactFlow,
@@ -455,17 +456,46 @@ function Magnification() {
   return null;
 }
 
-function FitToPane({ count, moved }: { count: number; moved: boolean }) {
+function FitToPane({
+  count,
+  reserveTop,
+  moved,
+}: {
+  count: number;
+  reserveTop: number;
+  moved: boolean;
+}) {
   const initialized = useNodesInitialized();
-  const { fitView } = useReactFlow();
+  const { fitView, fitBounds, getNodes } = useReactFlow();
   // React Flow measures its own pane; taking the size from its store rather than observing the
   // DOM means refitting on exactly the changes it has already noticed.
   const width = useStore((s) => s.width);
   const height = useStore((s) => s.height);
   useEffect(() => {
     if (moved || !initialized || count === 0 || width === 0 || height === 0) return;
+    // `fitView` fits NODE bounds, and the span shelves hang above them. Padding is a fraction of
+    // what is being fitted, so a short row leaves less room above it than a tall one — a
+    // three-column graph fits with about 40px of headroom while the band wants 93, and the shelves
+    // are clipped until someone pans. Worse, adding a span changes no node, so nothing refits.
+    //
+    // Fitting explicit bounds says what the graph actually occupies. The loop shelves below have
+    // always ridden on padding and still do: they hang under the deepest lane, which grows with the
+    // layout the padding is measured from.
+    if (reserveTop > 0) {
+      const bounds = getNodesBounds(getNodes());
+      void fitBounds(
+        {
+          x: bounds.x,
+          y: bounds.y - reserveTop,
+          width: bounds.width,
+          height: bounds.height + reserveTop,
+        },
+        { padding: 0.15 },
+      );
+      return;
+    }
     void fitView({ padding: 0.3 });
-  }, [initialized, count, width, height, moved, fitView]);
+  }, [initialized, count, width, height, moved, reserveTop, fitView, fitBounds, getNodes]);
   return null;
 }
 
@@ -490,6 +520,16 @@ type SpanEdgeType = Edge<SpanData, "span">;
  * Above the row rather than below because the band underneath is the loop shelves', and an edge
  * sharing their space reads as one of them.
  */
+/**
+ * The corner radius a span turns on, and the clearance its risers need at both ends of the gap.
+ *
+ * A riser closer to its box than this puts the corner's control point BEHIND the handle — the path
+ * then enters the node it just left and doubles back out. Named here because the geometry and the
+ * distribution have to agree about it: eight lanes across a 96px gap put risers 10.7px out, inside
+ * a 14px corner.
+ */
+const SPAN_RADIUS = 14;
+
 function SpanEdge({
   id,
   sourceX,
@@ -501,8 +541,7 @@ function SpanEdge({
   style,
 }: EdgeProps<SpanEdgeType>) {
   const { shelfY, takeoff, landing } = data ?? { shelfY: sourceY, takeoff: 0, landing: 0 };
-  // Matches the loop shelves', which match the stage edges' rounding.
-  const r = 14;
+  const r = SPAN_RADIUS;
   // A span runs forwards, so the target is normally to the right — but a workflow declares its own
   // column order, and a hardcoded direction would turn the corners inside out.
   const dir = targetX >= sourceX ? 1 : -1;
@@ -692,7 +731,11 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
     const riser = (node: NodeView) => {
       const lanes = band.get(node.stage) ?? [node];
       const k = lanes.findIndex((lane) => lane.name === node.name);
-      return (COLUMN_GAP * (Math.max(0, k) + 1)) / (lanes.length + 1);
+      // Across the gap MINUS a corner's clearance at each end. A riser nearer its box than the
+      // radius puts the turn's control point behind the handle, and the path enters the node it
+      // just left before doubling back out.
+      const usable = Math.max(0, COLUMN_GAP - 2 * SPAN_RADIUS);
+      return SPAN_RADIUS + (usable * (Math.max(0, k) + 1)) / (lanes.length + 1);
     };
     spans.forEach(({ from, to }, i) => {
       const source = byName.get(from);
@@ -827,7 +870,12 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
       maxZoom={1.6}
       colorMode="dark"
     >
-      <FitToPane count={rfNodes.length} moved={moved.current} />
+      <FitToPane
+        count={rfNodes.length}
+        // What hangs above the boxes and has to be fitted with them.
+        reserveTop={rfEdges.some((e) => e.type === "span") ? SPAN_BAND : 0}
+        moved={moved.current}
+      />
       <Magnification />
     </ReactFlow>
   );
