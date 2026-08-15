@@ -2,6 +2,15 @@
 resolver = "3"
 members = ["crates/*"]
 
+# Debug info is what makes a build of this workspace expensive to compile and link, not the code:
+# `nodes/workflow.rs` alone is half a megabyte, and a crate is one compilation unit. Line tables keep
+# what a backtrace is read for — file and line — and drop the rest, which is variable and type
+# description no panic message quotes. Unpacked leaves it in object files rather than making the
+# linker gather it, which is where the peak was.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
