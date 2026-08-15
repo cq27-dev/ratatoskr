@@ -54,12 +54,98 @@ export const SPAN_BAND = 3 * LOOP_SHELF_STEP;
  */
 export const SPAN_RADIUS = 14;
 
-/** Where a box sits, in the column its stage names and the lane within it. */
-export function position(node: NodeView, lanesInStage: number, maxLanes: number) {
-  const offset = (maxLanes - lanesInStage) / 2;
+/**
+ * How tall a box is drawn.
+ *
+ * The one place a height is decided, because every vertical number in the layout is stacked out of
+ * it: where the lanes below it sit, how deep the row reaches, where the shelves hang, what the view
+ * has to fit. A box that grows — a node showing the subagents it spawned — grows here, and the rest
+ * follows without a second constant to keep in step.
+ *
+ * Declared rather than measured. React Flow keeps a node hidden until a ResizeObserver reports its
+ * size, so measuring makes whether the graph appears at all depend on that callback firing; and a
+ * box's contents are known before it is drawn, so there is nothing to learn by asking the DOM.
+ */
+export function nodeHeight(_node: NodeView): number {
+  return NODE_SIZE.height;
+}
+
+/** A rectangle, in the flow's own coordinates. */
+export type Bounds = { x: number; y: number; width: number; height: number };
+
+/**
+ * Where every box goes: columns left to right by stage, lanes stacked down by their own heights.
+ *
+ * Stacked rather than multiplied by a fixed pitch, so one box being taller than its siblings moves
+ * the lanes under it instead of drawing over them. With every box the same height this is exactly a
+ * constant pitch — which is what `layout.test.js` pins, since that is the layout in use today.
+ *
+ * A lane the column does not fill still takes a collapsed box's worth of room: `lane` is a declared
+ * position, a workflow may leave a hole in one, and a hole that closed up would move every box under
+ * it somewhere its layout did not ask for.
+ *
+ * Each column is centred against the tallest, so a fork sits either side of the row its neighbours
+ * are on.
+ */
+export function place(
+  columns: readonly (readonly NodeView[])[],
+  heightOf: (node: NodeView) => number = nodeHeight,
+): Map<string, Bounds> {
+  /*
+   * One column, top to bottom: where each of its boxes sits relative to the column's own top, and
+   * how deep it reaches.
+   *
+   * The lanes it leaves empty are charged for arithmetically rather than materialised as slots.
+   * `lane` is a declared position bounded only by the run's node count, so a recording may put one
+   * box at lane N-1 in each of N columns, and a slot per lane would make drawing it quadratic in a
+   * shape the read gate accepts. It also removes a disagreement that put a column off centre: a
+   * sparse array's holes are skipped by `reduce` and visited by `for...of`, so the depth a column
+   * was centred by and the depth it was drawn at were different numbers.
+   */
+  const stack = (lanes: readonly NodeView[]) => {
+    const boxes: { node: NodeView; y: number; height: number }[] = [];
+    let y = 0;
+    let filled = 0; // the lowest lane not yet accounted for
+    for (const node of [...lanes].sort((a, b) => a.lane - b.lane)) {
+      const empty = Math.max(0, node.lane - filled);
+      y += empty * (NODE_SIZE.height + LANE_GAP);
+      const height = heightOf(node);
+      boxes.push({ node, y, height });
+      y += height + LANE_GAP;
+      filled = node.lane + 1;
+    }
+    // `y` has a trailing gap on it — a column is as deep as its last box, not the room after it.
+    return { boxes, depth: Math.max(0, y - LANE_GAP) };
+  };
+
+  const stacked = columns.map(stack);
+  const tallest = Math.max(0, ...stacked.map((column) => column.depth));
+  const placed = new Map<string, Bounds>();
+  for (const column of stacked) {
+    const top = (tallest - column.depth) / 2;
+    for (const { node, y, height } of column.boxes) {
+      placed.set(node.name, {
+        x: node.stage * COLUMN_PITCH,
+        y: top + y,
+        width: NODE_SIZE.width,
+        height,
+      });
+    }
+  }
+  return placed;
+}
+
+/**
+ * How far the boxes reach up and down — what the shelves hang off and the view has to fit.
+ *
+ * Read off the placements rather than derived from the lane count and a fixed height: a row is only
+ * as deep as the boxes actually in it, and one of them growing has to move what hangs under it.
+ */
+export function rowExtent(placed: Iterable<Bounds>): { top: number; bottom: number } {
+  const boxes = [...placed];
   return {
-    x: node.stage * COLUMN_PITCH,
-    y: (node.lane + offset) * LANE_PITCH,
+    top: Math.min(0, ...boxes.map((b) => b.y)),
+    bottom: Math.max(0, ...boxes.map((b) => b.y + b.height)),
   };
 }
 
@@ -87,9 +173,6 @@ export function spanShelf(i: number, count: number, rowTop: number): number {
   return rowTop - (SPAN_BAND * (i + 1)) / (Math.max(1, count) + 1);
 }
 
-/** A rectangle, in the flow's own coordinates. */
-export type Bounds = { x: number; y: number; width: number; height: number };
-
 /**
  * The rectangle a fit has to cover: the boxes, plus whatever hangs off them.
  *
@@ -108,4 +191,60 @@ export function fittedBounds(nodes: Bounds, above: number, below: number): Bound
     width: nodes.width,
     height: nodes.height + above + below,
   };
+}
+
+/**
+ * The largest pair of boxes that sit next to each other in a column, added together.
+ *
+ * What the scrub magnification is bounded by: two neighbours both growing share the gap between
+ * them, so what matters is the tallest adjacent pair rather than the tallest box. Boxes with an
+ * empty lane between them are counted as neighbours too, which only over-reserves — they have that
+ * lane's room as well.
+ *
+ * A box with no box under or over it is in no pair and contributes nothing, however tall it is:
+ * there is no lane gap for it to grow into, and counting it against the lane bound holds a lone
+ * grown node down to a magnification it never needed. Zero when no column holds two, which leaves
+ * `crowdLimit` to the column gap.
+ */
+export function tallestNeighbours(placed: Iterable<Bounds>): number {
+  const columns = new Map<number, Bounds[]>();
+  for (const box of placed) {
+    // Appended, not rebuilt: a spread here re-copies the column for every box in it, which is
+    // quadratic in a column the read gate is happy to accept.
+    const column = columns.get(box.x);
+    if (column) column.push(box);
+    else columns.set(box.x, [box]);
+  }
+  let tallest = 0;
+  for (const column of columns.values()) {
+    const heights = column.sort((a, b) => a.y - b.y).map((box) => box.height);
+    for (let i = 1; i < heights.length; i += 1) {
+      tallest = Math.max(tallest, (heights[i - 1] ?? 0) + (heights[i] ?? 0));
+    }
+  }
+  return tallest;
+}
+
+/**
+ * The most a node can grow while its neighbours grow too, before they touch.
+ *
+ * Hovering does not need this: it enlarges one box and lifts it above the others, so covering a
+ * neighbour is the point. Scrubbing enlarges every node that was working at that moment, and two of
+ * those can be adjacent — with no one on top, they have to fit. Growth is centred, so a pair reaches
+ * half its own added height into the gap between them, and `0.7` of the gap leaves a visible sliver
+ * rather than letting them meet edge to edge.
+ *
+ * Taken from the heights actually placed rather than from `NODE_SIZE`, because the pair is what the
+ * bound is about: a 300px box beside a collapsed one eats 67px of a 62px lane gap at the magnifica-
+ * tion two collapsed boxes are safe at. With every box the same height this is exactly the constant
+ * it replaces.
+ *
+ * The horizontal half needs no such care — every box is `NODE_SIZE.width` wide, and columns are a
+ * whole gap apart whatever is in them.
+ */
+export function crowdLimit(neighbours: number): number {
+  return Math.min(
+    1 + (COLUMN_GAP * 0.7) / NODE_SIZE.width,
+    1 + (2 * LANE_GAP * 0.7) / Math.max(1, neighbours),
+  );
 }

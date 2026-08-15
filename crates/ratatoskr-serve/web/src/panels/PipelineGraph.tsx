@@ -19,15 +19,17 @@ import {
 import { Brain, Infinity as InfinityIcon, Repeat, Wrench } from "lucide-react";
 import { TOOL_GROUPS } from "../ui/tools";
 import {
-  COLUMN_GAP,
   LANE_GAP,
   LOOP_SHELF_STEP,
   NODE_SIZE,
+  crowdLimit,
+  place,
+  rowExtent,
   LOOP_BAND,
   SPAN_BAND,
   SPAN_RADIUS,
   fittedBounds,
-  position,
+  tallestNeighbours,
   spanRiser,
   spanShelf,
 } from "./layout";
@@ -200,6 +202,32 @@ function NodeFacts({
       </div>
     </>
   );
+}
+
+/**
+ * A node update, keeping what React Flow measured on the last one.
+ *
+ * The same box in the same place with new `data` keeps its measurement: React Flow owns measurement
+ * and writes it back through `onNodesChange`, and replacing the object it is working on makes it
+ * re-measure on every render and drop the edges it cannot route until both endpoints are measured.
+ *
+ * A box that changed SIZE is not the same box: its measurement describes something that no longer
+ * exists, and React Flow would go on fitting, routing and hit-testing the size it used to be. Only
+ * the measurement is replaced. Handing back the bare node instead takes its handle bounds away with
+ * it, and a node without those reads as uninitialised — the condition the fit waits on, so the graph
+ * would never refit around the box that grew.
+ */
+export function carryMeasurement(
+  previous: PipelineNodeType | undefined,
+  next: PipelineNodeType,
+): PipelineNodeType {
+  if (!previous) return next;
+  const size = { width: next.width, height: next.height };
+  if (previous.width === size.width && previous.height === size.height) {
+    return { ...previous, ...next };
+  }
+  if (size.width === undefined || size.height === undefined) return next;
+  return { ...previous, ...next, measured: { width: size.width, height: size.height } };
 }
 
 /** Nodes grouped into their stages, in pipeline order, from what the server sent. */
@@ -418,24 +446,7 @@ function BackLoopEdge({
  *
  * Must be rendered INSIDE `<ReactFlow>` — that is what puts it in the provider's context.
  */
-/**
- * The most a node can grow while its neighbours grow too, before they touch.
- *
- * Hovering does not need this: it enlarges one box and lifts it above the others, so covering a
- * neighbour is the point. Scrubbing enlarges every node that was working at that moment, and two of
- * those can be adjacent — with no one on top, they have to fit. Growth is centred, so each of two
- * neighbours reaches half the gap; the pair therefore has the whole gap to share, and `0.7` of it
- * leaves a visible sliver rather than letting them meet edge to edge.
- *
- * Derived from the layout constants rather than written as a number, because it is a fact *about*
- * them: change the pitch and the safe magnification changes with it.
- */
-const CROWD_LIMIT = Math.min(
-  1 + (COLUMN_GAP * 0.7) / NODE_SIZE.width,
-  1 + (LANE_GAP * 0.7) / NODE_SIZE.height,
-);
-
-function Magnification() {
+function Magnification({ crowd }: { crowd: number }) {
   const zoom = useStore((s) => s.transform[2]);
   useEffect(() => {
     // Clamped: under 1.2 it is not worth the movement, and past 3 the node covers its whole
@@ -445,8 +456,8 @@ function Magnification() {
     root.setProperty("--mag", mag.toFixed(2));
     // Tracks `--mag` where there is room and stops where there is not, so a narrow pane — which is
     // exactly where `--mag` is largest — does not turn the working nodes into one merged block.
-    root.setProperty("--mag-scrub", Math.min(1 + (mag - 1) * 0.7, CROWD_LIMIT).toFixed(2));
-  }, [zoom]);
+    root.setProperty("--mag-scrub", Math.min(1 + (mag - 1) * 0.7, crowd).toFixed(2));
+  }, [zoom, crowd]);
   return null;
 }
 
@@ -467,6 +478,25 @@ function FitToPane({
   // DOM means refitting on exactly the changes it has already noticed.
   const width = useStore((s) => s.width);
   const height = useStore((s) => s.height);
+  /*
+   * How deep the graph reaches, read from the nodes React Flow has actually committed.
+   *
+   * A box growing changes neither the node count nor the pane size, so without this nothing refits
+   * and the taller graph stays fitted to the bounds it had before. Taken from the store rather than
+   * from the layout the component just computed, because that number changes a render EARLIER than
+   * the nodes do: fitting on it would fit the old boxes, and by the time the new ones land nothing
+   * has changed to fit again.
+   */
+  const depth = useStore((s) => {
+    let top = Infinity;
+    let bottom = -Infinity;
+    for (const node of s.nodeLookup.values()) {
+      const y = node.internals.positionAbsolute.y;
+      top = Math.min(top, y);
+      bottom = Math.max(bottom, y + (node.measured.height ?? 0));
+    }
+    return bottom > top ? bottom - top : 0;
+  });
   useEffect(() => {
     if (moved || !initialized || count === 0 || width === 0 || height === 0) return;
     // `fitView` fits NODE bounds, and the span shelves hang above them. Padding is a fraction of
@@ -474,9 +504,9 @@ function FitToPane({
     // three-column graph fits with about 40px of headroom while the band wants 93, and the shelves
     // are clipped until someone pans. Worse, adding a span changes no node, so nothing refits.
     //
-    // Fitting explicit bounds says what the graph actually occupies. The loop shelves below have
-    // always ridden on padding and still do: they hang under the deepest lane, which grows with the
-    // layout the padding is measured from.
+    // Fitting explicit bounds says what the graph actually occupies. Both ends of it: reserving
+    // only the band above would take away the padding the loop shelves below had been riding on,
+    // since fitting bounds fits them tighter than `fitView` does.
     if (reserveTop > 0 || reserveBottom > 0) {
       void fitBounds(fittedBounds(getNodesBounds(getNodes()), reserveTop, reserveBottom), {
         padding: 0.15,
@@ -487,6 +517,7 @@ function FitToPane({
   }, [
     initialized,
     count,
+    depth,
     width,
     height,
     moved,
@@ -599,19 +630,33 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
   const columns = useMemo(() => stages(nodes), [nodes]);
   const byName = useMemo(() => new Map(nodes.map((n) => [n.name, n])), [nodes]);
 
+  /*
+   * Where the boxes go, computed once and read by everything that hangs off them — the boxes
+   * themselves, the shelves above and below, and the rectangle the view fits. Two derivations of
+   * one layout is how a shelf comes to hang off a row the boxes are no longer on.
+   */
+  const placed = useMemo(() => place(columns), [columns]);
+  const extent = useMemo(() => rowExtent(placed.values()), [placed]);
+  // How far a scrubbed box may grow before it covers the one under it. Off the placement, since
+  // that is what says which boxes are neighbours and how tall they are.
+  const crowd = useMemo(() => crowdLimit(tallestNeighbours(placed.values())), [placed]);
+
   const desiredNodes = useMemo<PipelineNodeType[]>(() => {
-    const maxLanes = Math.max(1, ...columns.map((c) => c.length));
     return columns.flatMap((lanes) =>
-      lanes.map((n) => ({
-        id: n.name,
-        type: "pipeline" as const,
-        position: position(n, lanes.length, maxLanes),
-        data: { node: n, live: live.get(n.name), isSelected: selected === n.name },
-        draggable: false,
-        ...NODE_SIZE,
-      })),
+      lanes.map((n) => {
+        const box = placed.get(n.name) ?? { x: 0, y: 0, ...NODE_SIZE };
+        return {
+          id: n.name,
+          type: "pipeline" as const,
+          position: { x: box.x, y: box.y },
+          data: { node: n, live: live.get(n.name), isSelected: selected === n.name },
+          draggable: false,
+          width: box.width,
+          height: box.height,
+        };
+      }),
     );
-  }, [columns, live, selected]);
+  }, [columns, placed, live, selected]);
 
   const desiredEdges = useMemo<Edge[]>(() => {
     // Every node in a stage feeds every node in the next one — which is what a fork joining back
@@ -689,15 +734,10 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
     const verifier = byName.get("verifier");
     const analyst = byName.get("analyst");
     // The shelves hang under the whole layout, not under one box, so two of them cannot cross a
-    // node in a deeper lane. Measured off the positions actually being drawn.
-    const maxLanes = Math.max(1, ...columns.map((c) => c.length));
-    const laneTops = columns.flatMap((lanes) =>
-      lanes.map((n) => position(n, lanes.length, maxLanes).y),
-    );
-    const rowBottom = Math.max(0, ...laneTops) + NODE_SIZE.height;
-    // The spans hang over the whole layout for the same reason the loops hang under it: one that
-    // cleared only its own box would cross a box in a shallower lane.
-    const rowTop = Math.min(0, ...laneTops);
+    // node in a deeper lane — and over it for the same reason, since one clearing only its own box
+    // would cross a box in a shallower lane. Read off the boxes actually being drawn, so a taller
+    // one takes its shelves with it.
+    const { top: rowTop, bottom: rowBottom } = extent;
 
     /*
      * Hand-offs across stages the run never entered. An ordinary edge joins adjacent columns, so
@@ -809,7 +849,7 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
     // Not clickable, and not focusable by tab: an edge here states a relation between two nodes and
     // has nothing to show when you pick it. See the note in `ConvergeEdge` on the hit path.
     return edges.map((e) => ({ ...e, selectable: false, focusable: false, interactionWidth: 0 }));
-  }, [byName, columns, loops, nodes]);
+  }, [byName, columns, extent, loops, nodes]);
 
   /*
    * React Flow is a controlled component: it owns node measurement and writes the result back
@@ -827,10 +867,8 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
 
   useEffect(() => {
     setRfNodes((prev) => {
-      const measured = new Map(prev.map((n) => [n.id, n]));
-      // Carry each node's existing measurement across a data update: it is the same box in the
-      // same place, and only `data` has changed.
-      return desiredNodes.map((n) => ({ ...measured.get(n.id), ...n }));
+      const previous = new Map(prev.map((n) => [n.id, n]));
+      return desiredNodes.map((n) => carryMeasurement(previous.get(n.id), n));
     });
   }, [desiredNodes, setRfNodes]);
 
@@ -878,7 +916,7 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
         }
         moved={moved.current}
       />
-      <Magnification />
+      <Magnification crowd={crowd} />
     </ReactFlow>
   );
 }
