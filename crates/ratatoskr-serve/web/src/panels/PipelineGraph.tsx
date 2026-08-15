@@ -23,11 +23,12 @@ import {
   LANE_GAP,
   LOOP_SHELF_STEP,
   NODE_SIZE,
+  place,
+  rowExtent,
   LOOP_BAND,
   SPAN_BAND,
   SPAN_RADIUS,
   fittedBounds,
-  position,
   spanRiser,
   spanShelf,
 } from "./layout";
@@ -452,11 +453,14 @@ function Magnification() {
 
 function FitToPane({
   count,
+  depth,
   reserveTop,
   reserveBottom,
   moved,
 }: {
   count: number;
+  /** How deep the layout reaches. A box growing changes no count and no pane size. */
+  depth: number;
   reserveTop: number;
   reserveBottom: number;
   moved: boolean;
@@ -474,9 +478,9 @@ function FitToPane({
     // three-column graph fits with about 40px of headroom while the band wants 93, and the shelves
     // are clipped until someone pans. Worse, adding a span changes no node, so nothing refits.
     //
-    // Fitting explicit bounds says what the graph actually occupies. The loop shelves below have
-    // always ridden on padding and still do: they hang under the deepest lane, which grows with the
-    // layout the padding is measured from.
+    // Fitting explicit bounds says what the graph actually occupies. Both ends of it: reserving
+    // only the band above would take away the padding the loop shelves below had been riding on,
+    // since fitting bounds fits them tighter than `fitView` does.
     if (reserveTop > 0 || reserveBottom > 0) {
       void fitBounds(fittedBounds(getNodesBounds(getNodes()), reserveTop, reserveBottom), {
         padding: 0.15,
@@ -487,6 +491,7 @@ function FitToPane({
   }, [
     initialized,
     count,
+    depth,
     width,
     height,
     moved,
@@ -599,19 +604,30 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
   const columns = useMemo(() => stages(nodes), [nodes]);
   const byName = useMemo(() => new Map(nodes.map((n) => [n.name, n])), [nodes]);
 
+  /*
+   * Where the boxes go, computed once and read by everything that hangs off them — the boxes
+   * themselves, the shelves above and below, and the rectangle the view fits. Two derivations of
+   * one layout is how a shelf comes to hang off a row the boxes are no longer on.
+   */
+  const placed = useMemo(() => place(columns), [columns]);
+  const extent = useMemo(() => rowExtent(placed.values()), [placed]);
+
   const desiredNodes = useMemo<PipelineNodeType[]>(() => {
-    const maxLanes = Math.max(1, ...columns.map((c) => c.length));
     return columns.flatMap((lanes) =>
-      lanes.map((n) => ({
-        id: n.name,
-        type: "pipeline" as const,
-        position: position(n, lanes.length, maxLanes),
-        data: { node: n, live: live.get(n.name), isSelected: selected === n.name },
-        draggable: false,
-        ...NODE_SIZE,
-      })),
+      lanes.map((n) => {
+        const box = placed.get(n.name) ?? { x: 0, y: 0, ...NODE_SIZE };
+        return {
+          id: n.name,
+          type: "pipeline" as const,
+          position: { x: box.x, y: box.y },
+          data: { node: n, live: live.get(n.name), isSelected: selected === n.name },
+          draggable: false,
+          width: box.width,
+          height: box.height,
+        };
+      }),
     );
-  }, [columns, live, selected]);
+  }, [columns, placed, live, selected]);
 
   const desiredEdges = useMemo<Edge[]>(() => {
     // Every node in a stage feeds every node in the next one — which is what a fork joining back
@@ -689,15 +705,10 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
     const verifier = byName.get("verifier");
     const analyst = byName.get("analyst");
     // The shelves hang under the whole layout, not under one box, so two of them cannot cross a
-    // node in a deeper lane. Measured off the positions actually being drawn.
-    const maxLanes = Math.max(1, ...columns.map((c) => c.length));
-    const laneTops = columns.flatMap((lanes) =>
-      lanes.map((n) => position(n, lanes.length, maxLanes).y),
-    );
-    const rowBottom = Math.max(0, ...laneTops) + NODE_SIZE.height;
-    // The spans hang over the whole layout for the same reason the loops hang under it: one that
-    // cleared only its own box would cross a box in a shallower lane.
-    const rowTop = Math.min(0, ...laneTops);
+    // node in a deeper lane — and over it for the same reason, since one clearing only its own box
+    // would cross a box in a shallower lane. Read off the boxes actually being drawn, so a taller
+    // one takes its shelves with it.
+    const { top: rowTop, bottom: rowBottom } = extent;
 
     /*
      * Hand-offs across stages the run never entered. An ordinary edge joins adjacent columns, so
@@ -809,7 +820,7 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
     // Not clickable, and not focusable by tab: an edge here states a relation between two nodes and
     // has nothing to show when you pick it. See the note in `ConvergeEdge` on the hit path.
     return edges.map((e) => ({ ...e, selectable: false, focusable: false, interactionWidth: 0 }));
-  }, [byName, columns, loops, nodes]);
+  }, [byName, columns, extent, loops, nodes]);
 
   /*
    * React Flow is a controlled component: it owns node measurement and writes the result back
@@ -869,6 +880,7 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
     >
       <FitToPane
         count={rfNodes.length}
+        depth={extent.bottom - extent.top}
         // What hangs off the boxes and has to be fitted with them. Both ends: the loop shelves
         // below were riding on `fitView`'s padding, and reserving only the span band above took
         // that padding away from them.

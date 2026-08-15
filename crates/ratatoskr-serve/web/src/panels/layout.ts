@@ -54,12 +54,81 @@ export const SPAN_BAND = 3 * LOOP_SHELF_STEP;
  */
 export const SPAN_RADIUS = 14;
 
-/** Where a box sits, in the column its stage names and the lane within it. */
-export function position(node: NodeView, lanesInStage: number, maxLanes: number) {
-  const offset = (maxLanes - lanesInStage) / 2;
+/**
+ * How tall a box is drawn.
+ *
+ * The one place a height is decided, because every vertical number in the layout is stacked out of
+ * it: where the lanes below it sit, how deep the row reaches, where the shelves hang, what the view
+ * has to fit. A box that grows — a node showing the subagents it spawned — grows here, and the rest
+ * follows without a second constant to keep in step.
+ *
+ * Declared rather than measured. React Flow keeps a node hidden until a ResizeObserver reports its
+ * size, so measuring makes whether the graph appears at all depend on that callback firing; and a
+ * box's contents are known before it is drawn, so there is nothing to learn by asking the DOM.
+ */
+export function nodeHeight(_node: NodeView): number {
+  return NODE_SIZE.height;
+}
+
+/** A rectangle, in the flow's own coordinates. */
+export type Bounds = { x: number; y: number; width: number; height: number };
+
+/**
+ * Where every box goes: columns left to right by stage, lanes stacked down by their own heights.
+ *
+ * Stacked rather than multiplied by a fixed pitch, so one box being taller than its siblings moves
+ * the lanes under it instead of drawing over them. With every box the same height this is exactly a
+ * constant pitch — which is what `layout.test.js` pins, since that is the layout in use today.
+ *
+ * A lane the column does not fill still takes a collapsed box's worth of room: `lane` is a declared
+ * position, a workflow may leave a hole in one, and a hole that closed up would move every box under
+ * it somewhere its layout did not ask for.
+ *
+ * Each column is centred against the tallest, so a fork sits either side of the row its neighbours
+ * are on.
+ */
+export function place(
+  columns: readonly (readonly NodeView[])[],
+  heightOf: (node: NodeView) => number = nodeHeight,
+): Map<string, Bounds> {
+  // A column as its lanes are drawn: every slot up to its deepest lane, empty ones included.
+  const slots = (lanes: readonly NodeView[]) => {
+    const filled = new Array<NodeView | undefined>(
+      lanes.reduce((deepest, n) => Math.max(deepest, n.lane + 1), 0),
+    );
+    for (const n of lanes) filled[n.lane] = n;
+    return filled;
+  };
+  const depth = (lanes: readonly NodeView[]) =>
+    slots(lanes).reduce(
+      (total, n, i) => total + (n ? heightOf(n) : NODE_SIZE.height) + (i > 0 ? LANE_GAP : 0),
+      0,
+    );
+
+  const tallest = Math.max(0, ...columns.map(depth));
+  const placed = new Map<string, Bounds>();
+  for (const lanes of columns) {
+    let y = (tallest - depth(lanes)) / 2;
+    for (const n of slots(lanes)) {
+      const height = n ? heightOf(n) : NODE_SIZE.height;
+      if (n) placed.set(n.name, { x: n.stage * COLUMN_PITCH, y, width: NODE_SIZE.width, height });
+      y += height + LANE_GAP;
+    }
+  }
+  return placed;
+}
+
+/**
+ * How far the boxes reach up and down — what the shelves hang off and the view has to fit.
+ *
+ * Read off the placements rather than derived from the lane count and a fixed height: a row is only
+ * as deep as the boxes actually in it, and one of them growing has to move what hangs under it.
+ */
+export function rowExtent(placed: Iterable<Bounds>): { top: number; bottom: number } {
+  const boxes = [...placed];
   return {
-    x: node.stage * COLUMN_PITCH,
-    y: (node.lane + offset) * LANE_PITCH,
+    top: Math.min(0, ...boxes.map((b) => b.y)),
+    bottom: Math.max(0, ...boxes.map((b) => b.y + b.height)),
   };
 }
 
@@ -86,9 +155,6 @@ export function spanRiser(k: number, lanes: number): number {
 export function spanShelf(i: number, count: number, rowTop: number): number {
   return rowTop - (SPAN_BAND * (i + 1)) / (Math.max(1, count) + 1);
 }
-
-/** A rectangle, in the flow's own coordinates. */
-export type Bounds = { x: number; y: number; width: number; height: number };
 
 /**
  * The rectangle a fit has to cover: the boxes, plus whatever hangs off them.
