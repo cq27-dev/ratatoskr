@@ -18,6 +18,17 @@ import {
 } from "@xyflow/react";
 import { Brain, Infinity as InfinityIcon, Repeat, Wrench } from "lucide-react";
 import { TOOL_GROUPS } from "../ui/tools";
+import {
+  COLUMN_GAP,
+  LANE_GAP,
+  LOOP_SHELF_STEP,
+  NODE_SIZE,
+  SPAN_BAND,
+  SPAN_RADIUS,
+  position,
+  spanRiser,
+  spanShelf,
+} from "./layout";
 import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode, SessionScope } from "../api";
 import {
   forkHandoff,
@@ -37,16 +48,6 @@ import {
  * is not a general graph layout — elkjs/dagre exist for graphs whose edges aren't known until
  * runtime, and here every edge is "the stage before it".
  */
-/* Pitch is the box plus the room an edge needs to turn in. Derived from NODE_SIZE rather than
- * written as a literal: the two drifted apart once already, leaving 20px for a right-angled edge
- * to route through, and the edges rendered as smears. */
-// Wide and tall enough that the meta line still fits on one row inside `.node`'s padding: the
-// cycles and token counts wrapped when the padding grew, and a wrapped count reads as two facts.
-const NODE_SIZE = { width: 202, height: 104 };
-const COLUMN_GAP = 96;
-const LANE_GAP = 62;
-const COLUMN_PITCH = NODE_SIZE.width + COLUMN_GAP;
-const LANE_PITCH = NODE_SIZE.height + LANE_GAP;
 
 function stageLabel(id: string): string {
   return id
@@ -55,13 +56,6 @@ function stageLabel(id: string): string {
     .join(" ");
 }
 
-function position(node: NodeView, lanesInStage: number, maxLanes: number) {
-  const offset = (maxLanes - lanesInStage) / 2;
-  return {
-    x: node.stage * COLUMN_PITCH,
-    y: (node.lane + offset) * LANE_PITCH,
-  };
-}
 
 /**
  * Declared up front rather than measured. React Flow keeps a node `visibility: hidden` until a
@@ -326,7 +320,6 @@ function ConvergeEdge({ id, sourceX, sourceY, label, markerEnd, style }: EdgePro
  * loops are evenly spaced whether or not the self-loop is drawn, and the spacing follows the
  * layout constants rather than being a number that has to be re-measured when they change.
  */
-const LOOP_SHELF_STEP = LANE_GAP / 2;
 
 /**
  * How deep the band of span shelves reaches above the row.
@@ -335,7 +328,6 @@ const LOOP_SHELF_STEP = LANE_GAP / 2;
  * `fitView`'s padding covers both. Fixed: the spans divide this band between them however many
  * there are, rather than each taking a step and pushing the outermost out of the fitted view.
  */
-const SPAN_BAND = 3 * LOOP_SHELF_STEP;
 
 /** What a back-edge needs beyond its endpoints: its caption, its shelf, and its riser's offset. */
 type BackLoopData = { label: string; shelfY: number; takeoff: number };
@@ -528,7 +520,6 @@ type SpanEdgeType = Edge<SpanData, "span">;
  * distribution have to agree about it: eight lanes across a 96px gap put risers 10.7px out, inside
  * a 14px corner.
  */
-const SPAN_RADIUS = 14;
 
 function SpanEdge({
   id,
@@ -730,12 +721,10 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
      */
     const riser = (node: NodeView) => {
       const lanes = band.get(node.stage) ?? [node];
-      const k = lanes.findIndex((lane) => lane.name === node.name);
-      // Across the gap MINUS a corner's clearance at each end. A riser nearer its box than the
-      // radius puts the turn's control point behind the handle, and the path enters the node it
-      // just left before doubling back out.
-      const usable = Math.max(0, COLUMN_GAP - 2 * SPAN_RADIUS);
-      return SPAN_RADIUS + (usable * (Math.max(0, k) + 1)) / (lanes.length + 1);
+      return spanRiser(
+        lanes.findIndex((lane) => lane.name === node.name),
+        lanes.length,
+      );
     };
     spans.forEach(({ from, to }, i) => {
       const source = byName.get(from);
@@ -749,7 +738,7 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
         targetHandle: "in",
         type: "span",
         data: {
-          shelfY: rowTop - (SPAN_BAND * (i + 1)) / (spans.length + 1),
+          shelfY: spanShelf(i, spans.length, rowTop),
           takeoff: riser(source),
           landing: riser(target),
         },
