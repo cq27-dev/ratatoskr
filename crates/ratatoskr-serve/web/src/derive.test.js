@@ -4,7 +4,8 @@ import {
   applyDerived,
   convergeLoops,
   forkHandoff,
-  startedOperations,
+  contiguous,
+  handoffEvidence,
   handoffDrawn,
   inNodeBoxes,
   nodesFromEvents,
@@ -198,19 +199,19 @@ test("events belonging to no node are skipped", () => {
 // The implementer cannot start before the red team has finished (`implement_host` in
 // ratatoskr-nodes/src/workflow.rs refuses to), so both boxes having started is the whole test.
 test("both the red team and the implementer having started draws the hand-off", () => {
-  expect(forkHandoff([node("redteam", "done"), node("implementer", "working")], new Set())).toBe(true);
+  expect(forkHandoff([node("redteam", "done"), node("implementer", "working")], null)).toBe(true);
 });
 
 test("a started red team alone draws no hand-off, because nothing has received the tree", () => {
-  expect(forkHandoff([node("redteam", "working"), node("implementer", "idle")], new Set())).toBe(false);
+  expect(forkHandoff([node("redteam", "working"), node("implementer", "idle")], null)).toBe(false);
 });
 
 test("neither node having started draws no hand-off", () => {
-  expect(forkHandoff([node("redteam", "idle"), node("implementer", "idle")], new Set())).toBe(false);
+  expect(forkHandoff([node("redteam", "idle"), node("implementer", "idle")], null)).toBe(false);
 });
 
 test("a workflow with no red team at all draws no hand-off from nothing", () => {
-  expect(forkHandoff([node("analyst", "done"), node("implementer", "working")], new Set())).toBe(false);
+  expect(forkHandoff([node("analyst", "done"), node("implementer", "working")], null)).toBe(false);
 });
 
 // The edge is a vertical step down the lane gap between two boxes in one column. A layout that
@@ -221,7 +222,7 @@ test("a layout that puts the two in different columns draws no lane hand-off", (
     { ...node("redteam", "done"), stage: 0 },
     { ...node("implementer", "working"), stage: 2 },
   ];
-  expect(forkHandoff(nodes, new Set())).toBe(false);
+  expect(forkHandoff(nodes, null)).toBe(false);
 });
 
 test("sharing a column is what draws it", () => {
@@ -229,11 +230,11 @@ test("sharing a column is what draws it", () => {
     { ...node("redteam", "done"), stage: 3, lane: 0 },
     { ...node("implementer", "working"), stage: 3, lane: 1 },
   ];
-  expect(forkHandoff(nodes, new Set())).toBe(true);
+  expect(forkHandoff(nodes, null)).toBe(true);
 });
 
 test("a failed red team still handed the tree over, so the hand-off is drawn", () => {
-  expect(forkHandoff([node("redteam", "failed"), node("implementer", "working")], new Set())).toBe(true);
+  expect(forkHandoff([node("redteam", "failed"), node("implementer", "working")], null)).toBe(true);
 });
 
 /** A node the shape places, at a column of its own. */
@@ -1873,66 +1874,62 @@ test("an execution that ended keeps its failure state but is no longer a control
   expect(workingNodeNames(shape, cancelled)).toEqual([]);
 });
 
-test("a stream that names its hosts draws the hand-off from evidence, not from box state", () => {
-  // Two non-idle boxes prove the hand-off only for the Rust operations: `implement()` cannot start
-  // until the awaited `redTeam()` has finished. A workflow that composes its own stages into the
-  // same boxes carries no such guarantee — and its stream announces its hosts, so the edge can ask
-  // whether the operation ran instead of inferring it.
+test("the hand-off is drawn from redTeam completing and implement then starting", () => {
+  // Two non-idle boxes prove the hand-off only for the Rust operations, and only in one lifecycle:
+  // `implement_host` waits for a red team that was CALLED first, rejects one still in flight, and
+  // permits implementation where none was called. Starts alone cannot tell those apart — a host
+  // announces itself before its body runs, so a failing `redTeam()` a workflow catches, and the
+  // `implement()` the guard then rejects, both leave starts behind. The evidence is redTeam's
+  // completed END before implement's start.
   const shape = [node("redteam", "done"), node("implementer", "working")];
-  const custom = startedOperations(
-    inNodeBoxes(
-      [
-        { at: "t", kind: "span_start", span_id: "00000000000000a1", execution: "host", execution_name: "my_probe" },
-      ],
-      registry(["redteam"], ["implementer"]),
-    ),
-  );
-  expect(forkHandoff(shape, custom)).toBe(false);
-
-  const standard = startedOperations(
-    inNodeBoxes(
-      [
-        { at: "t", kind: "span_start", span_id: "00000000000000a1", execution: "host", execution_name: "redTeam" },
-        { at: "t", kind: "span_start", span_id: "00000000000000b2", execution: "host", execution_name: "implement" },
-      ],
-      registry(["redteam"], ["implementer"]),
-    ),
-  );
-  expect(forkHandoff(shape, standard)).toBe(true);
-
-  // A stream that announces nothing is from before executions did, and reads as it always did.
-  expect(forkHandoff(shape, new Set())).toBe(true);
-
-  // A BOUNDED window proves no absence: with history unavailable the view holds a replayed tail,
-  // and the `implement` start may simply have scrolled out while later hosts remain in view. The
-  // set the custom-workflow case suppresses on is a COMPLETE stream's; a tail says it cannot tell,
-  // and the box fallback — which is what the stored nodes prove — draws the hand-off that
-  // happened.
-  expect(forkHandoff(shape, null)).toBe(true);
-
-  // The evidence is ORDERED, because the sequencing guarantee belongs to one call order:
-  // `implement()` waits for `redTeam()` only where redTeam was called first, and `implement_host`
-  // explicitly permits implementation when redTeam was never called. A custom stage can populate
-  // the redteam box beside an independent `implement()` — implement having started proves nothing
-  // about a hand-off on its own.
-  const hosts = (...names) =>
-    startedOperations(
+  const stages = registry(["redteam"], ["implementer"]);
+  const lifecycle = (...records) =>
+    handoffEvidence(
       inNodeBoxes(
-        names.map((name, i) => ({
-          at: "t",
-          kind: "span_start",
-          span_id: `${i + 1}`.padStart(16, "0"),
+        records.map(([kind, name, span, outcome], i) => ({
+          at: `t${i}`,
+          kind,
+          span_id: span,
           execution: "host",
           execution_name: name,
+          ...(outcome ? { outcome } : {}),
         })),
-        registry(["redteam"], ["implementer"]),
+        stages,
       ),
     );
-  expect(forkHandoff(shape, hosts("my_probe", "implement"))).toBe(false);
-  expect(forkHandoff(shape, hosts("implement", "redTeam"))).toBe(false);
-  expect(forkHandoff(shape, hosts("redTeam", "my_probe", "implement"))).toBe(true);
-});
+  const H1 = "00000000000000a1";
+  const H2 = "00000000000000b2";
 
+  // The standard flow: redTeam completes, implement starts. Handed off.
+  const standard = lifecycle(
+    ["span_start", "redTeam", H1],
+    ["span_end", "redTeam", H1, "completed"],
+    ["span_start", "implement", H2],
+  );
+  expect(standard).toBe(true);
+  expect(forkHandoff(shape, standard)).toBe(true);
+
+  // A failing redTeam the workflow caught, then an implement the guard rejects: both STARTED, and
+  // nothing was handed to anyone. Custom stages may then populate both boxes.
+  const caught = lifecycle(
+    ["span_start", "redTeam", H1],
+    ["span_end", "redTeam", H1, "unvalidated"],
+    ["span_start", "implement", H2],
+  );
+  expect(caught).toBe(false);
+  expect(forkHandoff(shape, caught)).toBe(false);
+
+  // implement before redTeam ever completed, and implement without any redTeam.
+  expect(
+    lifecycle(["span_start", "implement", H2], ["span_start", "redTeam", H1]),
+  ).toBe(false);
+  expect(lifecycle(["span_start", "my_probe", H1], ["span_start", "implement", H2])).toBe(false);
+
+  // A stream that announces no hosts is from before executions did: it cannot say, and the box
+  // fallback — what every stream got before there was evidence — draws the edge.
+  expect(handoffEvidence(inNodeBoxes([], stages))).toBe(null);
+  expect(forkHandoff(shape, null)).toBe(true);
+});
 test("a custom stage in the implementer box is not a converge loop", () => {
   // The loop being counted is the standard operation's. A workflow may compose any stage into the
   // implementer box, and its starts arrive under that box's name — counting them displayed a retry
@@ -1994,4 +1991,24 @@ test("a custom stage in the implementer box is not a converge loop", () => {
     stages,
   );
   expect(convergeLoops(future, stages)).toEqual({ fix: 0, replan: 0, retry: 1 });
+});
+
+test("a reconnect gap is not a complete account", () => {
+  // `onReset` clears the live buffer while the history re-read is throttled, so stale history gets
+  // joined to a fresh bounded tail with the slice between them missing. An absence in that slice
+  // proves nothing — a hand-off whose redTeam records fell in the gap was being suppressed as
+  // though the stream had denied it.
+  const ev = (at) => ({ at, kind: "model_text", node: "analyst", detail: "…" });
+  const history = [ev("t1"), ev("t2"), ev("t3")];
+
+  // The replay overlaps history: nothing fell between.
+  expect(contiguous(history, [ev("t3"), ev("t4")])).toBe(true);
+  // An empty buffer has nothing after history to miss.
+  expect(contiguous(history, [])).toBe(true);
+  // The replay begins after history ends: the slice between is missing, and the account is not
+  // complete — evidence read from it would prove absences it cannot.
+  expect(contiguous(history, [ev("t5")])).toBe(false);
+  // No history at all is the bounded tail.
+  expect(contiguous(null, [ev("t1")])).toBe(false);
+  expect(contiguous([], [])).toBe(false);
 });

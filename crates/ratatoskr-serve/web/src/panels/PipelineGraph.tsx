@@ -618,11 +618,11 @@ interface Props {
   /** Implementer re-entries so far, by route. Folded from the same event prefix as `nodes`. */
   loops: ConvergeLoops;
   /**
-   * The workflow hosts the stream has announced, by name. What lets an edge that asserts an
-   * operation's sequencing ask whether that operation ran, instead of inferring it from box state
-   * that arbitrary composed stages can also produce.
+   * Whether the stream shows the red-team hand-off, or `null` where it cannot say. Evidence for
+   * the edge that asserts it, instead of inference from box state that arbitrary composed stages
+   * can also produce.
    */
-  operations: ReadonlySet<string> | null;
+  handoff: boolean | null;
   selected: string | null;
   /** `null` clears the selection, which returns the lower pane to the combined feed. */
   onSelect: (name: string | null) => void;
@@ -632,7 +632,7 @@ export default function PipelineGraph({
   nodes,
   live,
   loops,
-  operations,
+  handoff,
   selected,
   onSelect,
 }: Props) {
@@ -721,7 +721,7 @@ export default function PipelineGraph({
      * without a red team draws nothing. A short vertical line down the lane gap, unlabelled and
      * untinted: it is a forward hand-off and should look like the other forward edges.
      */
-    if (forkHandoff(nodes, operations)) {
+    if (forkHandoff(nodes, handoff)) {
       edges.push({
         id: "redteam-implementer",
         source: "redteam",
@@ -863,7 +863,7 @@ export default function PipelineGraph({
     // Not clickable, and not focusable by tab: an edge here states a relation between two nodes and
     // has nothing to show when you pick it. See the note in `ConvergeEdge` on the hit path.
     return edges.map((e) => ({ ...e, selectable: false, focusable: false, interactionWidth: 0 }));
-  }, [byName, columns, extent, loops, nodes, operations]);
+  }, [byName, columns, extent, loops, nodes, handoff]);
 
   /*
    * React Flow is a controlled component: it owns node measurement and writes the result back

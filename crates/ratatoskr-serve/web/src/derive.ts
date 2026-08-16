@@ -631,27 +631,56 @@ function fold(into: NodeTelemetry, next: NodeTelemetry): NodeTelemetry {
 }
 
 /**
- * Every host execution this stream has seen start, by name — the Rust operations and declared
- * stages alike.
+ * Whether this stream shows the red team handing the tree to the implementer — or `null` where it
+ * cannot say.
  *
- * All of them rather than the operations alone, because absence has to be tellable from silence: a
- * custom workflow that ran no Rust operation still announces its declared-stage hosts, so an empty
- * set means a stream from before executions announced themselves — not a workflow that happened to
- * run nothing standard. And a name here that is an operation's IS the operation, since a declared
- * stage is refused every operation's name.
+ * The hand-off happened exactly where `redTeam()` COMPLETED and `implement()` then started:
+ * `implement_host` waits for a red team that was called first, rejects one still in flight, and
+ * permits implementation where none was called at all. Starts alone prove none of that — a host
+ * announces itself before its body runs, so a failing `redTeam()` a workflow catches, and the
+ * `implement()` the guard then rejects, both leave starts behind — which is why the evidence here
+ * is redTeam's completed END before implement's start.
  *
- * The set's iteration order is each host's FIRST start, in stream order — a `Set` iterates in
- * insertion order — and consumers rely on it: which of two operations started first is evidence,
- * not trivia, since a sequencing guarantee holds only for the call order that invokes it.
+ * `null` for a stream that announces no hosts: one from before executions announced themselves,
+ * which can prove nothing either way. A host-announcing stream that cannot show the completed
+ * hand-off is a workflow that did not make it, and that is `false` — a custom workflow may
+ * populate the same boxes through declared stages, and box state is exactly what this exists to
+ * stop inferring from.
  */
-export function startedOperations(events: readonly BoxedEvent[]): Set<string> {
-  const started = new Set<string>();
+/**
+ * Whether a live buffer joins a loaded history with nothing missing between them.
+ *
+ * The buffer's first event at or before the history's last means the bounded replay overlapped
+ * what history already covers, so no slice fell between the two. Not a given: a reconnect clears
+ * the buffer while the history re-read is throttled, and joining stale history to a fresh tail
+ * leaves a gap that reads as a complete account — an absence in the gap then proves things it
+ * cannot. Both states self-heal, since the next history read advances its end past the replay's
+ * start.
+ */
+export function contiguous(
+  history: readonly LiveEvent[] | null,
+  buffer: readonly LiveEvent[],
+): boolean {
+  if (!history?.length) return false;
+  return buffer.length === 0 || buffer[0]!.at <= history[history.length - 1]!.at;
+}
+
+export function handoffEvidence(events: readonly BoxedEvent[]): boolean | null {
+  let sawHosts = false;
+  let redTeamCompleted = false;
+  const hosts = new Map<string, string>();
   for (const e of events) {
-    if (e.kind === "span_start" && e.execution === "host" && e.execution_name !== undefined) {
-      started.add(e.execution_name);
+    if (e.execution !== "host" || !e.span_id) continue;
+    if (e.kind === "span_start" && e.execution_name !== undefined) {
+      sawHosts = true;
+      hosts.set(e.span_id, e.execution_name);
+      if (e.execution_name === "implement" && redTeamCompleted) return true;
+    }
+    if (e.kind === "span_end" && e.outcome === "completed" && hosts.get(e.span_id) === "redTeam") {
+      redTeamCompleted = true;
     }
   }
-  return started;
+  return sawHosts ? false : null;
 }
 
 /**
@@ -771,32 +800,18 @@ export function convergeLoops(
  */
 export function forkHandoff(
   nodes: readonly NodeView[],
-  operations: ReadonlySet<string> | null,
+  handoff: boolean | null,
 ): boolean {
   const started = (name: string) => nodes.find((n) => n.name === name && n.state !== "idle");
   const redTeam = started("redteam");
   const implementer = started("implementer");
   if (!redTeam || !implementer || redTeam.stage !== implementer.stage) return false;
-  // Drawn from evidence where the stream can give it. The sequencing this edge asserts belongs to
-  // one call order: `implement()` waits for the awaited `redTeam()` ONLY where `redTeam()` was
-  // called first — `implement_host` explicitly permits implementation when redTeam was never
-  // called — so `implement` having started proves nothing on its own, and a custom stage
-  // populating the redteam box beside an independent `implement()` drew a hand-off that never
-  // happened. The evidence is ordered: redTeam's first start before implement's, which the set's
-  // insertion order carries.
-  //
-  // Absence proves anything only where the stream reaches back to the run's beginning. `null` is a
-  // bounded window — history unavailable, a replayed tail — where a start may simply have scrolled
-  // out; suppressing the edge there hid a hand-off that happened. An empty set is a complete
-  // stream from before executions announced themselves. Both fall back to the box inference, which
-  // is what every stream got before there was evidence to read.
-  if (operations === null || operations.size === 0) return true;
-  let redTeamFirst = false;
-  for (const name of operations) {
-    if (name === "redTeam") redTeamFirst = true;
-    else if (name === "implement") return redTeamFirst;
-  }
-  return false;
+  // Drawn from [`handoffEvidence`] where the stream can give it. `null` is a stream that cannot
+  // say — one from before executions announced themselves, or a window that does not reach back to
+  // the run's beginning, where an absent record proves nothing because it may simply have scrolled
+  // out. Both fall back to the box inference, which is what every stream got before there was
+  // evidence to read.
+  return handoff ?? true;
 }
 
 /**

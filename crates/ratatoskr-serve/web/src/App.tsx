@@ -3,7 +3,8 @@ import { useQueryState } from "nuqs";
 import {
   applyDerived,
   convergeLoops,
-  startedOperations,
+  contiguous,
+  handoffEvidence,
   inNodeBoxes,
   nodesFromEvents,
   stagesOf,
@@ -511,16 +512,21 @@ export default function App() {
     [boxedShown, detail],
   );
 
-  // Which workflow hosts have announced themselves, so an edge asserting an operation's sequencing
-  // can ask whether that operation ran rather than inferring it from box state.
+  // Whether the stream shows the red-team hand-off, so the edge asserting it can read evidence
+  // rather than inferring from box state — but only where the timeline is a CONTINUOUS account
+  // from the run's beginning. Two ways it is not, and both make absence meaningless:
   //
-  // Only where the timeline reaches back to the run's beginning. Without history this view holds a
-  // bounded tail, and an operation's start may have scrolled out of it — absence proves nothing
-  // there, and `null` says so. Positive evidence is not worth salvaging from a tail: any hand-off
-  // it could prove is one the box fallback draws anyway.
-  const operations = useMemo(
-    () => (history?.length ? startedOperations(boxedShown) : null),
-    [boxedShown, history],
+  // - no history at all: this view holds the bounded replay tail, and a record may have scrolled
+  //   out of it;
+  // - a reconnect gap: `onReset` clears the live buffer while the history re-read is throttled, so
+  //   stale history is joined to a fresh bounded tail and the slice between them is missing.
+  //
+  // Continuity is verified, not assumed: the live buffer's first event at or before the history's
+  // last means the replay overlapped it and nothing fell between. Both states self-heal — the next
+  // history read advances its end past the replay's start.
+  const handoff = useMemo(
+    () => (contiguous(history, events) ? handoffEvidence(boxedShown) : null),
+    [boxedShown, history, events],
   );
 
   /*
@@ -649,7 +655,7 @@ export default function App() {
                 nodes={graphNodes}
                 live={live}
                 loops={loops}
-                operations={operations}
+                handoff={handoff}
                 selected={node}
                 onSelect={setNode}
               />
