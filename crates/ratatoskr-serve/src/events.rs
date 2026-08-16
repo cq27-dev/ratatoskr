@@ -240,41 +240,6 @@ async fn replay_from(dir: &Path) -> Option<PathBuf> {
     logs.pop()
 }
 
-/// The execution a record belongs to and the one that invoked it, read from a single place.
-///
-/// A node's turn runs inside a span holding its identity, so everything the turn emits — every tool
-/// call, every line of model text — carries that identity there rather than on the record. Reading
-/// the record alone leaves those events unidentified, and an unidentified record is filed under
-/// whichever invocation is in flight: with two invocations of one stage overlapping, that is the
-/// wrong one.
-///
-/// Atomically, because the two halves only mean anything together. A record stating its own
-/// identity states its own parentage or has none — reading the parent off the span that encloses it
-/// takes it from a DIFFERENT execution, which is a parent this record never had. Only where the
-/// record says nothing does the enclosing span answer, and then it answers both.
-fn invocation_of(record: &Value) -> (Option<&str>, Option<&str>) {
-    if let Some(span_id) = record.get("span_id").and_then(Value::as_str) {
-        return (
-            Some(span_id),
-            record.get("parent_span_id").and_then(Value::as_str),
-        );
-    }
-    record
-        .get("spans")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .rev()
-        .find_map(|span| {
-            let span_id = span.get("span_id").and_then(Value::as_str)?;
-            Some((
-                Some(span_id),
-                span.get("parent_span_id").and_then(Value::as_str),
-            ))
-        })
-        .unwrap_or((None, None))
-}
-
 /// Pull `run_id` out of a record: a plain field first (how the dashboard's own launch and reap
 /// lines carry it, since they are emitted outside any run), then the enclosing spans.
 fn run_id_of(record: &Value) -> Option<&str> {
@@ -288,16 +253,77 @@ fn run_id_of(record: &Value) -> Option<&str> {
         .find_map(|span| span.get("run_id").and_then(Value::as_str))
 }
 
-/// Same idea for the node: a field on checkpoint records, the `agent` span for everything an
-/// agent emits.
-fn node_of(record: &Value) -> Option<&str> {
-    record.get("node").and_then(Value::as_str).or_else(|| {
+/// What a record is attributed to: the node, the execution, and the execution that invoked it.
+///
+/// One source for all three, and that is the point. A node's turn runs inside a span holding its
+/// name and its identity, so everything the turn emits — every tool call, every line of model text
+/// — carries them there rather than on the record. Resolved separately they came from different
+/// places: the name scanned outward from the run while the identity scanned inward from the turn,
+/// so a clarification's records paired the answerer's execution with the asking node's name. One
+/// turn, split across two invocations.
+///
+/// A record's own fields are one source and are taken together. Stating an identity and no parent
+/// states that it has none — inheriting a parent from the span around it describes a parentage that
+/// never existed.
+///
+/// Otherwise the innermost span that names an execution answers, and answers all of it. Innermost
+/// because a turn runs inside the host call that drove it, and a record belongs to the nearest
+/// execution it was emitted inside.
+///
+/// A lifecycle record inherits no node. It names an execution, under `execution_name`, because a
+/// host call is an execution the shape cannot place — and anything folding a record that carries
+/// `node` into node state would draw a box for it.
+struct Attribution<'a> {
+    node: Option<&'a str>,
+    span_id: Option<&'a str>,
+    parent_span_id: Option<&'a str>,
+}
+
+fn attribution_of<'a>(record: &'a Value, kind: &str) -> Attribution<'a> {
+    let field = |key: &str| record.get(key).and_then(Value::as_str);
+    let spans = || {
         record
-            .get("spans")?
-            .as_array()?
-            .iter()
-            .find_map(|span| span.get("node").and_then(Value::as_str))
-    })
+            .get("spans")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+    };
+    let named = |node: Option<&'a str>| {
+        if matches!(kind, "span_start" | "span_end") {
+            None
+        } else {
+            node
+        }
+    };
+
+    if let Some(span_id) = field("span_id") {
+        return Attribution {
+            node: named(field("node")),
+            span_id: Some(span_id),
+            parent_span_id: field("parent_span_id"),
+        };
+    }
+    let enclosing = spans()
+        .rev()
+        .find(|span| span.get("span_id").and_then(Value::as_str).is_some());
+    let of_span = |key: &str| {
+        enclosing
+            .and_then(|span| span.get(key))
+            .and_then(Value::as_str)
+    };
+    Attribution {
+        // The record's own name still wins where it has one — a checkpoint names the node it
+        // covers, which is not always the node whose span it was written inside. Failing that, the
+        // execution's own span; failing THAT, the nearest span naming a node at all, which is what
+        // a stream from before executions had identities carries.
+        node: named(field("node").or_else(|| of_span("node")).or_else(|| {
+            spans()
+                .rev()
+                .find_map(|s| s.get("node").and_then(Value::as_str))
+        })),
+        span_id: of_span("span_id"),
+        parent_span_id: of_span("parent_span_id"),
+    }
 }
 
 /// Normalise one log record, keeping only what a viewer can act on.
@@ -308,7 +334,7 @@ fn to_event(record: &Value) -> LiveEvent {
         .unwrap_or("event")
         .to_string();
     let str_field = |key: &str| record.get(key).and_then(Value::as_str);
-    let invocation = invocation_of(record);
+    let attribution = attribution_of(record, &kind);
     let detail = match kind.as_str() {
         "tool_call" => str_field("tool").unwrap_or("tool"),
         "model_text" => str_field("text").unwrap_or_default(),
@@ -346,12 +372,12 @@ fn to_event(record: &Value) -> LiveEvent {
         // One execution, both halves. Looked up independently, a record carrying its own identity
         // and no parent took the parent off the span that encloses it — which belongs to a
         // different execution, so the pair described a parentage that never existed.
-        span_id: invocation.0.map(str::to_string),
-        parent_span_id: invocation.1.map(str::to_string),
+        span_id: attribution.span_id.map(str::to_string),
+        parent_span_id: attribution.parent_span_id.map(str::to_string),
         execution: str_field("execution").map(str::to_string),
         execution_name: str_field("execution_name").map(str::to_string),
         kind,
-        node: node_of(record).map(str::to_string),
+        node: attribution.node.map(str::to_string),
         detail,
     }
 }
@@ -727,6 +753,51 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_turn_is_attributed_to_the_turn_it_is_running_in() {
+        // A clarification's answering turn runs INSIDE the asking node's span. Resolved separately,
+        // the name scanned outward from the run while the identity scanned inward from the turn, so
+        // one turn's records paired the answerer's execution with the asking node's name — its
+        // model text drawn under the asker while its cost was recorded against the answerer.
+        let answering = serde_json::json!({
+            "kind": "model_text",
+            "text": "because the invariant says so",
+            "spans": [
+                { "run_id": "r1" },
+                { "node": "implementer", "span_id": "00000000000000a1" },
+                { "node": "analyst", "span_id": "00000000000000b2", "parent_span_id": "00000000000000a1" },
+            ],
+        });
+        let event = to_event(&answering);
+        assert_eq!(event.node.as_deref(), Some("analyst"), "what is answering");
+        assert_eq!(event.span_id.as_deref(), Some("00000000000000b2"));
+        assert_eq!(
+            event.parent_span_id.as_deref(),
+            Some("00000000000000a1"),
+            "invoked by the turn that asked"
+        );
+
+        // A lifecycle record inherits no node at all. It names an execution — a host call is one
+        // the shape cannot place — and anything folding a record carrying `node` into node state
+        // would draw a box for it.
+        let lifecycle = serde_json::json!({
+            "kind": "span_end",
+            "span_id": "00000000000000c3",
+            "execution": "host",
+            "execution_name": "isConverged",
+            // Named on the record as well as around it. The rule is the normaliser's, not a
+            // property of what today's emitters happen to leave out: whatever a lifecycle record
+            // says, it is not a node's record, and a fold that placed it would draw a box for a
+            // host call.
+            "node": "implementer",
+            "spans": [{ "node": "implementer", "span_id": "00000000000000a1" }],
+        });
+        let ended = to_event(&lifecycle);
+        assert_eq!(ended.node, None);
+        assert_eq!(ended.span_id.as_deref(), Some("00000000000000c3"));
+        assert_eq!(ended.execution_name.as_deref(), Some("isConverged"));
+    }
+
+    #[test]
     fn an_identity_and_its_parent_come_from_one_execution() {
         // The two halves only mean anything together. A record stating its own identity states its
         // own parentage or has none — taking the parent off the span that encloses it describes a
@@ -855,12 +926,12 @@ mod tests {
     fn attribution_comes_from_a_field_or_the_span_list() {
         let from_span: Value = serde_json::from_str(&agent_line("r1", "scout")).unwrap();
         assert_eq!(run_id_of(&from_span), Some("r1"));
-        assert_eq!(node_of(&from_span), Some("scout"));
+        assert_eq!(to_event(&from_span).node.as_deref(), Some("scout"));
 
         // The dashboard's own launch/reap lines are emitted outside any run span.
         let from_field = serde_json::json!({"kind": "run_started", "run_id": "r2"});
         assert_eq!(run_id_of(&from_field), Some("r2"));
-        assert_eq!(node_of(&from_field), None);
+        assert_eq!(to_event(&from_field).node, None);
 
         assert_eq!(run_id_of(&serde_json::json!({"kind": "x"})), None);
     }

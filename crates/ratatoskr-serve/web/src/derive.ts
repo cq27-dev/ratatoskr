@@ -117,18 +117,27 @@ interface Tracked {
 function attempts<A extends Tracked>() {
   const list: A[] = [];
   const byId = new Map<string, A>();
-  const live: A[] = [];
+  /**
+   * The live ones, newest last — a stack that may hold ended entries, discarded when looked at.
+   *
+   * Removing from the middle of an array costs a scan and a shift, which is quadratic where a
+   * history holds many overlapping invocations: N starts followed by N ends walk the whole live set
+   * N times. Here an entry is pushed once and popped once, so a lookup pays only for what it
+   * discards and never for what is still running.
+   */
+  const stack: A[] = [];
   const add = (made: A) => {
     list.push(made);
     byId.set(made.span, made);
-    if (made.live) live.push(made);
+    if (made.live) stack.push(made);
     return made;
   };
+  const newestLive = () => {
+    while (stack.length > 0 && !stack[stack.length - 1]!.live) stack.pop();
+    return stack.at(-1);
+  };
   const end = (attempt: A) => {
-    if (!attempt.live) return;
     attempt.live = false;
-    const at = live.indexOf(attempt);
-    if (at >= 0) live.splice(at, 1);
   };
   return {
     list,
@@ -151,7 +160,7 @@ function attempts<A extends Tracked>() {
      */
     for: (e: BoxedEvent, span: string, make: (live: boolean) => A): A => {
       if (e.span_id) return byId.get(span) ?? add(make(false));
-      return live.at(-1) ?? list.at(-1) ?? add(make(false));
+      return newestLive() ?? list.at(-1) ?? add(make(false));
     },
     /**
      * The invocation a viewer is looking at: the newest still live, else the newest seen.
@@ -160,7 +169,7 @@ function attempts<A extends Tracked>() {
      * what the box is doing. Taking the newest outright drew a finished sibling's model and tools
      * while the one still running went unseen.
      */
-    current: (): A | undefined => live.at(-1) ?? list.at(-1),
+    current: (): A | undefined => newestLive() ?? list.at(-1),
   };
 }
 type Attempts<A extends Tracked> = ReturnType<typeof attempts<A>>;
@@ -990,10 +999,15 @@ function fromStream(
   //
   // The server's only where the stream cannot answer at all: an ingested tail whose starts are in a
   // rotated file, or a run recorded before checkpoints carried telemetry.
-  const telemetry = d.costed || d.started ? d.telemetry : (n.telemetry ?? d.telemetry);
+  const shown = d.costed || d.started ? d.telemetry : (n.telemetry ?? d.telemetry);
   const settled: NodeState = died ? "failed" : n.state;
+  // Dropped, not merely not-set. `n` is spread below, so leaving the key out keeps the SERVER's
+  // telemetry — the run's final state — against an attempt this view watched start and knows
+  // nothing about yet. A historical start that announced no facts is exactly that case: the stream
+  // is authoritative and has nothing to say, and nothing is what it must show.
+  const { telemetry: _stale, ...without } = n;
   return {
-    ...n,
+    ...without,
     state: ended && d.state === "working" ? settled : d.state,
     checkpoints: d.checkpoints,
     // What the STREAM saw, before the settling above can take it back. A failed run with two
@@ -1001,7 +1015,7 @@ function fromStream(
     // `node_start` proves they ran — and a reader inferring that their stage was never entered
     // would assert a hand-off across a stage that did.
     entered: d.state !== "idle",
-    ...(telemetry ? { telemetry } : {}),
+    ...(shown ? { telemetry: shown } : {}),
   };
 }
 

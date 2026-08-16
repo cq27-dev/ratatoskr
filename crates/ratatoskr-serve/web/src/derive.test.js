@@ -1460,3 +1460,47 @@ test("folding a long history costs what the history costs", () => {
   // The last invocation's own figures, not the sum of twenty thousand.
   expect(box.telemetry.input_tokens).toBe(1);
 });
+
+test("overlapping invocations cost what they cost to end", () => {
+  // The existing history test alternates start and checkpoint, so only one invocation is ever live
+  // and removing it is free. A history may instead hold many at once — and removing from the middle
+  // of the live set costs a scan and a shift, which is quadratic across N starts and N ends.
+  const stages = registry(["probe"]);
+  const many = 50_000;
+  const spans = Array.from({ length: many }, (_, n) => `${n + 1}`.padStart(16, "0"));
+  const events = [
+    ...spans.map((span) => attemptStart("probe", span, "opus")),
+    ...spans.map((span) => attemptCheckpoint("probe", span, 1)),
+  ];
+  const boxed = inNodeBoxes(events, stages);
+
+  const started = performance.now();
+  const box = nodesFromEvents(boxed).get("probe");
+  liveNodes(boxed);
+  expect(performance.now() - started).toBeLessThan(500);
+  expect(box.checkpoints).toBe(many);
+  expect(box.state).toBe("done");
+});
+
+test("a start that announces nothing shows nothing, not the run's final figures", () => {
+  // A `node_start` carries facts only sometimes. Where the stream watched an attempt begin and has
+  // nothing to say about it yet, that IS the answer — the server's record is the run's final state,
+  // and leaving it in place draws the previous attempt's model and tokens against a fresh one.
+  const stages = registry(["implementer"]);
+  const bare = { at: "t", kind: "node_start", node: "implementer", detail: "node started" };
+  const served = [
+    {
+      name: "implementer",
+      state: "done",
+      checkpoints: 1,
+      stage: 0,
+      lane: 0,
+      shaped: true,
+      telemetry: { ...blankTelemetry, model: "opus", input_tokens: 100 },
+    },
+  ];
+
+  const drawn = applyDerived(served, nodesFromEvents(inNodeBoxes([bare], stages)))[0];
+  expect(drawn.state).toBe("working");
+  expect(drawn.telemetry).toBeUndefined();
+});

@@ -573,7 +573,25 @@ where
     );
     let agent = bind_tools(builder, &tools, None, None, None, None);
 
-    let answer = agent.prompt(question).await;
+    // The turn's own span, carrying what is running and which execution it is. Without it this turn
+    // is polled inside the ASKING node's span — `execution` sets a task-local identity and no span —
+    // so every line of model text and every tool call the hook emits would be attributed to the
+    // asker, while the record of what it cost names the answerer. One turn, split across two
+    // invocations, showing its activity under the wrong node.
+    let invocation = current_execution();
+    let span = tracing::info_span!(
+        "agent",
+        node,
+        "gen_ai.operation.name" = "invoke_agent",
+        "gen_ai.agent.name" = node,
+        span_id = invocation.map(|i| i.span_id.to_string()),
+        parent_span_id = invocation
+            .and_then(|i| i.parent_span_id)
+            .map(|p| p.to_string()),
+    );
+    let answer = async { agent.prompt(question).await }
+        .instrument(span)
+        .await;
     // No store to checkpoint to here, so it goes to the log. A one-shot question whose cost is
     // unknowable is the same defect as an uncounted node, in a smaller place.
     let (usage, calls) = meter.read();
@@ -3103,9 +3121,6 @@ where
         "gen_ai.agent.name" = node,
         "gen_ai.request.model" = %model_name,
         span_id = current_execution().map(|i| i.span_id.to_string()),
-        parent_span_id = current_execution()
-            .and_then(|i| i.parent_span_id)
-            .map(|p| p.to_string()),
         parent_span_id = current_execution()
             .and_then(|i| i.parent_span_id)
             .map(|p| p.to_string()),
