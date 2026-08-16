@@ -2675,6 +2675,13 @@ struct SpanEnd {
     invocation: Invocation,
     name: String,
     kind: ExecutionKind,
+    /// Whether the execution ran to the end, as against being dropped part way.
+    ///
+    /// Set after the work returns, so a guard dropped without it was cancelled — a run stopped, a
+    /// task abandoned. Closing an execution's liveness is not the same as saying it finished, and a
+    /// reader with only "it ended" has to treat the outcome as unknown: a cancelled node that read
+    /// as done was excluded from the candidates a failed run is attributed to.
+    completed: bool,
 }
 
 impl Drop for SpanEnd {
@@ -2689,6 +2696,7 @@ impl Drop for SpanEnd {
             parent_span_id,
             execution_name = %self.name,
             execution = self.kind.as_str(),
+            outcome = if self.completed { "completed" } else { "cancelled" },
             "execution ended"
         );
     }
@@ -2728,12 +2736,17 @@ pub async fn execution_as<F: Future>(
         execution = kind.as_str(),
         "execution started"
     );
-    let _end = SpanEnd {
+    let mut end = SpanEnd {
         invocation,
         name: name.to_string(),
         kind,
+        completed: false,
     };
-    EXECUTION.scope(invocation, work).await
+    let outcome = EXECUTION.scope(invocation, work).await;
+    // Reached only if the work returned. A future dropped part way never gets here, and its guard
+    // says so.
+    end.completed = true;
+    outcome
 }
 
 /// Run `work` as one execution: everything it records names this identity, and everything it

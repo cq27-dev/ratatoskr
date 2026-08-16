@@ -350,6 +350,11 @@ export interface LiveEvent {
    * execution: naming the asker here would open an invocation of the asker that never happened.
    */
   asked_by?: string;
+  /**
+   * How an execution ended, on a `span_end`: `completed`, or `cancelled` where the work was dropped
+   * part way. Ending is not finishing — without this the outcome is unknown.
+   */
+  outcome?: string;
 }
 
 /** What one attempt cost, off the event stream. */

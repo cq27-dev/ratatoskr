@@ -117,6 +117,14 @@ pub struct LiveEvent {
     /// prompt still has to say who is waiting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub asked_by: Option<String>,
+    /// How an execution ended, on a `span_end`: `completed`, or `cancelled` where the work was
+    /// dropped part way.
+    ///
+    /// Ending is not finishing. A record that says only "it ended" leaves the outcome unknown, and
+    /// a reader that took it for success excluded a cancelled node from the candidates a failed run
+    /// is attributed to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 /// What one attempt of a node cost.
@@ -340,6 +348,10 @@ fn to_event(record: &Value) -> LiveEvent {
                     .map(str::to_string)
                     .collect()
             }),
+        outcome: (kind == "span_end")
+            .then(|| str_field("outcome"))
+            .flatten()
+            .map(str::to_string),
         asked_by: (kind == "question")
             .then(|| str_field("from"))
             .flatten()
@@ -948,6 +960,7 @@ mod tests {
             controlled_as: None,
             tools_used: None,
             asked_by: None,
+            outcome: None,
         };
         let noise = LiveEvent {
             at: "t1".into(),
@@ -970,6 +983,7 @@ mod tests {
             controlled_as: None,
             tools_used: None,
             asked_by: None,
+            outcome: None,
         };
 
         // The question is the oldest event, well outside the replay window.

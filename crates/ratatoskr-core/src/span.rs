@@ -216,10 +216,17 @@ impl Attribution {
             })),
             invocation: match enclosing {
                 None => None,
-                Some(span) => id(span, "span_id")?.map(|span_id| Invocation {
-                    span_id,
-                    parent_span_id: id(span, "parent_span_id").ok().flatten(),
-                }),
+                // Both halves of the span, and both refused if either is unreadable. Swallowing the
+                // parent's error promoted the execution to a root — the shape a reader would then
+                // build, out of a value nobody could parse, and the opposite of what the same
+                // malformed field means when the record carries it itself.
+                Some(span) => match id(span, "span_id")? {
+                    None => None,
+                    Some(span_id) => Some(Invocation {
+                        span_id,
+                        parent_span_id: id(span, "parent_span_id")?,
+                    }),
+                },
             },
             // From the same span as the identity, so a turn's records keep the address its start
             // announced even where the start itself has been trimmed out of view.
@@ -234,6 +241,74 @@ impl Attribution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_is_attributed_from_one_source_and_refuses_what_it_cannot_read() {
+        let of = |value: serde_json::Value| Attribution::of(&value);
+
+        // Its own fields, taken together: an identity and no parent states that it has none.
+        let stated = of(serde_json::json!({
+            "kind": "checkpoint",
+            "node": "implementer",
+            "span_id": "00000000000000a1",
+            "spans": [{ "node": "analyst", "span_id": "00000000000000b2",
+                        "parent_span_id": "00000000000000c3" }],
+        }))
+        .unwrap();
+        assert_eq!(stated.node.as_deref(), Some("implementer"));
+        assert_eq!(
+            stated.invocation.and_then(|i| i.parent_span_id),
+            None,
+            "a record that names its own execution names its own parent, or has none"
+        );
+        assert!(stated.stated);
+
+        // Otherwise the innermost span naming an execution answers all of it, control address
+        // included — which is how a turn's records keep their address when its start is out of view.
+        let inherited = of(serde_json::json!({
+            "kind": "tool_call",
+            "tool": "Read",
+            "spans": [
+                { "node": "implementer", "span_id": "00000000000000a1" },
+                { "node": "analyst", "span_id": "00000000000000b2",
+                  "parent_span_id": "00000000000000a1", "controlled_as": "implementer" },
+            ],
+        }))
+        .unwrap();
+        assert_eq!(inherited.node.as_deref(), Some("analyst"));
+        assert_eq!(
+            inherited.invocation.map(|i| i.span_id),
+            SpanId::parse("00000000000000b2")
+        );
+        assert_eq!(inherited.controlled_as.as_deref(), Some("implementer"));
+        assert!(!inherited.stated);
+
+        // A lifecycle record is attributed to no node, whatever it carries.
+        let lifecycle = of(serde_json::json!({
+            "kind": "span_end",
+            "node": "implementer",
+            "span_id": "00000000000000c3",
+        }))
+        .unwrap();
+        assert_eq!(lifecycle.node, None);
+
+        // Present and unreadable is refused wherever it sits — on the record, or on the span it was
+        // emitted inside. Reading it as absent would report a nested execution as one the run drove.
+        for unreadable in [
+            serde_json::json!({ "kind": "usage", "span_id": "nope" }),
+            serde_json::json!({ "kind": "usage", "span_id": "00000000000000a1",
+                                "parent_span_id": "nope" }),
+            serde_json::json!({ "kind": "tool_call", "spans": [{ "span_id": "nope" }] }),
+            serde_json::json!({ "kind": "tool_call",
+                                "spans": [{ "span_id": "00000000000000a1",
+                                            "parent_span_id": "nope" }] }),
+        ] {
+            assert!(
+                of(unreadable.clone()).is_err(),
+                "{unreadable} names something that is not an execution"
+            );
+        }
+    }
 
     #[test]
     fn an_id_is_sixteen_hex_characters_and_reads_back_as_itself() {

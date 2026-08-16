@@ -313,7 +313,13 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       }
       found.member.end(found.attempt);
       found.attempt.ended = true;
-      if (found.attempt.state === "working") found.attempt.state = "done";
+      // Ending is not finishing. A `span_end` is emitted however the execution left — returned,
+      // errored, or dropped when the run was cancelled — so only one that says it COMPLETED settles
+      // the outcome. Taking any end for success rendered a cancelled node as done, and a failed run
+      // is attributed among the nodes still reading as working.
+      if (e.outcome === "completed" && found.attempt.state === "working") {
+        found.attempt.state = "done";
+      }
       continue;
     }
     if (!e.node) continue;
@@ -492,6 +498,9 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
             // composed member ENDING proves nothing about the box either: `implementer_attempt`
             // announces its end before the host that drove it writes the aggregate, so finishing
             // the box there drops its working state for the window in between.
+            // An execution that ended without saying HOW is still working as far as this reads:
+            // its outcome is nobody's record, the clause above keeps it working, and a failed run
+            // is attributed among the nodes that read that way.
             box.members.get(name)?.current()?.ended === true
             ? "done"
             : members.some((m) => current(m) && current(m)?.state !== "idle")

@@ -1350,7 +1350,7 @@ test("an invocation that writes no checkpoint is ended by its own span_end", () 
   const ended = inNodeBoxes(
     [
       attemptStart("characterizer", span, "opus"),
-      { at: "t", kind: "span_end", span_id: span, execution: "node", execution_name: "characterizer" },
+      { at: "t", kind: "span_end", outcome: "completed", span_id: span, execution: "node", execution_name: "characterizer" },
     ],
     stages,
   );
@@ -1368,7 +1368,7 @@ test("a composed member ending does not finish the box its host is still driving
   const mid = inNodeBoxes(
     [
       attemptStart("implementer_attempt", span, "opus"),
-      { at: "t", kind: "span_end", span_id: span, execution: "node", execution_name: "implementer_attempt" },
+      { at: "t", kind: "span_end", outcome: "completed", span_id: span, execution: "node", execution_name: "implementer_attempt" },
     ],
     stages,
   );
@@ -1378,7 +1378,7 @@ test("a composed member ending does not finish the box its host is still driving
   const whole = inNodeBoxes(
     [
       attemptStart("implementer_attempt", span, "opus"),
-      { at: "t", kind: "span_end", span_id: span, execution: "node", execution_name: "implementer_attempt" },
+      { at: "t", kind: "span_end", outcome: "completed", span_id: span, execution: "node", execution_name: "implementer_attempt" },
       checkpointed("implementer"),
     ],
     stages,
@@ -1396,7 +1396,7 @@ test("an end seen before anything else of its execution still ends it", () => {
   const span = "00000000000000e5";
   const tail = inNodeBoxes(
     [
-      { at: "t", kind: "span_end", span_id: span, execution: "node", execution_name: "characterizer" },
+      { at: "t", kind: "span_end", outcome: "completed", span_id: span, execution: "node", execution_name: "characterizer" },
       called("characterizer", "Read", span),
     ],
     stages,
@@ -1681,7 +1681,7 @@ test("a usage record carries what a turn reached for and whether it failed", () 
     [
       attemptStart("analyst", span, "opus"),
       failed,
-      { at: "t", kind: "span_end", span_id: span, execution: "node", execution_name: "analyst" },
+      { at: "t", kind: "span_end", outcome: "completed", span_id: span, execution: "node", execution_name: "analyst" },
     ],
     stages,
   );
@@ -1689,4 +1689,33 @@ test("a usage record carries what a turn reached for and whether it failed", () 
 
   expect([...box.telemetry.tools_used]).toEqual(["Read", "Grep"]);
   expect(box.state).toBe("failed");
+});
+
+test("an execution that was cancelled is not reported as having finished", () => {
+  // `span_end` is emitted however an execution leaves — returned, errored, or dropped when the run
+  // was stopped. Reading any end as success rendered a cancelled node as done, and a failed run is
+  // attributed among the nodes still reading as working: the one that died was excluded from its
+  // own reconciliation.
+  const shape = [composed("characterizer", "idle")];
+  const stages = registry(["characterizer"]);
+  const span = "00000000000000f7";
+  const cancelled = inNodeBoxes(
+    [
+      attemptStart("characterizer", span, "opus"),
+      {
+        at: "t",
+        kind: "span_end",
+        outcome: "cancelled",
+        span_id: span,
+        execution: "node",
+        execution_name: "characterizer",
+      },
+    ],
+    stages,
+  );
+
+  // Not done: nothing recorded how it went, and a viewer told "done" is told something nobody knows.
+  expect(nodesFromEvents(cancelled).get("characterizer").state).toBe("working");
+  // Which is what keeps it a candidate when the run is reconciled as failed.
+  expect(applyDerived(shape, nodesFromEvents(cancelled), "failed")[0].state).toBe("failed");
 });
