@@ -144,6 +144,9 @@ pub async fn run_acceptance(a: Acceptance<'_>) -> Result<Vec<StepOutcome>, Strin
             // under whichever invocation is in flight, and a suite runs from a host call whose
             // aggregate names a different one.
             span_id = ratatoskr_agent::current_execution().map(|i| i.span_id.to_string()),
+            parent_span_id = ratatoskr_agent::current_execution()
+                .and_then(|i| i.parent_span_id)
+                .map(|p| p.to_string()),
             step = %step.name,
             command = %step.command.join(" "),
             exit_code = out.exit_code,

@@ -1343,28 +1343,24 @@ test("an event about a running node does not open an invocation nothing can clos
 });
 
 test("an invocation that writes no checkpoint is ended by its own span_end", () => {
-  // An evidence-only stage, a turn whose failure the workflow recovered from, an answerer: all
-  // executions that end without a record of their own. Nothing in the stream could close them, so
-  // the box they belong to stayed working with its controls offered for the rest of the run.
+  // An evidence-only stage, and a turn whose failure the workflow recovered from: executions that
+  // end without a record of their own, so nothing in the stream could close them and the box worked
+  // for the rest of the run with its Stop still offered.
   //
-  // The lifecycle event is what closes them. It names an execution and no node — a host call is an
+  // The lifecycle event closes them. It names an execution and no node — a host call is an
   // execution the shape cannot place — so it is matched by identity wherever that execution is.
-  const shape = [composed("redteam", "idle")];
-  const stages = registry(["redteam", "redteam_author"]);
+  const shape = [composed("characterizer", "idle")];
+  const stages = registry(["characterizer"]);
   const span = "00000000000000f6";
-  const ran = [attemptStart("redteam_author", span, "opus"), checkpointed("redteam")];
 
-  // The box's own aggregate has landed, and the member is still going: still working, and the Stop
-  // is still aimed at it. That is the case this must not break.
-  const working = inNodeBoxes(ran, stages);
-  expect(applied(shape, working)[0].state).toBe("working");
-  expect(workingNodeNames(shape, working)).toEqual(["redteam"]);
+  const running = inNodeBoxes([attemptStart("characterizer", span, "opus")], stages);
+  expect(applied(shape, running)[0].state).toBe("working");
+  expect(workingNodeNames(shape, running)).toEqual(["characterizer"]);
 
-  // Once the member's execution ends — with no checkpoint of its own, ever — the box is finished.
   const ended = inNodeBoxes(
     [
-      ...ran,
-      { at: "t", kind: "span_end", span_id: span, execution: "node", execution_name: "redteam_author" },
+      attemptStart("characterizer", span, "opus"),
+      { at: "t", kind: "span_end", span_id: span, execution: "node", execution_name: "characterizer" },
     ],
     stages,
   );
@@ -1372,34 +1368,52 @@ test("an invocation that writes no checkpoint is ended by its own span_end", () 
   expect(workingNodeNames(shape, ended)).toEqual([]);
 });
 
-test("a box with no record of its own finishes only when its members ANNOUNCE they are over", () => {
-  // The distinction this turns on, and getting it wrong either way is visible. A member's
-  // checkpoint says the BOX STARTED — its peer may still be to run, and the box's own aggregate is
-  // what finishes it. Only an execution announcing its end says nothing more is coming, which is
-  // the one case where no aggregate will ever arrive.
-  const shape = [composed("redteam", "idle")];
-  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
-  const span = "0000000000000a11";
-
-  // The classifier has finished and the author has not started. Still working: the box has no
-  // record of its own, and a member's checkpoint is not one.
-  const half = inNodeBoxes(
-    [attemptStart("redteam_classifier", span, "opus"), attemptCheckpoint("redteam_classifier", span, 5)],
-    stages,
-  );
-  expect(applied(shape, half)[0].state).toBe("working");
-
-  // The same member, its execution announcing it is over. Now nothing is running and nothing is
-  // coming, so the Stop is not still offered against it.
-  const over = inNodeBoxes(
+test("a composed member ending does not finish the box its host is still driving", () => {
+  // `implementer_attempt` announces its end BEFORE the host that drove it runs the suite and writes
+  // the aggregate. Reading one member's end as the box's would drop the implementer's working state
+  // for the window in between — and a graph that draws hand-offs from state would draw one.
+  const shape = [composed("implementer", "idle")];
+  const stages = registry(["implementer", "implementer_attempt"]);
+  const span = "00000000000000d4";
+  const mid = inNodeBoxes(
     [
-      attemptStart("redteam_classifier", span, "opus"),
-      { at: "t", kind: "span_end", span_id: span, execution: "node", execution_name: "redteam_classifier" },
+      attemptStart("implementer_attempt", span, "opus"),
+      { at: "t", kind: "span_end", span_id: span, execution: "node", execution_name: "implementer_attempt" },
     ],
     stages,
   );
-  expect(applied(shape, over)[0].state).toBe("done");
-  expect(workingNodeNames(shape, over)).toEqual([]);
+  expect(applied(shape, mid)[0].state).toBe("working");
+
+  // The host's own record is what finishes it, as it always was.
+  const whole = inNodeBoxes(
+    [
+      attemptStart("implementer_attempt", span, "opus"),
+      { at: "t", kind: "span_end", span_id: span, execution: "node", execution_name: "implementer_attempt" },
+      checkpointed("implementer"),
+    ],
+    stages,
+  );
+  expect(applied(shape, whole)[0].state).toBe("done");
+});
+
+test("an end seen before anything else of its execution still ends it", () => {
+  // The guard emitting `span_end` drops as the execution leaves, which is BEFORE its caller writes
+  // anything about it — and an imported tail can begin anywhere, so the end may be the first record
+  // of that execution in view. Dropped, whatever follows opens an attempt that never ended, and a
+  // box with no aggregate of its own reads working for the rest of the run with its Stop offered.
+  const shape = [composed("characterizer", "idle")];
+  const stages = registry(["characterizer"]);
+  const span = "00000000000000e5";
+  const tail = inNodeBoxes(
+    [
+      { at: "t", kind: "span_end", span_id: span, execution: "node", execution_name: "characterizer" },
+      called("characterizer", "Read", span),
+    ],
+    stages,
+  );
+
+  expect(nodesFromEvents(tail).get("characterizer").state).toBe("done");
+  expect(workingNodeNames(shape, tail)).toEqual([]);
 });
 
 test("a finished invocation does not stand in for one still running", () => {

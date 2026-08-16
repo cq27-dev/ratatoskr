@@ -237,6 +237,15 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
    * is its only output, a turn whose failure the workflow recovered from.
    */
   const everywhere = new Map<string, { member: Member; attempt: Attempt }>();
+  /**
+   * Executions whose end arrived before anything that names them.
+   *
+   * The guard that emits a `span_end` drops as the execution leaves, which is BEFORE its caller
+   * writes the checkpoint — so in an imported tail whose `node_start` was rotated away, the end is
+   * the first record of that execution this view sees. Dropped, the checkpoint that follows creates
+   * an attempt that never ended, and a box with no aggregate of its own works forever.
+   */
+  const endedEarly = new Set<string>();
 
   const make = (span: string, live: boolean, started: boolean): Attempt => ({
     span,
@@ -256,6 +265,12 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
   const attemptFor = (member: Member, e: BoxedEvent, span: string): Attempt => {
     const found = member.for(e, span, (live) => make(span, live, false));
     if (!everywhere.has(found.span)) everywhere.set(found.span, { member, attempt: found });
+    // An end this view saw before it saw anything else of that execution.
+    if (endedEarly.has(found.span)) {
+      member.end(found);
+      found.ended = true;
+      if (found.state === "working") found.state = "done";
+    }
     return found;
   };
 
@@ -264,11 +279,13 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     // is — the only thing that can, for an invocation that writes no checkpoint.
     if (e.kind === "span_end" && e.span_id) {
       const found = everywhere.get(e.span_id);
-      if (found) {
-        found.member.end(found.attempt);
-        found.attempt.ended = true;
-        if (found.attempt.state === "working") found.attempt.state = "done";
+      if (!found) {
+        endedEarly.add(e.span_id);
+        continue;
       }
+      found.member.end(found.attempt);
+      found.attempt.ended = true;
+      if (found.attempt.state === "working") found.attempt.state = "done";
       continue;
     }
     if (!e.node) continue;
@@ -377,7 +394,10 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // `detail` carries the tool name for this kind.
       if (e.detail) attempt.used.add(e.detail);
     }
-    if (WORKING.has(e.kind)) attemptFor(member, e, span).state = "working";
+    // Not over an execution that has announced its end: a record can arrive after it, and one that
+    // means "this is running" does not make it run again.
+    const seen = attemptFor(member, e, span);
+    if (WORKING.has(e.kind) && !seen.ended) seen.state = "working";
   }
 
   const out = new Map<string, DerivedNode>();
@@ -405,14 +425,17 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
         ? "failed"
         : box.checkpoints > 0
           ? "done"
-          : // No record of the box's own, and every member's execution has ANNOUNCED its end.
-            // Nothing is running and nothing more is coming: an evidence-only stage and a turn
-            // whose failure the workflow recovered from write no aggregate ever, so a box waiting
-            // for one works for the rest of the run with its Stop still offered.
+          : // No record of the box's own, and the box's OWN member has announced its end. That is
+            // the stage that is its own node — an evidence-only one, or a turn whose failure the
+            // workflow recovered from — which writes no aggregate ever, so a box waiting for one
+            // works for the rest of the run with its Stop still offered.
             //
-            // A member's CHECKPOINT is not this. That says the box STARTED — a peer may still be to
-            // run, and the box's own record is what finishes it.
-            members.length > 0 && members.every((m) => current(m)?.ended)
+            // The box's own, not any member's, and two different things would go wrong otherwise.
+            // A member's CHECKPOINT says the box STARTED, since a peer may still be to run. And a
+            // composed member ENDING proves nothing about the box either: `implementer_attempt`
+            // announces its end before the host that drove it writes the aggregate, so finishing
+            // the box there drops its working state for the window in between.
+            box.members.get(name)?.current()?.ended === true
             ? "done"
             : members.some((m) => current(m) && current(m)?.state !== "idle")
               ? "working"
@@ -716,6 +739,15 @@ export function liveNodes(events: readonly BoxedEvent[]): Map<string, LiveNode> 
 
   const boxes = new Map<string, Map<string, Member>>();
   const everywhere = new Map<string, { member: Member; attempt: Attempt }>();
+  /**
+   * Executions whose end arrived before anything that names them.
+   *
+   * The guard that emits a `span_end` drops as the execution leaves, which is BEFORE its caller
+   * writes the checkpoint — so in an imported tail whose `node_start` was rotated away, the end is
+   * the first record of that execution this view sees. Dropped, the checkpoint that follows creates
+   * an attempt that never ended, and a box with no aggregate of its own works forever.
+   */
+  const endedEarly = new Set<string>();
   const made = (span: string, live: boolean, started: boolean): Attempt => ({
     span,
     live,
@@ -730,10 +762,12 @@ export function liveNodes(events: readonly BoxedEvent[]): Map<string, LiveNode> 
     // checkpoints. Matched by identity, exactly as the checkpointed fold matches it.
     if (e.kind === "span_end" && e.span_id) {
       const found = everywhere.get(e.span_id);
-      if (found) {
-        found.member.end(found.attempt);
-        found.attempt.ended = true;
+      if (!found) {
+        endedEarly.add(e.span_id);
+        continue;
       }
+      found.member.end(found.attempt);
+      found.attempt.ended = true;
       continue;
     }
     if (!e.node) continue;
@@ -745,6 +779,11 @@ export function liveNodes(events: readonly BoxedEvent[]): Map<string, LiveNode> 
     const span = keyOf(e, name);
     const remember = (attempt: Attempt) => {
       if (!everywhere.has(attempt.span)) everywhere.set(attempt.span, { member, attempt });
+      // An end this view saw before it saw anything else of that execution.
+      if (endedEarly.has(attempt.span)) {
+        member.end(attempt);
+        attempt.ended = true;
+      }
       return attempt;
     };
 

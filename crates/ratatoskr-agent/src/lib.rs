@@ -586,6 +586,9 @@ where
         // the answerer, and both halves of that say so.
         node,
         span_id = current_execution().map(|i| i.span_id.to_string()),
+        parent_span_id = current_execution()
+            .and_then(|i| i.parent_span_id)
+            .map(|p| p.to_string()),
         "gen_ai.usage.input_tokens" = usage.input_tokens,
         "gen_ai.usage.output_tokens" = usage.output_tokens,
         "gen_ai.usage.cached_input_tokens" = usage.cached_input_tokens,
@@ -3103,6 +3106,9 @@ where
         parent_span_id = current_execution()
             .and_then(|i| i.parent_span_id)
             .map(|p| p.to_string()),
+        parent_span_id = current_execution()
+            .and_then(|i| i.parent_span_id)
+            .map(|p| p.to_string()),
     );
     // Announced at the start, because a checkpoint only exists once the node has finished — and
     // the moment a reader most wants to know what a node is running on is while it is still
@@ -3217,6 +3223,9 @@ where
             kind = "usage",
             node,
             span_id = current_execution().map(|i| i.span_id.to_string()),
+            parent_span_id = current_execution()
+                .and_then(|i| i.parent_span_id)
+                .map(|p| p.to_string()),
             "gen_ai.usage.input_tokens" = telemetry.usage.input_tokens,
             "gen_ai.usage.output_tokens" = telemetry.usage.output_tokens,
             "gen_ai.usage.cached_input_tokens" = telemetry.usage.cached_input_tokens,
