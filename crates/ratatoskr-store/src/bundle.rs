@@ -514,7 +514,7 @@ mod tests {
         // already taken, that is quadratic in the chain's length — and a bundle is the one
         // checkpoint path this process did not produce, so its shape is whatever an author chose.
         use ratatoskr_core::span::{Invocation, SpanId};
-        let deep = 20_000u64;
+        let deep = 30_000u64;
         let id = |n: u64| SpanId::new(n.to_be_bytes()).expect("nonzero");
         let chain: Vec<Checkpoint> = (1..=deep)
             .map(|n| {
@@ -529,15 +529,18 @@ mod tests {
             })
             .collect();
 
+        // Warmed first, and bounded well clear of both answers: scanning the steps already taken
+        // takes about a second and a half at this length, walking them once a few milliseconds. The
+        // suite runs in parallel, so the bound has to survive a loaded machine without losing the
+        // distinction it exists to draw.
+        super::check_execution_graph("warm", &chain, &[]).expect("a chain is not a cycle");
         let started = std::time::Instant::now();
-        let store = Store::open_in_memory().unwrap();
         super::check_execution_graph("deep", &chain, &[]).expect("a chain is not a cycle");
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(250),
+            started.elapsed() < std::time::Duration::from_millis(500),
             "checking a chain of {deep} took {:?}",
             started.elapsed()
         );
-        drop(store);
     }
 
     #[tokio::test]

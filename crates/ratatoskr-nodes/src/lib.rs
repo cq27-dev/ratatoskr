@@ -247,16 +247,15 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
     // node that used zero tokens is a claim rather than an absence. Everything else is already
     // optional and simply travels as it is.
     let spent = logged.ran_a_model().then_some(&logged.usage);
+    let (span_id, parent_span_id) = ratatoskr_agent::ids_of_execution(invocation);
     tracing::info!(
         kind = "checkpoint",
         node = r.node,
         // The event carries the identity for the same reason the row does, and because a live
         // reader has nothing else: it sees a name and a moment, and two invocations of one stage
         // are the same name at two moments.
-        span_id = invocation.map(|i| i.span_id.to_string()),
-        parent_span_id = invocation
-            .and_then(|i| i.parent_span_id)
-            .map(|p| p.to_string()),
+        span_id,
+        parent_span_id,
         bytes = json.len(),
         iteration = r.iteration,
         model = logged.model.as_deref(),
@@ -1055,6 +1054,13 @@ mod checkpoint_event_tests {
         }
     }
 
+    /// Held while a test collects records, so only one does at a time.
+    ///
+    /// `set_default` installs a subscriber for the calling thread, and the suite runs its tests in
+    /// parallel on a pool: two collecting at once occasionally read each other's, which shows up as
+    /// a count that is short rather than as anything obviously wrong.
+    static COLLECTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Emit one checkpoint through the real path and read back the JSON it produced.
     ///
     /// `None` is the aggregate case: an operation host writes its record with no turn to claim, so
@@ -1073,6 +1079,7 @@ mod checkpoint_event_tests {
         if let Some(telemetry) = telemetry {
             ledger.record("redteam", telemetry);
         }
+        let _collecting = COLLECTING.lock().await;
         let buf = Buffer::default();
         // The same layer options `init_logging` installs — a shape assertion against a differently
         // configured sink would pin nothing that ships.
@@ -1107,6 +1114,7 @@ mod checkpoint_event_tests {
     /// Every record a scope emitted, in order.
     async fn events_of<F: Future<Output = ()>>(work: F) -> Vec<serde_json::Value> {
         use tracing_subscriber::layer::SubscriberExt as _;
+        let _collecting = COLLECTING.lock().await;
         let buf = Buffer::default();
         let layer = tracing_subscriber::fmt::layer()
             .json()

@@ -6,7 +6,6 @@ import {
   forkHandoff,
   handoffDrawn,
   inNodeBoxes,
-  liveNodes,
   nodesFromEvents,
   skippedSpans,
   stagesOf,
@@ -732,14 +731,14 @@ test("the live map is keyed by the box, so the box draws with what its member an
   };
   const events = [announced, called];
 
-  const raw = liveNodes(events);
+  const raw = nodesFromEvents(events);
   expect([...raw.keys()]).toEqual(["context_distillation"]);
   expect(raw.get("context")).toBeUndefined();
 
-  const boxed = liveNodes(inNodeBoxes(events, stages));
+  const boxed = nodesFromEvents(inNodeBoxes(events, stages));
   expect([...boxed.keys()]).toEqual(["context"]);
   const box = boxed.get("context");
-  expect(box.facts.model).toBe("anthropic/claude-sonnet-5");
+  expect(box.telemetry.model).toBe("anthropic/claude-sonnet-5");
   expect(box.cycles).toBe(1);
   expect([...box.used]).toEqual(["Read"]);
 });
@@ -766,17 +765,17 @@ test("the live map keeps a member's activity when a sibling starts beside it", (
     called("redteam_author", "Write"),
   ];
 
-  const box = liveNodes(inNodeBoxes(events, stages)).get("redteam");
+  const box = nodesFromEvents(inNodeBoxes(events, stages)).get("redteam");
   expect(box.cycles).toBe(2);
   expect([...box.used].sort()).toEqual(["Grep", "Write"]);
   // And the same for what they announced: a box running two profiles names both, exactly as the
   // checkpointed fold beside this one does.
-  expect(box.facts.model).toBe("anthropic/claude-haiku-5, anthropic/claude-sonnet-5");
+  expect(box.telemetry.model).toBe("anthropic/claude-haiku-5, anthropic/claude-sonnet-5");
 
   // Per MEMBER, not per invocation: a member re-entered starts its own counts again, and #285 is
   // where a second invocation of one stage gets numbers of its own.
   const again = [...events, announced("redteam_classifier", "anthropic/claude-haiku-5")];
-  const reentered = liveNodes(inNodeBoxes(again, stages)).get("redteam");
+  const reentered = nodesFromEvents(inNodeBoxes(again, stages)).get("redteam");
   expect(reentered.cycles).toBe(1);
   expect([...reentered.used]).toEqual(["Write"]);
 });
@@ -797,16 +796,12 @@ test("a member re-entering restarts its counts whether or not it announces facts
   ];
 
   const boxed = inNodeBoxes(events, stages);
-  const live = liveNodes(boxed).get("analyst");
+  const live = nodesFromEvents(boxed).get("analyst");
   expect(live.cycles).toBe(1);
   expect([...live.used]).toEqual(["Write"]);
-  // The two folds answer the same question the same way.
-  const derived = nodesFromEvents(boxed).get("analyst");
-  expect(live.cycles).toBe(derived.cycles);
-  expect([...live.used]).toEqual([...derived.used]);
   // And what it announced first survives a restart that announced nothing — the model is a fact
   // about the member, not about the attempt.
-  expect(live.facts.model).toBe("m");
+  expect(live.telemetry.model).toBe("m");
 });
 
 test("a usage event costs the member whatever it reports, zero included", () => {
@@ -1250,8 +1245,8 @@ test("a record whose start this view never saw gets its own attempt", () => {
 });
 
 test("a tool call from the older of two live invocations is not shown against the newer", () => {
-  // The graph draws live cycles and tools from `liveNodes`, so a fold that is invocation-aware in
-  // one place and member-keyed in the other still shows the wrong thing. `Promise.all` overlaps two
+  // The graph draws live cycles and tools from the same fold the boxes come from — it used to
+  // come from a second one, member-keyed, which showed the wrong thing. `Promise.all` overlaps two
   // invocations of one stage: A's tool call arrives after B has started, and keyed by name it lands
   // on B — which is drawn as the box's live activity.
   const stages = registry(["probe"]);
@@ -1274,16 +1269,11 @@ test("a tool call from the older of two live invocations is not shown against th
   const boxed = inNodeBoxes(events, stages);
 
   // The current invocation is B, and what it has done is its own — one call, not three.
-  const live = liveNodes(boxed).get("probe");
+  const live = nodesFromEvents(boxed).get("probe");
   expect(live.cycles).toBe(1);
   expect([...live.used]).toEqual(["Write"]);
-  expect(live.facts.model).toBe("sonnet");
+  expect(live.telemetry.model).toBe("sonnet");
 
-  // The two folds answer the same question the same way, which is what keeps a box's live counts
-  // and its checkpointed ones describing one attempt.
-  const derived = nodesFromEvents(boxed).get("probe");
-  expect(derived.cycles).toBe(live.cycles);
-  expect([...derived.used]).toEqual([...live.used]);
 });
 
 test("a running attempt shows its own pending figures, not the finished one's", () => {
@@ -1434,14 +1424,14 @@ test("a finished invocation does not stand in for one still running", () => {
   const box = nodesFromEvents(boxed).get("probe");
   expect(box.state).toBe("working");
   expect(box.telemetry.model).toBe("opus");
-  const live = liveNodes(boxed).get("probe");
+  const live = nodesFromEvents(boxed).get("probe");
   expect([...live.used]).toEqual(["Read"]);
-  expect(live.facts.model).toBe("opus");
+  expect(live.telemetry.model).toBe("opus");
 });
 
 test("folding a long history costs what the history costs", () => {
   // An imported bundle has no bound on how many times a stage was invoked. Searching a member's
-  // attempts per record is quadratic in that number, and both folds run on every render and every
+  // attempts per record is quadratic in that number, and the fold runs on every render and every
   // scrub of the timeline.
   const stages = registry(["implementer"]);
   const many = 20_000;
@@ -1454,7 +1444,7 @@ test("folding a long history costs what the history costs", () => {
 
   const started = performance.now();
   const box = nodesFromEvents(boxed).get("implementer");
-  liveNodes(boxed);
+  nodesFromEvents(boxed);
   expect(performance.now() - started).toBeLessThan(500);
   expect(box.checkpoints).toBe(many);
   // The last invocation's own figures, not the sum of twenty thousand.
@@ -1476,7 +1466,7 @@ test("overlapping invocations cost what they cost to end", () => {
 
   const started = performance.now();
   const box = nodesFromEvents(boxed).get("probe");
-  liveNodes(boxed);
+  nodesFromEvents(boxed);
   expect(performance.now() - started).toBeLessThan(500);
   expect(box.checkpoints).toBe(many);
   expect(box.state).toBe("done");

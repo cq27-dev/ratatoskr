@@ -478,14 +478,9 @@ impl<'a> TurnSubject<'a> {
         }
     }
 
-    fn span_id(&self) -> Option<String> {
-        self.invocation.map(|i| i.span_id.to_string())
-    }
-
-    fn parent_span_id(&self) -> Option<String> {
-        self.invocation
-            .and_then(|i| i.parent_span_id)
-            .map(|p| p.to_string())
+    /// Its identity and parentage as a record states them — the pair, never one of them.
+    fn ids(&self) -> (Option<String>, Option<String>) {
+        ids_of_execution(self.invocation)
     }
 
     /// Announce a turn before it waits on the provider.
@@ -494,13 +489,14 @@ impl<'a> TurnSubject<'a> {
     /// most wants to know what is running is while it is still running. A turn that announces
     /// nothing until its first response is invisible for exactly as long as it is slow.
     fn started(&self, facts: TurnFacts<'_>) {
+        let (span_id, parent_span_id) = self.ids();
         tracing::info!(
             kind = "node_start",
             node = self.node,
             // Which execution is starting, so a live reader can pair this with the record that
             // closes it — and tell a second attempt from the first, which shares its name.
-            span_id = self.span_id(),
-            parent_span_id = self.parent_span_id(),
+            span_id,
+            parent_span_id,
             controlled_as = self.controlled_as,
             model = facts.model,
             tools = %facts.tools.join(","),
@@ -516,11 +512,12 @@ impl<'a> TurnSubject<'a> {
     /// that sees a cost stops falling back to the store, so a partial report is displayed as
     /// measured absence — no model, no turns, no duration.
     fn spent(&self, telemetry: &NodeTelemetry) {
+        let (span_id, parent_span_id) = self.ids();
         tracing::info!(
             kind = "usage",
             node = self.node,
-            span_id = self.span_id(),
-            parent_span_id = self.parent_span_id(),
+            span_id,
+            parent_span_id,
             "gen_ai.usage.input_tokens" = telemetry.usage.input_tokens,
             "gen_ai.usage.output_tokens" = telemetry.usage.output_tokens,
             "gen_ai.usage.cached_input_tokens" = telemetry.usage.cached_input_tokens,
@@ -696,8 +693,8 @@ where
         "gen_ai.operation.name" = "invoke_agent",
         "gen_ai.agent.name" = node,
         "gen_ai.request.model" = %route.model,
-        span_id = subject.span_id(),
-        parent_span_id = subject.parent_span_id(),
+        span_id = subject.ids().0,
+        parent_span_id = subject.ids().1,
     );
     // Announced before the wait, like any other turn. An answerer that says nothing until its first
     // response is invisible for exactly as long as it is slow — and a clarification is the case
@@ -2670,13 +2667,14 @@ struct SpanEnd {
 
 impl Drop for SpanEnd {
     fn drop(&mut self) {
+        // The same pair its start named. Absent parentage means the run drove this execution, which
+        // is a claim about the run's shape — so a nested end that stated nothing described itself
+        // as top-level, and the two halves of one execution disagreed.
+        let (span_id, parent_span_id) = ids_of_execution(Some(self.invocation));
         tracing::info!(
             kind = "span_end",
-            span_id = %self.invocation.span_id,
-            // The same parentage its start named. Absent means the run drove this execution, which
-            // is a claim about the run's shape — so a nested end that stated nothing described
-            // itself as top-level, and the two halves of one execution disagreed.
-            parent_span_id = self.invocation.parent_span_id.map(|p| p.to_string()),
+            span_id,
+            parent_span_id,
             execution_name = %self.name,
             execution = self.kind.as_str(),
             "execution ended"
@@ -2709,10 +2707,11 @@ pub async fn execution_as<F: Future>(
     // not a box: the shape cannot place `redTeam` or `isConverged`, and a reader that folds every
     // event carrying `node` into node state would give a run a trailing column per host it called.
     // What a lifecycle record says is which execution began, not which box it belongs to.
+    let (span_id, parent_span_id) = ids_of_execution(Some(invocation));
     tracing::info!(
         kind = "span_start",
-        span_id = %invocation.span_id,
-        parent_span_id = invocation.parent_span_id.map(|p| p.to_string()),
+        span_id,
+        parent_span_id,
         execution_name = %name,
         execution = kind.as_str(),
         "execution started"
@@ -2735,6 +2734,25 @@ pub async fn execution_as<F: Future>(
 /// scope at all, which would leave it with no identity.
 pub async fn execution<F: Future>(name: &str, kind: ExecutionKind, work: F) -> F::Output {
     execution_as(mint_span_id(), name, kind, work).await
+}
+
+/// The running execution's identity and parentage, as a record states them.
+///
+/// One call, because the two are one answer: a record that names an execution and takes its parent
+/// from somewhere else describes a parentage that never existed. `(None, None)` outside every
+/// execution, which is the truth about a record written there.
+pub fn execution_ids() -> (Option<String>, Option<String>) {
+    ids_of_execution(current_execution())
+}
+
+/// How an execution is written down: sixteen hex characters, and the same for what invoked it.
+pub fn ids_of_execution(invocation: Option<Invocation>) -> (Option<String>, Option<String>) {
+    (
+        invocation.map(|i| i.span_id.to_string()),
+        invocation
+            .and_then(|i| i.parent_span_id)
+            .map(|p| p.to_string()),
+    )
 }
 
 /// Which execution the running future is, and what invoked it.
@@ -3236,10 +3254,8 @@ where
         "gen_ai.operation.name" = "invoke_agent",
         "gen_ai.agent.name" = node,
         "gen_ai.request.model" = %model_name,
-        span_id = current_execution().map(|i| i.span_id.to_string()),
-        parent_span_id = current_execution()
-            .and_then(|i| i.parent_span_id)
-            .map(|p| p.to_string()),
+        span_id = execution_ids().0,
+        parent_span_id = execution_ids().1,
     );
     // Announced at the start, because a checkpoint only exists once the node has finished — and
     // the moment a reader most wants to know what a node is running on is while it is still

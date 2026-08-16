@@ -4,7 +4,6 @@ import {
   applyDerived,
   convergeLoops,
   inNodeBoxes,
-  liveNodes,
   nodesFromEvents,
   stagesOf,
   workingNodeNames,
@@ -405,6 +404,16 @@ export default function App() {
   );
 
   /**
+   * The stream folded into per-node state, once.
+   *
+   * Everything drawn from the stream reads this: the boxes' state and counts, and what fills a box
+   * while it works. A second fold over the same events keeps the same per-attempt bookkeeping, and
+   * the two then have to be kept agreeing about which invocation is current and what it has spent —
+   * a question with one answer.
+   */
+  const derived = useMemo(() => nodesFromEvents(boxedShown), [boxedShown]);
+
+  /**
    * Every node's box, rebuilt from the stream rather than read from the store.
    *
    * The store holds each node's LATEST row, so at any point but the end it answers a different
@@ -430,8 +439,8 @@ export default function App() {
     // is not a pipeline node, so the derivation is legitimately empty; falling back to the store
     // there showed every node finished, with its final counts, at step one of the run.
     if (!shownEvents.length) return detail.nodes;
-    return applyDerived(detail.nodes, nodesFromEvents(boxedShown), ended);
-  }, [detail, shownEvents, boxedShown, ended, loading]);
+    return applyDerived(detail.nodes, derived, ended);
+  }, [detail, shownEvents, derived, ended, loading]);
 
   /**
    * Which nodes are working right now — what stop and steer can be aimed at.
@@ -481,9 +490,11 @@ export default function App() {
 
   // What a node announced when it started, plus its tool calls so far. A checkpoint carries the
   // same facts, but only once the node has stopped — this is what fills the box while it works.
-  // Keyed by box, like everything else the graph asks: `PipelineGraph` looks it up under the box's
-  // name, and a member's announcement is the box's.
-  const live = useMemo(() => liveNodes(boxedShown), [boxedShown]);
+  //
+  // The same fold the boxes come from, not a second one over the same stream: two folds keeping the
+  // same per-attempt state have to be kept agreeing about which invocation is current, which is a
+  // question with one answer.
+  const live = derived;
 
   /**
    * How many times the implementer was re-entered, split by the route that brought it back.

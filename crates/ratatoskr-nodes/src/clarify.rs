@@ -170,17 +170,17 @@ impl NodeClarifier {
 
         // Emit before waiting: the dashboard learns about the question by tailing this, so it has
         // to be on disk before the request that blocks on an answer.
+        //
+        // The waiting belongs to the exchange, which is its own execution. `execution` sets a
+        // task-local identity and no span, so a record that states nothing is read against the
+        // ASKING node's span — filing the wait under the asker while the exchange's own checkpoint
+        // and lifecycle name the child.
+        let (span_id, parent_span_id) = ratatoskr_agent::execution_ids();
         tracing::info!(
             kind = "question",
             question_id,
-            // The waiting belongs to the exchange, which is its own execution. `execution` sets a
-            // task-local identity and no span, so a record that states nothing is read against the
-            // ASKING node's span — filing the wait under the asker while the exchange's own
-            // checkpoint and lifecycle name the child.
-            span_id = ratatoskr_agent::current_execution().map(|i| i.span_id.to_string()),
-            parent_span_id = ratatoskr_agent::current_execution()
-                .and_then(|i| i.parent_span_id)
-                .map(|p| p.to_string()),
+            span_id,
+            parent_span_id,
             from,
             question,
             "waiting on the user"
@@ -200,13 +200,12 @@ impl NodeClarifier {
         // Always announce the outcome, including the ordinary one where nobody answered. The
         // dashboard clears its prompt on this event, so without it a viewer is left staring at a
         // question the run has long since moved past.
+        let (span_id, parent_span_id) = ratatoskr_agent::execution_ids();
         tracing::info!(
             kind = "question_answered",
             question_id,
-            span_id = ratatoskr_agent::current_execution().map(|i| i.span_id.to_string()),
-            parent_span_id = ratatoskr_agent::current_execution()
-                .and_then(|i| i.parent_span_id)
-                .map(|p| p.to_string()),
+            span_id,
+            parent_span_id,
             answered = answer.is_some(),
             "question resolved"
         );
