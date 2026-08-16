@@ -518,6 +518,11 @@ impl<'a> TurnSubject<'a> {
             node = self.node,
             span_id,
             parent_span_id,
+            // The address rides on every record that states its own identity, because stating one
+            // is what STOPS the reader falling back to the span that carries it. A tail whose
+            // start has scrolled away reconstructs the attempt from this record, and an answerer
+            // without its address reads as controllable — a Stop nothing polls.
+            controlled_as = self.controlled_as,
             "gen_ai.usage.input_tokens" = telemetry.usage.input_tokens,
             "gen_ai.usage.output_tokens" = telemetry.usage.output_tokens,
             "gen_ai.usage.cached_input_tokens" = telemetry.usage.cached_input_tokens,
@@ -4658,7 +4663,7 @@ mod tests {
             AlwaysInvalid,
             NodeRun {
                 node: "analyst",
-                controlled_as: None,
+                controlled_as: Some("implementer"),
                 route: &route,
                 preamble: "Answer.",
                 question: "Answer.",
@@ -4674,7 +4679,9 @@ mod tests {
                 shell: None,
                 push: None,
                 conversation: None,
-                ledger: None,
+                // A ledger, because the usage record is only emitted for a turn whose cost has
+                // somewhere to go — and the usage record is half of what this test reads.
+                ledger: Some(Arc::new(RunLedger::default())),
                 produces: None,
             },
             ProviderCallQueue::default(),
@@ -4700,6 +4707,22 @@ mod tests {
             end["outcome"], "unvalidated",
             "an end at the model-turn boundary must not claim the stage completed: {end}"
         );
+
+        // The control address rides on the records that state their own identity — the usage
+        // record above all, since a tail whose start has scrolled away reconstructs the attempt
+        // from it, and an answerer without its address reads as a Stop target nothing polls.
+        let usage = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["kind"] == "usage")
+            .expect("the turn reported its cost");
+        assert_eq!(usage["controlled_as"], "implementer", "{usage}");
+        let start = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["kind"] == "node_start")
+            .expect("the turn announced itself");
+        assert_eq!(start["controlled_as"], "implementer", "{start}");
     }
 
     #[tokio::test]

@@ -67,52 +67,59 @@ fn check_execution_graph(
     struct Known {
         parent: Option<SpanId>,
         asserted: bool,
-        /// The node whose `node_start` opened this execution, where one did.
+        /// The `node_start` that opened this execution, where one did: the node it named, and the
+        /// event's place in the stream.
         ///
         /// The start alone, because sharing an execution's span is otherwise ordinary: an
         /// acceptance step and a turn-less checkpoint both hang records off the host call that
         /// drove them, under the nodes they are about. Two STARTS claiming one id are two attempts,
         /// and a reader keying attempts by id would fold them into one — the second overwriting
-        /// the first, which then stays live forever or is closed by the wrong end.
-        opened_by: Option<String>,
+        /// the first, which then stays live forever or is closed by the wrong end. Whatever node
+        /// the second names: the store deduplicates ingestion on the sequence number, so one
+        /// persisted event has one seq, and a repeat under a different seq is a different record
+        /// claiming the same execution.
+        opened_by: Option<(String, i64)>,
     }
     let mut parents: std::collections::HashMap<SpanId, Known> = std::collections::HashMap::new();
-    let mut claim =
-        |span_id: SpanId, parent: Option<SpanId>, asserted: bool, opened_by: Option<&str>| {
-            let known = parents.entry(span_id).or_insert(Known {
-                parent,
-                asserted,
-                opened_by: opened_by.map(ToString::to_string),
-            });
-            let conflict = match (known.parent, parent) {
-                (Some(before), Some(now)) => before != now,
-                // An explicit root, then a parent — or the other way about. Both cannot be true, and a
-                // consumer would disagree with itself about where the execution hangs.
-                (None, Some(_)) => known.asserted,
-                (Some(_), None) => asserted,
-                (None, None) => false,
-            };
-            if conflict {
-                return Err(bad(format!(
-                    "execution {span_id} is described twice with different parentage"
-                )));
-            }
-            if let (Some(before), Some(now)) = (known.opened_by.as_deref(), opened_by)
-                && before != now
-            {
-                return Err(bad(format!(
-                    "execution {span_id} is started by `{before}` and by `{now}`"
-                )));
-            }
-            if parent.is_some() {
-                known.parent = parent;
-            }
-            known.asserted |= asserted;
-            if let Some(now) = opened_by {
-                known.opened_by = Some(now.to_string());
-            }
-            Ok(())
+    let mut claim = |span_id: SpanId,
+                     parent: Option<SpanId>,
+                     asserted: bool,
+                     opened_by: Option<(&str, i64)>| {
+        let known = parents.entry(span_id).or_insert(Known {
+            parent,
+            asserted,
+            opened_by: opened_by.map(|(node, seq)| (node.to_string(), seq)),
+        });
+        let conflict = match (known.parent, parent) {
+            (Some(before), Some(now)) => before != now,
+            // An explicit root, then a parent — or the other way about. Both cannot be true, and a
+            // consumer would disagree with itself about where the execution hangs.
+            (None, Some(_)) => known.asserted,
+            (Some(_), None) => asserted,
+            (None, None) => false,
         };
+        if conflict {
+            return Err(bad(format!(
+                "execution {span_id} is described twice with different parentage"
+            )));
+        }
+        if let (Some((before, at)), Some((now, seq))) = (known.opened_by.as_ref(), opened_by)
+            && (before != now || *at != seq)
+        {
+            return Err(bad(format!(
+                "execution {span_id} is started twice — by `{before}` and by `{now}` — and \
+                     one execution is one attempt"
+            )));
+        }
+        if parent.is_some() {
+            known.parent = parent;
+        }
+        known.asserted |= asserted;
+        if let Some((now, seq)) = opened_by {
+            known.opened_by = Some((now.to_string(), seq));
+        }
+        Ok(())
+    };
 
     // A ROW per execution, though. Two rows claiming one execution collapse two of them into one
     // with nothing to notice it by, which is what an identity is for.
@@ -157,7 +164,10 @@ fn check_execution_graph(
                 invocation.span_id,
                 invocation.parent_span_id,
                 false,
-                starts.then_some(attribution.node.as_deref()).flatten(),
+                starts
+                    .then_some(attribution.node.as_deref())
+                    .flatten()
+                    .map(|node| (node, event.seq)),
             )?;
         }
     }
@@ -643,7 +653,9 @@ mod tests {
             Err(StoreError::BadExecutionGraph { .. })
         ));
 
-        // The same start said twice is the same start — a rotated log replayed over itself.
+        // The same start said twice — one node, one SEQ — is the same persisted event, since the
+        // store deduplicates ingestion on the sequence number. Under a different seq it is a
+        // second record claiming the execution, whatever node it names: the collapse is the same.
         let mut echoed = bundle_of(vec![]);
         echoed.runs[0].run.run_id = "echoed".into();
         echoed.runs[0].events = vec![
@@ -651,6 +663,23 @@ mod tests {
             started("analyst", "00000000000000f3"),
         ];
         assert!(store.import(&echoed).await.is_ok());
+
+        let mut reused = bundle_of(vec![]);
+        reused.runs[0].run.run_id = "reused".into();
+        reused.runs[0].events = vec![
+            EventRow {
+                seq: 1,
+                ..started("analyst", "00000000000000f4")
+            },
+            EventRow {
+                seq: 2,
+                ..started("analyst", "00000000000000f4")
+            },
+        ];
+        assert!(matches!(
+            store.import(&reused).await,
+            Err(StoreError::BadExecutionGraph { .. })
+        ));
 
         // Repeating what it already said is not disagreement: a start and its end both name the
         // execution and its parent, and a turn's records are many.

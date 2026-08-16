@@ -208,7 +208,15 @@ impl Attribution {
                 .into_iter()
                 .flatten()
         };
-        let enclosing = spans().rev().find(|span| span.get("span_id").is_some());
+        // Innermost span that NAMES an execution. A span carrying `span_id: null` says it has none
+        // — null is absence spelled out — so the search continues outward past it rather than
+        // stopping on the key: stopping there returned no invocation for a record with a valid
+        // enclosing execution, which evaded a bundle's graph validation and folded the record into
+        // the unidentified attempt. A malformed non-null id still stops the search, and is refused
+        // where it is read — skipping outward past it would read a graph the record does not have.
+        let enclosing = spans()
+            .rev()
+            .find(|span| span.get("span_id").is_some_and(|v| !v.is_null()));
         let of_span = |key: &str| {
             enclosing
                 .and_then(|span| span.get(key))
@@ -301,7 +309,21 @@ mod tests {
         assert_eq!(lifecycle.node, None);
 
         // `null` is absence spelled out: a producer that writes the key at all writes it for every
-        // record, and refusing it would refuse whole streams for saying "none" explicitly.
+        // record, and refusing it would refuse whole streams for saying "none" explicitly. On a
+        // SPAN, a null id also does not stop the outward search for the enclosing execution.
+        let outer = of(serde_json::json!({
+            "kind": "tool_call",
+            "spans": [
+                { "node": "implementer", "span_id": "00000000000000a1" },
+                { "node": "implementer", "span_id": null },
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            outer.invocation.map(|i| i.span_id),
+            SpanId::parse("00000000000000a1"),
+            "a span that says it has no execution is not the innermost that HAS one"
+        );
         let spelled = of(serde_json::json!({
             "kind": "usage", "span_id": "00000000000000a1", "parent_span_id": null,
         }))

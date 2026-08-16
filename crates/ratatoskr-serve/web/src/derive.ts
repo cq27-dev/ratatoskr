@@ -268,7 +268,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
    * the first record of that execution this view sees. Dropped, the checkpoint that follows creates
    * an attempt that never ended, and a box with no aggregate of its own works forever.
    */
-  const endedEarly = new Set<string>();
+  const endedEarly = new Map<string, string | undefined>();
 
   const make = (span: string, live: boolean, started: boolean): Attempt => ({
     span,
@@ -293,11 +293,16 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     // still knows a Stop aimed here would not reach it.
     if (e.controlled_as !== undefined) found.controllable = e.controlled_as === e.node;
     if (!everywhere.has(found.span)) everywhere.set(found.span, { member, attempt: found });
-    // An end this view saw before it saw anything else of that execution.
+    // An end this view saw before it saw anything else of that execution — applied with the
+    // outcome it carried, because arriving first does not change what it said. Settling "done"
+    // here regardless made a cancelled or unvalidated end read as success purely because the tail
+    // began at the end record.
     if (endedEarly.has(found.span)) {
       member.end(found);
       found.ended = true;
-      if (found.state === "working") found.state = "done";
+      if (endedEarly.get(found.span) === "completed" && found.state === "working") {
+        found.state = "done";
+      }
     }
     return found;
   };
@@ -308,7 +313,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     if (e.kind === "span_end" && e.span_id) {
       const found = everywhere.get(e.span_id);
       if (!found) {
-        endedEarly.add(e.span_id);
+        endedEarly.set(e.span_id, e.outcome);
         continue;
       }
       found.member.end(found.attempt);

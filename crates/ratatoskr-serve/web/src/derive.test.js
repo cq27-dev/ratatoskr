@@ -1386,6 +1386,32 @@ test("a composed member ending does not finish the box its host is still driving
   expect(applied(shape, whole)[0].state).toBe("done");
 });
 
+test("an end that arrived first keeps the outcome it carried", () => {
+  // Arriving first does not change what a record said. The early-end path used to settle "done"
+  // regardless, so a cancelled or unvalidated end read as success purely because the tail began at
+  // the end record — and the node left the candidates its failed run is attributed among.
+  const shape = [composed("characterizer", "idle")];
+  const stages = registry(["characterizer"]);
+  const span = "00000000000000f9";
+  const tail = inNodeBoxes(
+    [
+      {
+        at: "t",
+        kind: "span_end",
+        outcome: "cancelled",
+        span_id: span,
+        execution: "node",
+        execution_name: "characterizer",
+      },
+      called("characterizer", "Read", span),
+    ],
+    stages,
+  );
+
+  expect(nodesFromEvents(tail).get("characterizer").state).toBe("working");
+  expect(applyDerived(shape, nodesFromEvents(tail), "failed")[0].state).toBe("failed");
+});
+
 test("an end seen before anything else of its execution still ends it", () => {
   // The guard emitting `span_end` drops as the execution leaves, which is BEFORE its caller writes
   // anything about it — and an imported tail can begin anywhere, so the end may be the first record
