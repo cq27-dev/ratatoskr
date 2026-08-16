@@ -1342,20 +1342,48 @@ test("an invocation that writes no checkpoint is ended by its own span_end", () 
   const shape = [composed("characterizer", "idle")];
   const stages = registry(["characterizer"]);
   const span = "00000000000000f6";
+  const host = "00000000000000e6";
+  const start = { ...attemptStart("characterizer", span, "opus"), parent_span_id: host };
 
-  const running = inNodeBoxes([attemptStart("characterizer", span, "opus")], stages);
+  const running = inNodeBoxes([start], stages);
   expect(applied(shape, running)[0].state).toBe("working");
   expect(workingNodeNames(shape, running)).toEqual(["characterizer"]);
 
+  // The turn's own end alone settles nothing: the stage validates and checkpoints AFTER the model
+  // turn returns, and any of that can still fail it.
+  const turnOnly = inNodeBoxes(
+    [
+      start,
+      { at: "t", kind: "span_end", outcome: "completed", span_id: span, execution: "node", execution_name: "characterizer" },
+    ],
+    stages,
+  );
+  expect(applied(shape, turnOnly)[0].state).toBe("working");
+
+  // The host call closing clean IS the stage boundary, and is what finishes the box.
   const ended = inNodeBoxes(
     [
-      attemptStart("characterizer", span, "opus"),
+      start,
       { at: "t", kind: "span_end", outcome: "completed", span_id: span, execution: "node", execution_name: "characterizer" },
+      { at: "t", kind: "span_end", outcome: "completed", span_id: host, execution: "host", execution_name: "characterize" },
     ],
     stages,
   );
   expect(applied(shape, ended)[0].state).toBe("done");
   expect(workingNodeNames(shape, ended)).toEqual([]);
+
+  // And a host that ERRORED after the turn — validation, normalisation, the checkpoint write —
+  // does not close clean, so the stage stays a candidate for the failure it caused.
+  const failedAfter = inNodeBoxes(
+    [
+      start,
+      { at: "t", kind: "span_end", outcome: "completed", span_id: span, execution: "node", execution_name: "characterizer" },
+      { at: "t", kind: "span_end", outcome: "unvalidated", span_id: host, execution: "host", execution_name: "characterize" },
+    ],
+    stages,
+  );
+  expect(applied(shape, failedAfter)[0].state).toBe("working");
+  expect(applyDerived(shape, nodesFromEvents(failedAfter), "failed")[0].state).toBe("failed");
 });
 
 test("a composed member ending does not finish the box its host is still driving", () => {
@@ -1377,9 +1405,12 @@ test("a composed member ending does not finish the box its host is still driving
   // The host's own record is what finishes it, as it always was.
   const whole = inNodeBoxes(
     [
-      attemptStart("implementer_attempt", span, "opus"),
+      { ...attemptStart("implementer_attempt", span, "opus"), parent_span_id: "00000000000000d5" },
       { at: "t", kind: "span_end", outcome: "completed", span_id: span, execution: "node", execution_name: "implementer_attempt" },
       checkpointed("implementer"),
+      // The host closes after the aggregate it wrote, and its clean end is what settles the
+      // members it drove.
+      { at: "t", kind: "span_end", outcome: "completed", span_id: "00000000000000d5", execution: "host", execution_name: "implement" },
     ],
     stages,
   );
@@ -1420,10 +1451,12 @@ test("an end seen before anything else of its execution still ends it", () => {
   const shape = [composed("characterizer", "idle")];
   const stages = registry(["characterizer"]);
   const span = "00000000000000e5";
+  const host = "00000000000000e7";
   const tail = inNodeBoxes(
     [
       { at: "t", kind: "span_end", outcome: "completed", span_id: span, execution: "node", execution_name: "characterizer" },
-      called("characterizer", "Read", span),
+      { ...called("characterizer", "Read", span), parent_span_id: host },
+      { at: "t", kind: "span_end", outcome: "completed", span_id: host, execution: "host", execution_name: "characterize" },
     ],
     stages,
   );
@@ -1547,6 +1580,30 @@ test("a clarification answerer is not offered as a control target", () => {
   // An ordinary turn, whose control is its own box, still is.
   const ordinary = inNodeBoxes([attemptStart("analyst", "00000000000000c3", "opus")], stages);
   expect(workingNodeNames([composed("analyst", "idle")], ordinary)).toEqual(["analyst"]);
+
+  // An answerer abandoned by a Stop resolves QUIETLY. Its turn was cancelled because the ASKING
+  // node was stopped — the failure story is the asker's — and a box left "working" by it reads as
+  // live forever, and stands as a stale second candidate that blocks a later failure's attribution.
+  const abandoned = inNodeBoxes(
+    [
+      answering,
+      {
+        at: "t",
+        kind: "span_end",
+        outcome: "cancelled",
+        span_id: "00000000000000b2",
+        execution: "node",
+        execution_name: "analyst",
+      },
+    ],
+    stages,
+  );
+  expect(nodesFromEvents(abandoned).get("analyst").state).toBe("idle");
+  expect(workingNodeNames([composed("analyst", "idle")], abandoned)).toEqual([]);
+  // Not a candidate: a later failure elsewhere still has one story.
+  expect(applyDerived([composed("analyst", "idle")], nodesFromEvents(abandoned), "failed")[0].state).toBe(
+    "idle",
+  );
 });
 
 test("a stage answering a clarification can still be stopped for its own turn", () => {

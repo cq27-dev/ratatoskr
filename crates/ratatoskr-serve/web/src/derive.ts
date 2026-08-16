@@ -230,6 +230,10 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
    */
   interface Attempt extends Tracked {
     state: NodeState;
+    /** How this execution's own end said it went, once it has. */
+    outcome?: string | undefined;
+    /** The execution that invoked this one, where a record has said. */
+    parent?: string;
     telemetry?: NodeTelemetry;
     cycles: number;
     used: Set<string>;
@@ -261,6 +265,45 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
    */
   const everywhere = new Map<string, { member: Member; attempt: Attempt }>();
   /**
+   * Executions whose COMPLETED end has been seen, and the attempts each one invoked.
+   *
+   * A turn ending is not the stage finishing: a declared stage validates, normalises and
+   * checkpoints AFTER its model turn returns, and any of those can still fail it. The host call is
+   * the boundary that closes only once all of that has happened — so a turn settles as done when
+   * its own end said "completed" AND the execution that invoked it says the boundary was reached.
+   * Either may be seen first; the settle runs at whichever arrives second.
+   */
+  const completedEnds = new Set<string>();
+  const childrenOf = new Map<string, Attempt[]>();
+  const settled = (attempt: Attempt) => {
+    if (
+      attempt.outcome === "completed" &&
+      attempt.state === "working" &&
+      attempt.parent !== undefined &&
+      completedEnds.has(attempt.parent)
+    ) {
+      attempt.state = "done";
+    }
+  };
+  /**
+   * Apply an execution's own end to its attempt, however the two met.
+   *
+   * An abandoned answerer resolves QUIETLY: its turn was cancelled because the asking node was
+   * stopped, the failure story is the asker's, and a box left "working" by it reads as live
+   * forever — and stands as a stale second candidate that blocks a later failure's attribution.
+   * Idle rather than done, because nothing finished; the box simply has nothing of its own to
+   * show any more.
+   */
+  const applyEnd = (member: Member, attempt: Attempt, outcome: string | undefined) => {
+    member.end(attempt);
+    attempt.ended = true;
+    attempt.outcome = outcome;
+    if ((outcome === "cancelled" || outcome === "unvalidated") && !attempt.controllable) {
+      attempt.state = "idle";
+    }
+    settled(attempt);
+  };
+  /**
    * Executions whose end arrived before anything that names them.
    *
    * The guard that emits a `span_end` drops as the execution leaves, which is BEFORE its caller
@@ -286,45 +329,41 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     everywhere.set(span, { member, attempt: made });
     return made;
   };
-  const attemptFor = (member: Member, e: BoxedEvent, span: string): Attempt => {
-    const found = member.for(e, span, (live) => make(span, live, false));
+  const filed = (member: Member, e: BoxedEvent, attempt: Attempt): Attempt => {
     // Wherever the address arrives, not only on a start. Every record of a turn carries it, off the
     // span the turn opened — so an attempt reconstructed from a tail whose start has scrolled away
     // still knows a Stop aimed here would not reach it.
-    if (e.controlled_as !== undefined) found.controllable = e.controlled_as === e.node;
-    if (!everywhere.has(found.span)) everywhere.set(found.span, { member, attempt: found });
-    // An end this view saw before it saw anything else of that execution — applied with the
-    // outcome it carried, because arriving first does not change what it said. Settling "done"
-    // here regardless made a cancelled or unvalidated end read as success purely because the tail
-    // began at the end record.
-    if (endedEarly.has(found.span)) {
-      member.end(found);
-      found.ended = true;
-      if (endedEarly.get(found.span) === "completed" && found.state === "working") {
-        found.state = "done";
-      }
+    if (e.controlled_as !== undefined) attempt.controllable = e.controlled_as === e.node;
+    if (!everywhere.has(attempt.span)) everywhere.set(attempt.span, { member, attempt });
+    if (attempt.parent === undefined && e.parent_span_id) {
+      attempt.parent = e.parent_span_id;
+      childrenOf.set(e.parent_span_id, [...(childrenOf.get(e.parent_span_id) ?? []), attempt]);
+      settled(attempt);
     }
-    return found;
+    // An end this view saw before it saw anything else of that execution — applied with the
+    // outcome it carried, because arriving first does not change what it said.
+    if (endedEarly.has(attempt.span) && !attempt.ended) {
+      applyEnd(member, attempt, endedEarly.get(attempt.span));
+    }
+    return attempt;
   };
+  const attemptFor = (member: Member, e: BoxedEvent, span: string): Attempt =>
+    filed(member, e, member.for(e, span, (live) => make(span, live, false)));
 
   for (const e of events) {
     // An execution's own end, which names no node. It closes the invocation it names wherever that
     // is — the only thing that can, for an invocation that writes no checkpoint.
     if (e.kind === "span_end" && e.span_id) {
+      if (e.outcome === "completed") {
+        completedEnds.add(e.span_id);
+        for (const child of childrenOf.get(e.span_id) ?? []) settled(child);
+      }
       const found = everywhere.get(e.span_id);
       if (!found) {
         endedEarly.set(e.span_id, e.outcome);
         continue;
       }
-      found.member.end(found.attempt);
-      found.attempt.ended = true;
-      // Ending is not finishing. A `span_end` is emitted however the execution left — returned,
-      // errored, or dropped when the run was cancelled — so only one that says it COMPLETED settles
-      // the outcome. Taking any end for success rendered a cancelled node as done, and a failed run
-      // is attributed among the nodes still reading as working.
-      if (e.outcome === "completed" && found.attempt.state === "working") {
-        found.attempt.state = "done";
-      }
+      applyEnd(found.member, found.attempt, e.outcome);
       continue;
     }
     if (!e.node) continue;
@@ -345,7 +384,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // the box a member is drawn in is its own address — so a member whose control goes somewhere
       // else entirely is one nothing here can reach.
       attempt.controllable = (e.controlled_as ?? e.node) === e.node;
-      everywhere.set(span, { member, attempt });
+      filed(member, e, attempt);
       // What it RAN ON carries across a re-entry; what it SPENT does not. The model, its tools and
       // its session are configuration — a start that announces nothing has not changed them — while
       // tokens, turns and duration belong to the attempt that spent them, which is the whole reason
@@ -503,10 +542,12 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
             // composed member ENDING proves nothing about the box either: `implementer_attempt`
             // announces its end before the host that drove it writes the aggregate, so finishing
             // the box there drops its working state for the window in between.
-            // An execution that ended without saying HOW is still working as far as this reads:
-            // its outcome is nobody's record, the clause above keeps it working, and a failed run
-            // is attributed among the nodes that read that way.
-            box.members.get(name)?.current()?.ended === true
+            // The box's own member reached DONE without a record of the box's own: the stage that
+            // is its own node, settled by the boundary that invoked it. Merely ENDED is not this —
+            // a turn ends before its stage validates and checkpoints, and an end whose outcome the
+            // boundary never confirmed is nobody's record, which keeps the node among a failed
+            // run's candidates.
+            box.members.get(name)?.current()?.state === "done"
             ? "done"
             : members.some((m) => current(m) && current(m)?.state !== "idle")
               ? "working"
