@@ -334,6 +334,12 @@ export interface LiveEvent {
    */
   execution?: string;
   execution_name?: string;
+  /**
+   * On a `node_start`: where a Stop or Steer for this turn is addressed, when that is not the node
+   * itself. A clarification answerer runs on the ASKING node's control, so a control offered under
+   * the answerer's own name is never polled.
+   */
+  controlled_as?: string;
 }
 
 /** What one attempt cost, off the event stream. */

@@ -173,6 +173,14 @@ impl NodeClarifier {
         tracing::info!(
             kind = "question",
             question_id,
+            // The waiting belongs to the exchange, which is its own execution. `execution` sets a
+            // task-local identity and no span, so a record that states nothing is read against the
+            // ASKING node's span — filing the wait under the asker while the exchange's own
+            // checkpoint and lifecycle name the child.
+            span_id = ratatoskr_agent::current_execution().map(|i| i.span_id.to_string()),
+            parent_span_id = ratatoskr_agent::current_execution()
+                .and_then(|i| i.parent_span_id)
+                .map(|p| p.to_string()),
             from,
             question,
             "waiting on the user"
@@ -195,6 +203,10 @@ impl NodeClarifier {
         tracing::info!(
             kind = "question_answered",
             question_id,
+            span_id = ratatoskr_agent::current_execution().map(|i| i.span_id.to_string()),
+            parent_span_id = ratatoskr_agent::current_execution()
+                .and_then(|i| i.parent_span_id)
+                .map(|p| p.to_string()),
             answered = answer.is_some(),
             "question resolved"
         );

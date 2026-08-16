@@ -449,6 +449,104 @@ fn openai_client() -> Result<(openai::Client<TelemetryHttp>, ProviderCallQueue),
 ///
 /// `preamble` is the system prompt; `route` picks the provider/model. Returns the agent's final
 /// text after its tool-calling loop settles.
+/// What every record of a model turn says about itself, so no two emitters can disagree.
+///
+/// Identity, the node it is FOR, and the name an operator's Stop reaches — through one place,
+/// because they had drifted apart in every combination: an answerer's cost under the asker's name,
+/// a turn's tool calls under a different execution from its usage, a control offered against a name
+/// the running turn never polls.
+#[derive(Clone, Copy)]
+pub(crate) struct TurnSubject<'a> {
+    /// What ran, and what a viewer sees the work under.
+    pub node: &'a str,
+    /// Where a Stop or a Steer for this turn has to be addressed, when that is not [`Self::node`].
+    ///
+    /// A stage composed into a box answers at the box's name. A clarification answerer is stranger:
+    /// it runs on the ASKING node's control, because a Stop during one ends the asking turn — so
+    /// nothing addressed to the answerer's own name is ever polled, and a reader offering one would
+    /// hand an operator a button that does nothing.
+    pub controlled_as: Option<&'a str>,
+    pub invocation: Option<Invocation>,
+}
+
+impl<'a> TurnSubject<'a> {
+    fn of(node: &'a str, controlled_as: Option<&'a str>) -> Self {
+        Self {
+            node,
+            controlled_as,
+            invocation: current_execution(),
+        }
+    }
+
+    fn span_id(&self) -> Option<String> {
+        self.invocation.map(|i| i.span_id.to_string())
+    }
+
+    fn parent_span_id(&self) -> Option<String> {
+        self.invocation
+            .and_then(|i| i.parent_span_id)
+            .map(|p| p.to_string())
+    }
+
+    /// Announce a turn before it waits on the provider.
+    ///
+    /// Before, because a checkpoint only exists once the turn has finished, and the moment a reader
+    /// most wants to know what is running is while it is still running. A turn that announces
+    /// nothing until its first response is invisible for exactly as long as it is slow.
+    fn started(&self, facts: TurnFacts<'_>) {
+        tracing::info!(
+            kind = "node_start",
+            node = self.node,
+            // Which execution is starting, so a live reader can pair this with the record that
+            // closes it — and tell a second attempt from the first, which shares its name.
+            span_id = self.span_id(),
+            parent_span_id = self.parent_span_id(),
+            controlled_as = self.controlled_as,
+            model = facts.model,
+            tools = %facts.tools.join(","),
+            thinking = facts.thinking,
+            reuses_session = facts.reuses_session,
+            "node started"
+        );
+    }
+
+    /// Report what a turn cost, in the field names a reader reads.
+    ///
+    /// Every one of them, because a record that carries some of them is authoritative: a reader
+    /// that sees a cost stops falling back to the store, so a partial report is displayed as
+    /// measured absence — no model, no turns, no duration.
+    fn spent(&self, telemetry: &NodeTelemetry) {
+        tracing::info!(
+            kind = "usage",
+            node = self.node,
+            span_id = self.span_id(),
+            parent_span_id = self.parent_span_id(),
+            "gen_ai.usage.input_tokens" = telemetry.usage.input_tokens,
+            "gen_ai.usage.output_tokens" = telemetry.usage.output_tokens,
+            "gen_ai.usage.cached_input_tokens" = telemetry.usage.cached_input_tokens,
+            "gen_ai.usage.cache_creation_input_tokens" =
+                telemetry.usage.cache_creation_input_tokens,
+            "gen_ai.usage.reasoning_tokens" = telemetry.usage.reasoning_tokens,
+            turns = telemetry.turns,
+            duration_ms = telemetry.duration_ms,
+            model = telemetry.model.as_deref(),
+            tools = %telemetry.tools.join(","),
+            tools_used = %telemetry.tools_used.join(","),
+            thinking = telemetry.thinking,
+            reuses_session = telemetry.reuses_session,
+            "node usage"
+        );
+    }
+}
+
+/// What a turn is about to run on.
+struct TurnFacts<'a> {
+    model: &'a str,
+    tools: &'a [String],
+    thinking: bool,
+    reuses_session: bool,
+}
+
 /// One turn against a model, outside any node's own run.
 ///
 /// `answerer` is what is ANSWERING, when that is not what `control` addresses. A clarification runs
@@ -466,11 +564,12 @@ pub async fn ask(
     control: Option<RuntimeControl>,
     answerer: Option<&str>,
 ) -> Result<String, AgentError> {
-    let node = answerer.map(str::to_string).unwrap_or_else(|| {
-        control
-            .as_ref()
-            .map_or_else(|| "ask".to_string(), |control| control.node.clone())
-    });
+    let addressed = control
+        .as_ref()
+        .map_or_else(|| "ask".to_string(), |control| control.node.clone());
+    let node = answerer.map_or_else(|| addressed.clone(), str::to_string);
+    // Only where they differ: a plain ask answers under its own name and is controlled by it.
+    let controlled_as = (node != addressed).then_some(addressed.as_str());
     match parse_provider(&route.provider)? {
         Provider::Anthropic => {
             let session = uuid::Uuid::new_v4().to_string();
@@ -478,6 +577,7 @@ pub async fn ask(
             run(AskRun {
                 model: caching(client.completion_model(&route.model)),
                 node: &node,
+                controlled_as,
                 preamble,
                 question,
                 tools,
@@ -493,6 +593,7 @@ pub async fn ask(
             run(AskRun {
                 model: client.completion_model(&route.model),
                 node: &node,
+                controlled_as,
                 preamble,
                 question,
                 tools,
@@ -511,6 +612,7 @@ pub async fn ask(
                 // it rejects would cost the call rather than the cache.
                 model: client.completion_model(&route.model),
                 node: &node,
+                controlled_as,
                 preamble,
                 question,
                 tools,
@@ -528,6 +630,9 @@ pub async fn ask(
 struct AskRun<'a, M> {
     model: M,
     node: &'a str,
+    /// Where a Stop for this turn is addressed, when that is not [`Self::node`] — the asking node,
+    /// for a clarification.
+    controlled_as: Option<&'a str>,
     preamble: &'a str,
     question: &'a str,
     tools: ToolSet,
@@ -554,6 +659,7 @@ where
     let AskRun {
         model,
         node,
+        controlled_as,
         preamble,
         question,
         tools,
@@ -578,44 +684,50 @@ where
     // so every line of model text and every tool call the hook emits would be attributed to the
     // asker, while the record of what it cost names the answerer. One turn, split across two
     // invocations, showing its activity under the wrong node.
-    let invocation = current_execution();
+    //
+    // The control address stays the asker's, and is stated rather than left to be inferred: a Stop
+    // during a clarification ends the ASKING node's turn, so nothing addressed to the answerer's
+    // own name is ever polled and a reader offering one would hand an operator a dead button.
+    let subject = TurnSubject::of(node, controlled_as);
+    let tool_names = tools.names();
     let span = tracing::info_span!(
         "agent",
         node,
         "gen_ai.operation.name" = "invoke_agent",
         "gen_ai.agent.name" = node,
-        span_id = invocation.map(|i| i.span_id.to_string()),
-        parent_span_id = invocation
-            .and_then(|i| i.parent_span_id)
-            .map(|p| p.to_string()),
+        "gen_ai.request.model" = %route.model,
+        span_id = subject.span_id(),
+        parent_span_id = subject.parent_span_id(),
     );
+    // Announced before the wait, like any other turn. An answerer that says nothing until its first
+    // response is invisible for exactly as long as it is slow — and a clarification is the case
+    // where a viewer is most likely to be wondering what the run is doing.
+    subject.started(TurnFacts {
+        model: &route.model,
+        tools: &tool_names,
+        thinking: thinking_left_on(route),
+        reuses_session: false,
+    });
+    let started = std::time::Instant::now();
     let answer = async { agent.prompt(question).await }
         .instrument(span)
         .await;
     // No store to checkpoint to here, so it goes to the log. A one-shot question whose cost is
-    // unknowable is the same defect as an uncounted node, in a smaller place.
+    // unknowable is the same defect as an uncounted node, in a smaller place — and a report that
+    // carries only some of the fields is worse than none, because a reader that sees a cost stops
+    // falling back to the store and displays the rest as measured absence.
     let (usage, calls) = meter.read();
-    tracing::info!(
-        kind = "usage",
-        calls,
-        // The name and the identity together, or neither. This runs inside the ASKING node's span,
-        // so an identity on its own is read against the asker's name — which files an answerer's
-        // cost under the asker, in an invocation of the asker that never happened. What ran here is
-        // the answerer, and both halves of that say so.
-        node,
-        span_id = current_execution().map(|i| i.span_id.to_string()),
-        parent_span_id = current_execution()
-            .and_then(|i| i.parent_span_id)
-            .map(|p| p.to_string()),
-        "gen_ai.usage.input_tokens" = usage.input_tokens,
-        "gen_ai.usage.output_tokens" = usage.output_tokens,
-        "gen_ai.usage.cached_input_tokens" = usage.cached_input_tokens,
-        // The write half, and the expensive one: a cache write is billed above the ordinary input
-        // rate, so a cost read from hits alone reads as cheaper than it was.
-        "gen_ai.usage.cache_creation_input_tokens" = usage.cache_creation_input_tokens,
-        "gen_ai.usage.reasoning_tokens" = usage.reasoning_tokens,
-        "ask usage"
-    );
+    subject.spent(&NodeTelemetry {
+        model: Some(route.model.clone()),
+        duration_ms: Some(started.elapsed().as_millis() as u64),
+        usage,
+        turns: Some(calls),
+        error: answer.as_ref().err().map(ToString::to_string),
+        tools: tool_names,
+        tools_used: meter.used(),
+        reuses_session: false,
+        thinking: thinking_left_on(route),
+    });
     answer.map_err(|e| AgentError::Prompt(e.to_string()))
 }
 
@@ -2551,7 +2663,7 @@ impl ExecutionKind {
 /// that line, and an execution that started and never ended is exactly what a reader cannot tell
 /// from one still running.
 struct SpanEnd {
-    span_id: SpanId,
+    invocation: Invocation,
     name: String,
     kind: ExecutionKind,
 }
@@ -2560,7 +2672,11 @@ impl Drop for SpanEnd {
     fn drop(&mut self) {
         tracing::info!(
             kind = "span_end",
-            span_id = %self.span_id,
+            span_id = %self.invocation.span_id,
+            // The same parentage its start named. Absent means the run drove this execution, which
+            // is a claim about the run's shape — so a nested end that stated nothing described
+            // itself as top-level, and the two halves of one execution disagreed.
+            parent_span_id = self.invocation.parent_span_id.map(|p| p.to_string()),
             execution_name = %self.name,
             execution = self.kind.as_str(),
             "execution ended"
@@ -2602,7 +2718,7 @@ pub async fn execution_as<F: Future>(
         "execution started"
     );
     let _end = SpanEnd {
-        span_id: invocation.span_id,
+        invocation,
         name: name.to_string(),
         kind,
     };
@@ -3128,22 +3244,17 @@ where
     // Announced at the start, because a checkpoint only exists once the node has finished — and
     // the moment a reader most wants to know what a node is running on is while it is still
     // running. The facts here are the configured ones; cost arrives with the checkpoint.
-    let invocation = current_execution();
-    tracing::info!(
-        kind = "node_start",
-        node,
-        // Which execution is starting, so a live reader can pair this with the checkpoint that
-        // closes it — and tell a second attempt from the first, which shares its name.
-        span_id = invocation.map(|i| i.span_id.to_string()),
-        parent_span_id = invocation
-            .and_then(|i| i.parent_span_id)
-            .map(|p| p.to_string()),
-        model = %model_name,
-        tools = %tool_names.join(","),
-        thinking = thinking_left_on(route),
-        reuses_session = continuing_session(route.session, conversation, compacted_session.is_some()),
-        "node started"
-    );
+    let subject = TurnSubject::of(node, controlled_as);
+    subject.started(TurnFacts {
+        model: &model_name,
+        tools: &tool_names,
+        thinking: thinking_left_on(route),
+        reuses_session: continuing_session(
+            route.session,
+            conversation,
+            compacted_session.is_some(),
+        ),
+    });
     let started = std::time::Instant::now();
     // A node the operator stopped has not failed, and its work is not thrown away: the run parks
     // here until they start it again, then runs the node afresh on the same question — which is
@@ -3234,22 +3345,7 @@ where
             ),
             thinking: thinking_left_on(route),
         };
-        tracing::info!(
-            kind = "usage",
-            node,
-            span_id = current_execution().map(|i| i.span_id.to_string()),
-            parent_span_id = current_execution()
-                .and_then(|i| i.parent_span_id)
-                .map(|p| p.to_string()),
-            "gen_ai.usage.input_tokens" = telemetry.usage.input_tokens,
-            "gen_ai.usage.output_tokens" = telemetry.usage.output_tokens,
-            "gen_ai.usage.cached_input_tokens" = telemetry.usage.cached_input_tokens,
-            "gen_ai.usage.cache_creation_input_tokens" =
-                telemetry.usage.cache_creation_input_tokens,
-            "gen_ai.usage.reasoning_tokens" = telemetry.usage.reasoning_tokens,
-            duration_ms = telemetry.duration_ms,
-            "node usage"
-        );
+        subject.spent(&telemetry);
         ledger.record(node, telemetry);
     }
 

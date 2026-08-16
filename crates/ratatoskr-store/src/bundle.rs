@@ -46,25 +46,59 @@ pub struct Bundle {
 ///
 /// Checked at the boundary rather than trusted, because a bundle is the one checkpoint path this
 /// process did not produce.
-fn check_execution_graph(run_id: &str, checkpoints: &[Checkpoint]) -> Result<(), StoreError> {
+fn check_execution_graph(
+    run_id: &str,
+    checkpoints: &[Checkpoint],
+    events: &[EventRow],
+) -> Result<(), StoreError> {
+    use ratatoskr_core::span::SpanId;
     let bad = |problem: String| StoreError::BadExecutionGraph {
         run_id: run_id.to_string(),
         problem,
     };
 
     let mut parents = std::collections::HashMap::new();
+    let mut claim = |span_id: SpanId, parent: Option<SpanId>| {
+        match parents.insert(span_id, parent) {
+            // Saying again what is already recorded is not a conflict: an execution's start and its
+            // end both name it and its parent, and a run's log holds many records of one turn.
+            Some(before) if before != parent => Err(bad(format!(
+                "execution {span_id} is described twice with different parentage"
+            ))),
+            _ => Ok(()),
+        }
+    };
+
+    // A ROW per execution, though. Two rows claiming one execution collapse two of them into one
+    // with nothing to notice it by, which is what an identity is for.
+    let mut rows = std::collections::HashSet::new();
     for checkpoint in checkpoints {
-        let Some(invocation) = checkpoint.invocation else {
+        if let Some(invocation) = checkpoint.invocation {
+            if !rows.insert(invocation.span_id) {
+                return Err(bad(format!(
+                    "execution {} names more than one record",
+                    invocation.span_id
+                )));
+            }
+            claim(invocation.span_id, invocation.parent_span_id)?;
+        }
+    }
+    // And the executions that exist only as events. Most of them do: a host call, a clarification,
+    // a turn whose failure a workflow recovered from and an answerer all announce themselves and
+    // write no checkpoint, so validating rows alone leaves the larger half of a run's execution
+    // graph unchecked — including the parents the rows point at.
+    for event in events {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload_json) else {
             continue;
         };
-        if parents
-            .insert(invocation.span_id, invocation.parent_span_id)
-            .is_some()
-        {
-            return Err(bad(format!(
-                "execution {} names more than one record",
-                invocation.span_id
-            )));
+        let id = |key: &str| {
+            payload
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .and_then(SpanId::parse)
+        };
+        if let Some(span_id) = id("span_id") {
+            claim(span_id, id("parent_span_id"))?;
         }
     }
 
@@ -176,7 +210,7 @@ impl Store {
                 });
                 continue;
             }
-            check_execution_graph(id, &one.checkpoints)?;
+            check_execution_graph(id, &one.checkpoints, &one.events)?;
             self.insert_imported_run(&one.run, &bundle.exported_by)
                 .await?;
             for c in &one.checkpoints {
@@ -351,6 +385,51 @@ mod tests {
         // Refused before anything is written: a run half-imported is worse than one refused.
         assert!(store.run("imported").await.unwrap().is_none());
 
+        // An execution that exists only as EVENTS is checked too. Most of a run's executions do: a
+        // host call, a clarification, an answerer and a recovered failure all announce themselves
+        // and write no checkpoint, so validating rows alone leaves the larger half unchecked.
+        let lifecycle = |span: &str, parent: &str| EventRow {
+            seq: 0,
+            at: "2026-08-15T00:00:00Z".into(),
+            kind: "span_start".into(),
+            node: None,
+            payload_json: format!(
+                r#"{{"kind":"span_start","span_id":"{span}","parent_span_id":"{parent}"}}"#
+            ),
+        };
+        let mut ring = bundle_of(vec![]);
+        ring.runs[0].run.run_id = "ring".into();
+        ring.runs[0].events = vec![
+            lifecycle("00000000000000aa", "00000000000000bb"),
+            lifecycle("00000000000000bb", "00000000000000aa"),
+        ];
+        assert!(matches!(
+            store.import(&ring).await,
+            Err(StoreError::BadExecutionGraph { .. })
+        ));
+
+        // One execution described twice, disagreeing about what invoked it.
+        let mut split = bundle_of(vec![]);
+        split.runs[0].run.run_id = "split".into();
+        split.runs[0].events = vec![
+            lifecycle("00000000000000cc", "00000000000000aa"),
+            lifecycle("00000000000000cc", "00000000000000bb"),
+        ];
+        assert!(matches!(
+            store.import(&split).await,
+            Err(StoreError::BadExecutionGraph { .. })
+        ));
+
+        // Repeating what it already said is not disagreement: a start and its end both name the
+        // execution and its parent, and a turn's records are many.
+        let mut repeated = bundle_of(vec![]);
+        repeated.runs[0].run.run_id = "twice".into();
+        repeated.runs[0].events = vec![
+            lifecycle("00000000000000cc", "00000000000000aa"),
+            lifecycle("00000000000000cc", "00000000000000aa"),
+        ];
+        assert!(store.import(&repeated).await.is_ok());
+
         // And the shape a run actually produces goes in — including the ordinary case of a parent
         // this run has no checkpoint for, since host calls and nested turns announce themselves in
         // the event stream and write no row. A walk that ends there has ended, not failed.
@@ -396,7 +475,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let store = Store::open_in_memory().unwrap();
-        super::check_execution_graph("deep", &chain).expect("a chain is not a cycle");
+        super::check_execution_graph("deep", &chain, &[]).expect("a chain is not a cycle");
         assert!(
             started.elapsed() < std::time::Duration::from_millis(250),
             "checking a chain of {deep} took {:?}",

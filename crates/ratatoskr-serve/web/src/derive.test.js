@@ -1504,3 +1504,31 @@ test("a start that announces nothing shows nothing, not the run's final figures"
   expect(drawn.state).toBe("working");
   expect(drawn.telemetry).toBeUndefined();
 });
+
+test("a clarification answerer is not offered as a control target", () => {
+  // The answerer's turn runs on the ASKING node's control — a Stop during a clarification ends the
+  // asking turn, which is the point of blocking it. So nothing addressed to the answerer's own box
+  // is ever polled: offering it hands an operator a button that does nothing, which reads as an
+  // option that was ignored.
+  const stages = registry(["analyst"], ["implementer"]);
+  const answering = {
+    at: "t",
+    kind: "node_start",
+    node: "analyst",
+    detail: "node started",
+    span_id: "00000000000000b2",
+    parent_span_id: "00000000000000a1",
+    controlled_as: "implementer",
+    facts: { model: "opus", tools: [], thinking: false, reuses_session: false },
+  };
+  const boxed = inNodeBoxes([answering], stages);
+
+  // It IS working, and drawn as working — a viewer should see the run is doing something.
+  expect(nodesFromEvents(boxed).get("analyst").state).toBe("working");
+  // It is not something a control can reach.
+  expect(workingNodeNames([composed("analyst", "idle")], boxed)).toEqual([]);
+
+  // An ordinary turn, whose control is its own box, still is.
+  const ordinary = inNodeBoxes([attemptStart("analyst", "00000000000000c3", "opus")], stages);
+  expect(workingNodeNames([composed("analyst", "idle")], ordinary)).toEqual(["analyst"]);
+});

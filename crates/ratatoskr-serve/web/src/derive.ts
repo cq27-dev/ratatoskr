@@ -46,6 +46,13 @@ export interface DerivedNode {
    * first one's model, tokens and duration.
    */
   started: boolean;
+  /**
+   * Whether a Stop or a Steer aimed at this box would reach what is running in it.
+   *
+   * False for a box whose live work is a clarification answerer: that turn runs on the ASKING
+   * node's control, so nothing addressed here is polled.
+   */
+  controllable: boolean;
 }
 
 /** The event kinds that mean a node is doing something. */
@@ -97,6 +104,14 @@ interface Tracked {
   live: boolean;
   /** Opened by a `node_start` in this view, rather than inferred from a record about it. */
   started: boolean;
+  /**
+   * Whether a Stop or a Steer aimed at the box this is drawn in would reach it.
+   *
+   * A clarification answerer runs on the ASKING node's control — a Stop during one ends the asking
+   * turn — so nothing addressed to the answerer's own box is ever polled. Offering it hands an
+   * operator a button that does nothing, which is worse than offering none.
+   */
+  controllable: boolean;
   /**
    * The execution said it was over — its own checkpoint, or its `span_end`.
    *
@@ -261,6 +276,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     live,
     started,
     ended: false,
+    controllable: true,
     state: "working",
     cycles: 0,
     used: new Set(),
@@ -311,6 +327,10 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // once per converge iteration.
       const before = member.current()?.telemetry;
       const attempt = open(member, span);
+      // Where a control for this turn is addressed. Stated only when it is not the node itself, and
+      // the box a member is drawn in is its own address — so a member whose control goes somewhere
+      // else entirely is one nothing here can reach.
+      attempt.controllable = (e.controlled_as ?? e.node) === e.node;
       // What it RAN ON carries across a re-entry; what it SPENT does not. The model, its tools and
       // its session are configuration — a start that announces nothing has not changed them — while
       // tokens, turns and duration belong to the attempt that spent them, which is the whole reason
@@ -467,6 +487,8 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // whether it has reported a cost yet. A started attempt that has spent nothing so far is this
       // view's answer and stands; one this view never saw start is a gap the server's record fills.
       started: members.some((m) => current(m)?.started ?? false),
+      // Whether a control aimed here would reach what is running.
+      controllable: members.some((m) => current(m)?.controllable ?? true),
     });
   }
   return out;
@@ -762,6 +784,7 @@ export function liveNodes(events: readonly BoxedEvent[]): Map<string, LiveNode> 
     live,
     started,
     ended: false,
+    controllable: true,
     cycles: 0,
     used: new Set(),
   });
@@ -877,8 +900,11 @@ export function workingNodeNames(
   nodes: readonly NodeView[],
   events: readonly BoxedEvent[],
 ): string[] {
+  // Working AND reachable. A clarification answerer is a live turn drawn in its own box whose
+  // control belongs to the node that asked, so a Stop offered against it is a button that does
+  // nothing — worse than offering none, because it reads as an option that was ignored.
   const active = [...nodesFromEvents(events)]
-    .filter(([, node]) => node.state === "working")
+    .filter(([, node]) => node.state === "working" && node.controllable)
     .map(([name]) => name);
   if (events.some((event) => event.kind === "node_start")) return active;
   return nodes.filter((node) => node.state === "working").map((node) => node.name);

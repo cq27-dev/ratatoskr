@@ -96,6 +96,14 @@ pub struct LiveEvent {
     pub execution: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution_name: Option<String>,
+    /// Where a Stop or a Steer for this turn is addressed, on a `node_start`, when that is not the
+    /// node itself.
+    ///
+    /// A clarification answerer runs on the ASKING node's control, so nothing addressed to the
+    /// answerer's own name is ever polled — offering one hands an operator a button that does
+    /// nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controlled_as: Option<String>,
 }
 
 /// What one attempt of a node cost.
@@ -376,6 +384,7 @@ fn to_event(record: &Value) -> LiveEvent {
         parent_span_id: attribution.parent_span_id.map(str::to_string),
         execution: str_field("execution").map(str::to_string),
         execution_name: str_field("execution_name").map(str::to_string),
+        controlled_as: str_field("controlled_as").map(str::to_string),
         kind,
         node: attribution.node.map(str::to_string),
         detail,
@@ -975,6 +984,7 @@ mod tests {
             parent_span_id: None,
             execution: None,
             execution_name: None,
+            controlled_as: None,
         };
         let noise = LiveEvent {
             at: "t1".into(),
@@ -994,6 +1004,7 @@ mod tests {
             parent_span_id: None,
             execution: None,
             execution_name: None,
+            controlled_as: None,
         };
 
         // The question is the oldest event, well outside the replay window.
