@@ -107,9 +107,254 @@ impl Invocation {
     }
 }
 
+/// What a log record says it is: the node it belongs to, the execution that produced it, what
+/// invoked that one, and where a control aimed at it goes.
+///
+/// One representation and one parser, read by everything that consumes a record — the event
+/// normaliser the dashboard folds, and the import that validates a bundle. They had drifted:
+/// resolved separately, a record's name came from one place and its identity from another, and a
+/// bundle was validated against fields the reader does not even use.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Attribution {
+    /// What ran. `None` for a record that belongs to no node — a lifecycle record names an
+    /// execution, and a host call is an execution the shape cannot place.
+    pub node: Option<String>,
+    pub invocation: Option<Invocation>,
+    /// Where a Stop or a Steer for this record's turn is addressed, when that is not [`Self::node`].
+    pub controlled_as: Option<String>,
+    /// Whether the record stated its own identity, rather than inheriting it from the span it was
+    /// emitted inside.
+    ///
+    /// The difference matters to a validator: a record's own absent parent may be an assertion that
+    /// the run drove it, while an inherited one is only what the enclosing span happened to say.
+    pub stated: bool,
+}
+
+/// Why a record's execution could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Malformed {
+    /// A field is present and is not sixteen hex characters.
+    NotAnId { key: &'static str, found: String },
+}
+
+impl std::fmt::Display for Malformed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAnId { key, found } => write!(f, "`{key}` is `{found}`, which is not an id"),
+        }
+    }
+}
+
+impl Attribution {
+    /// Read one record.
+    ///
+    /// A record's own fields are one source and are taken together — stating an identity and no
+    /// parent states that it has none, and inheriting a parent from the span around it would
+    /// describe a parentage that never existed. Otherwise the innermost span naming an execution
+    /// answers, and answers all of it: a turn runs inside the host call that drove it, and a record
+    /// belongs to the nearest execution it was emitted inside.
+    ///
+    /// A lifecycle record is attributed to no node whatever it carries. It names an execution, and
+    /// anything folding a record with a node into node state would draw a box for a host call.
+    ///
+    /// A present-but-unreadable id is an error rather than an absence. Absent says nothing; a value
+    /// nobody can parse says something that cannot be checked, and reading it as absent asserts a
+    /// shape the record never claimed.
+    pub fn of(record: &serde_json::Value) -> Result<Self, Malformed> {
+        let text = |key: &str| record.get(key).and_then(serde_json::Value::as_str);
+        let kind = text("kind").unwrap_or("event");
+        let lifecycle = matches!(kind, "span_start" | "span_end");
+        let named = |node: Option<&str>| {
+            (!lifecycle)
+                .then_some(node)
+                .flatten()
+                .map(ToString::to_string)
+        };
+        // Missing and unreadable are different findings, so `as_str` cannot make the call: it turns
+        // a number, an object or a boolean sitting where an id belongs into the same `None` a
+        // missing key produces, and a malformed parentage was thereby demoted to a root. JSON's
+        // `null` is the one non-string that reads as absent — it is how absence is spelled by a
+        // producer that writes the key at all.
+        let id = |source: &serde_json::Value, key: &'static str| match source.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(hex)) => {
+                SpanId::parse(hex).map(Some).ok_or(Malformed::NotAnId {
+                    key,
+                    found: hex.to_string(),
+                })
+            }
+            Some(other) => Err(Malformed::NotAnId {
+                key,
+                found: other.to_string(),
+            }),
+        };
+
+        if let Some(span_id) = id(record, "span_id")? {
+            return Ok(Self {
+                node: named(text("node")),
+                invocation: Some(Invocation {
+                    span_id,
+                    parent_span_id: id(record, "parent_span_id")?,
+                }),
+                controlled_as: text("controlled_as").map(ToString::to_string),
+                stated: true,
+            });
+        }
+
+        let spans = || {
+            record
+                .get("spans")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+        };
+        // Innermost span that NAMES an execution. A span carrying `span_id: null` says it has none
+        // — null is absence spelled out — so the search continues outward past it rather than
+        // stopping on the key: stopping there returned no invocation for a record with a valid
+        // enclosing execution, which evaded a bundle's graph validation and folded the record into
+        // the unidentified attempt. A malformed non-null id still stops the search, and is refused
+        // where it is read — skipping outward past it would read a graph the record does not have.
+        let enclosing = spans()
+            .rev()
+            .find(|span| span.get("span_id").is_some_and(|v| !v.is_null()));
+        let of_span = |key: &str| {
+            enclosing
+                .and_then(|span| span.get(key))
+                .and_then(serde_json::Value::as_str)
+        };
+        Ok(Self {
+            // The record's own name still wins where it has one — a checkpoint names the node it
+            // covers, which is not always the node whose span it was written inside.
+            node: named(text("node").or_else(|| of_span("node")).or_else(|| {
+                spans()
+                    .rev()
+                    .find_map(|s| s.get("node").and_then(serde_json::Value::as_str))
+            })),
+            invocation: match enclosing {
+                None => None,
+                // Both halves of the span, and both refused if either is unreadable. Swallowing the
+                // parent's error promoted the execution to a root — the shape a reader would then
+                // build, out of a value nobody could parse, and the opposite of what the same
+                // malformed field means when the record carries it itself.
+                Some(span) => match id(span, "span_id")? {
+                    None => None,
+                    Some(span_id) => Some(Invocation {
+                        span_id,
+                        parent_span_id: id(span, "parent_span_id")?,
+                    }),
+                },
+            },
+            // From the same span as the identity, so a turn's records keep the address its start
+            // announced even where the start itself has been trimmed out of view.
+            controlled_as: text("controlled_as")
+                .or_else(|| of_span("controlled_as"))
+                .map(ToString::to_string),
+            stated: false,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_is_attributed_from_one_source_and_refuses_what_it_cannot_read() {
+        let of = |value: serde_json::Value| Attribution::of(&value);
+
+        // Its own fields, taken together: an identity and no parent states that it has none.
+        let stated = of(serde_json::json!({
+            "kind": "checkpoint",
+            "node": "implementer",
+            "span_id": "00000000000000a1",
+            "spans": [{ "node": "analyst", "span_id": "00000000000000b2",
+                        "parent_span_id": "00000000000000c3" }],
+        }))
+        .unwrap();
+        assert_eq!(stated.node.as_deref(), Some("implementer"));
+        assert_eq!(
+            stated.invocation.and_then(|i| i.parent_span_id),
+            None,
+            "a record that names its own execution names its own parent, or has none"
+        );
+        assert!(stated.stated);
+
+        // Otherwise the innermost span naming an execution answers all of it, control address
+        // included — which is how a turn's records keep their address when its start is out of view.
+        let inherited = of(serde_json::json!({
+            "kind": "tool_call",
+            "tool": "Read",
+            "spans": [
+                { "node": "implementer", "span_id": "00000000000000a1" },
+                { "node": "analyst", "span_id": "00000000000000b2",
+                  "parent_span_id": "00000000000000a1", "controlled_as": "implementer" },
+            ],
+        }))
+        .unwrap();
+        assert_eq!(inherited.node.as_deref(), Some("analyst"));
+        assert_eq!(
+            inherited.invocation.map(|i| i.span_id),
+            SpanId::parse("00000000000000b2")
+        );
+        assert_eq!(inherited.controlled_as.as_deref(), Some("implementer"));
+        assert!(!inherited.stated);
+
+        // A lifecycle record is attributed to no node, whatever it carries.
+        let lifecycle = of(serde_json::json!({
+            "kind": "span_end",
+            "node": "implementer",
+            "span_id": "00000000000000c3",
+        }))
+        .unwrap();
+        assert_eq!(lifecycle.node, None);
+
+        // `null` is absence spelled out: a producer that writes the key at all writes it for every
+        // record, and refusing it would refuse whole streams for saying "none" explicitly. On a
+        // SPAN, a null id also does not stop the outward search for the enclosing execution.
+        let outer = of(serde_json::json!({
+            "kind": "tool_call",
+            "spans": [
+                { "node": "implementer", "span_id": "00000000000000a1" },
+                { "node": "implementer", "span_id": null },
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            outer.invocation.map(|i| i.span_id),
+            SpanId::parse("00000000000000a1"),
+            "a span that says it has no execution is not the innermost that HAS one"
+        );
+        let spelled = of(serde_json::json!({
+            "kind": "usage", "span_id": "00000000000000a1", "parent_span_id": null,
+        }))
+        .unwrap();
+        assert_eq!(spelled.invocation.and_then(|i| i.parent_span_id), None);
+
+        // Present and unreadable is refused wherever it sits — on the record, or on the span it was
+        // emitted inside. Reading it as absent would report a nested execution as one the run drove.
+        for unreadable in [
+            serde_json::json!({ "kind": "usage", "span_id": "nope" }),
+            // A present value of the wrong TYPE is as unreadable as a wrong string: `as_str` made
+            // a number sitting where an id belongs indistinguishable from a missing key.
+            serde_json::json!({ "kind": "usage", "span_id": 41 }),
+            serde_json::json!({ "kind": "usage", "span_id": "00000000000000a1",
+                                "parent_span_id": true }),
+            serde_json::json!({ "kind": "tool_call",
+                                "spans": [{ "span_id": "00000000000000a1",
+                                            "parent_span_id": {} }] }),
+            serde_json::json!({ "kind": "usage", "span_id": "00000000000000a1",
+                                "parent_span_id": "nope" }),
+            serde_json::json!({ "kind": "tool_call", "spans": [{ "span_id": "nope" }] }),
+            serde_json::json!({ "kind": "tool_call",
+                                "spans": [{ "span_id": "00000000000000a1",
+                                            "parent_span_id": "nope" }] }),
+        ] {
+            assert!(
+                of(unreadable.clone()).is_err(),
+                "{unreadable} names something that is not an execution"
+            );
+        }
+    }
 
     #[test]
     fn an_id_is_sixteen_hex_characters_and_reads_back_as_itself() {

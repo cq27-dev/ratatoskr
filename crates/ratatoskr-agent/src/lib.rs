@@ -449,6 +449,118 @@ fn openai_client() -> Result<(openai::Client<TelemetryHttp>, ProviderCallQueue),
 ///
 /// `preamble` is the system prompt; `route` picks the provider/model. Returns the agent's final
 /// text after its tool-calling loop settles.
+/// What every record of a model turn says about itself, so no two emitters can disagree.
+///
+/// Identity, the node it is FOR, and the name an operator's Stop reaches — through one place,
+/// because they had drifted apart in every combination: an answerer's cost under the asker's name,
+/// a turn's tool calls under a different execution from its usage, a control offered against a name
+/// the running turn never polls.
+#[derive(Clone, Copy)]
+pub(crate) struct TurnSubject<'a> {
+    /// What ran, and what a viewer sees the work under.
+    pub node: &'a str,
+    /// Where a Stop or a Steer for this turn has to be addressed, when that is not [`Self::node`].
+    ///
+    /// A stage composed into a box answers at the box's name. A clarification answerer is stranger:
+    /// it runs on the ASKING node's control, because a Stop during one ends the asking turn — so
+    /// nothing addressed to the answerer's own name is ever polled, and a reader offering one would
+    /// hand an operator a button that does nothing.
+    pub controlled_as: Option<&'a str>,
+    pub invocation: Option<Invocation>,
+}
+
+impl<'a> TurnSubject<'a> {
+    fn of(node: &'a str, controlled_as: Option<&'a str>) -> Self {
+        Self {
+            node,
+            controlled_as,
+            invocation: current_execution(),
+        }
+    }
+
+    /// Its identity and parentage as a record states them — the pair, never one of them.
+    fn ids(&self) -> (Option<String>, Option<String>) {
+        ids_of_execution(self.invocation)
+    }
+
+    /// Announce a turn before it waits on the provider.
+    ///
+    /// Before, because a checkpoint only exists once the turn has finished, and the moment a reader
+    /// most wants to know what is running is while it is still running. A turn that announces
+    /// nothing until its first response is invisible for exactly as long as it is slow.
+    fn started(&self, facts: TurnFacts<'_>) {
+        let (span_id, parent_span_id) = self.ids();
+        tracing::info!(
+            kind = "node_start",
+            node = self.node,
+            // Which execution is starting, so a live reader can pair this with the record that
+            // closes it — and tell a second attempt from the first, which shares its name.
+            span_id,
+            parent_span_id,
+            controlled_as = self.controlled_as,
+            model = facts.model,
+            tools = %facts.tools.join(","),
+            thinking = facts.thinking,
+            reuses_session = facts.reuses_session,
+            "node started"
+        );
+    }
+
+    /// Report what a turn cost, in the field names a reader reads.
+    ///
+    /// Every one of them, because a record that carries some of them is authoritative: a reader
+    /// that sees a cost stops falling back to the store, so a partial report is displayed as
+    /// measured absence — no model, no turns, no duration.
+    fn spent(&self, telemetry: &NodeTelemetry) {
+        let (span_id, parent_span_id) = self.ids();
+        tracing::info!(
+            kind = "usage",
+            node = self.node,
+            span_id,
+            parent_span_id,
+            // The address rides on every record that states its own identity, because stating one
+            // is what STOPS the reader falling back to the span that carries it. A tail whose
+            // start has scrolled away reconstructs the attempt from this record, and an answerer
+            // without its address reads as controllable — a Stop nothing polls.
+            controlled_as = self.controlled_as,
+            "gen_ai.usage.input_tokens" = telemetry.usage.input_tokens,
+            "gen_ai.usage.output_tokens" = telemetry.usage.output_tokens,
+            "gen_ai.usage.cached_input_tokens" = telemetry.usage.cached_input_tokens,
+            "gen_ai.usage.cache_creation_input_tokens" =
+                telemetry.usage.cache_creation_input_tokens,
+            "gen_ai.usage.reasoning_tokens" = telemetry.usage.reasoning_tokens,
+            turns = telemetry.turns,
+            duration_ms = telemetry.duration_ms,
+            model = telemetry.model.as_deref(),
+            tools = %telemetry.tools.join(","),
+            tools_used = %telemetry.tools_used.join(","),
+            thinking = telemetry.thinking,
+            reuses_session = telemetry.reuses_session,
+            // Why it failed, for a turn that writes no checkpoint to carry it. Without this a
+            // recovered failure — an answerer that could not answer, an evidence-only turn that
+            // errored — reads as done the moment its execution ends.
+            error = telemetry.error.as_deref(),
+            "node usage"
+        );
+    }
+}
+
+/// What a turn is about to run on.
+struct TurnFacts<'a> {
+    model: &'a str,
+    tools: &'a [String],
+    thinking: bool,
+    reuses_session: bool,
+}
+
+/// One turn against a model, outside any node's own run.
+///
+/// `answerer` is what is ANSWERING, when that is not what `control` addresses. A clarification runs
+/// on the ASKER's control — a Stop during one ends the asking node's turn, which is the whole point
+/// of blocking it — while the turn itself is the answerer's. Taking the name from the control puts
+/// the answerer's cost and its execution under the asker: an invocation of the asker that never
+/// happened, whose figures then stand in for its real one. The same split `NodeRun` keeps between
+/// `node` and `controlled_as`, from the other side.
 pub async fn ask(
     route: &ModelRoute,
     preamble: &str,
@@ -456,10 +568,14 @@ pub async fn ask(
     tools: ToolSet,
     max_turns: Option<usize>,
     control: Option<RuntimeControl>,
+    answerer: Option<&str>,
 ) -> Result<String, AgentError> {
-    let node = control
+    let addressed = control
         .as_ref()
         .map_or_else(|| "ask".to_string(), |control| control.node.clone());
+    let node = answerer.map_or_else(|| addressed.clone(), str::to_string);
+    // Only where they differ: a plain ask answers under its own name and is controlled by it.
+    let controlled_as = (node != addressed).then_some(addressed.as_str());
     match parse_provider(&route.provider)? {
         Provider::Anthropic => {
             let session = uuid::Uuid::new_v4().to_string();
@@ -467,6 +583,7 @@ pub async fn ask(
             run(AskRun {
                 model: caching(client.completion_model(&route.model)),
                 node: &node,
+                controlled_as,
                 preamble,
                 question,
                 tools,
@@ -482,6 +599,7 @@ pub async fn ask(
             run(AskRun {
                 model: client.completion_model(&route.model),
                 node: &node,
+                controlled_as,
                 preamble,
                 question,
                 tools,
@@ -500,6 +618,7 @@ pub async fn ask(
                 // it rejects would cost the call rather than the cache.
                 model: client.completion_model(&route.model),
                 node: &node,
+                controlled_as,
                 preamble,
                 question,
                 tools,
@@ -517,6 +636,9 @@ pub async fn ask(
 struct AskRun<'a, M> {
     model: M,
     node: &'a str,
+    /// Where a Stop for this turn is addressed, when that is not [`Self::node`] — the asking node,
+    /// for a clarification.
+    controlled_as: Option<&'a str>,
     preamble: &'a str,
     question: &'a str,
     tools: ToolSet,
@@ -543,6 +665,7 @@ where
     let AskRun {
         model,
         node,
+        controlled_as,
         preamble,
         question,
         tools,
@@ -562,22 +685,63 @@ where
     );
     let agent = bind_tools(builder, &tools, None, None, None, None);
 
-    let answer = agent.prompt(question).await;
-    // No store to checkpoint to here, so it goes to the log. A one-shot question whose cost is
-    // unknowable is the same defect as an uncounted node, in a smaller place.
-    let (usage, calls) = meter.read();
-    tracing::info!(
-        kind = "usage",
-        calls,
-        "gen_ai.usage.input_tokens" = usage.input_tokens,
-        "gen_ai.usage.output_tokens" = usage.output_tokens,
-        "gen_ai.usage.cached_input_tokens" = usage.cached_input_tokens,
-        // The write half, and the expensive one: a cache write is billed above the ordinary input
-        // rate, so a cost read from hits alone reads as cheaper than it was.
-        "gen_ai.usage.cache_creation_input_tokens" = usage.cache_creation_input_tokens,
-        "gen_ai.usage.reasoning_tokens" = usage.reasoning_tokens,
-        "ask usage"
+    // The turn's own span, carrying what is running and which execution it is. Without it this turn
+    // is polled inside the ASKING node's span — `execution` sets a task-local identity and no span —
+    // so every line of model text and every tool call the hook emits would be attributed to the
+    // asker, while the record of what it cost names the answerer. One turn, split across two
+    // invocations, showing its activity under the wrong node.
+    //
+    // The control address stays the asker's, and is stated rather than left to be inferred: a Stop
+    // during a clarification ends the ASKING node's turn, so nothing addressed to the answerer's
+    // own name is ever polled and a reader offering one would hand an operator a dead button.
+    let subject = TurnSubject::of(node, controlled_as);
+    let tool_names = tools.names();
+    // `provider/model`, the same identity an ordinary turn reports. An answerer commonly has no
+    // checkpoint, so these records are the only account of what it ran on — and a bare model name
+    // beside a qualified one folds one route into two.
+    let model_name = format!("{}/{}", route.provider, route.model);
+    let span = tracing::info_span!(
+        "agent",
+        node,
+        "gen_ai.operation.name" = "invoke_agent",
+        "gen_ai.agent.name" = node,
+        "gen_ai.request.model" = %model_name,
+        span_id = subject.ids().0,
+        parent_span_id = subject.ids().1,
+        // On the span, not only on the start: a viewer attaching mid-turn, or an imported tail,
+        // sees the tool calls and the model text and never the `node_start` — and an answerer whose
+        // address is missing reads as controllable, which offers a Stop that nothing polls.
+        controlled_as = subject.controlled_as,
     );
+    // Announced before the wait, like any other turn. An answerer that says nothing until its first
+    // response is invisible for exactly as long as it is slow — and a clarification is the case
+    // where a viewer is most likely to be wondering what the run is doing.
+    subject.started(TurnFacts {
+        model: &model_name,
+        tools: &tool_names,
+        thinking: thinking_left_on(route),
+        reuses_session: false,
+    });
+    let started = std::time::Instant::now();
+    let answer = async { agent.prompt(question).await }
+        .instrument(span)
+        .await;
+    // No store to checkpoint to here, so it goes to the log. A one-shot question whose cost is
+    // unknowable is the same defect as an uncounted node, in a smaller place — and a report that
+    // carries only some of the fields is worse than none, because a reader that sees a cost stops
+    // falling back to the store and displays the rest as measured absence.
+    let (usage, calls) = meter.read();
+    subject.spent(&NodeTelemetry {
+        model: Some(model_name),
+        duration_ms: Some(started.elapsed().as_millis() as u64),
+        usage,
+        turns: Some(calls),
+        error: answer.as_ref().err().map(ToString::to_string),
+        tools: tool_names,
+        tools_used: meter.used(),
+        reuses_session: false,
+        thinking: thinking_left_on(route),
+    });
     answer.map_err(|e| AgentError::Prompt(e.to_string()))
 }
 
@@ -2474,6 +2638,21 @@ tokio::task_local! {
     static CLAIM_SCOPE: u64;
     /// The execution the running future belongs to; see [`execution`].
     static EXECUTION: Invocation;
+    /// Whether the running execution's output has survived every check so far; see
+    /// [`output_unvalidated`].
+    static VALIDATED: std::sync::Arc<std::sync::atomic::AtomicBool>;
+}
+
+/// Record that the running execution's output failed a validation its caller will fail on too.
+///
+/// The turn returns the raw text either way — the caller's parse is what produces the error the
+/// stage fails with — but the turn's `span_end` must not then read as the work completing: a stage
+/// that reads done is excluded from the candidates a failed run is attributed among, so the failed
+/// stage rendered as the one part of the run that succeeded.
+pub fn output_unvalidated() {
+    let _ = VALIDATED.try_with(|validated| {
+        validated.store(false, std::sync::atomic::Ordering::Relaxed);
+    });
 }
 
 /// The scope of a turn recorded with no scope open — the sequential paths that run outside a
@@ -2513,18 +2692,40 @@ impl ExecutionKind {
 /// that line, and an execution that started and never ended is exactly what a reader cannot tell
 /// from one still running.
 struct SpanEnd {
-    span_id: SpanId,
+    invocation: Invocation,
     name: String,
     kind: ExecutionKind,
+    /// Whether the execution ran to the end, as against being dropped part way.
+    ///
+    /// Set after the work returns, so a guard dropped without it was cancelled — a run stopped, a
+    /// task abandoned. Closing an execution's liveness is not the same as saying it finished, and a
+    /// reader with only "it ended" has to treat the outcome as unknown: a cancelled node that read
+    /// as done was excluded from the candidates a failed run is attributed to.
+    completed: bool,
+    /// Whether everything the execution produced survived its checks; see [`output_unvalidated`].
+    validated: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for SpanEnd {
     fn drop(&mut self) {
+        // The same pair its start named. Absent parentage means the run drove this execution, which
+        // is a claim about the run's shape — so a nested end that stated nothing described itself
+        // as top-level, and the two halves of one execution disagreed.
+        let (span_id, parent_span_id) = ids_of_execution(Some(self.invocation));
         tracing::info!(
             kind = "span_end",
-            span_id = %self.span_id,
+            span_id,
+            parent_span_id,
             execution_name = %self.name,
             execution = self.kind.as_str(),
+            outcome = match (
+                self.completed,
+                self.validated.load(std::sync::atomic::Ordering::Relaxed),
+            ) {
+                (false, _) => "cancelled",
+                (true, false) => "unvalidated",
+                (true, true) => "completed",
+            },
             "execution ended"
         );
     }
@@ -2555,20 +2756,30 @@ pub async fn execution_as<F: Future>(
     // not a box: the shape cannot place `redTeam` or `isConverged`, and a reader that folds every
     // event carrying `node` into node state would give a run a trailing column per host it called.
     // What a lifecycle record says is which execution began, not which box it belongs to.
+    let (span_id, parent_span_id) = ids_of_execution(Some(invocation));
     tracing::info!(
         kind = "span_start",
-        span_id = %invocation.span_id,
-        parent_span_id = invocation.parent_span_id.map(|p| p.to_string()),
+        span_id,
+        parent_span_id,
         execution_name = %name,
         execution = kind.as_str(),
         "execution started"
     );
-    let _end = SpanEnd {
-        span_id: invocation.span_id,
+    let validated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut end = SpanEnd {
+        invocation,
         name: name.to_string(),
         kind,
+        completed: false,
+        validated: std::sync::Arc::clone(&validated),
     };
-    EXECUTION.scope(invocation, work).await
+    let outcome = EXECUTION
+        .scope(invocation, VALIDATED.scope(validated, work))
+        .await;
+    // Reached only if the work returned. A future dropped part way never gets here, and its guard
+    // says so.
+    end.completed = true;
+    outcome
 }
 
 /// Run `work` as one execution: everything it records names this identity, and everything it
@@ -2581,6 +2792,25 @@ pub async fn execution_as<F: Future>(
 /// scope at all, which would leave it with no identity.
 pub async fn execution<F: Future>(name: &str, kind: ExecutionKind, work: F) -> F::Output {
     execution_as(mint_span_id(), name, kind, work).await
+}
+
+/// The running execution's identity and parentage, as a record states them.
+///
+/// One call, because the two are one answer: a record that names an execution and takes its parent
+/// from somewhere else describes a parentage that never existed. `(None, None)` outside every
+/// execution, which is the truth about a record written there.
+pub fn execution_ids() -> (Option<String>, Option<String>) {
+    ids_of_execution(current_execution())
+}
+
+/// How an execution is written down: sixteen hex characters, and the same for what invoked it.
+pub fn ids_of_execution(invocation: Option<Invocation>) -> (Option<String>, Option<String>) {
+    (
+        invocation.map(|i| i.span_id.to_string()),
+        invocation
+            .and_then(|i| i.parent_span_id)
+            .map(|p| p.to_string()),
+    )
 }
 
 /// Which execution the running future is, and what invoked it.
@@ -3082,30 +3312,24 @@ where
         "gen_ai.operation.name" = "invoke_agent",
         "gen_ai.agent.name" = node,
         "gen_ai.request.model" = %model_name,
-        span_id = current_execution().map(|i| i.span_id.to_string()),
-        parent_span_id = current_execution()
-            .and_then(|i| i.parent_span_id)
-            .map(|p| p.to_string()),
+        span_id = execution_ids().0,
+        parent_span_id = execution_ids().1,
+        controlled_as,
     );
     // Announced at the start, because a checkpoint only exists once the node has finished — and
     // the moment a reader most wants to know what a node is running on is while it is still
     // running. The facts here are the configured ones; cost arrives with the checkpoint.
-    let invocation = current_execution();
-    tracing::info!(
-        kind = "node_start",
-        node,
-        // Which execution is starting, so a live reader can pair this with the checkpoint that
-        // closes it — and tell a second attempt from the first, which shares its name.
-        span_id = invocation.map(|i| i.span_id.to_string()),
-        parent_span_id = invocation
-            .and_then(|i| i.parent_span_id)
-            .map(|p| p.to_string()),
-        model = %model_name,
-        tools = %tool_names.join(","),
-        thinking = thinking_left_on(route),
-        reuses_session = continuing_session(route.session, conversation, compacted_session.is_some()),
-        "node started"
-    );
+    let subject = TurnSubject::of(node, controlled_as);
+    subject.started(TurnFacts {
+        model: &model_name,
+        tools: &tool_names,
+        thinking: thinking_left_on(route),
+        reuses_session: continuing_session(
+            route.session,
+            conversation,
+            compacted_session.is_some(),
+        ),
+    });
     let started = std::time::Instant::now();
     // A node the operator stopped has not failed, and its work is not thrown away: the run parks
     // here until they start it again, then runs the node afresh on the same question — which is
@@ -3160,21 +3384,37 @@ where
         // mistake a model corrects immediately when told. The correction is a fresh short prompt
         // rather than a continuation, so the preamble and tools stay cached and the transcript
         // does not grow.
-        if may_correct_schema
-            && let Err(invalid) = ratatoskr_graph::validate_raw(raw, &schema_value)
-        {
-            may_correct_schema = false;
-            tracing::warn!(node, %invalid, "output failed its schema; asking for a correction");
-            prompt = format!(
-                "Your answer did not match the schema you were given: {invalid}\n\n\
-                 Here is what you returned:\n{raw}\n\n\
-                 Return the same content corrected to match the schema. Change only what the \
-                 error names — keep every finding, do not shorten anything, and do not go and \
-                 look anything up again. Answer by calling the output tool.",
-            );
-            continue;
+        match ratatoskr_graph::validate_raw(raw, &schema_value) {
+            // What validated is what is returned: the extracted JSON, not the prose that may be
+            // wrapped around it. The extraction is lenient — a fenced or prefaced object is
+            // recovered — while a caller parses what it receives strictly, and handing back the
+            // prose let the two disagree: the turn ended "completed" and the stage then failed on
+            // its own parse, rendering the failed stage as the one part of the run that succeeded.
+            // Returning the validated value is what makes "completed" a claim the caller cannot
+            // refute.
+            Ok(value) => break Ok(value.to_string()),
+            Err(invalid) if may_correct_schema => {
+                may_correct_schema = false;
+                tracing::warn!(node, %invalid, "output failed its schema; asking for a correction");
+                prompt = format!(
+                    "Your answer did not match the schema you were given: {invalid}\n\n\
+                     Here is what you returned:\n{raw}\n\n\
+                     Return the same content corrected to match the schema. Change only what the \
+                     error names — keep every finding, do not shorten anything, and do not go and \
+                     look anything up again. Answer by calling the output tool.",
+                );
+                continue;
+            }
+            Err(_) => {
+                // The correction came back invalid too. The raw text still goes to the caller —
+                // its parse is what produces the error the stage fails with — but this turn's end
+                // must not read as the work completing: the caller's validation is still to run
+                // and is known to fail, and a stage that reads done is excluded from the
+                // candidates a failed run is attributed among.
+                output_unvalidated();
+                break attempt;
+            }
         }
-        break attempt;
     };
 
     let (usage, calls) = meter.read();
@@ -3196,18 +3436,7 @@ where
             ),
             thinking: thinking_left_on(route),
         };
-        tracing::info!(
-            kind = "usage",
-            node,
-            "gen_ai.usage.input_tokens" = telemetry.usage.input_tokens,
-            "gen_ai.usage.output_tokens" = telemetry.usage.output_tokens,
-            "gen_ai.usage.cached_input_tokens" = telemetry.usage.cached_input_tokens,
-            "gen_ai.usage.cache_creation_input_tokens" =
-                telemetry.usage.cache_creation_input_tokens,
-            "gen_ai.usage.reasoning_tokens" = telemetry.usage.reasoning_tokens,
-            duration_ms = telemetry.duration_ms,
-            "node usage"
-        );
+        subject.spent(&telemetry);
         ledger.record(node, telemetry);
     }
 
@@ -4356,6 +4585,244 @@ mod tests {
             .expect("a node outside every host call is still an execution");
         assert_eq!(overseer.parent_span_id, None, "the run is the trace");
         assert_ne!(overseer.span_id, referee.span_id);
+    }
+
+    /// A model that wraps a valid answer in prose, as models do.
+    #[derive(Clone, Default)]
+    struct ProseWrapped;
+
+    impl CompletionModel for ProseWrapped {
+        type Response = ();
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            Ok(CompletionResponse {
+                choice: OneOrMany::one(AssistantContent::text(
+                    "Here is the summary you asked for: {\"summary\": \"done\"} — hope it helps!",
+                )),
+                usage: rig_core::completion::Usage::default(),
+                raw_response: (),
+                message_id: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+            Err(CompletionError::ResponseError("no stream".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_completed_turn_returns_the_value_it_validated_not_the_prose_around_it() {
+        // The schema gate recovers a JSON object from prose — that leniency is the point of it —
+        // while a caller parses what it receives strictly. Handing back the prose let the two
+        // disagree: the turn ended "completed" and the stage then failed on its own parse, so the
+        // failed stage rendered as the one part of the run that succeeded. What validated is what
+        // is returned, and "completed" becomes a claim the caller cannot refute.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct Done {
+            summary: String,
+        }
+
+        let route = ModelRoute {
+            provider: "test".to_string(),
+            model: "test-model".to_string(),
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        };
+        let answer = run_typed_with_control(
+            ProseWrapped,
+            NodeRun {
+                node: "analyst",
+                controlled_as: None,
+                route: &route,
+                preamble: "Answer.",
+                question: "Answer.",
+                tools: ToolSet::default(),
+                output_schema: schemars::schema_for!(Done),
+                policy: None,
+                max_turns: Some(4),
+                clarifier: None,
+                observer: None,
+                skills: Vec::new(),
+                files: None,
+                rag_rat_worktree: None,
+                shell: None,
+                push: None,
+                conversation: None,
+                ledger: None,
+                produces: None,
+            },
+            ProviderCallQueue::default(),
+            None,
+        )
+        .await
+        .expect("the prose-wrapped answer validates");
+
+        // Exactly what a strict caller does with it, succeeding exactly when the turn completed.
+        let parsed: Done = serde_json::from_str(&answer).expect("the returned text IS the value");
+        assert_eq!(parsed.summary, "done");
+    }
+
+    /// A model whose output never matches any schema, however often it is corrected.
+    #[derive(Clone, Default)]
+    struct AlwaysInvalid;
+
+    impl CompletionModel for AlwaysInvalid {
+        type Response = ();
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            Ok(CompletionResponse {
+                choice: OneOrMany::one(AssistantContent::text("not the schema, ever")),
+                usage: rig_core::completion::Usage::default(),
+                raw_response: (),
+                message_id: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+            Err(CompletionError::ResponseError("no stream".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_whose_output_never_validates_does_not_end_as_completed() {
+        // `run_structured` returns the raw text either way — the caller's parse is what produces
+        // the error the stage fails with — but that parse happens AFTER this turn's `span_end`.
+        // An end that read "completed" there marked the stage done before its output was checked,
+        // and a failed run attributes itself among the nodes still reading as working: the stage
+        // that failed rendered as the one part of the run that succeeded.
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Done {
+            summary: String,
+        }
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("sink").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let route = ModelRoute {
+            provider: "test".to_string(),
+            model: "test-model".to_string(),
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        };
+        let sink = Sink::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_writer(sink.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let guard = tracing::subscriber::set_default(subscriber);
+        let answer = run_typed_with_control(
+            AlwaysInvalid,
+            NodeRun {
+                node: "analyst",
+                controlled_as: Some("implementer"),
+                route: &route,
+                preamble: "Answer.",
+                question: "Answer.",
+                tools: ToolSet::default(),
+                output_schema: schemars::schema_for!(Done),
+                policy: None,
+                max_turns: Some(4),
+                clarifier: None,
+                observer: None,
+                skills: Vec::new(),
+                files: None,
+                rag_rat_worktree: None,
+                shell: None,
+                push: None,
+                conversation: None,
+                // A ledger, because the usage record is only emitted for a turn whose cost has
+                // somewhere to go — and the usage record is half of what this test reads.
+                ledger: Some(Arc::new(RunLedger::default())),
+                produces: None,
+            },
+            ProviderCallQueue::default(),
+            None,
+        )
+        .await;
+        drop(guard);
+
+        // The raw text still reaches the caller — failing the turn here would discard the model's
+        // work over what may be a recoverable parse.
+        assert_eq!(
+            answer.expect("the raw text is returned"),
+            "not the schema, ever"
+        );
+
+        let raw = String::from_utf8(sink.0.lock().expect("sink").clone()).expect("utf-8");
+        let end = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["kind"] == "span_end")
+            .expect("the turn announced its end");
+        assert_eq!(
+            end["outcome"], "unvalidated",
+            "an end at the model-turn boundary must not claim the stage completed: {end}"
+        );
+
+        // The control address rides on the records that state their own identity — the usage
+        // record above all, since a tail whose start has scrolled away reconstructs the attempt
+        // from it, and an answerer without its address reads as a Stop target nothing polls.
+        let usage = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["kind"] == "usage")
+            .expect("the turn reported its cost");
+        assert_eq!(usage["controlled_as"], "implementer", "{usage}");
+        let start = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["kind"] == "node_start")
+            .expect("the turn announced itself");
+        assert_eq!(start["controlled_as"], "implementer", "{start}");
     }
 
     #[tokio::test]

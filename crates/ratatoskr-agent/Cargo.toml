@@ -31,6 +31,8 @@ tracing.workspace = true
 # `test-util` for `start_paused`: the control tests wait between polls, and paused time makes that
 # instant rather than real seconds in the suite.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# Capturing the records a turn emits, so a test can assert on the events a viewer folds.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

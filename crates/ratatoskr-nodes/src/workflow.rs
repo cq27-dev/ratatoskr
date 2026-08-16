@@ -2504,7 +2504,20 @@ fn claiming(name: &str, host: HostFn) -> HostFn {
     Arc::new(move |arg| {
         let name = name.clone();
         let call = host(arg);
-        Box::pin(async move { ratatoskr_agent::claim_scope(&name, call).await })
+        Box::pin(async move {
+            ratatoskr_agent::claim_scope(&name, async move {
+                let out = call.await;
+                // A host that errors did not complete the stage, and its end must say so: the host
+                // call IS the stage boundary — validation, normalisation and the checkpoint all
+                // happen inside it — and a reader settles the turns under a host only when the
+                // host's own end claims the boundary was reached.
+                if out.is_err() {
+                    ratatoskr_agent::output_unvalidated();
+                }
+                out
+            })
+            .await
+        })
     })
 }
 
@@ -3297,6 +3310,67 @@ mod tests {
 
     use super::*;
     use crate::analyst;
+
+    #[tokio::test]
+    async fn a_host_that_errors_does_not_end_its_execution_as_completed() {
+        // The host call is the stage boundary: validation, normalisation and the checkpoint all
+        // happen inside it, after the model turn has already ended "completed". A host that errors
+        // out did not reach that boundary, and a reader settles the turns under a host only when
+        // the host's own end says it was reached — so an erring host ending "completed" marked the
+        // failed stage done and took it out of its own run's failure candidates.
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("sink").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let end_of = |sink: &Sink| {
+            let raw = String::from_utf8(sink.0.lock().expect("sink").clone()).expect("utf-8");
+            raw.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|record| record["kind"] == "span_end")
+                .expect("the host call announced its end")
+        };
+        let capture = |sink: &Sink| {
+            let layer = tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_writer(sink.clone());
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(layer))
+        };
+
+        let failing: ratatoskr_script::workflow::HostFn = std::sync::Arc::new(|_arg| {
+            Box::pin(async { Err("output failed the stage's schema".to_string()) })
+        });
+        let sink = Sink::default();
+        let guard = capture(&sink);
+        let _ = claiming("implement", failing)("{}".to_string()).await;
+        drop(guard);
+        assert_eq!(end_of(&sink)["outcome"], "unvalidated", "{}", end_of(&sink));
+
+        // And one that returns is the boundary being reached.
+        let fine: ratatoskr_script::workflow::HostFn =
+            std::sync::Arc::new(|_arg| Box::pin(async { Ok("{}".to_string()) }));
+        let sink = Sink::default();
+        let guard = capture(&sink);
+        let _ = claiming("implement", fine)("{}".to_string()).await;
+        drop(guard);
+        assert_eq!(end_of(&sink)["outcome"], "completed", "{}", end_of(&sink));
+    }
 
     fn red(failing: &[&str], passing: &[&str], exit: i32) -> RedTeamOutput {
         RedTeamOutput {

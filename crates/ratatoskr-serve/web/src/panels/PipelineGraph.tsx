@@ -39,7 +39,7 @@ import {
   handoffDrawn,
   skippedSpans,
   type ConvergeLoops,
-  type LiveNode,
+  type DerivedNode,
 } from "../derive";
 
 /*
@@ -87,25 +87,26 @@ function NodeFacts({
   planned,
 }: {
   telemetry: NodeTelemetry | undefined;
-  live: LiveNode | undefined;
+  live: DerivedNode | undefined;
   planned: PlannedNode | undefined;
 }) {
   // Three sources, most-actual first: what the node recorded, what it announced when it started,
   // and what config says it would use. The last is what fills a node that has not run yet.
-  const tools = telemetry?.tools?.length ? telemetry.tools : (live?.facts?.tools ?? []);
+  const tools = telemetry?.tools?.length ? telemetry.tools : (live?.telemetry?.tools ?? []);
   // What it reached for, as against what it was handed. A node given a shell it never used is
   // worth seeing, so the two are drawn differently rather than the unused ones being dropped.
   const used = telemetry?.tools_used?.length
     ? new Set(telemetry.tools_used)
     : (live?.used ?? new Set<string>());
-  const modelFull = telemetry?.model ?? live?.facts?.model ?? planned?.model ?? null;
-  const thinking = telemetry?.thinking ?? live?.facts?.thinking ?? planned?.thinking ?? false;
+  const modelFull = telemetry?.model ?? live?.telemetry?.model ?? planned?.model ?? null;
+  const thinking =
+    telemetry?.thinking ?? live?.telemetry?.thinking ?? planned?.thinking ?? false;
   // Every scope this box's stages run under, so a box whose halves continue differently shows each
   // of their marks rather than one of them winning. Config is the only source that can say WHICH: a
   // recorded `reuses_session` is set by a compacted re-entry too, so on its own it can say no more
   // than "something continued", and it is the last resort for a box config has no route for.
   const scopes = new Set<SessionScope>(planned?.sessions ?? []);
-  if (!scopes.size && (telemetry?.reuses_session || live?.facts?.reuses_session)) {
+  if (!scopes.size && (telemetry?.reuses_session || live?.telemetry?.reuses_session)) {
     scopes.add("reuse");
   }
   const cycles = telemetry?.turns ?? live?.cycles ?? null;
@@ -243,7 +244,7 @@ function stages(nodes: NodeView[]): NodeView[][] {
     .map(([, lanes]) => lanes.sort((a, b) => a.lane - b.lane));
 }
 
-type PipelineNodeData = { node: NodeView; live: LiveNode | undefined; isSelected: boolean };
+type PipelineNodeData = { node: NodeView; live: DerivedNode | undefined; isSelected: boolean };
 type PipelineNodeType = Node<PipelineNodeData, "pipeline">;
 
 /** One pipeline node: name, live dot, state, and its checkpoint count. */
@@ -283,7 +284,7 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
           {node.checkpoints > 0 ? `${node.checkpoints} CP` : "—"}
         </span>
       </div>
-      {(node.telemetry || data.live?.facts || node.planned) && (
+      {(node.telemetry || data.live?.telemetry || node.planned) && (
         <NodeFacts telemetry={node.telemetry} live={data.live} planned={node.planned} />
       )}
       <Handle type="source" id="out" position={Position.Right} isConnectable={false} />
@@ -613,7 +614,7 @@ interface Props {
    */
   nodes: NodeView[];
   /** Keyed by node name. Fills the box while a node is still working. */
-  live: Map<string, LiveNode>;
+  live: Map<string, DerivedNode>;
   /** Implementer re-entries so far, by route. Folded from the same event prefix as `nodes`. */
   loops: ConvergeLoops;
   selected: string | null;

@@ -170,9 +170,17 @@ impl NodeClarifier {
 
         // Emit before waiting: the dashboard learns about the question by tailing this, so it has
         // to be on disk before the request that blocks on an answer.
+        //
+        // The waiting belongs to the exchange, which is its own execution. `execution` sets a
+        // task-local identity and no span, so a record that states nothing is read against the
+        // ASKING node's span — filing the wait under the asker while the exchange's own checkpoint
+        // and lifecycle name the child.
+        let (span_id, parent_span_id) = ratatoskr_agent::execution_ids();
         tracing::info!(
             kind = "question",
             question_id,
+            span_id,
+            parent_span_id,
             from,
             question,
             "waiting on the user"
@@ -192,9 +200,12 @@ impl NodeClarifier {
         // Always announce the outcome, including the ordinary one where nobody answered. The
         // dashboard clears its prompt on this event, so without it a viewer is left staring at a
         // question the run has long since moved past.
+        let (span_id, parent_span_id) = ratatoskr_agent::execution_ids();
         tracing::info!(
             kind = "question_answered",
             question_id,
+            span_id,
+            parent_span_id,
             answered = answer.is_some(),
             "question resolved"
         );
@@ -359,6 +370,9 @@ impl NodeClarifier {
             ToolSet::default(),
             Some(ANSWER_MAX_TURNS),
             control.clone(),
+            // The control is the ASKER's — a Stop here ends the asking node's turn — but what runs
+            // is the answerer, and every record of this turn has to say so.
+            Some(answerer),
         )
         .instrument(span);
         let response = match control.as_ref() {

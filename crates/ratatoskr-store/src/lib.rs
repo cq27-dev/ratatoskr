@@ -68,7 +68,8 @@ pub enum StoreError {
     #[error("no run `{0}` to record provenance against")]
     NoSuchRun(String),
     #[error(
-        "this bundle is format version {found}; this build reads up to {}. Update ratatoskr to read it",
+        "this bundle is format version {found}; this build reads version {}. One version is one \
+         shape, so a bundle of another is refused rather than read with the wrong meaning",
         crate::bundle::FORMAT_VERSION
     )]
     Unsupported { found: u32 },

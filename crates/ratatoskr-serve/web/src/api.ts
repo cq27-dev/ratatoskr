@@ -315,6 +315,46 @@ export interface LiveEvent {
   error?: string;
   /** Which attempt this was, on a `checkpoint`. */
   iteration?: number;
+  /**
+   * Which execution produced this, and what invoked that one.
+   *
+   * A name is not an execution: one stage is invoked once per converge pass and may be invoked
+   * concurrently, so two records under one name are two invocations and only this says which.
+   * Absent on records written before executions had identities; `parent_span_id` absent means the
+   * run drove this execution, which is not a gap.
+   */
+  span_id?: string;
+  parent_span_id?: string;
+  /**
+   * On `span_start` and `span_end`: what kind of execution it is (`host`, `node`, `clarification`)
+   * and what it is called.
+   *
+   * The name is deliberately not `node` — a host call is an execution the shape cannot place, and
+   * folding it into node state would draw a box for it.
+   */
+  execution?: string;
+  execution_name?: string;
+  /**
+   * On a `node_start`: where a Stop or Steer for this turn is addressed, when that is not the node
+   * itself. A clarification answerer runs on the ASKING node's control, so a control offered under
+   * the answerer's own name is never polled.
+   */
+  controlled_as?: string;
+  /**
+   * What the turn reached for, on a `usage` record — the only record a turn that writes no
+   * checkpoint leaves of it.
+   */
+  tools_used?: string[];
+  /**
+   * Who is waiting, on a `question`. Apart from `node`, because the exchange is its own
+   * execution: naming the asker here would open an invocation of the asker that never happened.
+   */
+  asked_by?: string;
+  /**
+   * How an execution ended, on a `span_end`: `completed`, or `cancelled` where the work was dropped
+   * part way. Ending is not finishing — without this the outcome is unknown.
+   */
+  outcome?: string;
 }
 
 /** What one attempt cost, off the event stream. */
