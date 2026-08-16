@@ -4,6 +4,7 @@ import {
   applyDerived,
   convergeLoops,
   forkHandoff,
+  startedOperations,
   handoffDrawn,
   inNodeBoxes,
   nodesFromEvents,
@@ -197,19 +198,19 @@ test("events belonging to no node are skipped", () => {
 // The implementer cannot start before the red team has finished (`implement_host` in
 // ratatoskr-nodes/src/workflow.rs refuses to), so both boxes having started is the whole test.
 test("both the red team and the implementer having started draws the hand-off", () => {
-  expect(forkHandoff([node("redteam", "done"), node("implementer", "working")])).toBe(true);
+  expect(forkHandoff([node("redteam", "done"), node("implementer", "working")], new Set())).toBe(true);
 });
 
 test("a started red team alone draws no hand-off, because nothing has received the tree", () => {
-  expect(forkHandoff([node("redteam", "working"), node("implementer", "idle")])).toBe(false);
+  expect(forkHandoff([node("redteam", "working"), node("implementer", "idle")], new Set())).toBe(false);
 });
 
 test("neither node having started draws no hand-off", () => {
-  expect(forkHandoff([node("redteam", "idle"), node("implementer", "idle")])).toBe(false);
+  expect(forkHandoff([node("redteam", "idle"), node("implementer", "idle")], new Set())).toBe(false);
 });
 
 test("a workflow with no red team at all draws no hand-off from nothing", () => {
-  expect(forkHandoff([node("analyst", "done"), node("implementer", "working")])).toBe(false);
+  expect(forkHandoff([node("analyst", "done"), node("implementer", "working")], new Set())).toBe(false);
 });
 
 // The edge is a vertical step down the lane gap between two boxes in one column. A layout that
@@ -220,7 +221,7 @@ test("a layout that puts the two in different columns draws no lane hand-off", (
     { ...node("redteam", "done"), stage: 0 },
     { ...node("implementer", "working"), stage: 2 },
   ];
-  expect(forkHandoff(nodes)).toBe(false);
+  expect(forkHandoff(nodes, new Set())).toBe(false);
 });
 
 test("sharing a column is what draws it", () => {
@@ -228,11 +229,11 @@ test("sharing a column is what draws it", () => {
     { ...node("redteam", "done"), stage: 3, lane: 0 },
     { ...node("implementer", "working"), stage: 3, lane: 1 },
   ];
-  expect(forkHandoff(nodes)).toBe(true);
+  expect(forkHandoff(nodes, new Set())).toBe(true);
 });
 
 test("a failed red team still handed the tree over, so the hand-off is drawn", () => {
-  expect(forkHandoff([node("redteam", "failed"), node("implementer", "working")])).toBe(true);
+  expect(forkHandoff([node("redteam", "failed"), node("implementer", "working")], new Set())).toBe(true);
 });
 
 /** A node the shape places, at a column of its own. */
@@ -1870,4 +1871,83 @@ test("an execution that ended keeps its failure state but is no longer a control
 
   expect(nodesFromEvents(cancelled).get("characterizer").state).toBe("working");
   expect(workingNodeNames(shape, cancelled)).toEqual([]);
+});
+
+test("a stream that names its hosts draws the hand-off from evidence, not from box state", () => {
+  // Two non-idle boxes prove the hand-off only for the Rust operations: `implement()` cannot start
+  // until the awaited `redTeam()` has finished. A workflow that composes its own stages into the
+  // same boxes carries no such guarantee — and its stream announces its hosts, so the edge can ask
+  // whether the operation ran instead of inferring it.
+  const shape = [node("redteam", "done"), node("implementer", "working")];
+  const custom = startedOperations(
+    inNodeBoxes(
+      [
+        { at: "t", kind: "span_start", span_id: "00000000000000a1", execution: "host", execution_name: "my_probe" },
+      ],
+      registry(["redteam"], ["implementer"]),
+    ),
+  );
+  expect(forkHandoff(shape, custom)).toBe(false);
+
+  const standard = startedOperations(
+    inNodeBoxes(
+      [
+        { at: "t", kind: "span_start", span_id: "00000000000000a1", execution: "host", execution_name: "redTeam" },
+        { at: "t", kind: "span_start", span_id: "00000000000000b2", execution: "host", execution_name: "implement" },
+      ],
+      registry(["redteam"], ["implementer"]),
+    ),
+  );
+  expect(forkHandoff(shape, standard)).toBe(true);
+
+  // A stream that announces nothing is from before executions did, and reads as it always did.
+  expect(forkHandoff(shape, new Set())).toBe(true);
+});
+
+test("a custom stage in the implementer box is not a converge loop", () => {
+  // The loop being counted is the standard operation's. A workflow may compose any stage into the
+  // implementer box, and its starts arrive under that box's name — counting them displayed a retry
+  // no operation ever ran. What drove a start is its parent execution, and a declared stage's host
+  // can never bear an operation's name.
+  const stages = registry(["implementer", "implementer_attempt", "my_builder"], ["analyst"]);
+  const host = (span, name) => ({
+    at: "t",
+    kind: "span_start",
+    span_id: span,
+    execution: "host",
+    execution_name: name,
+  });
+  const startUnder = (name, span, parent) => ({
+    at: "t",
+    kind: "node_start",
+    node: name,
+    detail: "node started",
+    span_id: span,
+    parent_span_id: parent,
+  });
+
+  // Driven twice by a declared host, once by the operation: one entry, no re-entries counted.
+  const custom = inNodeBoxes(
+    [
+      host("00000000000000a1", "implement"),
+      startUnder("implementer_attempt", "00000000000000b1", "00000000000000a1"),
+      host("00000000000000a2", "my_builder"),
+      startUnder("my_builder", "00000000000000b2", "00000000000000a2"),
+      startUnder("my_builder", "00000000000000b3", "00000000000000a2"),
+    ],
+    stages,
+  );
+  expect(convergeLoops(custom)).toEqual({ fix: 0, replan: 0, retry: 0 });
+
+  // The same shape driven by the operation counts, and classifies as it always has.
+  const standard = inNodeBoxes(
+    [
+      host("00000000000000a1", "implement"),
+      startUnder("implementer_attempt", "00000000000000b1", "00000000000000a1"),
+      host("00000000000000a3", "iterate"),
+      startUnder("implementer_attempt", "00000000000000b4", "00000000000000a3"),
+    ],
+    stages,
+  );
+  expect(convergeLoops(standard)).toEqual({ fix: 0, replan: 0, retry: 1 });
 });

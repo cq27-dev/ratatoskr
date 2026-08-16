@@ -3,6 +3,7 @@ import { useQueryState } from "nuqs";
 import {
   applyDerived,
   convergeLoops,
+  startedOperations,
   inNodeBoxes,
   nodesFromEvents,
   stagesOf,
@@ -510,6 +511,10 @@ export default function App() {
     [boxedShown],
   );
 
+  // Which workflow hosts have announced themselves, so an edge asserting an operation's sequencing
+  // can ask whether that operation ran rather than inferring it from box state.
+  const operations = useMemo(() => startedOperations(boxedShown), [boxedShown]);
+
   /*
    * Leaving a run drops everything read for it.
    *
@@ -636,6 +641,7 @@ export default function App() {
                 nodes={graphNodes}
                 live={live}
                 loops={loops}
+                operations={operations}
                 selected={node}
                 onSelect={setNode}
               />

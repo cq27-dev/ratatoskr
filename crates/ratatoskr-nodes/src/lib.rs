@@ -1172,11 +1172,15 @@ mod checkpoint_event_tests {
                 .collect()
         };
         for node in ["iterate", "redteam_author", "characterizer"] {
-            assert_eq!(of("span_start", node).len(), 1, "{node} started once");
+            assert_eq!(
+                of("span_start", node).len(),
+                1,
+                "{node} started once: {events:#?}"
+            );
             assert_eq!(
                 of("span_end", node).len(),
                 1,
-                "{node} ended once, though it wrote no checkpoint"
+                "{node} ended once, though it wrote no checkpoint: {events:#?}"
             );
             assert_eq!(
                 of("span_start", node)[0]["span_id"],

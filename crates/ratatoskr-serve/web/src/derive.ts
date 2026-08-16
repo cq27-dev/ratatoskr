@@ -631,6 +631,47 @@ function fold(into: NodeTelemetry, next: NodeTelemetry): NodeTelemetry {
 }
 
 /**
+ * The Rust-owned workflow operations, exactly as `OPERATION_HOSTS` in
+ * `ratatoskr-nodes/src/workflow.rs` declares them.
+ *
+ * A declared stage can never take one of these names — `validate_declarations` refuses the
+ * conflict — so a host execution bearing one IS the built-in operation, and one bearing any other
+ * name is a stage some workflow declared. That distinction is what lets a reader tell "the
+ * standard converge loop drove this" from "a custom workflow drove something drawn in the same
+ * box", which no box name can say.
+ */
+const OPERATION_HOSTS = new Set([
+  "context",
+  "redTeam",
+  "implement",
+  "iterate",
+  "replanAtCeiling",
+  "verify",
+  "isConverged",
+  "testCommandRan",
+]);
+
+/**
+ * Every host execution this stream has seen start, by name — the Rust operations and declared
+ * stages alike.
+ *
+ * All of them rather than the operations alone, because absence has to be tellable from silence: a
+ * custom workflow that ran no Rust operation still announces its declared-stage hosts, so an empty
+ * set means a stream from before executions announced themselves — not a workflow that happened to
+ * run nothing standard. And a name in [`OPERATION_HOSTS`] is the operation itself, since a declared
+ * stage is refused any of those names.
+ */
+export function startedOperations(events: readonly BoxedEvent[]): Set<string> {
+  const started = new Set<string>();
+  for (const e of events) {
+    if (e.kind === "span_start" && e.execution === "host" && e.execution_name !== undefined) {
+      started.add(e.execution_name);
+    }
+  }
+  return started;
+}
+
+/**
  * How many times the implementer was re-entered, by the route that brought it back.
  *
  * `full()` returns to the implementer three different ways and the graph draws each as its own
@@ -674,13 +715,35 @@ export function convergeLoops(events: readonly BoxedEvent[]): ConvergeLoops {
   const out: ConvergeLoops = { fix: 0, replan: 0, retry: 0 };
   let entered = false;
   let since = new Set<string>();
+  // Every execution that has announced itself, so a start can say what DROVE it. The loop being
+  // counted is the standard converge operation's, and the box name cannot say that: a custom stage
+  // composed into the implementer box starts under the same box, and counting it displayed a retry
+  // no operation ever ran.
+  const drivers = new Map<string, { host: boolean; operation: boolean }>();
 
   for (const e of events) {
+    if (e.kind === "span_start" && e.span_id) {
+      drivers.set(e.span_id, {
+        host: e.execution === "host",
+        operation:
+          e.execution === "host" &&
+          e.execution_name !== undefined &&
+          OPERATION_HOSTS.has(e.execution_name),
+      });
+      continue;
+    }
     if (!e.node || e.kind !== "node_start") continue;
     if (e.node !== "implementer") {
       since.add(e.node);
       continue;
     }
+    // Counted only where what drove it is the standard operation — or where the stream cannot say:
+    // a start with no parentage, or a parent this view never saw announce itself, is a stream from
+    // before executions had identities, and reads as it always did. A KNOWN non-operation driver —
+    // a declared stage's host, a clarification exchange — is positive evidence this was not the
+    // loop.
+    const driver = e.parent_span_id ? drivers.get(e.parent_span_id) : undefined;
+    if (driver !== undefined && !driver.operation) continue;
     if (!entered) entered = true;
     else if (since.has("analyst")) out.replan += 1;
     else if (since.has("verifier")) out.fix += 1;
@@ -715,11 +778,21 @@ export function convergeLoops(events: readonly BoxedEvent[]): ConvergeLoops {
  * same edge renders as a diagonal across the graph, duplicating the forward edge the columns
  * already draw.
  */
-export function forkHandoff(nodes: readonly NodeView[]): boolean {
+export function forkHandoff(
+  nodes: readonly NodeView[],
+  operations: ReadonlySet<string>,
+): boolean {
   const started = (name: string) => nodes.find((n) => n.name === name && n.state !== "idle");
   const redTeam = started("redteam");
   const implementer = started("implementer");
-  return !!redTeam && !!implementer && redTeam.stage === implementer.stage;
+  if (!redTeam || !implementer || redTeam.stage !== implementer.stage) return false;
+  // Drawn from evidence where the stream carries it. The sequencing this edge asserts is the
+  // `implement()` operation's — it cannot start until the awaited `redTeam()` has finished, which
+  // is what makes two non-idle boxes proof — and that proof does not transfer to arbitrary stages
+  // a workflow composed into the same boxes. A stream that announces its hosts and never announces
+  // `implement` is a workflow that never made this hand-off; one that announces none is a stream
+  // from before executions did, and reads as it always did.
+  return operations.size === 0 || operations.has("implement");
 }
 
 /**
