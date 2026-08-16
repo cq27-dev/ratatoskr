@@ -170,14 +170,22 @@ impl Attribution {
                 .flatten()
                 .map(ToString::to_string)
         };
-        let id = |source: &serde_json::Value, key: &'static str| match source
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-        {
-            None => Ok(None),
-            Some(hex) => SpanId::parse(hex).map(Some).ok_or(Malformed::NotAnId {
+        // Missing and unreadable are different findings, so `as_str` cannot make the call: it turns
+        // a number, an object or a boolean sitting where an id belongs into the same `None` a
+        // missing key produces, and a malformed parentage was thereby demoted to a root. JSON's
+        // `null` is the one non-string that reads as absent — it is how absence is spelled by a
+        // producer that writes the key at all.
+        let id = |source: &serde_json::Value, key: &'static str| match source.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(hex)) => {
+                SpanId::parse(hex).map(Some).ok_or(Malformed::NotAnId {
+                    key,
+                    found: hex.to_string(),
+                })
+            }
+            Some(other) => Err(Malformed::NotAnId {
                 key,
-                found: hex.to_string(),
+                found: other.to_string(),
             }),
         };
 
@@ -292,10 +300,26 @@ mod tests {
         .unwrap();
         assert_eq!(lifecycle.node, None);
 
+        // `null` is absence spelled out: a producer that writes the key at all writes it for every
+        // record, and refusing it would refuse whole streams for saying "none" explicitly.
+        let spelled = of(serde_json::json!({
+            "kind": "usage", "span_id": "00000000000000a1", "parent_span_id": null,
+        }))
+        .unwrap();
+        assert_eq!(spelled.invocation.and_then(|i| i.parent_span_id), None);
+
         // Present and unreadable is refused wherever it sits — on the record, or on the span it was
         // emitted inside. Reading it as absent would report a nested execution as one the run drove.
         for unreadable in [
             serde_json::json!({ "kind": "usage", "span_id": "nope" }),
+            // A present value of the wrong TYPE is as unreadable as a wrong string: `as_str` made
+            // a number sitting where an id belongs indistinguishable from a missing key.
+            serde_json::json!({ "kind": "usage", "span_id": 41 }),
+            serde_json::json!({ "kind": "usage", "span_id": "00000000000000a1",
+                                "parent_span_id": true }),
+            serde_json::json!({ "kind": "tool_call",
+                                "spans": [{ "span_id": "00000000000000a1",
+                                            "parent_span_id": {} }] }),
             serde_json::json!({ "kind": "usage", "span_id": "00000000000000a1",
                                 "parent_span_id": "nope" }),
             serde_json::json!({ "kind": "tool_call", "spans": [{ "span_id": "nope" }] }),

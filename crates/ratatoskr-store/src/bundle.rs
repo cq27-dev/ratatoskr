@@ -50,7 +50,7 @@ fn check_execution_graph(
     run_id: &str,
     checkpoints: &[Checkpoint],
     events: &[EventRow],
-) -> Result<(), StoreError> {
+) -> Result<usize, StoreError> {
     use ratatoskr_core::span::SpanId;
     let bad = |problem: String| StoreError::BadExecutionGraph {
         run_id: run_id.to_string(),
@@ -114,9 +114,11 @@ fn check_execution_graph(
     // see. A tool call carries its identity on the span it was emitted inside, and a validator
     // reading only top-level fields checked a graph nobody consumes.
     for event in events {
-        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload_json) else {
-            continue;
-        };
+        // Refused, not skipped. A payload nobody can parse would still be PERSISTED — import counts
+        // the row and history serves it — so skipping it here validates a different bundle than the
+        // one being imported, and the gap is exactly where a malformed graph would hide.
+        let payload = serde_json::from_str::<serde_json::Value>(&event.payload_json)
+            .map_err(|e| bad(format!("event {} is not a record: {e}", event.seq)))?;
         let attribution = ratatoskr_core::span::Attribution::of(&payload)
             .map_err(|malformed| bad(format!("a record is unreadable: {malformed}")))?;
         if let Some(invocation) = attribution.invocation {
@@ -133,6 +135,11 @@ fn check_execution_graph(
     // the list for membership made the walk quadratic in a chain's length, which is exactly the
     // shape an unbounded bundle would have to exploit.
     let mut terminates = std::collections::HashSet::new();
+    // How many hops the walks took, all told. Linearity is a claim about THIS number — everything
+    // already walked terminates and is never stepped onto again, so the hops cannot exceed the
+    // executions — and the number is what the test asserts. A wall-clock bound was tried first and
+    // measured the machine's load: a correct walk failed it twice under a parallel suite.
+    let mut hops = 0usize;
     for start in parents.keys() {
         let mut walked = Vec::new();
         let mut on_this_walk = std::collections::HashSet::new();
@@ -152,6 +159,7 @@ fn check_execution_graph(
                 )));
             }
             walked.push(at);
+            hops += 1;
             // A parent with no record of its own — a host call, a nested turn — ends the walk.
             match parents.get(&at).and_then(|known| known.parent) {
                 Some(parent) => at = parent,
@@ -160,7 +168,7 @@ fn check_execution_graph(
         }
         terminates.extend(walked);
     }
-    Ok(())
+    Ok(hops)
 }
 
 /// The version this build writes and is willing to read.
@@ -538,6 +546,23 @@ mod tests {
             Err(StoreError::BadExecutionGraph { .. })
         ));
 
+        // A payload nobody can parse is refused, not skipped: import would still PERSIST it — the
+        // row is counted and history serves it — so skipping it in validation checks a different
+        // bundle than the one being written.
+        let mut torn = bundle_of(vec![]);
+        torn.runs[0].run.run_id = "torn".into();
+        torn.runs[0].events = vec![EventRow {
+            seq: 0,
+            at: "2026-08-15T00:00:00Z".into(),
+            kind: "span_start".into(),
+            node: None,
+            payload_json: r#"{"kind":"span_start","span_id":"00000000000000aa","truncat"#.into(),
+        }];
+        assert!(matches!(
+            store.import(&torn).await,
+            Err(StoreError::BadExecutionGraph { .. })
+        ));
+
         // Repeating what it already said is not disagreement: a start and its end both name the
         // execution and its parent, and a turn's records are many.
         let mut repeated = bundle_of(vec![]);
@@ -571,10 +596,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_long_ancestry_costs_what_its_length_costs() {
-        // The walk asks "have I been here on this walk" once per hop. Asked by scanning the steps
-        // already taken, that is quadratic in the chain's length — and a bundle is the one
-        // checkpoint path this process did not produce, so its shape is whatever an author chose.
+    async fn a_long_ancestry_costs_one_hop_per_execution() {
+        // A bundle is the one checkpoint path this process did not produce, so its shape is
+        // whatever an author chose — and a chain is the shape that makes the walk's cost visible.
+        //
+        // Linearity is asserted as the HOP COUNT: everything already walked terminates and is never
+        // stepped onto again, so the hops cannot exceed the executions. That is the mode an author
+        // controls — dropping the memoisation walks the whole chain once per start and the count
+        // goes quadratic. The other mode, a membership probe that scans instead of hashing, spends
+        // time WITHIN a hop and no count observes it; a wall-clock bound was tried for that and
+        // measured the machine's load instead, failing a correct walk twice under a parallel
+        // suite. That cost lives in the set's contract, where a clock is the only witness.
         use ratatoskr_core::span::{Invocation, SpanId};
         let deep = 30_000u64;
         let id = |n: u64| SpanId::new(n.to_be_bytes()).expect("nonzero");
@@ -591,17 +623,11 @@ mod tests {
             })
             .collect();
 
-        // Warmed first, and bounded well clear of both answers: scanning the steps already taken
-        // takes about a second and a half at this length, walking them once a few milliseconds. The
-        // suite runs in parallel, so the bound has to survive a loaded machine without losing the
-        // distinction it exists to draw.
-        super::check_execution_graph("warm", &chain, &[]).expect("a chain is not a cycle");
-        let started = std::time::Instant::now();
-        super::check_execution_graph("deep", &chain, &[]).expect("a chain is not a cycle");
+        let hops =
+            super::check_execution_graph("deep", &chain, &[]).expect("a chain is not a cycle");
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
-            "checking a chain of {deep} took {:?}",
-            started.elapsed()
+            hops <= deep as usize,
+            "walking a chain of {deep} took {hops} hops — the memoisation is not holding"
         );
     }
 
