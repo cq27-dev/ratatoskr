@@ -1909,6 +1909,28 @@ test("a stream that names its hosts draws the hand-off from evidence, not from b
   // and the box fallback — which is what the stored nodes prove — draws the hand-off that
   // happened.
   expect(forkHandoff(shape, null)).toBe(true);
+
+  // The evidence is ORDERED, because the sequencing guarantee belongs to one call order:
+  // `implement()` waits for `redTeam()` only where redTeam was called first, and `implement_host`
+  // explicitly permits implementation when redTeam was never called. A custom stage can populate
+  // the redteam box beside an independent `implement()` — implement having started proves nothing
+  // about a hand-off on its own.
+  const hosts = (...names) =>
+    startedOperations(
+      inNodeBoxes(
+        names.map((name, i) => ({
+          at: "t",
+          kind: "span_start",
+          span_id: `${i + 1}`.padStart(16, "0"),
+          execution: "host",
+          execution_name: name,
+        })),
+        registry(["redteam"], ["implementer"]),
+      ),
+    );
+  expect(forkHandoff(shape, hosts("my_probe", "implement"))).toBe(false);
+  expect(forkHandoff(shape, hosts("implement", "redTeam"))).toBe(false);
+  expect(forkHandoff(shape, hosts("redTeam", "my_probe", "implement"))).toBe(true);
 });
 
 test("a custom stage in the implementer box is not a converge loop", () => {

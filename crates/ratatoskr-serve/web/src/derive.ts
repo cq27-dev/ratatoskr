@@ -639,6 +639,10 @@ function fold(into: NodeTelemetry, next: NodeTelemetry): NodeTelemetry {
  * set means a stream from before executions announced themselves — not a workflow that happened to
  * run nothing standard. And a name here that is an operation's IS the operation, since a declared
  * stage is refused every operation's name.
+ *
+ * The set's iteration order is each host's FIRST start, in stream order — a `Set` iterates in
+ * insertion order — and consumers rely on it: which of two operations started first is evidence,
+ * not trivia, since a sequencing guarantee holds only for the call order that invokes it.
  */
 export function startedOperations(events: readonly BoxedEvent[]): Set<string> {
   const started = new Set<string>();
@@ -773,18 +777,26 @@ export function forkHandoff(
   const redTeam = started("redteam");
   const implementer = started("implementer");
   if (!redTeam || !implementer || redTeam.stage !== implementer.stage) return false;
-  // Drawn from evidence where the stream can give it. The sequencing this edge asserts is the
-  // `implement()` operation's — it cannot start until the awaited `redTeam()` has finished, which
-  // is what makes two non-idle boxes proof — and that proof does not transfer to arbitrary stages
-  // a workflow composed into the same boxes. A COMPLETE stream that announces its hosts and never
-  // announces `implement` is a workflow that never made this hand-off.
+  // Drawn from evidence where the stream can give it. The sequencing this edge asserts belongs to
+  // one call order: `implement()` waits for the awaited `redTeam()` ONLY where `redTeam()` was
+  // called first — `implement_host` explicitly permits implementation when redTeam was never
+  // called — so `implement` having started proves nothing on its own, and a custom stage
+  // populating the redteam box beside an independent `implement()` drew a hand-off that never
+  // happened. The evidence is ordered: redTeam's first start before implement's, which the set's
+  // insertion order carries.
   //
-  // Absence proves that only where the stream reaches back to the run's beginning. `null` is a
-  // bounded window — history unavailable, a replayed tail — where the `implement` start may simply
-  // have scrolled out; suppressing the edge there hid a hand-off that happened. An empty set is a
-  // complete stream from before executions announced themselves. Both fall back to the box
-  // inference, which is what every stream got before there was evidence to read.
-  return operations === null || operations.size === 0 || operations.has("implement");
+  // Absence proves anything only where the stream reaches back to the run's beginning. `null` is a
+  // bounded window — history unavailable, a replayed tail — where a start may simply have scrolled
+  // out; suppressing the edge there hid a hand-off that happened. An empty set is a complete
+  // stream from before executions announced themselves. Both fall back to the box inference, which
+  // is what every stream got before there was evidence to read.
+  if (operations === null || operations.size === 0) return true;
+  let redTeamFirst = false;
+  for (const name of operations) {
+    if (name === "redTeam") redTeamFirst = true;
+    else if (name === "implement") return redTeamFirst;
+  }
+  return false;
 }
 
 /**
