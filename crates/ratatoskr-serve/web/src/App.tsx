@@ -507,8 +507,8 @@ export default function App() {
    * `implement()` call.
    */
   const loops = useMemo(
-    () => convergeLoops(boxedShown),
-    [boxedShown],
+    () => convergeLoops(boxedShown, detail?.stages ?? []),
+    [boxedShown, detail],
   );
 
   // Which workflow hosts have announced themselves, so an edge asserting an operation's sequencing

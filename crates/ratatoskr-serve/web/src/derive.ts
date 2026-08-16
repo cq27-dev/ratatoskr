@@ -631,35 +631,14 @@ function fold(into: NodeTelemetry, next: NodeTelemetry): NodeTelemetry {
 }
 
 /**
- * The Rust-owned workflow operations, exactly as `OPERATION_HOSTS` in
- * `ratatoskr-nodes/src/workflow.rs` declares them.
- *
- * A declared stage can never take one of these names — `validate_declarations` refuses the
- * conflict — so a host execution bearing one IS the built-in operation, and one bearing any other
- * name is a stage some workflow declared. That distinction is what lets a reader tell "the
- * standard converge loop drove this" from "a custom workflow drove something drawn in the same
- * box", which no box name can say.
- */
-const OPERATION_HOSTS = new Set([
-  "context",
-  "redTeam",
-  "implement",
-  "iterate",
-  "replanAtCeiling",
-  "verify",
-  "isConverged",
-  "testCommandRan",
-]);
-
-/**
  * Every host execution this stream has seen start, by name — the Rust operations and declared
  * stages alike.
  *
  * All of them rather than the operations alone, because absence has to be tellable from silence: a
  * custom workflow that ran no Rust operation still announces its declared-stage hosts, so an empty
  * set means a stream from before executions announced themselves — not a workflow that happened to
- * run nothing standard. And a name in [`OPERATION_HOSTS`] is the operation itself, since a declared
- * stage is refused any of those names.
+ * run nothing standard. And a name here that is an operation's IS the operation, since a declared
+ * stage is refused every operation's name.
  */
 export function startedOperations(events: readonly BoxedEvent[]): Set<string> {
   const started = new Set<string>();
@@ -711,24 +690,32 @@ export interface ConvergeLoops {
  * and the counts are the counts as of that point, which is what keeps the edges honest while
  * someone scrubs.
  */
-export function convergeLoops(events: readonly BoxedEvent[]): ConvergeLoops {
+export function convergeLoops(
+  events: readonly BoxedEvent[],
+  stages: readonly RunStage[],
+): ConvergeLoops {
   const out: ConvergeLoops = { fix: 0, replan: 0, retry: 0 };
   let entered = false;
   let since = new Set<string>();
+  // A host is either a Rust operation or a declared stage — `build_hosts_with_turn` refuses a
+  // stage that takes an operation's name, so the two tables are disjoint by construction — and the
+  // run's own registry says which. Derived per run rather than copied as a list of names, because
+  // a copy is a second authority: a recovery operation added in Rust would have read here as a
+  // known non-operation, and its real re-entries would have been silently discarded.
+  const declared = new Set(stages.map((stage) => stage.id));
   // Every execution that has announced itself, so a start can say what DROVE it. The loop being
   // counted is the standard converge operation's, and the box name cannot say that: a custom stage
   // composed into the implementer box starts under the same box, and counting it displayed a retry
   // no operation ever ran.
-  const drivers = new Map<string, { host: boolean; operation: boolean }>();
+  const drivers = new Map<string, { operation: boolean }>();
 
   for (const e of events) {
     if (e.kind === "span_start" && e.span_id) {
       drivers.set(e.span_id, {
-        host: e.execution === "host",
         operation:
           e.execution === "host" &&
           e.execution_name !== undefined &&
-          OPERATION_HOSTS.has(e.execution_name),
+          !declared.has(e.execution_name),
       });
       continue;
     }
