@@ -622,7 +622,7 @@ interface Props {
    * operation's sequencing ask whether that operation ran, instead of inferring it from box state
    * that arbitrary composed stages can also produce.
    */
-  operations: ReadonlySet<string>;
+  operations: ReadonlySet<string> | null;
   selected: string | null;
   /** `null` clears the selection, which returns the lower pane to the combined feed. */
   onSelect: (name: string | null) => void;

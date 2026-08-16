@@ -513,7 +513,15 @@ export default function App() {
 
   // Which workflow hosts have announced themselves, so an edge asserting an operation's sequencing
   // can ask whether that operation ran rather than inferring it from box state.
-  const operations = useMemo(() => startedOperations(boxedShown), [boxedShown]);
+  //
+  // Only where the timeline reaches back to the run's beginning. Without history this view holds a
+  // bounded tail, and an operation's start may have scrolled out of it — absence proves nothing
+  // there, and `null` says so. Positive evidence is not worth salvaging from a tail: any hand-off
+  // it could prove is one the box fallback draws anyway.
+  const operations = useMemo(
+    () => (history?.length ? startedOperations(boxedShown) : null),
+    [boxedShown, history],
+  );
 
   /*
    * Leaving a run drops everything read for it.

@@ -1902,6 +1902,13 @@ test("a stream that names its hosts draws the hand-off from evidence, not from b
 
   // A stream that announces nothing is from before executions did, and reads as it always did.
   expect(forkHandoff(shape, new Set())).toBe(true);
+
+  // A BOUNDED window proves no absence: with history unavailable the view holds a replayed tail,
+  // and the `implement` start may simply have scrolled out while later hosts remain in view. The
+  // set the custom-workflow case suppresses on is a COMPLETE stream's; a tail says it cannot tell,
+  // and the box fallback — which is what the stored nodes prove — draws the hand-off that
+  // happened.
+  expect(forkHandoff(shape, null)).toBe(true);
 });
 
 test("a custom stage in the implementer box is not a converge loop", () => {
