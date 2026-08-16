@@ -145,7 +145,7 @@ fn check_execution_graph(
 ///
 /// One version is one shape: a bundle claiming this version carries every field of it, so adding a
 /// field is a version bump rather than a defaulted key the reader has to guess at.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// What an import did, per run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,7 +193,12 @@ impl Store {
     /// the same id are either the same run — in which case there is nothing to do — or a collision,
     /// where overwriting would destroy local work to make room for a copy.
     pub async fn import(&self, bundle: &Bundle) -> Result<Vec<Imported>, StoreError> {
-        if bundle.version > FORMAT_VERSION {
+        // Its own version and no other. One version is one shape, and the shape includes what a
+        // record MEANS: a `span_end` that carries no parent now says the run drove that execution,
+        // where the version-2 exporter simply left the field off. Reading one as the other would
+        // report a nested execution as top-level, or refuse a bundle that is fine — and a reader
+        // that guesses which is worse than one that declines.
+        if bundle.version != FORMAT_VERSION {
             return Err(StoreError::Unsupported {
                 found: bundle.version,
             });
@@ -543,6 +548,17 @@ mod tests {
             .unwrap();
         bundle.version = FORMAT_VERSION + 1;
         let store = Store::open_in_memory().unwrap();
+        assert!(matches!(
+            store.import(&bundle).await,
+            Err(StoreError::Unsupported { .. })
+        ));
+
+        // And an older one, for the same reason rather than a different one. A version is a shape,
+        // and the shape includes what a record MEANS: a `span_end` carrying no parent now says the
+        // run drove that execution, where an earlier exporter simply left the field off. A reader
+        // that took one for the other would report a nested execution as top-level, or refuse a
+        // bundle that was never wrong.
+        bundle.version = FORMAT_VERSION - 1;
         assert!(matches!(
             store.import(&bundle).await,
             Err(StoreError::Unsupported { .. })

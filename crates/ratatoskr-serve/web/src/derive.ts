@@ -487,8 +487,15 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // whether it has reported a cost yet. A started attempt that has spent nothing so far is this
       // view's answer and stands; one this view never saw start is a gap the server's record fills.
       started: members.some((m) => current(m)?.started ?? false),
-      // Whether a control aimed here would reach what is running.
-      controllable: members.some((m) => current(m)?.controllable ?? true),
+      // Whether a control aimed here would reach ANY of what is running, not only the invocation
+      // being displayed. A stage can be running an ordinary turn and answering a clarification at
+      // once — the answerer controlled by the node that asked, the ordinary one by this box — and
+      // reading the newest alone takes the Stop away from a turn that is still reachable.
+      controllable: members.some((m) =>
+        m.list.some((a) => a.live)
+          ? m.list.some((a) => a.live && a.controllable)
+          : (current(m)?.controllable ?? true),
+      ),
     });
   }
   return out;

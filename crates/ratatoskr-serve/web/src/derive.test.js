@@ -1532,3 +1532,33 @@ test("a clarification answerer is not offered as a control target", () => {
   const ordinary = inNodeBoxes([attemptStart("analyst", "00000000000000c3", "opus")], stages);
   expect(workingNodeNames([composed("analyst", "idle")], ordinary)).toEqual(["analyst"]);
 });
+
+test("a stage answering a clarification can still be stopped for its own turn", () => {
+  // One stage running two invocations: its own turn, controlled here, and a clarification it is
+  // answering for another node, controlled there. Reading only the newest live attempt took the
+  // Stop away from the ordinary turn for as long as the answerer ran — a control that existed,
+  // was reachable, and was not offered.
+  const stages = registry(["analyst"], ["implementer"]);
+  const answering = {
+    at: "t",
+    kind: "node_start",
+    node: "analyst",
+    detail: "node started",
+    span_id: "00000000000000b2",
+    parent_span_id: "00000000000000a1",
+    controlled_as: "implementer",
+    facts: { model: "opus", tools: [], thinking: false, reuses_session: false },
+  };
+  // The answerer starts SECOND, so it is the one a display would choose.
+  const both = inNodeBoxes(
+    [attemptStart("analyst", "00000000000000c3", "opus"), answering],
+    stages,
+  );
+
+  expect(nodesFromEvents(both).get("analyst").state).toBe("working");
+  expect(workingNodeNames([composed("analyst", "idle")], both)).toEqual(["analyst"]);
+
+  // With only the answerer live, there is nothing here to reach.
+  const alone = inNodeBoxes([answering], stages);
+  expect(workingNodeNames([composed("analyst", "idle")], alone)).toEqual([]);
+});
