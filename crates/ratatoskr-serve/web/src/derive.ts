@@ -634,12 +634,13 @@ function fold(into: NodeTelemetry, next: NodeTelemetry): NodeTelemetry {
  * Whether this stream shows the red team handing the tree to the implementer — or `null` where it
  * cannot say.
  *
- * The hand-off happened exactly where `redTeam()` COMPLETED and `implement()` then started:
+ * The hand-off happened exactly where `redTeam()` COMPLETED and an `implement()` called after it
+ * DROVE work: a `node_start` under the implement call's span. Anything less proves less.
  * `implement_host` waits for a red team that was called first, rejects one still in flight, and
- * permits implementation where none was called at all. Starts alone prove none of that — a host
- * announces itself before its body runs, so a failing `redTeam()` a workflow catches, and the
- * `implement()` the guard then rejects, both leave starts behind — which is why the evidence here
- * is redTeam's completed END before implement's start.
+ * permits implementation where none was called at all — and a host announces itself before its
+ * body runs, so a failing `redTeam()` a workflow catches, the `implement()` the guard then
+ * rejects, and an `implement()` that fails in its own preparation before reaching the implementer
+ * all leave starts behind with nothing handed to anyone.
  *
  * `null` for a stream that announces no hosts: one from before executions announced themselves,
  * which can prove nothing either way. A host-announcing stream that cannot show the completed
@@ -662,22 +663,45 @@ export function contiguous(
   buffer: readonly LiveEvent[],
 ): boolean {
   if (!history?.length) return false;
-  return buffer.length === 0 || buffer[0]!.at <= history[history.length - 1]!.at;
+  // The overlap is the TAIL's, and the replay's front is not the tail's front: `trim_replay`
+  // preserves `question*` events ahead of the bounded tail — a run blocked on a human must show
+  // its question however old — so a preserved question's timestamp proves nothing about where the
+  // tail begins, and reading it as the buffer's start claimed continuity across a missing slice.
+  // Skipping the leading questions errs the safe way only: a genuine tail that happens to open
+  // with a question reads as a gap and falls back, never the reverse.
+  const tail = buffer.find((e) => !e.kind.startsWith("question"));
+  return tail === undefined || tail.at <= history[history.length - 1]!.at;
 }
 
 export function handoffEvidence(events: readonly BoxedEvent[]): boolean | null {
   let sawHosts = false;
   let redTeamCompleted = false;
   const hosts = new Map<string, string>();
+  const implementCalls = new Set<string>();
   for (const e of events) {
-    if (e.execution !== "host" || !e.span_id) continue;
-    if (e.kind === "span_start" && e.execution_name !== undefined) {
-      sawHosts = true;
-      hosts.set(e.span_id, e.execution_name);
-      if (e.execution_name === "implement" && redTeamCompleted) return true;
+    if (!e.span_id) continue;
+    if (e.execution === "host") {
+      if (e.kind === "span_start" && e.execution_name !== undefined) {
+        sawHosts = true;
+        hosts.set(e.span_id, e.execution_name);
+        if (e.execution_name === "implement" && redTeamCompleted) implementCalls.add(e.span_id);
+      }
+      if (
+        e.kind === "span_end" &&
+        e.outcome === "completed" &&
+        hosts.get(e.span_id) === "redTeam"
+      ) {
+        redTeamCompleted = true;
+      }
+      continue;
     }
-    if (e.kind === "span_end" && e.outcome === "completed" && hosts.get(e.span_id) === "redTeam") {
-      redTeamCompleted = true;
+    // The moment a tree is actually in the implementer's hands: work started UNDER the implement
+    // call. The host's own start is not it — `implement()` can fail after announcing itself and
+    // before driving anything, in its guard, its argument parsing or its worktree setup, handing
+    // nothing to anyone. Whatever happens to the implementation afterwards, the hand-off this
+    // start received is history.
+    if (e.kind === "node_start" && e.parent_span_id && implementCalls.has(e.parent_span_id)) {
+      return true;
     }
   }
   return sawHosts ? false : null;

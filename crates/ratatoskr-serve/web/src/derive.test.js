@@ -1899,15 +1899,41 @@ test("the hand-off is drawn from redTeam completing and implement then starting"
     );
   const H1 = "00000000000000a1";
   const H2 = "00000000000000b2";
+  const driven = {
+    at: "t9",
+    kind: "node_start",
+    node: "implementer",
+    detail: "node started",
+    span_id: "00000000000000c9",
+    parent_span_id: H2,
+  };
 
-  // The standard flow: redTeam completes, implement starts. Handed off.
-  const standard = lifecycle(
-    ["span_start", "redTeam", H1],
-    ["span_end", "redTeam", H1, "completed"],
-    ["span_start", "implement", H2],
+  // The standard flow: redTeam completes, implement starts, and DRIVES the implementer's work.
+  const standard = handoffEvidence(
+    inNodeBoxes(
+      [
+        { at: "t0", kind: "span_start", span_id: H1, execution: "host", execution_name: "redTeam" },
+        { at: "t1", kind: "span_end", outcome: "completed", span_id: H1, execution: "host", execution_name: "redTeam" },
+        { at: "t2", kind: "span_start", span_id: H2, execution: "host", execution_name: "implement" },
+        driven,
+      ],
+      stages,
+    ),
   );
   expect(standard).toBe(true);
   expect(forkHandoff(shape, standard)).toBe(true);
+
+  // The implement call alone is not the hand-off: it can fail in its own preparation — the guard,
+  // argument parsing, the worktree — after announcing itself and before driving anything. Until
+  // work starts under it, nothing is in the implementer's hands.
+  const stillborn = lifecycle(
+    ["span_start", "redTeam", H1],
+    ["span_end", "redTeam", H1, "completed"],
+    ["span_start", "implement", H2],
+    ["span_end", "implement", H2, "unvalidated"],
+  );
+  expect(stillborn).toBe(false);
+  expect(forkHandoff(shape, stillborn)).toBe(false);
 
   // A failing redTeam the workflow caught, then an implement the guard rejects: both STARTED, and
   // nothing was handed to anyone. Custom stages may then populate both boxes.
@@ -2011,4 +2037,15 @@ test("a reconnect gap is not a complete account", () => {
   // No history at all is the bounded tail.
   expect(contiguous(null, [ev("t1")])).toBe(false);
   expect(contiguous([], [])).toBe(false);
+
+  // The replay preserves `question*` events AHEAD of its bounded tail, however old — a run blocked
+  // on a human must show its question — so a preserved question's timestamp says nothing about
+  // where the tail begins. Reading it as the buffer's start claimed continuity across a missing
+  // slice, and an absence in that slice suppressed a hand-off the run made.
+  const question = { at: "t2", kind: "question", node: null, detail: "which way?" };
+  expect(contiguous(history, [question, ev("t5")])).toBe(false);
+  // While a tail that genuinely overlaps still proves itself past the preserved front.
+  expect(contiguous(history, [question, ev("t3"), ev("t5")])).toBe(true);
+  // A buffer of preserved questions alone has no tail to miss anything.
+  expect(contiguous(history, [question])).toBe(true);
 });
