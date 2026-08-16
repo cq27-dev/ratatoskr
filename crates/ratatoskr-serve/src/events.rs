@@ -104,6 +104,19 @@ pub struct LiveEvent {
     /// nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub controlled_as: Option<String>,
+    /// What the turn reached for, off a `usage` record.
+    ///
+    /// A turn that writes no checkpoint — an answerer, an evidence-only stage — has only this
+    /// record to carry it, and what a node called is most of what a viewer wants from it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_used: Option<Vec<String>>,
+    /// Who is waiting, on a `question`.
+    ///
+    /// Carried apart from `node`, deliberately: the exchange is its own execution, so naming the
+    /// asker as this record's node would open an invocation of the asker that never happened. The
+    /// prompt still has to say who is waiting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asked_by: Option<String>,
 }
 
 /// What one attempt of a node cost.
@@ -262,79 +275,6 @@ fn run_id_of(record: &Value) -> Option<&str> {
         .find_map(|span| span.get("run_id").and_then(Value::as_str))
 }
 
-/// What a record is attributed to: the node, the execution, and the execution that invoked it.
-///
-/// One source for all three, and that is the point. A node's turn runs inside a span holding its
-/// name and its identity, so everything the turn emits — every tool call, every line of model text
-/// — carries them there rather than on the record. Resolved separately they came from different
-/// places: the name scanned outward from the run while the identity scanned inward from the turn,
-/// so a clarification's records paired the answerer's execution with the asking node's name. One
-/// turn, split across two invocations.
-///
-/// A record's own fields are one source and are taken together. Stating an identity and no parent
-/// states that it has none — inheriting a parent from the span around it describes a parentage that
-/// never existed.
-///
-/// Otherwise the innermost span that names an execution answers, and answers all of it. Innermost
-/// because a turn runs inside the host call that drove it, and a record belongs to the nearest
-/// execution it was emitted inside.
-///
-/// A lifecycle record inherits no node. It names an execution, under `execution_name`, because a
-/// host call is an execution the shape cannot place — and anything folding a record that carries
-/// `node` into node state would draw a box for it.
-struct Attribution<'a> {
-    node: Option<&'a str>,
-    span_id: Option<&'a str>,
-    parent_span_id: Option<&'a str>,
-}
-
-fn attribution_of<'a>(record: &'a Value, kind: &str) -> Attribution<'a> {
-    let field = |key: &str| record.get(key).and_then(Value::as_str);
-    let spans = || {
-        record
-            .get("spans")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-    };
-    let named = |node: Option<&'a str>| {
-        if matches!(kind, "span_start" | "span_end") {
-            None
-        } else {
-            node
-        }
-    };
-
-    if let Some(span_id) = field("span_id") {
-        return Attribution {
-            node: named(field("node")),
-            span_id: Some(span_id),
-            parent_span_id: field("parent_span_id"),
-        };
-    }
-    let enclosing = spans()
-        .rev()
-        .find(|span| span.get("span_id").and_then(Value::as_str).is_some());
-    let of_span = |key: &str| {
-        enclosing
-            .and_then(|span| span.get(key))
-            .and_then(Value::as_str)
-    };
-    Attribution {
-        // The record's own name still wins where it has one — a checkpoint names the node it
-        // covers, which is not always the node whose span it was written inside. Failing that, the
-        // execution's own span; failing THAT, the nearest span naming a node at all, which is what
-        // a stream from before executions had identities carries.
-        node: named(field("node").or_else(|| of_span("node")).or_else(|| {
-            spans()
-                .rev()
-                .find_map(|s| s.get("node").and_then(Value::as_str))
-        })),
-        span_id: of_span("span_id"),
-        parent_span_id: of_span("parent_span_id"),
-    }
-}
-
 /// Normalise one log record, keeping only what a viewer can act on.
 fn to_event(record: &Value) -> LiveEvent {
     let kind = record
@@ -343,7 +283,10 @@ fn to_event(record: &Value) -> LiveEvent {
         .unwrap_or("event")
         .to_string();
     let str_field = |key: &str| record.get(key).and_then(Value::as_str);
-    let attribution = attribution_of(record, &kind);
+    // One parser, shared with the import that validates a bundle: what a record is attributed to is
+    // one question, and answering it in two places is how the two came to disagree about which
+    // fields even count. A record nobody can read names no execution rather than a plausible one.
+    let attribution = ratatoskr_core::span::Attribution::of(record).unwrap_or_default();
     let detail = match kind.as_str() {
         "tool_call" => str_field("tool").unwrap_or("tool"),
         "model_text" => str_field("text").unwrap_or_default(),
@@ -381,13 +324,30 @@ fn to_event(record: &Value) -> LiveEvent {
         // One execution, both halves. Looked up independently, a record carrying its own identity
         // and no parent took the parent off the span that encloses it — which belongs to a
         // different execution, so the pair described a parentage that never existed.
-        span_id: attribution.span_id.map(str::to_string),
-        parent_span_id: attribution.parent_span_id.map(str::to_string),
+        span_id: attribution.invocation.map(|i| i.span_id.to_string()),
+        parent_span_id: attribution
+            .invocation
+            .and_then(|i| i.parent_span_id)
+            .map(|p| p.to_string()),
+        controlled_as: attribution.controlled_as,
+        // Comma-separated on the wire, as every tool list in this stream is.
+        tools_used: (kind == "usage")
+            .then(|| str_field("tools_used"))
+            .flatten()
+            .map(|used| {
+                used.split(',')
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            }),
+        asked_by: (kind == "question")
+            .then(|| str_field("from"))
+            .flatten()
+            .map(str::to_string),
         execution: str_field("execution").map(str::to_string),
         execution_name: str_field("execution_name").map(str::to_string),
-        controlled_as: str_field("controlled_as").map(str::to_string),
         kind,
-        node: attribution.node.map(str::to_string),
+        node: attribution.node,
         detail,
     }
 }
@@ -986,6 +946,8 @@ mod tests {
             execution: None,
             execution_name: None,
             controlled_as: None,
+            tools_used: None,
+            asked_by: None,
         };
         let noise = LiveEvent {
             at: "t1".into(),
@@ -1006,6 +968,8 @@ mod tests {
             execution: None,
             execution_name: None,
             controlled_as: None,
+            tools_used: None,
+            asked_by: None,
         };
 
         // The question is the oldest event, well outside the replay window.

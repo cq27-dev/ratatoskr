@@ -107,6 +107,130 @@ impl Invocation {
     }
 }
 
+/// What a log record says it is: the node it belongs to, the execution that produced it, what
+/// invoked that one, and where a control aimed at it goes.
+///
+/// One representation and one parser, read by everything that consumes a record — the event
+/// normaliser the dashboard folds, and the import that validates a bundle. They had drifted:
+/// resolved separately, a record's name came from one place and its identity from another, and a
+/// bundle was validated against fields the reader does not even use.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Attribution {
+    /// What ran. `None` for a record that belongs to no node — a lifecycle record names an
+    /// execution, and a host call is an execution the shape cannot place.
+    pub node: Option<String>,
+    pub invocation: Option<Invocation>,
+    /// Where a Stop or a Steer for this record's turn is addressed, when that is not [`Self::node`].
+    pub controlled_as: Option<String>,
+    /// Whether the record stated its own identity, rather than inheriting it from the span it was
+    /// emitted inside.
+    ///
+    /// The difference matters to a validator: a record's own absent parent may be an assertion that
+    /// the run drove it, while an inherited one is only what the enclosing span happened to say.
+    pub stated: bool,
+}
+
+/// Why a record's execution could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Malformed {
+    /// A field is present and is not sixteen hex characters.
+    NotAnId { key: &'static str, found: String },
+}
+
+impl std::fmt::Display for Malformed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAnId { key, found } => write!(f, "`{key}` is `{found}`, which is not an id"),
+        }
+    }
+}
+
+impl Attribution {
+    /// Read one record.
+    ///
+    /// A record's own fields are one source and are taken together — stating an identity and no
+    /// parent states that it has none, and inheriting a parent from the span around it would
+    /// describe a parentage that never existed. Otherwise the innermost span naming an execution
+    /// answers, and answers all of it: a turn runs inside the host call that drove it, and a record
+    /// belongs to the nearest execution it was emitted inside.
+    ///
+    /// A lifecycle record is attributed to no node whatever it carries. It names an execution, and
+    /// anything folding a record with a node into node state would draw a box for a host call.
+    ///
+    /// A present-but-unreadable id is an error rather than an absence. Absent says nothing; a value
+    /// nobody can parse says something that cannot be checked, and reading it as absent asserts a
+    /// shape the record never claimed.
+    pub fn of(record: &serde_json::Value) -> Result<Self, Malformed> {
+        let text = |key: &str| record.get(key).and_then(serde_json::Value::as_str);
+        let kind = text("kind").unwrap_or("event");
+        let lifecycle = matches!(kind, "span_start" | "span_end");
+        let named = |node: Option<&str>| {
+            (!lifecycle)
+                .then_some(node)
+                .flatten()
+                .map(ToString::to_string)
+        };
+        let id = |source: &serde_json::Value, key: &'static str| match source
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+        {
+            None => Ok(None),
+            Some(hex) => SpanId::parse(hex).map(Some).ok_or(Malformed::NotAnId {
+                key,
+                found: hex.to_string(),
+            }),
+        };
+
+        if let Some(span_id) = id(record, "span_id")? {
+            return Ok(Self {
+                node: named(text("node")),
+                invocation: Some(Invocation {
+                    span_id,
+                    parent_span_id: id(record, "parent_span_id")?,
+                }),
+                controlled_as: text("controlled_as").map(ToString::to_string),
+                stated: true,
+            });
+        }
+
+        let spans = || {
+            record
+                .get("spans")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+        };
+        let enclosing = spans().rev().find(|span| span.get("span_id").is_some());
+        let of_span = |key: &str| {
+            enclosing
+                .and_then(|span| span.get(key))
+                .and_then(serde_json::Value::as_str)
+        };
+        Ok(Self {
+            // The record's own name still wins where it has one — a checkpoint names the node it
+            // covers, which is not always the node whose span it was written inside.
+            node: named(text("node").or_else(|| of_span("node")).or_else(|| {
+                spans()
+                    .rev()
+                    .find_map(|s| s.get("node").and_then(serde_json::Value::as_str))
+            })),
+            invocation: match enclosing {
+                None => None,
+                Some(span) => id(span, "span_id")?.map(|span_id| Invocation {
+                    span_id,
+                    parent_span_id: id(span, "parent_span_id").ok().flatten(),
+                }),
+            },
+            // From the same span as the identity, so a turn's records keep the address its start
+            // announced even where the start itself has been trimmed out of view.
+            controlled_as: text("controlled_as")
+                .or_else(|| of_span("controlled_as"))
+                .map(ToString::to_string),
+            stated: false,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

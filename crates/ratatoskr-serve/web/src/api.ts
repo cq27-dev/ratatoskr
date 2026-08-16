@@ -340,6 +340,16 @@ export interface LiveEvent {
    * the answerer's own name is never polled.
    */
   controlled_as?: string;
+  /**
+   * What the turn reached for, on a `usage` record — the only record a turn that writes no
+   * checkpoint leaves of it.
+   */
+  tools_used?: string[];
+  /**
+   * Who is waiting, on a `question`. Apart from `node`, because the exchange is its own
+   * execution: naming the asker here would open an invocation of the asker that never happened.
+   */
+  asked_by?: string;
 }
 
 /** What one attempt cost, off the event stream. */

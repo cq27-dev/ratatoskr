@@ -531,6 +531,10 @@ impl<'a> TurnSubject<'a> {
             tools_used = %telemetry.tools_used.join(","),
             thinking = telemetry.thinking,
             reuses_session = telemetry.reuses_session,
+            // Why it failed, for a turn that writes no checkpoint to carry it. Without this a
+            // recovered failure — an answerer that could not answer, an evidence-only turn that
+            // errored — reads as done the moment its execution ends.
+            error = telemetry.error.as_deref(),
             "node usage"
         );
     }
@@ -687,20 +691,28 @@ where
     // own name is ever polled and a reader offering one would hand an operator a dead button.
     let subject = TurnSubject::of(node, controlled_as);
     let tool_names = tools.names();
+    // `provider/model`, the same identity an ordinary turn reports. An answerer commonly has no
+    // checkpoint, so these records are the only account of what it ran on — and a bare model name
+    // beside a qualified one folds one route into two.
+    let model_name = format!("{}/{}", route.provider, route.model);
     let span = tracing::info_span!(
         "agent",
         node,
         "gen_ai.operation.name" = "invoke_agent",
         "gen_ai.agent.name" = node,
-        "gen_ai.request.model" = %route.model,
+        "gen_ai.request.model" = %model_name,
         span_id = subject.ids().0,
         parent_span_id = subject.ids().1,
+        // On the span, not only on the start: a viewer attaching mid-turn, or an imported tail,
+        // sees the tool calls and the model text and never the `node_start` — and an answerer whose
+        // address is missing reads as controllable, which offers a Stop that nothing polls.
+        controlled_as = subject.controlled_as,
     );
     // Announced before the wait, like any other turn. An answerer that says nothing until its first
     // response is invisible for exactly as long as it is slow — and a clarification is the case
     // where a viewer is most likely to be wondering what the run is doing.
     subject.started(TurnFacts {
-        model: &route.model,
+        model: &model_name,
         tools: &tool_names,
         thinking: thinking_left_on(route),
         reuses_session: false,
@@ -715,7 +727,7 @@ where
     // falling back to the store and displays the rest as measured absence.
     let (usage, calls) = meter.read();
     subject.spent(&NodeTelemetry {
-        model: Some(route.model.clone()),
+        model: Some(model_name),
         duration_ms: Some(started.elapsed().as_millis() as u64),
         usage,
         turns: Some(calls),
@@ -3256,6 +3268,7 @@ where
         "gen_ai.request.model" = %model_name,
         span_id = execution_ids().0,
         parent_span_id = execution_ids().1,
+        controlled_as,
     );
     // Announced at the start, because a checkpoint only exists once the node has finished — and
     // the moment a reader most wants to know what a node is running on is while it is still

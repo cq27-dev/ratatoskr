@@ -57,25 +57,38 @@ fn check_execution_graph(
         problem,
     };
 
-    let mut parents = std::collections::HashMap::new();
-    // What one record says about an execution's parentage, folded with what the others said.
+    // What is known of each execution's parentage, and whether a record ASSERTED it.
     //
-    // A record that omits the field says NOTHING about parentage — not that there is none. Many
-    // records describe one execution and they need not each repeat it, so only two records naming
-    // DIFFERENT parents are a disagreement. The absence a reader reads as "the run drove this" is a
-    // checkpoint row's, which is one record and the whole of what that row states.
-    let mut claim = |span_id: SpanId, parent: Option<SpanId>| {
-        let known = parents.entry(span_id).or_insert(parent);
-        match (*known, parent) {
-            (Some(before), Some(now)) if before != now => Err(bad(format!(
+    // A checkpoint row's absent parent is an assertion: the row is one record and the whole of what
+    // it states, so it says the run drove that execution. A log record's absence is silence —
+    // many records describe one execution and need not each repeat what invoked it. So an assertion
+    // and a parent conflict, two different parents conflict, and silence conflicts with nothing.
+    #[derive(Clone, Copy)]
+    struct Known {
+        parent: Option<SpanId>,
+        asserted: bool,
+    }
+    let mut parents: std::collections::HashMap<SpanId, Known> = std::collections::HashMap::new();
+    let mut claim = |span_id: SpanId, parent: Option<SpanId>, asserted: bool| {
+        let known = parents.entry(span_id).or_insert(Known { parent, asserted });
+        let conflict = match (known.parent, parent) {
+            (Some(before), Some(now)) => before != now,
+            // An explicit root, then a parent — or the other way about. Both cannot be true, and a
+            // consumer would disagree with itself about where the execution hangs.
+            (None, Some(_)) => known.asserted,
+            (Some(_), None) => asserted,
+            (None, None) => false,
+        };
+        if conflict {
+            return Err(bad(format!(
                 "execution {span_id} is described twice with different parentage"
-            ))),
-            (None, Some(now)) => {
-                *known = Some(now);
-                Ok(())
-            }
-            _ => Ok(()),
+            )));
         }
+        if parent.is_some() {
+            known.parent = parent;
+        }
+        known.asserted |= asserted;
+        Ok(())
     };
 
     // A ROW per execution, though. Two rows claiming one execution collapse two of them into one
@@ -89,31 +102,25 @@ fn check_execution_graph(
                     invocation.span_id
                 )));
             }
-            claim(invocation.span_id, invocation.parent_span_id)?;
+            claim(invocation.span_id, invocation.parent_span_id, true)?;
         }
     }
     // And the executions that exist only as events. Most of them do: a host call, a clarification,
     // a turn whose failure a workflow recovered from and an answerer all announce themselves and
     // write no checkpoint, so validating rows alone leaves the larger half of a run's execution
     // graph unchecked — including the parents the rows point at.
+    //
+    // Read with the parser the event NORMALISER uses, so what is validated is what a consumer will
+    // see. A tool call carries its identity on the span it was emitted inside, and a validator
+    // reading only top-level fields checked a graph nobody consumes.
     for event in events {
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload_json) else {
             continue;
         };
-        let written = |key: &str| payload.get(key).and_then(serde_json::Value::as_str);
-        // Present and unreadable is not absent. Absent says nothing; a value nobody can parse says
-        // something that cannot be checked, and recording it as a root asserts a shape the bundle
-        // never claimed — the same rule the checkpoint reader follows.
-        let id = |key: &str| match written(key) {
-            None => Ok(None),
-            Some(hex) => SpanId::parse(hex).map(Some).ok_or_else(|| {
-                bad(format!(
-                    "an execution names `{hex}`, which is not an execution"
-                ))
-            }),
-        };
-        if let Some(span_id) = id("span_id")? {
-            claim(span_id, id("parent_span_id")?)?;
+        let attribution = ratatoskr_core::span::Attribution::of(&payload)
+            .map_err(|malformed| bad(format!("a record is unreadable: {malformed}")))?;
+        if let Some(invocation) = attribution.invocation {
+            claim(invocation.span_id, invocation.parent_span_id, false)?;
         }
     }
 
@@ -146,7 +153,7 @@ fn check_execution_graph(
             }
             walked.push(at);
             // A parent with no record of its own — a host call, a nested turn — ends the walk.
-            match parents.get(&at).copied().flatten() {
+            match parents.get(&at).and_then(|known| known.parent) {
                 Some(parent) => at = parent,
                 None => break,
             }
@@ -473,6 +480,61 @@ mod tests {
         }];
         assert!(matches!(
             store.import(&malformed).await,
+            Err(StoreError::BadExecutionGraph { .. })
+        ));
+
+        // A row's absent parent is an ASSERTION that the run drove it — the row is one record and
+        // the whole of what it states — so a later record giving that execution a parent is a
+        // contradiction, not an elaboration. Consumers would otherwise disagree about whether the
+        // execution is a root or a child.
+        let rooted = SpanId::parse("00000000000000f1").unwrap();
+        let mut contradicted = bundle_of(vec![imported_checkpoint(
+            "analyst",
+            Invocation::root(rooted),
+        )]);
+        contradicted.runs[0].run.run_id = "contradicted".into();
+        contradicted.runs[0].events = vec![lifecycle("00000000000000f1", "00000000000000aa")];
+        assert!(matches!(
+            store.import(&contradicted).await,
+            Err(StoreError::BadExecutionGraph { .. })
+        ));
+
+        // An identity a consumer reads off the SPAN a record was emitted inside is validated too:
+        // that is where a tool call carries it, and a validator reading only top-level fields
+        // checked a graph nobody consumes.
+        let nested = |span: &str, parent: &str| EventRow {
+            seq: 0,
+            at: "2026-08-15T00:00:00Z".into(),
+            kind: "tool_call".into(),
+            node: Some("analyst".into()),
+            payload_json: format!(
+                r#"{{"kind":"tool_call","tool":"Read","spans":[{{"node":"analyst","span_id":"{span}","parent_span_id":"{parent}"}}]}}"#
+            ),
+        };
+        let mut inside = bundle_of(vec![]);
+        inside.runs[0].run.run_id = "inside".into();
+        inside.runs[0].events = vec![
+            nested("00000000000000a7", "00000000000000b8"),
+            nested("00000000000000b8", "00000000000000a7"),
+        ];
+        assert!(matches!(
+            store.import(&inside).await,
+            Err(StoreError::BadExecutionGraph { .. })
+        ));
+
+        // Including one nobody can read.
+        let mut unreadable = bundle_of(vec![]);
+        unreadable.runs[0].run.run_id = "unreadable".into();
+        unreadable.runs[0].events = vec![EventRow {
+            seq: 0,
+            at: "2026-08-15T00:00:00Z".into(),
+            kind: "tool_call".into(),
+            node: Some("analyst".into()),
+            payload_json: r#"{"kind":"tool_call","tool":"Read","spans":[{"span_id":"nope"}]}"#
+                .into(),
+        }];
+        assert!(matches!(
+            store.import(&unreadable).await,
             Err(StoreError::BadExecutionGraph { .. })
         ));
 

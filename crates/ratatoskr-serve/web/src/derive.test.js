@@ -1586,3 +1586,107 @@ test("a turn that writes no checkpoint reports all of what it cost", () => {
   expect(box.telemetry.input_tokens).toBe(90);
   expect(box.telemetry.duration_ms).toBe(4200);
 });
+
+test("a box with a finished member and a live answerer offers no control", () => {
+  // A composed box: one member done, the other answering someone else's clarification. Reading
+  // reachability per member let the FINISHED one answer for the box, so a Stop was offered against
+  // work controlled by the node that asked — a button nothing polls.
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"], ["implementer"]);
+  const done = [
+    attemptStart("redteam_classifier", "00000000000000c1", "opus"),
+    attemptCheckpoint("redteam_classifier", "00000000000000c1", 5),
+  ];
+  const answering = {
+    at: "t",
+    kind: "node_start",
+    node: "redteam_author",
+    detail: "node started",
+    span_id: "00000000000000d2",
+    parent_span_id: "00000000000000a1",
+    controlled_as: "implementer",
+    facts: { model: "opus", tools: [], thinking: false, reuses_session: false },
+  };
+  const boxed = inNodeBoxes([...done, answering], stages);
+
+  expect(nodesFromEvents(boxed).get("redteam").state).toBe("working");
+  expect(workingNodeNames([composed("redteam", "idle")], boxed)).toEqual([]);
+});
+
+test("a turn whose start has scrolled out of view keeps its controls and its address", () => {
+  // A viewer attaching to a long tool-heavy turn gets a tail with no `node_start` in it. The fold
+  // reconstructs the turn from the records that remain — and requiring a start anywhere in view
+  // threw that away for the store's answer, which still says idle until the node checkpoints. The
+  // controls disappeared for exactly as long as the turn was interesting.
+  const stages = registry(["analyst"], ["implementer"]);
+  const server = [{ ...composed("analyst", "idle"), shaped: true }];
+  const tail = inNodeBoxes(
+    [
+      {
+        at: "t",
+        kind: "tool_call",
+        node: "analyst",
+        detail: "Read",
+        span_id: "00000000000000c3",
+      },
+    ],
+    stages,
+  );
+  expect(nodesFromEvents(tail).get("analyst").state).toBe("working");
+  expect(workingNodeNames(server, tail)).toEqual(["analyst"]);
+
+  // And the address survives the same trimming, because the turn's span carries it: an answerer
+  // whose start is out of view must not read as controllable.
+  const answering = inNodeBoxes(
+    [
+      {
+        at: "t",
+        kind: "tool_call",
+        node: "analyst",
+        detail: "Read",
+        span_id: "00000000000000d4",
+        controlled_as: "implementer",
+      },
+    ],
+    stages,
+  );
+  expect(nodesFromEvents(answering).get("analyst").state).toBe("working");
+  expect(workingNodeNames(server, answering)).toEqual([]);
+});
+
+test("a usage record carries what a turn reached for and whether it failed", () => {
+  // The only terminal record a turn without a checkpoint leaves. Its tools were dropped on the way
+  // in, and its error was never emitted at all — so a recovered failure read as done the moment its
+  // execution ended.
+  const stages = registry(["analyst"]);
+  const span = "00000000000000e5";
+  const failed = {
+    at: "t",
+    kind: "usage",
+    node: "analyst",
+    detail: "node usage",
+    span_id: span,
+    turns: 2,
+    error: "could not answer",
+    tools_used: ["Read", "Grep"],
+    usage: {
+      input_tokens: 10,
+      output_tokens: 2,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      reasoning_tokens: 0,
+      duration_ms: 30,
+    },
+  };
+  const ended = inNodeBoxes(
+    [
+      attemptStart("analyst", span, "opus"),
+      failed,
+      { at: "t", kind: "span_end", span_id: span, execution: "node", execution_name: "analyst" },
+    ],
+    stages,
+  );
+  const box = nodesFromEvents(ended).get("analyst");
+
+  expect([...box.telemetry.tools_used]).toEqual(["Read", "Grep"]);
+  expect(box.state).toBe("failed");
+});

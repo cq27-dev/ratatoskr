@@ -288,6 +288,10 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
   };
   const attemptFor = (member: Member, e: BoxedEvent, span: string): Attempt => {
     const found = member.for(e, span, (live) => make(span, live, false));
+    // Wherever the address arrives, not only on a start. Every record of a turn carries it, off the
+    // span the turn opened — so an attempt reconstructed from a tail whose start has scrolled away
+    // still knows a Stop aimed here would not reach it.
+    if (e.controlled_as !== undefined) found.controllable = e.controlled_as === e.node;
     if (!everywhere.has(found.span)) everywhere.set(found.span, { member, attempt: found });
     // An end this view saw before it saw anything else of that execution.
     if (endedEarly.has(found.span)) {
@@ -330,6 +334,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // the box a member is drawn in is its own address — so a member whose control goes somewhere
       // else entirely is one nothing here can reach.
       attempt.controllable = (e.controlled_as ?? e.node) === e.node;
+      everywhere.set(span, { member, attempt });
       // What it RAN ON carries across a re-entry; what it SPENT does not. The model, its tools and
       // its session are configuration — a start that announces nothing has not changed them — while
       // tokens, turns and duration belong to the attempt that spent them, which is the whole reason
@@ -425,8 +430,18 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
               reuses_session: e.facts.reuses_session,
             }
           : {}),
-        tools_used: [...new Set([...(attempt.telemetry?.tools_used ?? []), ...attempt.used])],
+        tools_used: [
+          ...new Set([
+            ...(attempt.telemetry?.tools_used ?? []),
+            ...(e.tools_used ?? []),
+            ...attempt.used,
+          ]),
+        ],
       };
+      // A turn that writes no checkpoint has only this record to say it FAILED, and its execution
+      // ending says nothing about how. Without this a recovered failure — an answerer that could
+      // not answer, an evidence-only turn that errored — reads as done the moment its span ends.
+      if (e.error) attempt.state = "failed";
       continue;
     }
 
@@ -504,11 +519,12 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // being displayed. A stage can be running an ordinary turn and answering a clarification at
       // once — the answerer controlled by the node that asked, the ordinary one by this box — and
       // reading the newest alone takes the Stop away from a turn that is still reachable.
-      controllable: members.some((m) =>
-        m.list.some((a) => a.live)
-          ? m.list.some((a) => a.live && a.controllable)
-          : (current(m)?.controllable ?? true),
-      ),
+      // Reachable if anything RUNNING here can be reached. Read per box rather than per member:
+      // a box with a finished member and one live answerer would otherwise answer from the
+      // finished one, and offer a Stop against a turn controlled by the node that asked.
+      controllable: members.some((m) => m.list.some((a) => a.live))
+        ? members.some((m) => m.list.some((a) => a.live && a.controllable))
+        : members.some((m) => current(m)?.controllable ?? true),
     });
   }
   return out;
@@ -779,6 +795,15 @@ export function workingNodeNames(
   const active = [...nodesFromEvents(events)]
     .filter(([, node]) => node.state === "working" && node.controllable)
     .map(([name]) => name);
+  // Anything the stream shows working is reachable, whether or not this view caught its start. A
+  // viewer attaching to a long tool-heavy turn gets a tail whose `node_start` has already scrolled
+  // out of it, and requiring one anywhere in view threw away a node the stream had reconstructed —
+  // falling back to the store, which still says idle until that node checkpoints. The controls
+  // disappeared for exactly as long as the turn was interesting.
+  if (active.length > 0) return active;
+  // Nothing running in view: the store's answer, which is where a viewer with no stream at all
+  // starts from. A stream that shows a start and no live node is a run that has stopped, and that
+  // has nothing for the store to add.
   if (events.some((event) => event.kind === "node_start")) return active;
   return nodes.filter((node) => node.state === "working").map((node) => node.name);
 }

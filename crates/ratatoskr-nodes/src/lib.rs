@@ -1226,7 +1226,11 @@ mod checkpoint_event_tests {
             .iter()
             .filter(|e| e["kind"] == "span_start" || e["kind"] == "span_end")
             .collect();
-        assert_eq!(lifecycle.len(), 4, "two executions, each started and ended");
+        assert_eq!(
+            lifecycle.len(),
+            4,
+            "two executions, each started and ended: {events:#?}"
+        );
         for event in &lifecycle {
             assert!(
                 event.get("node").is_none(),

@@ -15,7 +15,9 @@ export function Question({
 }) {
   return (
     <Compose
-      heading={<>/// {question.node ?? "a node"} is waiting on you</>}
+      // The asker, carried apart from `node`: the exchange is its own execution, so naming the
+      // asker as this record's node would open an invocation of the asker that never happened.
+      heading={<>/// {question.asked_by ?? question.node ?? "a node"} is waiting on you</>}
       aside={clock(question.at)}
       prompt={question.detail ?? undefined}
       placeholder="your answer…"
