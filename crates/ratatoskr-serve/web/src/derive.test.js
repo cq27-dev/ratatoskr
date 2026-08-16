@@ -1562,3 +1562,37 @@ test("a stage answering a clarification can still be stopped for its own turn", 
   const alone = inNodeBoxes([answering], stages);
   expect(workingNodeNames([composed("analyst", "idle")], alone)).toEqual([]);
 });
+
+test("a turn that writes no checkpoint reports all of what it cost", () => {
+  // An answerer and an evidence-only stage never checkpoint, so their `usage` record is the only
+  // account of them there is. A stream carrying a cost is authoritative — whatever this leaves out
+  // is displayed as measured absence, not filled in from the store — so a three-turn answer with a
+  // tool call must not read as one cycle on no model.
+  const stages = registry(["analyst"]);
+  const span = "00000000000000b2";
+  const spent = {
+    at: "t",
+    kind: "usage",
+    node: "analyst",
+    detail: "node usage",
+    span_id: span,
+    turns: 3,
+    facts: { model: "opus", tools: ["Read", "Grep"], thinking: true, reuses_session: false },
+    usage: {
+      input_tokens: 90,
+      output_tokens: 12,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      reasoning_tokens: 0,
+      duration_ms: 4200,
+    },
+  };
+  const box = nodesFromEvents(inNodeBoxes([spent], stages)).get("analyst");
+
+  expect(box.telemetry.turns).toBe(3);
+  expect(box.telemetry.model).toBe("opus");
+  expect(box.telemetry.tools).toEqual(["Read", "Grep"]);
+  expect(box.telemetry.thinking).toBe(true);
+  expect(box.telemetry.input_tokens).toBe(90);
+  expect(box.telemetry.duration_ms).toBe(4200);
+});

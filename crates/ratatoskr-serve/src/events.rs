@@ -173,12 +173,13 @@ pub struct LiveNodeFacts {
 impl LiveNodeFacts {
     /// Read them off a `node_start` record. `None` for every other kind.
     fn of(record: &Value) -> Option<Self> {
-        // Both ends of an attempt carry them: `node_start` announces what the node was given,
-        // and `checkpoint` records what it turned out to have. A viewer moving through a run needs
-        // whichever came last.
+        // Every end of an attempt carries them: `node_start` announces what the node was given,
+        // `checkpoint` records what it turned out to have, and `usage` is the only one of the three
+        // a turn that writes no checkpoint — an answerer, an evidence-only stage — ever emits. A
+        // viewer moving through a run needs whichever came last.
         if !matches!(
             record.get("kind").and_then(Value::as_str)?,
-            "node_start" | "checkpoint"
+            "node_start" | "checkpoint" | "usage"
         ) {
             return None;
         }

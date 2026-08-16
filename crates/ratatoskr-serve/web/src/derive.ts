@@ -405,6 +405,10 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // run's FINAL state — so scrubbing back to an earlier attempt shows a later one's numbers.
       const attempt = attemptFor(member, e, span);
       attempt.costed = true;
+      // All of it, not the counters alone. For a turn that writes no checkpoint — an answerer, an
+      // evidence-only stage — this is the ONLY record of what it ran on and how many turns it took,
+      // and a stream that carries a cost is authoritative: whatever this leaves out is displayed as
+      // measured absence rather than filled in from anywhere else.
       attempt.telemetry = {
         ...(attempt.telemetry ?? blank()),
         input_tokens: e.usage.input_tokens,
@@ -413,6 +417,16 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
         cache_creation_input_tokens: e.usage.cache_creation_input_tokens,
         reasoning_tokens: e.usage.reasoning_tokens,
         duration_ms: e.usage.duration_ms,
+        turns: e.turns ?? attempt.telemetry?.turns ?? null,
+        ...(e.facts
+          ? {
+              model: e.facts.model,
+              tools: e.facts.tools,
+              thinking: e.facts.thinking,
+              reuses_session: e.facts.reuses_session,
+            }
+          : {}),
+        tools_used: [...new Set([...(attempt.telemetry?.tools_used ?? []), ...attempt.used])],
       };
       continue;
     }

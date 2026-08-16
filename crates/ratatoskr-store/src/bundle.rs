@@ -58,13 +58,22 @@ fn check_execution_graph(
     };
 
     let mut parents = std::collections::HashMap::new();
+    // What one record says about an execution's parentage, folded with what the others said.
+    //
+    // A record that omits the field says NOTHING about parentage — not that there is none. Many
+    // records describe one execution and they need not each repeat it, so only two records naming
+    // DIFFERENT parents are a disagreement. The absence a reader reads as "the run drove this" is a
+    // checkpoint row's, which is one record and the whole of what that row states.
     let mut claim = |span_id: SpanId, parent: Option<SpanId>| {
-        match parents.insert(span_id, parent) {
-            // Saying again what is already recorded is not a conflict: an execution's start and its
-            // end both name it and its parent, and a run's log holds many records of one turn.
-            Some(before) if before != parent => Err(bad(format!(
+        let known = parents.entry(span_id).or_insert(parent);
+        match (*known, parent) {
+            (Some(before), Some(now)) if before != now => Err(bad(format!(
                 "execution {span_id} is described twice with different parentage"
             ))),
+            (None, Some(now)) => {
+                *known = Some(now);
+                Ok(())
+            }
             _ => Ok(()),
         }
     };
@@ -91,14 +100,20 @@ fn check_execution_graph(
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload_json) else {
             continue;
         };
-        let id = |key: &str| {
-            payload
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .and_then(SpanId::parse)
+        let written = |key: &str| payload.get(key).and_then(serde_json::Value::as_str);
+        // Present and unreadable is not absent. Absent says nothing; a value nobody can parse says
+        // something that cannot be checked, and recording it as a root asserts a shape the bundle
+        // never claimed — the same rule the checkpoint reader follows.
+        let id = |key: &str| match written(key) {
+            None => Ok(None),
+            Some(hex) => SpanId::parse(hex).map(Some).ok_or_else(|| {
+                bad(format!(
+                    "an execution names `{hex}`, which is not an execution"
+                ))
+            }),
         };
-        if let Some(span_id) = id("span_id") {
-            claim(span_id, id("parent_span_id"))?;
+        if let Some(span_id) = id("span_id")? {
+            claim(span_id, id("parent_span_id")?)?;
         }
     }
 
@@ -422,6 +437,42 @@ mod tests {
         ];
         assert!(matches!(
             store.import(&split).await,
+            Err(StoreError::BadExecutionGraph { .. })
+        ));
+
+        // A record that omits the parent says nothing about it, rather than claiming there is none.
+        // A run's log holds many records of one execution and they need not each repeat it — which
+        // is also what lets a run recorded before ends carried parentage still transfer.
+        let bare = |span: &str| EventRow {
+            seq: 1,
+            at: "2026-08-15T00:00:00Z".into(),
+            kind: "span_end".into(),
+            node: None,
+            payload_json: format!(r#"{{"kind":"span_end","span_id":"{span}"}}"#),
+        };
+        let mut quiet = bundle_of(vec![]);
+        quiet.runs[0].run.run_id = "quiet".into();
+        quiet.runs[0].events = vec![
+            lifecycle("00000000000000dd", "00000000000000aa"),
+            bare("00000000000000dd"),
+        ];
+        assert!(store.import(&quiet).await.is_ok());
+
+        // Present and unreadable is not absent, though: it says something nobody can check, and
+        // recording it as a root asserts a shape the bundle never claimed.
+        let mut malformed = bundle_of(vec![]);
+        malformed.runs[0].run.run_id = "malformed".into();
+        malformed.runs[0].events = vec![EventRow {
+            seq: 0,
+            at: "2026-08-15T00:00:00Z".into(),
+            kind: "span_start".into(),
+            node: None,
+            payload_json:
+                r#"{"kind":"span_start","span_id":"00000000000000ee","parent_span_id":"nope"}"#
+                    .into(),
+        }];
+        assert!(matches!(
+            store.import(&malformed).await,
             Err(StoreError::BadExecutionGraph { .. })
         ));
 
