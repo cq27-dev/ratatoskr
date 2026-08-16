@@ -2633,6 +2633,21 @@ tokio::task_local! {
     static CLAIM_SCOPE: u64;
     /// The execution the running future belongs to; see [`execution`].
     static EXECUTION: Invocation;
+    /// Whether the running execution's output has survived every check so far; see
+    /// [`output_unvalidated`].
+    static VALIDATED: std::sync::Arc<std::sync::atomic::AtomicBool>;
+}
+
+/// Record that the running execution's output failed a validation its caller will fail on too.
+///
+/// The turn returns the raw text either way — the caller's parse is what produces the error the
+/// stage fails with — but the turn's `span_end` must not then read as the work completing: a stage
+/// that reads done is excluded from the candidates a failed run is attributed among, so the failed
+/// stage rendered as the one part of the run that succeeded.
+pub fn output_unvalidated() {
+    let _ = VALIDATED.try_with(|validated| {
+        validated.store(false, std::sync::atomic::Ordering::Relaxed);
+    });
 }
 
 /// The scope of a turn recorded with no scope open — the sequential paths that run outside a
@@ -2682,6 +2697,8 @@ struct SpanEnd {
     /// reader with only "it ended" has to treat the outcome as unknown: a cancelled node that read
     /// as done was excluded from the candidates a failed run is attributed to.
     completed: bool,
+    /// Whether everything the execution produced survived its checks; see [`output_unvalidated`].
+    validated: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for SpanEnd {
@@ -2696,7 +2713,14 @@ impl Drop for SpanEnd {
             parent_span_id,
             execution_name = %self.name,
             execution = self.kind.as_str(),
-            outcome = if self.completed { "completed" } else { "cancelled" },
+            outcome = match (
+                self.completed,
+                self.validated.load(std::sync::atomic::Ordering::Relaxed),
+            ) {
+                (false, _) => "cancelled",
+                (true, false) => "unvalidated",
+                (true, true) => "completed",
+            },
             "execution ended"
         );
     }
@@ -2736,13 +2760,17 @@ pub async fn execution_as<F: Future>(
         execution = kind.as_str(),
         "execution started"
     );
+    let validated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mut end = SpanEnd {
         invocation,
         name: name.to_string(),
         kind,
         completed: false,
+        validated: std::sync::Arc::clone(&validated),
     };
-    let outcome = EXECUTION.scope(invocation, work).await;
+    let outcome = EXECUTION
+        .scope(invocation, VALIDATED.scope(validated, work))
+        .await;
     // Reached only if the work returned. A future dropped part way never gets here, and its guard
     // says so.
     end.completed = true;
@@ -3351,19 +3379,25 @@ where
         // mistake a model corrects immediately when told. The correction is a fresh short prompt
         // rather than a continuation, so the preamble and tools stay cached and the transcript
         // does not grow.
-        if may_correct_schema
-            && let Err(invalid) = ratatoskr_graph::validate_raw(raw, &schema_value)
-        {
-            may_correct_schema = false;
-            tracing::warn!(node, %invalid, "output failed its schema; asking for a correction");
-            prompt = format!(
-                "Your answer did not match the schema you were given: {invalid}\n\n\
-                 Here is what you returned:\n{raw}\n\n\
-                 Return the same content corrected to match the schema. Change only what the \
-                 error names — keep every finding, do not shorten anything, and do not go and \
-                 look anything up again. Answer by calling the output tool.",
-            );
-            continue;
+        if let Err(invalid) = ratatoskr_graph::validate_raw(raw, &schema_value) {
+            if may_correct_schema {
+                may_correct_schema = false;
+                tracing::warn!(node, %invalid, "output failed its schema; asking for a correction");
+                prompt = format!(
+                    "Your answer did not match the schema you were given: {invalid}\n\n\
+                     Here is what you returned:\n{raw}\n\n\
+                     Return the same content corrected to match the schema. Change only what the \
+                     error names — keep every finding, do not shorten anything, and do not go and \
+                     look anything up again. Answer by calling the output tool.",
+                );
+                continue;
+            }
+            // The correction came back invalid too. The raw text still goes to the caller — its
+            // parse is what produces the error the stage fails with — but this turn's end must not
+            // read as the work completing: the caller's validation is still to run and is known to
+            // fail, and a stage that reads done is excluded from the candidates a failed run is
+            // attributed among.
+            output_unvalidated();
         }
         break attempt;
     };
@@ -4536,6 +4570,136 @@ mod tests {
             .expect("a node outside every host call is still an execution");
         assert_eq!(overseer.parent_span_id, None, "the run is the trace");
         assert_ne!(overseer.span_id, referee.span_id);
+    }
+
+    /// A model whose output never matches any schema, however often it is corrected.
+    #[derive(Clone, Default)]
+    struct AlwaysInvalid;
+
+    impl CompletionModel for AlwaysInvalid {
+        type Response = ();
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            Ok(CompletionResponse {
+                choice: OneOrMany::one(AssistantContent::text("not the schema, ever")),
+                usage: rig_core::completion::Usage::default(),
+                raw_response: (),
+                message_id: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+            Err(CompletionError::ResponseError("no stream".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_whose_output_never_validates_does_not_end_as_completed() {
+        // `run_structured` returns the raw text either way — the caller's parse is what produces
+        // the error the stage fails with — but that parse happens AFTER this turn's `span_end`.
+        // An end that read "completed" there marked the stage done before its output was checked,
+        // and a failed run attributes itself among the nodes still reading as working: the stage
+        // that failed rendered as the one part of the run that succeeded.
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Done {
+            summary: String,
+        }
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("sink").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let route = ModelRoute {
+            provider: "test".to_string(),
+            model: "test-model".to_string(),
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        };
+        let sink = Sink::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_writer(sink.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let guard = tracing::subscriber::set_default(subscriber);
+        let answer = run_typed_with_control(
+            AlwaysInvalid,
+            NodeRun {
+                node: "analyst",
+                controlled_as: None,
+                route: &route,
+                preamble: "Answer.",
+                question: "Answer.",
+                tools: ToolSet::default(),
+                output_schema: schemars::schema_for!(Done),
+                policy: None,
+                max_turns: Some(4),
+                clarifier: None,
+                observer: None,
+                skills: Vec::new(),
+                files: None,
+                rag_rat_worktree: None,
+                shell: None,
+                push: None,
+                conversation: None,
+                ledger: None,
+                produces: None,
+            },
+            ProviderCallQueue::default(),
+            None,
+        )
+        .await;
+        drop(guard);
+
+        // The raw text still reaches the caller — failing the turn here would discard the model's
+        // work over what may be a recoverable parse.
+        assert_eq!(
+            answer.expect("the raw text is returned"),
+            "not the schema, ever"
+        );
+
+        let raw = String::from_utf8(sink.0.lock().expect("sink").clone()).expect("utf-8");
+        let end = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["kind"] == "span_end")
+            .expect("the turn announced its end");
+        assert_eq!(
+            end["outcome"], "unvalidated",
+            "an end at the model-turn boundary must not claim the stage completed: {end}"
+        );
     }
 
     #[tokio::test]

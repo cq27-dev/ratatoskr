@@ -63,33 +63,56 @@ fn check_execution_graph(
     // it states, so it says the run drove that execution. A log record's absence is silence —
     // many records describe one execution and need not each repeat what invoked it. So an assertion
     // and a parent conflict, two different parents conflict, and silence conflicts with nothing.
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     struct Known {
         parent: Option<SpanId>,
         asserted: bool,
+        /// The node whose `node_start` opened this execution, where one did.
+        ///
+        /// The start alone, because sharing an execution's span is otherwise ordinary: an
+        /// acceptance step and a turn-less checkpoint both hang records off the host call that
+        /// drove them, under the nodes they are about. Two STARTS claiming one id are two attempts,
+        /// and a reader keying attempts by id would fold them into one — the second overwriting
+        /// the first, which then stays live forever or is closed by the wrong end.
+        opened_by: Option<String>,
     }
     let mut parents: std::collections::HashMap<SpanId, Known> = std::collections::HashMap::new();
-    let mut claim = |span_id: SpanId, parent: Option<SpanId>, asserted: bool| {
-        let known = parents.entry(span_id).or_insert(Known { parent, asserted });
-        let conflict = match (known.parent, parent) {
-            (Some(before), Some(now)) => before != now,
-            // An explicit root, then a parent — or the other way about. Both cannot be true, and a
-            // consumer would disagree with itself about where the execution hangs.
-            (None, Some(_)) => known.asserted,
-            (Some(_), None) => asserted,
-            (None, None) => false,
+    let mut claim =
+        |span_id: SpanId, parent: Option<SpanId>, asserted: bool, opened_by: Option<&str>| {
+            let known = parents.entry(span_id).or_insert(Known {
+                parent,
+                asserted,
+                opened_by: opened_by.map(ToString::to_string),
+            });
+            let conflict = match (known.parent, parent) {
+                (Some(before), Some(now)) => before != now,
+                // An explicit root, then a parent — or the other way about. Both cannot be true, and a
+                // consumer would disagree with itself about where the execution hangs.
+                (None, Some(_)) => known.asserted,
+                (Some(_), None) => asserted,
+                (None, None) => false,
+            };
+            if conflict {
+                return Err(bad(format!(
+                    "execution {span_id} is described twice with different parentage"
+                )));
+            }
+            if let (Some(before), Some(now)) = (known.opened_by.as_deref(), opened_by)
+                && before != now
+            {
+                return Err(bad(format!(
+                    "execution {span_id} is started by `{before}` and by `{now}`"
+                )));
+            }
+            if parent.is_some() {
+                known.parent = parent;
+            }
+            known.asserted |= asserted;
+            if let Some(now) = opened_by {
+                known.opened_by = Some(now.to_string());
+            }
+            Ok(())
         };
-        if conflict {
-            return Err(bad(format!(
-                "execution {span_id} is described twice with different parentage"
-            )));
-        }
-        if parent.is_some() {
-            known.parent = parent;
-        }
-        known.asserted |= asserted;
-        Ok(())
-    };
 
     // A ROW per execution, though. Two rows claiming one execution collapse two of them into one
     // with nothing to notice it by, which is what an identity is for.
@@ -102,7 +125,7 @@ fn check_execution_graph(
                     invocation.span_id
                 )));
             }
-            claim(invocation.span_id, invocation.parent_span_id, true)?;
+            claim(invocation.span_id, invocation.parent_span_id, true, None)?;
         }
     }
     // And the executions that exist only as events. Most of them do: a host call, a clarification,
@@ -119,10 +142,23 @@ fn check_execution_graph(
         // one being imported, and the gap is exactly where a malformed graph would hide.
         let payload = serde_json::from_str::<serde_json::Value>(&event.payload_json)
             .map_err(|e| bad(format!("event {} is not a record: {e}", event.seq)))?;
+        // An object, specifically. `null`, a number and a list all parse, and each would be
+        // persisted and served as a record that attributes to nothing — validated as empty and
+        // then normalised downstream into a synthetic event nobody wrote.
+        if !payload.is_object() {
+            return Err(bad(format!("event {} is not a record", event.seq)));
+        }
         let attribution = ratatoskr_core::span::Attribution::of(&payload)
             .map_err(|malformed| bad(format!("a record is unreadable: {malformed}")))?;
         if let Some(invocation) = attribution.invocation {
-            claim(invocation.span_id, invocation.parent_span_id, false)?;
+            let starts =
+                payload.get("kind").and_then(serde_json::Value::as_str) == Some("node_start");
+            claim(
+                invocation.span_id,
+                invocation.parent_span_id,
+                false,
+                starts.then_some(attribution.node.as_deref()).flatten(),
+            )?;
         }
     }
 
@@ -562,6 +598,59 @@ mod tests {
             store.import(&torn).await,
             Err(StoreError::BadExecutionGraph { .. })
         ));
+
+        // A value that parses and is not an object is not a record either: `null`, a number and a
+        // list would each be persisted and served, attributing to nothing.
+        for scalar in ["null", "42", "[]"] {
+            let mut hollow = bundle_of(vec![]);
+            hollow.runs[0].run.run_id = format!("hollow-{scalar}");
+            hollow.runs[0].events = vec![EventRow {
+                seq: 0,
+                at: "2026-08-15T00:00:00Z".into(),
+                kind: "span_start".into(),
+                node: None,
+                payload_json: scalar.into(),
+            }];
+            assert!(
+                matches!(
+                    store.import(&hollow).await,
+                    Err(StoreError::BadExecutionGraph { .. })
+                ),
+                "{scalar} is not a record"
+            );
+        }
+
+        // One START per execution. Sharing a span is otherwise ordinary — an acceptance step and a
+        // turn-less checkpoint both hang off the host call that drove them — but two starts
+        // claiming one id are two attempts, and a reader keying attempts by id folds them into
+        // one: the second overwrites the first, which stays live forever or is closed by the
+        // wrong end.
+        let started = |node: &str, span: &str| EventRow {
+            seq: 0,
+            at: "2026-08-15T00:00:00Z".into(),
+            kind: "node_start".into(),
+            node: Some(node.into()),
+            payload_json: format!(r#"{{"kind":"node_start","node":"{node}","span_id":"{span}"}}"#),
+        };
+        let mut reopened = bundle_of(vec![]);
+        reopened.runs[0].run.run_id = "reopened".into();
+        reopened.runs[0].events = vec![
+            started("analyst", "00000000000000f2"),
+            started("implementer", "00000000000000f2"),
+        ];
+        assert!(matches!(
+            store.import(&reopened).await,
+            Err(StoreError::BadExecutionGraph { .. })
+        ));
+
+        // The same start said twice is the same start — a rotated log replayed over itself.
+        let mut echoed = bundle_of(vec![]);
+        echoed.runs[0].run.run_id = "echoed".into();
+        echoed.runs[0].events = vec![
+            started("analyst", "00000000000000f3"),
+            started("analyst", "00000000000000f3"),
+        ];
+        assert!(store.import(&echoed).await.is_ok());
 
         // Repeating what it already said is not disagreement: a start and its end both name the
         // execution and its parent, and a turn's records are many.

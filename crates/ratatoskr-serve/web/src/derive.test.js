@@ -1691,7 +1691,8 @@ test("a usage record carries what a turn reached for and whether it failed", () 
   expect(box.state).toBe("failed");
 });
 
-test("an execution that was cancelled is not reported as having finished", () => {
+for (const outcome of ["cancelled", "unvalidated"]) {
+test(`an execution that ended ${outcome} is not reported as having finished`, () => {
   // `span_end` is emitted however an execution leaves — returned, errored, or dropped when the run
   // was stopped. Reading any end as success rendered a cancelled node as done, and a failed run is
   // attributed among the nodes still reading as working: the one that died was excluded from its
@@ -1705,7 +1706,7 @@ test("an execution that was cancelled is not reported as having finished", () =>
       {
         at: "t",
         kind: "span_end",
-        outcome: "cancelled",
+        outcome,
         span_id: span,
         execution: "node",
         execution_name: "characterizer",
@@ -1719,3 +1720,4 @@ test("an execution that was cancelled is not reported as having finished", () =>
   // Which is what keeps it a candidate when the run is reconciled as failed.
   expect(applyDerived(shape, nodesFromEvents(cancelled), "failed")[0].state).toBe("failed");
 });
+}
