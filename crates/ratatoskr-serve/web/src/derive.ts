@@ -337,7 +337,12 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     if (!everywhere.has(attempt.span)) everywhere.set(attempt.span, { member, attempt });
     if (attempt.parent === undefined && e.parent_span_id) {
       attempt.parent = e.parent_span_id;
-      childrenOf.set(e.parent_span_id, [...(childrenOf.get(e.parent_span_id) ?? []), attempt]);
+      // Appended, never rebuilt: a spread here copies every sibling already registered for each
+      // new one, which is quadratic in a host's fan-out — the third time this exact shape has
+      // appeared in this file, and the fold runs on every render and every scrub.
+      const siblings = childrenOf.get(e.parent_span_id);
+      if (siblings) siblings.push(attempt);
+      else childrenOf.set(e.parent_span_id, [attempt]);
       settled(attempt);
     }
     // An end this view saw before it saw anything else of that execution — applied with the

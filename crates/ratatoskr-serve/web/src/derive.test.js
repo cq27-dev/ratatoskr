@@ -1510,6 +1510,46 @@ test("folding a long history costs what the history costs", () => {
   expect(box.telemetry.input_tokens).toBe(1);
 });
 
+test("a wide fan-out under one host costs what the children cost", () => {
+  // The shapes above vary the ATTEMPT count; this one varies the children registered under one
+  // parent, which is its own accumulation — and rebuilding the sibling list per child is quadratic
+  // in a host's fan-out. A host may drive any number of invocations, an imported history is
+  // unbounded, and the fold runs on every render and every scrub.
+  const stages = registry(["probe"]);
+  const host = "00000000000000d9";
+  const many = 20_000;
+  const events = [];
+  for (let n = 1; n <= many; n += 1) {
+    const span = `${n}`.padStart(16, "0");
+    events.push(
+      { ...attemptStart("probe", span, "opus"), parent_span_id: host },
+      {
+        at: "t",
+        kind: "span_end",
+        outcome: "completed",
+        span_id: span,
+        execution: "node",
+        execution_name: "probe",
+      },
+    );
+  }
+  events.push({
+    at: "t",
+    kind: "span_end",
+    outcome: "completed",
+    span_id: host,
+    execution: "host",
+    execution_name: "probe",
+  });
+  const boxed = inNodeBoxes(events, stages);
+
+  const started = performance.now();
+  const box = nodesFromEvents(boxed).get("probe");
+  expect(performance.now() - started).toBeLessThan(500);
+  // And the host's clean close settled every one of them.
+  expect(box.state).toBe("done");
+});
+
 test("overlapping invocations cost what they cost to end", () => {
   // The existing history test alternates start and checkpoint, so only one invocation is ever live
   // and removing it is free. A history may instead hold many at once — and removing from the middle
