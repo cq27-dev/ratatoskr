@@ -3384,8 +3384,16 @@ where
         // mistake a model corrects immediately when told. The correction is a fresh short prompt
         // rather than a continuation, so the preamble and tools stay cached and the transcript
         // does not grow.
-        if let Err(invalid) = ratatoskr_graph::validate_raw(raw, &schema_value) {
-            if may_correct_schema {
+        match ratatoskr_graph::validate_raw(raw, &schema_value) {
+            // What validated is what is returned: the extracted JSON, not the prose that may be
+            // wrapped around it. The extraction is lenient — a fenced or prefaced object is
+            // recovered — while a caller parses what it receives strictly, and handing back the
+            // prose let the two disagree: the turn ended "completed" and the stage then failed on
+            // its own parse, rendering the failed stage as the one part of the run that succeeded.
+            // Returning the validated value is what makes "completed" a claim the caller cannot
+            // refute.
+            Ok(value) => break Ok(value.to_string()),
+            Err(invalid) if may_correct_schema => {
                 may_correct_schema = false;
                 tracing::warn!(node, %invalid, "output failed its schema; asking for a correction");
                 prompt = format!(
@@ -3397,14 +3405,16 @@ where
                 );
                 continue;
             }
-            // The correction came back invalid too. The raw text still goes to the caller — its
-            // parse is what produces the error the stage fails with — but this turn's end must not
-            // read as the work completing: the caller's validation is still to run and is known to
-            // fail, and a stage that reads done is excluded from the candidates a failed run is
-            // attributed among.
-            output_unvalidated();
+            Err(_) => {
+                // The correction came back invalid too. The raw text still goes to the caller —
+                // its parse is what produces the error the stage fails with — but this turn's end
+                // must not read as the work completing: the caller's validation is still to run
+                // and is known to fail, and a stage that reads done is excluded from the
+                // candidates a failed run is attributed among.
+                output_unvalidated();
+                break attempt;
+            }
         }
-        break attempt;
     };
 
     let (usage, calls) = meter.read();
@@ -4575,6 +4585,96 @@ mod tests {
             .expect("a node outside every host call is still an execution");
         assert_eq!(overseer.parent_span_id, None, "the run is the trace");
         assert_ne!(overseer.span_id, referee.span_id);
+    }
+
+    /// A model that wraps a valid answer in prose, as models do.
+    #[derive(Clone, Default)]
+    struct ProseWrapped;
+
+    impl CompletionModel for ProseWrapped {
+        type Response = ();
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            Ok(CompletionResponse {
+                choice: OneOrMany::one(AssistantContent::text(
+                    "Here is the summary you asked for: {\"summary\": \"done\"} — hope it helps!",
+                )),
+                usage: rig_core::completion::Usage::default(),
+                raw_response: (),
+                message_id: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+            Err(CompletionError::ResponseError("no stream".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_completed_turn_returns_the_value_it_validated_not_the_prose_around_it() {
+        // The schema gate recovers a JSON object from prose — that leniency is the point of it —
+        // while a caller parses what it receives strictly. Handing back the prose let the two
+        // disagree: the turn ended "completed" and the stage then failed on its own parse, so the
+        // failed stage rendered as the one part of the run that succeeded. What validated is what
+        // is returned, and "completed" becomes a claim the caller cannot refute.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct Done {
+            summary: String,
+        }
+
+        let route = ModelRoute {
+            provider: "test".to_string(),
+            model: "test-model".to_string(),
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        };
+        let answer = run_typed_with_control(
+            ProseWrapped,
+            NodeRun {
+                node: "analyst",
+                controlled_as: None,
+                route: &route,
+                preamble: "Answer.",
+                question: "Answer.",
+                tools: ToolSet::default(),
+                output_schema: schemars::schema_for!(Done),
+                policy: None,
+                max_turns: Some(4),
+                clarifier: None,
+                observer: None,
+                skills: Vec::new(),
+                files: None,
+                rag_rat_worktree: None,
+                shell: None,
+                push: None,
+                conversation: None,
+                ledger: None,
+                produces: None,
+            },
+            ProviderCallQueue::default(),
+            None,
+        )
+        .await
+        .expect("the prose-wrapped answer validates");
+
+        // Exactly what a strict caller does with it, succeeding exactly when the turn completed.
+        let parsed: Done = serde_json::from_str(&answer).expect("the returned text IS the value");
+        assert_eq!(parsed.summary, "done");
     }
 
     /// A model whose output never matches any schema, however often it is corrected.

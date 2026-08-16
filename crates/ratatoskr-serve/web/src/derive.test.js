@@ -1747,3 +1747,30 @@ test(`an execution that ended ${outcome} is not reported as having finished`, ()
   expect(applyDerived(shape, nodesFromEvents(cancelled), "failed")[0].state).toBe("failed");
 });
 }
+
+test("an execution that ended keeps its failure state but is no longer a control target", () => {
+  // A cancelled end deliberately leaves the state working — that is what keeps the node among a
+  // failed run's candidates — but the execution is known to be OVER, and a Stop offered against it
+  // reaches nothing. The two questions come apart here: still working as far as blame goes, not
+  // reachable as far as controls go.
+  const shape = [composed("characterizer", "idle")];
+  const stages = registry(["characterizer"]);
+  const span = "00000000000000fa";
+  const cancelled = inNodeBoxes(
+    [
+      attemptStart("characterizer", span, "opus"),
+      {
+        at: "t",
+        kind: "span_end",
+        outcome: "cancelled",
+        span_id: span,
+        execution: "node",
+        execution_name: "characterizer",
+      },
+    ],
+    stages,
+  );
+
+  expect(nodesFromEvents(cancelled).get("characterizer").state).toBe("working");
+  expect(workingNodeNames(shape, cancelled)).toEqual([]);
+});

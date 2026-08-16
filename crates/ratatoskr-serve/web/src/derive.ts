@@ -538,7 +538,14 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // finished one, and offer a Stop against a turn controlled by the node that asked.
       controllable: members.some((m) => m.list.some((a) => a.live))
         ? members.some((m) => m.list.some((a) => a.live && a.controllable))
-        : members.some((m) => current(m)?.controllable ?? true),
+        : // Nothing live in view. An attempt reconstructed from a trimmed tail may still be
+          // running — its start is what scrolled away — so it stays reachable; one whose execution
+          // has ENDED is known to be over, whatever state it kept for the failure ledger, and a
+          // Stop offered against it reaches nothing.
+          members.some((m) => {
+            const shown = current(m);
+            return shown !== undefined && !shown.ended && shown.controllable;
+          }),
     });
   }
   return out;
