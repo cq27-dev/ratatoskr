@@ -3478,6 +3478,85 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+    /// Captures this thread's tracing output through one PROCESS-WIDE subscriber.
+    ///
+    /// A per-test `set_default` subscriber cannot capture reliably while other tests emit
+    /// concurrently, and the failure is silent record loss: callsite interest is cached
+    /// process-wide, and with only thread-SCOPED dispatchers registered it is computed by asking
+    /// the default of whichever thread evaluates it — a thread with no subscriber caches
+    /// `Interest::never`, and that record kind is then skipped on every thread, including the one
+    /// whose subscriber wanted it. Which records vanished depended on which callsites were
+    /// (re)evaluated on foreign threads, which is why the flake lost a prefix on one run and a
+    /// suffix on the next, and never reproduced in isolation.
+    ///
+    /// One GLOBAL dispatcher makes interest a constant: every thread's `get_default` reaches it,
+    /// so nothing can cache `never`. It routes by a thread-local slot — emission happens on the
+    /// test's own thread (the current-thread runtime keeps the whole turn there), so the slot
+    /// sees exactly this test's records, and a thread with no slot set writes to nobody.
+    mod capture {
+        use std::cell::RefCell;
+        use std::sync::{Arc, Mutex, Once};
+
+        thread_local! {
+            static ACTIVE: RefCell<Option<Arc<Mutex<Vec<u8>>>>> = const { RefCell::new(None) };
+        }
+
+        #[derive(Clone, Default)]
+        struct Router;
+        impl std::io::Write for Router {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                ACTIVE.with(|active| {
+                    if let Some(sink) = active.borrow().as_ref() {
+                        sink.lock().expect("capture sink").extend_from_slice(buf);
+                    }
+                });
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Router {
+            type Writer = Router;
+            fn make_writer(&'a self) -> Self::Writer {
+                Router
+            }
+        }
+
+        /// The capture in progress; read with [`Capturing::text`], released on drop.
+        pub struct Capturing(Arc<Mutex<Vec<u8>>>);
+        impl Capturing {
+            pub fn text(&self) -> String {
+                String::from_utf8(self.0.lock().expect("capture sink").clone()).expect("utf-8")
+            }
+        }
+        impl Drop for Capturing {
+            fn drop(&mut self) {
+                ACTIVE.with(|active| active.borrow_mut().take());
+            }
+        }
+
+        pub fn start() -> Capturing {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            static INSTALL: Once = Once::new();
+            INSTALL.call_once(|| {
+                let layer = tracing_subscriber::fmt::layer()
+                    .json()
+                    .flatten_event(true)
+                    .with_writer(Router);
+                tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
+                    .expect("this is the test binary's one global subscriber");
+                // Callsites hit before this install cached their interest against an empty
+                // dispatcher set. Recompute them against the global now standing, or those
+                // record kinds stay skipped process-wide for the rest of the run.
+                tracing::callsite::rebuild_interest_cache();
+            });
+            let sink = Arc::new(Mutex::new(Vec::new()));
+            ACTIVE.with(|active| *active.borrow_mut() = Some(Arc::clone(&sink)));
+            Capturing(sink)
+        }
+    }
+
     use rig_core::completion::CompletionRequest;
     use rig_core::streaming::StreamingCompletionResponse;
 
@@ -4732,30 +4811,10 @@ mod tests {
         // An end that read "completed" there marked the stage done before its output was checked,
         // and a failed run attributes itself among the nodes still reading as working: the stage
         // that failed rendered as the one part of the run that succeeded.
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         #[derive(serde::Deserialize, schemars::JsonSchema)]
         #[allow(dead_code)]
         struct Done {
             summary: String,
-        }
-
-        #[derive(Clone, Default)]
-        struct Sink(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("sink").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
-            type Writer = Sink;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
         }
 
         let route = ModelRoute {
@@ -4767,13 +4826,7 @@ mod tests {
             params: None,
             session: Default::default(),
         };
-        let sink = Sink::default();
-        let layer = tracing_subscriber::fmt::layer()
-            .json()
-            .flatten_event(true)
-            .with_writer(sink.clone());
-        let subscriber = tracing_subscriber::registry().with(layer);
-        let guard = tracing::subscriber::set_default(subscriber);
+        let capturing = capture::start();
         let answer = run_typed_with_control(
             AlwaysInvalid,
             NodeRun {
@@ -4804,7 +4857,6 @@ mod tests {
             None,
         )
         .await;
-        drop(guard);
 
         // The raw text still reaches the caller — failing the turn here would discard the model's
         // work over what may be a recoverable parse.
@@ -4813,12 +4865,15 @@ mod tests {
             "not the schema, ever"
         );
 
-        let raw = String::from_utf8(sink.0.lock().expect("sink").clone()).expect("utf-8");
+        let raw = capturing.text();
         let end = raw
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .find(|record| record["kind"] == "span_end")
-            .expect("the turn announced its end");
+            // The whole capture, because this has flaked on CI with nothing to diagnose by: an
+            // empty capture, a missing single record, and a corrupted line are three different
+            // failures, and the message is the only evidence a CI run leaves behind.
+            .unwrap_or_else(|| panic!("the turn announced its end; captured: {raw:?}"));
         assert_eq!(
             end["outcome"], "unvalidated",
             "an end at the model-turn boundary must not claim the stage completed: {end}"
@@ -4831,13 +4886,13 @@ mod tests {
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .find(|record| record["kind"] == "usage")
-            .expect("the turn reported its cost");
+            .unwrap_or_else(|| panic!("the turn reported its cost; captured: {raw:?}"));
         assert_eq!(usage["controlled_as"], "implementer", "{usage}");
         let start = raw
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .find(|record| record["kind"] == "node_start")
-            .expect("the turn announced itself");
+            .unwrap_or_else(|| panic!("the turn announced itself; captured: {raw:?}"));
         assert_eq!(start["controlled_as"], "implementer", "{start}");
         // Stated provenance rides the start — the record a reader anchors the box by from the
         // first moment of the turn, not the checkpoint that arrives when it is over.

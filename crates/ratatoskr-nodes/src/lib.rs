@@ -1031,35 +1031,89 @@ pub(crate) fn with_conventions(node: &str, conventions: Option<&str>, base: Stri
 }
 
 #[cfg(test)]
-mod checkpoint_event_tests {
-    use std::sync::{Arc, Mutex};
+/// Captures this thread's tracing output through one PROCESS-WIDE subscriber.
+///
+/// A per-test `set_default` subscriber cannot capture reliably while other tests emit
+/// concurrently, and the failure is silent record loss: callsite interest is cached
+/// process-wide, and with only thread-SCOPED dispatchers registered it is computed by asking the
+/// default of whichever thread evaluates it — a thread with no subscriber caches
+/// `Interest::never`, and that record kind is then skipped on every thread, including the one
+/// whose subscriber wanted it. The `COLLECTING` mutex this replaces serialized collectors against
+/// each other, which was never the race: the poison comes from any OTHER test's thread touching a
+/// callsite. One GLOBAL dispatcher makes interest a constant, and it routes by a thread-local
+/// slot — emission stays on the test's own thread, so the slot sees exactly this test's records.
+///
+/// The layer options are the ones `init_logging` ships, so shape assertions pin what runs pin.
+/// A twin lives in ratatoskr-agent's tests: test-only code, two separate binaries, and a shared
+/// test-util crate for seventy lines would be a dependency the workspace does not need.
+pub(crate) mod test_capture {
+    use std::cell::RefCell;
+    use std::sync::{Arc, Mutex, Once};
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<Arc<Mutex<Vec<u8>>>>> = const { RefCell::new(None) };
+    }
 
     #[derive(Clone, Default)]
-    struct Buffer(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Buffer {
+    struct Router;
+    impl std::io::Write for Router {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("buffer mutex").extend_from_slice(buf);
+            ACTIVE.with(|active| {
+                if let Some(sink) = active.borrow().as_ref() {
+                    sink.lock().expect("capture sink").extend_from_slice(buf);
+                }
+            });
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
-        type Writer = Buffer;
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Router {
+        type Writer = Router;
         fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
+            Router
         }
     }
 
-    /// Held while a test collects records, so only one does at a time.
-    ///
-    /// `set_default` installs a subscriber for the calling thread, and the suite runs its tests in
-    /// parallel on a pool: two collecting at once occasionally read each other's, which shows up as
-    /// a count that is short rather than as anything obviously wrong.
-    static COLLECTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// The capture in progress; read with [`Capturing::text`], released on drop.
+    pub struct Capturing(Arc<Mutex<Vec<u8>>>);
+    impl Capturing {
+        pub fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("capture sink").clone()).expect("utf-8")
+        }
+    }
+    impl Drop for Capturing {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.borrow_mut().take());
+        }
+    }
+
+    pub fn start() -> Capturing {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            let layer = tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(true)
+                .with_writer(Router);
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
+                .expect("this is the test binary's one global subscriber");
+            // Callsites hit before this install cached their interest against an empty
+            // dispatcher set. Recompute them against the global now standing, or those record
+            // kinds stay skipped process-wide for the rest of the run.
+            tracing::callsite::rebuild_interest_cache();
+        });
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        ACTIVE.with(|active| *active.borrow_mut() = Some(Arc::clone(&sink)));
+        Capturing(sink)
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_event_tests {
 
     /// Emit one checkpoint through the real path and read back the JSON it produced.
     ///
@@ -1068,8 +1122,6 @@ mod checkpoint_event_tests {
     async fn checkpoint_record(
         telemetry: Option<ratatoskr_core::NodeTelemetry>,
     ) -> serde_json::Value {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let store = ratatoskr_store::Store::open_in_memory().expect("in-memory store");
         store
             .upsert_run("r1", None, "running")
@@ -1079,18 +1131,7 @@ mod checkpoint_event_tests {
         if let Some(telemetry) = telemetry {
             ledger.record("redteam", telemetry);
         }
-        let _collecting = COLLECTING.lock().await;
-        let buf = Buffer::default();
-        // The same layer options `init_logging` installs — a shape assertion against a differently
-        // configured sink would pin nothing that ships.
-        let layer = tracing_subscriber::fmt::layer()
-            .json()
-            .flatten_event(true)
-            .with_current_span(false)
-            .with_span_list(true)
-            .with_writer(buf.clone());
-        let subscriber = tracing_subscriber::registry().with(layer);
-        let guard = tracing::subscriber::set_default(subscriber);
+        let capturing = crate::test_capture::start();
         super::record(super::Record {
             store: &store,
             run_id: "r1",
@@ -1102,9 +1143,8 @@ mod checkpoint_event_tests {
         })
         .await
         .expect("the checkpoint to be written");
-        drop(guard);
 
-        let raw = String::from_utf8(buf.0.lock().expect("buffer mutex").clone()).expect("utf-8");
+        let raw = capturing.text();
         raw.lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("one JSON object"))
             .find(|record| record["kind"] == "checkpoint")
@@ -1113,20 +1153,9 @@ mod checkpoint_event_tests {
 
     /// Every record a scope emitted, in order.
     async fn events_of<F: Future<Output = ()>>(work: F) -> Vec<serde_json::Value> {
-        use tracing_subscriber::layer::SubscriberExt as _;
-        let _collecting = COLLECTING.lock().await;
-        let buf = Buffer::default();
-        let layer = tracing_subscriber::fmt::layer()
-            .json()
-            .flatten_event(true)
-            .with_current_span(false)
-            .with_span_list(true)
-            .with_writer(buf.clone());
-        let subscriber = tracing_subscriber::registry().with(layer);
-        let guard = tracing::subscriber::set_default(subscriber);
+        let capturing = crate::test_capture::start();
         work.await;
-        drop(guard);
-        let raw = String::from_utf8(buf.0.lock().expect("buffer mutex").clone()).expect("utf-8");
+        let raw = capturing.text();
         raw.lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("one JSON object"))
             .collect()
