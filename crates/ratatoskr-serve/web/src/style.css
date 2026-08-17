@@ -940,6 +940,19 @@ body {
 .react-flow__edge.is-live .react-flow__edge-path {
   stroke: var(--tint, var(--live));
 }
+/* The edge that was just traversed: a dash pulse travelling the path's direction, in the hue the
+   edge already carries. Kept after `.is-live` so a loop that is both keeps its live hue while the
+   dashes move; the motion, not a colour, is what says "this just happened" — a colour would fight
+   the per-node hues that answer "who". */
+.react-flow__edge.is-traversed .react-flow__edge-path {
+  stroke-dasharray: 6 4;
+  animation: edge-traversed 700ms linear infinite;
+}
+@keyframes edge-traversed {
+  to {
+    stroke-dashoffset: -10;
+  }
+}
 .react-flow__edge-text {
   fill: var(--muted);
   font-family: var(--mono);

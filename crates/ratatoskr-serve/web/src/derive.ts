@@ -232,6 +232,95 @@ type Attempts<A extends Tracked> = ReturnType<typeof attempts<A>>;
  *   is still one state per member, and #285 is where that is resolved.
  * - **the count** is the box's own rows, so a converge iteration is one, not one per member.
  */
+/**
+ * Span parentage and ownership, shared by every fold that resolves callers.
+ *
+ * One implementation, because two folds keeping their own copies of these rules is how they would
+ * come to disagree about one stream. Parentage from EVERY record that names both ids — including
+ * host and exchange lifecycle records, which node loops never reach — because a nested node's
+ * chain to its caller runs THROUGH the host call that drove it. Ownership ONLY from a
+ * `node_start`: any other record's `node` labels the row it produced, not the execution that
+ * opened the span it rides on — a box's aggregate lands on its host call's span, a
+ * clarification's row on the exchange span. The walk is hop-capped because parentage is
+ * producer-supplied data, and a cycle in it must cost a bounded walk rather than hang the render.
+ */
+function spanIndex() {
+  const parent = new Map<string, string>();
+  const box = new Map<string, string>();
+  return {
+    /** Capture what this record proves. First mention wins for both maps: a producer states an
+     *  execution's parentage when it opens it, and a later record contradicting it is not
+     *  evidence the tree changed. */
+    note(e: BoxedEvent | LiveEvent): void {
+      if (e.span_id && e.parent_span_id && !parent.has(e.span_id)) {
+        parent.set(e.span_id, e.parent_span_id);
+      }
+      if (e.kind === "node_start" && e.span_id && e.node && !box.has(e.span_id)) {
+        box.set(e.span_id, e.node);
+      }
+    },
+    /** The box owning the nearest node-execution span at or above `from`; `undefined` when the
+     *  chain reaches the run itself, or data this view never saw. */
+    owner(from: string | undefined): string | undefined {
+      let span = from;
+      for (let hop = 0; span !== undefined && hop < 64; hop += 1) {
+        const found = box.get(span);
+        if (found !== undefined) return found;
+        span = parent.get(span);
+      }
+      return undefined;
+    },
+  };
+}
+
+/** One traversal of the graph: the box that just became active, and what handed off to it. */
+export interface Transition {
+  /** `null` for the run's very first start, which nothing handed off to. */
+  from: string | null;
+  to: string;
+  at: string;
+}
+
+/**
+ * Every hand-off the stream shows, in order — the last one at or before the cursor is the edge
+ * that just lit.
+ *
+ * A transition is a box BECOMING active: a `node_start` for a box that is not already the active
+ * one. Member churn inside a box is not a transition — the box was active throughout — and a box
+ * is over when its OWN record lands, which is what lets the converge self-loop read as
+ * implementer → implementer rather than nothing.
+ *
+ * `from` is provenance first and adjacency last: the invocation's STATED caller, else the box its
+ * parentage resolves to, else the box most recently settled — the least wrong claim available,
+ * exactly as the trailing columns' ordering is — else whatever was active. A resolution to the
+ * box itself is internal structure and falls through to the fallbacks, which is also what draws
+ * the self-loop.
+ */
+export function transitions(events: readonly BoxedEvent[]): Transition[] {
+  const index = spanIndex();
+  const out: Transition[] = [];
+  let active: string | null = null;
+  let settled: string | null = null;
+  for (const e of events) {
+    index.note(e);
+    if (!e.node) continue;
+    if (e.kind === "node_start" && e.node !== active) {
+      const resolved = e.caller ?? index.owner(e.parent_span_id ?? undefined);
+      const from = (resolved !== e.node ? resolved : undefined) ?? settled ?? active;
+      out.push({ from, to: e.node, at: e.at });
+      active = e.node;
+      continue;
+    }
+    // The box's own record, not a member's: a member finishing mid-box — the classifier before
+    // the author — must not read as the box ending, or the author's start invents a self-loop.
+    if (e.kind === "checkpoint" && (e.member ?? e.node) === e.node) {
+      settled = e.node;
+      if (active === e.node) active = null;
+    }
+  }
+  return out;
+}
+
 export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, DerivedNode> {
   /**
    * One invocation of one member: what it ran on, what it spent, and whether it is still going.
@@ -333,17 +422,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
    * an attempt that never ended, and a box with no aggregate of its own works forever.
    */
   const endedEarly = new Map<string, string | undefined>();
-  /**
-   * Span parentage and ownership, for resolving which box an execution ran inside.
-   *
-   * Parentage from EVERY record that names both ids — including host lifecycle records, which the
-   * node loop below never reaches — because a nested node's chain to its caller runs THROUGH the
-   * host call that drove it: answerer turn → ask host call → the asking node's turn. Ownership
-   * only for spans a node-attributed record opened; a host span belongs to no box and is exactly
-   * what the walk steps over.
-   */
-  const spanParent = new Map<string, string>();
-  const spanBox = new Map<string, string>();
+  const index = spanIndex();
 
   const make = (span: string, live: boolean, started: boolean): Attempt => ({
     span,
@@ -388,20 +467,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     filed(member, e, member.for(e, span, (live) => make(span, live, false)));
 
   for (const e of events) {
-    // First mention wins for both maps: a producer states an execution's parentage when it opens
-    // it, and a later record contradicting it is not evidence the tree changed.
-    if (e.span_id && e.parent_span_id && !spanParent.has(e.span_id)) {
-      spanParent.set(e.span_id, e.parent_span_id);
-    }
-    // Ownership only from a node execution ANNOUNCING itself. Any other record's `node` labels
-    // the row it produced, not the execution that opened the span it rides on: a box's aggregate
-    // is written on its host call's span, and a clarification's row on the exchange span —
-    // reading those as ownership resolved an answerer's caller to a "clarification" box instead
-    // of THROUGH the exchange to the node that asked. A span whose start scrolled away resolves
-    // no owner, which errs toward silence and a trailing column.
-    if (e.kind === "node_start" && e.span_id && e.node && !spanBox.has(e.span_id)) {
-      spanBox.set(e.span_id, e.node);
-    }
+    index.note(e);
     // An execution's own end, which names no node. It closes the invocation it names wherever that
     // is — the only thing that can, for an invocation that writes no checkpoint.
     if (e.kind === "span_end" && e.span_id) {
@@ -584,13 +650,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
         // honestly reaches no box, and reading that as a root VOTE against the statement would
         // refuse the one anchor the producer went out of its way to assert. Conflicts between
         // statements — or between a statement and another invocation's walk — still refuse.
-        let owner: string | undefined = a.stated;
-        let span = owner === undefined ? a.parent : undefined;
-        for (let hop = 0; span !== undefined && hop < 64; hop += 1) {
-          owner = spanBox.get(span);
-          if (owner !== undefined) break;
-          span = spanParent.get(span);
-        }
+        const owner = a.stated ?? index.owner(a.parent);
         // Nested under this box's own turn: internal structure, saying nothing about who called
         // the box — the only outcome that abstains.
         if (owner === name) continue;

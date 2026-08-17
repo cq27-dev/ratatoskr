@@ -41,6 +41,7 @@ import {
 } from "./layout";
 import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode, SessionScope } from "../api";
 import {
+  type Transition,
   forkHandoff,
   handoffDrawn,
   skippedSpans,
@@ -671,6 +672,13 @@ interface Props {
    * can also produce.
    */
   handoff: boolean | null;
+  /**
+   * The edge that was just traversed — the last hand-off at or before the shown position — or
+   * `null` before anything has. Which edge lights is decided here by matching endpoints, so the
+   * pulse lands on whatever the pair is drawn as: a stage edge, a caller drop, the converge
+   * self-loop, or a back-loop.
+   */
+  transition: Transition | null;
   selected: string | null;
   /** `null` clears the selection, which returns the lower pane to the combined feed. */
   onSelect: (name: string | null) => void;
@@ -681,6 +689,7 @@ export default function PipelineGraph({
   live,
   loops,
   handoff,
+  transition,
   selected,
   onSelect,
 }: Props) {
@@ -982,8 +991,24 @@ export default function PipelineGraph({
     }
     // Not clickable, and not focusable by tab: an edge here states a relation between two nodes and
     // has nothing to show when you pick it. See the note in `ConvergeEdge` on the hit path.
-    return edges.map((e) => ({ ...e, selectable: false, focusable: false, interactionWidth: 0 }));
-  }, [byName, columns, extent, loops, nodes, spineList, handoff, branches, placed]);
+    //
+    // The traversed edge is tagged by its ENDPOINTS, not by kind: the last hand-off lights
+    // whatever the pair is drawn as — a stage edge, a caller drop, the converge self-loop
+    // (from === to), or a back-loop. Composed onto whatever class the edge already carries,
+    // for the same reason the loops compose `is-live`.
+    return edges.map((e) => {
+      const traversed =
+        transition !== null && e.source === transition.from && e.target === transition.to;
+      const className = [e.className, traversed ? "is-traversed" : ""].filter(Boolean).join(" ");
+      return {
+        ...e,
+        selectable: false,
+        focusable: false,
+        interactionWidth: 0,
+        ...(className ? { className } : {}),
+      };
+    });
+  }, [byName, columns, extent, loops, nodes, spineList, handoff, branches, placed, transition]);
 
   /*
    * React Flow is a controlled component: it owns node measurement and writes the result back

@@ -12,6 +12,7 @@ import {
   nodesFromEvents,
   skippedSpans,
   stagesOf,
+  transitions,
   workingNodeNames,
 } from "./derive";
 
@@ -2275,4 +2276,90 @@ test("a branch hangs only off a parent that holds a column of its own", () => {
   expect(branchParent(byName.get("stray"), byName)).toBeNull();
   // A placed node never branches, whatever it carries.
   expect(branchParent(byName.get("implementer"), byName)).toBeNull();
+});
+
+test("the last transition at any prefix is the edge that just lit", () => {
+  // A fold of the shown prefix, so scrubbing is free: back before a hand-off, it has not happened.
+  const stages = registry(["analyst"], ["implementer"]);
+  const events = inNodeBoxes(
+    [start("analyst"), checkpointed("analyst"), start("implementer")],
+    stages,
+  );
+
+  expect(transitions(events.slice(0, 0))).toEqual([]);
+  expect(transitions(events.slice(0, 1)).at(-1)).toEqual({
+    from: null,
+    to: "analyst",
+    at: events[0].at,
+  });
+  // The checkpoint alone changes nothing — a box ending is not a traversal.
+  expect(transitions(events.slice(0, 2)).at(-1).to).toBe("analyst");
+  expect(transitions(events).at(-1)).toEqual({
+    from: "analyst",
+    to: "implementer",
+    at: events[2].at,
+  });
+});
+
+test("the converge self-loop reads as implementer to implementer", () => {
+  const stages = registry(["implementer"]);
+  const events = inNodeBoxes(
+    [start("implementer"), checkpointed("implementer"), start("implementer")],
+    stages,
+  );
+  expect(transitions(events).at(-1)).toEqual({
+    from: "implementer",
+    to: "implementer",
+    at: events[2].at,
+  });
+});
+
+test("member churn inside a box is not a transition", () => {
+  // The classifier finishing while the author starts is the box working, not the graph moving —
+  // a member's checkpoint must not end the box, or the author's start invents a self-loop.
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const events = inNodeBoxes(
+    [
+      start("redteam_classifier"),
+      checkpointed("redteam_classifier"),
+      start("redteam_author"),
+    ],
+    stages,
+  );
+  const seen = transitions(events);
+  expect(seen).toHaveLength(1);
+  expect(seen[0].to).toBe("redteam");
+});
+
+test("a transition's from is provenance before adjacency", () => {
+  const stages = registry(["implementer"], ["verifier"], ["referee"], ["analyst"], ["helper"]);
+
+  // Stated: the referee starts while the verifier was the last box settled, and the statement
+  // names the implementer — the edge that lights is the caller drop, not verifier adjacency.
+  const host = "00000000000000e1";
+  const stated = inNodeBoxes(
+    [
+      start("verifier"),
+      checkpointed("verifier"),
+      { at: "t0", kind: "span_start", span_id: host, parent_span_id: "00000000000000ff", execution: "host", execution_name: "iterate" },
+      { ...attemptStart("referee", "00000000000000e2", "opus"), parent_span_id: host, caller: "implementer" },
+    ],
+    stages,
+  );
+  expect(transitions(stated).at(-1)).toMatchObject({ from: "implementer", to: "referee" });
+
+  // Walked: an answerer resolves the asker through the exchange, whatever settled before it.
+  const asking = "00000000000000e3";
+  const exchange = "00000000000000e4";
+  const walked = inNodeBoxes(
+    [
+      start("verifier"),
+      checkpointed("verifier"),
+      attemptStart("analyst", asking, "opus"),
+      { at: "t1", kind: "span_start", span_id: exchange, parent_span_id: asking, execution: "clarification", execution_name: "clarify" },
+      { ...attemptStart("helper", "00000000000000e5", "haiku"), parent_span_id: exchange },
+    ],
+    stages,
+  );
+  expect(transitions(walked).at(-1)).toMatchObject({ from: "analyst", to: "helper" });
 });
