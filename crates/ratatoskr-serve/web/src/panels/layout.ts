@@ -164,11 +164,14 @@ export function branchPlace(
   heightOf: (node: NodeView) => number = nodeHeight,
 ): Map<string, Bounds> {
   const out = new Map<string, Bounds>();
-  const stacked = new Map<string, number>();
+  // Stacked per COLUMN, not per parent: two parents in different lanes of one stage share an x,
+  // so their children share a column too — keyed by caller, both first children landed on the
+  // same coordinates and drew on top of each other.
+  const stacked = new Map<number, number>();
   for (const child of children) {
     const parent = child.caller ? parentBounds(child.caller) : undefined;
-    if (!parent || !child.caller) continue;
-    const below = stacked.get(child.caller) ?? 0;
+    if (!parent) continue;
+    const below = stacked.get(parent.x) ?? 0;
     const height = heightOf(child);
     out.set(child.name, {
       x: parent.x + BRANCH_INDENT,
@@ -176,9 +179,39 @@ export function branchPlace(
       width: NODE_SIZE.width,
       height,
     });
-    stacked.set(child.caller, below + height + LANE_GAP);
+    stacked.set(parent.x, below + height + LANE_GAP);
   }
   return out;
+}
+
+/**
+ * The spine: every node not anchored to a parent, with the trailing columns re-numbered compactly.
+ *
+ * `place` keys a column's x off `node.stage`, so an anchored node leaving its trailing column
+ * would otherwise leave a full column's width of empty viewport where it used to be. Only the
+ * SYNTHETIC stages are renumbered — a trailing column is the client's own ordering — and a
+ * declared stage is never touched: a shape's columns are the graph the workflow asked for,
+ * including any hole it chose to leave.
+ */
+export function spineNodes(
+  nodes: readonly NodeView[],
+  anchored: ReadonlySet<string>,
+): NodeView[] {
+  const kept = nodes.filter((n) => !anchored.has(n.name));
+  const base = kept.reduce(
+    (max, n) => (n.shaped !== false ? Math.max(max, n.stage + 1) : max),
+    0,
+  );
+  const restaged = new Map(
+    kept
+      .filter((n) => n.shaped === false)
+      .sort((a, b) => a.stage - b.stage)
+      .map((n, i) => [n.name, base + i] as const),
+  );
+  return kept.map((n) => {
+    const stage = restaged.get(n.name);
+    return stage === undefined || stage === n.stage ? n : { ...n, stage };
+  });
 }
 
 /**

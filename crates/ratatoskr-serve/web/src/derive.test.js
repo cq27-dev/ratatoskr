@@ -2135,20 +2135,30 @@ test("an unplaced node carries the stream's caller, and the server's stands wher
     // own resolution produced.
     { name: "helper", state: "done", checkpoints: 1, stage: 5, lane: 0, shaped: false, caller: "scout" },
   ];
-  // The stream watched THIS run's parentage, so its answer outranks the mirrored call site.
+  // The stream watched THIS run's parentage, so its answer outranks the mirrored call site —
+  // where the account is complete.
   const seen = [
     attemptStart("analyst", "00000000000000a5", "opus"),
     { ...attemptStart("helper", "00000000000000b5", "haiku"), parent_span_id: "00000000000000a5" },
   ];
-  const view = applyDerived(shape, nodesFromEvents(inNodeBoxes(seen, stages)));
+  const view = applyDerived(shape, nodesFromEvents(inNodeBoxes(seen, stages)), null, true);
   expect(view.find((n) => n.name === "helper").caller).toBe("analyst");
+
+  // An INCOMPLETE account resolves no stream caller: the resolution rests on every invocation of
+  // the box agreeing, and a bounded tail may have dropped an earlier one from a different caller —
+  // its agreement proves nothing. The server's answer is from the durable record and stands.
+  const bounded = applyDerived(shape, nodesFromEvents(inNodeBoxes(seen, stages)), null, false);
+  expect(bounded.find((n) => n.name === "helper").caller).toBe("scout");
+  // And incomplete is what an unstated window is.
+  const unstated = applyDerived(shape, nodesFromEvents(inNodeBoxes(seen, stages)));
+  expect(unstated.find((n) => n.name === "helper").caller).toBe("scout");
 
   // No parentage in the stream: the server's answer is the only one and stands.
   const silent = [
     attemptStart("analyst", "00000000000000a6", "opus"),
     attemptStart("helper", "00000000000000b6", "haiku"),
   ];
-  const kept = applyDerived(shape, nodesFromEvents(inNodeBoxes(silent, stages)));
+  const kept = applyDerived(shape, nodesFromEvents(inNodeBoxes(silent, stages)), null, true);
   expect(kept.find((n) => n.name === "helper").caller).toBe("scout");
 });
 

@@ -26,6 +26,7 @@ import {
   crowdLimit,
   place,
   rowExtent,
+  spineNodes,
   LOOP_BAND,
   SPAN_BAND,
   SPAN_RADIUS,
@@ -654,10 +655,10 @@ export default function PipelineGraph({
     () => nodes.filter((n) => branchParent(n, byName) !== null),
     [nodes, byName],
   );
-  const columns = useMemo(() => {
-    const anchored = new Set(branches.map((n) => n.name));
-    return stages(nodes.filter((n) => !anchored.has(n.name)));
-  }, [nodes, branches]);
+  const columns = useMemo(
+    () => stages(spineNodes(nodes, new Set(branches.map((n) => n.name)))),
+    [nodes, branches],
+  );
 
   /*
    * Where the boxes go, computed once and read by everything that hangs off them — the boxes

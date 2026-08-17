@@ -18,6 +18,7 @@ import {
   rowExtent,
   spanRiser,
   spanShelf,
+  spineNodes,
   tallestNeighbours,
 } from "./panels/layout";
 import { carryMeasurement } from "./panels/PipelineGraph";
@@ -382,4 +383,50 @@ test("a branch child hangs under the loop band, indented off its parent's column
   // The indent keeps a child inside its own column's reach: it must end before the next column's
   // indent begins, for the pitch this layout produces.
   expect(BRANCH_INDENT + NODE_SIZE.width).toBeLessThan(COLUMN_PITCH + BRANCH_INDENT);
+});
+
+test("children of two parents sharing a column stack instead of overlapping", () => {
+  // Two parents in different lanes of one stage share an x, so their children share a column too.
+  // Keyed by caller, both first children landed on the same coordinates and drew on top of each
+  // other; the stack is per column.
+  const x = 3 * COLUMN_PITCH;
+  const upper = { x, y: 0, width: NODE_SIZE.width, height: NODE_SIZE.height };
+  const lower = { x, y: LANE_PITCH, width: NODE_SIZE.width, height: NODE_SIZE.height };
+  const child = (name, caller) => ({ name, state: "done", checkpoints: 1, stage: 6, lane: 0, shaped: false, caller });
+
+  const boxes = branchPlace(
+    [child("a", "redteam"), child("b", "implementer")],
+    (name) => (name === "redteam" ? upper : name === "implementer" ? lower : undefined),
+    2 * NODE_SIZE.height + LANE_GAP,
+  );
+  expect(boxes.get("a").x).toBe(boxes.get("b").x);
+  expect(boxes.get("b").y).toBe(boxes.get("a").y + boxes.get("a").height + LANE_GAP);
+});
+
+test("an anchored node's vacated trailing column closes, and declared stages never move", () => {
+  // `place` keys a column's x off `node.stage`, so a branch leaving its trailing column would
+  // otherwise leave a column of empty viewport where it used to be. Only the synthetic stages are
+  // renumbered — a declared layout keeps its columns exactly, including any hole it chose.
+  const declared = (name, stage) => ({ name, state: "done", checkpoints: 1, stage, lane: 0 });
+  const trailing = (name, stage, caller) => ({
+    name, state: "done", checkpoints: 1, stage, lane: 0, shaped: false,
+    ...(caller ? { caller } : {}),
+  });
+  const nodes = [
+    declared("analyst", 0),
+    declared("implementer", 2),
+    trailing("referee", 3, "implementer"),
+    trailing("stray", 4),
+  ];
+
+  const spine = spineNodes(nodes, new Set(["referee"]));
+  expect(spine.map((n) => n.name)).toEqual(["analyst", "implementer", "stray"]);
+  // The stray moves into the column the referee vacated.
+  expect(spine.find((n) => n.name === "stray").stage).toBe(3);
+  // Declared stages are untouched, hole at stage 1 included.
+  expect(spine.find((n) => n.name === "analyst").stage).toBe(0);
+  expect(spine.find((n) => n.name === "implementer").stage).toBe(2);
+  // Nothing anchored: every node keeps exactly the stage it arrived with.
+  const kept = spineNodes(nodes, new Set());
+  expect(kept.map((n) => n.stage)).toEqual([0, 2, 3, 4]);
 });

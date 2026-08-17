@@ -1086,6 +1086,13 @@ export function applyDerived(
   shape: readonly NodeView[],
   derived: Map<string, DerivedNode>,
   ended: RunStatus | null = null,
+  // Whether the events behind `derived` are a complete account from the run's beginning — the
+  // same fact `contiguous` answers for the hand-off. The stream's caller resolution rests on
+  // having seen EVERY invocation of a box: a bounded tail may hide an earlier invocation from a
+  // different caller, so its agreement proves nothing and no stream caller is read from it. The
+  // server's `caller` is resolved from the durable record and stands either way. Defaulting to
+  // incomplete errs toward a trailing column, which is honest; an anchor is an assertion.
+  complete: boolean = false,
 ): NodeView[] {
   // Which node a failed run died in, when the record names one.
   //
@@ -1123,8 +1130,11 @@ export function applyDerived(
   const extra = order.map((name, i) => {
     // Who invoked it, with the stream's answer first: the stream watched THIS run's parentage,
     // while the server's `caller` mirrors a known call site — the referee — and covers nothing
-    // else. Where only one has an answer, that answer stands.
-    const caller = derived.get(name)?.caller ?? unplaced.get(name)?.caller;
+    // else. Where only one has an answer, that answer stands. The stream's answer only from a
+    // complete account: resolution rests on every invocation agreeing, and a window that may
+    // have dropped one proves nothing by the agreement of what remains.
+    const caller =
+      (complete ? derived.get(name)?.caller : undefined) ?? unplaced.get(name)?.caller;
     return {
       ...fromStream(unplaced.get(name) ?? unrun(name), derived.get(name), ended, name === died),
       stage: base + i,
