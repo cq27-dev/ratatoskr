@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 
 import {
   applyDerived,
+  branchParent,
   convergeLoops,
   forkHandoff,
   contiguous,
@@ -363,6 +364,19 @@ test("no forward edge is drawn from a shaped column into an appended node", () =
 // chain stays.
 test("an appended node still hands off to the next appended node", () => {
   expect(handoffDrawn(appended("transform", 0), appended("publish_docs", 1))).toBe(true);
+});
+
+test("an appended node that names its caller receives no adjacency edge", () => {
+  // The chain is the least wrong claim available only where nothing better exists. In a dynamic
+  // chain X -> A -> B where A anchored under X and B stayed trailing, the closed-up columns make
+  // X and B neighbours — and the chain edge then asserts X -> B beside caller edges that say
+  // otherwise. A target with a caller takes exactly one in-edge: the caller's.
+  const called = { ...appended("aide", 1), caller: "helper" };
+  expect(handoffDrawn(appended("helper", 0), called)).toBe(false);
+  expect(handoffDrawn(placed("analyst", 0), called)).toBe(false);
+  // The caller-bearing node still hands off DOWN the chain, where the next node has no better
+  // claim of its own.
+  expect(handoffDrawn(called, appended("scribe", 2))).toBe(true);
 });
 
 test("a declared layout's own hand-offs are drawn in full", () => {
@@ -2068,4 +2082,197 @@ test("a view scrubbed to inside the history is complete whatever the buffer hold
   expect(contiguous(history, gapped, null)).toBe(false);
   // No history means even an early position sits in a bounded tail, not a complete account.
   expect(contiguous(null, gapped, "t5")).toBe(false);
+});
+
+test("a nested node resolves its caller through the host call that drove it", () => {
+  // The chain to a caller runs THROUGH spans no box owns: an answerer's turn hangs off the ask
+  // host call, whose parent is the asking node's own turn. The walk steps over the host span and
+  // anchors the box to the nearest span another box's execution opened.
+  const stages = registry(["analyst"], ["helper"]);
+  const asking = "00000000000000a1";
+  const ask = "00000000000000b1";
+  const events = [
+    attemptStart("analyst", asking, "opus"),
+    { at: "t1", kind: "span_start", span_id: ask, parent_span_id: asking, execution: "host", execution_name: "ask" },
+    { ...attemptStart("helper", "00000000000000c1", "haiku"), parent_span_id: ask },
+  ];
+  const boxes = nodesFromEvents(inNodeBoxes(events, stages));
+  expect(boxes.get("helper").caller).toBe("analyst");
+  // The asking node itself is driven by nothing the stream shows.
+  expect(boxes.get("analyst").caller).toBeUndefined();
+});
+
+test("a node driven by the run itself resolves no caller", () => {
+  // A run-driven invocation that STATES nothing: its parent is an operation host the run drove,
+  // and above that host there is no box. The stream honestly has no anchor, and nothing here
+  // invents one.
+  const stages = registry(["referee"]);
+  const host = "00000000000000b2";
+  const events = [
+    { at: "t0", kind: "span_start", span_id: host, parent_span_id: "00000000000000ff", execution: "host", execution_name: "iterate" },
+    { ...attemptStart("referee", "00000000000000c2", "opus"), parent_span_id: host },
+  ];
+  expect(nodesFromEvents(inNodeBoxes(events, stages)).get("referee").caller).toBeUndefined();
+});
+
+test("a stated caller anchors a run-driven invocation from its first record", () => {
+  // The referee: invoked by the converge host, which no box owns, yet judging exactly the
+  // implementer's latest checkpoint — so the producer STATES the caller on the node_start, and
+  // the box anchors from the first moment of the turn. Waiting for the checkpoint's mirrored
+  // caller left the flagship case in a trailing column for its entire model turn — the one
+  // stretch of time the placement exists to show.
+  const stages = registry(["implementer"], ["referee"]);
+  const host = "00000000000000b9";
+  const live = [
+    attemptStart("implementer", "00000000000000a9", "opus"),
+    { at: "t0", kind: "span_start", span_id: host, parent_span_id: "00000000000000ff", execution: "host", execution_name: "iterate" },
+    { ...attemptStart("referee", "00000000000000c9", "opus"), parent_span_id: host, caller: "implementer" },
+  ];
+  const derived = nodesFromEvents(inNodeBoxes(live, stages));
+  expect(derived.get("referee").caller).toBe("implementer");
+
+  // And it reaches the row before any server row exists: mid-turn the shape has no referee, and
+  // the anchor must not wait for the checkpoint that ends the turn.
+  const view = applyDerived([composed("implementer", "working")], derived, null, true);
+  expect(view.find((n) => n.name === "referee").caller).toBe("implementer");
+
+  // A statement is a resolution like any other: two invocations stating different callers fit
+  // two histories, and anchor the box to neither.
+  const conflicted = [
+    ...live,
+    { ...attemptStart("referee", "00000000000000d9", "opus"), parent_span_id: host, caller: "analyst" },
+  ];
+  expect(nodesFromEvents(inNodeBoxes(conflicted, stages)).get("referee").caller).toBeNull();
+});
+
+test("two invocations that resolve different callers anchor the box to neither", () => {
+  // One box holds one place in the graph. An anchor that fits two histories asserts neither, so
+  // a node invoked from two different boxes keeps its trailing column. The refusal is `null`,
+  // not absence: it is evidence, and a durable record must not re-anchor what it contradicts.
+  const stages = registry(["analyst"], ["scout"], ["helper"]);
+  const events = [
+    attemptStart("analyst", "00000000000000a3", "opus"),
+    attemptStart("scout", "00000000000000b3", "opus"),
+    { ...attemptStart("helper", "00000000000000c3", "haiku"), parent_span_id: "00000000000000a3" },
+    { ...attemptStart("helper", "00000000000000d3", "haiku"), parent_span_id: "00000000000000b3" },
+  ];
+  expect(nodesFromEvents(inNodeBoxes(events, stages)).get("helper").caller).toBeNull();
+
+  // And the refusal holds through `applyDerived`: a persisted caller — an imported run's referee
+  // row, say — must not re-anchor a box whose complete history refused the anchor. Silence lets
+  // the server's answer stand; a refusal does not.
+  const shape = [
+    composed("analyst", "done"),
+    { name: "helper", state: "done", checkpoints: 2, stage: 5, lane: 0, shaped: false, caller: "scout" },
+  ];
+  const view = applyDerived(shape, nodesFromEvents(inNodeBoxes(events, stages)), null, true);
+  expect(view.find((n) => n.name === "helper").caller).toBeUndefined();
+});
+
+test("an answerer resolves the asker through the exchange, not the exchange's row label", () => {
+  // `NodeClarifier::answer` opens an exchange execution inside the asking node's turn, runs the
+  // answerer as its child, and writes the exchange's row — node: "clarification" — on the
+  // EXCHANGE span. A row's label names what was produced, not the execution that opened the span
+  // it rides on: reading it as ownership resolved the answerer's caller to a "clarification"
+  // box — a two-level dynamic chain the anchor rules rightly refuse — leaving the advertised
+  // answerer case in the trailing column this resolution exists to remove.
+  const stages = registry(["analyst"], ["helper"], ["clarification"]);
+  const asker = attemptStart("analyst", "00000000000000a8", "opus");
+  const exchange = {
+    at: "t1",
+    kind: "span_start",
+    span_id: "00000000000000b8",
+    parent_span_id: "00000000000000a8",
+    execution: "clarification",
+    execution_name: "clarify",
+  };
+  const answerer = { ...attemptStart("helper", "00000000000000c8", "haiku"), parent_span_id: "00000000000000b8" };
+  const row = attemptCheckpoint("clarification", "00000000000000b8", 5);
+
+  // The row may land before or after the answerer's start; neither order may claim the span.
+  for (const events of [[asker, exchange, answerer, row], [asker, exchange, row, answerer]]) {
+    expect(nodesFromEvents(inNodeBoxes(events, stages)).get("helper").caller).toBe("analyst");
+  }
+});
+
+test("a workflow-driven invocation beside a nested one anchors the box to neither", () => {
+  // One invocation nested under `analyst`, one driven by the run itself — its parent chain
+  // reaches no box. The box's history fits two placements, under the caller and in its own
+  // trailing column, and a root resolution is a vote exactly as a concrete caller is: silently
+  // dropping it moved the box under a caller that only sometimes called it.
+  const stages = registry(["analyst"], ["helper"]);
+  const nested = { ...attemptStart("helper", "00000000000000b7", "haiku"), parent_span_id: "00000000000000a7" };
+  const op = { at: "t0", kind: "span_start", span_id: "00000000000000c7", parent_span_id: "00000000000000ee", execution: "host", execution_name: "helperOp" };
+  const driven = { ...attemptStart("helper", "00000000000000d7", "haiku"), parent_span_id: "00000000000000c7" };
+  const asker = attemptStart("analyst", "00000000000000a7", "opus");
+
+  // Either order: the conflict is about the history, not about which arrived last. And it is a
+  // REFUSAL (`null`), not silence — the durable fallback must not undo it.
+  for (const events of [[asker, nested, op, driven], [asker, op, driven, nested]]) {
+    expect(nodesFromEvents(inNodeBoxes(events, stages)).get("helper").caller).toBeNull();
+  }
+});
+
+test("a cycle in producer parentage costs a bounded walk and anchors nothing", () => {
+  // Parentage is producer-supplied data. Two spans naming each other as parent must cost a capped
+  // walk rather than hang the render, and prove no caller.
+  const stages = registry(["helper"]);
+  const events = [
+    { at: "t0", kind: "span_start", span_id: "00000000000000a4", parent_span_id: "00000000000000b4", execution: "host", execution_name: "x" },
+    { at: "t0", kind: "span_start", span_id: "00000000000000b4", parent_span_id: "00000000000000a4", execution: "host", execution_name: "y" },
+    { ...attemptStart("helper", "00000000000000c4", "haiku"), parent_span_id: "00000000000000a4" },
+  ];
+  expect(nodesFromEvents(inNodeBoxes(events, stages)).get("helper").caller).toBeUndefined();
+});
+
+test("an unplaced node carries the stream's caller, and the server's stands where the stream is silent", () => {
+  const stages = registry(["analyst"], ["helper"]);
+  const shape = [
+    composed("analyst", "done"),
+    // The server placed `helper` from its checkpoint in a trailing column, with the caller its
+    // own resolution produced.
+    { name: "helper", state: "done", checkpoints: 1, stage: 5, lane: 0, shaped: false, caller: "scout" },
+  ];
+  // The stream watched THIS run's parentage, so its answer outranks the mirrored call site —
+  // where the account is complete.
+  const seen = [
+    attemptStart("analyst", "00000000000000a5", "opus"),
+    { ...attemptStart("helper", "00000000000000b5", "haiku"), parent_span_id: "00000000000000a5" },
+  ];
+  const view = applyDerived(shape, nodesFromEvents(inNodeBoxes(seen, stages)), null, true);
+  expect(view.find((n) => n.name === "helper").caller).toBe("analyst");
+
+  // An INCOMPLETE account resolves no stream caller: the resolution rests on every invocation of
+  // the box agreeing, and a bounded tail may have dropped an earlier one from a different caller —
+  // its agreement proves nothing. The server's answer is from the durable record and stands.
+  const bounded = applyDerived(shape, nodesFromEvents(inNodeBoxes(seen, stages)), null, false);
+  expect(bounded.find((n) => n.name === "helper").caller).toBe("scout");
+  // And incomplete is what an unstated window is.
+  const unstated = applyDerived(shape, nodesFromEvents(inNodeBoxes(seen, stages)));
+  expect(unstated.find((n) => n.name === "helper").caller).toBe("scout");
+
+  // No parentage in the stream: the server's answer is the only one and stands.
+  const silent = [
+    attemptStart("analyst", "00000000000000a6", "opus"),
+    attemptStart("helper", "00000000000000b6", "haiku"),
+  ];
+  const kept = applyDerived(shape, nodesFromEvents(inNodeBoxes(silent, stages)), null, true);
+  expect(kept.find((n) => n.name === "helper").caller).toBe("scout");
+});
+
+test("a branch hangs only off a parent that holds a column of its own", () => {
+  const byName = new Map([
+    ["implementer", { name: "implementer", state: "done", checkpoints: 1, stage: 3, lane: 1 }],
+    ["referee", { name: "referee", state: "done", checkpoints: 1, stage: 6, lane: 0, shaped: false, caller: "implementer" }],
+    ["meta", { name: "meta", state: "done", checkpoints: 1, stage: 7, lane: 0, shaped: false, caller: "referee" }],
+    ["stray", { name: "stray", state: "done", checkpoints: 0, stage: 8, lane: 0, shaped: false, caller: "gone" }],
+  ]);
+  expect(branchParent(byName.get("referee"), byName)).toBe("implementer");
+  // One level deep: a dynamic node called by another dynamic node keeps its trailing column,
+  // because hanging it off a box that itself moved is an assertion the walk cannot stand behind.
+  expect(branchParent(byName.get("meta"), byName)).toBeNull();
+  // A caller with no box anchors nothing.
+  expect(branchParent(byName.get("stray"), byName)).toBeNull();
+  // A placed node never branches, whatever it carries.
+  expect(branchParent(byName.get("implementer"), byName)).toBeNull();
 });

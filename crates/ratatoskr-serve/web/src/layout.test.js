@@ -1,21 +1,30 @@
 import { expect, test } from "bun:test";
 
 import {
+  BRANCH_DROP,
+  BRANCH_TAP,
   COLUMN_GAP,
   COLUMN_PITCH,
   LANE_GAP,
   LANE_PITCH,
   NODE_SIZE,
   LOOP_BAND,
+  LOOP_SHELF_STEP,
   SPAN_BAND,
   SPAN_RADIUS,
+  anchoredBranches,
+  branchPlace,
   crowdLimit,
   fittedBounds,
   place,
+  regionBands,
   rowExtent,
   spanRiser,
   spanShelf,
+  spineNodes,
   tallestNeighbours,
+  tapSide,
+  wiredToSpine,
 } from "./panels/layout";
 import { carryMeasurement } from "./panels/PipelineGraph";
 
@@ -352,4 +361,223 @@ test("finding the pair costs what the boxes cost", () => {
   const started = performance.now();
   expect(tallestNeighbours(tall)).toBe(2 * NODE_SIZE.height);
   expect(performance.now() - started).toBeLessThan(60);
+});
+
+
+
+test("an anchored node's vacated trailing column closes, and declared stages never move", () => {
+  // `place` keys a column's x off `node.stage`, so a branch leaving its trailing column would
+  // otherwise leave a column of empty viewport where it used to be. Only the synthetic stages are
+  // renumbered — a declared layout keeps its columns exactly, including any hole it chose.
+  const declared = (name, stage) => ({ name, state: "done", checkpoints: 1, stage, lane: 0 });
+  const trailing = (name, stage, caller) => ({
+    name, state: "done", checkpoints: 1, stage, lane: 0, shaped: false,
+    ...(caller ? { caller } : {}),
+  });
+  const nodes = [
+    declared("analyst", 0),
+    declared("implementer", 2),
+    trailing("referee", 3, "implementer"),
+    trailing("stray", 4),
+  ];
+
+  const spine = spineNodes(nodes, new Set(["referee"]));
+  expect(spine.map((n) => n.name)).toEqual(["analyst", "implementer", "stray"]);
+  // The stray moves into the column the referee vacated.
+  expect(spine.find((n) => n.name === "stray").stage).toBe(3);
+  // Declared stages are untouched, hole at stage 1 included.
+  expect(spine.find((n) => n.name === "analyst").stage).toBe(0);
+  expect(spine.find((n) => n.name === "implementer").stage).toBe(2);
+  // Nothing anchored: every node keeps exactly the stage it arrived with.
+  const kept = spineNodes(nodes, new Set());
+  expect(kept.map((n) => n.stage)).toEqual([0, 2, 3, 4]);
+});
+
+
+
+
+test("a branch child hangs directly below its parent, under the loop band", () => {
+  // Directly below, because the caller edge is a straight vertical between the two branch taps.
+  // Below the band, because the space beside a parent belongs to the spine and the shelves are
+  // placed off the spine's extent. A child whose parent has no box is left to the caller.
+  const parent = { x: 3 * COLUMN_PITCH, y: LANE_PITCH, width: NODE_SIZE.width, height: NODE_SIZE.height };
+  const child = (name, caller) => ({ name, state: "done", checkpoints: 1, stage: 6, lane: 0, shaped: false, caller });
+  const rowBottom = 2 * NODE_SIZE.height + LANE_GAP;
+
+  const boxes = branchPlace(
+    [child("referee", "implementer"), child("stray", "gone")],
+    (name) => (name === "implementer" ? parent : undefined),
+    rowBottom,
+  );
+  expect(boxes.get("referee")).toEqual({
+    x: parent.x,
+    y: rowBottom + LOOP_BAND + BRANCH_DROP,
+    ...NODE_SIZE,
+  });
+  expect(boxes.has("stray")).toBe(false);
+});
+
+test("the branch tap clears every wire its own column draws", () => {
+  // The drop runs at BRANCH_TAP of the box width, inside the column: the gaps carry the back-loop
+  // shelves, so any vertical there necessarily crosses them. Within the column the wires are the
+  // converge self-loop — reaching width/4 either side of the bottom centre — and the loop handles
+  // at the centre itself. The tap must sit strictly between the box corner and the self-loop's
+  // left edge, with a corner's clearance from each.
+  const tap = BRANCH_TAP * NODE_SIZE.width;
+  const selfLoopLeft = NODE_SIZE.width / 2 - NODE_SIZE.width / 4;
+  expect(tap).toBeGreaterThanOrEqual(SPAN_RADIUS);
+  expect(selfLoopLeft - tap).toBeGreaterThanOrEqual(SPAN_RADIUS);
+});
+
+test("only a column's deepest lane anchors, and only one child per parent", () => {
+  // The caller edge is a straight drop from the parent's bottom: a box below the parent would be
+  // crossed by it, and a second child would sit below the first with its drop running through it.
+  // What these gates refuse keeps its trailing column, which always draws clean.
+  const declared = (name, stage, lane) => ({ name, state: "done", checkpoints: 1, stage, lane });
+  const trailing = (name, stage, caller) => ({
+    name, state: "done", checkpoints: 1, stage, lane: 0, shaped: false,
+    ...(caller ? { caller } : {}),
+  });
+
+  // The flagship shape: the implementer is its column's deepest lane, the referee anchors.
+  const standard = [
+    declared("redteam", 3, 0),
+    declared("implementer", 3, 1),
+    trailing("referee", 6, "implementer"),
+  ];
+  expect(anchoredBranches(standard)).toEqual(new Set(["referee"]));
+
+  // A child of the UPPER lane is refused — the drop would cross the implementer's box.
+  const upper = [
+    declared("redteam", 3, 0),
+    declared("implementer", 3, 1),
+    trailing("aide", 6, "redteam"),
+  ];
+  expect(anchoredBranches(upper)).toEqual(new Set());
+
+  // A second child of one parent is refused; the first (in list order) anchors.
+  const two = [
+    declared("implementer", 3, 0),
+    trailing("referee", 6, "implementer"),
+    trailing("second", 7, "implementer"),
+  ];
+  expect(anchoredBranches(two)).toEqual(new Set(["referee"]));
+
+  // A trailing parent is its column's deepest trivially.
+  const chainRoot = [
+    declared("analyst", 0, 0),
+    trailing("helper", 5),
+    trailing("aide", 6, "helper"),
+  ];
+  expect(anchoredBranches(chainRoot)).toEqual(new Set(["aide"]));
+});
+
+test("the vertical regions are owned: ordered, disjoint, and every class stays home", () => {
+  // The region model exists so a new wiring class collides in a failing test instead of a review
+  // round: spans above the row, boxes and stage edges in it, loop shelves below, branch children
+  // below that. Verticals may CROSS a band — the branch drop crosses the loop band — but
+  // horizontal runs and boxes stay inside their own region.
+  const rowTop = 0;
+  const rowBottom = 3 * LANE_PITCH - LANE_GAP;
+  const r = regionBands(rowTop, rowBottom);
+
+  expect(r.spans.bottom).toBeLessThanOrEqual(r.row.top);
+  expect(r.row.bottom).toBeLessThanOrEqual(r.loops.top);
+  expect(r.loops.bottom).toBeLessThanOrEqual(r.branches.top);
+
+  // Span shelves live in the span band, whatever the span count.
+  for (const count of [1, 4, 64]) {
+    for (let i = 0; i < count; i += 1) {
+      const y = spanShelf(i, count, rowTop);
+      expect(y).toBeGreaterThanOrEqual(r.spans.top);
+      expect(y).toBeLessThan(r.spans.bottom);
+    }
+  }
+
+  // The three loop shelves live in the loop band, and the converge self-loop's drop below a
+  // bottom-lane box stays inside it too.
+  for (const step of [1, 2, 3]) {
+    const y = rowBottom + step * LOOP_SHELF_STEP;
+    expect(y).toBeGreaterThan(r.loops.top);
+    expect(y).toBeLessThanOrEqual(r.loops.bottom);
+  }
+  expect(LANE_GAP / 2).toBeLessThanOrEqual(LOOP_BAND);
+
+  // Branch children start below the loop band.
+  const parent = { x: 0, y: rowBottom - NODE_SIZE.height, width: NODE_SIZE.width, height: NODE_SIZE.height };
+  const child = { name: "c", state: "done", checkpoints: 1, stage: 5, lane: 0, shaped: false, caller: "p" };
+  const box = branchPlace([child], () => parent, rowBottom).get("c");
+  expect(box.y).toBeGreaterThanOrEqual(r.branches.top);
+});
+
+test("branch eligibility costs what the candidates cost, not their square", () => {
+  // Candidates are the imported-history shape nothing bounds. The deepest-lane check used to
+  // sweep the whole node list per candidate, which froze the render for most of a second at a
+  // ten-thousand-child fan-out before React Flow drew anything. Bounded generously — the
+  // quadratic form measured ~800ms here against single-digit milliseconds for the indexed one.
+  const nodes = [{ name: "parent", state: "done", checkpoints: 1, stage: 0, lane: 0 }];
+  for (let i = 0; i < 10_000; i += 1) {
+    nodes.push({
+      name: `child-${i}`, state: "done", checkpoints: 1, stage: 1 + i, lane: 0,
+      shaped: false, caller: "parent",
+    });
+  }
+  const started = performance.now();
+  const anchored = anchoredBranches(nodes);
+  expect(performance.now() - started).toBeLessThan(100);
+  // One child per parent: the fan-out anchors exactly one and the rest keep trailing columns.
+  expect(anchored.size).toBe(1);
+});
+
+test("a loop participant stays on the spine, however good its caller looks", () => {
+  // The loop edges and the fork hand-off route against spine handles and the spine's extent: a
+  // back-loop lands on its target's BOTTOM handle from a shelf above it, so a target anchored
+  // below the band would be entered straight through its own box. Anchoring moves only children;
+  // the pin is on the candidate.
+  const present = new Set(["implementer", "verifier", "analyst", "redteam"]);
+  const has = (name) => present.has(name);
+
+  expect(wiredToSpine({ retry: 1, fix: 0, replan: 0 }, has)).toEqual(
+    new Set(["implementer", "redteam"]),
+  );
+  expect(wiredToSpine({ retry: 0, fix: 1, replan: 0 }, has)).toEqual(
+    new Set(["implementer", "verifier", "redteam"]),
+  );
+  expect(wiredToSpine({ retry: 0, fix: 0, replan: 2 }, has)).toEqual(
+    new Set(["verifier", "analyst", "implementer", "redteam"]),
+  );
+  // No loops and no fork pair: nothing pinned.
+  expect(wiredToSpine({ retry: 0, fix: 0, replan: 0 }, () => false)).toEqual(new Set());
+
+  // And the pin holds through eligibility: an unplaced analyst with a clean caller keeps its
+  // trailing column while a replan loop addresses it.
+  const nodes = [
+    { name: "verifier", state: "done", checkpoints: 1, stage: 0, lane: 0 },
+    { name: "analyst", state: "done", checkpoints: 1, stage: 5, lane: 0, shaped: false, caller: "verifier" },
+  ];
+  expect(anchoredBranches(nodes, new Set(["analyst"]))).toEqual(new Set());
+  expect(anchoredBranches(nodes)).toEqual(new Set(["analyst"]));
+});
+
+test("the tap drops away from the side a loop shelf arrives on", () => {
+  // A shelf ends at its target's bottom centre and arrives from its other endpoint's side — a
+  // verifier LEFT of the implementer runs the fix shelf across the left tap. Approached from
+  // both sides, or neither, the left tap stands: with both crossed there is nothing to duck.
+  const center = 500;
+  expect(tapSide(center, [])).toBe("left");
+  expect(tapSide(center, [900])).toBe("left");
+  expect(tapSide(center, [100])).toBe("right");
+  expect(tapSide(center, [100, 900])).toBe("left");
+});
+
+test("both taps clear the self-loop's reach and their box corner", () => {
+  // The right tap mirrors the left, and both must sit strictly between a corner and the converge
+  // self-loop's reach with a corner's clearance from each — a declared layout may put the
+  // approaching shelf on either side, so both sides have to be as clear as the one tap was.
+  for (const tap of [BRANCH_TAP * NODE_SIZE.width, (1 - BRANCH_TAP) * NODE_SIZE.width]) {
+    const fromCorner = Math.min(tap, NODE_SIZE.width - tap);
+    const fromSelfLoop = Math.abs(tap - NODE_SIZE.width / 2) - NODE_SIZE.width / 4;
+    expect(fromCorner).toBeGreaterThanOrEqual(SPAN_RADIUS);
+    expect(fromSelfLoop).toBeGreaterThanOrEqual(SPAN_RADIUS);
+  }
 });

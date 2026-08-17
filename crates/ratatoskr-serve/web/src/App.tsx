@@ -416,6 +416,18 @@ export default function App() {
   const derived = useMemo(() => nodesFromEvents(boxedShown), [boxedShown]);
 
   /**
+   * Whether the shown prefix is a complete account from the run's beginning.
+   *
+   * One computation for everything that spends absence as evidence: the hand-off edge, and the
+   * stream's caller anchoring — both rest on "this view saw everything", and two copies of that
+   * judgement is how they would come to disagree about one window.
+   */
+  const complete = useMemo(
+    () => contiguous(history, events, shownAt),
+    [history, events, shownAt],
+  );
+
+  /**
    * Every node's box, rebuilt from the stream rather than read from the store.
    *
    * The store holds each node's LATEST row, so at any point but the end it answers a different
@@ -441,8 +453,8 @@ export default function App() {
     // is not a pipeline node, so the derivation is legitimately empty; falling back to the store
     // there showed every node finished, with its final counts, at step one of the run.
     if (!shownEvents.length) return detail.nodes;
-    return applyDerived(detail.nodes, derived, ended);
-  }, [detail, shownEvents, derived, ended, loading]);
+    return applyDerived(detail.nodes, derived, ended, complete);
+  }, [detail, shownEvents, derived, ended, loading, complete]);
 
   /**
    * Which nodes are working right now — what stop and steer can be aimed at.
@@ -527,8 +539,8 @@ export default function App() {
   // or before the history's last means the replay overlapped it and nothing fell between. Both
   // broken states self-heal, since the next history read advances its end past the replay's start.
   const handoff = useMemo(
-    () => (contiguous(history, events, shownAt) ? handoffEvidence(boxedShown) : null),
-    [boxedShown, history, events, shownAt],
+    () => (complete ? handoffEvidence(boxedShown) : null),
+    [boxedShown, complete],
   );
 
   /*

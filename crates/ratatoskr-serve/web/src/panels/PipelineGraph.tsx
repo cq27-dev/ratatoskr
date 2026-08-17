@@ -22,9 +22,15 @@ import {
   LANE_GAP,
   LOOP_SHELF_STEP,
   NODE_SIZE,
+  BRANCH_TAP,
+  anchoredBranches,
+  tapSide,
+  wiredToSpine,
+  branchPlace,
   crowdLimit,
   place,
   rowExtent,
+  spineNodes,
   LOOP_BAND,
   SPAN_BAND,
   SPAN_RADIUS,
@@ -288,6 +294,40 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
         <NodeFacts telemetry={node.telemetry} live={data.live} planned={node.planned} />
       )}
       <Handle type="source" id="out" position={Position.Right} isConnectable={false} />
+      {/* The branch taps: where a caller edge drops out of a parent and into the child hung below
+          it — a straight vertical, so the offsets on the two boxes must match. Off-centre and
+          inside the column, because the gaps carry the loop shelves and the bottom centre carries
+          the loop handles; outside the converge self-loop's reach on either side. Both sides
+          exist statically — `tapSide` picks per parent, away from any loop shelf ending at its
+          column, since a declared layout may order its stages either way. */}
+      <Handle
+        type="source"
+        id="branch-out-left"
+        position={Position.Bottom}
+        style={{ left: `${BRANCH_TAP * 100}%` }}
+        isConnectable={false}
+      />
+      <Handle
+        type="target"
+        id="branch-in-left"
+        position={Position.Top}
+        style={{ left: `${BRANCH_TAP * 100}%` }}
+        isConnectable={false}
+      />
+      <Handle
+        type="source"
+        id="branch-out-right"
+        position={Position.Bottom}
+        style={{ left: `${(1 - BRANCH_TAP) * 100}%` }}
+        isConnectable={false}
+      />
+      <Handle
+        type="target"
+        id="branch-in-right"
+        position={Position.Top}
+        style={{ left: `${(1 - BRANCH_TAP) * 100}%` }}
+        isConnectable={false}
+      />
       <Handle type="target" id="loop-in" position={Position.Bottom} isConnectable={false} />
       <Handle type="source" id="loop-out" position={Position.Bottom} isConnectable={false} />
     </div>
@@ -480,23 +520,31 @@ function FitToPane({
   const width = useStore((s) => s.width);
   const height = useStore((s) => s.height);
   /*
-   * How deep the graph reaches, read from the nodes React Flow has actually committed.
+   * The rectangle the committed nodes occupy, read from what React Flow has actually laid out.
    *
-   * A box growing changes neither the node count nor the pane size, so without this nothing refits
-   * and the taller graph stays fitted to the bounds it had before. Taken from the store rather than
-   * from the layout the component just computed, because that number changes a render EARLIER than
-   * the nodes do: fitting on it would fit the old boxes, and by the time the new ones land nothing
-   * has changed to fit again.
+   * A box growing or MOVING changes neither the node count nor the pane size, so without this
+   * nothing refits and the graph stays fitted to the bounds it had before. Both axes: a node
+   * leaving a trailing column for a caller branch — or switching branch columns as replay
+   * completeness changes — moves horizontally with the count, the depth and the reserved bands
+   * all unchanged, and tracking depth alone left the graph zoomed for a column that no longer
+   * exists. Taken from the store rather than from the layout the component just computed, because
+   * that changes a render EARLIER than the nodes do: fitting on it would fit the old boxes, and
+   * by the time the new ones land nothing has changed to fit again. One string, so the selector
+   * compares equal when nothing moved.
    */
-  const depth = useStore((s) => {
+  const bounds = useStore((s) => {
     let top = Infinity;
     let bottom = -Infinity;
+    let left = Infinity;
+    let right = -Infinity;
     for (const node of s.nodeLookup.values()) {
-      const y = node.internals.positionAbsolute.y;
+      const { x, y } = node.internals.positionAbsolute;
       top = Math.min(top, y);
       bottom = Math.max(bottom, y + (node.measured.height ?? 0));
+      left = Math.min(left, x);
+      right = Math.max(right, x + (node.measured.width ?? 0));
     }
-    return bottom > top ? bottom - top : 0;
+    return bottom > top ? `${left}:${right}:${top}:${bottom}` : "";
   });
   useEffect(() => {
     if (moved || !initialized || count === 0 || width === 0 || height === 0) return;
@@ -518,7 +566,7 @@ function FitToPane({
   }, [
     initialized,
     count,
-    depth,
+    bounds,
     width,
     height,
     moved,
@@ -641,36 +689,63 @@ export default function PipelineGraph({
    * Deriving any of them from a second source is how the loop came to glow green while a different
    * node worked, and how a failed run's dead node went on reading "working".
    */
-  const columns = useMemo(() => stages(nodes), [nodes]);
   const byName = useMemo(() => new Map(nodes.map((n) => [n.name, n])), [nodes]);
+  /*
+   * Nodes the stream proved were invoked from inside another hang off their caller's box instead
+   * of holding trailing columns — the spine's stage/lane math never sees them, so a run with no
+   * dynamic nodes lays out exactly as before. Which nodes qualify is `branchParent`'s caller rule
+   * plus `anchoredBranches`' geometric gates; all that is decided here is geometry.
+   */
+  const anchoredSet = useMemo(
+    () => anchoredBranches(nodes, wiredToSpine(loops, (name) => byName.has(name))),
+    [nodes, loops, byName],
+  );
+  const branches = useMemo(
+    () => nodes.filter((n) => anchoredSet.has(n.name)),
+    [nodes, anchoredSet],
+  );
+  // The spine list itself, not only its columns: everything that reasons about drawn columns —
+  // the stage fans, the skipped-span jumps — must read THIS list. Deriving a jump from the
+  // original `nodes` sees an anchored child still holding the trailing column it vacated, and
+  // draws a span from some earlier stage to a box that is no longer in any column.
+  const spineList = useMemo(() => spineNodes(nodes, anchoredSet), [nodes, anchoredSet]);
+  const columns = useMemo(() => stages(spineList), [spineList]);
 
   /*
    * Where the boxes go, computed once and read by everything that hangs off them — the boxes
    * themselves, the shelves above and below, and the rectangle the view fits. Two derivations of
    * one layout is how a shelf comes to hang off a row the boxes are no longer on.
+   *
+   * The extent is the SPINE's: the shelves hug the row, and branch boxes hang below them — an
+   * extent that included the branches would push every shelf under the boxes they annotate.
    */
-  const placed = useMemo(() => place(columns), [columns]);
-  const extent = useMemo(() => rowExtent(placed.values()), [placed]);
+  const spine = useMemo(() => place(columns), [columns]);
+  const extent = useMemo(() => rowExtent(spine.values()), [spine]);
+  const placed = useMemo(() => {
+    const all = new Map(spine);
+    for (const [name, box] of branchPlace(branches, (name) => spine.get(name), extent.bottom)) {
+      all.set(name, box);
+    }
+    return all;
+  }, [spine, branches, extent]);
   // How far a scrubbed box may grow before it covers the one under it. Off the placement, since
   // that is what says which boxes are neighbours and how tall they are.
   const crowd = useMemo(() => crowdLimit(tallestNeighbours(placed.values())), [placed]);
 
   const desiredNodes = useMemo<PipelineNodeType[]>(() => {
-    return columns.flatMap((lanes) =>
-      lanes.map((n) => {
-        const box = placed.get(n.name) ?? { x: 0, y: 0, ...NODE_SIZE };
-        return {
-          id: n.name,
-          type: "pipeline" as const,
-          position: { x: box.x, y: box.y },
-          data: { node: n, live: live.get(n.name), isSelected: selected === n.name },
-          draggable: false,
-          width: box.width,
-          height: box.height,
-        };
-      }),
-    );
-  }, [columns, placed, live, selected]);
+    return [...columns.flatMap((lanes) => lanes), ...branches].map((n) => {
+      const box = placed.get(n.name) ?? { x: 0, y: 0, ...NODE_SIZE };
+      return {
+        id: n.name,
+        type: "pipeline" as const,
+        position: { x: box.x, y: box.y },
+        data: { node: n, live: live.get(n.name), isSelected: selected === n.name },
+        draggable: false,
+        width: box.width,
+        height: box.height,
+      };
+    });
+  }, [columns, branches, placed, live, selected]);
 
   const desiredEdges = useMemo<Edge[]>(() => {
     // Every node in a stage feeds every node in the next one — which is what a fork joining back
@@ -695,17 +770,62 @@ export default function PipelineGraph({
     );
 
     /*
-     * The one in-edge an appended node can prove. The server resolves `caller` only where the
-     * record names the invocation rather than adjacency suggesting it — today the referee, which
-     * judges the implementer checkpoint fetched immediately before it — so where it is present it
-     * is the hand-off the columns above deliberately do not draw. Drawn like any other forward
-     * edge, and skipped when the caller has no box or the pair is already joined.
+     * The one in-edge an appended node can prove: its resolved caller. An ANCHORED child hangs
+     * directly below its parent, and its edge is a straight vertical between the two branch
+     * taps — inside the column, left of the converge self-loop's reach, so it crosses none of
+     * the column's own loop wiring and no stage edge, which all live in the gaps. A
+     * trailing-column target with a caller keeps the ordinary forward edge: it sits in a column
+     * of its own.
      */
+    // Which side each parent's tap drops on: away from any loop shelf ending at its column. A
+    // declared layout may order its stages either way, and a shelf arrives from its other
+    // endpoint's side — a verifier LEFT of the implementer runs the fix shelf across the left
+    // tap. The self-loop reaches both sides symmetrically and both taps clear it by construction.
+    const approaches = new Map<string, number[]>();
+    const approach = (name: string, other: string) => {
+      const from = placed.get(other);
+      if (!from) return;
+      const xs = approaches.get(name);
+      const x = from.x + from.width / 2;
+      if (xs) xs.push(x);
+      else approaches.set(name, [x]);
+    };
+    if (loops.fix > 0) {
+      approach("implementer", "verifier");
+      approach("verifier", "implementer");
+    }
+    if (loops.replan > 0) {
+      approach("analyst", "verifier");
+      approach("verifier", "analyst");
+    }
+    // Indexed once — scanning the whole list per caller edge is quadratic in a fan-out, and an
+    // imported history does not bound how many dynamic nodes one run may call.
+    const ids = new Set(edges.map((e) => e.id));
     for (const target of nodes) {
       const source = target.shaped === false && target.caller ? byName.get(target.caller) : undefined;
       if (!source) continue;
-      const edge = forward(source, target);
-      if (!edges.some((e) => e.id === edge.id)) edges.push(edge);
+      let edge: Edge;
+      if (anchoredSet.has(target.name)) {
+        const box = placed.get(source.name);
+        const side = tapSide(
+          (box?.x ?? 0) + (box?.width ?? NODE_SIZE.width) / 2,
+          approaches.get(source.name) ?? [],
+        );
+        edge = {
+          id: `${source.name}-${target.name}`,
+          source: source.name,
+          target: target.name,
+          sourceHandle: `branch-out-${side}`,
+          targetHandle: `branch-in-${side}`,
+          type: "straight",
+        };
+      } else {
+        edge = forward(source, target);
+      }
+      if (!ids.has(edge.id)) {
+        ids.add(edge.id);
+        edges.push(edge);
+      }
     }
 
     /*
@@ -771,7 +891,7 @@ export default function PipelineGraph({
      * A band of the same depth the loop shelves occupy below the row, divided by the number of
      * spans, is bounded whatever a workflow declares and separates them whenever there is room.
      */
-    const spans = skippedSpans(nodes);
+    const spans = skippedSpans(spineList);
     const band = new Map<number, NodeView[]>();
     for (const lanes of columns) if (lanes[0]) band.set(lanes[0].stage, lanes);
     /*
@@ -863,7 +983,7 @@ export default function PipelineGraph({
     // Not clickable, and not focusable by tab: an edge here states a relation between two nodes and
     // has nothing to show when you pick it. See the note in `ConvergeEdge` on the hit path.
     return edges.map((e) => ({ ...e, selectable: false, focusable: false, interactionWidth: 0 }));
-  }, [byName, columns, extent, loops, nodes, handoff]);
+  }, [byName, columns, extent, loops, nodes, spineList, handoff, branches, placed]);
 
   /*
    * React Flow is a controlled component: it owns node measurement and writes the result back
@@ -925,8 +1045,15 @@ export default function PipelineGraph({
         // below were riding on `fitView`'s padding, and reserving only the span band above took
         // that padding away from them.
         reserveTop={rfEdges.some((e) => e.type === "span") ? SPAN_BAND : 0}
+        // The union of the shelves and the boxes, not the band below the deepest node: the loop
+        // shelves reach LOOP_BAND below the SPINE, and a branch box hangs deeper than that
+        // already — reserving the whole band under it fitted a second, empty band beneath the
+        // branch. Only the part of the band the boxes do not cover is reserved; with no branch
+        // the two bottoms coincide and this is exactly LOOP_BAND.
         reserveBottom={
-          rfEdges.some((e) => e.type === "backloop" || e.type === "converge") ? LOOP_BAND : 0
+          rfEdges.some((e) => e.type === "backloop" || e.type === "converge")
+            ? Math.max(0, extent.bottom + LOOP_BAND - rowExtent(placed.values()).bottom)
+            : 0
         }
         moved={moved.current}
       />

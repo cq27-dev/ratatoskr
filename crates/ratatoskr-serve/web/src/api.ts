@@ -299,6 +299,13 @@ export interface LiveEvent {
   detail: string;
   /** Present on a `question` event: what an answer is posted against. */
   question_id?: string;
+  /**
+   * The box whose work this invocation is FOR, stated by its caller on a `node_start`.
+   *
+   * Producer provenance for an invocation whose parentage cannot say it — a run-driven judgement
+   * like the referee, invoked by an operation host no box owns.
+   */
+  caller?: string;
   /** An optional producer-provided summary for a tool call. */
   subject?: string;
   /** The bounded JSON arguments supplied to a tool call. */
