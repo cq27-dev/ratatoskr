@@ -513,7 +513,7 @@ export default function App() {
   );
 
   // Whether the stream shows the red-team hand-off, so the edge asserting it can read evidence
-  // rather than inferring from box state — but only where the timeline is a CONTINUOUS account
+  // rather than inferring from box state — but only where the SHOWN prefix is a complete account
   // from the run's beginning. Two ways it is not, and both make absence meaningless:
   //
   // - no history at all: this view holds the bounded replay tail, and a record may have scrolled
@@ -521,12 +521,14 @@ export default function App() {
   // - a reconnect gap: `onReset` clears the live buffer while the history re-read is throttled, so
   //   stale history is joined to a fresh bounded tail and the slice between them is missing.
   //
-  // Continuity is verified, not assumed: the live buffer's first event at or before the history's
-  // last means the replay overlapped it and nothing fell between. Both states self-heal — the next
-  // history read advances its end past the replay's start.
+  // Completeness is a property of the prefix, not the whole timeline: a gap sits after the
+  // history's end, so a scrub position inside the history shows nothing the gap could have
+  // swallowed, and only a position past it needs the join verified — the buffer's first event at
+  // or before the history's last means the replay overlapped it and nothing fell between. Both
+  // broken states self-heal, since the next history read advances its end past the replay's start.
   const handoff = useMemo(
-    () => (contiguous(history, events) ? handoffEvidence(boxedShown) : null),
-    [boxedShown, history, events],
+    () => (contiguous(history, events, shownAt) ? handoffEvidence(boxedShown) : null),
+    [boxedShown, history, events, shownAt],
   );
 
   /*

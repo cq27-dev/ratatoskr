@@ -2028,24 +2028,44 @@ test("a reconnect gap is not a complete account", () => {
   const history = [ev("t1"), ev("t2"), ev("t3")];
 
   // The replay overlaps history: nothing fell between.
-  expect(contiguous(history, [ev("t3"), ev("t4")])).toBe(true);
+  expect(contiguous(history, [ev("t3"), ev("t4")], null)).toBe(true);
   // An empty buffer has nothing after history to miss.
-  expect(contiguous(history, [])).toBe(true);
+  expect(contiguous(history, [], null)).toBe(true);
   // The replay begins after history ends: the slice between is missing, and the account is not
   // complete — evidence read from it would prove absences it cannot.
-  expect(contiguous(history, [ev("t5")])).toBe(false);
+  expect(contiguous(history, [ev("t5")], null)).toBe(false);
   // No history at all is the bounded tail.
-  expect(contiguous(null, [ev("t1")])).toBe(false);
-  expect(contiguous([], [])).toBe(false);
+  expect(contiguous(null, [ev("t1")], null)).toBe(false);
+  expect(contiguous([], [], null)).toBe(false);
 
   // The replay preserves `question*` events AHEAD of its bounded tail, however old — a run blocked
   // on a human must show its question — so a preserved question's timestamp says nothing about
   // where the tail begins. Reading it as the buffer's start claimed continuity across a missing
   // slice, and an absence in that slice suppressed a hand-off the run made.
   const question = { at: "t2", kind: "question", node: null, detail: "which way?" };
-  expect(contiguous(history, [question, ev("t5")])).toBe(false);
+  expect(contiguous(history, [question, ev("t5")], null)).toBe(false);
   // While a tail that genuinely overlaps still proves itself past the preserved front.
-  expect(contiguous(history, [question, ev("t3"), ev("t5")])).toBe(true);
+  expect(contiguous(history, [question, ev("t3"), ev("t5")], null)).toBe(true);
   // A buffer of preserved questions alone has no tail to miss anything.
-  expect(contiguous(history, [question])).toBe(true);
+  expect(contiguous(history, [question], null)).toBe(true);
+});
+
+test("a view scrubbed to inside the history is complete whatever the buffer holds", () => {
+  // A reconnect gap sits AFTER the history's end, so a scrub position at or before it shows
+  // nothing the gap could have swallowed — the history is one read from the run's beginning.
+  // Judging the whole timeline instead of the shown prefix turned that definite view into a
+  // fallback, and the fallback drew a hand-off the composed stages never made.
+  const ev = (at) => ({ at, kind: "model_text", node: "analyst", detail: "…" });
+  const history = [ev("t1"), ev("t2"), ev("t3")];
+  const gapped = [ev("t5")];
+
+  // Scrubbed to inside (or exactly to the end of) the history: complete despite the gap after it.
+  expect(contiguous(history, gapped, "t2")).toBe(true);
+  expect(contiguous(history, gapped, "t3")).toBe(true);
+  // Scrubbed past the history's end, the view includes the join — and the join is broken.
+  expect(contiguous(history, gapped, "t5")).toBe(false);
+  // The live end is the same question as a position past the history.
+  expect(contiguous(history, gapped, null)).toBe(false);
+  // No history means even an early position sits in a bounded tail, not a complete account.
+  expect(contiguous(null, gapped, "t5")).toBe(false);
 });

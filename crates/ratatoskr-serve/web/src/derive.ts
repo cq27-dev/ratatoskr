@@ -649,20 +649,25 @@ function fold(into: NodeTelemetry, next: NodeTelemetry): NodeTelemetry {
  * stop inferring from.
  */
 /**
- * Whether a live buffer joins a loaded history with nothing missing between them.
+ * Whether the view ending at `shownAt` is a complete account from the run's beginning.
  *
- * The buffer's first event at or before the history's last means the bounded replay overlapped
- * what history already covers, so no slice fell between the two. Not a given: a reconnect clears
- * the buffer while the history re-read is throttled, and joining stale history to a fresh tail
- * leaves a gap that reads as a complete account — an absence in the gap then proves things it
- * cannot. Both states self-heal, since the next history read advances its end past the replay's
- * start.
+ * The history is one read from the run's start, so a view that ends inside it — `shownAt` at or
+ * before its last event — is complete no matter what the live buffer holds: a reconnect gap sits
+ * AFTER everything such a view shows, and scrubbing back past the gap must not turn a definite
+ * answer into a fallback. Only a view that extends into the buffer (`shownAt` past the history, or
+ * `null` for the live end) needs the join checked: the buffer's first event at or before the
+ * history's last means the bounded replay overlapped what history covers and no slice fell
+ * between. Not a given — a reconnect clears the buffer while the history re-read is throttled, and
+ * joining stale history to a fresh tail leaves a gap that reads as a complete account. Both states
+ * self-heal, since the next history read advances its end past the replay's start.
  */
 export function contiguous(
   history: readonly LiveEvent[] | null,
   buffer: readonly LiveEvent[],
+  shownAt: string | null,
 ): boolean {
   if (!history?.length) return false;
+  if (shownAt !== null && shownAt <= history[history.length - 1]!.at) return true;
   // The overlap is the TAIL's, and the replay's front is not the tail's front: `trim_replay`
   // preserves `question*` events ahead of the bounded tail — a run blocked on a human must show
   // its question however old — so a preserved question's timestamp proves nothing about where the
