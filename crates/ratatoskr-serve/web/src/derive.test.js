@@ -2504,3 +2504,45 @@ test("a checkpoint-free box completes at its boundary, in either order", () => {
     expect(seen.at(-1).to).toBe("characterizer");
   }
 });
+
+test("a box reports what each member stage is doing, correct at any scrub position", () => {
+  // The red team mid-run: the classifier finished, the author is writing tests. The box shows one
+  // state; which member is where is this map, from the same fold, so it tracks the scrubber.
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const events = inNodeBoxes(
+    [
+      start("redteam_classifier"),
+      checkpointed("redteam_classifier"),
+      start("redteam_author"),
+    ],
+    stages,
+  );
+
+  const mid = nodesFromEvents(events.slice(0, 2)).get("redteam").memberStates;
+  expect(mid.get("redteam_classifier")).toBe("done");
+  expect(mid.has("redteam_author")).toBe(false);
+
+  const later = nodesFromEvents(events).get("redteam").memberStates;
+  expect(later.get("redteam_classifier")).toBe("done");
+  expect(later.get("redteam_author")).toBe("working");
+});
+
+test("the box's own aggregate is not a member state", () => {
+  // The aggregate row is the box, not a pip of itself — and a single-stage node has no member
+  // states at all, which is what keeps it looking as it does today.
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"], ["analyst"]);
+  const events = inNodeBoxes(
+    [
+      start("redteam_classifier"),
+      checkpointed("redteam_classifier"),
+      checkpointed("redteam"),
+      start("analyst"),
+      checkpointed("analyst"),
+    ],
+    stages,
+  );
+  const boxes = nodesFromEvents(events);
+  expect(boxes.get("redteam").memberStates.has("redteam")).toBe(false);
+  // The self-staged analyst's one member IS itself, so it reports no member states.
+  expect(boxes.get("analyst").memberStates).toBeUndefined();
+});

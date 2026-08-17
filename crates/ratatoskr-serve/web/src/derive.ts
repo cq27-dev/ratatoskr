@@ -53,6 +53,16 @@ export interface DerivedNode {
    */
   controllable: boolean;
   /**
+   * What each of this box's MEMBER stages is doing, keyed by stage id — the box's own aggregate
+   * excluded, since the box is not a pip of itself.
+   *
+   * From the same per-invocation bookkeeping the box state is folded from, which is what keeps a
+   * substage lighting at the point in the run where it actually ran and staying correct while
+   * scrubbing. Present only when a member has recorded; which stages a box is DECLARED to hold is
+   * the registry's answer, and a stage the shape never assigned to this box must not appear in it.
+   */
+  memberStates?: Map<string, NodeState>;
+  /**
    * The box whose execution this one's invocations ran INSIDE, when the stream shows one.
    *
    * Resolved by walking an invocation's span parentage outward to the nearest span some other
@@ -814,9 +824,18 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
         (into, next) => (into ? fold(into, next) : next),
         undefined,
       );
+    // What each MEMBER stage is doing, by the same rules its slice of the box state uses: working
+    // while any invocation of it is live, else whatever its current attempt reached. The box's
+    // own aggregate is the box, not a pip of itself.
+    const memberStates = new Map<string, NodeState>();
+    for (const [id, m] of box.members) {
+      if (id === name) continue;
+      memberStates.set(id, working(m) ? "working" : (current(m)?.state ?? "idle"));
+    }
     out.set(name, {
       state,
       checkpoints: box.checkpoints,
+      ...(memberStates.size ? { memberStates } : {}),
       ...(caller !== undefined ? { caller } : {}),
       ...(folded ? { telemetry: folded } : {}),
       cycles: members.reduce((n, m) => n + (current(m)?.cycles ?? 0), 0),

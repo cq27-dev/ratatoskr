@@ -26,7 +26,7 @@ import {
   tapSide,
   wiredToSpine,
 } from "./panels/layout";
-import { carryMeasurement, pulsedBox } from "./panels/PipelineGraph";
+import { carryMeasurement, pipStrip, pipsOf, pulsedBox } from "./panels/PipelineGraph";
 
 /**
  * The span geometry, over every shape a workflow may declare rather than the ones that happened to
@@ -593,4 +593,25 @@ test("the pulse falls back to the box when its pair has no drawn edge", () => {
   expect(pulsedBox({ from: "analyst", to: "implementer", at: "t" }, edges)).toBeNull();
   expect(pulsedBox({ from: "scout", to: "disputed", at: "t" }, edges)).toBe("disputed");
   expect(pulsedBox(null, edges)).toBeNull();
+});
+
+test("the pip strip never exceeds its cap, and the overflow tile takes the last slot", () => {
+  // The box must not grow with the stage count: NODE_SIZE is fixed and unmeasured, and the scrub
+  // magnification budget assumes neighbouring boxes can grow without covering each other.
+  const pips = (n) => Array.from({ length: n }, (_, i) => `s${i}`);
+  expect(pipStrip(pips(3), 6)).toEqual({ shown: ["s0", "s1", "s2"], more: 0 });
+  expect(pipStrip(pips(6), 6).more).toBe(0);
+  const capped = pipStrip(pips(9), 6);
+  expect(capped.shown).toHaveLength(5);
+  expect(capped.more).toBe(4);
+  expect(capped.shown.length + 1).toBeLessThanOrEqual(6);
+
+  // A box's pips: nothing for a single member, nothing where the stream is silent, idle where a
+  // declared member has not spoken, and never a stage the registry did not assign.
+  expect(pipsOf(["only"], new Map())).toEqual([]);
+  expect(pipsOf(["a", "b"], undefined)).toEqual([]);
+  expect(pipsOf(["a", "b"], new Map([["a", "done"]]))).toEqual([
+    { id: "a", state: "done" },
+    { id: "b", state: "idle" },
+  ]);
 });

@@ -867,6 +867,42 @@ body {
   }
 }
 
+/* Which of a composed box's stages is where, as fixed-footprint pips. The box must not grow with
+   the stage count — NODE_SIZE is fixed and unmeasured, and the scrub magnification budget assumes
+   it — so the strip caps and folds the rest into a +N tile (see PIP_CAP). The dots speak the
+   `.dot` vocabulary above: muted is not-yet, pulsing tint is running, foreground is done, hazard
+   is failed. Hover a pip for which stage it is; the side panel a click opens has the rest. */
+.node-pips {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+  margin-top: 3px;
+}
+.pip {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  background: var(--muted);
+}
+.pip--working {
+  background: var(--tint);
+  animation: pulse 1.1s steps(2, end) infinite;
+}
+.pip--done {
+  background: var(--fg);
+}
+.pip--failed {
+  background: var(--hazard);
+}
+.pip--more {
+  width: auto;
+  height: auto;
+  background: none;
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 6px;
+}
+
 .node-meta {
   margin-top: 5px;
   color: var(--muted);
