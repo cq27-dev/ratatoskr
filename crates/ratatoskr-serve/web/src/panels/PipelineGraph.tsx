@@ -24,6 +24,8 @@ import {
   NODE_SIZE,
   BRANCH_TAP,
   anchoredBranches,
+  tapSide,
+  wiredToSpine,
   branchPlace,
   crowdLimit,
   place,
@@ -292,23 +294,38 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
         <NodeFacts telemetry={node.telemetry} live={data.live} planned={node.planned} />
       )}
       <Handle type="source" id="out" position={Position.Right} isConnectable={false} />
-      {/* The branch tap: where a caller edge drops out of a parent and into the child hung below
-          it — a straight vertical, so the two offsets must match. Off-centre and inside the
-          column, because the gaps carry the loop shelves and the bottom centre carries the loop
-          handles; left of the converge self-loop's reach, so the drop crosses none of this
-          column's own wiring. See BRANCH_TAP. */}
+      {/* The branch taps: where a caller edge drops out of a parent and into the child hung below
+          it — a straight vertical, so the offsets on the two boxes must match. Off-centre and
+          inside the column, because the gaps carry the loop shelves and the bottom centre carries
+          the loop handles; outside the converge self-loop's reach on either side. Both sides
+          exist statically — `tapSide` picks per parent, away from any loop shelf ending at its
+          column, since a declared layout may order its stages either way. */}
       <Handle
         type="source"
-        id="branch-out"
+        id="branch-out-left"
         position={Position.Bottom}
         style={{ left: `${BRANCH_TAP * 100}%` }}
         isConnectable={false}
       />
       <Handle
         type="target"
-        id="branch-in"
+        id="branch-in-left"
         position={Position.Top}
         style={{ left: `${BRANCH_TAP * 100}%` }}
+        isConnectable={false}
+      />
+      <Handle
+        type="source"
+        id="branch-out-right"
+        position={Position.Bottom}
+        style={{ left: `${(1 - BRANCH_TAP) * 100}%` }}
+        isConnectable={false}
+      />
+      <Handle
+        type="target"
+        id="branch-in-right"
+        position={Position.Top}
+        style={{ left: `${(1 - BRANCH_TAP) * 100}%` }}
         isConnectable={false}
       />
       <Handle type="target" id="loop-in" position={Position.Bottom} isConnectable={false} />
@@ -679,7 +696,10 @@ export default function PipelineGraph({
    * dynamic nodes lays out exactly as before. Which nodes qualify is `branchParent`'s caller rule
    * plus `anchoredBranches`' geometric gates; all that is decided here is geometry.
    */
-  const anchoredSet = useMemo(() => anchoredBranches(nodes), [nodes]);
+  const anchoredSet = useMemo(
+    () => anchoredBranches(nodes, wiredToSpine(loops, (name) => byName.has(name))),
+    [nodes, loops, byName],
+  );
   const branches = useMemo(
     () => nodes.filter((n) => anchoredSet.has(n.name)),
     [nodes, anchoredSet],
@@ -757,22 +777,51 @@ export default function PipelineGraph({
      * trailing-column target with a caller keeps the ordinary forward edge: it sits in a column
      * of its own.
      */
+    // Which side each parent's tap drops on: away from any loop shelf ending at its column. A
+    // declared layout may order its stages either way, and a shelf arrives from its other
+    // endpoint's side — a verifier LEFT of the implementer runs the fix shelf across the left
+    // tap. The self-loop reaches both sides symmetrically and both taps clear it by construction.
+    const approaches = new Map<string, number[]>();
+    const approach = (name: string, other: string) => {
+      const from = placed.get(other);
+      if (!from) return;
+      const xs = approaches.get(name);
+      const x = from.x + from.width / 2;
+      if (xs) xs.push(x);
+      else approaches.set(name, [x]);
+    };
+    if (loops.fix > 0) {
+      approach("implementer", "verifier");
+      approach("verifier", "implementer");
+    }
+    if (loops.replan > 0) {
+      approach("analyst", "verifier");
+      approach("verifier", "analyst");
+    }
     // Indexed once — scanning the whole list per caller edge is quadratic in a fan-out, and an
     // imported history does not bound how many dynamic nodes one run may call.
     const ids = new Set(edges.map((e) => e.id));
     for (const target of nodes) {
       const source = target.shaped === false && target.caller ? byName.get(target.caller) : undefined;
       if (!source) continue;
-      const edge: Edge = anchoredSet.has(target.name)
-        ? {
-            id: `${source.name}-${target.name}`,
-            source: source.name,
-            target: target.name,
-            sourceHandle: "branch-out",
-            targetHandle: "branch-in",
-            type: "straight",
-          }
-        : forward(source, target);
+      let edge: Edge;
+      if (anchoredSet.has(target.name)) {
+        const box = placed.get(source.name);
+        const side = tapSide(
+          (box?.x ?? 0) + (box?.width ?? NODE_SIZE.width) / 2,
+          approaches.get(source.name) ?? [],
+        );
+        edge = {
+          id: `${source.name}-${target.name}`,
+          source: source.name,
+          target: target.name,
+          sourceHandle: `branch-out-${side}`,
+          targetHandle: `branch-in-${side}`,
+          type: "straight",
+        };
+      } else {
+        edge = forward(source, target);
+      }
       if (!ids.has(edge.id)) {
         ids.add(edge.id);
         edges.push(edge);

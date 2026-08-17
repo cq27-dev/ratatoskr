@@ -8,7 +8,7 @@
  * for every lane count and every span count.
  */
 import type { NodeView } from "../api";
-import { branchParent } from "../derive";
+import { branchParent, type ConvergeLoops } from "../derive";
 
 /* Pitch is the box plus the room an edge needs to turn in. Derived from NODE_SIZE rather than
  * written as a literal: the two drifted apart once already, leaving 20px for a right-angled edge
@@ -173,18 +173,35 @@ export function place(
 export const BRANCH_DROP = LANE_GAP;
 
 /**
- * Where the branch tap sits along its boxes' bottom and top edges, as a fraction of the width.
+ * Where the branch tap sits along its boxes' bottom and top edges, as a fraction of the width —
+ * this is the LEFT tap; the right tap mirrors it at `1 - BRANCH_TAP`.
  *
  * The caller edge is a straight drop from the parent's bottom into the child's top, and this is
  * the x it runs at. Inside the column rather than in the gap, because the gaps carry the loop
  * shelves — both back-edges run their horizontals across them, so any vertical there necessarily
- * crosses them — and LEFT of the converge self-loop's reach, which extends `width/4` either side
- * of the bottom centre. Between the box's corner and that reach, the drop crosses nothing this
- * column's wiring draws; the one crossing left anywhere is the replan shelf, which spans every
- * column between its endpoints and cannot be ducked by any x. See the clearance pin in
- * layout.test.js before moving this.
+ * crosses them — and outside the converge self-loop's reach, which extends `width/4` either side
+ * of the bottom centre. Between a box corner and that reach the drop crosses nothing this
+ * column's own wiring draws — EXCEPT a back-loop shelf that ENDS at this column, which arrives
+ * from whichever side its other endpoint sits on; `tapSide` picks the side away from it, since a
+ * declared layout may order its stages either way. The one crossing left anywhere is the replan
+ * shelf, which spans every column between its endpoints and cannot be ducked by any x. See the
+ * clearance pin in layout.test.js before moving this.
  */
 export const BRANCH_TAP = 0.125;
+
+/**
+ * Which side of a box the branch tap drops on: away from any loop shelf ending at it.
+ *
+ * `approaches` are the centre x's of the other endpoints of loops touching this box. A shelf
+ * arrives from its other endpoint's side, so a left-side endpoint crosses the left tap and the
+ * drop moves right. Approached from both sides — or neither — the left tap stands: with both
+ * sides crossed there is nothing to duck, and a stable default keeps the geometry from flapping.
+ */
+export function tapSide(centerX: number, approaches: readonly number[]): "left" | "right" {
+  const fromLeft = approaches.some((x) => x < centerX);
+  const fromRight = approaches.some((x) => x > centerX);
+  return fromLeft && !fromRight ? "right" : "left";
+}
 
 /**
  * Where the boxes anchored to a parent go: directly below it, under the loop band.
@@ -227,7 +244,42 @@ export function branchPlace(
  * clean; a crossed wire asserts a junction that does not exist, and no anchor is better than
  * that.
  */
-export function anchoredBranches(nodes: readonly NodeView[]): Set<string> {
+/**
+ * The nodes the special wiring is about to address by name, which must stay on the spine.
+ *
+ * The loop edges and the fork hand-off route against spine handles and the spine's extent: a
+ * back-loop lands on its target's BOTTOM handle from a shelf above it, so a target anchored
+ * below the band would be entered straight through its own box. Anchoring moves only children,
+ * so a parent on this list is fine — it is the CANDIDATE that may not be one of these.
+ *
+ * The fork pair is pinned whenever both boxes exist: `forkHandoff` can still draw their straight
+ * edge from box geometry alone, whatever the stream said.
+ */
+export function wiredToSpine(
+  loops: ConvergeLoops,
+  present: (name: string) => boolean,
+): Set<string> {
+  const out = new Set<string>();
+  if (loops.retry > 0 && present("implementer")) out.add("implementer");
+  if (loops.fix > 0 && present("implementer") && present("verifier")) {
+    out.add("implementer");
+    out.add("verifier");
+  }
+  if (loops.replan > 0 && present("verifier") && present("analyst")) {
+    out.add("verifier");
+    out.add("analyst");
+  }
+  if (present("redteam") && present("implementer")) {
+    out.add("redteam");
+    out.add("implementer");
+  }
+  return out;
+}
+
+export function anchoredBranches(
+  nodes: readonly NodeView[],
+  pinned: ReadonlySet<string> = new Set(),
+): Set<string> {
   const byName = new Map(nodes.map((n) => [n.name, n]));
   // Each declared column's deepest lane, indexed once. The eligibility check runs per candidate,
   // and candidates are the imported-history shape nothing bounds — a full scan per candidate is
@@ -241,6 +293,7 @@ export function anchoredBranches(nodes: readonly NodeView[]): Set<string> {
   const taken = new Set<string>();
   const out = new Set<string>();
   for (const n of nodes) {
+    if (pinned.has(n.name)) continue;
     const caller = branchParent(n, byName);
     if (!caller) continue;
     const parent = byName.get(caller);

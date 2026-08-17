@@ -23,6 +23,8 @@ import {
   spanShelf,
   spineNodes,
   tallestNeighbours,
+  tapSide,
+  wiredToSpine,
 } from "./panels/layout";
 import { carryMeasurement } from "./panels/PipelineGraph";
 
@@ -525,4 +527,57 @@ test("branch eligibility costs what the candidates cost, not their square", () =
   expect(performance.now() - started).toBeLessThan(100);
   // One child per parent: the fan-out anchors exactly one and the rest keep trailing columns.
   expect(anchored.size).toBe(1);
+});
+
+test("a loop participant stays on the spine, however good its caller looks", () => {
+  // The loop edges and the fork hand-off route against spine handles and the spine's extent: a
+  // back-loop lands on its target's BOTTOM handle from a shelf above it, so a target anchored
+  // below the band would be entered straight through its own box. Anchoring moves only children;
+  // the pin is on the candidate.
+  const present = new Set(["implementer", "verifier", "analyst", "redteam"]);
+  const has = (name) => present.has(name);
+
+  expect(wiredToSpine({ retry: 1, fix: 0, replan: 0 }, has)).toEqual(
+    new Set(["implementer", "redteam"]),
+  );
+  expect(wiredToSpine({ retry: 0, fix: 1, replan: 0 }, has)).toEqual(
+    new Set(["implementer", "verifier", "redteam"]),
+  );
+  expect(wiredToSpine({ retry: 0, fix: 0, replan: 2 }, has)).toEqual(
+    new Set(["verifier", "analyst", "implementer", "redteam"]),
+  );
+  // No loops and no fork pair: nothing pinned.
+  expect(wiredToSpine({ retry: 0, fix: 0, replan: 0 }, () => false)).toEqual(new Set());
+
+  // And the pin holds through eligibility: an unplaced analyst with a clean caller keeps its
+  // trailing column while a replan loop addresses it.
+  const nodes = [
+    { name: "verifier", state: "done", checkpoints: 1, stage: 0, lane: 0 },
+    { name: "analyst", state: "done", checkpoints: 1, stage: 5, lane: 0, shaped: false, caller: "verifier" },
+  ];
+  expect(anchoredBranches(nodes, new Set(["analyst"]))).toEqual(new Set());
+  expect(anchoredBranches(nodes)).toEqual(new Set(["analyst"]));
+});
+
+test("the tap drops away from the side a loop shelf arrives on", () => {
+  // A shelf ends at its target's bottom centre and arrives from its other endpoint's side — a
+  // verifier LEFT of the implementer runs the fix shelf across the left tap. Approached from
+  // both sides, or neither, the left tap stands: with both crossed there is nothing to duck.
+  const center = 500;
+  expect(tapSide(center, [])).toBe("left");
+  expect(tapSide(center, [900])).toBe("left");
+  expect(tapSide(center, [100])).toBe("right");
+  expect(tapSide(center, [100, 900])).toBe("left");
+});
+
+test("both taps clear the self-loop's reach and their box corner", () => {
+  // The right tap mirrors the left, and both must sit strictly between a corner and the converge
+  // self-loop's reach with a corner's clearance from each — a declared layout may put the
+  // approaching shelf on either side, so both sides have to be as clear as the one tap was.
+  for (const tap of [BRANCH_TAP * NODE_SIZE.width, (1 - BRANCH_TAP) * NODE_SIZE.width]) {
+    const fromCorner = Math.min(tap, NODE_SIZE.width - tap);
+    const fromSelfLoop = Math.abs(tap - NODE_SIZE.width / 2) - NODE_SIZE.width / 4;
+    expect(fromCorner).toBeGreaterThanOrEqual(SPAN_RADIUS);
+    expect(fromSelfLoop).toBeGreaterThanOrEqual(SPAN_RADIUS);
+  }
 });
