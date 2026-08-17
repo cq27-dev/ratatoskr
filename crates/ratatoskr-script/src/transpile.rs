@@ -25,7 +25,7 @@ use crate::ScriptError;
 
 /// Strip TypeScript types from `src`, returning JavaScript.
 pub fn transpile_ts(src: &str) -> Result<String, ScriptError> {
-    transpile(src, FileName::Anon, |_| Ok(()), |_| Ok(()))
+    transpile(src, FileName::Anon, |_| Ok(()), |_| Ok(())).map(|(javascript, _)| javascript)
 }
 
 const MAX_LOAD_BYTES: usize = 16 * 1024;
@@ -295,6 +295,52 @@ fn past_regex(bytes: &[u8], from: usize) -> usize {
 pub(crate) struct WorkflowSource {
     pub javascript: String,
     pub dependencies: Vec<PathBuf>,
+    pub mapping: SourceMapping,
+}
+
+/// A position in the source an author wrote — file, 1-based line, 1-based column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcePosition {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// What a transpile knows about where its output came from: generated (line, column) — zero-based,
+/// as the emitter counts — to the source position the author wrote.
+///
+/// Built from the emitter's own span records rather than a serialized source map: the consumer is
+/// this workspace's error translation, not a browser, and the pairs are already exactly the
+/// lookup it needs. Type stripping and `LOAD` inclusion move every line, so a runtime frame's
+/// position is meaningless against the TypeScript until it passes through here.
+#[derive(Debug, Clone, Default)]
+pub struct SourceMapping {
+    /// Sorted by generated (line, column).
+    entries: Vec<(u32, u32, SourcePosition)>,
+}
+
+impl SourceMapping {
+    /// The source position for a generated line (zero-based), at `column` where the caller has
+    /// one. `None` for a line no source produced — a frame there stays in the engine's own
+    /// coordinates, which is honest, where the nearest other line's answer would be a claim.
+    pub fn resolve(&self, line: u32, column: Option<u32>) -> Option<&SourcePosition> {
+        let on_line = {
+            let start = self.entries.partition_point(|(l, _, _)| *l < line);
+            let end = self.entries.partition_point(|(l, _, _)| *l <= line);
+            &self.entries[start..end]
+        };
+        match column {
+            // The last entry at or before the column, else the line's first: a frame's column may
+            // sit past the final mapped token on its line.
+            Some(column) => on_line
+                .iter()
+                .rev()
+                .find(|(_, c, _)| *c <= column)
+                .or_else(|| on_line.first())
+                .map(|(_, _, p)| p),
+            None => on_line.first().map(|(_, _, p)| p),
+        }
+    }
 }
 
 struct LoadedText {
@@ -333,7 +379,7 @@ pub(crate) fn transpile_workflow(
         dependencies.push(canonical_target.clone());
         Ok(LoadedText { content })
     };
-    let javascript = transpile_with_loads(
+    let (javascript, mapping) = transpile_with_loads(
         src,
         FileName::Real(path.to_path_buf()),
         path,
@@ -345,6 +391,7 @@ pub(crate) fn transpile_workflow(
     Ok(WorkflowSource {
         javascript,
         dependencies,
+        mapping,
     })
 }
 
@@ -359,7 +406,7 @@ pub fn transpile_with_includes(
     src: &str,
     includes: &[(&str, &str)],
     permitted: &[&str],
-) -> Result<String, ScriptError> {
+) -> Result<TranspiledModule, ScriptError> {
     let mut load = |requested: &str| {
         let normalized = normalize_bundled_target(requested)?;
         let (_, content) = includes
@@ -369,13 +416,24 @@ pub fn transpile_with_includes(
         let content = checked_load_text(normalized.as_str(), content.as_bytes().to_vec())?;
         Ok(LoadedText { content })
     };
-    transpile_with_loads(
+    let (javascript, mapping) = transpile_with_loads(
         src,
         FileName::Custom(name.to_string()),
         Path::new(name),
         permitted,
         &mut load,
-    )
+    )?;
+    Ok(TranspiledModule {
+        javascript,
+        mapping,
+    })
+}
+
+/// A module transpiled for the engine, with the mapping that reads its runtime frames.
+#[derive(Debug)]
+pub struct TranspiledModule {
+    pub javascript: String,
+    pub mapping: SourceMapping,
 }
 
 fn normalize_bundled_target(requested: &str) -> Result<String, String> {
@@ -437,7 +495,7 @@ fn transpile_with_loads(
     display_path: &Path,
     permitted: &[&str],
     load: &mut dyn FnMut(&str) -> Result<LoadedText, String>,
-) -> Result<String, ScriptError> {
+) -> Result<(String, SourceMapping), ScriptError> {
     transpile(
         src,
         file_name,
@@ -487,7 +545,7 @@ fn transpile(
     file_name: FileName,
     rewrite: impl FnOnce(&mut ParsedProgram) -> Result<(), ScriptError>,
     emitted: impl FnOnce(&ParsedProgram) -> Result<(), ScriptError>,
-) -> Result<String, ScriptError> {
+) -> Result<(String, SourceMapping), ScriptError> {
     // Before the parser, because the AST this builds is what cannot survive deep nesting.
     check_nesting(&file_name, src)?;
     GLOBALS.set(&Default::default(), || {
@@ -538,8 +596,15 @@ fn transpile(
         emitted(&parsed)?;
 
         let mut buf = Vec::new();
+        // The emitter records, for every token it prints, the generated position and the span it
+        // came from — which is the whole source map, in exactly the shape the error translation
+        // needs, with no serialized map in between.
+        let mut spans: Vec<(
+            swc_core::common::BytePos,
+            swc_core::common::source_map::LineCol,
+        )> = Vec::new();
         {
-            let writer = JsWriter::new(cm.clone(), "\n", &mut buf, None);
+            let writer = JsWriter::new(cm.clone(), "\n", &mut buf, Some(&mut spans));
             let mut emitter = Emitter {
                 cfg: CodegenConfig::default(),
                 cm: cm.clone(),
@@ -550,7 +615,29 @@ fn transpile(
                 .emit_program(&parsed.program)
                 .map_err(|e| ScriptError::Transpile(format!("codegen: {e}")))?;
         }
-        String::from_utf8(buf).map_err(|e| ScriptError::Transpile(e.to_string()))
+        let mut entries: Vec<(u32, u32, SourcePosition)> = spans
+            .iter()
+            // A synthesized node — a `LOAD` replacement literal — has no author position and
+            // carries a dummy span; a frame that lands on one keeps the engine's coordinates.
+            .filter(|(pos, _)| *pos != swc_core::common::BytePos(0))
+            .map(|(pos, at)| {
+                let loc = cm.lookup_char_pos(*pos);
+                (
+                    at.line,
+                    at.col,
+                    SourcePosition {
+                        file: loc.file.name.to_string(),
+                        line: loc.line as u32,
+                        column: loc.col_display as u32 + 1,
+                    },
+                )
+            })
+            .collect();
+        entries.sort_by_key(|entry| (entry.0, entry.1));
+        entries.dedup_by(|a, b| (a.0, a.1) == (b.0, b.1));
+        let javascript =
+            String::from_utf8(buf).map_err(|e| ScriptError::Transpile(e.to_string()))?;
+        Ok((javascript, SourceMapping { entries }))
     })
 }
 
@@ -848,7 +935,9 @@ mod tests {
             // Stripping also drops a specifier the source never used at all.
             "import { Foo } from \"unoffered\";\nexport const x = 1;",
         ] {
-            let js = transpile_with_includes("w", source, &[], &[]).unwrap();
+            let js = transpile_with_includes("w", source, &[], &[])
+                .unwrap()
+                .javascript;
             assert!(!js.contains("unoffered"), "got: {js}");
         }
     }

@@ -129,7 +129,7 @@ pub async fn run_plan(request: RunRequest<'_>) -> Result<PlanOutcome, PlanError>
     } = request;
     let runtime = match chosen {
         Workflow::BuiltIn => workflow::standard_runtime().await?,
-        Workflow::Scripted(runtime) => runtime,
+        Workflow::Scripted(runtime) => *runtime,
     };
     // Once per run: `SessionStart` describes the repository, not the stage or entrypoint.
     let plugin_context =
@@ -348,7 +348,9 @@ fn graph_fingerprint(repo: &std::path::Path) -> String {
     graph_fingerprint_of(
         repo,
         workflow::STANDARD_WORKFLOW_V1,
-        &workflow::standard_definitions().unwrap_or_default(),
+        &workflow::standard_definitions()
+            .map(|definitions| definitions.javascript)
+            .unwrap_or_default(),
     )
 }
 
@@ -373,7 +375,11 @@ fn graph_fingerprint_of(repo: &std::path::Path, orchestration: &str, definitions
     workflows.push(repo.join(SINGLE_FILE_WORKFLOW));
     // The same module map a run gives a workflow, so one that legitimately imports the standard
     // definitions still reports its `LOAD` dependencies instead of failing to transpile.
-    let modules = [(workflow::STANDARD_DEFINITIONS_MODULE, definitions)];
+    let modules = [ratatoskr_script::ModuleSource {
+        name: workflow::STANDARD_DEFINITIONS_MODULE,
+        source: definitions,
+        mapping: None,
+    }];
     for workflow in &workflows {
         if let Ok(dependencies) = ratatoskr_script::workflow::dependencies(workflow, &modules) {
             sources.extend(dependencies);
@@ -461,7 +467,10 @@ const SCRIPTED_REVIEW_WARNING: &str = "this workflow controls whether to run the
 pub enum Workflow {
     /// context → analyst → red-team → implementer → verify/converge → terminal delivery.
     BuiltIn,
-    Scripted(WorkflowRuntime),
+    /// Boxed: a runtime carries its engine, budgets and source maps, and the enum's other
+    /// variant is a unit — the payload lives behind one pointer so every `Workflow` value does
+    /// not weigh a runtime.
+    Scripted(Box<WorkflowRuntime>),
 }
 
 impl Workflow {
@@ -558,7 +567,12 @@ pub async fn governable_nodes() -> Result<Vec<String>, PlanError> {
 /// Every workflow a run could use: the built-in, then whatever this repo defines.
 pub async fn registry() -> Result<Vec<Workflow>, PlanError> {
     let mut all = vec![Workflow::BuiltIn];
-    all.extend(defined().await?.into_iter().map(Workflow::Scripted));
+    all.extend(
+        defined()
+            .await?
+            .into_iter()
+            .map(|w| Workflow::Scripted(Box::new(w))),
+    );
     Ok(all)
 }
 
@@ -586,7 +600,11 @@ async fn defined_in(
     // A repository's own workflow imports the standard definitions exactly as the bundled workflow
     // does — otherwise a repo could only restate the stages it wanted to reuse.
     let definitions = workflow::standard_definitions()?;
-    let modules = [(workflow::STANDARD_DEFINITIONS_MODULE, definitions.as_str())];
+    let modules = [ratatoskr_script::ModuleSource {
+        name: workflow::STANDARD_DEFINITIONS_MODULE,
+        source: &definitions.javascript,
+        mapping: Some(&definitions.mapping),
+    }];
     let mut found = WorkflowRuntime::discover(dir, &modules)
         .await
         .map_err(fail)?;
@@ -1725,7 +1743,7 @@ pub async fn run_full(request: RunRequest<'_>) -> Result<RunOutcome, PlanError> 
     } = request;
     let (runtime, repository_workflow) = match chosen {
         Workflow::BuiltIn => (workflow::standard_runtime().await?, false),
-        Workflow::Scripted(runtime) => (runtime, true),
+        Workflow::Scripted(runtime) => (*runtime, true),
     };
     if repository_workflow {
         tracing::warn!(workflow = runtime.meta().name, "{SCRIPTED_REVIEW_WARNING}");
@@ -3136,19 +3154,27 @@ mod agent_config_tests {
         // stage order, the branching and the gates. Editing `standard-v1.ts` changed what ran and
         // left the hash where it was.
         assert_ne!(
-            graph_fingerprint_of(&root, workflow::STANDARD_WORKFLOW_V1, &definitions),
+            graph_fingerprint_of(
+                &root,
+                workflow::STANDARD_WORKFLOW_V1,
+                &definitions.javascript
+            ),
             graph_fingerprint_of(
                 &root,
                 &format!(
                     "{}\n// a different orchestration\n",
                     workflow::STANDARD_WORKFLOW_V1
                 ),
-                &definitions
+                &definitions.javascript
             ),
         );
         assert_eq!(
             graph_fingerprint(&root),
-            graph_fingerprint_of(&root, workflow::STANDARD_WORKFLOW_V1, &definitions),
+            graph_fingerprint_of(
+                &root,
+                workflow::STANDARD_WORKFLOW_V1,
+                &definitions.javascript
+            ),
             "the fingerprint is the one taken over this build's definitions"
         );
 
@@ -3390,7 +3416,7 @@ mod agent_config_tests {
         let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         let mut all = vec![Workflow::BuiltIn];
-        all.extend(found.into_iter().map(Workflow::Scripted));
+        all.extend(found.into_iter().map(|w| Workflow::Scripted(Box::new(w))));
         all
     }
 
@@ -3490,7 +3516,7 @@ mod agent_config_tests {
         )
         .unwrap();
         let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
-        let declared = Workflow::Scripted(found.into_iter().next().unwrap());
+        let declared = Workflow::Scripted(Box::new(found.into_iter().next().unwrap()));
         assert_eq!(declared.nodes(), ["reviewer2", "triager"]);
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -3605,7 +3631,7 @@ mod agent_config_tests {
         std::fs::write(dir.join("a.ts"), r#"defineWorkflow({ name: "research" });"#).unwrap();
         let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
         let mut registry = vec![Workflow::BuiltIn];
-        registry.extend(found.into_iter().map(Workflow::Scripted));
+        registry.extend(found.into_iter().map(|w| Workflow::Scripted(Box::new(w))));
 
         let store = Store::open_in_memory().unwrap();
         let ledger = Arc::new(RunLedger::default());
@@ -4104,7 +4130,11 @@ mod referee_governance_tests {
             "renamed-standard",
             &composed,
             workflow::STANDARD_WORKFLOW_INCLUDES,
-            &[(workflow::STANDARD_DEFINITIONS_MODULE, &definitions)],
+            &[ratatoskr_script::ModuleSource {
+                name: workflow::STANDARD_DEFINITIONS_MODULE,
+                source: &definitions.javascript,
+                mapping: None,
+            }],
         )
         .await
         .unwrap();

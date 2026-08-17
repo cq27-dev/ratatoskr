@@ -42,7 +42,17 @@ use crate::transpile;
 ///
 /// Resolution is from this map alone — never the filesystem. A workflow runs with the repository's
 /// tools, so its imports are bounded by what the host offers, the same trust model `LOAD` uses.
-pub type Modules<'a> = &'a [(&'a str, &'a str)];
+pub type Modules<'a> = &'a [ModuleSource<'a>];
+
+/// One module a host provides to the engine: its import specifier, its emitted JavaScript, and —
+/// when the host transpiled it — the mapping that reads its runtime frames back to the source.
+/// A module without a mapping still loads and runs; its frames keep the engine's coordinates.
+#[derive(Clone, Copy)]
+pub struct ModuleSource<'a> {
+    pub name: &'a str,
+    pub source: &'a str,
+    pub mapping: Option<&'a transpile::SourceMapping>,
+}
 
 /// A host function's result: `Ok(json)` — a JSON-encoded return value — or `Err(message)`, which the
 /// script sees as a thrown `Error`.
@@ -71,7 +81,7 @@ pub fn dependencies(
 
 /// The specifiers a module map offers — the permitted import set the transpiler checks against.
 fn specifiers<'a>(modules: Modules<'a>) -> Vec<&'a str> {
-    modules.iter().map(|(name, _)| *name).collect()
+    modules.iter().map(|module| module.name).collect()
 }
 
 /// JS prelude: the schema helpers a declaration is written with, `defineWorkflow` and the
@@ -382,6 +392,89 @@ pub struct WorkflowRuntime {
     /// merged in by an earlier call would otherwise still answer for a stage this call never
     /// granted, which is the renderer-table defect (#270) wearing a different global.
     installed_hosts: std::sync::Mutex<Vec<String>>,
+    /// What reads a runtime frame back to the source its author wrote, keyed by the name the
+    /// frame carries: [`generated_name`] for the workflow module, the plain specifier for a
+    /// provided module. A frame whose name or line no mapping covers keeps the engine's own
+    /// coordinates, which is honest.
+    mappings: std::collections::HashMap<String, transpile::SourceMapping>,
+}
+
+impl WorkflowRuntime {
+    /// Rewrite every engine frame position in `message` that a mapping covers to the source
+    /// position its author wrote. A frame whose module or line no mapping covers is left exactly
+    /// as the engine said it, which is honest — see [`generated_name`].
+    fn translate_frames(&self, message: &str) -> String {
+        let mut out = message.to_string();
+        for (frame, mapping) in self.mappings.iter() {
+            out = translate_frames_of(&out, frame, mapping);
+        }
+        out
+    }
+}
+
+/// Replace `frame:LINE[:COL]` occurrences with the mapped source position.
+///
+/// QuickJS frames carry a 1-based line and, in builds that record it, a 1-based column; the
+/// mapping's generated side is zero-based. Parsed by hand rather than a regex dependency: the
+/// shape is one name, one or two numbers.
+fn translate_frames_of(text: &str, frame: &str, mapping: &transpile::SourceMapping) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(found) = rest.find(frame) {
+        out.push_str(&rest[..found]);
+        let after = &rest[found + frame.len()..];
+        let (line, line_len) = leading_number(after.strip_prefix(':').unwrap_or(""));
+        let translated = line.and_then(|line| {
+            let tail = &after[1 + line_len..];
+            let (column, column_len) = leading_number(tail.strip_prefix(':').unwrap_or(""));
+            let consumed = 1 + line_len + column.map_or(0, |_| 1 + column_len);
+            mapping
+                .resolve(line.saturating_sub(1), column.map(|c| c.saturating_sub(1)))
+                .map(|position| (position, consumed))
+        });
+        match translated {
+            Some((position, consumed)) => {
+                out.push_str(&format!(
+                    "{}:{}:{}",
+                    position.file, position.line, position.column
+                ));
+                rest = &after[consumed..];
+            }
+            None => {
+                out.push_str(frame);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The leading decimal number of `text`, with how many bytes it took. `(None, 0)` when `text`
+/// does not start with a digit.
+fn leading_number(text: &str) -> (Option<u32>, usize) {
+    let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 {
+        return (None, 0);
+    }
+    (text[..digits].parse().ok(), digits)
+}
+
+/// The frame-name → mapping table for one runtime: the workflow module under the name the engine
+/// declares it as, and every provided module that shipped a mapping under its specifier.
+fn frame_mappings(
+    module_name: &str,
+    workflow: transpile::SourceMapping,
+    modules: Modules<'_>,
+) -> std::collections::HashMap<String, transpile::SourceMapping> {
+    let mut mappings = std::collections::HashMap::new();
+    mappings.insert(generated_name(module_name), workflow);
+    for module in modules {
+        if let Some(mapping) = module.mapping {
+            mappings.insert(module.name.to_string(), mapping.clone());
+        }
+    }
+    mappings
 }
 
 impl WorkflowRuntime {
@@ -394,22 +487,25 @@ impl WorkflowRuntime {
         includes: &[(&str, &str)],
         modules: Modules<'_>,
     ) -> Result<Self, ScriptError> {
-        let source = transpile::transpile_with_includes(name, src, includes, &specifiers(modules))?;
+        let transpiled =
+            transpile::transpile_with_includes(name, src, includes, &specifiers(modules))?;
         let (runtime, context, budget) = engine(modules).await?;
-        let meta = Self::declared(&runtime, &context, &budget, name, &source)
+        let meta = Self::declared(&runtime, &context, &budget, name, &transpiled.javascript)
             .await?
             .ok_or_else(|| {
                 ScriptError::Eval(format!("bundled workflow `{name}` has no declaration"))
             })?;
+        let mappings = frame_mappings(name, transpiled.mapping, modules);
         Ok(Self {
             runtime,
             context,
             budget,
             module_name: name.into(),
-            source: source.into_boxed_str(),
+            source: transpiled.javascript.into_boxed_str(),
             meta: Box::new(meta),
             dependencies: Box::new([]),
             bundled: true,
+            mappings,
             run_span: RUN_BUDGET,
             run_total: RUN_TOTAL_BUDGET,
             installed_hosts: std::sync::Mutex::new(Vec::new()),
@@ -456,6 +552,7 @@ impl WorkflowRuntime {
             layout: Vec::new(),
         });
 
+        let mappings = frame_mappings(&module_name, loaded.mapping, modules);
         Ok(Some(WorkflowRuntime {
             runtime,
             context,
@@ -468,6 +565,7 @@ impl WorkflowRuntime {
             run_span: RUN_BUDGET,
             run_total: RUN_TOTAL_BUDGET,
             installed_hosts: std::sync::Mutex::new(Vec::new()),
+            mappings,
         }))
     }
 
@@ -595,6 +693,24 @@ impl WorkflowRuntime {
     /// override dropped `renderQuestion`, and hand a replacement stage a prompt written for the
     /// shape it replaced.
     pub async fn run_with_question_renderers(
+        &self,
+        entry: &str,
+        input_json: String,
+        hosts: HashMap<String, HostFn>,
+        question_renderers: HashMap<String, String>,
+    ) -> Result<String, ScriptError> {
+        self.run_exact(entry, input_json, hosts, question_renderers)
+            .await
+            // The one exit every engine failure leaves through, so it is where frames come home:
+            // an error surfaced to a person names the file and line they wrote, or keeps the
+            // engine's own coordinates where no mapping covers it.
+            .map_err(|error| match error {
+                ScriptError::Eval(message) => ScriptError::Eval(self.translate_frames(&message)),
+                other => other,
+            })
+    }
+
+    async fn run_exact(
         &self,
         entry: &str,
         input_json: String,
@@ -1196,9 +1312,9 @@ async fn engine(
     if !modules.is_empty() {
         let mut resolver = BuiltinResolver::default();
         let mut loader = BuiltinLoader::default();
-        for (name, source) in modules {
-            resolver.add_module(*name);
-            loader.add_module(*name, *source);
+        for module in modules {
+            resolver.add_module(module.name);
+            loader.add_module(module.name, module.source);
         }
         // No `FileResolver`: an import reaches the host's map or it fails to resolve.
         runtime.set_loader(resolver, loader).await;
@@ -1255,6 +1371,95 @@ mod tests {
         let path = dir.join("workflow.ts");
         std::fs::write(&path, ts).unwrap();
         WorkflowRuntime::load(&path, &[]).await.unwrap().unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_runtime_error_names_the_typescript_the_author_wrote() {
+        // Type stripping moves every line: the interface below occupies three lines the emitted
+        // JavaScript does not have, so the throw sits on TS line 7 and a different JS line. An
+        // untranslated frame would name the JS line in `<generated from …>` coordinates — the
+        // file the author never wrote and cannot read.
+        let dir = scratch("source-mapped-error");
+        let rt = load(
+            &dir,
+            r#"
+interface Shape {
+    x: number;
+}
+
+export async function run(input: Shape) {
+    throw new Error("boom");
+}
+"#,
+        )
+        .await;
+        let error = rt
+            .run("run", "{}".into(), HashMap::new())
+            .await
+            .expect_err("the workflow throws")
+            .to_string();
+        assert!(error.contains("boom"), "{error}");
+        assert!(
+            error.contains("workflow.ts:7:"),
+            "the author's file and line, not the emitted JavaScript's: {error}"
+        );
+        assert!(
+            !error.contains("<generated from"),
+            "every frame of the author's module translates: {error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_error_inside_an_imported_definition_names_that_definitions_source() {
+        // The definition's own type line shifts its throw from TS line 3 to JS line 2. The frame
+        // must name the module's source at the line its author wrote — not the importing
+        // workflow's, and not the emitted line.
+        let module = transpile::transpile_with_includes(
+            "ratatoskr/defs",
+            "type Boom = never;\nexport function explode(): Boom {\n    throw new Error(\"from the definition\");\n}\n",
+            &[],
+            &[],
+        )
+        .unwrap();
+        let dir = scratch("source-mapped-import-error");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("workflow.ts");
+        std::fs::write(
+            &path,
+            r#"
+import { explode } from "ratatoskr/defs";
+
+export async function run(input: {}) {
+    explode();
+}
+"#,
+        )
+        .unwrap();
+        let rt = WorkflowRuntime::load(
+            &path,
+            &[ModuleSource {
+                name: "ratatoskr/defs",
+                source: &module.javascript,
+                mapping: Some(&module.mapping),
+            }],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let error = rt
+            .run("run", "{}".into(), HashMap::new())
+            .await
+            .expect_err("the definition throws")
+            .to_string();
+        assert!(error.contains("from the definition"), "{error}");
+        assert!(
+            error.contains("ratatoskr/defs:3:"),
+            "the definition's source at the author's line: {error}"
+        );
+        // And the importing workflow's own frame still names the workflow's file.
+        assert!(error.contains("workflow.ts:5:"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2452,6 +2657,7 @@ export async function plan(i) { return { entryRan: true }; }
             &[],
         )
         .unwrap()
+        .javascript
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2472,9 +2678,16 @@ export async function plan(i) { return { entryRan: true }; }
         .unwrap();
 
         let module = definitions_module();
-        let found = WorkflowRuntime::discover(&dir, &[("ratatoskr/nodes", &module)])
-            .await
-            .unwrap();
+        let found = WorkflowRuntime::discover(
+            &dir,
+            &[ModuleSource {
+                name: "ratatoskr/nodes",
+                source: &module,
+                mapping: None,
+            }],
+        )
+        .await
+        .unwrap();
         let stages = &found[0].meta().stages;
 
         // Used whole: every field is the definition's, including the prompt its `LOAD` resolved —
@@ -2546,11 +2759,13 @@ export async function plan(i) { return { entryRan: true }; }
     }
 
     #[tokio::test]
-    async fn a_runtime_frame_never_claims_a_line_in_the_authors_file() {
-        // The engine sees the emitted JavaScript, whose lines are not the TypeScript's: type
-        // stripping and `LOAD` inclusion move everything. A frame stamped with the author's path
-        // and the emitted line points at a real file's wrong line, which reads as a fact rather
-        // than as the engine's own position.
+    async fn a_frame_names_the_authors_line_through_the_map_or_keeps_the_engines_coordinates() {
+        // The rule this replaces said a runtime frame may NEVER name the author's file, because
+        // type stripping and `LOAD` inclusion move every line and a stamped path beside an
+        // emitted position claimed a real file's wrong line. With the source map the position is
+        // computed FROM the TypeScript, so naming the file is now a true claim — and the spacer
+        // wall below is what proves it: forty stripped-and-kept lines apart, an untranslated
+        // frame could not land on the throw's own line.
         let dir = scratch("frame-position");
         let path = dir.join("throws.ts");
         let mut source = String::from("type Unused = { a: string };\n");
@@ -2570,15 +2785,16 @@ export async function plan(i) { return { entryRan: true }; }
             .to_string();
 
         assert!(error.contains("deliberate"), "{error}");
-        // The path appears — an author still has to know which workflow threw — but only inside a
-        // marker that says the position beside it belongs to generated code.
+        // The throw sits on TS line 43: the type line, forty spacers, the function line, then it.
         assert!(
-            error.contains(&format!("<generated from {}>", path.display())),
-            "{error}"
+            error.contains(&format!("{}:43:", path.display())),
+            "the author's own line, through the map: {error}"
         );
+        // And what the map cannot place keeps the engine's coordinates rather than borrowing the
+        // author's path — the honesty rule survives translation; it just applies to less.
         assert!(
-            !error.contains(&format!("{}:", path.display())),
-            "a bare `file:line` claims a position in the author's source: {error}"
+            !error.contains("<generated from"),
+            "every frame of this module has a mapped line: {error}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2598,7 +2814,16 @@ export async function plan(i) { return { entryRan: true }; }
         .unwrap();
 
         let module = definitions_module();
-        let error = match WorkflowRuntime::load(&path, &[("ratatoskr/nodes", &module)]).await {
+        let error = match WorkflowRuntime::load(
+            &path,
+            &[ModuleSource {
+                name: "ratatoskr/nodes",
+                source: &module,
+                mapping: None,
+            }],
+        )
+        .await
+        {
             Err(error) => error.to_string(),
             Ok(_) => panic!("a stage with no agent must be refused"),
         };
@@ -2629,7 +2854,16 @@ export async function plan(i) { return { entryRan: true }; }
         .unwrap();
 
         let module = definitions_module();
-        let error = match WorkflowRuntime::load(&path, &[("ratatoskr/nodes", &module)]).await {
+        let error = match WorkflowRuntime::load(
+            &path,
+            &[ModuleSource {
+                name: "ratatoskr/nodes",
+                source: &module,
+                mapping: None,
+            }],
+        )
+        .await
+        {
             Err(error) => error.to_string(),
             Ok(_) => panic!("an unresolvable import must be refused"),
         };
@@ -2660,7 +2894,16 @@ export async function plan(i) { return { entryRan: true }; }
         .unwrap();
 
         let module = definitions_module();
-        let error = match WorkflowRuntime::load(&path, &[("ratatoskr/nodes", &module)]).await {
+        let error = match WorkflowRuntime::load(
+            &path,
+            &[ModuleSource {
+                name: "ratatoskr/nodes",
+                source: &module,
+                mapping: None,
+            }],
+        )
+        .await
+        {
             Err(error) => error.to_string(),
             Ok(_) => panic!("an unresolvable import must be refused"),
         };
