@@ -169,11 +169,15 @@ export function branchPlace(
     const parent = child.caller ? parentBounds(child.caller) : undefined;
     if (parent) anchored.push({ child, parent });
   }
-  // In the parents' own lane order, not the order the stream appended the children: an appended
-  // node arrives by event order, so a lower parent's child listed first sat at the top of the
-  // shared stack and its caller edge crossed the upper parent's. The sort is stable, which is
-  // what keeps siblings of one parent in the order given.
-  anchored.sort((a, b) => a.parent.y - b.parent.y);
+  // In REVERSE parent-lane order — the lower parent's child on top — and never the order the
+  // stream appended the children. The caller edges descend corridors beside the stack, nearest
+  // corridor to the topmost child, and this is the one ordering that nests them: a deeper
+  // parent's edge takes off lower and lands higher, so its whole route sits inside the shallower
+  // parent's — like matched parentheses. Same-order stacking cannot be drawn flat: whichever way
+  // the corridors are assigned, either a lower parent's takeoff crosses an upper edge's vertical
+  // on its way out, or an upper child's landing crosses a lower edge's vertical on its way in.
+  // The sort is stable, which is what keeps siblings of one parent in the order given.
+  anchored.sort((a, b) => b.parent.y - a.parent.y);
   // Stacked per COLUMN, not per parent: two parents in different lanes of one stage share an x,
   // so their children share a column too — keyed by caller, both first children landed on the
   // same coordinates and drew on top of each other.

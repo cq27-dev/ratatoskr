@@ -718,10 +718,15 @@ export default function PipelineGraph({
     () => nodes.filter((n) => branchParent(n, byName) !== null),
     [nodes, byName],
   );
-  const columns = useMemo(
-    () => stages(spineNodes(nodes, new Set(branches.map((n) => n.name)))),
+  // The spine list itself, not only its columns: everything that reasons about drawn columns —
+  // the stage fans, the skipped-span jumps — must read THIS list. Deriving a jump from the
+  // original `nodes` sees an anchored child still holding the trailing column it vacated, and
+  // draws a span from some earlier stage to a box that is no longer in any column.
+  const spineList = useMemo(
+    () => spineNodes(nodes, new Set(branches.map((n) => n.name))),
     [nodes, branches],
   );
+  const columns = useMemo(() => stages(spineList), [spineList]);
 
   /*
    * Where the boxes go, computed once and read by everything that hangs off them — the boxes
@@ -889,7 +894,7 @@ export default function PipelineGraph({
      * A band of the same depth the loop shelves occupy below the row, divided by the number of
      * spans, is bounded whatever a workflow declares and separates them whenever there is room.
      */
-    const spans = skippedSpans(nodes);
+    const spans = skippedSpans(spineList);
     const band = new Map<number, NodeView[]>();
     for (const lanes of columns) if (lanes[0]) band.set(lanes[0].stage, lanes);
     /*
@@ -981,7 +986,7 @@ export default function PipelineGraph({
     // Not clickable, and not focusable by tab: an edge here states a relation between two nodes and
     // has nothing to show when you pick it. See the note in `ConvergeEdge` on the hit path.
     return edges.map((e) => ({ ...e, selectable: false, focusable: false, interactionWidth: 0 }));
-  }, [byName, columns, extent, loops, nodes, handoff, branches, placed]);
+  }, [byName, columns, extent, loops, nodes, spineList, handoff, branches, placed]);
 
   /*
    * React Flow is a controlled component: it owns node measurement and writes the result back

@@ -389,7 +389,8 @@ test("a branch child hangs under the loop band, indented off its parent's column
 test("children of two parents sharing a column stack instead of overlapping", () => {
   // Two parents in different lanes of one stage share an x, so their children share a column too.
   // Keyed by caller, both first children landed on the same coordinates and drew on top of each
-  // other; the stack is per column.
+  // other; the stack is per column, in reverse parent order — the LOWER parent's child on top,
+  // which is the ordering that nests the caller edges' corridors instead of crossing them.
   const x = 3 * COLUMN_PITCH;
   const upper = { x, y: 0, width: NODE_SIZE.width, height: NODE_SIZE.height };
   const lower = { x, y: LANE_PITCH, width: NODE_SIZE.width, height: NODE_SIZE.height };
@@ -401,7 +402,7 @@ test("children of two parents sharing a column stack instead of overlapping", ()
     2 * NODE_SIZE.height + LANE_GAP,
   );
   expect(boxes.get("a").x).toBe(boxes.get("b").x);
-  expect(boxes.get("b").y).toBe(boxes.get("a").y + boxes.get("a").height + LANE_GAP);
+  expect(boxes.get("a").y).toBe(boxes.get("b").y + boxes.get("b").height + LANE_GAP);
 });
 
 test("an anchored node's vacated trailing column closes, and declared stages never move", () => {
@@ -432,11 +433,13 @@ test("an anchored node's vacated trailing column closes, and declared stages nev
   expect(kept.map((n) => n.stage)).toEqual([0, 2, 3, 4]);
 });
 
-test("branch stacks follow the parents' lanes, not the order children appended", () => {
-  // Appended nodes arrive by event order, so a lower parent's child can be listed first. Placed
-  // in that order it sat at the top of the shared stack and its caller edge crossed the upper
-  // parent's. The stack is sorted by the parent's own y — stably, so siblings keep their order
-  // even when another parent's child interleaves them.
+test("branch stacks reverse the parents' lanes, whatever order the children appended", () => {
+  // The caller edges descend corridors beside the stack, nearest corridor to the topmost child.
+  // Reverse parent order is the one arrangement that nests them — a deeper parent's edge takes
+  // off lower and lands higher, sitting wholly inside the shallower parent's like matched
+  // parentheses. Same-order stacking cannot be drawn flat: some takeoff or landing always
+  // crosses another edge's vertical. Event order decides nothing; the sort is stable, so
+  // siblings of one parent keep their order even when another parent's child interleaves them.
   const x = 2 * COLUMN_PITCH;
   const upper = { x, y: 0, width: NODE_SIZE.width, height: NODE_SIZE.height };
   const lower = { x, y: LANE_PITCH, width: NODE_SIZE.width, height: NODE_SIZE.height };
@@ -444,17 +447,22 @@ test("branch stacks follow the parents' lanes, not the order children appended",
   const child = (name, caller) => ({ name, state: "done", checkpoints: 1, stage: 5, lane: 0, shaped: false, caller });
   const rowBottom = 2 * NODE_SIZE.height + LANE_GAP;
 
-  // The LOWER parent's child appended first still sits below the upper parent's.
-  const boxes = branchPlace([child("low", "implementer"), child("up", "redteam")], bounds, rowBottom);
-  expect(boxes.get("up").y).toBeLessThan(boxes.get("low").y);
+  // Whichever order they appended, the lower parent's child sits on top.
+  for (const children of [
+    [child("low", "implementer"), child("up", "redteam")],
+    [child("up", "redteam"), child("low", "implementer")],
+  ]) {
+    const boxes = branchPlace(children, bounds, rowBottom);
+    expect(boxes.get("low").y).toBeLessThan(boxes.get("up").y);
+  }
 
   const siblings = branchPlace(
     [child("first", "redteam"), child("mid", "implementer"), child("second", "redteam")],
     bounds,
     rowBottom,
   );
+  expect(siblings.get("mid").y).toBeLessThan(siblings.get("first").y);
   expect(siblings.get("first").y).toBeLessThan(siblings.get("second").y);
-  expect(siblings.get("second").y).toBeLessThan(siblings.get("mid").y);
 });
 
 test("branch corridors stand clear of the stack and the next column, one per child", () => {
@@ -471,5 +479,51 @@ test("branch corridors stand clear of the stack and the next column, one per chi
       seen.add(at);
     }
     expect(seen.size).toBe(count);
+  }
+});
+
+test("branch caller edges nest without crossing, for parents sharing a stage", () => {
+  // The full geometry of every edge — takeoff at the parent's centre, vertical down its corridor,
+  // landing at the child's centre — checked pairwise for interior crossings. This is the claim the
+  // reverse stacking exists for, pinned as arithmetic rather than as an ordering: sorting decides
+  // nothing unless the segments it produces actually stay apart.
+  const parents = [0, 1, 2].map((lane) => ({
+    name: `p${lane}`,
+    box: { x: 0, y: lane * LANE_PITCH, width: NODE_SIZE.width, height: NODE_SIZE.height },
+  }));
+  const bounds = (name) => parents.find((p) => p.name === name)?.box;
+  const children = parents.map(({ name }, i) => ({
+    name: `c${i}`, state: "done", checkpoints: 1, stage: 5, lane: 0, shaped: false, caller: name,
+  }));
+  const rowBottom = 3 * LANE_PITCH - LANE_GAP;
+  const placed = branchPlace(children, bounds, rowBottom);
+
+  // Risers by stack position, exactly as the graph assigns them.
+  const order = [...placed.entries()].sort((a, b) => a[1].y - b[1].y).map(([name]) => name);
+  const edges = children.map((child) => {
+    const parent = bounds(child.caller);
+    const box = placed.get(child.name);
+    const k = order.indexOf(child.name);
+    const corridor = Math.max(box.x + box.width, parent.x + parent.width) + branchRiser(k, order.length);
+    const py = parent.y + parent.height / 2;
+    const cy = box.y + box.height / 2;
+    return {
+      id: child.name,
+      horizontals: [
+        { y: py, x1: parent.x + parent.width, x2: corridor },
+        { y: cy, x1: box.x + box.width, x2: corridor },
+      ],
+      vertical: { x: corridor, y1: py, y2: cy },
+    };
+  });
+
+  for (const a of edges) {
+    for (const b of edges) {
+      if (a.id === b.id) continue;
+      for (const h of a.horizontals) {
+        const crosses = h.x1 < b.vertical.x && b.vertical.x < h.x2 && b.vertical.y1 < h.y && h.y < b.vertical.y2;
+        expect(crosses).toBe(false);
+      }
+    }
   }
 });
