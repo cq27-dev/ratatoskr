@@ -52,6 +52,16 @@ export interface DerivedNode {
    * node's control, so nothing addressed here is polled.
    */
   controllable: boolean;
+  /**
+   * The box whose execution this one's invocations ran INSIDE, when the stream shows one.
+   *
+   * Resolved by walking an invocation's span parentage outward to the nearest span some other
+   * box's execution opened — through host-call spans, which belong to no box, without stopping.
+   * Absent when no chain reaches another box (a node driven by the workflow itself), and absent
+   * when two invocations resolve different callers: one box holds one place in the graph, and an
+   * anchor that fits two histories is an assertion about neither.
+   */
+  caller?: string;
 }
 
 /** The event kinds that mean a node is doing something. */
@@ -312,6 +322,17 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
    * an attempt that never ended, and a box with no aggregate of its own works forever.
    */
   const endedEarly = new Map<string, string | undefined>();
+  /**
+   * Span parentage and ownership, for resolving which box an execution ran inside.
+   *
+   * Parentage from EVERY record that names both ids — including host lifecycle records, which the
+   * node loop below never reaches — because a nested node's chain to its caller runs THROUGH the
+   * host call that drove it: answerer turn → ask host call → the asking node's turn. Ownership
+   * only for spans a node-attributed record opened; a host span belongs to no box and is exactly
+   * what the walk steps over.
+   */
+  const spanParent = new Map<string, string>();
+  const spanBox = new Map<string, string>();
 
   const make = (span: string, live: boolean, started: boolean): Attempt => ({
     span,
@@ -356,6 +377,12 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     filed(member, e, member.for(e, span, (live) => make(span, live, false)));
 
   for (const e of events) {
+    // First mention wins for both maps: a producer states an execution's parentage when it opens
+    // it, and a later record contradicting it is not evidence the tree changed.
+    if (e.span_id && e.parent_span_id && !spanParent.has(e.span_id)) {
+      spanParent.set(e.span_id, e.parent_span_id);
+    }
+    if (e.span_id && e.node && !spanBox.has(e.span_id)) spanBox.set(e.span_id, e.node);
     // An execution's own end, which names no node. It closes the invocation it names wherever that
     // is — the only thing that can, for an invocation that writes no checkpoint.
     if (e.kind === "span_end" && e.span_id) {
@@ -512,9 +539,40 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     if (WORKING.has(e.kind) && !seen.ended) seen.state = "working";
   }
 
+  /**
+   * The box this one's invocations ran inside, when every chain that resolves agrees.
+   *
+   * From the invocation's PARENT outward — its own span proves only itself — through spans no box
+   * owns, which is where host calls sit. A chain that reaches this box's own span stops without an
+   * answer: a member nested inside its box's aggregate turn is the box's own structure, not a
+   * caller. Hops are capped because parentage is producer-supplied data, and a cycle in it must
+   * cost a bounded walk rather than hang the render.
+   */
+  const callerOf = (name: string, box: { members: Map<string, Member> }): string | undefined => {
+    let found: string | undefined;
+    for (const m of box.members.values()) {
+      for (const a of m.list) {
+        let span = a.parent;
+        for (let hop = 0; span !== undefined && hop < 64; hop += 1) {
+          const owner = spanBox.get(span);
+          if (owner !== undefined) {
+            // Two invocations resolving different callers is an anchor that fits two histories,
+            // which is an assertion about neither.
+            if (owner !== name && found !== undefined && found !== owner) return undefined;
+            if (owner !== name) found = owner;
+            break;
+          }
+          span = spanParent.get(span);
+        }
+      }
+    }
+    return found;
+  };
+
   const out = new Map<string, DerivedNode>();
   for (const [name, box] of boxes) {
     const members = [...box.members.values()];
+    const caller = callerOf(name, box);
     // The box, from all of its members and its own rows. A member still working outranks
     // everything, including a failure: that is the live half a Stop has to keep reaching, and it is
     // what the box did on the way to the record it already has. Below that, the box's own record
@@ -567,6 +625,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     out.set(name, {
       state,
       checkpoints: box.checkpoints,
+      ...(caller !== undefined ? { caller } : {}),
       ...(folded ? { telemetry: folded } : {}),
       cycles: members.reduce((n, m) => n + (current(m)?.cycles ?? 0), 0),
       used: new Set(members.flatMap((m) => [...(current(m)?.used ?? [])])),
@@ -1061,16 +1120,42 @@ export function applyDerived(
   order.push(...[...unplaced.keys()].filter((name) => !derived.has(name)));
 
   const base = placed.reduce((max, n) => Math.max(max, n.stage + 1), 0);
-  const extra = order.map((name, i) => ({
-    ...fromStream(unplaced.get(name) ?? unrun(name), derived.get(name), ended, name === died),
-    stage: base + i,
-    lane: 0,
-    // These columns are this function's ordering, not a hand-off any shape declared — including
-    // for a node only the stream has seen, which arrives here with nothing said about it. What
-    // is drawn between them depends on knowing that: see `handoffDrawn`.
-    shaped: false,
-  }));
+  const extra = order.map((name, i) => {
+    // Who invoked it, with the stream's answer first: the stream watched THIS run's parentage,
+    // while the server's `caller` mirrors a known call site — the referee — and covers nothing
+    // else. Where only one has an answer, that answer stands.
+    const caller = derived.get(name)?.caller ?? unplaced.get(name)?.caller;
+    return {
+      ...fromStream(unplaced.get(name) ?? unrun(name), derived.get(name), ended, name === died),
+      stage: base + i,
+      lane: 0,
+      ...(caller !== undefined ? { caller } : {}),
+      // These columns are this function's ordering, not a hand-off any shape declared — including
+      // for a node only the stream has seen, which arrives here with nothing said about it. What
+      // is drawn between them depends on knowing that: see `handoffDrawn`.
+      shaped: false,
+    };
+  });
   return [...placed, ...extra];
+}
+
+/**
+ * The box a dynamically-invoked node hangs off, when the drawn graph can honour the anchor.
+ *
+ * Only a node the shape does not place — a declared layout is reproduced exactly — and only off a
+ * parent that holds a column of its own: one the shape placed, or one in a trailing column with no
+ * caller of its own. One level deep, deliberately. A chain of dynamic calls anchors its first link
+ * and leaves the rest in trailing columns, because the alternative — walking callers of callers —
+ * has to answer for cycles and for a parent that moved, and a trailing column is honest where a
+ * wrongly-hung box is an assertion.
+ */
+export function branchParent(
+  n: NodeView,
+  byName: ReadonlyMap<string, NodeView>,
+): string | null {
+  if (n.shaped !== false || !n.caller) return null;
+  const parent = byName.get(n.caller);
+  return parent && (parent.shaped !== false || !parent.caller) ? n.caller : null;
 }
 
 /**

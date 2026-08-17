@@ -22,6 +22,7 @@ import {
   LANE_GAP,
   LOOP_SHELF_STEP,
   NODE_SIZE,
+  branchPlace,
   crowdLimit,
   place,
   rowExtent,
@@ -35,6 +36,7 @@ import {
 } from "./layout";
 import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode, SessionScope } from "../api";
 import {
+  branchParent,
   forkHandoff,
   handoffDrawn,
   skippedSpans,
@@ -641,36 +643,57 @@ export default function PipelineGraph({
    * Deriving any of them from a second source is how the loop came to glow green while a different
    * node worked, and how a failed run's dead node went on reading "working".
    */
-  const columns = useMemo(() => stages(nodes), [nodes]);
   const byName = useMemo(() => new Map(nodes.map((n) => [n.name, n])), [nodes]);
+  /*
+   * Nodes the stream proved were invoked from inside another hang off their caller's box instead
+   * of holding trailing columns — the spine's stage/lane math never sees them, so a run with no
+   * dynamic nodes lays out exactly as before. Which nodes qualify is `branchParent`'s rule; all
+   * that is decided here is geometry.
+   */
+  const branches = useMemo(
+    () => nodes.filter((n) => branchParent(n, byName) !== null),
+    [nodes, byName],
+  );
+  const columns = useMemo(() => {
+    const anchored = new Set(branches.map((n) => n.name));
+    return stages(nodes.filter((n) => !anchored.has(n.name)));
+  }, [nodes, branches]);
 
   /*
    * Where the boxes go, computed once and read by everything that hangs off them — the boxes
    * themselves, the shelves above and below, and the rectangle the view fits. Two derivations of
    * one layout is how a shelf comes to hang off a row the boxes are no longer on.
+   *
+   * The extent is the SPINE's: the shelves hug the row, and branch boxes hang below them — an
+   * extent that included the branches would push every shelf under the boxes they annotate.
    */
-  const placed = useMemo(() => place(columns), [columns]);
-  const extent = useMemo(() => rowExtent(placed.values()), [placed]);
+  const spine = useMemo(() => place(columns), [columns]);
+  const extent = useMemo(() => rowExtent(spine.values()), [spine]);
+  const placed = useMemo(() => {
+    const all = new Map(spine);
+    for (const [name, box] of branchPlace(branches, (name) => spine.get(name), extent.bottom)) {
+      all.set(name, box);
+    }
+    return all;
+  }, [spine, branches, extent]);
   // How far a scrubbed box may grow before it covers the one under it. Off the placement, since
   // that is what says which boxes are neighbours and how tall they are.
   const crowd = useMemo(() => crowdLimit(tallestNeighbours(placed.values())), [placed]);
 
   const desiredNodes = useMemo<PipelineNodeType[]>(() => {
-    return columns.flatMap((lanes) =>
-      lanes.map((n) => {
-        const box = placed.get(n.name) ?? { x: 0, y: 0, ...NODE_SIZE };
-        return {
-          id: n.name,
-          type: "pipeline" as const,
-          position: { x: box.x, y: box.y },
-          data: { node: n, live: live.get(n.name), isSelected: selected === n.name },
-          draggable: false,
-          width: box.width,
-          height: box.height,
-        };
-      }),
-    );
-  }, [columns, placed, live, selected]);
+    return [...columns.flatMap((lanes) => lanes), ...branches].map((n) => {
+      const box = placed.get(n.name) ?? { x: 0, y: 0, ...NODE_SIZE };
+      return {
+        id: n.name,
+        type: "pipeline" as const,
+        position: { x: box.x, y: box.y },
+        data: { node: n, live: live.get(n.name), isSelected: selected === n.name },
+        draggable: false,
+        width: box.width,
+        height: box.height,
+      };
+    });
+  }, [columns, branches, placed, live, selected]);
 
   const desiredEdges = useMemo<Edge[]>(() => {
     // Every node in a stage feeds every node in the next one — which is what a fork joining back

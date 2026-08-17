@@ -136,6 +136,52 @@ export function place(
 }
 
 /**
+ * How far a branch child is indented past its parent's left edge.
+ *
+ * A quarter box: enough that the box reads as hanging off its parent rather than as another lane,
+ * and small enough that children of parents in adjacent columns cannot meet — a child reaches
+ * `x + width/4 + width`, which is inside the next column's own indent for any column pitch this
+ * layout produces.
+ */
+export const BRANCH_INDENT = NODE_SIZE.width / 4;
+/** The clearance between the loop band's bottom and the first branch child. */
+export const BRANCH_DROP = LANE_GAP;
+
+/**
+ * Where the boxes anchored to a parent go: under the loop band, indented off the parent's column,
+ * siblings of one parent stacked down in the order given.
+ *
+ * Below the loop band rather than beside the parent, because the space beside a parent belongs to
+ * the spine — the next column's boxes, the lane gap the scrub magnification grows into — and the
+ * shelves under the row are placed off the SPINE's extent, so a branch box among them would be
+ * crossed by every back-edge. A child whose parent has no box resolves to nothing here and keeps
+ * whatever placement the caller had for it.
+ */
+export function branchPlace(
+  children: readonly NodeView[],
+  parentBounds: (name: string) => Bounds | undefined,
+  rowBottom: number,
+  heightOf: (node: NodeView) => number = nodeHeight,
+): Map<string, Bounds> {
+  const out = new Map<string, Bounds>();
+  const stacked = new Map<string, number>();
+  for (const child of children) {
+    const parent = child.caller ? parentBounds(child.caller) : undefined;
+    if (!parent || !child.caller) continue;
+    const below = stacked.get(child.caller) ?? 0;
+    const height = heightOf(child);
+    out.set(child.name, {
+      x: parent.x + BRANCH_INDENT,
+      y: rowBottom + LOOP_BAND + BRANCH_DROP + below,
+      width: NODE_SIZE.width,
+      height,
+    });
+    stacked.set(child.caller, below + height + LANE_GAP);
+  }
+  return out;
+}
+
+/**
  * How far the boxes reach up and down — what the shelves hang off and the view has to fit.
  *
  * Read off the placements rather than derived from the lane count and a fixed height: a row is only

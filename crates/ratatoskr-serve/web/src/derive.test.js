@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 
 import {
   applyDerived,
+  branchParent,
   convergeLoops,
   forkHandoff,
   contiguous,
@@ -2068,4 +2069,102 @@ test("a view scrubbed to inside the history is complete whatever the buffer hold
   expect(contiguous(history, gapped, null)).toBe(false);
   // No history means even an early position sits in a bounded tail, not a complete account.
   expect(contiguous(null, gapped, "t5")).toBe(false);
+});
+
+test("a nested node resolves its caller through the host call that drove it", () => {
+  // The chain to a caller runs THROUGH spans no box owns: an answerer's turn hangs off the ask
+  // host call, whose parent is the asking node's own turn. The walk steps over the host span and
+  // anchors the box to the nearest span another box's execution opened.
+  const stages = registry(["analyst"], ["helper"]);
+  const asking = "00000000000000a1";
+  const ask = "00000000000000b1";
+  const events = [
+    attemptStart("analyst", asking, "opus"),
+    { at: "t1", kind: "span_start", span_id: ask, parent_span_id: asking, execution: "host", execution_name: "ask" },
+    { ...attemptStart("helper", "00000000000000c1", "haiku"), parent_span_id: ask },
+  ];
+  const boxes = nodesFromEvents(inNodeBoxes(events, stages));
+  expect(boxes.get("helper").caller).toBe("analyst");
+  // The asking node itself is driven by nothing the stream shows.
+  expect(boxes.get("analyst").caller).toBeUndefined();
+});
+
+test("a node driven by the run itself resolves no caller", () => {
+  // The referee's shape today: its parent is an operation host the RUN drove, and above that host
+  // there is no box. The stream honestly has no anchor — the server's mirrored call-site caller
+  // is the only answer for it, and nothing here invents one.
+  const stages = registry(["referee"]);
+  const host = "00000000000000b2";
+  const events = [
+    { at: "t0", kind: "span_start", span_id: host, parent_span_id: "00000000000000ff", execution: "host", execution_name: "iterate" },
+    { ...attemptStart("referee", "00000000000000c2", "opus"), parent_span_id: host },
+  ];
+  expect(nodesFromEvents(inNodeBoxes(events, stages)).get("referee").caller).toBeUndefined();
+});
+
+test("two invocations that resolve different callers anchor the box to neither", () => {
+  // One box holds one place in the graph. An anchor that fits two histories asserts neither, so
+  // a node invoked from two different boxes keeps its trailing column.
+  const stages = registry(["analyst"], ["scout"], ["helper"]);
+  const events = [
+    attemptStart("analyst", "00000000000000a3", "opus"),
+    attemptStart("scout", "00000000000000b3", "opus"),
+    { ...attemptStart("helper", "00000000000000c3", "haiku"), parent_span_id: "00000000000000a3" },
+    { ...attemptStart("helper", "00000000000000d3", "haiku"), parent_span_id: "00000000000000b3" },
+  ];
+  expect(nodesFromEvents(inNodeBoxes(events, stages)).get("helper").caller).toBeUndefined();
+});
+
+test("a cycle in producer parentage costs a bounded walk and anchors nothing", () => {
+  // Parentage is producer-supplied data. Two spans naming each other as parent must cost a capped
+  // walk rather than hang the render, and prove no caller.
+  const stages = registry(["helper"]);
+  const events = [
+    { at: "t0", kind: "span_start", span_id: "00000000000000a4", parent_span_id: "00000000000000b4", execution: "host", execution_name: "x" },
+    { at: "t0", kind: "span_start", span_id: "00000000000000b4", parent_span_id: "00000000000000a4", execution: "host", execution_name: "y" },
+    { ...attemptStart("helper", "00000000000000c4", "haiku"), parent_span_id: "00000000000000a4" },
+  ];
+  expect(nodesFromEvents(inNodeBoxes(events, stages)).get("helper").caller).toBeUndefined();
+});
+
+test("an unplaced node carries the stream's caller, and the server's stands where the stream is silent", () => {
+  const stages = registry(["analyst"], ["helper"]);
+  const shape = [
+    composed("analyst", "done"),
+    // The server placed `helper` from its checkpoint in a trailing column, with the caller its
+    // own resolution produced.
+    { name: "helper", state: "done", checkpoints: 1, stage: 5, lane: 0, shaped: false, caller: "scout" },
+  ];
+  // The stream watched THIS run's parentage, so its answer outranks the mirrored call site.
+  const seen = [
+    attemptStart("analyst", "00000000000000a5", "opus"),
+    { ...attemptStart("helper", "00000000000000b5", "haiku"), parent_span_id: "00000000000000a5" },
+  ];
+  const view = applyDerived(shape, nodesFromEvents(inNodeBoxes(seen, stages)));
+  expect(view.find((n) => n.name === "helper").caller).toBe("analyst");
+
+  // No parentage in the stream: the server's answer is the only one and stands.
+  const silent = [
+    attemptStart("analyst", "00000000000000a6", "opus"),
+    attemptStart("helper", "00000000000000b6", "haiku"),
+  ];
+  const kept = applyDerived(shape, nodesFromEvents(inNodeBoxes(silent, stages)));
+  expect(kept.find((n) => n.name === "helper").caller).toBe("scout");
+});
+
+test("a branch hangs only off a parent that holds a column of its own", () => {
+  const byName = new Map([
+    ["implementer", { name: "implementer", state: "done", checkpoints: 1, stage: 3, lane: 1 }],
+    ["referee", { name: "referee", state: "done", checkpoints: 1, stage: 6, lane: 0, shaped: false, caller: "implementer" }],
+    ["meta", { name: "meta", state: "done", checkpoints: 1, stage: 7, lane: 0, shaped: false, caller: "referee" }],
+    ["stray", { name: "stray", state: "done", checkpoints: 0, stage: 8, lane: 0, shaped: false, caller: "gone" }],
+  ]);
+  expect(branchParent(byName.get("referee"), byName)).toBe("implementer");
+  // One level deep: a dynamic node called by another dynamic node keeps its trailing column,
+  // because hanging it off a box that itself moved is an assertion the walk cannot stand behind.
+  expect(branchParent(byName.get("meta"), byName)).toBeNull();
+  // A caller with no box anchors nothing.
+  expect(branchParent(byName.get("stray"), byName)).toBeNull();
+  // A placed node never branches, whatever it carries.
+  expect(branchParent(byName.get("implementer"), byName)).toBeNull();
 });

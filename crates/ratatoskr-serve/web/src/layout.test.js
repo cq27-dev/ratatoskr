@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 
 import {
+  BRANCH_DROP,
+  BRANCH_INDENT,
   COLUMN_GAP,
   COLUMN_PITCH,
   LANE_GAP,
@@ -9,6 +11,7 @@ import {
   LOOP_BAND,
   SPAN_BAND,
   SPAN_RADIUS,
+  branchPlace,
   crowdLimit,
   fittedBounds,
   place,
@@ -352,4 +355,31 @@ test("finding the pair costs what the boxes cost", () => {
   const started = performance.now();
   expect(tallestNeighbours(tall)).toBe(2 * NODE_SIZE.height);
   expect(performance.now() - started).toBeLessThan(60);
+});
+
+test("a branch child hangs under the loop band, indented off its parent's column", () => {
+  // Below the band rather than beside the parent: the space beside a parent belongs to the spine,
+  // and the shelves are placed off the spine's extent — a branch box among them would be crossed
+  // by every back-edge.
+  const parent = { x: 3 * COLUMN_PITCH, y: 0, width: NODE_SIZE.width, height: NODE_SIZE.height };
+  const child = (name, caller) => ({ name, state: "done", checkpoints: 1, stage: 6, lane: 0, shaped: false, caller });
+  const rowBottom = 2 * NODE_SIZE.height + LANE_GAP;
+
+  const boxes = branchPlace(
+    [child("referee", "implementer"), child("second", "implementer"), child("stray", "gone")],
+    (name) => (name === "implementer" ? parent : undefined),
+    rowBottom,
+  );
+
+  const first = boxes.get("referee");
+  expect(first.x).toBe(parent.x + BRANCH_INDENT);
+  expect(first.y).toBe(rowBottom + LOOP_BAND + BRANCH_DROP);
+  // Siblings of one parent stack down in the order given, exactly as lanes do.
+  expect(boxes.get("second").y).toBe(first.y + first.height + LANE_GAP);
+  expect(boxes.get("second").x).toBe(first.x);
+  // A child whose parent has no box resolves to nothing here and keeps the caller's placement.
+  expect(boxes.has("stray")).toBe(false);
+  // The indent keeps a child inside its own column's reach: it must end before the next column's
+  // indent begins, for the pitch this layout produces.
+  expect(BRANCH_INDENT + NODE_SIZE.width).toBeLessThan(COLUMN_PITCH + BRANCH_INDENT);
 });
