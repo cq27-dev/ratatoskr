@@ -2126,6 +2126,32 @@ test("two invocations that resolve different callers anchor the box to neither",
   expect(view.find((n) => n.name === "helper").caller).toBeUndefined();
 });
 
+test("an answerer resolves the asker through the exchange, not the exchange's row label", () => {
+  // `NodeClarifier::answer` opens an exchange execution inside the asking node's turn, runs the
+  // answerer as its child, and writes the exchange's row — node: "clarification" — on the
+  // EXCHANGE span. A row's label names what was produced, not the execution that opened the span
+  // it rides on: reading it as ownership resolved the answerer's caller to a "clarification"
+  // box — a two-level dynamic chain the anchor rules rightly refuse — leaving the advertised
+  // answerer case in the trailing column this resolution exists to remove.
+  const stages = registry(["analyst"], ["helper"], ["clarification"]);
+  const asker = attemptStart("analyst", "00000000000000a8", "opus");
+  const exchange = {
+    at: "t1",
+    kind: "span_start",
+    span_id: "00000000000000b8",
+    parent_span_id: "00000000000000a8",
+    execution: "clarification",
+    execution_name: "clarify",
+  };
+  const answerer = { ...attemptStart("helper", "00000000000000c8", "haiku"), parent_span_id: "00000000000000b8" };
+  const row = attemptCheckpoint("clarification", "00000000000000b8", 5);
+
+  // The row may land before or after the answerer's start; neither order may claim the span.
+  for (const events of [[asker, exchange, answerer, row], [asker, exchange, row, answerer]]) {
+    expect(nodesFromEvents(inNodeBoxes(events, stages)).get("helper").caller).toBe("analyst");
+  }
+});
+
 test("a workflow-driven invocation beside a nested one anchors the box to neither", () => {
   // One invocation nested under `analyst`, one driven by the run itself — its parent chain
   // reaches no box. The box's history fits two placements, under the caller and in its own

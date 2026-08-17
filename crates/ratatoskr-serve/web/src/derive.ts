@@ -386,7 +386,15 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     if (e.span_id && e.parent_span_id && !spanParent.has(e.span_id)) {
       spanParent.set(e.span_id, e.parent_span_id);
     }
-    if (e.span_id && e.node && !spanBox.has(e.span_id)) spanBox.set(e.span_id, e.node);
+    // Ownership only from a node execution ANNOUNCING itself. Any other record's `node` labels
+    // the row it produced, not the execution that opened the span it rides on: a box's aggregate
+    // is written on its host call's span, and a clarification's row on the exchange span —
+    // reading those as ownership resolved an answerer's caller to a "clarification" box instead
+    // of THROUGH the exchange to the node that asked. A span whose start scrolled away resolves
+    // no owner, which errs toward silence and a trailing column.
+    if (e.kind === "node_start" && e.span_id && e.node && !spanBox.has(e.span_id)) {
+      spanBox.set(e.span_id, e.node);
+    }
     // An execution's own end, which names no node. It closes the invocation it names wherever that
     // is — the only thing that can, for an invocation that writes no checkpoint.
     if (e.kind === "span_end" && e.span_id) {
