@@ -22,8 +22,9 @@ import {
   LANE_GAP,
   LOOP_SHELF_STEP,
   NODE_SIZE,
+  BRANCH_TAP,
+  anchoredBranches,
   branchPlace,
-  branchRiser,
   crowdLimit,
   place,
   rowExtent,
@@ -38,7 +39,6 @@ import {
 } from "./layout";
 import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode, SessionScope } from "../api";
 import {
-  branchParent,
   forkHandoff,
   handoffDrawn,
   skippedSpans,
@@ -292,9 +292,25 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
         <NodeFacts telemetry={node.telemetry} live={data.live} planned={node.planned} />
       )}
       <Handle type="source" id="out" position={Position.Right} isConnectable={false} />
-      {/* Where a branch child receives its caller edge: the corridor runs beside the stack, so
-          the edge arrives from the right — the left side would cross the siblings above. */}
-      <Handle type="target" id="branch-in" position={Position.Right} isConnectable={false} />
+      {/* The branch tap: where a caller edge drops out of a parent and into the child hung below
+          it — a straight vertical, so the two offsets must match. Off-centre and inside the
+          column, because the gaps carry the loop shelves and the bottom centre carries the loop
+          handles; left of the converge self-loop's reach, so the drop crosses none of this
+          column's own wiring. See BRANCH_TAP. */}
+      <Handle
+        type="source"
+        id="branch-out"
+        position={Position.Bottom}
+        style={{ left: `${BRANCH_TAP * 100}%` }}
+        isConnectable={false}
+      />
+      <Handle
+        type="target"
+        id="branch-in"
+        position={Position.Top}
+        style={{ left: `${BRANCH_TAP * 100}%` }}
+        isConnectable={false}
+      />
       <Handle type="target" id="loop-in" position={Position.Bottom} isConnectable={false} />
       <Handle type="source" id="loop-out" position={Position.Bottom} isConnectable={false} />
     </div>
@@ -617,58 +633,7 @@ function SpanEdge({
   );
 }
 
-type BranchEdgeType = Edge<{ rise: number }, "branch">;
-
-/**
- * Parent to a branch child: out of the parent's right side, down the corridor beside the branch
- * stack, in through the child's right edge.
- *
- * Dedicated geometry rather than the ordinary smoothstep, because the stack shares one x: a
- * generic route into a lower child's LEFT side runs its horizontal approach straight through the
- * siblings stacked above it. The corridor sits right of the stack — inside the column gap, clear
- * of the spine's lower lanes and of the next column — and each child takes its own riser within
- * it, so two hand-offs never draw as one line.
- */
-function BranchEdge({
-  id,
-  sourceX,
-  sourceY,
-  targetX,
-  targetY,
-  data,
-  markerEnd,
-  style,
-}: EdgeProps<BranchEdgeType>) {
-  const r = SPAN_RADIUS;
-  const rise = data?.rise ?? r;
-  // Off whichever right edge reaches further: the child's box ends right of its parent's for the
-  // standard indent, but the corridor must clear both.
-  const corridor = Math.max(targetX, sourceX) + rise;
-  const path = [
-    `M ${sourceX},${sourceY}`,
-    `L ${corridor - r},${sourceY}`,
-    `Q ${corridor},${sourceY} ${corridor},${sourceY + r}`,
-    `L ${corridor},${targetY - r}`,
-    `Q ${corridor},${targetY} ${corridor - r},${targetY}`,
-    `L ${targetX},${targetY}`,
-  ].join(" ");
-  return (
-    <BaseEdge
-      id={id}
-      path={path}
-      interactionWidth={0}
-      {...(style ? { style } : {})}
-      {...(markerEnd ? { markerEnd } : {})}
-    />
-  );
-}
-
-const edgeTypes = {
-  converge: ConvergeEdge,
-  backloop: BackLoopEdge,
-  span: SpanEdge,
-  branch: BranchEdge,
-};
+const edgeTypes = { converge: ConvergeEdge, backloop: BackLoopEdge, span: SpanEdge };
 
 interface Props {
   /**
@@ -711,21 +676,19 @@ export default function PipelineGraph({
   /*
    * Nodes the stream proved were invoked from inside another hang off their caller's box instead
    * of holding trailing columns — the spine's stage/lane math never sees them, so a run with no
-   * dynamic nodes lays out exactly as before. Which nodes qualify is `branchParent`'s rule; all
-   * that is decided here is geometry.
+   * dynamic nodes lays out exactly as before. Which nodes qualify is `branchParent`'s caller rule
+   * plus `anchoredBranches`' geometric gates; all that is decided here is geometry.
    */
+  const anchoredSet = useMemo(() => anchoredBranches(nodes), [nodes]);
   const branches = useMemo(
-    () => nodes.filter((n) => branchParent(n, byName) !== null),
-    [nodes, byName],
+    () => nodes.filter((n) => anchoredSet.has(n.name)),
+    [nodes, anchoredSet],
   );
   // The spine list itself, not only its columns: everything that reasons about drawn columns —
   // the stage fans, the skipped-span jumps — must read THIS list. Deriving a jump from the
   // original `nodes` sees an anchored child still holding the trailing column it vacated, and
   // draws a span from some earlier stage to a box that is no longer in any column.
-  const spineList = useMemo(
-    () => spineNodes(nodes, new Set(branches.map((n) => n.name))),
-    [nodes, branches],
-  );
+  const spineList = useMemo(() => spineNodes(nodes, anchoredSet), [nodes, anchoredSet]);
   const columns = useMemo(() => stages(spineList), [spineList]);
 
   /*
@@ -787,42 +750,27 @@ export default function PipelineGraph({
     );
 
     /*
-     * The one in-edge an appended node can prove: its resolved caller. Where the target is a
-     * BRANCH child the edge takes the dedicated corridor geometry — the stack shares one x, and
-     * the ordinary smoothstep's approach into a lower child runs straight through the siblings
-     * above it. Each child's riser is its position in its COLUMN's stack, matching how
-     * `branchPlace` stacked the boxes, so no two corridors coincide. A trailing-column target
-     * with a caller keeps the ordinary forward edge: it sits in a column of its own.
+     * The one in-edge an appended node can prove: its resolved caller. An ANCHORED child hangs
+     * directly below its parent, and its edge is a straight vertical between the two branch
+     * taps — inside the column, left of the converge self-loop's reach, so it crosses none of
+     * the column's own loop wiring and no stage edge, which all live in the gaps. A
+     * trailing-column target with a caller keeps the ordinary forward edge: it sits in a column
+     * of its own.
      */
-    const stacks = new Map<number, string[]>();
-    for (const b of branches) {
-      const box = placed.get(b.name);
-      if (!box) continue;
-      const column = stacks.get(box.x);
-      if (column) column.push(b.name);
-      else stacks.set(box.x, [b.name]);
-    }
-    const inStack = new Map<string, { k: number; count: number }>();
-    for (const column of stacks.values()) {
-      column.sort((a, b) => (placed.get(a)?.y ?? 0) - (placed.get(b)?.y ?? 0));
-      column.forEach((name, k) => inStack.set(name, { k, count: column.length }));
-    }
     // Indexed once — scanning the whole list per caller edge is quadratic in a fan-out, and an
     // imported history does not bound how many dynamic nodes one run may call.
     const ids = new Set(edges.map((e) => e.id));
     for (const target of nodes) {
       const source = target.shaped === false && target.caller ? byName.get(target.caller) : undefined;
       if (!source) continue;
-      const at = inStack.get(target.name);
-      const edge: Edge = at
+      const edge: Edge = anchoredSet.has(target.name)
         ? {
             id: `${source.name}-${target.name}`,
             source: source.name,
             target: target.name,
-            sourceHandle: "out",
+            sourceHandle: "branch-out",
             targetHandle: "branch-in",
-            type: "branch",
-            data: { rise: branchRiser(at.k, at.count) },
+            type: "straight",
           }
         : forward(source, target);
       if (!ids.has(edge.id)) {

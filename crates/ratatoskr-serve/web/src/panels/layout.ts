@@ -8,6 +8,7 @@
  * for every lane count and every span count.
  */
 import type { NodeView } from "../api";
+import { branchParent } from "../derive";
 
 /* Pitch is the box plus the room an edge needs to turn in. Derived from NODE_SIZE rather than
  * written as a literal: the two drifted apart once already, leaving 20px for a right-angled edge
@@ -135,27 +136,33 @@ export function place(
   return placed;
 }
 
-/**
- * How far a branch child is indented past its parent's left edge.
- *
- * A quarter box: enough that the box reads as hanging off its parent rather than as another lane,
- * and small enough that children of parents in adjacent columns cannot meet — a child reaches
- * `x + width/4 + width`, which is inside the next column's own indent for any column pitch this
- * layout produces.
- */
-export const BRANCH_INDENT = NODE_SIZE.width / 4;
-/** The clearance between the loop band's bottom and the first branch child. */
+/** The clearance between the loop band's bottom and a branch child. */
 export const BRANCH_DROP = LANE_GAP;
 
 /**
- * Where the boxes anchored to a parent go: under the loop band, indented off the parent's column,
- * siblings of one parent stacked down in the order given.
+ * Where the branch tap sits along its boxes' bottom and top edges, as a fraction of the width.
  *
- * Below the loop band rather than beside the parent, because the space beside a parent belongs to
- * the spine — the next column's boxes, the lane gap the scrub magnification grows into — and the
- * shelves under the row are placed off the SPINE's extent, so a branch box among them would be
- * crossed by every back-edge. A child whose parent has no box resolves to nothing here and keeps
- * whatever placement the caller had for it.
+ * The caller edge is a straight drop from the parent's bottom into the child's top, and this is
+ * the x it runs at. Inside the column rather than in the gap, because the gaps carry the loop
+ * shelves — both back-edges run their horizontals across them, so any vertical there necessarily
+ * crosses them — and LEFT of the converge self-loop's reach, which extends `width/4` either side
+ * of the bottom centre. Between the box's corner and that reach, the drop crosses nothing this
+ * column's wiring draws; the one crossing left anywhere is the replan shelf, which spans every
+ * column between its endpoints and cannot be ducked by any x. See the clearance pin in
+ * layout.test.js before moving this.
+ */
+export const BRANCH_TAP = 0.125;
+
+/**
+ * Where the boxes anchored to a parent go: directly below it, under the loop band.
+ *
+ * Directly below, because the edge is a straight vertical at [`BRANCH_TAP`] and the child's tap
+ * must sit under its parent's. Below the loop band rather than beside the parent, because the
+ * space beside a parent belongs to the spine — the next column's boxes, the lane gap the scrub
+ * magnification grows into — and the shelves are placed off the SPINE's extent, so a branch box
+ * among them would be crossed by every back-edge. One child per column by construction: only a
+ * column's deepest lane anchors (see `anchoredBranches`), so there is nothing to stack. A child
+ * whose parent has no box resolves to nothing here and keeps whatever placement the caller had.
  */
 export function branchPlace(
   children: readonly NodeView[],
@@ -164,51 +171,54 @@ export function branchPlace(
   heightOf: (node: NodeView) => number = nodeHeight,
 ): Map<string, Bounds> {
   const out = new Map<string, Bounds>();
-  const anchored: { child: NodeView; parent: Bounds }[] = [];
   for (const child of children) {
     const parent = child.caller ? parentBounds(child.caller) : undefined;
-    if (parent) anchored.push({ child, parent });
-  }
-  // In REVERSE parent-lane order — the lower parent's child on top — and never the order the
-  // stream appended the children. The caller edges descend corridors beside the stack, nearest
-  // corridor to the topmost child, and this is the one ordering that nests them: a deeper
-  // parent's edge takes off lower and lands higher, so its whole route sits inside the shallower
-  // parent's — like matched parentheses. Same-order stacking cannot be drawn flat: whichever way
-  // the corridors are assigned, either a lower parent's takeoff crosses an upper edge's vertical
-  // on its way out, or an upper child's landing crosses a lower edge's vertical on its way in.
-  // The sort is stable, which is what keeps siblings of one parent in the order given.
-  anchored.sort((a, b) => b.parent.y - a.parent.y);
-  // Stacked per COLUMN, not per parent: two parents in different lanes of one stage share an x,
-  // so their children share a column too — keyed by caller, both first children landed on the
-  // same coordinates and drew on top of each other.
-  const stacked = new Map<number, number>();
-  for (const { child, parent } of anchored) {
-    const below = stacked.get(parent.x) ?? 0;
-    const height = heightOf(child);
+    if (!parent) continue;
     out.set(child.name, {
-      x: parent.x + BRANCH_INDENT,
-      y: rowBottom + LOOP_BAND + BRANCH_DROP + below,
+      x: parent.x,
+      y: rowBottom + LOOP_BAND + BRANCH_DROP,
       width: NODE_SIZE.width,
-      height,
+      height: heightOf(child),
     });
-    stacked.set(parent.x, below + height + LANE_GAP);
   }
   return out;
 }
 
 /**
- * How far right of a branch stack's boxes the corridor for child `k` of `count` stands.
+ * Which nodes actually hang off their caller, of those `branchParent` would allow.
  *
- * The caller edge drops down this corridor and enters its child from the right — entering from
- * the left would run the approach straight through the siblings stacked above. Distributed across
- * the gap between the stack's right edge and the next column, minus a corner's clearance, by the
- * same rule as `spanRiser` against this narrower gap: one riser per child, because siblings share
- * the corridor's range and a shared line would draw any number of hand-offs as one.
+ * Two geometric gates on top of the caller rule, both because the edge is a straight drop from
+ * the parent's bottom: the parent must be the deepest lane of its column — the drop crosses any
+ * box below it — and one child per parent, since a second child would sit below the first with
+ * its drop running through it. What these refuse keeps its trailing column, which always draws
+ * clean; a crossed wire asserts a junction that does not exist, and no anchor is better than
+ * that.
  */
-export function branchRiser(k: number, count: number): number {
-  const gap = COLUMN_PITCH - BRANCH_INDENT - NODE_SIZE.width;
-  const usable = Math.max(0, gap - 2 * SPAN_RADIUS);
-  return SPAN_RADIUS + (usable * (Math.max(0, k) + 1)) / (Math.max(1, count) + 1);
+export function anchoredBranches(nodes: readonly NodeView[]): Set<string> {
+  const byName = new Map(nodes.map((n) => [n.name, n]));
+  const taken = new Set<string>();
+  const out = new Set<string>();
+  for (const n of nodes) {
+    const caller = branchParent(n, byName);
+    if (!caller) continue;
+    const parent = byName.get(caller);
+    if (!parent) continue;
+    // Deepest among the DECLARED lanes of its column. Trailing columns hold one node each, so a
+    // trailing parent is its column's deepest trivially; a declared column's occupancy is its
+    // shaped nodes'.
+    const deepest = !nodes.some(
+      (o) =>
+        o.name !== parent.name &&
+        o.shaped !== false &&
+        parent.shaped !== false &&
+        o.stage === parent.stage &&
+        o.lane > parent.lane,
+    );
+    if (!deepest || taken.has(caller)) continue;
+    taken.add(caller);
+    out.add(n.name);
+  }
+  return out;
 }
 
 /**

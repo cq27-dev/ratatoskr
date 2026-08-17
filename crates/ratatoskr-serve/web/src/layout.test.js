@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 
 import {
   BRANCH_DROP,
-  BRANCH_INDENT,
+  BRANCH_TAP,
   COLUMN_GAP,
   COLUMN_PITCH,
   LANE_GAP,
@@ -11,8 +11,8 @@ import {
   LOOP_BAND,
   SPAN_BAND,
   SPAN_RADIUS,
+  anchoredBranches,
   branchPlace,
-  branchRiser,
   crowdLimit,
   fittedBounds,
   place,
@@ -359,51 +359,7 @@ test("finding the pair costs what the boxes cost", () => {
   expect(performance.now() - started).toBeLessThan(60);
 });
 
-test("a branch child hangs under the loop band, indented off its parent's column", () => {
-  // Below the band rather than beside the parent: the space beside a parent belongs to the spine,
-  // and the shelves are placed off the spine's extent — a branch box among them would be crossed
-  // by every back-edge.
-  const parent = { x: 3 * COLUMN_PITCH, y: 0, width: NODE_SIZE.width, height: NODE_SIZE.height };
-  const child = (name, caller) => ({ name, state: "done", checkpoints: 1, stage: 6, lane: 0, shaped: false, caller });
-  const rowBottom = 2 * NODE_SIZE.height + LANE_GAP;
 
-  const boxes = branchPlace(
-    [child("referee", "implementer"), child("second", "implementer"), child("stray", "gone")],
-    (name) => (name === "implementer" ? parent : undefined),
-    rowBottom,
-  );
-
-  const first = boxes.get("referee");
-  expect(first.x).toBe(parent.x + BRANCH_INDENT);
-  expect(first.y).toBe(rowBottom + LOOP_BAND + BRANCH_DROP);
-  // Siblings of one parent stack down in the order given, exactly as lanes do.
-  expect(boxes.get("second").y).toBe(first.y + first.height + LANE_GAP);
-  expect(boxes.get("second").x).toBe(first.x);
-  // A child whose parent has no box resolves to nothing here and keeps the caller's placement.
-  expect(boxes.has("stray")).toBe(false);
-  // The indent keeps a child inside its own column's reach: it must end before the next column's
-  // indent begins, for the pitch this layout produces.
-  expect(BRANCH_INDENT + NODE_SIZE.width).toBeLessThan(COLUMN_PITCH + BRANCH_INDENT);
-});
-
-test("children of two parents sharing a column stack instead of overlapping", () => {
-  // Two parents in different lanes of one stage share an x, so their children share a column too.
-  // Keyed by caller, both first children landed on the same coordinates and drew on top of each
-  // other; the stack is per column, in reverse parent order — the LOWER parent's child on top,
-  // which is the ordering that nests the caller edges' corridors instead of crossing them.
-  const x = 3 * COLUMN_PITCH;
-  const upper = { x, y: 0, width: NODE_SIZE.width, height: NODE_SIZE.height };
-  const lower = { x, y: LANE_PITCH, width: NODE_SIZE.width, height: NODE_SIZE.height };
-  const child = (name, caller) => ({ name, state: "done", checkpoints: 1, stage: 6, lane: 0, shaped: false, caller });
-
-  const boxes = branchPlace(
-    [child("a", "redteam"), child("b", "implementer")],
-    (name) => (name === "redteam" ? upper : name === "implementer" ? lower : undefined),
-    2 * NODE_SIZE.height + LANE_GAP,
-  );
-  expect(boxes.get("a").x).toBe(boxes.get("b").x);
-  expect(boxes.get("a").y).toBe(boxes.get("b").y + boxes.get("b").height + LANE_GAP);
-});
 
 test("an anchored node's vacated trailing column closes, and declared stages never move", () => {
   // `place` keys a column's x off `node.stage`, so a branch leaving its trailing column would
@@ -433,97 +389,81 @@ test("an anchored node's vacated trailing column closes, and declared stages nev
   expect(kept.map((n) => n.stage)).toEqual([0, 2, 3, 4]);
 });
 
-test("branch stacks reverse the parents' lanes, whatever order the children appended", () => {
-  // The caller edges descend corridors beside the stack, nearest corridor to the topmost child.
-  // Reverse parent order is the one arrangement that nests them — a deeper parent's edge takes
-  // off lower and lands higher, sitting wholly inside the shallower parent's like matched
-  // parentheses. Same-order stacking cannot be drawn flat: some takeoff or landing always
-  // crosses another edge's vertical. Event order decides nothing; the sort is stable, so
-  // siblings of one parent keep their order even when another parent's child interleaves them.
-  const x = 2 * COLUMN_PITCH;
-  const upper = { x, y: 0, width: NODE_SIZE.width, height: NODE_SIZE.height };
-  const lower = { x, y: LANE_PITCH, width: NODE_SIZE.width, height: NODE_SIZE.height };
-  const bounds = (name) => (name === "redteam" ? upper : name === "implementer" ? lower : undefined);
-  const child = (name, caller) => ({ name, state: "done", checkpoints: 1, stage: 5, lane: 0, shaped: false, caller });
+
+
+
+test("a branch child hangs directly below its parent, under the loop band", () => {
+  // Directly below, because the caller edge is a straight vertical between the two branch taps.
+  // Below the band, because the space beside a parent belongs to the spine and the shelves are
+  // placed off the spine's extent. A child whose parent has no box is left to the caller.
+  const parent = { x: 3 * COLUMN_PITCH, y: LANE_PITCH, width: NODE_SIZE.width, height: NODE_SIZE.height };
+  const child = (name, caller) => ({ name, state: "done", checkpoints: 1, stage: 6, lane: 0, shaped: false, caller });
   const rowBottom = 2 * NODE_SIZE.height + LANE_GAP;
 
-  // Whichever order they appended, the lower parent's child sits on top.
-  for (const children of [
-    [child("low", "implementer"), child("up", "redteam")],
-    [child("up", "redteam"), child("low", "implementer")],
-  ]) {
-    const boxes = branchPlace(children, bounds, rowBottom);
-    expect(boxes.get("low").y).toBeLessThan(boxes.get("up").y);
-  }
-
-  const siblings = branchPlace(
-    [child("first", "redteam"), child("mid", "implementer"), child("second", "redteam")],
-    bounds,
+  const boxes = branchPlace(
+    [child("referee", "implementer"), child("stray", "gone")],
+    (name) => (name === "implementer" ? parent : undefined),
     rowBottom,
   );
-  expect(siblings.get("mid").y).toBeLessThan(siblings.get("first").y);
-  expect(siblings.get("first").y).toBeLessThan(siblings.get("second").y);
+  expect(boxes.get("referee")).toEqual({
+    x: parent.x,
+    y: rowBottom + LOOP_BAND + BRANCH_DROP,
+    ...NODE_SIZE,
+  });
+  expect(boxes.has("stray")).toBe(false);
 });
 
-test("branch corridors stand clear of the stack and the next column, one per child", () => {
-  // The caller edge drops beside the stack and enters its child from the right; a corridor
-  // inside the stack crosses the boxes, one past the gap crosses the next column, and two
-  // children sharing a line draw two hand-offs as one.
-  const gap = COLUMN_PITCH - BRANCH_INDENT - NODE_SIZE.width;
-  for (const count of [1, 2, 3, 5, 8]) {
-    const seen = new Set();
-    for (let k = 0; k < count; k += 1) {
-      const at = branchRiser(k, count);
-      expect(at).toBeGreaterThanOrEqual(SPAN_RADIUS);
-      expect(at).toBeLessThanOrEqual(gap - SPAN_RADIUS);
-      seen.add(at);
-    }
-    expect(seen.size).toBe(count);
-  }
+test("the branch tap clears every wire its own column draws", () => {
+  // The drop runs at BRANCH_TAP of the box width, inside the column: the gaps carry the back-loop
+  // shelves, so any vertical there necessarily crosses them. Within the column the wires are the
+  // converge self-loop — reaching width/4 either side of the bottom centre — and the loop handles
+  // at the centre itself. The tap must sit strictly between the box corner and the self-loop's
+  // left edge, with a corner's clearance from each.
+  const tap = BRANCH_TAP * NODE_SIZE.width;
+  const selfLoopLeft = NODE_SIZE.width / 2 - NODE_SIZE.width / 4;
+  expect(tap).toBeGreaterThanOrEqual(SPAN_RADIUS);
+  expect(selfLoopLeft - tap).toBeGreaterThanOrEqual(SPAN_RADIUS);
 });
 
-test("branch caller edges nest without crossing, for parents sharing a stage", () => {
-  // The full geometry of every edge — takeoff at the parent's centre, vertical down its corridor,
-  // landing at the child's centre — checked pairwise for interior crossings. This is the claim the
-  // reverse stacking exists for, pinned as arithmetic rather than as an ordering: sorting decides
-  // nothing unless the segments it produces actually stay apart.
-  const parents = [0, 1, 2].map((lane) => ({
-    name: `p${lane}`,
-    box: { x: 0, y: lane * LANE_PITCH, width: NODE_SIZE.width, height: NODE_SIZE.height },
-  }));
-  const bounds = (name) => parents.find((p) => p.name === name)?.box;
-  const children = parents.map(({ name }, i) => ({
-    name: `c${i}`, state: "done", checkpoints: 1, stage: 5, lane: 0, shaped: false, caller: name,
-  }));
-  const rowBottom = 3 * LANE_PITCH - LANE_GAP;
-  const placed = branchPlace(children, bounds, rowBottom);
-
-  // Risers by stack position, exactly as the graph assigns them.
-  const order = [...placed.entries()].sort((a, b) => a[1].y - b[1].y).map(([name]) => name);
-  const edges = children.map((child) => {
-    const parent = bounds(child.caller);
-    const box = placed.get(child.name);
-    const k = order.indexOf(child.name);
-    const corridor = Math.max(box.x + box.width, parent.x + parent.width) + branchRiser(k, order.length);
-    const py = parent.y + parent.height / 2;
-    const cy = box.y + box.height / 2;
-    return {
-      id: child.name,
-      horizontals: [
-        { y: py, x1: parent.x + parent.width, x2: corridor },
-        { y: cy, x1: box.x + box.width, x2: corridor },
-      ],
-      vertical: { x: corridor, y1: py, y2: cy },
-    };
+test("only a column's deepest lane anchors, and only one child per parent", () => {
+  // The caller edge is a straight drop from the parent's bottom: a box below the parent would be
+  // crossed by it, and a second child would sit below the first with its drop running through it.
+  // What these gates refuse keeps its trailing column, which always draws clean.
+  const declared = (name, stage, lane) => ({ name, state: "done", checkpoints: 1, stage, lane });
+  const trailing = (name, stage, caller) => ({
+    name, state: "done", checkpoints: 1, stage, lane: 0, shaped: false,
+    ...(caller ? { caller } : {}),
   });
 
-  for (const a of edges) {
-    for (const b of edges) {
-      if (a.id === b.id) continue;
-      for (const h of a.horizontals) {
-        const crosses = h.x1 < b.vertical.x && b.vertical.x < h.x2 && b.vertical.y1 < h.y && h.y < b.vertical.y2;
-        expect(crosses).toBe(false);
-      }
-    }
-  }
+  // The flagship shape: the implementer is its column's deepest lane, the referee anchors.
+  const standard = [
+    declared("redteam", 3, 0),
+    declared("implementer", 3, 1),
+    trailing("referee", 6, "implementer"),
+  ];
+  expect(anchoredBranches(standard)).toEqual(new Set(["referee"]));
+
+  // A child of the UPPER lane is refused — the drop would cross the implementer's box.
+  const upper = [
+    declared("redteam", 3, 0),
+    declared("implementer", 3, 1),
+    trailing("aide", 6, "redteam"),
+  ];
+  expect(anchoredBranches(upper)).toEqual(new Set());
+
+  // A second child of one parent is refused; the first (in list order) anchors.
+  const two = [
+    declared("implementer", 3, 0),
+    trailing("referee", 6, "implementer"),
+    trailing("second", 7, "implementer"),
+  ];
+  expect(anchoredBranches(two)).toEqual(new Set(["referee"]));
+
+  // A trailing parent is its column's deepest trivially.
+  const chainRoot = [
+    declared("analyst", 0, 0),
+    trailing("helper", 5),
+    trailing("aide", 6, "helper"),
+  ];
+  expect(anchoredBranches(chainRoot)).toEqual(new Set(["aide"]));
 });
