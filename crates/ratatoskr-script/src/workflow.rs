@@ -377,6 +377,11 @@ pub struct WorkflowRuntime {
     /// real minute to every future run of the suite.
     run_span: Duration,
     run_total: Duration,
+    /// The host names the LAST entry call installed as globals, so the next call can remove what
+    /// it does not re-install. The table is each call's exactly — on a reused runtime, a host
+    /// merged in by an earlier call would otherwise still answer for a stage this call never
+    /// granted, which is the renderer-table defect (#270) wearing a different global.
+    installed_hosts: std::sync::Mutex<Vec<String>>,
 }
 
 impl WorkflowRuntime {
@@ -407,6 +412,7 @@ impl WorkflowRuntime {
             bundled: true,
             run_span: RUN_BUDGET,
             run_total: RUN_TOTAL_BUDGET,
+            installed_hosts: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -461,6 +467,7 @@ impl WorkflowRuntime {
             bundled: false,
             run_span: RUN_BUDGET,
             run_total: RUN_TOTAL_BUDGET,
+            installed_hosts: std::sync::Mutex::new(Vec::new()),
         }))
     }
 
@@ -610,6 +617,21 @@ impl WorkflowRuntime {
         let entry = entry.to_string();
         let budget = Arc::clone(&self.budget);
 
+        // What an earlier call installed and this one does not: removed before this call's table
+        // goes in, so the table is this call's exactly. Recorded up front rather than on success —
+        // a call that failed mid-install still leaves only what it actually set, and over-removing
+        // costs nothing.
+        let stale: Vec<String> = {
+            let mut installed = self.installed_hosts.lock().expect("installed hosts");
+            let stale = installed
+                .iter()
+                .filter(|name| !hosts.contains_key(name.as_str()))
+                .cloned()
+                .collect();
+            *installed = hosts.keys().cloned().collect();
+            stale
+        };
+
         within(
             &self.module_name,
             &self.runtime,
@@ -632,6 +654,17 @@ impl WorkflowRuntime {
                     .eval(HOST_WRAPPER)
                     .catch(&ctx)
                     .map_err(|e| ScriptError::Eval(format!("{e}")))?;
+
+                // A stage this call does not grant is not callable, however recently it was. The
+                // removal makes a stale call fail as an unknown name — the same refusal a host
+                // never installed gets — rather than answering with an authority this entry was
+                // never given.
+                for name in stale {
+                    ctx.globals()
+                        .remove(name.as_str())
+                        .catch(&ctx)
+                        .map_err(|e| ScriptError::Eval(format!("{e}")))?;
+                }
 
                 for (name, hostfn) in hosts {
                     let hf = hostfn.clone();
@@ -1222,6 +1255,71 @@ mod tests {
         let path = dir.join("workflow.ts");
         std::fs::write(&path, ts).unwrap();
         WorkflowRuntime::load(&path, &[]).await.unwrap().unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_host_from_an_earlier_call_does_not_answer_in_this_one() {
+        // The host table is each call's exactly. On a reused runtime, hosts merged into
+        // `globalThis` by an earlier entry call would otherwise still be callable — a stage this
+        // call never granted, answering with an authority it was never given. The stale name must
+        // fail as an unknown, exactly as a host never installed does.
+        let dir = std::env::temp_dir().join(format!(
+            "ratatoskr-workflow-test-exact-hosts-{}",
+            std::process::id()
+        ));
+        let rt = load(
+            &dir,
+            r#"
+            export async function first(input: {}) {
+                return { a: JSON.parse(await a("{}")) };
+            }
+            export async function second(input: {}) {
+                return { again: JSON.parse(await a("{}")) };
+            }
+            export async function other(input: {}) {
+                return { b: JSON.parse(await b("{}")) };
+            }
+            "#,
+        )
+        .await;
+
+        let granted = rt
+            .run(
+                "first",
+                "{}".into(),
+                HashMap::from([("a".to_string(), host(|_| async { Ok("1".to_string()) }))]),
+            )
+            .await
+            .expect("the granted host answers");
+        assert_eq!(granted, r#"{"a":1}"#);
+
+        // The next call grants only `b`. Calling `a` — installed by the call before — must fail
+        // as an unknown name, not answer from the stale table.
+        let stale = rt
+            .run(
+                "second",
+                "{}".into(),
+                HashMap::from([("b".to_string(), host(|_| async { Ok("2".to_string()) }))]),
+            )
+            .await
+            .expect_err("the stale host must not answer");
+        assert!(
+            stale.to_string().contains("a is not defined"),
+            "an unknown name, exactly as a host never installed: {stale}"
+        );
+
+        // While the host this call DID grant works, on the same reused runtime.
+        let fresh = rt
+            .run(
+                "other",
+                "{}".into(),
+                HashMap::from([("b".to_string(), host(|_| async { Ok("2".to_string()) }))]),
+            )
+            .await
+            .expect("this call's own grant answers");
+        assert_eq!(fresh, r#"{"b":2}"#);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test(flavor = "current_thread")]

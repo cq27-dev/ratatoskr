@@ -117,6 +117,11 @@ pub struct WorkflowContext {
     ceiling_replan_started: AtomicBool,
     invocations: AtomicUsize,
     iterations: AtomicU32,
+    /// Standard-stage adapter runtimes, pooled for the run; see [`WorkflowContext::adapter`].
+    standard_runtimes: Mutex<Vec<WorkflowRuntime>>,
+    /// How many adapter runtimes this run has built — the pool's growth, which is the
+    /// measurement: a sequential run builds one, however many turns it makes.
+    standard_runtimes_built: AtomicUsize,
     /// What plugins contributed for this run, prefixed to each node's preamble.
     plugin_context: crate::PluginContext,
     /// Where this run's nodes report what their turns cost. A scripted run records the same
@@ -253,7 +258,39 @@ impl WorkflowContext {
             ceiling_replan_started: AtomicBool::new(false),
             invocations: AtomicUsize::new(0),
             iterations: AtomicU32::new(0),
+            standard_runtimes: Mutex::new(Vec::new()),
+            standard_runtimes_built: AtomicUsize::new(0),
         }))
+    }
+
+    /// A standard-stage adapter runtime, leased from the run's pool and returned on drop.
+    ///
+    /// Pooled rather than built per call: the bundled source does not change during a run, and a
+    /// converge loop paid a transpile and a fresh QuickJS context for every model turn. Pooled
+    /// rather than SHARED: adapter entries NEST — the characterizer runs inside the implementer's
+    /// own turn — so serializing calls on one context would deadlock, and concurrent entries on
+    /// one context would interleave the per-entry JS ceilings. A leased runtime serves exactly
+    /// one entry at a time; sequential turns reuse one, and overlapping turns each hold their
+    /// own, so the pool's size is the run's actual adapter concurrency.
+    pub(crate) async fn adapter(self: &Arc<Self>) -> Result<AdapterLease, PlanError> {
+        let pooled = self.standard_runtimes.lock().expect("adapter pool").pop();
+        let runtime = match pooled {
+            Some(runtime) => runtime,
+            None => {
+                self.standard_runtimes_built.fetch_add(1, Ordering::Relaxed);
+                standard_runtime().await?
+            }
+        };
+        Ok(AdapterLease {
+            runtime: Some(runtime),
+            pool: Arc::clone(self),
+        })
+    }
+
+    /// How many adapter runtimes this run has built so far.
+    #[cfg(test)]
+    pub(crate) fn adapters_built(&self) -> usize {
+        self.standard_runtimes_built.load(Ordering::Relaxed)
     }
 
     /// The acceptance steps for this run, resolved from `proposed` the first time and frozen.
@@ -2630,6 +2667,33 @@ struct StandardStageInvocation {
     after_guard: bool,
 }
 
+/// A pooled adapter runtime on loan; see [`WorkflowContext::adapter`].
+pub(crate) struct AdapterLease {
+    runtime: Option<WorkflowRuntime>,
+    pool: Arc<WorkflowContext>,
+}
+
+impl std::ops::Deref for AdapterLease {
+    type Target = WorkflowRuntime;
+    fn deref(&self) -> &WorkflowRuntime {
+        self.runtime
+            .as_ref()
+            .expect("leased runtime present until drop")
+    }
+}
+
+impl Drop for AdapterLease {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            self.pool
+                .standard_runtimes
+                .lock()
+                .expect("adapter pool")
+                .push(runtime);
+        }
+    }
+}
+
 async fn execute_standard_stage(
     executor: &Arc<StageExecutor>,
     stage: Stage,
@@ -2663,7 +2727,9 @@ async fn execute_standard_stage(
     });
     let input: serde_json::Value =
         serde_json::from_str(&input_json).map_err(|error| format!("{stage_id} arg: {error}"))?;
-    let runtime = standard_runtime()
+    let runtime = executor
+        .ctx
+        .adapter()
         .await
         .map_err(|error| error.to_string())?;
     runtime
@@ -12760,6 +12826,56 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(docker, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn a_runs_adapter_runtimes_are_pooled_by_its_actual_concurrency() {
+        // The bundled source does not change during a run, and a converge loop paid a transpile
+        // and a fresh QuickJS context per model turn. Pooled rather than shared, because adapter
+        // entries nest — the characterizer runs inside the implementer's own turn — so a lease
+        // held across another lease must get its OWN runtime, while sequential turns reuse one.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-adapter-pool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let config = RatatoskrConfig::default();
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            "run-adapter-pool",
+            "reuse the adapter",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+
+        // Sequential turns — the converge loop's shape — build exactly one runtime between them.
+        for _ in 0..3 {
+            let lease = ctx.adapter().await.unwrap();
+            assert!(lease.is_bundled());
+        }
+        assert_eq!(ctx.adapters_built(), 1, "a sequential run transpiles once");
+
+        // Overlapping turns — a nested characterizer — each hold their own.
+        let outer = ctx.adapter().await.unwrap();
+        let inner = ctx.adapter().await.unwrap();
+        assert_eq!(
+            ctx.adapters_built(),
+            2,
+            "an overlapping turn builds its own"
+        );
+        drop(inner);
+        drop(outer);
+
+        // Both return to the pool: the next sequential stretch builds nothing further.
+        let again = ctx.adapter().await.unwrap();
+        drop(again);
+        assert_eq!(ctx.adapters_built(), 2);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
