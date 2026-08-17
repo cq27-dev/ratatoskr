@@ -23,6 +23,7 @@ import {
   LOOP_SHELF_STEP,
   NODE_SIZE,
   branchPlace,
+  branchRiser,
   crowdLimit,
   place,
   rowExtent,
@@ -291,6 +292,9 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
         <NodeFacts telemetry={node.telemetry} live={data.live} planned={node.planned} />
       )}
       <Handle type="source" id="out" position={Position.Right} isConnectable={false} />
+      {/* Where a branch child receives its caller edge: the corridor runs beside the stack, so
+          the edge arrives from the right — the left side would cross the siblings above. */}
+      <Handle type="target" id="branch-in" position={Position.Right} isConnectable={false} />
       <Handle type="target" id="loop-in" position={Position.Bottom} isConnectable={false} />
       <Handle type="source" id="loop-out" position={Position.Bottom} isConnectable={false} />
     </div>
@@ -483,23 +487,31 @@ function FitToPane({
   const width = useStore((s) => s.width);
   const height = useStore((s) => s.height);
   /*
-   * How deep the graph reaches, read from the nodes React Flow has actually committed.
+   * The rectangle the committed nodes occupy, read from what React Flow has actually laid out.
    *
-   * A box growing changes neither the node count nor the pane size, so without this nothing refits
-   * and the taller graph stays fitted to the bounds it had before. Taken from the store rather than
-   * from the layout the component just computed, because that number changes a render EARLIER than
-   * the nodes do: fitting on it would fit the old boxes, and by the time the new ones land nothing
-   * has changed to fit again.
+   * A box growing or MOVING changes neither the node count nor the pane size, so without this
+   * nothing refits and the graph stays fitted to the bounds it had before. Both axes: a node
+   * leaving a trailing column for a caller branch — or switching branch columns as replay
+   * completeness changes — moves horizontally with the count, the depth and the reserved bands
+   * all unchanged, and tracking depth alone left the graph zoomed for a column that no longer
+   * exists. Taken from the store rather than from the layout the component just computed, because
+   * that changes a render EARLIER than the nodes do: fitting on it would fit the old boxes, and
+   * by the time the new ones land nothing has changed to fit again. One string, so the selector
+   * compares equal when nothing moved.
    */
-  const depth = useStore((s) => {
+  const bounds = useStore((s) => {
     let top = Infinity;
     let bottom = -Infinity;
+    let left = Infinity;
+    let right = -Infinity;
     for (const node of s.nodeLookup.values()) {
-      const y = node.internals.positionAbsolute.y;
+      const { x, y } = node.internals.positionAbsolute;
       top = Math.min(top, y);
       bottom = Math.max(bottom, y + (node.measured.height ?? 0));
+      left = Math.min(left, x);
+      right = Math.max(right, x + (node.measured.width ?? 0));
     }
-    return bottom > top ? bottom - top : 0;
+    return bottom > top ? `${left}:${right}:${top}:${bottom}` : "";
   });
   useEffect(() => {
     if (moved || !initialized || count === 0 || width === 0 || height === 0) return;
@@ -521,7 +533,7 @@ function FitToPane({
   }, [
     initialized,
     count,
-    depth,
+    bounds,
     width,
     height,
     moved,
@@ -605,7 +617,58 @@ function SpanEdge({
   );
 }
 
-const edgeTypes = { converge: ConvergeEdge, backloop: BackLoopEdge, span: SpanEdge };
+type BranchEdgeType = Edge<{ rise: number }, "branch">;
+
+/**
+ * Parent to a branch child: out of the parent's right side, down the corridor beside the branch
+ * stack, in through the child's right edge.
+ *
+ * Dedicated geometry rather than the ordinary smoothstep, because the stack shares one x: a
+ * generic route into a lower child's LEFT side runs its horizontal approach straight through the
+ * siblings stacked above it. The corridor sits right of the stack — inside the column gap, clear
+ * of the spine's lower lanes and of the next column — and each child takes its own riser within
+ * it, so two hand-offs never draw as one line.
+ */
+function BranchEdge({
+  id,
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  data,
+  markerEnd,
+  style,
+}: EdgeProps<BranchEdgeType>) {
+  const r = SPAN_RADIUS;
+  const rise = data?.rise ?? r;
+  // Off whichever right edge reaches further: the child's box ends right of its parent's for the
+  // standard indent, but the corridor must clear both.
+  const corridor = Math.max(targetX, sourceX) + rise;
+  const path = [
+    `M ${sourceX},${sourceY}`,
+    `L ${corridor - r},${sourceY}`,
+    `Q ${corridor},${sourceY} ${corridor},${sourceY + r}`,
+    `L ${corridor},${targetY - r}`,
+    `Q ${corridor},${targetY} ${corridor - r},${targetY}`,
+    `L ${targetX},${targetY}`,
+  ].join(" ");
+  return (
+    <BaseEdge
+      id={id}
+      path={path}
+      interactionWidth={0}
+      {...(style ? { style } : {})}
+      {...(markerEnd ? { markerEnd } : {})}
+    />
+  );
+}
+
+const edgeTypes = {
+  converge: ConvergeEdge,
+  backloop: BackLoopEdge,
+  span: SpanEdge,
+  branch: BranchEdge,
+};
 
 interface Props {
   /**
@@ -719,17 +782,48 @@ export default function PipelineGraph({
     );
 
     /*
-     * The one in-edge an appended node can prove. The server resolves `caller` only where the
-     * record names the invocation rather than adjacency suggesting it — today the referee, which
-     * judges the implementer checkpoint fetched immediately before it — so where it is present it
-     * is the hand-off the columns above deliberately do not draw. Drawn like any other forward
-     * edge, and skipped when the caller has no box or the pair is already joined.
+     * The one in-edge an appended node can prove: its resolved caller. Where the target is a
+     * BRANCH child the edge takes the dedicated corridor geometry — the stack shares one x, and
+     * the ordinary smoothstep's approach into a lower child runs straight through the siblings
+     * above it. Each child's riser is its position in its COLUMN's stack, matching how
+     * `branchPlace` stacked the boxes, so no two corridors coincide. A trailing-column target
+     * with a caller keeps the ordinary forward edge: it sits in a column of its own.
      */
+    const stacks = new Map<number, string[]>();
+    for (const b of branches) {
+      const box = placed.get(b.name);
+      if (!box) continue;
+      const column = stacks.get(box.x);
+      if (column) column.push(b.name);
+      else stacks.set(box.x, [b.name]);
+    }
+    const inStack = new Map<string, { k: number; count: number }>();
+    for (const column of stacks.values()) {
+      column.sort((a, b) => (placed.get(a)?.y ?? 0) - (placed.get(b)?.y ?? 0));
+      column.forEach((name, k) => inStack.set(name, { k, count: column.length }));
+    }
+    // Indexed once — scanning the whole list per caller edge is quadratic in a fan-out, and an
+    // imported history does not bound how many dynamic nodes one run may call.
+    const ids = new Set(edges.map((e) => e.id));
     for (const target of nodes) {
       const source = target.shaped === false && target.caller ? byName.get(target.caller) : undefined;
       if (!source) continue;
-      const edge = forward(source, target);
-      if (!edges.some((e) => e.id === edge.id)) edges.push(edge);
+      const at = inStack.get(target.name);
+      const edge: Edge = at
+        ? {
+            id: `${source.name}-${target.name}`,
+            source: source.name,
+            target: target.name,
+            sourceHandle: "out",
+            targetHandle: "branch-in",
+            type: "branch",
+            data: { rise: branchRiser(at.k, at.count) },
+          }
+        : forward(source, target);
+      if (!ids.has(edge.id)) {
+        ids.add(edge.id);
+        edges.push(edge);
+      }
     }
 
     /*
@@ -887,7 +981,7 @@ export default function PipelineGraph({
     // Not clickable, and not focusable by tab: an edge here states a relation between two nodes and
     // has nothing to show when you pick it. See the note in `ConvergeEdge` on the hit path.
     return edges.map((e) => ({ ...e, selectable: false, focusable: false, interactionWidth: 0 }));
-  }, [byName, columns, extent, loops, nodes, handoff]);
+  }, [byName, columns, extent, loops, nodes, handoff, branches, placed]);
 
   /*
    * React Flow is a controlled component: it owns node measurement and writes the result back

@@ -57,11 +57,15 @@ export interface DerivedNode {
    *
    * Resolved by walking an invocation's span parentage outward to the nearest span some other
    * box's execution opened — through host-call spans, which belong to no box, without stopping.
-   * Absent when no chain reaches another box (a node driven by the workflow itself), and absent
-   * when two invocations resolve different callers: one box holds one place in the graph, and an
-   * anchor that fits two histories is an assertion about neither.
+   *
+   * Three states, and the difference between the empty two is load-bearing. ABSENT: the stream
+   * names no box — every chain reaches the run itself, the referee's shape — and a caller from a
+   * durable record may stand in. NULL: the stream REFUSES one — two invocations resolved
+   * different callers, or one resolved a box while another ran at the root — and that refusal is
+   * evidence, so nothing else may re-anchor what the stream contradicted. Collapsing the two let
+   * a persisted caller re-anchor a box whose complete history had explicitly refused it.
    */
-  caller?: string;
+  caller?: string | null;
 }
 
 /** The event kinds that mean a node is doing something. */
@@ -548,11 +552,15 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
    * caller. Hops are capped because parentage is producer-supplied data, and a cycle in it must
    * cost a bounded walk rather than hang the render.
    */
-  const callerOf = (name: string, box: { members: Map<string, Member> }): string | undefined => {
+  // `undefined` when the stream names no box, `null` when it REFUSES one — a refusal is evidence
+  // and must not read as silence, or a durable caller re-anchors what the stream contradicted.
+  const callerOf = (name: string, box: { members: Map<string, Member> }): string | null | undefined => {
     let found: string | undefined;
     // An invocation whose chain reaches no box at all: driven by the workflow itself, or
     // unresolvable. That is a VOTE, not an abstention — a box invoked once at the root and once
     // inside another fits two placements, which is the same conflict as two different callers.
+    // Alone it is not a refusal: every chain reaching the run is the stream having no box to
+    // name, which is where a durable record's answer legitimately stands in.
     let rooted = false;
     for (const m of box.members.values()) {
       for (const a of m.list) {
@@ -572,11 +580,12 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
         }
         // Two invocations resolving different callers is an anchor that fits two histories,
         // which is an assertion about neither.
-        if (found !== undefined && found !== owner) return undefined;
+        if (found !== undefined && found !== owner) return null;
         found = owner;
       }
     }
-    return rooted ? undefined : found;
+    if (rooted && found !== undefined) return null;
+    return found;
   };
 
   const out = new Map<string, DerivedNode>();
@@ -1140,13 +1149,23 @@ export function applyDerived(
   const extra = order.map((name, i) => {
     // Who invoked it, with the stream's answer first: the stream watched THIS run's parentage,
     // while the server's `caller` mirrors a known call site — the referee — and covers nothing
-    // else. Where only one has an answer, that answer stands. The stream's answer only from a
-    // complete account: resolution rests on every invocation agreeing, and a window that may
-    // have dropped one proves nothing by the agreement of what remains.
-    const caller =
-      (complete ? derived.get(name)?.caller : undefined) ?? unplaced.get(name)?.caller;
+    // else. The stream's answer only from a complete account: resolution rests on every
+    // invocation agreeing, and a window that may have dropped one proves nothing by the
+    // agreement of what remains. Its REFUSAL (`null`) is an answer too — the invocations
+    // contradict each other — and the durable record must not re-anchor what the stream
+    // contradicted; only genuine silence (`undefined`) lets the server's answer stand.
+    const stream = complete ? derived.get(name)?.caller : undefined;
+    const caller = stream === null ? undefined : (stream ?? unplaced.get(name)?.caller);
+    // The persisted caller is stripped before the resolved one is re-added: it rides in on the
+    // server row's spread, and leaving it there is exactly how a refusal would be undone.
+    const { caller: _persisted, ...row } = fromStream(
+      unplaced.get(name) ?? unrun(name),
+      derived.get(name),
+      ended,
+      name === died,
+    );
     return {
-      ...fromStream(unplaced.get(name) ?? unrun(name), derived.get(name), ended, name === died),
+      ...row,
       stage: base + i,
       lane: 0,
       ...(caller !== undefined ? { caller } : {}),

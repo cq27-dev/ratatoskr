@@ -2104,7 +2104,8 @@ test("a node driven by the run itself resolves no caller", () => {
 
 test("two invocations that resolve different callers anchor the box to neither", () => {
   // One box holds one place in the graph. An anchor that fits two histories asserts neither, so
-  // a node invoked from two different boxes keeps its trailing column.
+  // a node invoked from two different boxes keeps its trailing column. The refusal is `null`,
+  // not absence: it is evidence, and a durable record must not re-anchor what it contradicts.
   const stages = registry(["analyst"], ["scout"], ["helper"]);
   const events = [
     attemptStart("analyst", "00000000000000a3", "opus"),
@@ -2112,7 +2113,17 @@ test("two invocations that resolve different callers anchor the box to neither",
     { ...attemptStart("helper", "00000000000000c3", "haiku"), parent_span_id: "00000000000000a3" },
     { ...attemptStart("helper", "00000000000000d3", "haiku"), parent_span_id: "00000000000000b3" },
   ];
-  expect(nodesFromEvents(inNodeBoxes(events, stages)).get("helper").caller).toBeUndefined();
+  expect(nodesFromEvents(inNodeBoxes(events, stages)).get("helper").caller).toBeNull();
+
+  // And the refusal holds through `applyDerived`: a persisted caller — an imported run's referee
+  // row, say — must not re-anchor a box whose complete history refused the anchor. Silence lets
+  // the server's answer stand; a refusal does not.
+  const shape = [
+    composed("analyst", "done"),
+    { name: "helper", state: "done", checkpoints: 2, stage: 5, lane: 0, shaped: false, caller: "scout" },
+  ];
+  const view = applyDerived(shape, nodesFromEvents(inNodeBoxes(events, stages)), null, true);
+  expect(view.find((n) => n.name === "helper").caller).toBeUndefined();
 });
 
 test("a workflow-driven invocation beside a nested one anchors the box to neither", () => {
@@ -2126,9 +2137,10 @@ test("a workflow-driven invocation beside a nested one anchors the box to neithe
   const driven = { ...attemptStart("helper", "00000000000000d7", "haiku"), parent_span_id: "00000000000000c7" };
   const asker = attemptStart("analyst", "00000000000000a7", "opus");
 
-  // Either order: the conflict is about the history, not about which arrived last.
+  // Either order: the conflict is about the history, not about which arrived last. And it is a
+  // REFUSAL (`null`), not silence — the durable fallback must not undo it.
   for (const events of [[asker, nested, op, driven], [asker, op, driven, nested]]) {
-    expect(nodesFromEvents(inNodeBoxes(events, stages)).get("helper").caller).toBeUndefined();
+    expect(nodesFromEvents(inNodeBoxes(events, stages)).get("helper").caller).toBeNull();
   }
 });
 

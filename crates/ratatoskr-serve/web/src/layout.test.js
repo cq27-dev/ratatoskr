@@ -12,6 +12,7 @@ import {
   SPAN_BAND,
   SPAN_RADIUS,
   branchPlace,
+  branchRiser,
   crowdLimit,
   fittedBounds,
   place,
@@ -454,4 +455,21 @@ test("branch stacks follow the parents' lanes, not the order children appended",
   );
   expect(siblings.get("first").y).toBeLessThan(siblings.get("second").y);
   expect(siblings.get("second").y).toBeLessThan(siblings.get("mid").y);
+});
+
+test("branch corridors stand clear of the stack and the next column, one per child", () => {
+  // The caller edge drops beside the stack and enters its child from the right; a corridor
+  // inside the stack crosses the boxes, one past the gap crosses the next column, and two
+  // children sharing a line draw two hand-offs as one.
+  const gap = COLUMN_PITCH - BRANCH_INDENT - NODE_SIZE.width;
+  for (const count of [1, 2, 3, 5, 8]) {
+    const seen = new Set();
+    for (let k = 0; k < count; k += 1) {
+      const at = branchRiser(k, count);
+      expect(at).toBeGreaterThanOrEqual(SPAN_RADIUS);
+      expect(at).toBeLessThanOrEqual(gap - SPAN_RADIUS);
+      seen.add(at);
+    }
+    expect(seen.size).toBe(count);
+  }
 });

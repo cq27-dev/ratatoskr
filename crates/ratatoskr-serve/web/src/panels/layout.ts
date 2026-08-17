@@ -193,6 +193,21 @@ export function branchPlace(
 }
 
 /**
+ * How far right of a branch stack's boxes the corridor for child `k` of `count` stands.
+ *
+ * The caller edge drops down this corridor and enters its child from the right — entering from
+ * the left would run the approach straight through the siblings stacked above. Distributed across
+ * the gap between the stack's right edge and the next column, minus a corner's clearance, by the
+ * same rule as `spanRiser` against this narrower gap: one riser per child, because siblings share
+ * the corridor's range and a shared line would draw any number of hand-offs as one.
+ */
+export function branchRiser(k: number, count: number): number {
+  const gap = COLUMN_PITCH - BRANCH_INDENT - NODE_SIZE.width;
+  const usable = Math.max(0, gap - 2 * SPAN_RADIUS);
+  return SPAN_RADIUS + (usable * (Math.max(0, k) + 1)) / (Math.max(1, count) + 1);
+}
+
+/**
  * The spine: every node not anchored to a parent, with the trailing columns re-numbered compactly.
  *
  * `place` keys a column's x off `node.stage`, so an anchored node leaving its trailing column
