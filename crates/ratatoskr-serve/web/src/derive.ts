@@ -631,6 +631,88 @@ function fold(into: NodeTelemetry, next: NodeTelemetry): NodeTelemetry {
 }
 
 /**
+ * Whether this stream shows the red team handing the tree to the implementer — or `null` where it
+ * cannot say.
+ *
+ * The hand-off happened exactly where `redTeam()` COMPLETED and an `implement()` called after it
+ * DROVE work: a `node_start` under the implement call's span. Anything less proves less.
+ * `implement_host` waits for a red team that was called first, rejects one still in flight, and
+ * permits implementation where none was called at all — and a host announces itself before its
+ * body runs, so a failing `redTeam()` a workflow catches, the `implement()` the guard then
+ * rejects, and an `implement()` that fails in its own preparation before reaching the implementer
+ * all leave starts behind with nothing handed to anyone.
+ *
+ * `null` for a stream that announces no hosts: one from before executions announced themselves,
+ * which can prove nothing either way. A host-announcing stream that cannot show the completed
+ * hand-off is a workflow that did not make it, and that is `false` — a custom workflow may
+ * populate the same boxes through declared stages, and box state is exactly what this exists to
+ * stop inferring from.
+ */
+/**
+ * Whether the view ending at `shownAt` is a complete account from the run's beginning.
+ *
+ * The history is one read from the run's start, so a view that ends inside it — `shownAt` at or
+ * before its last event — is complete no matter what the live buffer holds: a reconnect gap sits
+ * AFTER everything such a view shows, and scrubbing back past the gap must not turn a definite
+ * answer into a fallback. Only a view that extends into the buffer (`shownAt` past the history, or
+ * `null` for the live end) needs the join checked: the buffer's first event at or before the
+ * history's last means the bounded replay overlapped what history covers and no slice fell
+ * between. Not a given — a reconnect clears the buffer while the history re-read is throttled, and
+ * joining stale history to a fresh tail leaves a gap that reads as a complete account. Both states
+ * self-heal, since the next history read advances its end past the replay's start.
+ */
+export function contiguous(
+  history: readonly LiveEvent[] | null,
+  buffer: readonly LiveEvent[],
+  shownAt: string | null,
+): boolean {
+  if (!history?.length) return false;
+  if (shownAt !== null && shownAt <= history[history.length - 1]!.at) return true;
+  // The overlap is the TAIL's, and the replay's front is not the tail's front: `trim_replay`
+  // preserves `question*` events ahead of the bounded tail — a run blocked on a human must show
+  // its question however old — so a preserved question's timestamp proves nothing about where the
+  // tail begins, and reading it as the buffer's start claimed continuity across a missing slice.
+  // Skipping the leading questions errs the safe way only: a genuine tail that happens to open
+  // with a question reads as a gap and falls back, never the reverse.
+  const tail = buffer.find((e) => !e.kind.startsWith("question"));
+  return tail === undefined || tail.at <= history[history.length - 1]!.at;
+}
+
+export function handoffEvidence(events: readonly BoxedEvent[]): boolean | null {
+  let sawHosts = false;
+  let redTeamCompleted = false;
+  const hosts = new Map<string, string>();
+  const implementCalls = new Set<string>();
+  for (const e of events) {
+    if (!e.span_id) continue;
+    if (e.execution === "host") {
+      if (e.kind === "span_start" && e.execution_name !== undefined) {
+        sawHosts = true;
+        hosts.set(e.span_id, e.execution_name);
+        if (e.execution_name === "implement" && redTeamCompleted) implementCalls.add(e.span_id);
+      }
+      if (
+        e.kind === "span_end" &&
+        e.outcome === "completed" &&
+        hosts.get(e.span_id) === "redTeam"
+      ) {
+        redTeamCompleted = true;
+      }
+      continue;
+    }
+    // The moment a tree is actually in the implementer's hands: work started UNDER the implement
+    // call. The host's own start is not it — `implement()` can fail after announcing itself and
+    // before driving anything, in its guard, its argument parsing or its worktree setup, handing
+    // nothing to anyone. Whatever happens to the implementation afterwards, the hand-off this
+    // start received is history.
+    if (e.kind === "node_start" && e.parent_span_id && implementCalls.has(e.parent_span_id)) {
+      return true;
+    }
+  }
+  return sawHosts ? false : null;
+}
+
+/**
  * How many times the implementer was re-entered, by the route that brought it back.
  *
  * `full()` returns to the implementer three different ways and the graph draws each as its own
@@ -670,17 +752,47 @@ export interface ConvergeLoops {
  * and the counts are the counts as of that point, which is what keeps the edges honest while
  * someone scrubs.
  */
-export function convergeLoops(events: readonly BoxedEvent[]): ConvergeLoops {
+export function convergeLoops(
+  events: readonly BoxedEvent[],
+  stages: readonly RunStage[],
+): ConvergeLoops {
   const out: ConvergeLoops = { fix: 0, replan: 0, retry: 0 };
   let entered = false;
   let since = new Set<string>();
+  // A host is either a Rust operation or a declared stage — `build_hosts_with_turn` refuses a
+  // stage that takes an operation's name, so the two tables are disjoint by construction — and the
+  // run's own registry says which. Derived per run rather than copied as a list of names, because
+  // a copy is a second authority: a recovery operation added in Rust would have read here as a
+  // known non-operation, and its real re-entries would have been silently discarded.
+  const declared = new Set(stages.map((stage) => stage.id));
+  // Every execution that has announced itself, so a start can say what DROVE it. The loop being
+  // counted is the standard converge operation's, and the box name cannot say that: a custom stage
+  // composed into the implementer box starts under the same box, and counting it displayed a retry
+  // no operation ever ran.
+  const drivers = new Map<string, { operation: boolean }>();
 
   for (const e of events) {
+    if (e.kind === "span_start" && e.span_id) {
+      drivers.set(e.span_id, {
+        operation:
+          e.execution === "host" &&
+          e.execution_name !== undefined &&
+          !declared.has(e.execution_name),
+      });
+      continue;
+    }
     if (!e.node || e.kind !== "node_start") continue;
     if (e.node !== "implementer") {
       since.add(e.node);
       continue;
     }
+    // Counted only where what drove it is the standard operation — or where the stream cannot say:
+    // a start with no parentage, or a parent this view never saw announce itself, is a stream from
+    // before executions had identities, and reads as it always did. A KNOWN non-operation driver —
+    // a declared stage's host, a clarification exchange — is positive evidence this was not the
+    // loop.
+    const driver = e.parent_span_id ? drivers.get(e.parent_span_id) : undefined;
+    if (driver !== undefined && !driver.operation) continue;
     if (!entered) entered = true;
     else if (since.has("analyst")) out.replan += 1;
     else if (since.has("verifier")) out.fix += 1;
@@ -715,11 +827,20 @@ export function convergeLoops(events: readonly BoxedEvent[]): ConvergeLoops {
  * same edge renders as a diagonal across the graph, duplicating the forward edge the columns
  * already draw.
  */
-export function forkHandoff(nodes: readonly NodeView[]): boolean {
+export function forkHandoff(
+  nodes: readonly NodeView[],
+  handoff: boolean | null,
+): boolean {
   const started = (name: string) => nodes.find((n) => n.name === name && n.state !== "idle");
   const redTeam = started("redteam");
   const implementer = started("implementer");
-  return !!redTeam && !!implementer && redTeam.stage === implementer.stage;
+  if (!redTeam || !implementer || redTeam.stage !== implementer.stage) return false;
+  // Drawn from [`handoffEvidence`] where the stream can give it. `null` is a stream that cannot
+  // say — one from before executions announced themselves, or a window that does not reach back to
+  // the run's beginning, where an absent record proves nothing because it may simply have scrolled
+  // out. Both fall back to the box inference, which is what every stream got before there was
+  // evidence to read.
+  return handoff ?? true;
 }
 
 /**

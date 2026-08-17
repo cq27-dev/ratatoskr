@@ -4,6 +4,8 @@ import {
   applyDerived,
   convergeLoops,
   forkHandoff,
+  contiguous,
+  handoffEvidence,
   handoffDrawn,
   inNodeBoxes,
   nodesFromEvents,
@@ -74,7 +76,7 @@ test("a completed live attempt does not revive a stale stored target", () => {
 });
 
 test("the initial implement() call is not a loop, so nothing draws x1", () => {
-  expect(convergeLoops([start("analyst"), start("implementer")])).toEqual({
+  expect(convergeLoops([start("analyst"), start("implementer")], [])).toEqual({
     fix: 0,
     replan: 0,
     retry: 0,
@@ -82,7 +84,7 @@ test("the initial implement() call is not a loop, so nothing draws x1", () => {
 });
 
 test("a verifier between two implementer starts is a direct fix", () => {
-  expect(convergeLoops([start("implementer"), start("verifier"), start("implementer")])).toEqual({
+  expect(convergeLoops([start("implementer"), start("verifier"), start("implementer")], [])).toEqual({
     fix: 1,
     replan: 0,
     retry: 0,
@@ -93,7 +95,7 @@ test("a verifier between two implementer starts is a direct fix", () => {
 // tests-not-clean path that reaches `iterate({})` without `verify()` ever running. So a referee
 // start on its own is a failed-test retry, and must never be read as the verifier's fix.
 test("a referee with no verifier is a retry, because the referee runs on both paths", () => {
-  expect(convergeLoops([start("implementer"), start("referee"), start("implementer")])).toEqual({
+  expect(convergeLoops([start("implementer"), start("referee"), start("implementer")], [])).toEqual({
     fix: 0,
     replan: 0,
     retry: 1,
@@ -107,7 +109,7 @@ test("the common real fix cycle through verifier then referee is a direct fix", 
     start("referee"),
     start("implementer"),
   ];
-  expect(convergeLoops(events)).toEqual({ fix: 1, replan: 0, retry: 0 });
+  expect(convergeLoops(events, [])).toEqual({ fix: 1, replan: 0, retry: 0 });
 });
 
 test("an analyst re-run makes it a replan even though the verifier also ran", () => {
@@ -117,11 +119,11 @@ test("an analyst re-run makes it a replan even though the verifier also ran", ()
     start("analyst"),
     start("implementer"),
   ];
-  expect(convergeLoops(events)).toEqual({ fix: 0, replan: 1, retry: 0 });
+  expect(convergeLoops(events, [])).toEqual({ fix: 0, replan: 1, retry: 0 });
 });
 
 test("re-entering with no verifier and no analyst is a retry", () => {
-  expect(convergeLoops([start("implementer"), start("implementer")])).toEqual({
+  expect(convergeLoops([start("implementer"), start("implementer")], [])).toEqual({
     fix: 0,
     replan: 0,
     retry: 1,
@@ -139,7 +141,7 @@ test("nodes outside the loop shape do not change the classification", () => {
     start("characterizer"),
     start("implementer"),
   ];
-  expect(convergeLoops(events)).toEqual({ fix: 1, replan: 0, retry: 1 });
+  expect(convergeLoops(events, [])).toEqual({ fix: 1, replan: 0, retry: 1 });
 });
 
 test("a run shaped like 414fb163 counts one of each, retry included", () => {
@@ -162,7 +164,7 @@ test("a run shaped like 414fb163 counts one of each, retry included", () => {
     start("implementer"),
     start("publisher"),
   ];
-  expect(convergeLoops(events)).toEqual({ fix: 1, replan: 1, retry: 1 });
+  expect(convergeLoops(events, [])).toEqual({ fix: 1, replan: 1, retry: 1 });
 });
 
 test("counts are those of the prefix given, never the run's final totals", () => {
@@ -174,7 +176,7 @@ test("counts are those of the prefix given, never the run's final totals", () =>
     start("analyst"),
     start("implementer"),
   ];
-  const at = (n) => convergeLoops(events.slice(0, n));
+  const at = (n) => convergeLoops(events.slice(0, n), []);
 
   expect(at(1)).toEqual({ fix: 0, replan: 0, retry: 0 });
   expect(at(2)).toEqual({ fix: 0, replan: 0, retry: 0 });
@@ -191,25 +193,25 @@ test("events belonging to no node are skipped", () => {
     { at: "2026-08-12T10:00:01Z", kind: "node_start", node: null, detail: "node started" },
     start("implementer"),
   ];
-  expect(convergeLoops(events)).toEqual({ fix: 1, replan: 0, retry: 0 });
+  expect(convergeLoops(events, [])).toEqual({ fix: 1, replan: 0, retry: 0 });
 });
 
 // The implementer cannot start before the red team has finished (`implement_host` in
 // ratatoskr-nodes/src/workflow.rs refuses to), so both boxes having started is the whole test.
 test("both the red team and the implementer having started draws the hand-off", () => {
-  expect(forkHandoff([node("redteam", "done"), node("implementer", "working")])).toBe(true);
+  expect(forkHandoff([node("redteam", "done"), node("implementer", "working")], null)).toBe(true);
 });
 
 test("a started red team alone draws no hand-off, because nothing has received the tree", () => {
-  expect(forkHandoff([node("redteam", "working"), node("implementer", "idle")])).toBe(false);
+  expect(forkHandoff([node("redteam", "working"), node("implementer", "idle")], null)).toBe(false);
 });
 
 test("neither node having started draws no hand-off", () => {
-  expect(forkHandoff([node("redteam", "idle"), node("implementer", "idle")])).toBe(false);
+  expect(forkHandoff([node("redteam", "idle"), node("implementer", "idle")], null)).toBe(false);
 });
 
 test("a workflow with no red team at all draws no hand-off from nothing", () => {
-  expect(forkHandoff([node("analyst", "done"), node("implementer", "working")])).toBe(false);
+  expect(forkHandoff([node("analyst", "done"), node("implementer", "working")], null)).toBe(false);
 });
 
 // The edge is a vertical step down the lane gap between two boxes in one column. A layout that
@@ -220,7 +222,7 @@ test("a layout that puts the two in different columns draws no lane hand-off", (
     { ...node("redteam", "done"), stage: 0 },
     { ...node("implementer", "working"), stage: 2 },
   ];
-  expect(forkHandoff(nodes)).toBe(false);
+  expect(forkHandoff(nodes, null)).toBe(false);
 });
 
 test("sharing a column is what draws it", () => {
@@ -228,11 +230,11 @@ test("sharing a column is what draws it", () => {
     { ...node("redteam", "done"), stage: 3, lane: 0 },
     { ...node("implementer", "working"), stage: 3, lane: 1 },
   ];
-  expect(forkHandoff(nodes)).toBe(true);
+  expect(forkHandoff(nodes, null)).toBe(true);
 });
 
 test("a failed red team still handed the tree over, so the hand-off is drawn", () => {
-  expect(forkHandoff([node("redteam", "failed"), node("implementer", "working")])).toBe(true);
+  expect(forkHandoff([node("redteam", "failed"), node("implementer", "working")], null)).toBe(true);
 });
 
 /** A node the shape places, at a column of its own. */
@@ -706,8 +708,8 @@ test("a re-entry is counted from the box, whichever stage announced it", () => {
     start("verifier"),
     start("implementer_attempt"),
   ];
-  expect(convergeLoops(events)).toEqual({ fix: 0, replan: 0, retry: 0 });
-  expect(convergeLoops(inNodeBoxes(events, stages))).toEqual({ fix: 1, replan: 0, retry: 0 });
+  expect(convergeLoops(events, [])).toEqual({ fix: 0, replan: 0, retry: 0 });
+  expect(convergeLoops(inNodeBoxes(events, stages), [])).toEqual({ fix: 1, replan: 0, retry: 0 });
 });
 
 test("the live map is keyed by the box, so the box draws with what its member announced", () => {
@@ -1870,4 +1872,200 @@ test("an execution that ended keeps its failure state but is no longer a control
 
   expect(nodesFromEvents(cancelled).get("characterizer").state).toBe("working");
   expect(workingNodeNames(shape, cancelled)).toEqual([]);
+});
+
+test("the hand-off is drawn from redTeam completing and implement then starting", () => {
+  // Two non-idle boxes prove the hand-off only for the Rust operations, and only in one lifecycle:
+  // `implement_host` waits for a red team that was CALLED first, rejects one still in flight, and
+  // permits implementation where none was called. Starts alone cannot tell those apart — a host
+  // announces itself before its body runs, so a failing `redTeam()` a workflow catches, and the
+  // `implement()` the guard then rejects, both leave starts behind. The evidence is redTeam's
+  // completed END before implement's start.
+  const shape = [node("redteam", "done"), node("implementer", "working")];
+  const stages = registry(["redteam"], ["implementer"]);
+  const lifecycle = (...records) =>
+    handoffEvidence(
+      inNodeBoxes(
+        records.map(([kind, name, span, outcome], i) => ({
+          at: `t${i}`,
+          kind,
+          span_id: span,
+          execution: "host",
+          execution_name: name,
+          ...(outcome ? { outcome } : {}),
+        })),
+        stages,
+      ),
+    );
+  const H1 = "00000000000000a1";
+  const H2 = "00000000000000b2";
+  const driven = {
+    at: "t9",
+    kind: "node_start",
+    node: "implementer",
+    detail: "node started",
+    span_id: "00000000000000c9",
+    parent_span_id: H2,
+  };
+
+  // The standard flow: redTeam completes, implement starts, and DRIVES the implementer's work.
+  const standard = handoffEvidence(
+    inNodeBoxes(
+      [
+        { at: "t0", kind: "span_start", span_id: H1, execution: "host", execution_name: "redTeam" },
+        { at: "t1", kind: "span_end", outcome: "completed", span_id: H1, execution: "host", execution_name: "redTeam" },
+        { at: "t2", kind: "span_start", span_id: H2, execution: "host", execution_name: "implement" },
+        driven,
+      ],
+      stages,
+    ),
+  );
+  expect(standard).toBe(true);
+  expect(forkHandoff(shape, standard)).toBe(true);
+
+  // The implement call alone is not the hand-off: it can fail in its own preparation — the guard,
+  // argument parsing, the worktree — after announcing itself and before driving anything. Until
+  // work starts under it, nothing is in the implementer's hands.
+  const stillborn = lifecycle(
+    ["span_start", "redTeam", H1],
+    ["span_end", "redTeam", H1, "completed"],
+    ["span_start", "implement", H2],
+    ["span_end", "implement", H2, "unvalidated"],
+  );
+  expect(stillborn).toBe(false);
+  expect(forkHandoff(shape, stillborn)).toBe(false);
+
+  // A failing redTeam the workflow caught, then an implement the guard rejects: both STARTED, and
+  // nothing was handed to anyone. Custom stages may then populate both boxes.
+  const caught = lifecycle(
+    ["span_start", "redTeam", H1],
+    ["span_end", "redTeam", H1, "unvalidated"],
+    ["span_start", "implement", H2],
+  );
+  expect(caught).toBe(false);
+  expect(forkHandoff(shape, caught)).toBe(false);
+
+  // implement before redTeam ever completed, and implement without any redTeam.
+  expect(
+    lifecycle(["span_start", "implement", H2], ["span_start", "redTeam", H1]),
+  ).toBe(false);
+  expect(lifecycle(["span_start", "my_probe", H1], ["span_start", "implement", H2])).toBe(false);
+
+  // A stream that announces no hosts is from before executions did: it cannot say, and the box
+  // fallback — what every stream got before there was evidence — draws the edge.
+  expect(handoffEvidence(inNodeBoxes([], stages))).toBe(null);
+  expect(forkHandoff(shape, null)).toBe(true);
+});
+test("a custom stage in the implementer box is not a converge loop", () => {
+  // The loop being counted is the standard operation's. A workflow may compose any stage into the
+  // implementer box, and its starts arrive under that box's name — counting them displayed a retry
+  // no operation ever ran. What drove a start is its parent execution, and a declared stage's host
+  // can never bear an operation's name.
+  const stages = registry(["implementer", "implementer_attempt", "my_builder"], ["analyst"]);
+  const host = (span, name) => ({
+    at: "t",
+    kind: "span_start",
+    span_id: span,
+    execution: "host",
+    execution_name: name,
+  });
+  const startUnder = (name, span, parent) => ({
+    at: "t",
+    kind: "node_start",
+    node: name,
+    detail: "node started",
+    span_id: span,
+    parent_span_id: parent,
+  });
+
+  // Driven twice by a declared host, once by the operation: one entry, no re-entries counted.
+  const custom = inNodeBoxes(
+    [
+      host("00000000000000a1", "implement"),
+      startUnder("implementer_attempt", "00000000000000b1", "00000000000000a1"),
+      host("00000000000000a2", "my_builder"),
+      startUnder("my_builder", "00000000000000b2", "00000000000000a2"),
+      startUnder("my_builder", "00000000000000b3", "00000000000000a2"),
+    ],
+    stages,
+  );
+  expect(convergeLoops(custom, stages)).toEqual({ fix: 0, replan: 0, retry: 0 });
+
+  // The same shape driven by the operation counts, and classifies as it always has.
+  const standard = inNodeBoxes(
+    [
+      host("00000000000000a1", "implement"),
+      startUnder("implementer_attempt", "00000000000000b1", "00000000000000a1"),
+      host("00000000000000a3", "iterate"),
+      startUnder("implementer_attempt", "00000000000000b4", "00000000000000a3"),
+    ],
+    stages,
+  );
+  expect(convergeLoops(standard, stages)).toEqual({ fix: 0, replan: 0, retry: 1 });
+
+  // An operation this client has never heard of still counts, because operation-ness is derived
+  // from the run's own registry — a host is a declared stage or a Rust operation, nothing else —
+  // rather than copied as a list of names. A copy was a second authority: a recovery operation
+  // added in Rust would have read as a known non-operation, and its re-entries were discarded.
+  const future = inNodeBoxes(
+    [
+      host("00000000000000a1", "implement"),
+      startUnder("implementer_attempt", "00000000000000b1", "00000000000000a1"),
+      host("00000000000000a4", "recoverBuild"),
+      startUnder("implementer_attempt", "00000000000000b5", "00000000000000a4"),
+    ],
+    stages,
+  );
+  expect(convergeLoops(future, stages)).toEqual({ fix: 0, replan: 0, retry: 1 });
+});
+
+test("a reconnect gap is not a complete account", () => {
+  // `onReset` clears the live buffer while the history re-read is throttled, so stale history gets
+  // joined to a fresh bounded tail with the slice between them missing. An absence in that slice
+  // proves nothing — a hand-off whose redTeam records fell in the gap was being suppressed as
+  // though the stream had denied it.
+  const ev = (at) => ({ at, kind: "model_text", node: "analyst", detail: "…" });
+  const history = [ev("t1"), ev("t2"), ev("t3")];
+
+  // The replay overlaps history: nothing fell between.
+  expect(contiguous(history, [ev("t3"), ev("t4")], null)).toBe(true);
+  // An empty buffer has nothing after history to miss.
+  expect(contiguous(history, [], null)).toBe(true);
+  // The replay begins after history ends: the slice between is missing, and the account is not
+  // complete — evidence read from it would prove absences it cannot.
+  expect(contiguous(history, [ev("t5")], null)).toBe(false);
+  // No history at all is the bounded tail.
+  expect(contiguous(null, [ev("t1")], null)).toBe(false);
+  expect(contiguous([], [], null)).toBe(false);
+
+  // The replay preserves `question*` events AHEAD of its bounded tail, however old — a run blocked
+  // on a human must show its question — so a preserved question's timestamp says nothing about
+  // where the tail begins. Reading it as the buffer's start claimed continuity across a missing
+  // slice, and an absence in that slice suppressed a hand-off the run made.
+  const question = { at: "t2", kind: "question", node: null, detail: "which way?" };
+  expect(contiguous(history, [question, ev("t5")], null)).toBe(false);
+  // While a tail that genuinely overlaps still proves itself past the preserved front.
+  expect(contiguous(history, [question, ev("t3"), ev("t5")], null)).toBe(true);
+  // A buffer of preserved questions alone has no tail to miss anything.
+  expect(contiguous(history, [question], null)).toBe(true);
+});
+
+test("a view scrubbed to inside the history is complete whatever the buffer holds", () => {
+  // A reconnect gap sits AFTER the history's end, so a scrub position at or before it shows
+  // nothing the gap could have swallowed — the history is one read from the run's beginning.
+  // Judging the whole timeline instead of the shown prefix turned that definite view into a
+  // fallback, and the fallback drew a hand-off the composed stages never made.
+  const ev = (at) => ({ at, kind: "model_text", node: "analyst", detail: "…" });
+  const history = [ev("t1"), ev("t2"), ev("t3")];
+  const gapped = [ev("t5")];
+
+  // Scrubbed to inside (or exactly to the end of) the history: complete despite the gap after it.
+  expect(contiguous(history, gapped, "t2")).toBe(true);
+  expect(contiguous(history, gapped, "t3")).toBe(true);
+  // Scrubbed past the history's end, the view includes the join — and the join is broken.
+  expect(contiguous(history, gapped, "t5")).toBe(false);
+  // The live end is the same question as a position past the history.
+  expect(contiguous(history, gapped, null)).toBe(false);
+  // No history means even an early position sits in a bounded tail, not a complete account.
+  expect(contiguous(null, gapped, "t5")).toBe(false);
 });

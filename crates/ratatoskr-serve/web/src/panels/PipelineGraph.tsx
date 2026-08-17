@@ -617,12 +617,25 @@ interface Props {
   live: Map<string, DerivedNode>;
   /** Implementer re-entries so far, by route. Folded from the same event prefix as `nodes`. */
   loops: ConvergeLoops;
+  /**
+   * Whether the stream shows the red-team hand-off, or `null` where it cannot say. Evidence for
+   * the edge that asserts it, instead of inference from box state that arbitrary composed stages
+   * can also produce.
+   */
+  handoff: boolean | null;
   selected: string | null;
   /** `null` clears the selection, which returns the lower pane to the combined feed. */
   onSelect: (name: string | null) => void;
 }
 
-export default function PipelineGraph({ nodes, live, loops, selected, onSelect }: Props) {
+export default function PipelineGraph({
+  nodes,
+  live,
+  loops,
+  handoff,
+  selected,
+  onSelect,
+}: Props) {
   /*
    * Everything below — boxes, edges, and the converge loop — reads `nodes` and nothing else.
    * Deriving any of them from a second source is how the loop came to glow green while a different
@@ -708,7 +721,7 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
      * without a red team draws nothing. A short vertical line down the lane gap, unlabelled and
      * untinted: it is a forward hand-off and should look like the other forward edges.
      */
-    if (forkHandoff(nodes)) {
+    if (forkHandoff(nodes, handoff)) {
       edges.push({
         id: "redteam-implementer",
         source: "redteam",
@@ -850,7 +863,7 @@ export default function PipelineGraph({ nodes, live, loops, selected, onSelect }
     // Not clickable, and not focusable by tab: an edge here states a relation between two nodes and
     // has nothing to show when you pick it. See the note in `ConvergeEdge` on the hit path.
     return edges.map((e) => ({ ...e, selectable: false, focusable: false, interactionWidth: 0 }));
-  }, [byName, columns, extent, loops, nodes]);
+  }, [byName, columns, extent, loops, nodes, handoff]);
 
   /*
    * React Flow is a controlled component: it owns node measurement and writes the result back
