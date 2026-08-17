@@ -2546,3 +2546,23 @@ test("the box's own aggregate is not a member state", () => {
   // The self-staged analyst's one member IS itself, so it reports no member states.
   expect(boxes.get("analyst").memberStates).toBeUndefined();
 });
+
+test("a member that failed stays failed in the strip, without failing the box", () => {
+  // A checkpoint's error is the event contract's failure signal, and the strip reads member
+  // states directly — flattening a member's error to done drew a failed substage as completed.
+  // The BOX still fails only on its own record, exactly as before: the classifier erring is a
+  // fact about the classifier, and the box works on while the author runs.
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const events = inNodeBoxes(
+    [
+      start("redteam_classifier"),
+      { ...checkpointed("redteam_classifier"), error: "no baseline" },
+      start("redteam_author"),
+    ],
+    stages,
+  );
+  const box = nodesFromEvents(events).get("redteam");
+  expect(box.memberStates.get("redteam_classifier")).toBe("failed");
+  expect(box.memberStates.get("redteam_author")).toBe("working");
+  expect(box.state).toBe("working");
+});

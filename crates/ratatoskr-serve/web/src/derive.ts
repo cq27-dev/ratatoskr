@@ -632,11 +632,14 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // the box finished, and for a box that is itself a stage its own record is one member's too.
       //
       // An error is the only thing that tells a failed member from a finished one: both write a
-      // checkpoint, and the fact of one proves only that the invocation stopped. Only the box's own
-      // record can fail the box, as before.
+      // checkpoint, and the fact of one proves only that the invocation stopped. The MEMBER keeps
+      // its failure — an error on a checkpoint is the event contract's failure signal, and the
+      // stage strip reads member states directly, so flattening it to done drew a failed substage
+      // as completed — while the BOX still fails only on its own record: the box-state clause
+      // below consults the box's own member alone, exactly as before.
       const attempt = attemptFor(member, e, span);
       member.end(attempt);
-      attempt.state = own && e.error ? "failed" : "done";
+      attempt.state = e.error ? "failed" : "done";
       if (own) box.checkpoints += 1;
       attempt.telemetry = {
         ...(attempt.telemetry ?? blank()),
