@@ -5,6 +5,7 @@ import {
   convergeLoops,
   contiguous,
   handoffEvidence,
+  transitions,
   inNodeBoxes,
   nodesFromEvents,
   stagesOf,
@@ -543,6 +544,20 @@ export default function App() {
     [boxedShown, complete],
   );
 
+  /**
+   * The edge that was just traversed — the last hand-off at or before the cursor.
+   *
+   * A fold of the shown prefix like everything else drawn from the stream, which is what makes it
+   * correct under scrubbing for free: scrub back before a hand-off and it never happened yet.
+   * Only from a complete account, the same fact every stream claim gates on: a bounded tail or a
+   * reconnect gap can open mid-run, and a fold that starts after an unseen hand-off pulses an
+   * edge that was not the last real transition.
+   */
+  const transition = useMemo(
+    () => (complete ? (transitions(boxedShown).at(-1) ?? null) : null),
+    [boxedShown, complete],
+  );
+
   /*
    * Leaving a run drops everything read for it.
    *
@@ -670,6 +685,7 @@ export default function App() {
                 live={live}
                 loops={loops}
                 handoff={handoff}
+                transition={transition}
                 selected={node}
                 onSelect={setNode}
               />

@@ -41,6 +41,7 @@ import {
 } from "./layout";
 import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode, SessionScope } from "../api";
 import {
+  type Transition,
   forkHandoff,
   handoffDrawn,
   skippedSpans,
@@ -250,13 +251,42 @@ function stages(nodes: NodeView[]): NodeView[][] {
     .map(([, lanes]) => lanes.sort((a, b) => a.lane - b.lane));
 }
 
-type PipelineNodeData = { node: NodeView; live: DerivedNode | undefined; isSelected: boolean };
+/**
+ * The box to pulse when the latest transition has no drawn edge, or `null` when an edge carries
+ * it.
+ *
+ * A pair can be undrawable on purpose: a node invoked by two different boxes anchors nowhere and
+ * chains from nothing — the graph deliberately refuses every in-edge for it — yet the hand-off
+ * still happened. Pulsing a nonexistent edge would assert a relation the graph refuses; pulsing
+ * the box asserts only what the record proved, that it just became active.
+ */
+export function pulsedBox(
+  transition: Transition | null,
+  edges: readonly { source: string; target: string }[],
+): string | null {
+  if (!transition) return null;
+  const drawn = edges.some((e) => e.source === transition.from && e.target === transition.to);
+  return drawn ? null : transition.to;
+}
+
+type PipelineNodeData = {
+  node: NodeView;
+  live: DerivedNode | undefined;
+  isSelected: boolean;
+  /** Whether this box just became active with no drawn edge to carry the pulse; see [`pulsedBox`]. */
+  entered: boolean;
+};
 type PipelineNodeType = Node<PipelineNodeData, "pipeline">;
 
 /** One pipeline node: name, live dot, state, and its checkpoint count. */
 function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
   const { node, isSelected } = data;
-  const cls = ["node", `node--${node.state}`, isSelected ? "node--selected" : ""]
+  const cls = [
+    "node",
+    `node--${node.state}`,
+    isSelected ? "node--selected" : "",
+    data.entered ? "node--entered" : "",
+  ]
     .filter(Boolean)
     .join(" ");
 
@@ -671,6 +701,13 @@ interface Props {
    * can also produce.
    */
   handoff: boolean | null;
+  /**
+   * The edge that was just traversed — the last hand-off at or before the shown position — or
+   * `null` before anything has. Which edge lights is decided here by matching endpoints, so the
+   * pulse lands on whatever the pair is drawn as: a stage edge, a caller drop, the converge
+   * self-loop, or a back-loop.
+   */
+  transition: Transition | null;
   selected: string | null;
   /** `null` clears the selection, which returns the lower pane to the combined feed. */
   onSelect: (name: string | null) => void;
@@ -681,6 +718,7 @@ export default function PipelineGraph({
   live,
   loops,
   handoff,
+  transition,
   selected,
   onSelect,
 }: Props) {
@@ -731,21 +769,6 @@ export default function PipelineGraph({
   // How far a scrubbed box may grow before it covers the one under it. Off the placement, since
   // that is what says which boxes are neighbours and how tall they are.
   const crowd = useMemo(() => crowdLimit(tallestNeighbours(placed.values())), [placed]);
-
-  const desiredNodes = useMemo<PipelineNodeType[]>(() => {
-    return [...columns.flatMap((lanes) => lanes), ...branches].map((n) => {
-      const box = placed.get(n.name) ?? { x: 0, y: 0, ...NODE_SIZE };
-      return {
-        id: n.name,
-        type: "pipeline" as const,
-        position: { x: box.x, y: box.y },
-        data: { node: n, live: live.get(n.name), isSelected: selected === n.name },
-        draggable: false,
-        width: box.width,
-        height: box.height,
-      };
-    });
-  }, [columns, branches, placed, live, selected]);
 
   const desiredEdges = useMemo<Edge[]>(() => {
     // Every node in a stage feeds every node in the next one — which is what a fork joining back
@@ -982,8 +1005,49 @@ export default function PipelineGraph({
     }
     // Not clickable, and not focusable by tab: an edge here states a relation between two nodes and
     // has nothing to show when you pick it. See the note in `ConvergeEdge` on the hit path.
-    return edges.map((e) => ({ ...e, selectable: false, focusable: false, interactionWidth: 0 }));
-  }, [byName, columns, extent, loops, nodes, spineList, handoff, branches, placed]);
+    //
+    // The traversed edge is tagged by its ENDPOINTS, not by kind: the last hand-off lights
+    // whatever the pair is drawn as — a stage edge, a caller drop, the converge self-loop
+    // (from === to), or a back-loop. Composed onto whatever class the edge already carries,
+    // for the same reason the loops compose `is-live`.
+    return edges.map((e) => {
+      const traversed =
+        transition !== null && e.source === transition.from && e.target === transition.to;
+      const className = [e.className, traversed ? "is-traversed" : ""].filter(Boolean).join(" ");
+      return {
+        ...e,
+        selectable: false,
+        focusable: false,
+        interactionWidth: 0,
+        ...(className ? { className } : {}),
+      };
+    });
+  }, [byName, columns, extent, loops, nodes, spineList, handoff, branches, placed, transition]);
+  // Where the pulse lands when no edge can carry it. Decided from the edges actually being
+  // drawn, so the fallback and the edge tag can never both fire — or neither.
+  const pulsed = useMemo(() => pulsedBox(transition, desiredEdges), [transition, desiredEdges]);
+
+
+  const desiredNodes = useMemo<PipelineNodeType[]>(() => {
+    return [...columns.flatMap((lanes) => lanes), ...branches].map((n) => {
+      const box = placed.get(n.name) ?? { x: 0, y: 0, ...NODE_SIZE };
+      return {
+        id: n.name,
+        type: "pipeline" as const,
+        position: { x: box.x, y: box.y },
+        data: {
+          node: n,
+          live: live.get(n.name),
+          isSelected: selected === n.name,
+          entered: pulsed === n.name,
+        },
+        draggable: false,
+        width: box.width,
+        height: box.height,
+      };
+    });
+  }, [columns, branches, placed, live, selected, pulsed]);
+
 
   /*
    * React Flow is a controlled component: it owns node measurement and writes the result back

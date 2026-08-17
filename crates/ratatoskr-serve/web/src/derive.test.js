@@ -12,6 +12,7 @@ import {
   nodesFromEvents,
   skippedSpans,
   stagesOf,
+  transitions,
   workingNodeNames,
 } from "./derive";
 
@@ -2275,4 +2276,231 @@ test("a branch hangs only off a parent that holds a column of its own", () => {
   expect(branchParent(byName.get("stray"), byName)).toBeNull();
   // A placed node never branches, whatever it carries.
   expect(branchParent(byName.get("implementer"), byName)).toBeNull();
+});
+
+test("the last transition at any prefix is the edge that just lit", () => {
+  // A fold of the shown prefix, so scrubbing is free: back before a hand-off, it has not happened.
+  const stages = registry(["analyst"], ["implementer"]);
+  const events = inNodeBoxes(
+    [start("analyst"), checkpointed("analyst"), start("implementer")],
+    stages,
+  );
+
+  expect(transitions(events.slice(0, 0))).toEqual([]);
+  expect(transitions(events.slice(0, 1)).at(-1)).toEqual({
+    from: null,
+    to: "analyst",
+    at: events[0].at,
+  });
+  // The checkpoint alone changes nothing — a box ending is not a traversal.
+  expect(transitions(events.slice(0, 2)).at(-1).to).toBe("analyst");
+  expect(transitions(events).at(-1)).toEqual({
+    from: "analyst",
+    to: "implementer",
+    at: events[2].at,
+  });
+});
+
+test("the converge self-loop reads as implementer to implementer", () => {
+  const stages = registry(["implementer"]);
+  const events = inNodeBoxes(
+    [start("implementer"), checkpointed("implementer"), start("implementer")],
+    stages,
+  );
+  expect(transitions(events).at(-1)).toEqual({
+    from: "implementer",
+    to: "implementer",
+    at: events[2].at,
+  });
+});
+
+test("member churn inside a box is not a transition", () => {
+  // The classifier finishing while the author starts is the box working, not the graph moving —
+  // a member's checkpoint must not end the box, or the author's start invents a self-loop.
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const events = inNodeBoxes(
+    [
+      start("redteam_classifier"),
+      checkpointed("redteam_classifier"),
+      start("redteam_author"),
+    ],
+    stages,
+  );
+  const seen = transitions(events);
+  expect(seen).toHaveLength(1);
+  expect(seen[0].to).toBe("redteam");
+});
+
+test("a transition's from is provenance before adjacency", () => {
+  const stages = registry(["implementer"], ["verifier"], ["referee"], ["analyst"], ["helper"]);
+
+  // Stated: the referee starts while the verifier was the last box settled, and the statement
+  // names the implementer — the edge that lights is the caller drop, not verifier adjacency.
+  const host = "00000000000000e1";
+  const stated = inNodeBoxes(
+    [
+      start("verifier"),
+      checkpointed("verifier"),
+      { at: "t0", kind: "span_start", span_id: host, parent_span_id: "00000000000000ff", execution: "host", execution_name: "iterate" },
+      { ...attemptStart("referee", "00000000000000e2", "opus"), parent_span_id: host, caller: "implementer" },
+    ],
+    stages,
+  );
+  expect(transitions(stated).at(-1)).toMatchObject({ from: "implementer", to: "referee" });
+
+  // Walked: an answerer resolves the asker through the exchange, whatever settled before it.
+  const asking = "00000000000000e3";
+  const exchange = "00000000000000e4";
+  const walked = inNodeBoxes(
+    [
+      start("verifier"),
+      checkpointed("verifier"),
+      attemptStart("analyst", asking, "opus"),
+      { at: "t1", kind: "span_start", span_id: exchange, parent_span_id: asking, execution: "clarification", execution_name: "clarify" },
+      { ...attemptStart("helper", "00000000000000e5", "haiku"), parent_span_id: exchange },
+    ],
+    stages,
+  );
+  expect(transitions(walked).at(-1)).toMatchObject({ from: "analyst", to: "helper" });
+});
+
+test("a box's own record does not end it while a peer is still live", () => {
+  // A box that is itself a stage can write its own row while a composed peer still runs — the
+  // exact case nodesFromEvents keeps working. Clearing the active box there let the peer's next
+  // start invent a review -> review self-loop the run never made.
+  const stages = registry(["review", "review", "security"]);
+  const events = inNodeBoxes(
+    [
+      attemptStart("review", "00000000000000f1", "opus"),
+      attemptStart("security", "00000000000000f2", "haiku"),
+      attemptCheckpoint("review", "00000000000000f1", 5),
+      attemptStart("security", "00000000000000f3", "haiku"),
+    ],
+    stages,
+  );
+  const seen = transitions(events);
+  expect(seen).toHaveLength(1);
+  expect(seen[0].to).toBe("review");
+
+  // Once the peer drains too, the box is over, and a re-entry is a real self-loop again.
+  const drained = inNodeBoxes(
+    [
+      attemptStart("review", "00000000000000f4", "opus"),
+      attemptStart("security", "00000000000000f5", "haiku"),
+      attemptCheckpoint("review", "00000000000000f4", 5),
+      attemptCheckpoint("security", "00000000000000f5", 5),
+      attemptStart("review", "00000000000000f6", "opus"),
+    ],
+    stages,
+  );
+  expect(transitions(drained).at(-1)).toMatchObject({ from: "review", to: "review" });
+});
+
+test("a concurrent second invocation is not a new activation", () => {
+  // Workflows may run hosts concurrently: A starts, B starts, and A's SECOND invocation lands
+  // while its first is still live. Comparing against a single last-started box read that as a
+  // fresh activation and pulsed a B -> A hand-off that never happened — execution never left A,
+  // so the pulse belongs on the transition into B.
+  const stages = registry(["alpha"], ["beta"]);
+  const events = inNodeBoxes(
+    [
+      attemptStart("alpha", "00000000000000f7", "opus"),
+      attemptStart("beta", "00000000000000f8", "opus"),
+      attemptStart("alpha", "00000000000000f9", "opus"),
+    ],
+    stages,
+  );
+  const seen = transitions(events);
+  expect(seen).toHaveLength(2);
+  expect(seen.at(-1)).toMatchObject({ from: "alpha", to: "beta" });
+});
+
+test("a peer starting mid-cycle does not erase the box's completion", () => {
+  // The box's own checkpoint lands while one peer is live, and ANOTHER peer starts before the
+  // first drains. Resetting the latch on every start erased that completion, the cycle could
+  // then never close, and the next genuine re-entry was swallowed instead of drawing its
+  // self-loop.
+  const stages = registry(["review", "review", "security"]);
+  const events = inNodeBoxes(
+    [
+      attemptStart("review", "0000000000000101", "opus"),
+      attemptStart("security", "0000000000000102", "haiku"),
+      attemptCheckpoint("review", "0000000000000101", 5),
+      attemptStart("security", "0000000000000103", "haiku"),
+      attemptCheckpoint("security", "0000000000000102", 5),
+      attemptCheckpoint("security", "0000000000000103", 5),
+      attemptStart("review", "0000000000000104", "opus"),
+    ],
+    stages,
+  );
+  expect(transitions(events).at(-1)).toMatchObject({ from: "review", to: "review" });
+});
+
+test("a lifecycle end closes a checkpoint-free cycle", () => {
+  // An evidence-only stage or an answerer legitimately writes no checkpoint; its own execution's
+  // end is its completion. Without reading it, the cycle never closed and every later hand-off
+  // into that box was swallowed as though the first invocation still ran.
+  const stages = registry(["characterizer"]);
+  const events = inNodeBoxes(
+    [
+      attemptStart("characterizer", "0000000000000105", "opus"),
+      { at: "t1", kind: "span_end", outcome: "completed", span_id: "0000000000000105", execution: "node", execution_name: "characterizer" },
+      attemptStart("characterizer", "0000000000000106", "opus"),
+    ],
+    stages,
+  );
+  const seen = transitions(events);
+  expect(seen).toHaveLength(2);
+  expect(seen.at(-1)).toMatchObject({ from: "characterizer", to: "characterizer" });
+});
+
+test("a turn ending is not the box finishing — the boundary is", () => {
+  // An ordinary stage's execution ends BEFORE its host validates and writes the checkpoint —
+  // exactly where the node fold refuses to settle the turn. Completing the box on the raw end
+  // closed its cycle in that window, and a composed peer starting there read as a fresh
+  // transition the run never made.
+  const stages = registry(["review", "review", "security"]);
+  const host = "0000000000000110";
+  const events = inNodeBoxes(
+    [
+      { at: "t0", kind: "span_start", span_id: host, parent_span_id: "00000000000000ff", execution: "host", execution_name: "review_host" },
+      { ...attemptStart("review", "0000000000000111", "opus"), parent_span_id: host },
+      // The turn returns; validation and the checkpoint are still to come.
+      { at: "t1", kind: "span_end", outcome: "completed", span_id: "0000000000000111", execution: "node", execution_name: "review" },
+      { ...attemptStart("security", "0000000000000112", "haiku"), parent_span_id: host },
+    ],
+    stages,
+  );
+  const seen = transitions(events);
+  expect(seen).toHaveLength(1);
+  expect(seen[0].to).toBe("review");
+});
+
+test("a checkpoint-free box completes at its boundary, in either order", () => {
+  // The answerer/evidence-only shape: no checkpoint ever, so the own turn's completed end plus
+  // the completed end of the execution that invoked it are what finish the box — whichever
+  // arrives second. Only then does a re-entry read as the self-loop.
+  const stages = registry(["characterizer"]);
+  const hostOf = (span) => `00000000000001${span}`;
+  const turn = (span) => [
+    { at: "t0", kind: "span_start", span_id: hostOf(span), parent_span_id: "00000000000000ff", execution: "host", execution_name: "characterize" },
+    { ...attemptStart("characterizer", `00000000000000${span}`, "opus"), parent_span_id: hostOf(span) },
+  ];
+  const childEnd = (span, at) => ({ at, kind: "span_end", outcome: "completed", span_id: `00000000000000${span}`, execution: "node", execution_name: "characterizer" });
+  const hostEnd = (span, at) => ({ at, kind: "span_end", outcome: "completed", span_id: hostOf(span), execution: "host", execution_name: "characterize" });
+
+  for (const first of [
+    // Turn end first, boundary second — the usual order.
+    [...turn("21"), childEnd("21", "t1"), hostEnd("21", "t2")],
+    // Boundary's end seen first — an imported tail may interleave them.
+    [...turn("22"), hostEnd("22", "t1"), childEnd("22", "t2")],
+  ]) {
+    const events = inNodeBoxes(
+      [...first, attemptStart("characterizer", "0000000000000123", "opus")],
+      stages,
+    );
+    const seen = transitions(events);
+    expect(seen).toHaveLength(2);
+    expect(seen.at(-1).to).toBe("characterizer");
+  }
 });
