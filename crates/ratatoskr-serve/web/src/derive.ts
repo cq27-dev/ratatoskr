@@ -304,20 +304,35 @@ export interface Transition {
 export function transitions(events: readonly BoxedEvent[]): Transition[] {
   const index = spanIndex();
   const out: Transition[] = [];
+  /** The box most recently transitioned into — the `from` fallback of last resort. */
   let active: string | null = null;
   let settled: string | null = null;
   /**
-   * The invocations of each box still running, and whether its own record has landed.
-   *
-   * Both halves gate the box ENDING, because execution has not left a box until its own record
-   * exists AND nothing of it is still live — a box that is itself a stage can write its own row
-   * while a composed peer still runs, exactly the case `nodesFromEvents` keeps working, and
-   * clearing the box there let the peer's next start invent a self-loop the run never made.
-   * Keyed as the attempts are keyed: the span, or the one-unidentified-attempt stand-in.
+   * Each box's CYCLE: opened by its first start, closed when its own completion has landed and
+   * nothing of it is still live. The cycle is what a transition is about — a start inside an
+   * open cycle is more work in a box execution never left, whether that is member churn, a
+   * concurrent second invocation, or a peer beside a box that already wrote its own row.
+   * Comparing against a single last-started box instead treated A's second concurrent start as
+   * a new activation and pulsed a B → A hand-off that never happened.
    */
+  const open = new Set<string>();
+  /** Live invocations per box, keyed as the attempts are keyed. */
   const live = new Map<string, Set<string>>();
+  /**
+   * Whether the box's own completion has landed this cycle: its OWN checkpoint, or the lifecycle
+   * end of an invocation that IS the box — an evidence-only stage or an answerer writes no
+   * checkpoint, and a cycle nothing can close would swallow every later hand-off into that box.
+   */
   const ownDone = new Set<string>();
-  const over = (name: string) => ownDone.has(name) && (live.get(name)?.size ?? 0) === 0;
+  /** Spans opened by a box's OWN invocation (`member === node`), whose lifecycle end completes
+   *  the cycle the way the box's own checkpoint does. */
+  const ownSpan = new Set<string>();
+  const closeIfOver = (name: string) => {
+    if (open.has(name) && ownDone.has(name) && (live.get(name)?.size ?? 0) === 0) {
+      open.delete(name);
+      if (active === name) active = null;
+    }
+  };
   for (const e of events) {
     index.note(e);
     // An execution ending closes its invocation wherever it is — the only closer for one that
@@ -326,18 +341,30 @@ export function transitions(events: readonly BoxedEvent[]): Transition[] {
       const owner = index.boxOf(e.span_id);
       if (owner !== undefined) {
         live.get(owner)?.delete(e.span_id);
-        if (active === owner && over(owner)) active = null;
+        if (ownSpan.has(e.span_id)) {
+          ownDone.add(owner);
+          // A COMPLETED own end is also the box settling, for the `from` fallback: a
+          // checkpoint-free box that finished is what the next start was handed off from. A
+          // cancelled one handed nothing off and settles nobody.
+          if (e.outcome === "completed") settled = owner;
+        }
+        closeIfOver(owner);
       }
     }
     if (!e.node) continue;
     const key = e.span_id ?? `unidentified:${e.member ?? e.node}`;
     if (e.kind === "node_start") {
+      if ((e.member ?? e.node) === e.node && e.span_id) ownSpan.add(e.span_id);
       const running = live.get(e.node);
       if (running) running.add(key);
       else live.set(e.node, new Set([key]));
-      // A new invocation reopens the box's cycle: its own record is this cycle's to write.
-      ownDone.delete(e.node);
-      if (e.node !== active) {
+      if (!open.has(e.node)) {
+        open.add(e.node);
+        // The latch is a NEW cycle's to earn — reset here and only here. Resetting it on every
+        // start let a peer's mid-cycle start erase a completion already recorded, and a cycle
+        // whose latch kept vanishing could never close: the next genuine re-entry was then
+        // swallowed instead of drawing its self-loop.
+        ownDone.delete(e.node);
         const resolved = e.caller ?? index.owner(e.parent_span_id ?? undefined);
         const from = (resolved !== e.node ? resolved : undefined) ?? settled ?? active;
         out.push({ from, to: e.node, at: e.at });
@@ -345,16 +372,16 @@ export function transitions(events: readonly BoxedEvent[]): Transition[] {
       }
       continue;
     }
-    // Each checkpoint ends ONE invocation of the box. The box's OWN record is what makes it
-    // over — a member finishing mid-box must not read as the box ending — and even then only
-    // once nothing of it is still live.
+    // Each checkpoint ends ONE invocation of the box. The box's OWN record is a completion —
+    // a member finishing mid-box is not — and even a completed box stays open until nothing of
+    // it is live.
     if (e.kind === "checkpoint") {
       live.get(e.node)?.delete(key);
       if ((e.member ?? e.node) === e.node) {
         settled = e.node;
         ownDone.add(e.node);
       }
-      if (active === e.node && over(e.node)) active = null;
+      closeIfOver(e.node);
     }
   }
   return out;

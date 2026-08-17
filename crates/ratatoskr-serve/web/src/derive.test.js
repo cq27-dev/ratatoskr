@@ -2395,3 +2395,61 @@ test("a box's own record does not end it while a peer is still live", () => {
   );
   expect(transitions(drained).at(-1)).toMatchObject({ from: "review", to: "review" });
 });
+
+test("a concurrent second invocation is not a new activation", () => {
+  // Workflows may run hosts concurrently: A starts, B starts, and A's SECOND invocation lands
+  // while its first is still live. Comparing against a single last-started box read that as a
+  // fresh activation and pulsed a B -> A hand-off that never happened — execution never left A,
+  // so the pulse belongs on the transition into B.
+  const stages = registry(["alpha"], ["beta"]);
+  const events = inNodeBoxes(
+    [
+      attemptStart("alpha", "00000000000000f7", "opus"),
+      attemptStart("beta", "00000000000000f8", "opus"),
+      attemptStart("alpha", "00000000000000f9", "opus"),
+    ],
+    stages,
+  );
+  const seen = transitions(events);
+  expect(seen).toHaveLength(2);
+  expect(seen.at(-1)).toMatchObject({ from: "alpha", to: "beta" });
+});
+
+test("a peer starting mid-cycle does not erase the box's completion", () => {
+  // The box's own checkpoint lands while one peer is live, and ANOTHER peer starts before the
+  // first drains. Resetting the latch on every start erased that completion, the cycle could
+  // then never close, and the next genuine re-entry was swallowed instead of drawing its
+  // self-loop.
+  const stages = registry(["review", "review", "security"]);
+  const events = inNodeBoxes(
+    [
+      attemptStart("review", "0000000000000101", "opus"),
+      attemptStart("security", "0000000000000102", "haiku"),
+      attemptCheckpoint("review", "0000000000000101", 5),
+      attemptStart("security", "0000000000000103", "haiku"),
+      attemptCheckpoint("security", "0000000000000102", 5),
+      attemptCheckpoint("security", "0000000000000103", 5),
+      attemptStart("review", "0000000000000104", "opus"),
+    ],
+    stages,
+  );
+  expect(transitions(events).at(-1)).toMatchObject({ from: "review", to: "review" });
+});
+
+test("a lifecycle end closes a checkpoint-free cycle", () => {
+  // An evidence-only stage or an answerer legitimately writes no checkpoint; its own execution's
+  // end is its completion. Without reading it, the cycle never closed and every later hand-off
+  // into that box was swallowed as though the first invocation still ran.
+  const stages = registry(["characterizer"]);
+  const events = inNodeBoxes(
+    [
+      attemptStart("characterizer", "0000000000000105", "opus"),
+      { at: "t1", kind: "span_end", outcome: "completed", span_id: "0000000000000105", execution: "node", execution_name: "characterizer" },
+      attemptStart("characterizer", "0000000000000106", "opus"),
+    ],
+    stages,
+  );
+  const seen = transitions(events);
+  expect(seen).toHaveLength(2);
+  expect(seen.at(-1)).toMatchObject({ from: "characterizer", to: "characterizer" });
+});
