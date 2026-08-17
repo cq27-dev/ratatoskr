@@ -686,6 +686,7 @@ export default function App() {
                 loops={loops}
                 handoff={handoff}
                 transition={transition}
+                stages={detail?.stages ?? []}
                 selected={node}
                 onSelect={setNode}
               />

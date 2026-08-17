@@ -3321,58 +3321,30 @@ mod tests {
         // out did not reach that boundary, and a reader settles the turns under a host only when
         // the host's own end says it was reached — so an erring host ending "completed" marked the
         // failed stage done and took it out of its own run's failure candidates.
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        #[derive(Clone, Default)]
-        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("sink").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
-            type Writer = Sink;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let end_of = |sink: &Sink| {
-            let raw = String::from_utf8(sink.0.lock().expect("sink").clone()).expect("utf-8");
+        let end_of = |raw: &str| {
             raw.lines()
                 .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
                 .find(|record| record["kind"] == "span_end")
-                .expect("the host call announced its end")
-        };
-        let capture = |sink: &Sink| {
-            let layer = tracing_subscriber::fmt::layer()
-                .json()
-                .flatten_event(true)
-                .with_writer(sink.clone());
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(layer))
+                .unwrap_or_else(|| panic!("the host call announced its end; captured: {raw:?}"))
         };
 
         let failing: ratatoskr_script::workflow::HostFn = std::sync::Arc::new(|_arg| {
             Box::pin(async { Err("output failed the stage's schema".to_string()) })
         });
-        let sink = Sink::default();
-        let guard = capture(&sink);
+        let capturing = crate::test_capture::start();
         let _ = claiming("implement", failing)("{}".to_string()).await;
-        drop(guard);
-        assert_eq!(end_of(&sink)["outcome"], "unvalidated", "{}", end_of(&sink));
+        let raw = capturing.text();
+        drop(capturing);
+        assert_eq!(end_of(&raw)["outcome"], "unvalidated", "{}", end_of(&raw));
 
         // And one that returns is the boundary being reached.
         let fine: ratatoskr_script::workflow::HostFn =
             std::sync::Arc::new(|_arg| Box::pin(async { Ok("{}".to_string()) }));
-        let sink = Sink::default();
-        let guard = capture(&sink);
+        let capturing = crate::test_capture::start();
         let _ = claiming("implement", fine)("{}".to_string()).await;
-        drop(guard);
-        assert_eq!(end_of(&sink)["outcome"], "completed", "{}", end_of(&sink));
+        let raw = capturing.text();
+        drop(capturing);
+        assert_eq!(end_of(&raw)["outcome"], "completed", "{}", end_of(&raw));
     }
 
     fn red(failing: &[&str], passing: &[&str], exit: i32) -> RedTeamOutput {

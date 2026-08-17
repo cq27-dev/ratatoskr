@@ -2504,3 +2504,77 @@ test("a checkpoint-free box completes at its boundary, in either order", () => {
     expect(seen.at(-1).to).toBe("characterizer");
   }
 });
+
+test("a box reports what each member stage is doing, correct at any scrub position", () => {
+  // The red team mid-run: the classifier finished, the author is writing tests. The box shows one
+  // state; which member is where is this map, from the same fold, so it tracks the scrubber.
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const events = inNodeBoxes(
+    [
+      start("redteam_classifier"),
+      checkpointed("redteam_classifier"),
+      start("redteam_author"),
+    ],
+    stages,
+  );
+
+  const mid = nodesFromEvents(events.slice(0, 2)).get("redteam").memberStates;
+  expect(mid.get("redteam_classifier")).toBe("done");
+  expect(mid.has("redteam_author")).toBe(false);
+
+  const later = nodesFromEvents(events).get("redteam").memberStates;
+  expect(later.get("redteam_classifier")).toBe("done");
+  expect(later.get("redteam_author")).toBe("working");
+});
+
+test("the box's own aggregate is not a member state", () => {
+  // The aggregate row is the box, not a pip of itself — and a single-stage node has no member
+  // states at all, which is what keeps it looking as it does today.
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"], ["analyst"]);
+  const events = inNodeBoxes(
+    [
+      start("redteam_classifier"),
+      checkpointed("redteam_classifier"),
+      checkpointed("redteam"),
+      start("analyst"),
+      checkpointed("analyst"),
+    ],
+    stages,
+  );
+  const boxes = nodesFromEvents(events);
+  expect(boxes.get("redteam").memberStates.has("redteam")).toBe(false);
+  // The self-staged analyst's one member IS itself: its map is present — the stream spoke for
+  // the box — and empty, which is what tells a pip-free box from a stream-silent one.
+  expect(boxes.get("analyst").memberStates.size).toBe(0);
+});
+
+test("a peer waits as idle while only the self stage has run", () => {
+  // review composed of its self-named stage plus security, scrubbed to where only review has
+  // spoken. The box's derivation IS the stream having reached it — omitting the empty map there
+  // read as silence, and the strip vanished with security's waiting pip in it.
+  const stages = registry(["review", "review", "security"]);
+  const events = inNodeBoxes([start("review")], stages);
+  const box = nodesFromEvents(events).get("review");
+  expect(box.memberStates).toBeDefined();
+  expect(box.memberStates.size).toBe(0);
+});
+
+test("a member that failed stays failed in the strip, without failing the box", () => {
+  // A checkpoint's error is the event contract's failure signal, and the strip reads member
+  // states directly — flattening a member's error to done drew a failed substage as completed.
+  // The BOX still fails only on its own record, exactly as before: the classifier erring is a
+  // fact about the classifier, and the box works on while the author runs.
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const events = inNodeBoxes(
+    [
+      start("redteam_classifier"),
+      { ...checkpointed("redteam_classifier"), error: "no baseline" },
+      start("redteam_author"),
+    ],
+    stages,
+  );
+  const box = nodesFromEvents(events).get("redteam");
+  expect(box.memberStates.get("redteam_classifier")).toBe("failed");
+  expect(box.memberStates.get("redteam_author")).toBe("working");
+  expect(box.state).toBe("working");
+});

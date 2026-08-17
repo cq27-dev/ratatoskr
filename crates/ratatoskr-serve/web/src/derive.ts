@@ -53,6 +53,19 @@ export interface DerivedNode {
    */
   controllable: boolean;
   /**
+   * What each of this box's MEMBER stages is doing, keyed by stage id — the box's own aggregate
+   * excluded, since the box is not a pip of itself.
+   *
+   * From the same per-invocation bookkeeping the box state is folded from, which is what keeps a
+   * substage lighting at the point in the run where it actually ran and staying correct while
+   * scrubbing. Always present on a derived box, EMPTY when only its self-named stage has spoken:
+   * the box's derivation is itself the evidence the stream reached it, and omitting the map there
+   * read as stream-silence — hiding a declared peer's waiting pip exactly while its sibling ran.
+   * Which stages a box is DECLARED to hold is the registry's answer, and a stage the shape never
+   * assigned to this box must not appear in it.
+   */
+  memberStates: Map<string, NodeState>;
+  /**
    * The box whose execution this one's invocations ran INSIDE, when the stream shows one.
    *
    * Resolved by walking an invocation's span parentage outward to the nearest span some other
@@ -622,11 +635,14 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // the box finished, and for a box that is itself a stage its own record is one member's too.
       //
       // An error is the only thing that tells a failed member from a finished one: both write a
-      // checkpoint, and the fact of one proves only that the invocation stopped. Only the box's own
-      // record can fail the box, as before.
+      // checkpoint, and the fact of one proves only that the invocation stopped. The MEMBER keeps
+      // its failure — an error on a checkpoint is the event contract's failure signal, and the
+      // stage strip reads member states directly, so flattening it to done drew a failed substage
+      // as completed — while the BOX still fails only on its own record: the box-state clause
+      // below consults the box's own member alone, exactly as before.
       const attempt = attemptFor(member, e, span);
       member.end(attempt);
-      attempt.state = own && e.error ? "failed" : "done";
+      attempt.state = e.error ? "failed" : "done";
       if (own) box.checkpoints += 1;
       attempt.telemetry = {
         ...(attempt.telemetry ?? blank()),
@@ -814,9 +830,18 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
         (into, next) => (into ? fold(into, next) : next),
         undefined,
       );
+    // What each MEMBER stage is doing, by the same rules its slice of the box state uses: working
+    // while any invocation of it is live, else whatever its current attempt reached. The box's
+    // own aggregate is the box, not a pip of itself.
+    const memberStates = new Map<string, NodeState>();
+    for (const [id, m] of box.members) {
+      if (id === name) continue;
+      memberStates.set(id, working(m) ? "working" : (current(m)?.state ?? "idle"));
+    }
     out.set(name, {
       state,
       checkpoints: box.checkpoints,
+      memberStates,
       ...(caller !== undefined ? { caller } : {}),
       ...(folded ? { telemetry: folded } : {}),
       cycles: members.reduce((n, m) => n + (current(m)?.cycles ?? 0), 0),

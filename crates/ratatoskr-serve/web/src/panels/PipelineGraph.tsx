@@ -39,7 +39,14 @@ import {
   spanRiser,
   spanShelf,
 } from "./layout";
-import type { NodeFacts, NodeTelemetry, NodeView, PlannedNode, SessionScope } from "../api";
+import type {
+  NodeFacts,
+  NodeTelemetry,
+  NodeView,
+  PlannedNode,
+  RunStage,
+  SessionScope,
+} from "../api";
 import {
   type Transition,
   forkHandoff,
@@ -269,12 +276,59 @@ export function pulsedBox(
   return drawn ? null : transition.to;
 }
 
+/**
+ * How many pips a composed box shows before the rest fold into a `+N` tile.
+ *
+ * The box must NOT grow with the stage count: `NODE_SIZE` is fixed and unmeasured, and the scrub
+ * magnification budget assumes neighbouring boxes can grow without covering each other — a strip
+ * that widened the box would spend room the layout never reserved.
+ */
+export const PIP_CAP = 6;
+
+/**
+ * A box's pips: its declared member stages with what each is doing.
+ *
+ * `declared` is ALL of the box's stage ids, the self-named row included, and the threshold counts
+ * them all: a box of two stages shows its strip whether the second is a peer beside a self-named
+ * stage or two composed members — a self-plus-one-peer box that lost its strip hid exactly the
+ * peer state this exists to show. The SELF stage still draws no pip, because the box's own
+ * chrome — its border, its dot, its state line — already says what the box itself is doing; only
+ * a truly single-stage box is pip-free. None where the stream has not spoken for the box at all.
+ */
+export function pipsOf(
+  declared: readonly string[] | undefined,
+  box: string,
+  states: ReadonlyMap<string, string> | undefined,
+): { id: string; state: string }[] {
+  if (!declared || declared.length < 2 || !states) return [];
+  return declared
+    .filter((id) => id !== box)
+    .map((id) => ({ id, state: states.get(id) ?? "idle" }));
+}
+
+/** The pips a strip actually draws: everything, or `cap - 1` of them plus how many folded — the
+ *  `+N` tile takes the slot the overflow starts at, so the strip never exceeds `cap` tiles. */
+export function pipStrip<T>(
+  pips: readonly T[],
+  cap: number = PIP_CAP,
+): { shown: readonly T[]; more: number } {
+  if (pips.length <= cap) return { shown: pips, more: 0 };
+  const shown = pips.slice(0, cap - 1);
+  return { shown, more: pips.length - shown.length };
+}
+
 type PipelineNodeData = {
   node: NodeView;
   live: DerivedNode | undefined;
   isSelected: boolean;
   /** Whether this box just became active with no drawn edge to carry the pulse; see [`pulsedBox`]. */
   entered: boolean;
+  /**
+   * The box's declared member stages with what each is doing, in declaration order — empty for a
+   * single-stage box, and for one the stream has not spoken for. Which stages belong here is the
+   * run's REGISTRY's answer; a stage the shape never assigned to this box must not appear in it.
+   */
+  pips: readonly { id: string; state: string }[];
 };
 type PipelineNodeType = Node<PipelineNodeData, "pipeline">;
 
@@ -320,6 +374,22 @@ function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
           {node.checkpoints > 0 ? `${node.checkpoints} CP` : "—"}
         </span>
       </div>
+      {data.pips.length > 0 &&
+        (() => {
+          const { shown, more } = pipStrip(data.pips);
+          return (
+            <div className="node-pips">
+              {shown.map((p) => (
+                <span key={p.id} className={`pip pip--${p.state}`} data-tip={`${p.id} — ${p.state}`} />
+              ))}
+              {more > 0 && (
+                <span className="pip pip--more" data-tip={`${more} more stages — open the box for all of them`}>
+                  +{more}
+                </span>
+              )}
+            </div>
+          );
+        })()}
       {(node.telemetry || data.live?.telemetry || node.planned) && (
         <NodeFacts telemetry={node.telemetry} live={data.live} planned={node.planned} />
       )}
@@ -708,6 +778,8 @@ interface Props {
    * self-loop, or a back-loop.
    */
   transition: Transition | null;
+  /** The run's recorded registry — which stages compose each box, in declaration order. */
+  stages: readonly RunStage[];
   selected: string | null;
   /** `null` clears the selection, which returns the lower pane to the combined feed. */
   onSelect: (name: string | null) => void;
@@ -719,6 +791,7 @@ export default function PipelineGraph({
   loops,
   handoff,
   transition,
+  stages: registry,
   selected,
   onSelect,
 }: Props) {
@@ -769,6 +842,21 @@ export default function PipelineGraph({
   // How far a scrubbed box may grow before it covers the one under it. Off the placement, since
   // that is what says which boxes are neighbours and how tall they are.
   const crowd = useMemo(() => crowdLimit(tallestNeighbours(placed.values())), [placed]);
+
+  // Which stages compose each box, in declaration order, from the run's REGISTRY — never from the
+  // records: which stages a box holds is a property of the graph, and a box mid-run whose second
+  // member has not spoken yet still shows the pip waiting for it. ALL rows, the self-named one
+  // included: whether a box is multi-stage is counted over everything it holds, and `pipsOf` is
+  // what leaves the self stage pip-less.
+  const membersOf = useMemo(() => {
+    const out = new Map<string, string[]>();
+    for (const s of registry) {
+      const list = out.get(s.node);
+      if (list) list.push(s.id);
+      else out.set(s.node, [s.id]);
+    }
+    return out;
+  }, [registry]);
 
   const desiredEdges = useMemo<Edge[]>(() => {
     // Every node in a stage feeds every node in the next one — which is what a fork joining back
@@ -1040,13 +1128,17 @@ export default function PipelineGraph({
           live: live.get(n.name),
           isSelected: selected === n.name,
           entered: pulsed === n.name,
+          // Only where the stream has spoken for the box: a run whose log rotated away has no
+          // per-member evidence, and a strip of guessed pips would assert states nobody recorded.
+          // A single declared member is the box's own work and shows nothing the box does not.
+          pips: pipsOf(membersOf.get(n.name), n.name, live.get(n.name)?.memberStates),
         },
         draggable: false,
         width: box.width,
         height: box.height,
       };
     });
-  }, [columns, branches, placed, live, selected, pulsed]);
+  }, [columns, branches, placed, live, selected, pulsed, membersOf]);
 
 
   /*
