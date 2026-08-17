@@ -75,6 +75,39 @@ export function nodeHeight(_node: NodeView): number {
 export type Bounds = { x: number; y: number; width: number; height: number };
 
 /**
+ * The canvas's vertical region model: who draws where, stated once.
+ *
+ * Four classes of wiring share the canvas, and every routing defect this layout has had was one
+ * class discovering another's territory by intersection — a corridor was designed, hardened, and
+ * deleted because the gaps it descended through belong to the loop shelves. The regions own the
+ * question instead: span shelves above the row, boxes and stage edges in it, loop shelves in the
+ * band below, branch children below that. A vertical may CROSS a band it does not occupy — the
+ * branch drop crosses the loop band, and loop risers cross shallower shelves — but horizontal
+ * runs and boxes stay inside their own region.
+ *
+ * Adding a wiring class means adding its region here and its conformance pin in layout.test.js —
+ * that test is what turns the next territorial collision into a failing build instead of a
+ * review round.
+ */
+export function regionBands(
+  rowTop: number,
+  rowBottom: number,
+): {
+  spans: { top: number; bottom: number };
+  row: { top: number; bottom: number };
+  loops: { top: number; bottom: number };
+  branches: { top: number };
+} {
+  return {
+    spans: { top: rowTop - SPAN_BAND, bottom: rowTop },
+    row: { top: rowTop, bottom: rowBottom },
+    loops: { top: rowBottom, bottom: rowBottom + LOOP_BAND },
+    // Open-ended: branch boxes stack downward from here, and the fit reads their real extent.
+    branches: { top: rowBottom + LOOP_BAND },
+  };
+}
+
+/**
  * Where every box goes: columns left to right by stage, lanes stacked down by their own heights.
  *
  * Stacked rather than multiplied by a fixed pitch, so one box being taller than its siblings moves
@@ -196,6 +229,15 @@ export function branchPlace(
  */
 export function anchoredBranches(nodes: readonly NodeView[]): Set<string> {
   const byName = new Map(nodes.map((n) => [n.name, n]));
+  // Each declared column's deepest lane, indexed once. The eligibility check runs per candidate,
+  // and candidates are the imported-history shape nothing bounds — a full scan per candidate is
+  // quadratic in a fan-out, which froze the render before React Flow drew anything.
+  const deepestLane = new Map<number, number>();
+  for (const n of nodes) {
+    if (n.shaped === false) continue;
+    const known = deepestLane.get(n.stage);
+    if (known === undefined || n.lane > known) deepestLane.set(n.stage, n.lane);
+  }
   const taken = new Set<string>();
   const out = new Set<string>();
   for (const n of nodes) {
@@ -206,14 +248,8 @@ export function anchoredBranches(nodes: readonly NodeView[]): Set<string> {
     // Deepest among the DECLARED lanes of its column. Trailing columns hold one node each, so a
     // trailing parent is its column's deepest trivially; a declared column's occupancy is its
     // shaped nodes'.
-    const deepest = !nodes.some(
-      (o) =>
-        o.name !== parent.name &&
-        o.shaped !== false &&
-        parent.shaped !== false &&
-        o.stage === parent.stage &&
-        o.lane > parent.lane,
-    );
+    const deepest =
+      parent.shaped === false || deepestLane.get(parent.stage) === parent.lane;
     if (!deepest || taken.has(caller)) continue;
     taken.add(caller);
     out.add(n.name);

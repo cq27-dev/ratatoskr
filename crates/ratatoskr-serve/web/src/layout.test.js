@@ -9,6 +9,7 @@ import {
   LANE_PITCH,
   NODE_SIZE,
   LOOP_BAND,
+  LOOP_SHELF_STEP,
   SPAN_BAND,
   SPAN_RADIUS,
   anchoredBranches,
@@ -16,6 +17,7 @@ import {
   crowdLimit,
   fittedBounds,
   place,
+  regionBands,
   rowExtent,
   spanRiser,
   spanShelf,
@@ -466,4 +468,61 @@ test("only a column's deepest lane anchors, and only one child per parent", () =
     trailing("aide", 6, "helper"),
   ];
   expect(anchoredBranches(chainRoot)).toEqual(new Set(["aide"]));
+});
+
+test("the vertical regions are owned: ordered, disjoint, and every class stays home", () => {
+  // The region model exists so a new wiring class collides in a failing test instead of a review
+  // round: spans above the row, boxes and stage edges in it, loop shelves below, branch children
+  // below that. Verticals may CROSS a band — the branch drop crosses the loop band — but
+  // horizontal runs and boxes stay inside their own region.
+  const rowTop = 0;
+  const rowBottom = 3 * LANE_PITCH - LANE_GAP;
+  const r = regionBands(rowTop, rowBottom);
+
+  expect(r.spans.bottom).toBeLessThanOrEqual(r.row.top);
+  expect(r.row.bottom).toBeLessThanOrEqual(r.loops.top);
+  expect(r.loops.bottom).toBeLessThanOrEqual(r.branches.top);
+
+  // Span shelves live in the span band, whatever the span count.
+  for (const count of [1, 4, 64]) {
+    for (let i = 0; i < count; i += 1) {
+      const y = spanShelf(i, count, rowTop);
+      expect(y).toBeGreaterThanOrEqual(r.spans.top);
+      expect(y).toBeLessThan(r.spans.bottom);
+    }
+  }
+
+  // The three loop shelves live in the loop band, and the converge self-loop's drop below a
+  // bottom-lane box stays inside it too.
+  for (const step of [1, 2, 3]) {
+    const y = rowBottom + step * LOOP_SHELF_STEP;
+    expect(y).toBeGreaterThan(r.loops.top);
+    expect(y).toBeLessThanOrEqual(r.loops.bottom);
+  }
+  expect(LANE_GAP / 2).toBeLessThanOrEqual(LOOP_BAND);
+
+  // Branch children start below the loop band.
+  const parent = { x: 0, y: rowBottom - NODE_SIZE.height, width: NODE_SIZE.width, height: NODE_SIZE.height };
+  const child = { name: "c", state: "done", checkpoints: 1, stage: 5, lane: 0, shaped: false, caller: "p" };
+  const box = branchPlace([child], () => parent, rowBottom).get("c");
+  expect(box.y).toBeGreaterThanOrEqual(r.branches.top);
+});
+
+test("branch eligibility costs what the candidates cost, not their square", () => {
+  // Candidates are the imported-history shape nothing bounds. The deepest-lane check used to
+  // sweep the whole node list per candidate, which froze the render for most of a second at a
+  // ten-thousand-child fan-out before React Flow drew anything. Bounded generously — the
+  // quadratic form measured ~800ms here against single-digit milliseconds for the indexed one.
+  const nodes = [{ name: "parent", state: "done", checkpoints: 1, stage: 0, lane: 0 }];
+  for (let i = 0; i < 10_000; i += 1) {
+    nodes.push({
+      name: `child-${i}`, state: "done", checkpoints: 1, stage: 1 + i, lane: 0,
+      shaped: false, caller: "parent",
+    });
+  }
+  const started = performance.now();
+  const anchored = anchoredBranches(nodes);
+  expect(performance.now() - started).toBeLessThan(100);
+  // One child per parent: the fan-out anchors exactly one and the rest keep trailing columns.
+  expect(anchored.size).toBe(1);
 });
