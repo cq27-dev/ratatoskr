@@ -550,23 +550,33 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
    */
   const callerOf = (name: string, box: { members: Map<string, Member> }): string | undefined => {
     let found: string | undefined;
+    // An invocation whose chain reaches no box at all: driven by the workflow itself, or
+    // unresolvable. That is a VOTE, not an abstention — a box invoked once at the root and once
+    // inside another fits two placements, which is the same conflict as two different callers.
+    let rooted = false;
     for (const m of box.members.values()) {
       for (const a of m.list) {
         let span = a.parent;
+        let owner: string | undefined;
         for (let hop = 0; span !== undefined && hop < 64; hop += 1) {
-          const owner = spanBox.get(span);
-          if (owner !== undefined) {
-            // Two invocations resolving different callers is an anchor that fits two histories,
-            // which is an assertion about neither.
-            if (owner !== name && found !== undefined && found !== owner) return undefined;
-            if (owner !== name) found = owner;
-            break;
-          }
+          owner = spanBox.get(span);
+          if (owner !== undefined) break;
           span = spanParent.get(span);
         }
+        // Nested under this box's own turn: internal structure, saying nothing about who called
+        // the box — the only outcome that abstains.
+        if (owner === name) continue;
+        if (owner === undefined) {
+          rooted = true;
+          continue;
+        }
+        // Two invocations resolving different callers is an anchor that fits two histories,
+        // which is an assertion about neither.
+        if (found !== undefined && found !== owner) return undefined;
+        found = owner;
       }
     }
-    return found;
+    return rooted ? undefined : found;
   };
 
   const out = new Map<string, DerivedNode>();

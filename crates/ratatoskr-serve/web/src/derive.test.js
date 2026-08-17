@@ -2115,6 +2115,23 @@ test("two invocations that resolve different callers anchor the box to neither",
   expect(nodesFromEvents(inNodeBoxes(events, stages)).get("helper").caller).toBeUndefined();
 });
 
+test("a workflow-driven invocation beside a nested one anchors the box to neither", () => {
+  // One invocation nested under `analyst`, one driven by the run itself — its parent chain
+  // reaches no box. The box's history fits two placements, under the caller and in its own
+  // trailing column, and a root resolution is a vote exactly as a concrete caller is: silently
+  // dropping it moved the box under a caller that only sometimes called it.
+  const stages = registry(["analyst"], ["helper"]);
+  const nested = { ...attemptStart("helper", "00000000000000b7", "haiku"), parent_span_id: "00000000000000a7" };
+  const op = { at: "t0", kind: "span_start", span_id: "00000000000000c7", parent_span_id: "00000000000000ee", execution: "host", execution_name: "helperOp" };
+  const driven = { ...attemptStart("helper", "00000000000000d7", "haiku"), parent_span_id: "00000000000000c7" };
+  const asker = attemptStart("analyst", "00000000000000a7", "opus");
+
+  // Either order: the conflict is about the history, not about which arrived last.
+  for (const events of [[asker, nested, op, driven], [asker, op, driven, nested]]) {
+    expect(nodesFromEvents(inNodeBoxes(events, stages)).get("helper").caller).toBeUndefined();
+  }
+});
+
 test("a cycle in producer parentage costs a bounded walk and anchors nothing", () => {
   // Parentage is producer-supplied data. Two spans naming each other as parent must cost a capped
   // walk rather than hang the render, and prove no caller.
