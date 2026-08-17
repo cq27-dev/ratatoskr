@@ -285,14 +285,25 @@ export function pulsedBox(
  */
 export const PIP_CAP = 6;
 
-/** A box's pips: its declared members with what each is doing — or none for a single-member box,
- *  and none where the stream has not spoken for the box at all. */
+/**
+ * A box's pips: its declared member stages with what each is doing.
+ *
+ * `declared` is ALL of the box's stage ids, the self-named row included, and the threshold counts
+ * them all: a box of two stages shows its strip whether the second is a peer beside a self-named
+ * stage or two composed members — a self-plus-one-peer box that lost its strip hid exactly the
+ * peer state this exists to show. The SELF stage still draws no pip, because the box's own
+ * chrome — its border, its dot, its state line — already says what the box itself is doing; only
+ * a truly single-stage box is pip-free. None where the stream has not spoken for the box at all.
+ */
 export function pipsOf(
   declared: readonly string[] | undefined,
+  box: string,
   states: ReadonlyMap<string, string> | undefined,
 ): { id: string; state: string }[] {
   if (!declared || declared.length < 2 || !states) return [];
-  return declared.map((id) => ({ id, state: states.get(id) ?? "idle" }));
+  return declared
+    .filter((id) => id !== box)
+    .map((id) => ({ id, state: states.get(id) ?? "idle" }));
 }
 
 /** The pips a strip actually draws: everything, or `cap - 1` of them plus how many folded — the
@@ -834,12 +845,12 @@ export default function PipelineGraph({
 
   // Which stages compose each box, in declaration order, from the run's REGISTRY — never from the
   // records: which stages a box holds is a property of the graph, and a box mid-run whose second
-  // member has not spoken yet still shows the pip waiting for it. The box's self-named row is the
-  // box, not a member of it.
+  // member has not spoken yet still shows the pip waiting for it. ALL rows, the self-named one
+  // included: whether a box is multi-stage is counted over everything it holds, and `pipsOf` is
+  // what leaves the self stage pip-less.
   const membersOf = useMemo(() => {
     const out = new Map<string, string[]>();
     for (const s of registry) {
-      if (s.id === s.node) continue;
       const list = out.get(s.node);
       if (list) list.push(s.id);
       else out.set(s.node, [s.id]);
@@ -1120,7 +1131,7 @@ export default function PipelineGraph({
           // Only where the stream has spoken for the box: a run whose log rotated away has no
           // per-member evidence, and a strip of guessed pips would assert states nobody recorded.
           // A single declared member is the box's own work and shows nothing the box does not.
-          pips: pipsOf(membersOf.get(n.name), live.get(n.name)?.memberStates),
+          pips: pipsOf(membersOf.get(n.name), n.name, live.get(n.name)?.memberStates),
         },
         draggable: false,
         width: box.width,

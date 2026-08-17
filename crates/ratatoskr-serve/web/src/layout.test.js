@@ -606,12 +606,19 @@ test("the pip strip never exceeds its cap, and the overflow tile takes the last 
   expect(capped.more).toBe(4);
   expect(capped.shown.length + 1).toBeLessThanOrEqual(6);
 
-  // A box's pips: nothing for a single member, nothing where the stream is silent, idle where a
-  // declared member has not spoken, and never a stage the registry did not assign.
-  expect(pipsOf(["only"], new Map())).toEqual([]);
-  expect(pipsOf(["a", "b"], undefined)).toEqual([]);
-  expect(pipsOf(["a", "b"], new Map([["a", "done"]]))).toEqual([
+  // A box's pips: nothing for a truly single-stage box, nothing where the stream is silent, idle
+  // where a declared member has not spoken, and never a stage the registry did not assign. The
+  // threshold counts ALL of the box's stages, the self-named row included — a self-plus-one-peer
+  // box shows its peer's pip, since hiding it hid exactly the state the strip exists to show —
+  // while the self stage itself draws no pip: the box's own chrome already says what it is doing.
+  expect(pipsOf(["only"], "box", new Map())).toEqual([]);
+  expect(pipsOf(["box"], "box", new Map())).toEqual([]);
+  expect(pipsOf(["a", "b"], "box", undefined)).toEqual([]);
+  expect(pipsOf(["a", "b"], "box", new Map([["a", "done"]]))).toEqual([
     { id: "a", state: "done" },
     { id: "b", state: "idle" },
+  ]);
+  expect(pipsOf(["box", "peer"], "box", new Map([["peer", "working"]]))).toEqual([
+    { id: "peer", state: "working" },
   ]);
 });
