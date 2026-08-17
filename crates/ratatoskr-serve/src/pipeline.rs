@@ -315,7 +315,7 @@ fn ran_to_completion(status: Option<&str>) -> bool {
 
 /// Derive each node's state from the run status and its checkpoints.
 ///
-/// Three non-uniformities are handled explicitly:
+/// Four non-uniformities are handled explicitly:
 /// - **The implementer re-runs.** Converge checkpoints it once per iteration, so "has a
 ///   checkpoint" does not mean finished — while the run is live it is still converging, and the
 ///   fork stage is not complete no matter how many checkpoints it has.
@@ -331,6 +331,10 @@ fn ran_to_completion(status: Option<&str>) -> bool {
 ///   the cursor sits at — and nothing here separates them, so neither is named. Before the
 ///   implementer runs there is nothing to re-enter, the stage the run stopped at is the only
 ///   candidate, and it is still reported.
+/// - **A box whose members recorded but whose aggregate never landed names nobody on a failed
+///   run.** A workflow that calls a member stage directly never writes an aggregate, so the same
+///   rows fit that box's host dying after its members ran and a later stage failing after the box
+///   finished. Both fit; neither is named.
 ///
 /// Which node a run died in is answered far better by the event stream, where the node the host
 /// killed is the one left working with no checkpoint to follow it — see `web/src/derive.ts`. That is
@@ -423,19 +427,14 @@ pub fn derive_from(
         for node in nodes {
             let (lane, name) = (node.lane, &node.name);
             let times = node_times(&rows, name);
-            // What its members' records say, when it has none of its own — the same question
-            // `append_unknown` asks, asked through the same function.
-            let by_members = match times.is_empty() {
-                false => None,
-                true => from_members(
-                    registry
-                        .members(name)
-                        .iter()
-                        .any(|member| *member != name && count(&rows, member) > 0),
-                    terminal,
-                    completed,
-                ),
-            };
+            // Whether members recorded while the box itself never did — the same question
+            // `append_unknown` asks, answered through the same function below.
+            let members_recorded = times.is_empty()
+                && registry
+                    .members(name)
+                    .iter()
+                    .any(|member| *member != name && count(&rows, member) > 0);
+            let by_members = from_members(members_recorded, terminal, completed);
 
             let state = if let Some(state) = by_members {
                 state
@@ -450,6 +449,14 @@ pub fn derive_from(
                     _ if unattributable => NodeState::Idle,
                     // Several lanes of this column fit the failure equally.
                     _ if candidates > 1 => NodeState::Idle,
+                    // Members recorded and no aggregate: a workflow that calls a member stage
+                    // directly never writes one — the box's work ended with its member's — while
+                    // an operation host that died after its members ran leaves exactly the same
+                    // rows. A failure that fits both histories is attributed to neither; only the
+                    // event stream can separate them. Reachable only on a terminal, uncompleted
+                    // run — `from_members` answers the live and completed halves before this
+                    // match is consulted.
+                    _ if members_recorded => NodeState::Idle,
                     _ if failed => NodeState::Failed,
                     _ if !terminal => NodeState::Working,
                     _ => NodeState::Idle,
@@ -1351,6 +1358,34 @@ mod tests {
             !views.iter().any(|v| v.state == NodeState::Failed),
             "an unattributed failure, not one pinned on the stage that happens to be next"
         );
+    }
+
+    #[test]
+    fn a_failure_after_a_directly_called_member_blames_neither_the_box_nor_what_follows() {
+        // `security` composed into `review`, and the run fails with no `review` aggregate. Two
+        // histories fit these rows exactly: the workflow called `security` directly — no aggregate
+        // is ever written then, `review`'s work ended with its member's, and a later `deploy`
+        // died — or `review`'s own host died after its member ran. Checkpoints cannot separate
+        // them, so neither node is named; the run's own status still says it failed. The cursor
+        // used to sit on `review` and blame it, which painted a box red that may have finished.
+        let shape = shape_with(
+            &[(&["review"], false), (&["deploy"], false)],
+            &[("review", &["security"])],
+        );
+        let views = derive_with(Some("failed"), &[cp("security", "t1")], None, Some(&shape));
+        assert_eq!(state_of(&views, "review"), NodeState::Idle);
+        assert_eq!(state_of(&views, "deploy"), NodeState::Idle);
+        assert!(
+            !views.iter().any(|v| v.state == NodeState::Failed),
+            "an unattributed failure, not one pinned on whichever node is convenient"
+        );
+
+        // The ambiguity is the recorded members': the same shape dying before `security` ran
+        // leaves the stopped-at stage the lone explanation, and it is still named. Being composed
+        // is not what withholds the attribution — having member rows and no aggregate is.
+        let views = derive_with(Some("failed"), &[], None, Some(&shape));
+        assert_eq!(state_of(&views, "review"), NodeState::Failed);
+        assert_eq!(state_of(&views, "deploy"), NodeState::Idle);
     }
 
     #[test]
