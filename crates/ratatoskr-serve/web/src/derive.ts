@@ -259,6 +259,11 @@ function spanIndex() {
         box.set(e.span_id, e.node);
       }
     },
+    /** The box that opened exactly this span, with no walk — `undefined` for a span no
+     *  node execution announced. */
+    boxOf(span: string): string | undefined {
+      return box.get(span);
+    },
     /** The box owning the nearest node-execution span at or above `from`; `undefined` when the
      *  chain reaches the run itself, or data this view never saw. */
     owner(from: string | undefined): string | undefined {
@@ -301,21 +306,55 @@ export function transitions(events: readonly BoxedEvent[]): Transition[] {
   const out: Transition[] = [];
   let active: string | null = null;
   let settled: string | null = null;
+  /**
+   * The invocations of each box still running, and whether its own record has landed.
+   *
+   * Both halves gate the box ENDING, because execution has not left a box until its own record
+   * exists AND nothing of it is still live — a box that is itself a stage can write its own row
+   * while a composed peer still runs, exactly the case `nodesFromEvents` keeps working, and
+   * clearing the box there let the peer's next start invent a self-loop the run never made.
+   * Keyed as the attempts are keyed: the span, or the one-unidentified-attempt stand-in.
+   */
+  const live = new Map<string, Set<string>>();
+  const ownDone = new Set<string>();
+  const over = (name: string) => ownDone.has(name) && (live.get(name)?.size ?? 0) === 0;
   for (const e of events) {
     index.note(e);
+    // An execution ending closes its invocation wherever it is — the only closer for one that
+    // writes no checkpoint. `boxOf` is a direct lookup: only a span this view saw a node open.
+    if (e.kind === "span_end" && e.span_id) {
+      const owner = index.boxOf(e.span_id);
+      if (owner !== undefined) {
+        live.get(owner)?.delete(e.span_id);
+        if (active === owner && over(owner)) active = null;
+      }
+    }
     if (!e.node) continue;
-    if (e.kind === "node_start" && e.node !== active) {
-      const resolved = e.caller ?? index.owner(e.parent_span_id ?? undefined);
-      const from = (resolved !== e.node ? resolved : undefined) ?? settled ?? active;
-      out.push({ from, to: e.node, at: e.at });
-      active = e.node;
+    const key = e.span_id ?? `unidentified:${e.member ?? e.node}`;
+    if (e.kind === "node_start") {
+      const running = live.get(e.node);
+      if (running) running.add(key);
+      else live.set(e.node, new Set([key]));
+      // A new invocation reopens the box's cycle: its own record is this cycle's to write.
+      ownDone.delete(e.node);
+      if (e.node !== active) {
+        const resolved = e.caller ?? index.owner(e.parent_span_id ?? undefined);
+        const from = (resolved !== e.node ? resolved : undefined) ?? settled ?? active;
+        out.push({ from, to: e.node, at: e.at });
+        active = e.node;
+      }
       continue;
     }
-    // The box's own record, not a member's: a member finishing mid-box — the classifier before
-    // the author — must not read as the box ending, or the author's start invents a self-loop.
-    if (e.kind === "checkpoint" && (e.member ?? e.node) === e.node) {
-      settled = e.node;
-      if (active === e.node) active = null;
+    // Each checkpoint ends ONE invocation of the box. The box's OWN record is what makes it
+    // over — a member finishing mid-box must not read as the box ending — and even then only
+    // once nothing of it is still live.
+    if (e.kind === "checkpoint") {
+      live.get(e.node)?.delete(key);
+      if ((e.member ?? e.node) === e.node) {
+        settled = e.node;
+        ownDone.add(e.node);
+      }
+      if (active === e.node && over(e.node)) active = null;
     }
   }
   return out;

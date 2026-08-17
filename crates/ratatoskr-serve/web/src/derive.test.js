@@ -2363,3 +2363,35 @@ test("a transition's from is provenance before adjacency", () => {
   );
   expect(transitions(walked).at(-1)).toMatchObject({ from: "analyst", to: "helper" });
 });
+
+test("a box's own record does not end it while a peer is still live", () => {
+  // A box that is itself a stage can write its own row while a composed peer still runs — the
+  // exact case nodesFromEvents keeps working. Clearing the active box there let the peer's next
+  // start invent a review -> review self-loop the run never made.
+  const stages = registry(["review", "review", "security"]);
+  const events = inNodeBoxes(
+    [
+      attemptStart("review", "00000000000000f1", "opus"),
+      attemptStart("security", "00000000000000f2", "haiku"),
+      attemptCheckpoint("review", "00000000000000f1", 5),
+      attemptStart("security", "00000000000000f3", "haiku"),
+    ],
+    stages,
+  );
+  const seen = transitions(events);
+  expect(seen).toHaveLength(1);
+  expect(seen[0].to).toBe("review");
+
+  // Once the peer drains too, the box is over, and a re-entry is a real self-loop again.
+  const drained = inNodeBoxes(
+    [
+      attemptStart("review", "00000000000000f4", "opus"),
+      attemptStart("security", "00000000000000f5", "haiku"),
+      attemptCheckpoint("review", "00000000000000f4", 5),
+      attemptCheckpoint("security", "00000000000000f5", 5),
+      attemptStart("review", "00000000000000f6", "opus"),
+    ],
+    stages,
+  );
+  expect(transitions(drained).at(-1)).toMatchObject({ from: "review", to: "review" });
+});

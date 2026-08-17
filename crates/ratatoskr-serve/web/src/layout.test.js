@@ -26,7 +26,7 @@ import {
   tapSide,
   wiredToSpine,
 } from "./panels/layout";
-import { carryMeasurement } from "./panels/PipelineGraph";
+import { carryMeasurement, pulsedBox } from "./panels/PipelineGraph";
 
 /**
  * The span geometry, over every shape a workflow may declare rather than the ones that happened to
@@ -580,4 +580,17 @@ test("both taps clear the self-loop's reach and their box corner", () => {
     expect(fromCorner).toBeGreaterThanOrEqual(SPAN_RADIUS);
     expect(fromSelfLoop).toBeGreaterThanOrEqual(SPAN_RADIUS);
   }
+});
+
+test("the pulse falls back to the box when its pair has no drawn edge", () => {
+  // A node invoked by two different boxes anchors nowhere and chains from nothing — the graph
+  // refuses every in-edge for it — yet the hand-off happened. The pulse lands on the box, since
+  // asserting a nonexistent edge is exactly what the missing edge refuses.
+  const edges = [
+    { source: "analyst", target: "implementer" },
+    { source: "implementer", target: "referee" },
+  ];
+  expect(pulsedBox({ from: "analyst", to: "implementer", at: "t" }, edges)).toBeNull();
+  expect(pulsedBox({ from: "scout", to: "disputed", at: "t" }, edges)).toBe("disputed");
+  expect(pulsedBox(null, edges)).toBeNull();
 });

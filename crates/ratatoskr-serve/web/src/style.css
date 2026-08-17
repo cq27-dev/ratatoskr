@@ -953,6 +953,21 @@ body {
     stroke-dashoffset: -10;
   }
 }
+/* The pulse's fallback: a box that just became active with no drawn edge to carry it — a node
+   the graph refuses every in-edge for (a conflicted caller) still activates. The box breathes in
+   its own hue instead; asserting a nonexistent edge is exactly what the missing edge refuses. */
+.node.node--entered {
+  animation: node-entered 1.4s ease-in-out infinite;
+}
+@keyframes node-entered {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+  50% {
+    box-shadow: 0 0 0 3px var(--tint, var(--live));
+  }
+}
 .react-flow__edge-text {
   fill: var(--muted);
   font-family: var(--mono);

@@ -251,13 +251,42 @@ function stages(nodes: NodeView[]): NodeView[][] {
     .map(([, lanes]) => lanes.sort((a, b) => a.lane - b.lane));
 }
 
-type PipelineNodeData = { node: NodeView; live: DerivedNode | undefined; isSelected: boolean };
+/**
+ * The box to pulse when the latest transition has no drawn edge, or `null` when an edge carries
+ * it.
+ *
+ * A pair can be undrawable on purpose: a node invoked by two different boxes anchors nowhere and
+ * chains from nothing — the graph deliberately refuses every in-edge for it — yet the hand-off
+ * still happened. Pulsing a nonexistent edge would assert a relation the graph refuses; pulsing
+ * the box asserts only what the record proved, that it just became active.
+ */
+export function pulsedBox(
+  transition: Transition | null,
+  edges: readonly { source: string; target: string }[],
+): string | null {
+  if (!transition) return null;
+  const drawn = edges.some((e) => e.source === transition.from && e.target === transition.to);
+  return drawn ? null : transition.to;
+}
+
+type PipelineNodeData = {
+  node: NodeView;
+  live: DerivedNode | undefined;
+  isSelected: boolean;
+  /** Whether this box just became active with no drawn edge to carry the pulse; see [`pulsedBox`]. */
+  entered: boolean;
+};
 type PipelineNodeType = Node<PipelineNodeData, "pipeline">;
 
 /** One pipeline node: name, live dot, state, and its checkpoint count. */
 function PipelineNode({ data }: NodeProps<PipelineNodeType>) {
   const { node, isSelected } = data;
-  const cls = ["node", `node--${node.state}`, isSelected ? "node--selected" : ""]
+  const cls = [
+    "node",
+    `node--${node.state}`,
+    isSelected ? "node--selected" : "",
+    data.entered ? "node--entered" : "",
+  ]
     .filter(Boolean)
     .join(" ");
 
@@ -741,21 +770,6 @@ export default function PipelineGraph({
   // that is what says which boxes are neighbours and how tall they are.
   const crowd = useMemo(() => crowdLimit(tallestNeighbours(placed.values())), [placed]);
 
-  const desiredNodes = useMemo<PipelineNodeType[]>(() => {
-    return [...columns.flatMap((lanes) => lanes), ...branches].map((n) => {
-      const box = placed.get(n.name) ?? { x: 0, y: 0, ...NODE_SIZE };
-      return {
-        id: n.name,
-        type: "pipeline" as const,
-        position: { x: box.x, y: box.y },
-        data: { node: n, live: live.get(n.name), isSelected: selected === n.name },
-        draggable: false,
-        width: box.width,
-        height: box.height,
-      };
-    });
-  }, [columns, branches, placed, live, selected]);
-
   const desiredEdges = useMemo<Edge[]>(() => {
     // Every node in a stage feeds every node in the next one — which is what a fork joining back
     // together looks like, and the only edge relation the pipeline has. Except into a node the
@@ -1009,6 +1023,31 @@ export default function PipelineGraph({
       };
     });
   }, [byName, columns, extent, loops, nodes, spineList, handoff, branches, placed, transition]);
+  // Where the pulse lands when no edge can carry it. Decided from the edges actually being
+  // drawn, so the fallback and the edge tag can never both fire — or neither.
+  const pulsed = useMemo(() => pulsedBox(transition, desiredEdges), [transition, desiredEdges]);
+
+
+  const desiredNodes = useMemo<PipelineNodeType[]>(() => {
+    return [...columns.flatMap((lanes) => lanes), ...branches].map((n) => {
+      const box = placed.get(n.name) ?? { x: 0, y: 0, ...NODE_SIZE };
+      return {
+        id: n.name,
+        type: "pipeline" as const,
+        position: { x: box.x, y: box.y },
+        data: {
+          node: n,
+          live: live.get(n.name),
+          isSelected: selected === n.name,
+          entered: pulsed === n.name,
+        },
+        draggable: false,
+        width: box.width,
+        height: box.height,
+      };
+    });
+  }, [columns, branches, placed, live, selected, pulsed]);
+
 
   /*
    * React Flow is a controlled component: it owns node measurement and writes the result back
