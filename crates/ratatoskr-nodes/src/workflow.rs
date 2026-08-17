@@ -12698,38 +12698,56 @@ mod tests {
     // uses that identifier, a retag after resolution cannot move it, and selecting `container`
     // without a runtime is an error rather than a downgrade to landlock.
 
-    /// Restores `PATH` on drop. Prepending is safe for tests running alongside (every lookup
-    /// that resolved before still resolves); replacing is not, so the replaced window is kept
-    /// to a single resolution call.
-    struct PathGuard(Option<std::ffi::OsString>);
+    /// One `PATH`-mutating test at a time. `PATH` is process state and every guard restores the
+    /// snapshot IT took, so two overlapping guards un-nest: the first to drop resurrects a `PATH`
+    /// without the second one's fake runtime, and the second test's resolution then finds the
+    /// host's real docker — which answers for images the test never built.
+    static PATH_MUTATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Restores `PATH` on drop, and holds [`PATH_MUTATION`] for its whole lifetime — the guard IS
+    /// the test's claim on the process environment, not just the restore.
+    struct PathGuard {
+        old: Option<std::ffi::OsString>,
+        _serialized: tokio::sync::MutexGuard<'static, ()>,
+    }
 
     impl PathGuard {
-        fn prepended(dir: &std::path::Path) -> Self {
+        async fn prepended(dir: &std::path::Path) -> Self {
+            let serialized = PATH_MUTATION.lock().await;
             let old = std::env::var_os("PATH");
             let mut paths = vec![dir.to_path_buf()];
             if let Some(old) = &old {
                 paths.extend(std::env::split_paths(old));
             }
-            // SAFETY: process-environment mutation races with other tests; this only adds a
-            // directory, and drop restores.
+            // SAFETY: serialized by `PATH_MUTATION` against the other guards; prepending keeps
+            // every lookup that resolved before still resolving, and drop restores.
             unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
-            Self(old)
+            Self {
+                old,
+                _serialized: serialized,
+            }
         }
 
-        fn replaced_with(dir: &std::path::Path) -> Self {
+        async fn replaced_with(dir: &std::path::Path) -> Self {
+            let serialized = PATH_MUTATION.lock().await;
             let old = std::env::var_os("PATH");
-            // SAFETY: races with concurrent tests' subprocess spawns for the guard's lifetime;
-            // kept to the one call that must see a runtime-less PATH, and drop restores.
+            // SAFETY: serialized by `PATH_MUTATION` against the other guards; still races other
+            // tests' subprocess spawns for the guard's lifetime, so the replaced window is kept
+            // to the one call that must see a runtime-less `PATH`, and drop restores.
             unsafe { std::env::set_var("PATH", dir) };
-            Self(old)
+            Self {
+                old,
+                _serialized: serialized,
+            }
         }
     }
 
     impl Drop for PathGuard {
         fn drop(&mut self) {
-            // SAFETY: restores exactly what the guard found.
+            // SAFETY: restores exactly what the guard found; the lock in `_serialized` is
+            // released after this body, so the restore happens inside the claim.
             unsafe {
-                match &self.0 {
+                match &self.old {
                     Some(value) => std::env::set_var("PATH", value),
                     None => std::env::remove_var("PATH"),
                 }
@@ -12802,7 +12820,7 @@ mod tests {
 
         let first_digest = format!("sha256:{}", "ab".repeat(32));
         let runtime_dir = fake_container_runtime(&first_digest);
-        let _path = PathGuard::prepended(&runtime_dir);
+        let _path = PathGuard::prepended(&runtime_dir).await;
 
         let first = ctx.resolved_container_image().await.unwrap();
         assert_eq!(first.as_deref(), Some(first_digest.as_str()));
@@ -12882,7 +12900,7 @@ mod tests {
         .unwrap();
 
         let runtime_dir = fake_container_runtime(&format!("sha256:{}", "ab".repeat(32)));
-        let _path = PathGuard::prepended(&runtime_dir);
+        let _path = PathGuard::prepended(&runtime_dir).await;
 
         let resolved = ctx.resolved_container_image().await.unwrap();
         assert!(
@@ -12933,7 +12951,7 @@ mod tests {
         let empty = dir.join("no-runtime-here");
         std::fs::create_dir_all(&empty).unwrap();
         let err = {
-            let _path = PathGuard::replaced_with(&empty);
+            let _path = PathGuard::replaced_with(&empty).await;
             ctx.resolved_container_image()
                 .await
                 .expect_err("resolution without a runtime must fail")
