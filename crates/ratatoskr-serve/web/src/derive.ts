@@ -264,6 +264,10 @@ function spanIndex() {
     boxOf(span: string): string | undefined {
       return box.get(span);
     },
+    /** The recorded parent of exactly this span, with no walk. */
+    parentOf(span: string): string | undefined {
+      return parent.get(span);
+    },
     /** The box owning the nearest node-execution span at or above `from`; `undefined` when the
      *  chain reaches the run itself, or data this view never saw. */
     owner(from: string | undefined): string | undefined {
@@ -333,20 +337,43 @@ export function transitions(events: readonly BoxedEvent[]): Transition[] {
       if (active === name) active = null;
     }
   };
+  /**
+   * The boundary rule, exactly as the node fold settles a turn: a turn ENDING is not the box
+   * finishing. An ordinary stage's execution ends before its host validates and writes the
+   * checkpoint, and completing the box on the raw end let a peer starting in that window read as
+   * a fresh transition. A checkpoint-free box completes when its own turn ended COMPLETED and
+   * the execution that INVOKED it has completed too — either order of arrival — and a turn with
+   * no recorded parent answers to nobody, so its own completed end is its boundary.
+   */
+  const completedSpans = new Set<string>();
+  const awaiting = new Map<string, { span: string; box: string }[]>();
+  const finish = (box: string) => {
+    ownDone.add(box);
+    settled = box;
+    closeIfOver(box);
+  };
   for (const e of events) {
     index.note(e);
     // An execution ending closes its invocation wherever it is — the only closer for one that
     // writes no checkpoint. `boxOf` is a direct lookup: only a span this view saw a node open.
     if (e.kind === "span_end" && e.span_id) {
+      if (e.outcome === "completed") {
+        completedSpans.add(e.span_id);
+        for (const waited of awaiting.get(e.span_id) ?? []) finish(waited.box);
+        awaiting.delete(e.span_id);
+      }
       const owner = index.boxOf(e.span_id);
       if (owner !== undefined) {
         live.get(owner)?.delete(e.span_id);
-        if (ownSpan.has(e.span_id)) {
-          ownDone.add(owner);
-          // A COMPLETED own end is also the box settling, for the `from` fallback: a
-          // checkpoint-free box that finished is what the next start was handed off from. A
-          // cancelled one handed nothing off and settles nobody.
-          if (e.outcome === "completed") settled = owner;
+        if (ownSpan.has(e.span_id) && e.outcome === "completed") {
+          const boundary = index.parentOf(e.span_id);
+          if (boundary === undefined || completedSpans.has(boundary)) {
+            finish(owner);
+          } else {
+            const queue = awaiting.get(boundary);
+            if (queue) queue.push({ span: e.span_id, box: owner });
+            else awaiting.set(boundary, [{ span: e.span_id, box: owner }]);
+          }
         }
         closeIfOver(owner);
       }

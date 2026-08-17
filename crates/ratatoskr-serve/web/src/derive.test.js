@@ -2453,3 +2453,54 @@ test("a lifecycle end closes a checkpoint-free cycle", () => {
   expect(seen).toHaveLength(2);
   expect(seen.at(-1)).toMatchObject({ from: "characterizer", to: "characterizer" });
 });
+
+test("a turn ending is not the box finishing — the boundary is", () => {
+  // An ordinary stage's execution ends BEFORE its host validates and writes the checkpoint —
+  // exactly where the node fold refuses to settle the turn. Completing the box on the raw end
+  // closed its cycle in that window, and a composed peer starting there read as a fresh
+  // transition the run never made.
+  const stages = registry(["review", "review", "security"]);
+  const host = "0000000000000110";
+  const events = inNodeBoxes(
+    [
+      { at: "t0", kind: "span_start", span_id: host, parent_span_id: "00000000000000ff", execution: "host", execution_name: "review_host" },
+      { ...attemptStart("review", "0000000000000111", "opus"), parent_span_id: host },
+      // The turn returns; validation and the checkpoint are still to come.
+      { at: "t1", kind: "span_end", outcome: "completed", span_id: "0000000000000111", execution: "node", execution_name: "review" },
+      { ...attemptStart("security", "0000000000000112", "haiku"), parent_span_id: host },
+    ],
+    stages,
+  );
+  const seen = transitions(events);
+  expect(seen).toHaveLength(1);
+  expect(seen[0].to).toBe("review");
+});
+
+test("a checkpoint-free box completes at its boundary, in either order", () => {
+  // The answerer/evidence-only shape: no checkpoint ever, so the own turn's completed end plus
+  // the completed end of the execution that invoked it are what finish the box — whichever
+  // arrives second. Only then does a re-entry read as the self-loop.
+  const stages = registry(["characterizer"]);
+  const hostOf = (span) => `00000000000001${span}`;
+  const turn = (span) => [
+    { at: "t0", kind: "span_start", span_id: hostOf(span), parent_span_id: "00000000000000ff", execution: "host", execution_name: "characterize" },
+    { ...attemptStart("characterizer", `00000000000000${span}`, "opus"), parent_span_id: hostOf(span) },
+  ];
+  const childEnd = (span, at) => ({ at, kind: "span_end", outcome: "completed", span_id: `00000000000000${span}`, execution: "node", execution_name: "characterizer" });
+  const hostEnd = (span, at) => ({ at, kind: "span_end", outcome: "completed", span_id: hostOf(span), execution: "host", execution_name: "characterize" });
+
+  for (const first of [
+    // Turn end first, boundary second — the usual order.
+    [...turn("21"), childEnd("21", "t1"), hostEnd("21", "t2")],
+    // Boundary's end seen first — an imported tail may interleave them.
+    [...turn("22"), hostEnd("22", "t1"), childEnd("22", "t2")],
+  ]) {
+    const events = inNodeBoxes(
+      [...first, attemptStart("characterizer", "0000000000000123", "opus")],
+      stages,
+    );
+    const seen = transitions(events);
+    expect(seen).toHaveLength(2);
+    expect(seen.at(-1).to).toBe("characterizer");
+  }
+});
