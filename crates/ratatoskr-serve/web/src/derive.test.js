@@ -2543,8 +2543,20 @@ test("the box's own aggregate is not a member state", () => {
   );
   const boxes = nodesFromEvents(events);
   expect(boxes.get("redteam").memberStates.has("redteam")).toBe(false);
-  // The self-staged analyst's one member IS itself, so it reports no member states.
-  expect(boxes.get("analyst").memberStates).toBeUndefined();
+  // The self-staged analyst's one member IS itself: its map is present — the stream spoke for
+  // the box — and empty, which is what tells a pip-free box from a stream-silent one.
+  expect(boxes.get("analyst").memberStates.size).toBe(0);
+});
+
+test("a peer waits as idle while only the self stage has run", () => {
+  // review composed of its self-named stage plus security, scrubbed to where only review has
+  // spoken. The box's derivation IS the stream having reached it — omitting the empty map there
+  // read as silence, and the strip vanished with security's waiting pip in it.
+  const stages = registry(["review", "review", "security"]);
+  const events = inNodeBoxes([start("review")], stages);
+  const box = nodesFromEvents(events).get("review");
+  expect(box.memberStates).toBeDefined();
+  expect(box.memberStates.size).toBe(0);
 });
 
 test("a member that failed stays failed in the strip, without failing the box", () => {

@@ -621,4 +621,9 @@ test("the pip strip never exceeds its cap, and the overflow tile takes the last 
   expect(pipsOf(["box", "peer"], "box", new Map([["peer", "working"]]))).toEqual([
     { id: "peer", state: "working" },
   ]);
+  // An EMPTY map is the stream having spoken for the box while only its self stage ran — the
+  // declared peer waits as idle. Only an absent map is stream-silence.
+  expect(pipsOf(["review", "security"], "review", new Map())).toEqual([
+    { id: "security", state: "idle" },
+  ]);
 });

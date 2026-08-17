@@ -58,10 +58,13 @@ export interface DerivedNode {
    *
    * From the same per-invocation bookkeeping the box state is folded from, which is what keeps a
    * substage lighting at the point in the run where it actually ran and staying correct while
-   * scrubbing. Present only when a member has recorded; which stages a box is DECLARED to hold is
-   * the registry's answer, and a stage the shape never assigned to this box must not appear in it.
+   * scrubbing. Always present on a derived box, EMPTY when only its self-named stage has spoken:
+   * the box's derivation is itself the evidence the stream reached it, and omitting the map there
+   * read as stream-silence — hiding a declared peer's waiting pip exactly while its sibling ran.
+   * Which stages a box is DECLARED to hold is the registry's answer, and a stage the shape never
+   * assigned to this box must not appear in it.
    */
-  memberStates?: Map<string, NodeState>;
+  memberStates: Map<string, NodeState>;
   /**
    * The box whose execution this one's invocations ran INSIDE, when the stream shows one.
    *
@@ -838,7 +841,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     out.set(name, {
       state,
       checkpoints: box.checkpoints,
-      ...(memberStates.size ? { memberStates } : {}),
+      memberStates,
       ...(caller !== undefined ? { caller } : {}),
       ...(folded ? { telemetry: folded } : {}),
       cycles: members.reduce((n, m) => n + (current(m)?.cycles ?? 0), 0),
