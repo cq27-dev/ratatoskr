@@ -2326,6 +2326,9 @@ impl StageExecutor {
                 // The operator, though, acts on the box the graph draws. A stage that is its own
                 // node is that box; one that belongs to another answers at the box's address.
                 controlled_as: Some(stage.node_id()),
+                // A declared stage's caller IS its parentage: the host call that drove it names
+                // the invoker, and a reader resolves it through the spans.
+                caller: None,
                 route: &cfg.route,
                 preamble: &preamble,
                 question: &question,

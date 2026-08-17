@@ -104,6 +104,13 @@ pub struct LiveEvent {
     /// nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub controlled_as: Option<String>,
+    /// The box whose work this invocation is FOR, stated by its caller on a `node_start`.
+    ///
+    /// Producer provenance for an invocation whose parentage cannot say it — a run-driven
+    /// judgement like the referee, invoked by an operation host no box owns. A reader anchors the
+    /// box by this from the turn's first record instead of waiting for a checkpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<String>,
     /// What the turn reached for, off a `usage` record.
     ///
     /// A turn that writes no checkpoint — an answerer, an evidence-only stage — has only this
@@ -338,6 +345,10 @@ fn to_event(record: &Value) -> LiveEvent {
             .and_then(|i| i.parent_span_id)
             .map(|p| p.to_string()),
         controlled_as: attribution.controlled_as,
+        caller: (kind == "node_start")
+            .then(|| str_field("caller"))
+            .flatten()
+            .map(str::to_string),
         // Comma-separated on the wire, as every tool list in this stream is.
         tools_used: (kind == "usage")
             .then(|| str_field("tools_used"))
@@ -958,6 +969,7 @@ mod tests {
             execution: None,
             execution_name: None,
             controlled_as: None,
+            caller: None,
             tools_used: None,
             asked_by: None,
             outcome: None,
@@ -981,6 +993,7 @@ mod tests {
             execution: None,
             execution_name: None,
             controlled_as: None,
+            caller: None,
             tools_used: None,
             asked_by: None,
             outcome: None,

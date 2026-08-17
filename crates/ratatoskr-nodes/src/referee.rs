@@ -149,6 +149,11 @@ impl RefereeNode {
         crate::verifier::run_judgement(
             ratatoskr_agent::NodeRun {
                 node: "referee",
+                // Stated, because parentage cannot say it: the referee is invoked by the converge
+                // host, which no box owns, yet it judges exactly the implementer's latest
+                // checkpoint — the call below fetches it. A reader anchors the box by this from
+                // the first moment of the turn instead of waiting for the checkpoint's mirror.
+                caller: Some("implementer"),
                 controlled_as: None,
                 route: &self.route,
                 preamble: PREAMBLE,

@@ -248,6 +248,13 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     outcome?: string | undefined;
     /** The execution that invoked this one, where a record has said. */
     parent?: string;
+    /**
+     * The box this invocation's work is FOR, stated by its caller on the `node_start`.
+     *
+     * Producer provenance, above the parentage walk: a run-driven judgement's chain honestly
+     * reaches no box, yet its caller is known exactly at the call site and stated there.
+     */
+    stated?: string;
     telemetry?: NodeTelemetry;
     cycles: number;
     used: Set<string>;
@@ -428,6 +435,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
       // the box a member is drawn in is its own address — so a member whose control goes somewhere
       // else entirely is one nothing here can reach.
       attempt.controllable = (e.controlled_as ?? e.node) === e.node;
+      if (e.caller !== undefined) attempt.stated = e.caller;
       filed(member, e, attempt);
       // What it RAN ON carries across a re-entry; what it SPENT does not. The model, its tools and
       // its session are configuration — a start that announces nothing has not changed them — while
@@ -572,8 +580,12 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     let rooted = false;
     for (const m of box.members.values()) {
       for (const a of m.list) {
-        let span = a.parent;
-        let owner: string | undefined;
+        // Stated provenance supersedes this invocation's walk: a run-driven judgement's chain
+        // honestly reaches no box, and reading that as a root VOTE against the statement would
+        // refuse the one anchor the producer went out of its way to assert. Conflicts between
+        // statements — or between a statement and another invocation's walk — still refuse.
+        let owner: string | undefined = a.stated;
+        let span = owner === undefined ? a.parent : undefined;
         for (let hop = 0; span !== undefined && hop < 64; hop += 1) {
           owner = spanBox.get(span);
           if (owner !== undefined) break;

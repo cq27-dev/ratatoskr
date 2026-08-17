@@ -466,14 +466,18 @@ pub(crate) struct TurnSubject<'a> {
     /// nothing addressed to the answerer's own name is ever polled, and a reader offering one would
     /// hand an operator a button that does nothing.
     pub controlled_as: Option<&'a str>,
+    /// The box whose work this invocation is FOR, stated by the caller of the turn; see
+    /// [`NodeRun::caller`]. Rides the `node_start` record and nothing else.
+    pub caller: Option<&'a str>,
     pub invocation: Option<Invocation>,
 }
 
 impl<'a> TurnSubject<'a> {
-    fn of(node: &'a str, controlled_as: Option<&'a str>) -> Self {
+    fn of(node: &'a str, controlled_as: Option<&'a str>, caller: Option<&'a str>) -> Self {
         Self {
             node,
             controlled_as,
+            caller,
             invocation: current_execution(),
         }
     }
@@ -498,6 +502,7 @@ impl<'a> TurnSubject<'a> {
             span_id,
             parent_span_id,
             controlled_as = self.controlled_as,
+            caller = self.caller,
             model = facts.model,
             tools = %facts.tools.join(","),
             thinking = facts.thinking,
@@ -694,7 +699,7 @@ where
     // The control address stays the asker's, and is stated rather than left to be inferred: a Stop
     // during a clarification ends the ASKING node's turn, so nothing addressed to the answerer's
     // own name is ever polled and a reader offering one would hand an operator a dead button.
-    let subject = TurnSubject::of(node, controlled_as);
+    let subject = TurnSubject::of(node, controlled_as, None);
     let tool_names = tools.names();
     // `provider/model`, the same identity an ordinary turn reports. An answerer commonly has no
     // checkpoint, so these records are the only account of what it ran on — and a bare model name
@@ -3030,6 +3035,13 @@ pub struct NodeRun<'a> {
     /// so two stages composing one node poll under the box's name and a Stop reaches whichever of
     /// them is running. The record still says which one that was; only the address is shared.
     pub controlled_as: Option<&'a str>,
+    /// The box whose work this invocation is FOR, when parentage cannot say: a run-driven
+    /// judgement like the referee is invoked by an operation host with no box above it, yet its
+    /// caller is known exactly at the call site. Stated provenance, carried on the `node_start`
+    /// record — a reader anchors the box by it from the first moment of the turn, instead of
+    /// waiting for a checkpoint to mirror the call site after the fact. `None` for every node
+    /// whose caller IS its parentage: a nested invocation resolves through its spans.
+    pub caller: Option<&'a str>,
     pub route: &'a ModelRoute,
     pub preamble: &'a str,
     pub question: &'a str,
@@ -3158,6 +3170,7 @@ where
     let NodeRun {
         node,
         controlled_as,
+        caller,
         route,
         preamble,
         question,
@@ -3319,7 +3332,7 @@ where
     // Announced at the start, because a checkpoint only exists once the node has finished — and
     // the moment a reader most wants to know what a node is running on is while it is still
     // running. The facts here are the configured ones; cost arrives with the checkpoint.
-    let subject = TurnSubject::of(node, controlled_as);
+    let subject = TurnSubject::of(node, controlled_as, caller);
     subject.started(TurnFacts {
         model: &model_name,
         tools: &tool_names,
@@ -4524,6 +4537,7 @@ mod tests {
                 NodeRun {
                     node,
                     controlled_as: None,
+                    caller: None,
                     route: &route,
                     preamble: "Answer.",
                     question: "Answer.",
@@ -4648,6 +4662,7 @@ mod tests {
             NodeRun {
                 node: "analyst",
                 controlled_as: None,
+                caller: None,
                 route: &route,
                 preamble: "Answer.",
                 question: "Answer.",
@@ -4764,6 +4779,7 @@ mod tests {
             NodeRun {
                 node: "analyst",
                 controlled_as: Some("implementer"),
+                caller: Some("scout"),
                 route: &route,
                 preamble: "Answer.",
                 question: "Answer.",
@@ -4823,6 +4839,9 @@ mod tests {
             .find(|record| record["kind"] == "node_start")
             .expect("the turn announced itself");
         assert_eq!(start["controlled_as"], "implementer", "{start}");
+        // Stated provenance rides the start — the record a reader anchors the box by from the
+        // first moment of the turn, not the checkpoint that arrives when it is over.
+        assert_eq!(start["caller"], "scout", "{start}");
     }
 
     #[tokio::test]
@@ -4857,6 +4876,7 @@ mod tests {
             NodeRun {
                 node: "analyst",
                 controlled_as: None,
+                caller: None,
                 route: &route,
                 preamble: "Return the requested summary.",
                 question: "Summarise the change.",
@@ -4951,6 +4971,7 @@ mod tests {
             NodeRun {
                 node: "implementer_attempt",
                 controlled_as: Some("implementer"),
+                caller: None,
                 route: &route,
                 preamble: "Return the requested summary.",
                 question: "Summarise the change.",
@@ -5595,6 +5616,7 @@ mod tests {
         let answer = run_structured(NodeRun {
             node: "livetest",
             controlled_as: None,
+            caller: None,
             route: &route,
             preamble: "You edit files with the tools you are given. Do exactly what is asked.",
             question: "Create `greet.py` containing exactly these two lines:\n\
@@ -5668,6 +5690,7 @@ mod tests {
         let answer = run_structured(NodeRun {
             node: "usagetest",
             controlled_as: None,
+            caller: None,
             route: &route,
             preamble: "You answer briefly but completely.",
             question: "In four or five full sentences, describe what a git worktree is.",
@@ -5733,6 +5756,7 @@ mod tests {
             NodeRun {
                 node: "implementer",
                 controlled_as: None,
+                caller: None,
                 route,
                 preamble: "",
                 question: "",

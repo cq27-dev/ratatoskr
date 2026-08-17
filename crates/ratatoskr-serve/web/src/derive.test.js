@@ -2103,9 +2103,9 @@ test("a nested node resolves its caller through the host call that drove it", ()
 });
 
 test("a node driven by the run itself resolves no caller", () => {
-  // The referee's shape today: its parent is an operation host the RUN drove, and above that host
-  // there is no box. The stream honestly has no anchor — the server's mirrored call-site caller
-  // is the only answer for it, and nothing here invents one.
+  // A run-driven invocation that STATES nothing: its parent is an operation host the run drove,
+  // and above that host there is no box. The stream honestly has no anchor, and nothing here
+  // invents one.
   const stages = registry(["referee"]);
   const host = "00000000000000b2";
   const events = [
@@ -2113,6 +2113,36 @@ test("a node driven by the run itself resolves no caller", () => {
     { ...attemptStart("referee", "00000000000000c2", "opus"), parent_span_id: host },
   ];
   expect(nodesFromEvents(inNodeBoxes(events, stages)).get("referee").caller).toBeUndefined();
+});
+
+test("a stated caller anchors a run-driven invocation from its first record", () => {
+  // The referee: invoked by the converge host, which no box owns, yet judging exactly the
+  // implementer's latest checkpoint — so the producer STATES the caller on the node_start, and
+  // the box anchors from the first moment of the turn. Waiting for the checkpoint's mirrored
+  // caller left the flagship case in a trailing column for its entire model turn — the one
+  // stretch of time the placement exists to show.
+  const stages = registry(["implementer"], ["referee"]);
+  const host = "00000000000000b9";
+  const live = [
+    attemptStart("implementer", "00000000000000a9", "opus"),
+    { at: "t0", kind: "span_start", span_id: host, parent_span_id: "00000000000000ff", execution: "host", execution_name: "iterate" },
+    { ...attemptStart("referee", "00000000000000c9", "opus"), parent_span_id: host, caller: "implementer" },
+  ];
+  const derived = nodesFromEvents(inNodeBoxes(live, stages));
+  expect(derived.get("referee").caller).toBe("implementer");
+
+  // And it reaches the row before any server row exists: mid-turn the shape has no referee, and
+  // the anchor must not wait for the checkpoint that ends the turn.
+  const view = applyDerived([composed("implementer", "working")], derived, null, true);
+  expect(view.find((n) => n.name === "referee").caller).toBe("implementer");
+
+  // A statement is a resolution like any other: two invocations stating different callers fit
+  // two histories, and anchor the box to neither.
+  const conflicted = [
+    ...live,
+    { ...attemptStart("referee", "00000000000000d9", "opus"), parent_span_id: host, caller: "analyst" },
+  ];
+  expect(nodesFromEvents(inNodeBoxes(conflicted, stages)).get("referee").caller).toBeNull();
 });
 
 test("two invocations that resolve different callers anchor the box to neither", () => {
