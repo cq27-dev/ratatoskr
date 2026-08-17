@@ -992,9 +992,15 @@ export function skippedSpans(nodes: readonly NodeView[]): { from: string; to: st
  * pipeline's final stage, judging what the publisher published.
  *
  * Chained edges *within* the appended run are kept. For a run whose workflow declared no layout,
- * the order the stream first saw each node is the only ordering it has.
+ * the order the stream first saw each node is the only ordering it has — the least wrong claim
+ * available. But only where nothing better exists: an appended target that NAMES its caller has a
+ * better claim, and the chain edge beside it asserts a hand-off the record contradicts. That
+ * includes an adjacency the layout itself manufactured — an anchored node leaving the spine makes
+ * the trailing columns either side of it neighbours, and in a chain X → A → B where A anchored
+ * under X, the closed-up columns read X → B.
  */
 export function handoffDrawn(source: NodeView, target: NodeView): boolean {
+  if (target.shaped === false && target.caller) return false;
   return target.shaped !== false || source.shaped === false;
 }
 

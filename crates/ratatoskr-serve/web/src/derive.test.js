@@ -366,6 +366,19 @@ test("an appended node still hands off to the next appended node", () => {
   expect(handoffDrawn(appended("transform", 0), appended("publish_docs", 1))).toBe(true);
 });
 
+test("an appended node that names its caller receives no adjacency edge", () => {
+  // The chain is the least wrong claim available only where nothing better exists. In a dynamic
+  // chain X -> A -> B where A anchored under X and B stayed trailing, the closed-up columns make
+  // X and B neighbours — and the chain edge then asserts X -> B beside caller edges that say
+  // otherwise. A target with a caller takes exactly one in-edge: the caller's.
+  const called = { ...appended("aide", 1), caller: "helper" };
+  expect(handoffDrawn(appended("helper", 0), called)).toBe(false);
+  expect(handoffDrawn(placed("analyst", 0), called)).toBe(false);
+  // The caller-bearing node still hands off DOWN the chain, where the next node has no better
+  // claim of its own.
+  expect(handoffDrawn(called, appended("scribe", 2))).toBe(true);
+});
+
 test("a declared layout's own hand-offs are drawn in full", () => {
   expect(handoffDrawn(placed("analyst", 2), placed("implementer", 3))).toBe(true);
 });
