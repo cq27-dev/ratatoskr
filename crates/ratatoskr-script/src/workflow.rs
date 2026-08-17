@@ -437,6 +437,24 @@ fn translate_error(
 /// mapping's generated side is zero-based. Parsed by hand rather than a regex dependency: the
 /// shape is one name, one or two numbers.
 fn translate_frames_of(text: &str, frame: &str, mapping: &transpile::SourceMapping) -> String {
+    // Only STACK-FRAME lines translate — the engine's own `at …` formatting. An exception's
+    // message is the workflow's to write, and a workflow can throw any string, including one
+    // shaped exactly like a frame: rewriting it would corrupt what the author deliberately said,
+    // in the one channel they have for saying it.
+    text.split('\n')
+        .map(|line| {
+            if line.trim_start().starts_with("at ") {
+                translate_frame_line(line, frame, mapping)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// [`translate_frames_of`] for one line the engine formatted as a frame.
+fn translate_frame_line(text: &str, frame: &str, mapping: &transpile::SourceMapping) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(found) = rest.find(frame) {
@@ -1397,6 +1415,39 @@ mod tests {
         let path = dir.join("workflow.ts");
         std::fs::write(&path, ts).unwrap();
         WorkflowRuntime::load(&path, &[]).await.unwrap().unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_message_shaped_like_a_frame_is_not_rewritten() {
+        // The message is the workflow's to write, and a workflow can throw any string — including
+        // one that quotes a frame position exactly. Only the engine's own `at …` lines translate;
+        // rewriting the quoted text would corrupt what the author deliberately said, in the one
+        // channel they have for saying it.
+        let dir = scratch("frame-shaped-message");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("workflow.ts");
+        let quoted = format!("{}:1:1", generated_name(&path.display().to_string()));
+        std::fs::write(
+            &path,
+            format!(
+                "type Shift = number;\nexport async function run(input: {{}}) {{\n    throw new Error(\"see {quoted} for details\");\n}}\n"
+            ),
+        )
+        .unwrap();
+        let rt = WorkflowRuntime::load(&path, &[]).await.unwrap().unwrap();
+        let error = rt
+            .run("run", "{}".into(), HashMap::new())
+            .await
+            .expect_err("the workflow throws")
+            .to_string();
+        // The quoted text survives verbatim…
+        assert!(
+            error.contains(&format!("see {quoted} for details")),
+            "the author's message is not the translator's to edit: {error}"
+        );
+        // …while the real frame beneath it still comes home: the throw sits on TS line 3.
+        assert!(error.contains("workflow.ts:3:"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test(flavor = "current_thread")]
