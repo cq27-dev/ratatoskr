@@ -412,6 +412,25 @@ impl WorkflowRuntime {
     }
 }
 
+/// [`WorkflowRuntime::translate_frames`] for the loading paths, where the runtime does not exist
+/// yet but the mapping already does — a module may throw at top level during its first
+/// evaluation, and that error is a runtime error like any other.
+fn translate_error(
+    mappings: &std::collections::HashMap<String, transpile::SourceMapping>,
+    error: ScriptError,
+) -> ScriptError {
+    match error {
+        ScriptError::Eval(message) => {
+            let mut out = message;
+            for (frame, mapping) in mappings {
+                out = translate_frames_of(&out, frame, mapping);
+            }
+            ScriptError::Eval(out)
+        }
+        other => other,
+    }
+}
+
 /// Replace `frame:LINE[:COL]` occurrences with the mapped source position.
 ///
 /// QuickJS frames carry a 1-based line and, in builds that record it, a 1-based column; the
@@ -490,12 +509,16 @@ impl WorkflowRuntime {
         let transpiled =
             transpile::transpile_with_includes(name, src, includes, &specifiers(modules))?;
         let (runtime, context, budget) = engine(modules).await?;
+        // Built BEFORE the first evaluation: a module may throw at top level while `declared`
+        // reads it, and that is a runtime error like any other — reported against the emitted
+        // JavaScript, it names a file the author never wrote.
+        let mappings = frame_mappings(name, transpiled.mapping, modules);
         let meta = Self::declared(&runtime, &context, &budget, name, &transpiled.javascript)
-            .await?
+            .await
+            .map_err(|error| translate_error(&mappings, error))?
             .ok_or_else(|| {
                 ScriptError::Eval(format!("bundled workflow `{name}` has no declaration"))
             })?;
-        let mappings = frame_mappings(name, transpiled.mapping, modules);
         Ok(Self {
             runtime,
             context,
@@ -527,6 +550,9 @@ impl WorkflowRuntime {
         let (runtime, context, budget) = engine(modules).await?;
         let module_name = path.display().to_string();
 
+        // See `bundled_with_includes`: the mapping exists before the first evaluation, so a
+        // top-level throw during it already names the author's line.
+        let mappings = frame_mappings(&module_name, loaded.mapping, modules);
         // Evaluated once here to read what the script declares about itself. `run` evaluates it
         // again in the same context, which re-runs `defineWorkflow` — an idempotent assignment, and
         // the price of keeping the two paths independent.
@@ -537,7 +563,8 @@ impl WorkflowRuntime {
             &module_name,
             &loaded.javascript,
         )
-        .await?;
+        .await
+        .map_err(|error| translate_error(&mappings, error))?;
         let meta = declared.unwrap_or_else(|| WorkflowMeta {
             // A workflow that declares nothing is still usable and is named after its file, so
             // `defineWorkflow` stays optional for a workflow that only exports entries.
@@ -552,7 +579,6 @@ impl WorkflowRuntime {
             layout: Vec::new(),
         });
 
-        let mappings = frame_mappings(&module_name, loaded.mapping, modules);
         Ok(Some(WorkflowRuntime {
             runtime,
             context,
@@ -1371,6 +1397,65 @@ mod tests {
         let path = dir.join("workflow.ts");
         std::fs::write(&path, ts).unwrap();
         WorkflowRuntime::load(&path, &[]).await.unwrap().unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_top_level_throw_while_loading_names_the_authors_line() {
+        // A module may throw during its FIRST evaluation — the one `declared` runs before the
+        // runtime exists. That is a runtime error like any other, and it used to bypass the
+        // translation entirely: the mapping was built after the evaluation it needed to explain.
+        let dir = scratch("source-mapped-load-error");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("workflow.ts");
+        std::fs::write(
+            &path,
+            "type Shift = number;\nthrow new Error(\"at load\");\nexport async function run(input: {}) { return {}; }\n",
+        )
+        .unwrap();
+        let error = match WorkflowRuntime::load(&path, &[]).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("the module throws at top level"),
+        };
+        assert!(error.contains("at load"), "{error}");
+        // The throw is on TS line 2; the stripped type line above it shifts the JS.
+        assert!(
+            error.contains("workflow.ts:2:"),
+            "the author's line, through the map built before the first evaluation: {error}"
+        );
+        assert!(!error.contains("<generated from"), "{error}");
+
+        // And a provided module throwing at top level names ITS source, at its author's line.
+        let module = transpile::transpile_with_includes(
+            "ratatoskr/defs",
+            "type Shift = number;\nthrow new Error(\"module load\");\nexport const x = 1;\n",
+            &[],
+            &[],
+        )
+        .unwrap();
+        std::fs::write(
+            &path,
+            "import { x } from \"ratatoskr/defs\";\nexport async function run(input: {}) { return { x }; }\n",
+        )
+        .unwrap();
+        let error = match WorkflowRuntime::load(
+            &path,
+            &[ModuleSource {
+                name: "ratatoskr/defs",
+                source: &module.javascript,
+                mapping: Some(&module.mapping),
+            }],
+        )
+        .await
+        {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("the imported module throws at top level"),
+        };
+        assert!(error.contains("module load"), "{error}");
+        assert!(
+            error.contains("ratatoskr/defs:2:"),
+            "the definition's own line: {error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test(flavor = "current_thread")]
