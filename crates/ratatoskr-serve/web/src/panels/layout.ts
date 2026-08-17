@@ -164,13 +164,21 @@ export function branchPlace(
   heightOf: (node: NodeView) => number = nodeHeight,
 ): Map<string, Bounds> {
   const out = new Map<string, Bounds>();
+  const anchored: { child: NodeView; parent: Bounds }[] = [];
+  for (const child of children) {
+    const parent = child.caller ? parentBounds(child.caller) : undefined;
+    if (parent) anchored.push({ child, parent });
+  }
+  // In the parents' own lane order, not the order the stream appended the children: an appended
+  // node arrives by event order, so a lower parent's child listed first sat at the top of the
+  // shared stack and its caller edge crossed the upper parent's. The sort is stable, which is
+  // what keeps siblings of one parent in the order given.
+  anchored.sort((a, b) => a.parent.y - b.parent.y);
   // Stacked per COLUMN, not per parent: two parents in different lanes of one stage share an x,
   // so their children share a column too — keyed by caller, both first children landed on the
   // same coordinates and drew on top of each other.
   const stacked = new Map<number, number>();
-  for (const child of children) {
-    const parent = child.caller ? parentBounds(child.caller) : undefined;
-    if (!parent) continue;
+  for (const { child, parent } of anchored) {
     const below = stacked.get(parent.x) ?? 0;
     const height = heightOf(child);
     out.set(child.name, {

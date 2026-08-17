@@ -430,3 +430,28 @@ test("an anchored node's vacated trailing column closes, and declared stages nev
   const kept = spineNodes(nodes, new Set());
   expect(kept.map((n) => n.stage)).toEqual([0, 2, 3, 4]);
 });
+
+test("branch stacks follow the parents' lanes, not the order children appended", () => {
+  // Appended nodes arrive by event order, so a lower parent's child can be listed first. Placed
+  // in that order it sat at the top of the shared stack and its caller edge crossed the upper
+  // parent's. The stack is sorted by the parent's own y — stably, so siblings keep their order
+  // even when another parent's child interleaves them.
+  const x = 2 * COLUMN_PITCH;
+  const upper = { x, y: 0, width: NODE_SIZE.width, height: NODE_SIZE.height };
+  const lower = { x, y: LANE_PITCH, width: NODE_SIZE.width, height: NODE_SIZE.height };
+  const bounds = (name) => (name === "redteam" ? upper : name === "implementer" ? lower : undefined);
+  const child = (name, caller) => ({ name, state: "done", checkpoints: 1, stage: 5, lane: 0, shaped: false, caller });
+  const rowBottom = 2 * NODE_SIZE.height + LANE_GAP;
+
+  // The LOWER parent's child appended first still sits below the upper parent's.
+  const boxes = branchPlace([child("low", "implementer"), child("up", "redteam")], bounds, rowBottom);
+  expect(boxes.get("up").y).toBeLessThan(boxes.get("low").y);
+
+  const siblings = branchPlace(
+    [child("first", "redteam"), child("mid", "implementer"), child("second", "redteam")],
+    bounds,
+    rowBottom,
+  );
+  expect(siblings.get("first").y).toBeLessThan(siblings.get("second").y);
+  expect(siblings.get("second").y).toBeLessThan(siblings.get("mid").y);
+});

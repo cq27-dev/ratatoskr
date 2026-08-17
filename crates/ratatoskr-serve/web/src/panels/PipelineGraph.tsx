@@ -949,8 +949,15 @@ export default function PipelineGraph({
         // below were riding on `fitView`'s padding, and reserving only the span band above took
         // that padding away from them.
         reserveTop={rfEdges.some((e) => e.type === "span") ? SPAN_BAND : 0}
+        // The union of the shelves and the boxes, not the band below the deepest node: the loop
+        // shelves reach LOOP_BAND below the SPINE, and a branch box hangs deeper than that
+        // already — reserving the whole band under it fitted a second, empty band beneath the
+        // branch. Only the part of the band the boxes do not cover is reserved; with no branch
+        // the two bottoms coincide and this is exactly LOOP_BAND.
         reserveBottom={
-          rfEdges.some((e) => e.type === "backloop" || e.type === "converge") ? LOOP_BAND : 0
+          rfEdges.some((e) => e.type === "backloop" || e.type === "converge")
+            ? Math.max(0, extent.bottom + LOOP_BAND - rowExtent(placed.values()).bottom)
+            : 0
         }
         moved={moved.current}
       />
