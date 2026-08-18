@@ -264,28 +264,44 @@ impl AgentError {
 /// carries, so `unknown_provider` and `provider_client` are reachable in a trace rather than only in
 /// the returned error.
 ///
+/// The failure is recorded as its own EXECUTION, because the turn's execution is opened after
+/// provider resolution too — so without one here the records have no identity of their own and are
+/// attributed outward: a stage's setup failure to the host call that drove it, a clarification's to
+/// the exchange or the asking node. An execution opened here takes its parentage from whatever
+/// invoked the turn, exactly as the turn's own would have, and announces its start and end like any
+/// other.
+///
 /// Only for setup: [`AgentError::Prompt`] can only come from a turn that ran, and that turn already
 /// recorded its outcome on its own span — opening a second one here would double-count it.
-fn record_setup_failure(node: &str, route: &ModelRoute, error: AgentError) -> AgentError {
+async fn record_setup_failure(node: &str, route: &ModelRoute, error: AgentError) -> AgentError {
     if matches!(error, AgentError::Prompt(_)) {
         return error;
     }
     let model_name = format!("{}/{}", route.provider, route.model);
-    let span = tracing::info_span!(
-        "invoke_agent",
-        node,
-        otel.name = %otel_name("invoke_agent", node),
-        otel.kind = "client",
-        otel.status_code = tracing::field::Empty,
-        "error.type" = tracing::field::Empty,
-        "gen_ai.operation.name" = "invoke_agent",
-        "gen_ai.agent.name" = node,
-        "gen_ai.request.model" = %model_name,
-    );
-    record_turn_outcome(&span, Some(&error));
-    // Inside the span, so the failure has a record and not only a field on a span nothing was
-    // emitted under.
-    span.in_scope(|| tracing::warn!(node, %error, "the turn could not reach its provider"));
+    execution(node, ExecutionKind::Node, async {
+        let (span_id, parent_span_id) = execution_ids();
+        let span = tracing::info_span!(
+            "invoke_agent",
+            node,
+            otel.name = %otel_name("invoke_agent", node),
+            otel.kind = "client",
+            otel.status_code = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+            "gen_ai.operation.name" = "invoke_agent",
+            "gen_ai.agent.name" = node,
+            "gen_ai.request.model" = %model_name,
+            span_id,
+            parent_span_id,
+        );
+        record_turn_outcome(&span, Some(&error));
+        // A turn that never reached a provider produced no output to validate, so its end must not
+        // read as work completed — the same distinction a turn whose output failed its schema makes.
+        output_unvalidated();
+        // Inside the span, so the failure has a record and not only a field on a span nothing was
+        // emitted under.
+        span.in_scope(|| tracing::warn!(node, %error, "the turn could not reach its provider"));
+    })
+    .await;
     error
 }
 
@@ -657,7 +673,7 @@ pub async fn ask(
     let node = answerer.map_or_else(|| addressed.clone(), str::to_string);
     // Only where they differ: a plain ask answers under its own name and is controlled by it.
     let controlled_as = (node != addressed).then_some(addressed.as_str());
-    ask_resolved(
+    match ask_resolved(
         route,
         preamble,
         question,
@@ -668,7 +684,10 @@ pub async fn ask(
         controlled_as,
     )
     .await
-    .map_err(|error| record_setup_failure(&node, route, error))
+    {
+        Ok(answer) => Ok(answer),
+        Err(error) => Err(record_setup_failure(&node, route, error).await),
+    }
 }
 
 /// [`ask`], from provider resolution onward. Separate so a failure to resolve one is still a turn
@@ -3208,9 +3227,10 @@ pub struct NodeRun<'a> {
 pub async fn run_structured(run: NodeRun<'_>) -> Result<String, AgentError> {
     let node = run.node;
     let route = run.route;
-    run_structured_resolved(run)
-        .await
-        .map_err(|error| record_setup_failure(node, route, error))
+    match run_structured_resolved(run).await {
+        Ok(answer) => Ok(answer),
+        Err(error) => Err(record_setup_failure(node, route, error).await),
+    }
 }
 
 /// [`run_structured`], from provider resolution onward. Separate so a failure to resolve one is
@@ -4932,34 +4952,67 @@ mod tests {
             params: None,
             session: Default::default(),
         };
+        // Inside the execution that drove the turn — a host call, for a stage — so the identity
+        // the failure records can be compared against the one that invoked it.
         let capturing = capture::start();
-        let failed = run_structured(NodeRun {
-            node: "analyst",
-            controlled_as: None,
-            caller: None,
-            route: &route,
-            preamble: "Answer.",
-            question: "Answer.",
-            tools: ToolSet::default(),
-            output_schema: schemars::schema_for!(Done),
-            policy: None,
-            max_turns: Some(2),
-            clarifier: None,
-            observer: None,
-            skills: Vec::new(),
-            files: None,
-            rag_rat_worktree: None,
-            shell: None,
-            push: None,
-            conversation: None,
-            ledger: None,
-            produces: None,
+        let failed = execution("implement", ExecutionKind::Host, async {
+            run_structured(NodeRun {
+                node: "analyst",
+                controlled_as: None,
+                caller: None,
+                route: &route,
+                preamble: "Answer.",
+                question: "Answer.",
+                tools: ToolSet::default(),
+                output_schema: schemars::schema_for!(Done),
+                policy: None,
+                max_turns: Some(2),
+                clarifier: None,
+                observer: None,
+                skills: Vec::new(),
+                files: None,
+                rag_rat_worktree: None,
+                shell: None,
+                push: None,
+                conversation: None,
+                ledger: None,
+                produces: None,
+            })
+            .await
         })
         .await;
         let raw = capturing.text();
         drop(capturing);
 
         assert!(matches!(failed, Err(AgentError::UnknownProvider(_))));
+        let records = || {
+            raw.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        };
+        // The failure is its own execution, announced and closed like any turn's — without one the
+        // records have no identity and are attributed outward, to the host call that drove the
+        // turn or, for a clarification, to the node that asked.
+        let host = records()
+            .find(|record| record["execution_name"] == "implement")
+            .expect("the driving execution announced itself");
+        let turn = records()
+            .find(|record| record["kind"] == "span_start" && record["execution_name"] == "analyst")
+            .unwrap_or_else(|| panic!("the failed turn is an execution too; captured: {raw}"));
+        assert_ne!(
+            turn["span_id"], host["span_id"],
+            "the turn's identity is its own, not the caller's: {turn}"
+        );
+        assert_eq!(
+            turn["parent_span_id"], host["span_id"],
+            "and its parent is whatever invoked it: {turn}"
+        );
+        let end = records()
+            .find(|record| record["kind"] == "span_end" && record["execution_name"] == "analyst")
+            .unwrap_or_else(|| panic!("the failed turn announced its end; captured: {raw}"));
+        assert_eq!(
+            end["outcome"], "unvalidated",
+            "a turn that never reached a provider produced nothing to validate: {end}"
+        );
         let span = raw
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -4977,6 +5030,10 @@ mod tests {
         // The same mapping serves a client that could not initialize (`provider_client`), which is
         // the missing-API-key case; both classes were previously unreachable in a trace.
         assert_eq!(span["error.type"], "unknown_provider", "{span}");
+        // On the span too, so a record emitted inside it resolves to the turn rather than to the
+        // execution around it.
+        assert_eq!(span["span_id"], turn["span_id"], "{span}");
+        assert_eq!(span["parent_span_id"], host["span_id"], "{span}");
     }
 
     /// A model that refuses every request, so the turn ends in an error.
