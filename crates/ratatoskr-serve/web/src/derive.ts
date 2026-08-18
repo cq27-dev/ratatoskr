@@ -662,10 +662,10 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
               output_tokens: e.usage.output_tokens,
               cached_input_tokens: e.usage.cached_input_tokens,
               cache_creation_input_tokens: e.usage.cache_creation_input_tokens,
-              // The producer OMITS a count it never measured, and an omitted JSON field parses
-              // as `undefined` rather than `null`. Normalised here so absence has one spelling
-              // inside the fold: a strict null check downstream would miss `undefined` and add it
-              // as zero, inventing the measurement this whole field exists to avoid.
+              // The producer OMITS a count it never measured, and an omitted JSON field parses as
+              // `undefined` rather than `null`. Normalised here so absence has ONE spelling inside
+              // the fold, where `blank()` spells it `null`; the fold below is tolerant of both as
+              // well, because either one alone would let an unmeasured turn be added as zero.
               reasoning_tokens: e.usage.reasoning_tokens ?? null,
               duration_ms: e.usage.duration_ms,
             }

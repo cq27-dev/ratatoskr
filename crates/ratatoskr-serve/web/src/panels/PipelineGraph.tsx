@@ -219,19 +219,6 @@ function NodeFacts({
 }
 
 /**
- * A node update, keeping what React Flow measured on the last one.
- *
- * The same box in the same place with new `data` keeps its measurement: React Flow owns measurement
- * and writes it back through `onNodesChange`, and replacing the object it is working on makes it
- * re-measure on every render and drop the edges it cannot route until both endpoints are measured.
- *
- * A box that changed SIZE is not the same box: its measurement describes something that no longer
- * exists, and React Flow would go on fitting, routing and hit-testing the size it used to be. Only
- * the measurement is replaced. Handing back the bare node instead takes its handle bounds away with
- * it, and a node without those reads as uninitialised — the condition the fit waits on, so the graph
- * would never refit around the box that grew.
- */
-/**
  * What the thinking marker says, given what the turn reported about its reasoning.
  *
  * Four states, because absence means two different things and only one of them is about the
@@ -264,6 +251,19 @@ export function thinkingTip(
   return `Thinking: ${short(reasoning)} reasoning tokens before answering`;
 }
 
+/**
+ * A node update, keeping what React Flow measured on the last one.
+ *
+ * The same box in the same place with new `data` keeps its measurement: React Flow owns measurement
+ * and writes it back through `onNodesChange`, and replacing the object it is working on makes it
+ * re-measure on every render and drop the edges it cannot route until both endpoints are measured.
+ *
+ * A box that changed SIZE is not the same box: its measurement describes something that no longer
+ * exists, and React Flow would go on fitting, routing and hit-testing the size it used to be. Only
+ * the measurement is replaced. Handing back the bare node instead takes its handle bounds away with
+ * it, and a node without those reads as uninitialised — the condition the fit waits on, so the graph
+ * would never refit around the box that grew.
+ */
 export function carryMeasurement(
   previous: PipelineNodeType | undefined,
   next: PipelineNodeType,

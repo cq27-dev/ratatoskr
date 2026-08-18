@@ -794,18 +794,28 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         // NULL only on rows that predate the rename, so re-running this matches nothing.
         if table == "checkpoints" && existing.contains("thinking") {
             conn.execute_batch(
-                "UPDATE checkpoints SET thinking_requested = thinking                  WHERE thinking_requested IS NULL AND thinking IS NOT NULL",
+                "UPDATE checkpoints SET thinking_requested = thinking
+                 WHERE thinking_requested IS NULL AND thinking IS NOT NULL",
             )?;
             // The same repair for the count beside it. An Anthropic row's `0` was rig's default for
             // a payload that carries no reasoning figure at all, never something the endpoint said
             // — and left standing it goes on asserting a measurement nobody made, over exactly the
-            // history a reader scrubs back through. Self-limiting, like the copy above: a row
-            // written since records no figure for such a payload rather than a zero, so only rows
-            // from before this can match. A provider that DOES report the figure keeps the zero it
-            // reported, because that zero is an answer.
+            // history a reader scrubs back through.
+            //
+            // ONE route, which is what the `,` excludes. A row's `model` names every distinct route
+            // it folded, comma-joined — the halves of a composed node resolve their own — so a
+            // folded row beginning `anthropic/` may carry a zero its OpenAI half genuinely
+            // reported, and clearing that would destroy a measurement to remove a fabricated one.
+            // Where the row cannot say which half answered, it keeps what it has.
+            //
+            // Restricted that way the predicate is self-limiting, which matters because this runs
+            // on every open of a store that ever had the old column: a single-route Anthropic row
+            // written since records no figure at all rather than a zero, so it cannot match.
             conn.execute_batch(
                 "UPDATE checkpoints SET reasoning_tokens = NULL
-                 WHERE reasoning_tokens = 0 AND model LIKE 'anthropic/%'",
+                 WHERE reasoning_tokens = 0
+                   AND model LIKE 'anthropic/%'
+                   AND model NOT LIKE '%,%'",
             )?;
         }
     }
@@ -1215,6 +1225,27 @@ mod tests {
             .await
             .unwrap();
 
+        // A folded row: a composed node whose halves ran on different routes, the first of them
+        // Anthropic. Its zero came from the half that reports the figure, and nothing in the row
+        // says which — so the repair must leave it alone.
+        store
+            .insert_checkpoint(CheckpointWrite {
+                run_id: "run-1",
+                node_name: "redteam",
+                output_json: "{}",
+                telemetry: NodeTelemetry {
+                    model: Some("anthropic/claude-opus-4-8, openai/gpt-5.6-terra".to_string()),
+                    usage: ratatoskr_core::TokenUsage {
+                        reasoning_tokens: Some(0),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
         // A second row from a provider that DOES report the figure, and reported zero.
         store
             .insert_checkpoint(CheckpointWrite {
@@ -1270,7 +1301,12 @@ mod tests {
         assert_eq!(
             rows[1].telemetry.usage.reasoning_tokens,
             Some(0),
-            "while a provider that does report the figure keeps the zero it reported"
+            "a row whose halves ran on different routes keeps a zero the repair cannot attribute"
+        );
+        assert_eq!(
+            rows[2].telemetry.usage.reasoning_tokens,
+            Some(0),
+            "and a provider that does report the figure keeps the zero it reported"
         );
 
         // And the copy is once: it matches only rows the destination is still NULL on, so opening

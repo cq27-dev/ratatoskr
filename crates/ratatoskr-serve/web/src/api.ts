@@ -69,11 +69,13 @@ export interface NodeTelemetry {
   /** Written to cache rather than read from it. Billed at a premium, and what separates a run that
    *  reused its context from one that rebuilt it. */
   cache_creation_input_tokens: number;
-  /** What the model spent reasoning before it answered, where the endpoint reports it apart from
-   *  the rest. Absent means NOT MEASURED, which is not the same as measured zero: Anthropic bills
-   *  thinking inside the output count and reports no separate figure. */
-  /** Omitted entirely when the endpoint reported no such figure — an absent key, not a null one,
-   *  so anything reading it must treat `undefined` as absence too. */
+  /** What the model spent reasoning before it answered, where the response reported it apart from
+   *  the rest.
+   *
+   *  Omitted entirely when it reported no such figure — an absent KEY, not a null one, so anything
+   *  reading it must treat `undefined` as absence too. Absent is not the same statement as a
+   *  reported zero: Anthropic bills thinking inside its output count and reports nothing separate,
+   *  while an endpoint that answers zero has answered. */
   reasoning_tokens?: number | null;
   /** Whether the ROUTE left the node free to reason — configuration, not measurement. */
   thinking_requested: boolean;

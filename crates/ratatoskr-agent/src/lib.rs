@@ -325,8 +325,10 @@ async fn record_setup_failure(turn: SetupFailure<'_>, error: AgentError) -> Agen
                 reuses_session: false,
             });
             tracing::warn!(node, %error, "the turn could not reach its provider");
-            // Zeroes here are measurements, not absences: nothing was spent because nothing ran.
-            // The error is what makes this a failed attempt rather than a finished one.
+            // The counts are zero because nothing ran, and a zero that IS recorded is a
+            // measurement — no turn spent anything. The reasoning figure is absent rather than
+            // zero, for the same reason it is on any turn: no response reported one. The error is
+            // what makes this a failed attempt rather than a finished one.
             subject.spent(&NodeTelemetry {
                 model: Some(model_name.clone()),
                 duration_ms: Some(0),
@@ -1903,6 +1905,12 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
         rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
         CompletionError,
     > {
+        // Cleared like the call above, and never written: a streamed response is assembled from
+        // chunks and has no single raw payload to read, so a streaming turn reports no response
+        // facts and no reasoning measurement. Nothing takes this path today — every turn here goes
+        // through `prompt` — but leaving the slot alone would let such a turn wear the answer of
+        // whatever ran before it.
+        *self.responses.lock().expect("response facts poisoned") = None;
         retry_model_turn(&self.node, self.control.as_ref(), || {
             self.inner.stream(request.clone())
         })
@@ -1971,7 +1979,6 @@ impl Request {
 
     /// The defaults: a cap and nothing else. What the compactor asks for — a summary wants neither
     /// a temperature of the node's choosing nor its extended thinking budget.
-    ///
     pub fn plain() -> Self {
         Request {
             max_tokens: ratatoskr_core::DEFAULT_MAX_TOKENS,
@@ -6503,6 +6510,89 @@ mod tests {
 
         assert!(error.to_string().contains("invalid additional_params"));
         assert_eq!(meter.read().1, 0, "no transport method was invoked");
+    }
+
+    /// Answers with whatever raw payload it is given, so a test can say what the endpoint reported.
+    #[derive(Clone)]
+    struct AnswersWith(serde_json::Value);
+
+    impl CompletionModel for AnswersWith {
+        type Response = serde_json::Value;
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self(serde_json::Value::Null)
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            Ok(CompletionResponse {
+                choice: OneOrMany::one(AssistantContent::text("answered")),
+                // What rig hands the hook, independent of what the payload said: the whole point is
+                // that this number is only a measurement when the payload carried one.
+                usage: rig_core::completion::Usage {
+                    output_tokens: 3,
+                    reasoning_tokens: 700,
+                    ..Default::default()
+                },
+                raw_response: self.0.clone(),
+                message_id: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+            Err(CompletionError::ResponseError("no stream".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turns_reasoning_count_is_recorded_only_when_its_payload_reported_one() {
+        // The whole change, through the path a run takes: rig reports a reasoning number for every
+        // turn, and it is a measurement only when the response carried such a figure. The pieces
+        // are testable on their own — reading a payload, folding absence — but the wiring between
+        // them is what a run depends on, and it was the one part nothing exercised.
+        let spent = |raw: serde_json::Value| async move {
+            let (builder, meter) = metered(
+                "analyst",
+                AnswersWith(raw),
+                "answer",
+                None,
+                Request::plain(),
+                ProviderCallQueue::default(),
+                None,
+            );
+            builder
+                .build()
+                .prompt("question")
+                .await
+                .expect("the turn answers");
+            meter.read().0
+        };
+
+        // A payload that reported the figure: what rig counted is a measurement.
+        let reported = spent(serde_json::json!({
+            "model": "gpt-5.6-terra",
+            "usage": { "output_tokens_details": { "reasoning_tokens": 700 } },
+        }))
+        .await;
+        assert_eq!(reported.reasoning_tokens, Some(700));
+        assert_eq!(reported.output_tokens, 3, "the rest is counted either way");
+
+        // The same turn, from an endpoint whose payload carries no such figure: rig still hands
+        // over a number, and recording it would be the fabricated measurement this removes.
+        let silent = spent(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "usage": { "input_tokens": 10, "output_tokens": 3 },
+        }))
+        .await;
+        assert_eq!(silent.reasoning_tokens, None);
+        assert_eq!(silent.output_tokens, 3);
     }
 
     #[tokio::test]
