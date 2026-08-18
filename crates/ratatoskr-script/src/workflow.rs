@@ -437,20 +437,37 @@ fn translate_error(
 /// mapping's generated side is zero-based. Parsed by hand rather than a regex dependency: the
 /// shape is one name, one or two numbers.
 fn translate_frames_of(text: &str, frame: &str, mapping: &transpile::SourceMapping) -> String {
-    // Only STACK-FRAME lines translate — the engine's own `at …` formatting. An exception's
-    // message is the workflow's to write, and a workflow can throw any string, including one
-    // shaped exactly like a frame: rewriting it would corrupt what the author deliberately said,
-    // in the one channel they have for saying it.
-    text.split('\n')
-        .map(|line| {
-            if line.trim_start().starts_with("at ") {
+    // Only the STACK SECTION translates: the maximal TRAILING run of lines in the engine's own
+    // `at …` frame shape. An exception's message is the workflow's to write, and a workflow can
+    // throw any string — including a multiline one with a frame-shaped line in its middle. The
+    // engine appends the stack after the message, so a frame-shaped line with message text below
+    // it is the message's, not the stack's. (A message whose LAST line is frame-shaped adjoins
+    // the stack indistinguishably at the string level; that sliver is the boundary the format
+    // leaves us.)
+    let lines: Vec<&str> = text.split('\n').collect();
+    // Blank lines are neutral: a formatted error may end with a newline, and the empty tail must
+    // not read as "the stack ended before it began".
+    let stack_start = lines
+        .iter()
+        .rposition(|line| !is_frame_line(line) && !line.trim().is_empty())
+        .map_or(0, |last_message| last_message + 1);
+    lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            if index >= stack_start {
                 translate_frame_line(line, frame, mapping)
             } else {
-                line.to_string()
+                (*line).to_string()
             }
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Whether the engine would have formatted this line as a stack frame.
+fn is_frame_line(line: &str) -> bool {
+    line.trim_start().starts_with("at ")
 }
 
 /// [`translate_frames_of`] for one line the engine formatted as a frame.
@@ -1446,6 +1463,29 @@ mod tests {
             "the author's message is not the translator's to edit: {error}"
         );
         // …while the real frame beneath it still comes home: the throw sits on TS line 3.
+        assert!(error.contains("workflow.ts:3:"), "{error}");
+
+        // A MULTILINE message with a frame-shaped line in its middle: the stack is the trailing
+        // run the engine appends, and a frame-shaped line with message text below it is the
+        // message's own. Prefix matching alone rewrote it.
+        let framed_line = format!("at {quoted}");
+        std::fs::write(
+            &path,
+            format!(
+                "type Shift = number;\nexport async function run(input: {{}}) {{\n    throw new Error(\"before\\n{framed_line}\\nafter\");\n}}\n"
+            ),
+        )
+        .unwrap();
+        let rt = WorkflowRuntime::load(&path, &[]).await.unwrap().unwrap();
+        let error = rt
+            .run("run", "{}".into(), HashMap::new())
+            .await
+            .expect_err("the workflow throws")
+            .to_string();
+        assert!(
+            error.contains(&format!("before\n{framed_line}\nafter")),
+            "a frame-shaped line inside the message survives whole: {error}"
+        );
         assert!(error.contains("workflow.ts:3:"), "{error}");
         let _ = std::fs::remove_dir_all(dir);
     }
