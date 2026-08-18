@@ -10,8 +10,8 @@ pub mod transpile;
 pub mod workflow;
 
 pub use ruleset::{AgentRuleset, ModelRule, NodeRuleset, ScriptEngine, ToolRule};
-pub use transpile::transpile_with_includes;
-pub use workflow::{HostFn, HostResult, Modules, WorkflowRuntime};
+pub use transpile::{SourceMapping, SourcePosition, TranspiledModule, transpile_with_includes};
+pub use workflow::{HostFn, HostResult, ModuleSource, Modules, WorkflowRuntime};
 
 /// Errors loading or evaluating ruleset scripts.
 #[derive(Debug, thiserror::Error)]

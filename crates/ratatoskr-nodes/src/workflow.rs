@@ -2586,7 +2586,11 @@ pub(crate) async fn standard_runtime() -> Result<WorkflowRuntime, PlanError> {
         STANDARD_WORKFLOW_NAME,
         STANDARD_WORKFLOW_V1,
         STANDARD_WORKFLOW_INCLUDES,
-        &[(STANDARD_DEFINITIONS_MODULE, &definitions)],
+        &[ratatoskr_script::ModuleSource {
+            name: STANDARD_DEFINITIONS_MODULE,
+            source: &definitions.javascript,
+            mapping: Some(&definitions.mapping),
+        }],
     )
     .await
     .map_err(|error| PlanError::node("workflow", NodeError::Failed(error.to_string())))
@@ -2598,7 +2602,7 @@ pub(crate) async fn standard_runtime() -> Result<WorkflowRuntime, PlanError> {
 /// carry `LOAD("prompts/..")` calls, which are compile-time inclusions with no runtime equivalent.
 /// Every workflow gets the same map — a repository's own workflow imports these exactly as the
 /// bundled one does.
-pub(crate) fn standard_definitions() -> Result<String, PlanError> {
+pub(crate) fn standard_definitions() -> Result<ratatoskr_script::TranspiledModule, PlanError> {
     ratatoskr_script::transpile_with_includes(
         STANDARD_DEFINITIONS_MODULE,
         STANDARD_DEFINITIONS,
@@ -6692,7 +6696,11 @@ mod tests {
         let definitions = standard_definitions().unwrap();
         let runtime = WorkflowRuntime::load(
             &workflow_path,
-            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+            &[ratatoskr_script::ModuleSource {
+                name: STANDARD_DEFINITIONS_MODULE,
+                source: &definitions.javascript,
+                mapping: None,
+            }],
         )
         .await
         .unwrap()
@@ -6812,7 +6820,11 @@ mod tests {
         let definitions = standard_definitions().unwrap();
         let runtime = WorkflowRuntime::load(
             &workflow_path,
-            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+            &[ratatoskr_script::ModuleSource {
+                name: STANDARD_DEFINITIONS_MODULE,
+                source: &definitions.javascript,
+                mapping: None,
+            }],
         )
         .await
         .unwrap()
@@ -6883,7 +6895,11 @@ mod tests {
         let definitions = standard_definitions().unwrap();
         let runtime = WorkflowRuntime::load(
             &workflow_path,
-            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+            &[ratatoskr_script::ModuleSource {
+                name: STANDARD_DEFINITIONS_MODULE,
+                source: &definitions.javascript,
+                mapping: None,
+            }],
         )
         .await
         .unwrap()
@@ -6976,7 +6992,11 @@ mod tests {
         let definitions = standard_definitions().unwrap();
         let runtime = WorkflowRuntime::load(
             &workflow_path,
-            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+            &[ratatoskr_script::ModuleSource {
+                name: STANDARD_DEFINITIONS_MODULE,
+                source: &definitions.javascript,
+                mapping: None,
+            }],
         )
         .await
         .unwrap()
@@ -7065,7 +7085,11 @@ mod tests {
         let definitions = standard_definitions().unwrap();
         let runtime = WorkflowRuntime::load(
             &workflow_path,
-            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+            &[ratatoskr_script::ModuleSource {
+                name: STANDARD_DEFINITIONS_MODULE,
+                source: &definitions.javascript,
+                mapping: None,
+            }],
         )
         .await
         .unwrap()
@@ -7180,7 +7204,11 @@ mod tests {
         let definitions = standard_definitions().unwrap();
         let runtime = WorkflowRuntime::load(
             &workflow_path,
-            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+            &[ratatoskr_script::ModuleSource {
+                name: STANDARD_DEFINITIONS_MODULE,
+                source: &definitions.javascript,
+                mapping: None,
+            }],
         )
         .await
         .unwrap()
@@ -7271,7 +7299,11 @@ mod tests {
         let definitions = standard_definitions().unwrap();
         let runtime = WorkflowRuntime::load(
             &workflow_path,
-            &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+            &[ratatoskr_script::ModuleSource {
+                name: STANDARD_DEFINITIONS_MODULE,
+                source: &definitions.javascript,
+                mapping: None,
+            }],
         )
         .await
         .unwrap()
@@ -11403,7 +11435,11 @@ mod tests {
             let definitions = standard_definitions().unwrap();
             WorkflowRuntime::load(
                 &workflow_path,
-                &[(STANDARD_DEFINITIONS_MODULE, definitions.as_str())],
+                &[ratatoskr_script::ModuleSource {
+                    name: STANDARD_DEFINITIONS_MODULE,
+                    source: &definitions.javascript,
+                    mapping: None,
+                }],
             )
             .await
             .unwrap()
