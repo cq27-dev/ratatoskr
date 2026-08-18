@@ -8,6 +8,49 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Why a checkpoint exists, when the ordinary path is not the whole answer.
+///
+/// A run's records say WHAT each node produced; a few of them are produced by a path Rust drove for
+/// a reason the node names cannot carry. The ceiling recovery is the case this exists for: it
+/// revises the plan and runs one more attempt, writing an `analyst` row and an `implementer` row
+/// that are indistinguishable from a mid-loop replan and the retry that follows it — while meaning
+/// the opposite thing. One is the loop working, the other is the run giving up gracefully.
+///
+/// Only paths RUST owns get a cause. A workflow calling the analyst again with a previous plan is
+/// the script's decision, and stating a reason for it would be a claim the record cannot support —
+/// such a row carries no cause, and its input says what it was given.
+///
+/// Persists (strum) and serializes (serde) as the same snake_case token, so the stored column, the
+/// live event and any later analysis read one vocabulary.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    strum::IntoStaticStr,
+    strum::Display,
+    strum::EnumString,
+    strum::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum RecordCause {
+    /// The one bounded recovery a run gets after its iteration budget is spent: an analyst revision
+    /// and a final implementer attempt, both driven by Rust rather than asked for by the workflow.
+    CeilingRecovery,
+}
+
+impl RecordCause {
+    /// The stable token this persists as.
+    pub fn as_str(&self) -> &'static str {
+        self.into()
+    }
+}
+
 /// Lifecycle status of a run. Serializes (serde) and persists (strum, in the store's `status`
 /// column) as the same snake_case string — `strum::AsRefStr`/`EnumString` give the string ⇄ enum
 /// mapping, kept in one place with the variants.

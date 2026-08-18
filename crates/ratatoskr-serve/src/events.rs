@@ -64,6 +64,10 @@ pub struct LiveEvent {
     /// iteration, so without it repeated attempts collapse into one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iteration: Option<u64>,
+    /// Why this record exists, when the path that produced it is not the ordinary one — a ceiling
+    /// recovery's revision and final attempt say so. Absent for the ordinary path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
     /// Set on a `usage` event: what the node's attempt cost.
     ///
     /// Carried so a node's box can be rebuilt from the stream alone. Without it the numbers exist
@@ -340,6 +344,7 @@ fn to_event(record: &Value) -> LiveEvent {
             .filter(|e| !e.is_empty())
             .map(str::to_string),
         iteration: record.get("iteration").and_then(Value::as_u64),
+        cause: str_field("cause").map(str::to_string),
         // One execution, both halves. Looked up independently, a record carrying its own identity
         // and no parent took the parent off the span that encloses it — which belongs to a
         // different execution, so the pair described a parentage that never existed.
@@ -1044,6 +1049,7 @@ mod tests {
             turns: None,
             error: None,
             iteration: None,
+            cause: None,
             span_id: None,
             parent_span_id: None,
             execution: None,
@@ -1068,6 +1074,7 @@ mod tests {
             turns: None,
             error: None,
             iteration: None,
+            cause: None,
             span_id: None,
             parent_span_id: None,
             execution: None,

@@ -50,6 +50,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // drove — which is most of them, and not a gap.
     ("checkpoints", "span_id", "TEXT"),
     ("checkpoints", "parent_span_id", "TEXT"),
+    // Why this row exists, when the ordinary path is not the whole answer — see
+    // `ratatoskr_core::RecordCause`. Null for the ordinary path, which is nearly every row.
+    ("checkpoints", "cause", "TEXT"),
 ];
 
 /// Errors from the checkpoint store.
@@ -93,6 +96,9 @@ pub struct Checkpoint {
     pub input_json: Option<String>,
     /// Which pass of the converge loop this row came from; `None` for a node that runs once.
     pub iteration: Option<u32>,
+    /// Why this row exists, when the path that produced it is not the ordinary one — the ceiling
+    /// recovery's revision and final attempt say so here. `None` is the ordinary path.
+    pub cause: Option<ratatoskr_core::RecordCause>,
     /// Which execution wrote this row, and what invoked it.
     ///
     /// `None` for a row written before executions had identities. A row that HAS an identity and no
@@ -113,6 +119,8 @@ pub struct CheckpointWrite<'a> {
     /// the input, a checkpoint shows what came out and gives no way to ask why.
     pub input_json: Option<&'a str>,
     pub iteration: Option<u32>,
+    /// Why this row exists; see [`Checkpoint::cause`].
+    pub cause: Option<ratatoskr_core::RecordCause>,
     /// Which execution is writing this row, and what invoked it. `None` only where there is no
     /// execution to name — an import replaying a row that was written without one.
     pub invocation: Option<ratatoskr_core::span::Invocation>,
@@ -379,6 +387,7 @@ impl Store {
             output_json,
             input_json,
             iteration,
+            cause,
             invocation,
             telemetry,
         } = write;
@@ -397,9 +406,9 @@ impl Store {
                      model, duration_ms, turns, error,
                      input_tokens, output_tokens, cached_input_tokens,
                      cache_creation_input_tokens, reasoning_tokens, tools_json, reuses_session,
-                     thinking, tools_used_json, span_id, parent_span_id
+                     thinking, tools_used_json, span_id, parent_span_id, cause
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                           ?17, ?18, ?19, ?20)",
+                           ?17, ?18, ?19, ?20, ?21)",
                 params![
                     run_id,
                     node_name,
@@ -425,6 +434,8 @@ impl Store {
                     invocation
                         .and_then(|i| i.parent_span_id)
                         .map(|p| p.to_string()),
+                    // The same token the event carries, so a row and the record of it agree.
+                    cause.map(|cause| cause.as_str()),
                 ],
             )?;
             Ok::<_, StoreError>(())
@@ -444,7 +455,7 @@ impl Store {
                         model, duration_ms, turns, error,
                         input_tokens, output_tokens, cached_input_tokens,
                         cache_creation_input_tokens, reasoning_tokens, tools_json, reuses_session,
-                        thinking, tools_used_json, span_id, parent_span_id
+                        thinking, tools_used_json, span_id, parent_span_id, cause
                  FROM checkpoints WHERE run_id = ?1 ORDER BY id ASC",
             )?;
             let rows = stmt
@@ -455,6 +466,11 @@ impl Store {
                         created_at: row.get(2)?,
                         input_json: row.get(3)?,
                         iteration: row.get(4)?,
+                        // A token nobody can parse is not a cause: an unreadable value reports
+                        // none rather than being surfaced as a category of its own.
+                        cause: row
+                            .get::<_, Option<String>>(20)?
+                            .and_then(|token| token.parse().ok()),
                         // A row with no identity reports none. Nothing is invented: a reader that
                         // cannot tell two executions apart must be told so, not given a plausible
                         // answer.
@@ -1157,6 +1173,9 @@ mod tests {
                 output_json: r#"{"out":1}"#,
                 input_json: Some(r#"{"issue":"issue-6"}"#),
                 iteration: Some(2),
+                // A ceiling recovery's row says so; the assertion below is that it survives the
+                // round trip, which is the whole point of the column.
+                cause: Some(ratatoskr_core::RecordCause::CeilingRecovery),
                 invocation: Some(
                     ratatoskr_core::span::Invocation::root(
                         ratatoskr_core::span::SpanId::parse("00000000000000a1").unwrap(),
@@ -1187,6 +1206,7 @@ mod tests {
         let cp = &store.checkpoints_for_run("run-1").await.unwrap()[0];
         assert_eq!(cp.input_json.as_deref(), Some(r#"{"issue":"issue-6"}"#));
         assert_eq!(cp.iteration, Some(2));
+        assert_eq!(cp.cause, Some(ratatoskr_core::RecordCause::CeilingRecovery));
         assert_eq!(
             cp.telemetry.model.as_deref(),
             Some("anthropic/claude-opus-4")

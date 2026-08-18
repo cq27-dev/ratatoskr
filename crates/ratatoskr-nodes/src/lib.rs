@@ -167,6 +167,10 @@ struct Record<'a, T> {
     input: Option<String>,
     /// Which pass of the converge loop this is; `None` for a node that runs once.
     iteration: Option<u32>,
+    /// Why this record exists, when the path that produced it is not the ordinary one. Set only by
+    /// paths Rust drives: the ceiling recovery marks both rows it writes, so a reader can tell that
+    /// pair from a mid-loop replan and the retry that follows it.
+    cause: Option<ratatoskr_core::RecordCause>,
     ledger: Option<&'a Arc<RunLedger>>,
 }
 
@@ -228,6 +232,7 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
             output_json: &json,
             input_json: input_json.as_deref(),
             iteration: r.iteration,
+            cause: r.cause,
             // Which execution this row came out of, taken from the host call it is being written
             // inside — the same boundary the turn was claimed against, so the identity on the row
             // and the cost on the row are the same invocation's by construction. `None` outside a
@@ -258,6 +263,10 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
         parent_span_id,
         bytes = json.len(),
         iteration = r.iteration,
+        // Why this record exists, when the path is not the ordinary one. On the event as well as
+        // the row, because a viewer reconstructing where a run WAS reads the log — a mark only the
+        // store carried would be invisible in exactly the view that most needs it.
+        cause = r.cause.map(|cause| cause.as_str()),
         model = logged.model.as_deref(),
         tools = logged.tools.join(","),
         tools_used = logged.tools_used.join(","),
@@ -449,6 +458,7 @@ async fn checkpoint<T: Serialize>(
         output,
         input: None,
         iteration: None,
+        cause: None,
         ledger: None,
     })
     .await
@@ -804,6 +814,7 @@ async fn select_and_record_overseer(decision: OverseerDecision<'_>) -> Result<Wo
         output: &decided,
         input: Some(input_json),
         iteration: None,
+        cause: None,
         ledger: Some(ledger),
     })
     .await?;
@@ -1186,6 +1197,7 @@ mod checkpoint_event_tests {
             output: &serde_json::json!({ "ok": true }),
             input: None,
             iteration: None,
+            cause: None,
             ledger: Some(&ledger),
         })
         .await
@@ -1353,6 +1365,7 @@ mod checkpoint_event_tests {
                 output: &serde_json::json!({ "ok": true }),
                 input: None,
                 iteration: None,
+                cause: None,
                 ledger: Some(&ledger),
             })
             .await
@@ -1477,6 +1490,7 @@ mod checkpoint_event_tests {
                     output: &serde_json::json!({ "ok": true }),
                     input: None,
                     iteration: None,
+                    cause: None,
                     ledger: Some(&ledger),
                 })
                 .await
@@ -1905,6 +1919,7 @@ async fn publish_and_checkpoint(
         output: &out,
         input: None,
         iteration: None,
+        cause: None,
         ledger: Some(ledger),
     })
     .await?;
@@ -1996,6 +2011,7 @@ async fn bookkeep_and_checkpoint(
         output: &out,
         input: Some(input_json),
         iteration: None,
+        cause: None,
         ledger: Some(run.ledger),
     })
     .await?;

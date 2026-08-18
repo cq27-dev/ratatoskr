@@ -22,5 +22,5 @@ pub use config::{
 };
 pub use control::{Command, Control, ControlView, Directive, RunControl, normalized_node_name};
 pub use policy::{ToolDecision, ToolPolicy};
-pub use state::{RunState, RunStatus};
+pub use state::{RecordCause, RunState, RunStatus};
 pub use telemetry::{NodeTelemetry, TokenUsage};

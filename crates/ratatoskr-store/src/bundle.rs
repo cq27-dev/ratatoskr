@@ -221,7 +221,7 @@ fn check_execution_graph(
 ///
 /// One version is one shape: a bundle claiming this version carries every field of it, so adding a
 /// field is a version bump rather than a defaulted key the reader has to guess at.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// What an import did, per run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,6 +301,7 @@ impl Store {
                     output_json: &c.output_json,
                     input_json: c.input_json.as_deref(),
                     iteration: c.iteration,
+                    cause: c.cause,
                     invocation: c.invocation,
                     telemetry: c.telemetry.clone(),
                 })
@@ -401,6 +402,7 @@ mod tests {
             created_at: "2026-08-15T00:00:00Z".into(),
             input_json: None,
             iteration: None,
+            cause: None,
             invocation: Some(invocation),
             telemetry: Default::default(),
         }
