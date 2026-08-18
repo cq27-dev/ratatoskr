@@ -2578,3 +2578,63 @@ test("a member that failed stays failed in the strip, without failing the box", 
   expect(box.memberStates.get("redteam_author")).toBe("working");
   expect(box.state).toBe("working");
 });
+
+test("a turn that failed before it reached its provider reads as failed, not as still working", () => {
+  // The records a setup failure leaves: the turn's execution opens, the turn announces its start
+  // and its cost carrying the error, and the execution ends unvalidated because nothing was
+  // produced to validate. Without the start and the cost record, the warning alone opened an
+  // attempt nothing had started — controllable by default — and an `unvalidated` end settles only
+  // an attempt that is NOT controllable, so the box stayed working over a turn already over.
+  const stages = registry(["analyst"]);
+  const span = "00000000000000c7";
+  const events = [
+    {
+      at: "2026-08-12T10:00:00Z",
+      kind: "node_start",
+      node: "analyst",
+      detail: "node started",
+      span_id: span,
+      facts: {
+        model: "not-a-provider/test-model",
+        tools: [],
+        thinking: false,
+        reuses_session: false,
+      },
+    },
+    {
+      at: "2026-08-12T10:00:00Z",
+      kind: "usage",
+      node: "analyst",
+      detail: "node usage",
+      span_id: span,
+      turns: 0,
+      error: 'unknown provider "not-a-provider"; supported: anthropic, openai, moonshot',
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        reasoning_tokens: 0,
+        duration_ms: 0,
+      },
+    },
+    {
+      at: "2026-08-12T10:00:00Z",
+      kind: "span_end",
+      detail: "execution ended",
+      span_id: span,
+      outcome: "unvalidated",
+    },
+  ];
+
+  const boxed = inNodeBoxes(events, stages);
+  const derived = nodesFromEvents(boxed).get("analyst");
+  expect(derived.state).toBe("failed");
+  // And nothing offers a Stop for it: a failed turn is not a live one.
+  expect(workingNodeNames([...nodesFromEvents(boxed).values()], boxed)).not.toContain("analyst");
+
+  // And the failure is what does it: the same records without the cost report leave the attempt
+  // with nothing saying it failed, which is the state this test exists to keep out of the view.
+  const silent = [events[0], events[2]];
+  expect(nodesFromEvents(inNodeBoxes(silent, stages)).get("analyst").state).toBe("working");
+});

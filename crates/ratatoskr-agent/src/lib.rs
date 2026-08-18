@@ -242,6 +242,144 @@ pub enum AgentError {
     Prompt(String),
 }
 
+impl AgentError {
+    /// The error CLASS, for `error.type` — a stable token a backend can group by, never the
+    /// message. The message is already on the record the ledger writes; a span field that carried
+    /// it would make every distinct failure its own category.
+    pub fn error_type(&self) -> &'static str {
+        match self {
+            AgentError::UnknownProvider(_) => "unknown_provider",
+            AgentError::Provider { .. } => "provider_client",
+            AgentError::Prompt(_) => "prompt",
+        }
+    }
+}
+
+/// A turn that failed before it could open its own span still has to appear as a failed turn.
+///
+/// Provider resolution and client construction happen ahead of the turn — an unknown provider or a
+/// missing API key returns there — so the span the turn would have opened never exists, and a trace
+/// showed nothing at all for a node that demonstrably tried and failed. This opens that span for
+/// exactly those failures, carrying the same identity and the same outcome fields a turn's own span
+/// carries, so `unknown_provider` and `provider_client` are reachable in a trace rather than only in
+/// the returned error.
+///
+/// The failure is recorded as its own EXECUTION, because the turn's execution is opened after
+/// provider resolution too — so without one here the records have no identity of their own and are
+/// attributed outward: a stage's setup failure to the host call that drove it, a clarification's to
+/// the exchange or the asking node. An execution opened here takes its parentage from whatever
+/// invoked the turn, exactly as the turn's own would have, and announces its start and end like any
+/// other.
+///
+/// It emits the SAME lifecycle a turn that failed at the provider emits — `node_start` with this
+/// turn's control address, then the cost record carrying the error — because that is what a reader
+/// folding the stream reconstructs a failed attempt from. A warning alone left the node working: an
+/// attempt nothing started is controllable by default, and an execution ending `unvalidated` only
+/// settles an attempt that is not, so the box stayed live over a turn that was already over.
+///
+/// Only for setup: [`AgentError::Prompt`] can only come from a turn that ran, and that turn already
+/// recorded its outcome on its own span — opening a second one here would double-count it.
+async fn record_setup_failure(turn: SetupFailure<'_>, error: AgentError) -> AgentError {
+    if matches!(error, AgentError::Prompt(_)) {
+        return error;
+    }
+    let SetupFailure {
+        node,
+        controlled_as,
+        caller,
+        route,
+    } = turn;
+    let model_name = format!("{}/{}", route.provider, route.model);
+    execution(node, ExecutionKind::Node, async {
+        let (span_id, parent_span_id) = execution_ids();
+        let span = tracing::info_span!(
+            "invoke_agent",
+            node,
+            otel.name = %otel_name("invoke_agent", node),
+            otel.kind = "client",
+            otel.status_code = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+            "gen_ai.operation.name" = "invoke_agent",
+            "gen_ai.agent.name" = node,
+            "gen_ai.request.model" = %model_name,
+            span_id,
+            parent_span_id,
+        );
+        record_turn_outcome(&span, Some(&error));
+        // A turn that never reached a provider produced no output to validate, so its end must not
+        // read as work completed — the same distinction a turn whose output failed its schema makes.
+        output_unvalidated();
+        // The subject is built inside the execution, so its identity is this turn's rather than
+        // that of whatever invoked it.
+        let subject = TurnSubject::of(node, controlled_as, caller);
+        span.in_scope(|| {
+            subject.started(TurnFacts {
+                model: &model_name,
+                // It never got as far as binding any: an empty list is what it ran with, and the
+                // error below is why.
+                tools: &[],
+                thinking: thinking_left_on(route),
+                reuses_session: false,
+            });
+            tracing::warn!(node, %error, "the turn could not reach its provider");
+            // Zeroes here are measurements, not absences: nothing was spent because nothing ran.
+            // The error is what makes this a failed attempt rather than a finished one.
+            subject.spent(&NodeTelemetry {
+                model: Some(model_name.clone()),
+                duration_ms: Some(0),
+                usage: ratatoskr_core::TokenUsage::default(),
+                turns: Some(0),
+                error: Some(error.to_string()),
+                tools: Vec::new(),
+                tools_used: Vec::new(),
+                reuses_session: false,
+                thinking: thinking_left_on(route),
+            });
+        });
+    })
+    .await;
+    error
+}
+
+/// The turn a setup failure is about; see [`record_setup_failure`].
+struct SetupFailure<'a> {
+    node: &'a str,
+    /// Where a Stop for this turn would have been addressed, when that is not the node itself — an
+    /// attempt whose address is missing reads as one an operator can reach.
+    controlled_as: Option<&'a str>,
+    caller: Option<&'a str>,
+    route: &'a ModelRoute,
+}
+
+/// Stamp a turn's outcome onto its span: `otel.status_code` either way, `error.type` when it
+/// failed.
+///
+/// Both fields are declared `Empty` at span creation — a tracing span's field set is fixed by its
+/// callsite, so a field recorded later has to be declared there first, and one never recorded
+/// simply does not appear.
+fn record_turn_outcome(span: &tracing::Span, error: Option<&AgentError>) {
+    match error {
+        Some(error) => {
+            span.record("otel.status_code", "ERROR");
+            span.record("error.type", error.error_type());
+        }
+        None => {
+            span.record("otel.status_code", "OK");
+        }
+    }
+}
+
+/// The OpenTelemetry span name for an operation on a target: `invoke_agent analyst`.
+///
+/// Lives in a field rather than in the span's name because a tracing span name is `'static`
+/// metadata — it is chosen where the callsite is compiled, and the target here is a node name a
+/// workflow declares at runtime. `otel.name` is the documented way to give a span a dynamic name:
+/// an OTLP layer takes it as the exported span's name, so a backend groups `invoke_agent analyst`
+/// apart from `invoke_agent implementer` where the static metadata alone would collapse them.
+pub fn otel_name(operation: &str, target: &str) -> String {
+    format!("{operation} {target}")
+}
+
 /// The providers a route can name.
 enum Provider {
     Anthropic,
@@ -581,13 +719,53 @@ pub async fn ask(
     let node = answerer.map_or_else(|| addressed.clone(), str::to_string);
     // Only where they differ: a plain ask answers under its own name and is controlled by it.
     let controlled_as = (node != addressed).then_some(addressed.as_str());
+    match ask_resolved(
+        route,
+        preamble,
+        question,
+        tools,
+        max_turns,
+        control,
+        &node,
+        controlled_as,
+    )
+    .await
+    {
+        Ok(answer) => Ok(answer),
+        Err(error) => Err(record_setup_failure(
+            SetupFailure {
+                node: &node,
+                controlled_as,
+                // An ask has no caller to state: `ask_turn` builds its subject the same way.
+                caller: None,
+                route,
+            },
+            error,
+        )
+        .await),
+    }
+}
+
+/// [`ask`], from provider resolution onward. Separate so a failure to resolve one is still a turn
+/// with a span — see [`record_setup_failure`].
+#[allow(clippy::too_many_arguments)]
+async fn ask_resolved(
+    route: &ModelRoute,
+    preamble: &str,
+    question: &str,
+    tools: ToolSet,
+    max_turns: Option<usize>,
+    control: Option<RuntimeControl>,
+    node: &str,
+    controlled_as: Option<&str>,
+) -> Result<String, AgentError> {
     match parse_provider(&route.provider)? {
         Provider::Anthropic => {
             let session = uuid::Uuid::new_v4().to_string();
             let (client, calls) = anthropic_client(Some(&session))?;
             run(AskRun {
                 model: caching(client.completion_model(&route.model)),
-                node: &node,
+                node,
                 controlled_as,
                 preamble,
                 question,
@@ -603,7 +781,7 @@ pub async fn ask(
             let (client, calls) = openai_client()?;
             run(AskRun {
                 model: client.completion_model(&route.model),
-                node: &node,
+                node,
                 controlled_as,
                 preamble,
                 question,
@@ -622,7 +800,7 @@ pub async fn ask(
                 // endpoint honours an Anthropic `cache_control` is its business, and sending one
                 // it rejects would cost the call rather than the cache.
                 model: client.completion_model(&route.model),
-                node: &node,
+                node,
                 controlled_as,
                 preamble,
                 question,
@@ -706,8 +884,12 @@ where
     // beside a qualified one folds one route into two.
     let model_name = format!("{}/{}", route.provider, route.model);
     let span = tracing::info_span!(
-        "agent",
+        "invoke_agent",
         node,
+        otel.name = %otel_name("invoke_agent", node),
+        otel.kind = "client",
+        otel.status_code = tracing::field::Empty,
+        "error.type" = tracing::field::Empty,
         "gen_ai.operation.name" = "invoke_agent",
         "gen_ai.agent.name" = node,
         "gen_ai.request.model" = %model_name,
@@ -729,25 +911,30 @@ where
     });
     let started = std::time::Instant::now();
     let answer = async { agent.prompt(question).await }
-        .instrument(span)
-        .await;
+        .instrument(span.clone())
+        .await
+        .map_err(|error| AgentError::Prompt(error.to_string()));
+    record_turn_outcome(&span, answer.as_ref().err());
     // No store to checkpoint to here, so it goes to the log. A one-shot question whose cost is
     // unknowable is the same defect as an uncounted node, in a smaller place — and a report that
     // carries only some of the fields is worse than none, because a reader that sees a cost stops
     // falling back to the store and displays the rest as measured absence.
     let (usage, calls) = meter.read();
-    subject.spent(&NodeTelemetry {
-        model: Some(model_name),
-        duration_ms: Some(started.elapsed().as_millis() as u64),
-        usage,
-        turns: Some(calls),
-        error: answer.as_ref().err().map(ToString::to_string),
-        tools: tool_names,
-        tools_used: meter.used(),
-        reuses_session: false,
-        thinking: thinking_left_on(route),
+    // Inside the span, for the same reason the node turn's is.
+    span.in_scope(|| {
+        subject.spent(&NodeTelemetry {
+            model: Some(model_name),
+            duration_ms: Some(started.elapsed().as_millis() as u64),
+            usage,
+            turns: Some(calls),
+            error: answer.as_ref().err().map(ToString::to_string),
+            tools: tool_names,
+            tools_used: meter.used(),
+            reuses_session: false,
+            thinking: thinking_left_on(route),
+        })
     });
-    answer.map_err(|e| AgentError::Prompt(e.to_string()))
+    answer
 }
 
 /// Bind a tool declaration to the closure that answers it.
@@ -3094,6 +3281,21 @@ pub struct NodeRun<'a> {
 /// still validate it (see `ratatoskr_graph::parse_validated`), though a first answer that misses
 /// the schema is handed back for correction before it reaches one.
 pub async fn run_structured(run: NodeRun<'_>) -> Result<String, AgentError> {
+    let failed = SetupFailure {
+        node: run.node,
+        controlled_as: run.controlled_as,
+        caller: run.caller,
+        route: run.route,
+    };
+    match run_structured_resolved(run).await {
+        Ok(answer) => Ok(answer),
+        Err(error) => Err(record_setup_failure(failed, error).await),
+    }
+}
+
+/// [`run_structured`], from provider resolution onward. Separate so a failure to resolve one is
+/// still a turn with a span — see [`record_setup_failure`].
+async fn run_structured_resolved(run: NodeRun<'_>) -> Result<String, AgentError> {
     match parse_provider(&run.route.provider)? {
         Provider::Anthropic => {
             let session = session_id(&run);
@@ -3320,8 +3522,19 @@ where
     // not worth an SDK dependency yet, but naming to match now makes adopting one a layer swap
     // rather than a rename of every field a dashboard reads.
     let span = tracing::info_span!(
-        "agent",
+        "invoke_agent",
         node,
+        // The convention's span name is `<operation> <target>`, which is per-node — and a tracing
+        // span's own name is `'static` metadata, so it cannot be one. `otel.name` is where a
+        // dynamic name goes: an OTLP layer reads it as THE span name, which is what makes two
+        // nodes' spans distinguishable by name. See [`otel_name`].
+        otel.name = %otel_name("invoke_agent", node),
+        // A model turn leaves this process for the provider, so it is a client operation.
+        otel.kind = "client",
+        // Recorded at the end, from the turn's own outcome: a span that carries neither says the
+        // turn ended, never whether it worked.
+        otel.status_code = tracing::field::Empty,
+        "error.type" = tracing::field::Empty,
         "gen_ai.operation.name" = "invoke_agent",
         "gen_ai.agent.name" = node,
         "gen_ai.request.model" = %model_name,
@@ -3430,10 +3643,14 @@ where
         }
     };
 
+    // The outcome on the span itself, so a trace can separate a turn that failed from one that
+    // returned without reading the ledger beside it.
+    record_turn_outcome(&span, answer.as_ref().err());
+
     let (usage, calls) = meter.read();
     if let Some(ledger) = &ledger {
         let telemetry = NodeTelemetry {
-            model: Some(model_name),
+            model: Some(model_name.clone()),
             duration_ms: Some(started.elapsed().as_millis() as u64),
             usage,
             turns: Some(calls),
@@ -3449,8 +3666,12 @@ where
             ),
             thinking: thinking_left_on(route),
         };
-        subject.spent(&telemetry);
-        ledger.record(node, telemetry);
+        // Inside the turn's own span: the cost record is the turn's, and emitting it beside the
+        // span left the only account of a failed turn outside the span that says it failed.
+        span.in_scope(|| {
+            subject.spent(&telemetry);
+            ledger.record(node, telemetry);
+        });
     }
 
     // The node is over either way. A plugin told it was starting has to be told it stopped, or a
@@ -4769,6 +4990,275 @@ mod tests {
         // Exactly what a strict caller does with it, succeeding exactly when the turn completed.
         let parsed: Done = serde_json::from_str(&answer).expect("the returned text IS the value");
         assert_eq!(parsed.summary, "done");
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_never_reached_its_provider_is_still_a_failed_turn_on_a_span() {
+        // Provider resolution and client construction happen before the turn opens its span, so an
+        // unknown provider or a missing key returned with nothing in the trace at all: a node that
+        // tried and failed looked like a node that never ran.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Done {
+            summary: String,
+        }
+
+        let route = ModelRoute {
+            provider: "not-a-provider".to_string(),
+            model: "test-model".to_string(),
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        };
+        // Inside the execution that drove the turn — a host call, for a stage — so the identity
+        // the failure records can be compared against the one that invoked it.
+        let capturing = capture::start();
+        let failed = execution("implement", ExecutionKind::Host, async {
+            run_structured(NodeRun {
+                node: "analyst",
+                controlled_as: Some("implementer"),
+                caller: None,
+                route: &route,
+                preamble: "Answer.",
+                question: "Answer.",
+                tools: ToolSet::default(),
+                output_schema: schemars::schema_for!(Done),
+                policy: None,
+                max_turns: Some(2),
+                clarifier: None,
+                observer: None,
+                skills: Vec::new(),
+                files: None,
+                rag_rat_worktree: None,
+                shell: None,
+                push: None,
+                conversation: None,
+                ledger: None,
+                produces: None,
+            })
+            .await
+        })
+        .await;
+        let raw = capturing.text();
+        drop(capturing);
+
+        assert!(matches!(failed, Err(AgentError::UnknownProvider(_))));
+        let records = || {
+            raw.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        };
+        // The failure is its own execution, announced and closed like any turn's — without one the
+        // records have no identity and are attributed outward, to the host call that drove the
+        // turn or, for a clarification, to the node that asked.
+        let host = records()
+            .find(|record| record["execution_name"] == "implement")
+            .expect("the driving execution announced itself");
+        let turn = records()
+            .find(|record| record["kind"] == "span_start" && record["execution_name"] == "analyst")
+            .unwrap_or_else(|| panic!("the failed turn is an execution too; captured: {raw}"));
+        assert_ne!(
+            turn["span_id"], host["span_id"],
+            "the turn's identity is its own, not the caller's: {turn}"
+        );
+        assert_eq!(
+            turn["parent_span_id"], host["span_id"],
+            "and its parent is whatever invoked it: {turn}"
+        );
+        let end = records()
+            .find(|record| record["kind"] == "span_end" && record["execution_name"] == "analyst")
+            .unwrap_or_else(|| panic!("the failed turn announced its end; captured: {raw}"));
+        assert_eq!(
+            end["outcome"], "unvalidated",
+            "a turn that never reached a provider produced nothing to validate: {end}"
+        );
+
+        // The lifecycle a reader folds a failed attempt from. Without it the warning alone opened an
+        // attempt nothing had started — controllable by default — and an `unvalidated` end settles
+        // only an attempt that is NOT controllable, so the box stayed working over a turn that was
+        // already over.
+        let start = records()
+            .find(|record| record["kind"] == "node_start")
+            .unwrap_or_else(|| panic!("the failed turn announced its start; captured: {raw}"));
+        assert_eq!(start["node"], "analyst");
+        assert_eq!(start["span_id"], turn["span_id"], "{start}");
+        // Its control address, so an attempt addressed elsewhere does not read as one an operator
+        // can reach.
+        assert_eq!(start["controlled_as"], "implementer", "{start}");
+        let usage = records()
+            .find(|record| record["kind"] == "usage")
+            .unwrap_or_else(|| panic!("the failed turn reported its cost; captured: {raw}"));
+        assert_eq!(usage["span_id"], turn["span_id"], "{usage}");
+        // The error is what makes this a failed attempt rather than a finished one — the execution
+        // ending says nothing about how.
+        assert!(
+            usage["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("unknown provider")),
+            "the cost record carries why it failed: {usage}"
+        );
+        let span = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|record| {
+                record["spans"]
+                    .as_array()?
+                    .iter()
+                    .find(|span| span["name"] == "invoke_agent")
+                    .cloned()
+            })
+            .next_back()
+            .unwrap_or_else(|| panic!("the failed setup opened the turn's span; captured: {raw}"));
+        assert_eq!(span["otel.name"], "invoke_agent analyst");
+        assert_eq!(span["otel.status_code"], "ERROR", "{span}");
+        // The same mapping serves a client that could not initialize (`provider_client`), which is
+        // the missing-API-key case; both classes were previously unreachable in a trace.
+        assert_eq!(span["error.type"], "unknown_provider", "{span}");
+        // On the span too, so a record emitted inside it resolves to the turn rather than to the
+        // execution around it.
+        assert_eq!(span["span_id"], turn["span_id"], "{span}");
+        assert_eq!(span["parent_span_id"], host["span_id"], "{span}");
+    }
+
+    /// A model that refuses every request, so the turn ends in an error.
+    #[derive(Clone, Default)]
+    struct AlwaysRefuses;
+
+    impl CompletionModel for AlwaysRefuses {
+        type Response = ();
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            Err(CompletionError::ProviderError(
+                "the model refused".to_string(),
+            ))
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+            Err(CompletionError::ResponseError("no stream".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turns_span_names_its_node_and_says_whether_the_turn_worked() {
+        // Two things a trace could not do. Every node produced a span called `agent`, so a backend
+        // grouped the whole run into one bucket; and nothing on the span said how the turn ended,
+        // so a failed provider call and a returned one were indistinguishable without the ledger
+        // beside them.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Done {
+            summary: String,
+        }
+
+        let route = ModelRoute {
+            provider: "test".to_string(),
+            model: "test-model".to_string(),
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        };
+        let turn = |node: &'static str, refuses: bool| {
+            let route = route.clone();
+            async move {
+                let run = |model_run| NodeRun {
+                    node,
+                    controlled_as: None,
+                    caller: None,
+                    route: &route,
+                    preamble: "Answer.",
+                    question: "Answer.",
+                    tools: ToolSet::default(),
+                    output_schema: schemars::schema_for!(Done),
+                    policy: None,
+                    max_turns: Some(2),
+                    clarifier: None,
+                    observer: None,
+                    skills: Vec::new(),
+                    files: None,
+                    rag_rat_worktree: None,
+                    shell: None,
+                    push: None,
+                    conversation: None,
+                    ledger: Some(Arc::new(RunLedger::default())),
+                    produces: model_run,
+                };
+                let capturing = capture::start();
+                if refuses {
+                    let _ = run_typed_with_control(
+                        AlwaysRefuses,
+                        run(None),
+                        ProviderCallQueue::default(),
+                        None,
+                    )
+                    .await;
+                } else {
+                    let _ = run_typed_with_control(
+                        AlwaysInvalid,
+                        run(None),
+                        ProviderCallQueue::default(),
+                        None,
+                    )
+                    .await;
+                }
+                let raw = capturing.text();
+                drop(capturing);
+                // The cost record, which the turn emits inside its own span once the outcome is
+                // known — the one record whose span entry carries the whole turn's account.
+                raw.lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter(|record| record["kind"] == "usage")
+                    .filter_map(|record| {
+                        record["spans"]
+                            .as_array()?
+                            .iter()
+                            .find(|span| span["name"] == "invoke_agent")
+                            .cloned()
+                    })
+                    .next_back()
+                    .unwrap_or_else(|| {
+                        panic!("the turn's cost record names its span; captured: {raw}")
+                    })
+            }
+        };
+
+        let refused = turn("analyst", true).await;
+        let returned = turn("implementer", false).await;
+
+        // The convention's name is `<operation> <target>`, and a tracing span name is `'static`
+        // metadata — so the per-node name lives in `otel.name`, which is what an OTLP layer
+        // exports as the span's name.
+        assert_eq!(refused["otel.name"], "invoke_agent analyst");
+        assert_eq!(returned["otel.name"], "invoke_agent implementer");
+        assert_ne!(
+            refused["otel.name"], returned["otel.name"],
+            "two nodes must not produce identically-named spans"
+        );
+        // A model turn leaves this process, so it is a client operation.
+        assert_eq!(refused["otel.kind"], "client");
+
+        // And the outcome is on the span alone: a class to group by, never the message.
+        assert_eq!(refused["otel.status_code"], "ERROR", "{refused}");
+        assert_eq!(refused["error.type"], "prompt", "{refused}");
+        assert_eq!(returned["otel.status_code"], "OK", "{returned}");
+        assert!(
+            returned["error.type"].is_null(),
+            "a turn that returned carries no error type: {returned}"
+        );
     }
 
     /// A model whose output never matches any schema, however often it is corrected.

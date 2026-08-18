@@ -369,7 +369,15 @@ impl NodeClarifier {
         );
         let prompt = format!("A peer node (`{from}`) asks:\n{question}\n\nContext:\n{context}");
 
-        let span = tracing::info_span!("clarify", from, answerer);
+        // The operation is a clarification and its target is the node being asked, so two
+        // answerers do not share a name. `ask` opens its own `invoke_agent <answerer>` span
+        // inside this one, which is where the provider call and its outcome live.
+        let span = tracing::info_span!(
+            "clarify",
+            from,
+            answerer,
+            otel.name = %ratatoskr_agent::otel_name("clarify", answerer),
+        );
         let answer = ratatoskr_agent::ask(
             &route,
             &preamble,

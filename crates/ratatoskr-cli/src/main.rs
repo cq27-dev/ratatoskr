@@ -530,6 +530,17 @@ async fn ask(question: &str, config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The span every record of one run hangs under. `run_id` is a field rather than part of the
+/// static name because readers resolve it by key — see [`init_logging`] — while `otel.name` gives
+/// the exported span the convention's `<operation> <target>` name, which is per run.
+fn run_span(run_id: &str) -> tracing::Span {
+    tracing::info_span!(
+        "run",
+        run_id = %run_id,
+        otel.name = %ratatoskr_agent::otel_name("run", run_id),
+    )
+}
+
 /// Run the scout → memory → analyst plan flow for an issue and print the result.
 async fn plan(
     description: Option<String>,
@@ -559,7 +570,7 @@ async fn plan(
         engine: &engine,
         workflow: workflow.as_deref(),
     })
-    .instrument(tracing::info_span!("run", run_id = %run_id))
+    .instrument(run_span(&run_id))
     .await;
 
     // Tear down configured MCP clients regardless of outcome.
@@ -656,7 +667,7 @@ async fn run_cmd(
         engine: &engine,
         workflow: workflow.as_deref(),
     })
-    .instrument(tracing::info_span!("run", run_id = %run_id))
+    .instrument(run_span(&run_id))
     .await;
 
     shutdown_configured_mcp(configured).await;
@@ -700,7 +711,7 @@ async fn bookkeep(run_id: &str, config_path: &Path) -> anyhow::Result<()> {
         run_id,
         &engine,
     )
-    .instrument(tracing::info_span!("run", run_id = %run_id))
+    .instrument(run_span(run_id))
     .await;
 
     shutdown_configured_mcp(configured).await;
@@ -1736,7 +1747,8 @@ mod tests {
             .with_writer(buf.clone());
 
         tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
-            let span = tracing::info_span!("run", run_id = "run-abc");
+            // The production span, so a rename cannot pass this test while breaking the file.
+            let span = crate::run_span("run-abc");
             let _entered = span.enter();
             tracing::info!(
                 kind = "checkpoint",
@@ -1761,6 +1773,12 @@ mod tests {
         assert!(
             spans.iter().any(|s| s["run_id"] == "run-abc"),
             "run_id must be reachable through spans, got {spans:?}"
+        );
+        // The convention's `<operation> <target>` name rides beside it, for an exporter that takes
+        // a span's name from `otel.name` — the static metadata cannot carry a run id.
+        assert!(
+            spans.iter().any(|s| s["otel.name"] == "run run-abc"),
+            "the exported span name must name the run, got {spans:?}"
         );
     }
 

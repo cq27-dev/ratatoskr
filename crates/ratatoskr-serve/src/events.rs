@@ -698,6 +698,46 @@ mod tests {
     }
 
     #[test]
+    fn readers_resolve_a_record_by_span_key_whatever_the_spans_are_named() {
+        // Span names are the tracing tree's, and the tree now describes the run: a turn sits inside
+        // its converge iteration, which sits inside the run. Every reader here resolves `run_id`,
+        // `node` and the execution by KEY — a reader that matched a name would have broken the
+        // moment the operation-and-target naming landed, and would break again on the next span
+        // this run learns to open.
+        let in_an_iteration = serde_json::json!({
+            "kind": "tool_call",
+            "tool": "Bash",
+            "spans": [
+                { "name": "run", "run_id": "r1", "otel.name": "run r1" },
+                { "name": "iterate", "iteration": 2, "otel.name": "iterate 2" },
+                {
+                    "name": "invoke_agent",
+                    "node": "implementer",
+                    "otel.name": "invoke_agent implementer",
+                    "span_id": "00000000000000a1",
+                },
+            ],
+        });
+        assert_eq!(run_id_of(&in_an_iteration), Some("r1"));
+        let event = to_event(&in_an_iteration);
+        assert_eq!(event.node.as_deref(), Some("implementer"));
+        assert_eq!(event.span_id.as_deref(), Some("00000000000000a1"));
+
+        // The spans a run opens around its work carry no execution of their own, so the innermost
+        // execution is still the turn — an iteration is not something a node box is drawn for.
+        let outside_a_turn = serde_json::json!({
+            "kind": "event",
+            "message": "no referee or verifier route configured; trusting test results alone",
+            "spans": [
+                { "name": "run", "run_id": "r1" },
+                { "name": "iterate", "iteration": 2 },
+            ],
+        });
+        assert_eq!(run_id_of(&outside_a_turn), Some("r1"));
+        assert_eq!(to_event(&outside_a_turn).span_id, None);
+    }
+
+    #[test]
     fn every_record_of_a_turn_carries_the_execution_that_produced_it() {
         // A name is not an execution, so the fold on the other side files a record with no identity
         // under whichever invocation is in flight. With two invocations of one stage overlapping,

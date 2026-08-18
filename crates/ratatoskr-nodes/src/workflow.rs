@@ -31,6 +31,7 @@ use rmcp::service::ServerSink;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
+use tracing::Instrument as _;
 
 use crate::{
     AnalystOutput, BookkeeperInput, BookkeeperOutput, ChildTask, ImplementerNode,
@@ -1149,6 +1150,25 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
         .clone()
         .ok_or_else(|| "iterate() called before implement()".to_string())?;
 
+    // The iteration is a real level of the run, and until it had a span the referee that judged an
+    // attempt and the implementer that answered it hung off `run` as siblings of everything else —
+    // so a trace could not say which attempt a judgement belonged to. Opened once the iteration is
+    // accepted (lock taken, ceiling clear), and named by its number.
+    let span = tracing::info_span!(
+        "iterate",
+        iteration = n,
+        otel.name = %ratatoskr_agent::otel_name("iterate", &n.to_string()),
+    );
+    iterate_work(&ctx, input, worktree).instrument(span).await
+}
+
+/// One converge iteration: judge the last attempt, then drive the implementer at what it has to
+/// fix. Separate from [`iterate_host`] only so the whole unit runs inside one span.
+async fn iterate_work(
+    ctx: &Arc<WorkflowContext>,
+    input: IterateArg,
+    worktree: WorktreePath,
+) -> Result<String, String> {
     // Rebuild the diagnostic Rust-side (identical wording to the hardcoded converge loop) from the
     // baseline and the latest implementer output — the script doesn't get to author it.
     let red_team: RedTeamOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "redteam")
@@ -1162,7 +1182,7 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
     let analyst: AnalystOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "analyst")
         .await
         .map_err(|e| e.to_string())?;
-    let referee = referee_judgement(&ctx, &worktree, &analyst, &prev).await;
+    let referee = referee_judgement(ctx, &worktree, &analyst, &prev).await;
     // Referee first, same as the built-in loop: a moved referee makes the test sets meaningless,
     // so reverting it is what this iteration has to be told to do.
     let authored = red_team
@@ -1215,7 +1235,7 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
     };
 
     ctx.resolved_container_image().await?;
-    let node = build_implementer(&ctx, analyst)
+    let node = build_implementer(ctx, analyst)
         .await
         .map_err(|e| e.to_string())?;
     let out = node
@@ -1224,13 +1244,7 @@ async fn iterate_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String, 
         .map_err(|e| e.to_string())?;
     // The diagnostic, not the binding's argument: the script does not author it, so it is the one
     // thing that explains what this iteration was actually asked to fix.
-    note(
-        &ctx,
-        crate::policy::IMPLEMENTER_NODE,
-        &out,
-        Some(diagnostic),
-    )
-    .await?;
+    note(ctx, crate::policy::IMPLEMENTER_NODE, &out, Some(diagnostic)).await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -1782,7 +1796,16 @@ async fn replan_at_ceiling_host(
     executor: Arc<StageExecutor>,
     _arg: String,
 ) -> Result<String, String> {
-    replan_at_ceiling_with(ctx, executor, &LiveCeilingRecovery).await
+    // The recovery revises the plan and runs one more attempt against it — two node turns that
+    // belong to each other, and to nothing else in the run.
+    let span = tracing::info_span!(
+        "replan_at_ceiling",
+        run_id = %ctx.run_id,
+        otel.name = %ratatoskr_agent::otel_name("replan_at_ceiling", &ctx.run_id),
+    );
+    replan_at_ceiling_with(ctx, executor, &LiveCeilingRecovery)
+        .instrument(span)
+        .await
 }
 
 async fn replan_at_ceiling_with<R: CeilingRecovery>(
@@ -3230,6 +3253,20 @@ async fn finish_full<A: FullTerminalActions>(
     ctx: &Arc<WorkflowContext>,
     actions: &A,
 ) -> Result<RunOutcome, PlanError> {
+    // The terminal judgement decides the run's status and runs the bookkeeper and publisher under
+    // it. Without a span of its own those turns were siblings of the work they are reporting on.
+    let span = tracing::info_span!(
+        "finish_run",
+        run_id = %ctx.run_id,
+        otel.name = %ratatoskr_agent::otel_name("finish_run", &ctx.run_id),
+    );
+    finish_full_inner(ctx, actions).instrument(span).await
+}
+
+async fn finish_full_inner<A: FullTerminalActions>(
+    ctx: &Arc<WorkflowContext>,
+    actions: &A,
+) -> Result<RunOutcome, PlanError> {
     // The store is the source of truth the script can't fake; a missing checkpoint is a hard error.
     let plan = reconstruct_plan(&ctx.store, &ctx.run_id).await?;
     if !crate::fork_is_needed(&plan.analyst, &ctx.config) {
@@ -4467,6 +4504,97 @@ mod tests {
             checked, 4,
             "every stage a Rust caller folds into a box is checked here; found {checked}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_converge_iterations_work_happens_inside_one_iteration_span() {
+        // The judgement of the last attempt and the attempt that answers it are one unit of work.
+        // Without a span for the iteration they were siblings of the whole run, so a trace could
+        // not say which attempt a judgement belonged to — the referee looked unrelated to the
+        // implementer whose work it judged.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-iteration-span-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("worktree")).unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.implementer.max_iterations = 3;
+        let run_id = "run-iteration-span";
+        let ctx = Arc::new(
+            WorkflowContext::new(
+                None,
+                &config,
+                &store,
+                run_id,
+                "trace the iteration",
+                &engine,
+                crate::PluginContext::default(),
+            )
+            .unwrap(),
+        );
+        *ctx.worktree.lock().unwrap() = Some(WorktreePath(dir.join("worktree")));
+        store
+            .upsert_run(run_id, None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        for (node, value) in [
+            (
+                "redteam",
+                serde_json::to_value(red(&["acceptance"], &[], 1)).unwrap(),
+            ),
+            (
+                "implementer",
+                serde_json::to_value(imp(&["acceptance"], &[], 1)).unwrap(),
+            ),
+            (
+                "analyst",
+                json!({ "impact_summary": "x", "changes_code": true }),
+            ),
+        ] {
+            checkpoint(&store, run_id, node, &value).await.unwrap();
+        }
+
+        // No referee route, so the judgement is skipped and says so — a record emitted from
+        // inside the iteration, which is what carries the enclosing spans.
+        let capturing = crate::test_capture::start();
+        let _ = iterate_host(Arc::clone(&ctx), json!({}).to_string()).await;
+        let raw = capturing.text();
+        drop(capturing);
+
+        let iteration_spans = |record: &serde_json::Value| -> Vec<serde_json::Value> {
+            record["spans"]
+                .as_array()
+                .map(|spans| {
+                    spans
+                        .iter()
+                        .filter(|span| span["name"] == "iterate")
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let judgement = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| {
+                record["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("trusting test results alone"))
+            })
+            .unwrap_or_else(|| panic!("the skipped judgement said so; captured: {raw}"));
+        let enclosing = iteration_spans(&judgement);
+        assert_eq!(
+            enclosing.len(),
+            1,
+            "the judgement runs inside exactly one iteration span; captured: {judgement}"
+        );
+        assert_eq!(enclosing[0]["iteration"], 1, "named by its number");
+        // And the exported name is the operation with its target, which the static metadata alone
+        // cannot carry.
+        assert_eq!(enclosing[0]["otel.name"], "iterate 1");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
