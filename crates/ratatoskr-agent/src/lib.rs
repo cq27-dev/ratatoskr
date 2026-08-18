@@ -302,6 +302,9 @@ async fn record_setup_failure(turn: SetupFailure<'_>, error: AgentError) -> Agen
             "gen_ai.operation.name" = "invoke_agent",
             "gen_ai.agent.name" = node,
             "gen_ai.request.model" = %model_name,
+            "gen_ai.provider.name" = %route.provider,
+            // No response side at all: nothing answered, and an empty field is the truth about that
+            // where a recorded one would be a claim.
             span_id,
             parent_span_id,
         );
@@ -349,6 +352,23 @@ struct SetupFailure<'a> {
     controlled_as: Option<&'a str>,
     caller: Option<&'a str>,
     route: &'a ModelRoute,
+}
+
+/// Stamp what the provider answered onto the turn's span.
+///
+/// A turn is many provider calls and ends on one of them; these are that one's. The convention
+/// spells finish reasons as a LIST, and a tracing field has no list type — so the one reason this
+/// turn ended is recorded under the plural name, which is the same list with one element in it.
+fn record_response_facts(span: &tracing::Span, answered: Option<ResponseFacts>) {
+    let Some(answered) = answered else {
+        return;
+    };
+    if let Some(model) = answered.model {
+        span.record("gen_ai.response.model", model);
+    }
+    if let Some(reason) = answered.finish_reason {
+        span.record("gen_ai.response.finish_reasons", reason);
+    }
 }
 
 /// Stamp a turn's outcome onto its span: `otel.status_code` either way, `error.type` when it
@@ -668,10 +688,18 @@ impl<'a> TurnSubject<'a> {
             controlled_as = self.controlled_as,
             "gen_ai.usage.input_tokens" = telemetry.usage.input_tokens,
             "gen_ai.usage.output_tokens" = telemetry.usage.output_tokens,
-            "gen_ai.usage.cached_input_tokens" = telemetry.usage.cached_input_tokens,
-            "gen_ai.usage.cache_creation_input_tokens" =
+            // Two namespaces, deliberately. `gen_ai.usage.input_tokens` and `output_tokens` are
+            // attributes the OpenTelemetry GenAI conventions define, so a backend knows what they
+            // mean — with one caveat worth carrying to whoever exports these off this machine:
+            // `output_tokens` is understated by this provider layer (#171), and a conformant name
+            // carrying a wrong number is worse for an outside consumer than an honestly bespoke
+            // one, because nothing tells them to doubt it. The three below are this endpoint's own counts — no convention defines them —
+            // and under a `gen_ai.` name they would read as conformant to a consumer that has never
+            // heard of them. Named for what they are instead: extensions.
+            "ratatoskr.usage.cached_input_tokens" = telemetry.usage.cached_input_tokens,
+            "ratatoskr.usage.cache_creation_input_tokens" =
                 telemetry.usage.cache_creation_input_tokens,
-            "gen_ai.usage.reasoning_tokens" = telemetry.usage.reasoning_tokens,
+            "ratatoskr.usage.reasoning_tokens" = telemetry.usage.reasoning_tokens,
             turns = telemetry.turns,
             duration_ms = telemetry.duration_ms,
             model = telemetry.model.as_deref(),
@@ -893,6 +921,14 @@ where
         "gen_ai.operation.name" = "invoke_agent",
         "gen_ai.agent.name" = node,
         "gen_ai.request.model" = %model_name,
+        // Which provider SERVED the call. Without it a mixed-provider run is one undifferentiated
+        // set of turns, though the route knew all along.
+        "gen_ai.provider.name" = %route.provider,
+        // The response side, recorded when the turn ends: an endpoint may answer on a model other
+        // than the one asked for, and a turn cut off at the token cap and one that finished look
+        // identical without a reason.
+        "gen_ai.response.model" = tracing::field::Empty,
+        "gen_ai.response.finish_reasons" = tracing::field::Empty,
         span_id = subject.ids().0,
         parent_span_id = subject.ids().1,
         // On the span, not only on the start: a viewer attaching mid-turn, or an imported tail,
@@ -915,6 +951,7 @@ where
         .await
         .map_err(|error| AgentError::Prompt(error.to_string()));
     record_turn_outcome(&span, answer.as_ref().err());
+    record_response_facts(&span, meter.answered());
     // No store to checkpoint to here, so it goes to the log. A one-shot question whose cost is
     // unknowable is the same defect as an uncounted node, in a smaller place — and a report that
     // carries only some of the fields is worse than none, because a reader that sees a cost stops
@@ -1723,6 +1760,54 @@ where
 
 /// Gives each provider request its own single retry.
 ///
+/// What the provider said about the response it returned: which model answered, and why the turn
+/// ended.
+///
+/// The route says which model was ASKED for; an endpoint is free to answer with another — an alias
+/// resolved to a dated build, a gateway routing to what it has — and a trace that reports only the
+/// request cannot tell the two apart. The finish reason is the other half: a turn cut off at the
+/// token cap and one that finished its answer look identical without it.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ResponseFacts {
+    model: Option<String>,
+    finish_reason: Option<String>,
+}
+
+/// Read [`ResponseFacts`] off a provider's own payload.
+///
+/// By key rather than by type. The response type is the provider's, and rig only promises it
+/// serializes — so a typed reader would mean three of them, each pinned to a struct in a dependency
+/// this crate does not own. The keys below are what the three providers actually spell:
+/// `stop_reason` (Anthropic), `choices[].finish_reason` (chat completions, which is Moonshot), and
+/// the Responses API's `incomplete_details.reason` with `status` behind it. A payload that spells
+/// it some fourth way reports no reason, which is the truth about what could be read rather than a
+/// guess.
+fn response_facts(raw: &serde_json::Value) -> ResponseFacts {
+    let text = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_str)
+            .filter(|found| !found.is_empty())
+            .map(ToString::to_string)
+    };
+    let finish_reason = text(raw.get("stop_reason"))
+        .or_else(|| {
+            text(
+                raw.get("choices")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|choices| choices.first())
+                    .and_then(|choice| choice.get("finish_reason")),
+            )
+        })
+        // The Responses API says `incomplete` and puts the reason beside it, so the reason is the
+        // more specific answer where there is one and the status is the fallback.
+        .or_else(|| text(raw.pointer("/incomplete_details/reason")))
+        .or_else(|| text(raw.get("status")));
+    ResponseFacts {
+        model: text(raw.get("model")),
+        finish_reason,
+    }
+}
+
 /// An agent prompt can contain many provider turns separated by tool calls. Retrying the entire
 /// prompt makes an early transient failure consume the retry budget for a later one and discards
 /// completed work; this wrapper instead resends only the request that failed, against the same
@@ -1732,6 +1817,14 @@ struct RetryingModel<M> {
     inner: M,
     node: String,
     control: Option<RuntimeControl>,
+    /// The last response's facts, for the turn's span to report once the turn is over. Last rather
+    /// than every one: a turn is many calls and ends on one of them, and what ended it is the
+    /// question a span answers.
+    ///
+    /// Only the non-streaming path fills this. A streamed response is assembled from chunks and
+    /// its raw payload is never one value here, so a streaming turn reports no response facts —
+    /// absent, rather than a reason inferred from something that did not say one.
+    responses: Arc<Mutex<Option<ResponseFacts>>>,
 }
 
 impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
@@ -1744,6 +1837,7 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
             inner: M::make(client, model),
             node: "agent".to_string(),
             control: None,
+            responses: Arc::default(),
         }
     }
 
@@ -1751,10 +1845,14 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
-        retry_model_turn(&self.node, self.control.as_ref(), || {
+        let answered = retry_model_turn(&self.node, self.control.as_ref(), || {
             self.inner.completion(request.clone())
         })
-        .await
+        .await?;
+        if let Ok(raw) = serde_json::to_value(&answered.raw_response) {
+            *self.responses.lock().expect("response facts poisoned") = Some(response_facts(&raw));
+        }
+        Ok(answered)
     }
 
     async fn stream(
@@ -1857,17 +1955,20 @@ fn metered<M: CompletionModel + 'static>(
         .next_id;
     let usage = UsageHook::default();
     let observability = ObservabilityHook::default();
+    let responses: Arc<Mutex<Option<ResponseFacts>>> = Arc::default();
     let meter = Meter {
         total: Arc::clone(&usage.total),
         used: Arc::clone(&observability.used),
         provider_calls,
         first_call_id,
         claimed_provider_calls: Mutex::new(ClaimedProviderCalls::default()),
+        responses: Arc::clone(&responses),
     };
     let builder = AgentBuilder::new(RetryingModel {
         inner: model,
         node: node.to_string(),
         control,
+        responses,
     })
     .preamble(preamble)
     .default_max_turns(max_turns.unwrap_or(DEFAULT_MAX_TURNS))
@@ -1910,6 +2011,8 @@ pub struct Meter {
     /// What this meter already claimed, so repeated reads are stable and a nested compaction meter
     /// does not leave its provider calls for the enclosing node to count again.
     claimed_provider_calls: Mutex<ClaimedProviderCalls>,
+    /// What the provider said about the response that ended the turn; see [`ResponseFacts`].
+    responses: Arc<Mutex<Option<ResponseFacts>>>,
 }
 
 #[derive(Default)]
@@ -1919,6 +2022,14 @@ struct ClaimedProviderCalls {
 }
 
 impl Meter {
+    /// What the provider said about the response that ended the turn, if one did.
+    fn answered(&self) -> Option<ResponseFacts> {
+        self.responses
+            .lock()
+            .expect("response facts poisoned")
+            .clone()
+    }
+
     /// The usage so far. Read after the prompt returns — including on the error path, where the
     /// calls made before the failure cost exactly what they cost.
     pub fn read(&self) -> (TokenUsage, u64) {
@@ -3538,6 +3649,14 @@ where
         "gen_ai.operation.name" = "invoke_agent",
         "gen_ai.agent.name" = node,
         "gen_ai.request.model" = %model_name,
+        // Which provider SERVED the call. Without it a mixed-provider run is one undifferentiated
+        // set of turns, though the route knew all along.
+        "gen_ai.provider.name" = %route.provider,
+        // The response side, recorded when the turn ends: an endpoint may answer on a model other
+        // than the one asked for, and a turn cut off at the token cap and one that finished look
+        // identical without a reason.
+        "gen_ai.response.model" = tracing::field::Empty,
+        "gen_ai.response.finish_reasons" = tracing::field::Empty,
         span_id = execution_ids().0,
         parent_span_id = execution_ids().1,
         controlled_as,
@@ -3646,6 +3765,7 @@ where
     // The outcome on the span itself, so a trace can separate a turn that failed from one that
     // returned without reading the ledger beside it.
     record_turn_outcome(&span, answer.as_ref().err());
+    record_response_facts(&span, meter.answered());
 
     let (usage, calls) = meter.read();
     if let Some(ledger) = &ledger {
@@ -5121,6 +5241,51 @@ mod tests {
         assert_eq!(span["parent_span_id"], host["span_id"], "{span}");
     }
 
+    #[test]
+    fn a_response_reports_the_model_that_answered_and_why_the_turn_ended() {
+        // Read by key across the three payload shapes this harness actually sees. A typed reader
+        // would be three readers, each pinned to a struct in a dependency this crate does not own.
+        let anthropic = response_facts(&serde_json::json!({
+            "model": "claude-sonnet-4-6-20260101",
+            "stop_reason": "max_tokens",
+        }));
+        assert_eq!(
+            anthropic.model.as_deref(),
+            Some("claude-sonnet-4-6-20260101")
+        );
+        assert_eq!(anthropic.finish_reason.as_deref(), Some("max_tokens"));
+
+        // Chat completions, which is the Moonshot route.
+        let chat = response_facts(&serde_json::json!({
+            "model": "kimi-k2.5",
+            "choices": [{ "finish_reason": "length" }],
+        }));
+        assert_eq!(chat.model.as_deref(), Some("kimi-k2.5"));
+        assert_eq!(chat.finish_reason.as_deref(), Some("length"));
+
+        // The Responses API says `incomplete` and puts the reason beside it, so the reason wins.
+        let responses = response_facts(&serde_json::json!({
+            "model": "gpt-5.6-terra",
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+        }));
+        assert_eq!(
+            responses.finish_reason.as_deref(),
+            Some("max_output_tokens")
+        );
+        // And the status stands alone when nothing more specific is offered.
+        let complete = response_facts(&serde_json::json!({
+            "model": "gpt-5.6-terra",
+            "status": "completed",
+        }));
+        assert_eq!(complete.finish_reason.as_deref(), Some("completed"));
+
+        // A payload that spells it some fourth way reports no reason rather than a guess — and an
+        // empty string is not an answer either.
+        let unknown = response_facts(&serde_json::json!({ "model": "", "why": "who knows" }));
+        assert_eq!(unknown, ResponseFacts::default());
+    }
+
     /// A model that refuses every request, so the turn ends in an error.
     #[derive(Clone, Default)]
     struct AlwaysRefuses;
@@ -5250,6 +5415,19 @@ mod tests {
         );
         // A model turn leaves this process, so it is a client operation.
         assert_eq!(refused["otel.kind"], "client");
+        // Which provider served it — what makes a mixed-provider run legible at all.
+        assert_eq!(refused["gen_ai.provider.name"], "test");
+        // The response side is the answering turn's: the model that answered and why it ended.
+        assert_eq!(
+            returned["gen_ai.response.model"], "answering-model",
+            "{returned}"
+        );
+        assert_eq!(
+            returned["gen_ai.response.finish_reasons"], "stop",
+            "{returned}"
+        );
+        // A turn nothing answered reports neither, rather than echoing the route back.
+        assert!(refused["gen_ai.response.model"].is_null(), "{refused}");
 
         // And the outcome is on the span alone: a class to group by, never the message.
         assert_eq!(refused["otel.status_code"], "ERROR", "{refused}");
@@ -5266,7 +5444,9 @@ mod tests {
     struct AlwaysInvalid;
 
     impl CompletionModel for AlwaysInvalid {
-        type Response = ();
+        // A payload rather than a unit, because what a provider says about its own response — the
+        // model that answered, why the turn ended — is read off exactly this.
+        type Response = serde_json::Value;
         type StreamingResponse = ();
         type Client = ();
 
@@ -5281,7 +5461,10 @@ mod tests {
             Ok(CompletionResponse {
                 choice: OneOrMany::one(AssistantContent::text("not the schema, ever")),
                 usage: rig_core::completion::Usage::default(),
-                raw_response: (),
+                raw_response: serde_json::json!({
+                    "model": "answering-model",
+                    "stop_reason": "stop",
+                }),
                 message_id: None,
             })
         }
@@ -6483,6 +6666,7 @@ mod tests {
             inner,
             node: "analyst".to_string(),
             control: None,
+            responses: Arc::default(),
         };
 
         model
