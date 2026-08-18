@@ -817,6 +817,11 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
                    AND model LIKE 'anthropic/%'
                    AND model NOT LIKE '%,%'",
             )?;
+            // And then the old column goes, which is what makes both statements above a one-time
+            // repair rather than a scan on every open forever. It has no readers left, so keeping
+            // it would only leave a second spelling of a field this renamed, and a store opened
+            // again finds nothing to copy or clear.
+            conn.execute_batch("ALTER TABLE checkpoints DROP COLUMN thinking")?;
         }
     }
     Ok(())
@@ -1309,21 +1314,25 @@ mod tests {
             "and a provider that does report the figure keeps the zero it reported"
         );
 
-        // And the copy is once: it matches only rows the destination is still NULL on, so opening
-        // the same store again cannot undo a value written since.
+        // And the repair is ONCE. The old column is gone with its values, so a later open finds
+        // nothing to copy and nothing to clear — where leaving it in place would rescan every row
+        // of every store forever, and go on judging rows written long after the rename.
         {
             let conn = reopened.conn.lock().unwrap();
-            conn.execute_batch("UPDATE checkpoints SET thinking = 0")
-                .unwrap();
+            assert!(
+                conn.prepare("SELECT thinking FROM checkpoints").is_err(),
+                "the column the repair reads is dropped once it has been read"
+            );
         }
         drop(reopened);
         let again = Store::open(&path).unwrap();
+        let rows = again.checkpoints_for_run("run-1").await.unwrap();
         assert!(
-            again.checkpoints_for_run("run-1").await.unwrap()[0]
-                .telemetry
-                .thinking_requested,
-            "the migrated value stands; the old column is no longer read"
+            rows[0].telemetry.thinking_requested,
+            "the migrated value stands"
         );
+        assert_eq!(rows[0].telemetry.usage.reasoning_tokens, None);
+        assert_eq!(rows[2].telemetry.usage.reasoning_tokens, Some(0));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -657,11 +657,21 @@ test("a node that has not reported its cost yet makes no claim about its endpoin
   // A checkpoint is absent until a node finishes, so a live node's marker read as "this endpoint
   // reports no reasoning figure at all" while its first turn was still running — a claim about the
   // endpoint made before anything had asked it.
-  const pending = thinkingTip(undefined, { telemetry: null, costed: false });
+  // What the panel is ACTUALLY handed while a first turn runs: `fromStream` shows the stream's own
+  // record from the moment it watches an invocation start, so the node has a telemetry object with
+  // nothing measured in it yet — and reading that object's presence as a cost report is what made
+  // the marker claim the endpoint reports no reasoning figure during every first turn.
+  const started = { reasoning_tokens: null };
+  const pending = thinkingTip(started, { telemetry: started, costed: false });
   expect(pending).toContain("not reported what this turn spent yet");
   expect(pending).not.toContain("no reasoning figure at all");
   // A node nothing is known about at all reads the same way, rather than as an endpoint claim.
   expect(thinkingTip(undefined, undefined)).toBe(pending);
+  // And where the stream has no opinion — an ingested tail, a run older than telemetry — a
+  // recorded row IS the answer, so its absence is the endpoint's.
+  expect(thinkingTip({ reasoning_tokens: null }, undefined)).toContain(
+    "no reasoning figure at all",
+  );
 
   // And once a turn answers, the marker says what it answered — including a zero, and including
   // while the node is still live and only the stream has the figure.

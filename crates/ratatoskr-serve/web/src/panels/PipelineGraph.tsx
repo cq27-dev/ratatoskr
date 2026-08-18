@@ -237,8 +237,18 @@ export function thinkingTip(
   // a node finishes: reading only that made a live turn's reported figure — zero or otherwise —
   // render as an endpoint that reports none.
   const reasoning = telemetry?.reasoning_tokens ?? live?.telemetry?.reasoning_tokens ?? null;
-  // Whether any cost report has arrived at all, from either.
-  const costReported = telemetry != null || live?.costed === true;
+  // Whether any cost report has arrived at all.
+  //
+  // The stream decides wherever it has an opinion, because a started node is HANDED blank
+  // telemetry — `fromStream` shows the stream's own record from the moment it watches an
+  // invocation start, so the object exists before any turn has answered, and taking its presence
+  // as a cost report made this claim about the endpoint during every first turn. `costed` is the
+  // field that separates the two, and it says so.
+  //
+  // The server's record is the answer only where the stream has none: an ingested tail whose
+  // starts are in a rotated file, or a run recorded before checkpoints carried telemetry. There,
+  // a telemetry object is a finished row rather than a placeholder.
+  const costReported = live ? live.costed === true : telemetry != null;
   if (reasoning == null && !costReported) {
     return "Thinking: this node is not stopped from reasoning before it answers, and has not reported what this turn spent yet";
   }
