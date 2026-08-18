@@ -407,26 +407,6 @@ enum Provider {
     Moonshot,
 }
 
-/// Whether this provider reports reasoning tokens apart from the rest of its output.
-///
-/// A zero from an endpoint that reports no such figure is this layer's default, not the model's
-/// answer — and recording it as a measurement is what put `reasoning_tokens = 0` beside
-/// `thinking_requested = true` on every record that set both. Read off the provider because that is
-/// where the answer is knowable: it is a property of the endpoint's response shape, not of the turn.
-///
-/// Anthropic bills thinking inside `output_tokens` and reports nothing separate — rig's Anthropic
-/// adapter fills the field with a literal `0`. Both OpenAI surfaces this harness uses map it from a
-/// token-details block when the response carries one, and Moonshot runs on the chat-completions
-/// surface, so both report it where the model produced any.
-fn provider_reports_reasoning(provider: &str) -> bool {
-    match provider {
-        "anthropic" => false,
-        // The default for anything else: reporting a count the endpoint may well have sent is a
-        // smaller error than dropping one it did.
-        _ => true,
-    }
-}
-
 /// Resolve a config provider string. Kept separate so it's testable without a live connection.
 fn parse_provider(name: &str) -> Result<Provider, AgentError> {
     match name {
@@ -593,8 +573,9 @@ fn empty_openai_response(body: &[u8]) -> Option<EmptyOpenAiResponse> {
             output_tokens: usage.output_tokens,
             cached_input_tokens: usage.cached_input_tokens,
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
-            // This capture only ever reads an OpenAI Responses payload, which reports the figure.
-            reasoning_tokens: Some(usage.reasoning_tokens),
+            // Off this payload, like every other: a Responses body that carried no details block
+            // reports no reasoning here either.
+            reasoning_tokens: reported_reasoning(&raw).then_some(usage.reasoning_tokens),
         },
         reached_output_limit: reached_output_limit.is_some(),
     })
@@ -1803,6 +1784,14 @@ where
 struct ResponseFacts {
     model: Option<String>,
     finish_reason: Option<String>,
+    /// Whether this payload carried a reasoning figure at all.
+    ///
+    /// Per RESPONSE, not per provider. A provider-level answer is an approximation of this, and it
+    /// is wrong in both directions: an endpoint that usually reports the figure omits it for a
+    /// model that does no reasoning, or behind a compatible base URL that drops the detail block —
+    /// and rig maps a missing block to a literal zero, which is the fabricated measurement this
+    /// whole field exists to avoid. The payload is the only place the question has a real answer.
+    reasoning_reported: bool,
 }
 
 /// Read [`ResponseFacts`] off a provider's own payload.
@@ -1837,7 +1826,23 @@ fn response_facts(raw: &serde_json::Value) -> ResponseFacts {
     ResponseFacts {
         model: text(raw.get("model")),
         finish_reason,
+        reasoning_reported: reported_reasoning(raw),
     }
+}
+
+/// Whether a provider payload carried a reasoning-token figure of its own.
+///
+/// The two spellings this harness sees: `completion_tokens_details` on the chat-completions
+/// surface, which is Moonshot's, and `output_tokens_details` on the Responses API. Anthropic has
+/// neither — it bills thinking inside the output count — so its payloads answer no, which is the
+/// truth rather than a table's guess about the provider.
+fn reported_reasoning(raw: &serde_json::Value) -> bool {
+    [
+        "/usage/completion_tokens_details/reasoning_tokens",
+        "/usage/output_tokens_details/reasoning_tokens",
+    ]
+    .iter()
+    .any(|path| raw.pointer(path).is_some_and(serde_json::Value::is_number))
 }
 
 /// An agent prompt can contain many provider turns separated by tool calls. Retrying the entire
@@ -1940,9 +1945,6 @@ pub struct Request {
     max_tokens: u64,
     temperature: Option<f64>,
     params: Option<serde_json::Value>,
-    /// Whether a reasoning count off this route's endpoint is a measurement; see
-    /// [`provider_reports_reasoning`].
-    reports_reasoning: bool,
 }
 
 impl Request {
@@ -1950,7 +1952,6 @@ impl Request {
     pub fn of(route: &ModelRoute) -> Self {
         Request {
             max_tokens: route.max_tokens(),
-            reports_reasoning: provider_reports_reasoning(&route.provider),
             temperature: route.temperature,
             params: route.params.as_ref().and_then(|p| {
                 serde_json::to_value(p)
@@ -1971,16 +1972,11 @@ impl Request {
     /// The defaults: a cap and nothing else. What the compactor asks for — a summary wants neither
     /// a temperature of the node's choosing nor its extended thinking budget.
     ///
-    /// `reports_reasoning` is still the ROUTE's, passed in by the caller that has it: a summary
-    /// runs on the node's own endpoint, so what that endpoint says about reasoning is the same
-    /// answer the node's own turns get. Deciding it here recorded no reasoning for a compaction on
-    /// a provider that reported one.
-    pub fn plain(reports_reasoning: bool) -> Self {
+    pub fn plain() -> Self {
         Request {
             max_tokens: ratatoskr_core::DEFAULT_MAX_TOKENS,
             temperature: None,
             params: None,
-            reports_reasoning,
         }
     }
 }
@@ -1999,12 +1995,12 @@ fn metered<M: CompletionModel + 'static>(
         .lock()
         .expect("provider-call log poisoned")
         .next_id;
-    let usage = UsageHook {
-        reports_reasoning: request.reports_reasoning,
-        ..Default::default()
-    };
     let observability = ObservabilityHook::default();
     let responses: Arc<Mutex<Option<ResponseFacts>>> = Arc::default();
+    let usage = UsageHook {
+        responses: Arc::clone(&responses),
+        ..Default::default()
+    };
     let meter = Meter {
         total: Arc::clone(&usage.total),
         used: Arc::clone(&observability.used),
@@ -2159,9 +2155,10 @@ impl Meter {
 #[derive(Default)]
 struct UsageHook {
     total: Arc<Mutex<TokenUsage>>,
-    /// Whether a reasoning count off this endpoint is a measurement; see
-    /// [`provider_reports_reasoning`].
-    reports_reasoning: bool,
+    /// What the response that produced this turn said about itself, filled by [`RetryingModel`]
+    /// before rig hands the turn here. Its [`ResponseFacts::reasoning_reported`] is what makes a
+    /// reasoning count a measurement rather than rig's default.
+    responses: Arc<Mutex<Option<ResponseFacts>>>,
 }
 
 impl AgentHook for UsageHook {
@@ -2216,7 +2213,11 @@ impl AgentHook for UsageHook {
                 cached_input_tokens: event.usage.cached_input_tokens,
                 cache_creation_input_tokens: event.usage.cache_creation_input_tokens,
                 reasoning_tokens: self
-                    .reports_reasoning
+                    .responses
+                    .lock()
+                    .expect("response facts poisoned")
+                    .as_ref()
+                    .is_some_and(|answered| answered.reasoning_reported)
                     .then_some(event.usage.reasoning_tokens),
             });
         ModelTurnAction::Continue
@@ -3678,7 +3679,6 @@ where
                 ledger.clone(),
                 Arc::clone(&provider_calls),
                 runtime_control.clone(),
-                provider_reports_reasoning(&route.provider),
             ))
             .conversation(&compacted_session_key);
     } else if let Some(produces) = produces {
@@ -3690,7 +3690,6 @@ where
             ledger.clone(),
             provider_calls,
             runtime_control.clone(),
-            provider_reports_reasoning(&route.provider),
         ));
     }
     // Before the set is handed to the agent: what the model could call is part of what this turn
@@ -4126,6 +4125,7 @@ mod tests {
         *earlier.answered.lock().unwrap() = Some(ResponseFacts {
             model: Some("answered-earlier".to_string()),
             finish_reason: Some("tool_use".to_string()),
+            reasoning_reported: true,
         });
         let last = record_provider_call(&calls);
         let meter = Meter {
@@ -4147,6 +4147,7 @@ mod tests {
         *last.answered.lock().unwrap() = Some(ResponseFacts {
             model: Some("gpt-test".to_string()),
             finish_reason: Some("max_output_tokens".to_string()),
+            reasoning_reported: true,
         });
         let answered = meter
             .answered()
@@ -4158,6 +4159,7 @@ mod tests {
         *meter.responses.lock().unwrap() = Some(ResponseFacts {
             model: Some("the-model-that-answered".to_string()),
             finish_reason: Some("stop".to_string()),
+            reasoning_reported: true,
         });
         assert_eq!(
             meter.answered().and_then(|answered| answered.finish_reason),
@@ -5515,36 +5517,41 @@ mod tests {
     }
 
     #[test]
-    fn a_reasoning_count_is_absent_where_the_endpoint_reports_none() {
-        // 28 checkpoints once reported `thinking = true` beside `reasoning_tokens = 0`, all 28 of
-        // them: two fields on one row asserting opposite things, with nothing to say which was
-        // right. The zero was this side's default — Anthropic bills thinking inside its output
-        // count and reports no separate figure, and rig's adapter fills the field with a literal
-        // zero — so the fix is to stop calling it a measurement.
-        assert!(!provider_reports_reasoning("anthropic"));
-        // Both OpenAI surfaces this harness uses map the figure from a token-details block, and
-        // Moonshot runs on the chat-completions one.
-        assert!(provider_reports_reasoning("openai"));
-        assert!(provider_reports_reasoning("moonshot"));
+    fn a_reasoning_count_is_absent_unless_the_payload_carried_one() {
+        // 28 checkpoints once reported thinking beside `reasoning_tokens = 0`, all 28 of them: two
+        // fields on one row asserting opposite things. The zero was rig's default for a payload
+        // that carried no such figure, so the question is whether THIS response reported one —
+        // per response, because a provider-level answer is wrong in both directions. An endpoint
+        // that usually reports it omits the block for a model that does no reasoning, or behind a
+        // compatible base URL that drops it, and the default would be recorded as a measurement.
+        let chat = serde_json::json!({
+            "model": "kimi-k2.5",
+            "usage": { "completion_tokens_details": { "reasoning_tokens": 12 } },
+        });
+        assert!(response_facts(&chat).reasoning_reported);
+        let responses = serde_json::json!({
+            "model": "gpt-5.6-terra",
+            "usage": { "output_tokens_details": { "reasoning_tokens": 0 } },
+        });
+        assert!(
+            response_facts(&responses).reasoning_reported,
+            "a reported zero is a measurement and says so"
+        );
 
-        // What the route carries into the turn, so the answer travels with the request rather than
-        // being asked again somewhere it cannot be known.
-        let route = |provider: &str| ModelRoute {
-            provider: provider.to_string(),
-            model: "m".to_string(),
-            max_tokens: None,
-            context_window: None,
-            temperature: None,
-            params: None,
-            session: Default::default(),
-        };
-        assert!(!Request::of(&route("anthropic")).reports_reasoning);
-        assert!(Request::of(&route("openai")).reports_reasoning);
-        // Including the summarising turn a compacted node makes. It runs on that node's own
-        // endpoint, so what the endpoint reports is the node's answer — deciding it at the
-        // compactor recorded no reasoning for a compaction on a provider that reported one.
-        assert!(Request::plain(true).reports_reasoning);
-        assert!(!Request::plain(false).reports_reasoning);
+        // The same endpoint, answering for a model that reasons about nothing: no details block, so
+        // no figure — and rig's zero for it is not one.
+        let plain = serde_json::json!({
+            "model": "kimi-k2.5",
+            "usage": { "prompt_tokens": 10, "completion_tokens": 2 },
+        });
+        assert!(!response_facts(&plain).reasoning_reported);
+        // And Anthropic, which bills thinking inside its output count and carries neither spelling.
+        let anthropic = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 10, "output_tokens": 3 },
+        });
+        assert!(!response_facts(&anthropic).reasoning_reported);
 
         // And the fold keeps absence absent. Summing an unmeasured turn as zero would make a
         // folded row claim a measurement none of its turns made.
@@ -6445,7 +6452,7 @@ mod tests {
             },
             "answer directly",
             None,
-            Request::plain(true),
+            Request::plain(),
             Arc::clone(&provider_calls),
             None,
         );
@@ -6483,7 +6490,7 @@ mod tests {
             LocallyRejected,
             "answer directly",
             None,
-            Request::plain(true),
+            Request::plain(),
             provider_calls,
             None,
         );
@@ -6510,7 +6517,7 @@ mod tests {
             model(),
             "outer",
             None,
-            Request::plain(true),
+            Request::plain(),
             Arc::clone(&provider_calls),
             None,
         );
@@ -6525,7 +6532,7 @@ mod tests {
             model(),
             "nested",
             None,
-            Request::plain(true),
+            Request::plain(),
             Arc::clone(&provider_calls),
             None,
         );

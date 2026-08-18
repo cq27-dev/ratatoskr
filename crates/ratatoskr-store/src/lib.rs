@@ -796,6 +796,17 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             conn.execute_batch(
                 "UPDATE checkpoints SET thinking_requested = thinking                  WHERE thinking_requested IS NULL AND thinking IS NOT NULL",
             )?;
+            // The same repair for the count beside it. An Anthropic row's `0` was rig's default for
+            // a payload that carries no reasoning figure at all, never something the endpoint said
+            // — and left standing it goes on asserting a measurement nobody made, over exactly the
+            // history a reader scrubs back through. Self-limiting, like the copy above: a row
+            // written since records no figure for such a payload rather than a zero, so only rows
+            // from before this can match. A provider that DOES report the figure keeps the zero it
+            // reported, because that zero is an answer.
+            conn.execute_batch(
+                "UPDATE checkpoints SET reasoning_tokens = NULL
+                 WHERE reasoning_tokens = 0 AND model LIKE 'anthropic/%'",
+            )?;
         }
     }
     Ok(())
@@ -1204,6 +1215,25 @@ mod tests {
             .await
             .unwrap();
 
+        // A second row from a provider that DOES report the figure, and reported zero.
+        store
+            .insert_checkpoint(CheckpointWrite {
+                run_id: "run-1",
+                node_name: "verifier",
+                output_json: "{}",
+                telemetry: NodeTelemetry {
+                    model: Some("openai/gpt-5.6-terra".to_string()),
+                    usage: ratatoskr_core::TokenUsage {
+                        reasoning_tokens: Some(0),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
         // The shape a store written before the rename actually has: the value under the old name,
         // and nothing under the new one.
         {
@@ -1214,6 +1244,17 @@ mod tests {
             )
             .unwrap();
         }
+
+        // And the fabricated count beside it: an Anthropic row's zero was rig's default for a
+        // payload that carries no reasoning figure, never something the endpoint said.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "UPDATE checkpoints SET model = 'anthropic/claude-sonnet-4-6', \
+                 reasoning_tokens = 0 WHERE node_name = 'analyst'",
+            )
+            .unwrap();
+        }
         drop(store);
 
         let reopened = Store::open(&path).unwrap();
@@ -1221,6 +1262,15 @@ mod tests {
         assert!(
             rows[0].telemetry.thinking_requested,
             "a row written before the rename keeps what it recorded"
+        );
+        assert_eq!(
+            rows[0].telemetry.usage.reasoning_tokens, None,
+            "and stops asserting a measurement its endpoint never made"
+        );
+        assert_eq!(
+            rows[1].telemetry.usage.reasoning_tokens,
+            Some(0),
+            "while a provider that does report the figure keeps the zero it reported"
         );
 
         // And the copy is once: it matches only rows the destination is still NULL on, so opening
