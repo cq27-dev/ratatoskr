@@ -432,6 +432,10 @@ struct ProviderCall {
     /// Populated only when an empty OpenAI response carried usage that Rig discarded while
     /// converting the response into an error.
     empty_usage: Arc<Mutex<Option<TokenUsage>>>,
+    /// What that same discarded payload said about itself. The turn ends on this call and the
+    /// model never sees the response, so this is the only place its finish reason survives — and
+    /// the cutoff reason is exactly what a reader wants when a turn ends with nothing in it.
+    answered: Arc<Mutex<Option<ResponseFacts>>>,
 }
 
 #[derive(Debug, Default)]
@@ -460,6 +464,8 @@ struct TelemetryHttp {
 struct EmptyOpenAiResponse {
     usage: TokenUsage,
     reached_output_limit: bool,
+    /// The model that answered and why it stopped, off the same payload.
+    answered: ResponseFacts,
 }
 
 fn record_provider_call(calls: &ProviderCallQueue) -> ProviderCall {
@@ -512,6 +518,10 @@ impl HttpClientExt for TelemetryHttp {
                         .empty_usage
                         .lock()
                         .expect("provider-call usage mutex poisoned") = Some(empty.usage);
+                    *call
+                        .answered
+                        .lock()
+                        .expect("provider-call response mutex poisoned") = Some(empty.answered);
                 }
                 Ok(U::from(bytes))
             });
@@ -557,6 +567,7 @@ fn empty_openai_response(body: &[u8]) -> Option<EmptyOpenAiResponse> {
         return None;
     }
     Some(EmptyOpenAiResponse {
+        answered: response_facts(&raw),
         usage: TokenUsage {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
@@ -1845,6 +1856,10 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+        // Cleared before the call, not overwritten after it. A turn is many calls, and one that
+        // ends in failure has no response of its own — leaving the previous call's answer in place
+        // would attribute an earlier model and finish reason to a turn that ended some other way.
+        *self.responses.lock().expect("response facts poisoned") = None;
         let answered = retry_model_turn(&self.node, self.control.as_ref(), || {
             self.inner.completion(request.clone())
         })
@@ -2023,10 +2038,33 @@ struct ClaimedProviderCalls {
 
 impl Meter {
     /// What the provider said about the response that ended the turn, if one did.
+    ///
+    /// The model's own capture first: a call that returned hands its payload straight back. When
+    /// the turn ended on a payload the provider layer converted into an error — an OpenAI response
+    /// with no message or tool call, which is what exhausting the output budget on reasoning looks
+    /// like — the model never saw it, and the LAST provider call carries what it said. Last only:
+    /// an earlier call's answer describes a different response, and a turn that ended in a
+    /// transport failure has no answer at all.
     fn answered(&self) -> Option<ResponseFacts> {
-        self.responses
+        if let Some(answered) = self
+            .responses
             .lock()
             .expect("response facts poisoned")
+            .clone()
+        {
+            return Some(answered);
+        }
+        let calls = self
+            .provider_calls
+            .lock()
+            .expect("provider-call log poisoned");
+        calls
+            .calls
+            .iter()
+            .rfind(|call| call.id >= self.first_call_id)?
+            .answered
+            .lock()
+            .expect("provider-call response mutex poisoned")
             .clone()
     }
 
@@ -3987,6 +4025,155 @@ mod tests {
         > {
             Err(CompletionError::ResponseError(EMPTY_RESPONSE.to_string()))
         }
+    }
+
+    /// Answers once, then fails every later call — the shape of a tool-use turn whose final
+    /// provider call does not come back.
+    #[derive(Clone, Default)]
+    struct AnswersThenFails {
+        attempts: Arc<AtomicU64>,
+    }
+
+    impl CompletionModel for AnswersThenFails {
+        type Response = serde_json::Value;
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self::default()
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            if self.attempts.fetch_add(1, Ordering::Relaxed) > 0 {
+                return Err(CompletionError::ProviderError(
+                    "the endpoint went away".into(),
+                ));
+            }
+            Ok(CompletionResponse {
+                choice: OneOrMany::one(AssistantContent::text("the first turn")),
+                usage: Default::default(),
+                raw_response: serde_json::json!({
+                    "model": "answered-earlier",
+                    "stop_reason": "tool_use",
+                }),
+                message_id: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<
+            rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+            CompletionError,
+        > {
+            Err(CompletionError::ResponseError("no stream".to_string()))
+        }
+    }
+
+    #[test]
+    fn a_turn_that_ended_on_a_discarded_payload_still_reports_what_it_said() {
+        // The OpenAI Responses path: a response with no message or tool call — what exhausting the
+        // output budget on reasoning looks like — is converted into an error before the model sees
+        // it, so the turn's own capture is empty. The provider call kept what the payload said, and
+        // the cutoff reason is exactly what this telemetry exists to surface.
+        let calls: ProviderCallQueue = Default::default();
+        let earlier = record_provider_call(&calls);
+        *earlier.answered.lock().unwrap() = Some(ResponseFacts {
+            model: Some("answered-earlier".to_string()),
+            finish_reason: Some("tool_use".to_string()),
+        });
+        let last = record_provider_call(&calls);
+        let meter = Meter {
+            total: Arc::default(),
+            used: Arc::default(),
+            provider_calls: Arc::clone(&calls),
+            first_call_id: 0,
+            claimed_provider_calls: Mutex::new(ClaimedProviderCalls::default()),
+            responses: Arc::default(),
+        };
+
+        // The last call is the one the turn ended on, and it has said nothing yet.
+        assert_eq!(
+            meter.answered(),
+            None,
+            "an earlier call's answer is not this turn's"
+        );
+
+        *last.answered.lock().unwrap() = Some(ResponseFacts {
+            model: Some("gpt-test".to_string()),
+            finish_reason: Some("max_output_tokens".to_string()),
+        });
+        let answered = meter
+            .answered()
+            .expect("the discarded payload is still readable");
+        assert_eq!(answered.model.as_deref(), Some("gpt-test"));
+        assert_eq!(answered.finish_reason.as_deref(), Some("max_output_tokens"));
+
+        // And a call that DID come back outranks it: that payload is the turn's own.
+        *meter.responses.lock().unwrap() = Some(ResponseFacts {
+            model: Some("the-model-that-answered".to_string()),
+            finish_reason: Some("stop".to_string()),
+        });
+        assert_eq!(
+            meter.answered().and_then(|answered| answered.finish_reason),
+            Some("stop".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_final_call_does_not_wear_an_earlier_calls_answer() {
+        // A turn is many calls. Recording the facts only on success left the last SUCCESSFUL call's
+        // model and finish reason in place when a later call failed, so the span reported that a
+        // turn ended `tool_use` on a model that had answered several calls ago — while the turn
+        // actually ended because the provider did not come back.
+        let model = RetryingModel {
+            inner: AnswersThenFails::default(),
+            node: "analyst".to_string(),
+            control: None,
+            responses: Arc::default(),
+        };
+        let request = || CompletionRequest {
+            preamble: None,
+            chat_history: OneOrMany::one(rig_core::completion::Message::user("go")),
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            additional_params: None,
+            tool_choice: None,
+            output_schema: None,
+            model: None,
+            record_telemetry_content: false,
+        };
+
+        model
+            .completion(request())
+            .await
+            .expect("the first call answers");
+        assert_eq!(
+            model
+                .responses
+                .lock()
+                .unwrap()
+                .clone()
+                .and_then(|answered| answered.model),
+            Some("answered-earlier".to_string()),
+            "the call that answered reports what answered it"
+        );
+
+        model
+            .completion(request())
+            .await
+            .expect_err("the second call fails");
+        assert_eq!(
+            *model.responses.lock().unwrap(),
+            None,
+            "and a call that did not come back leaves no answer behind"
+        );
     }
 
     #[derive(Clone, Default)]
@@ -6283,8 +6470,21 @@ mod tests {
         assert_eq!(empty.usage.cached_input_tokens, 4);
         assert_eq!(empty.usage.reasoning_tokens, 1);
         assert!(!empty.reached_output_limit);
+        // And what the payload said about itself. The model never sees this response — Rig converts
+        // it into an error — so this capture is the only place its facts survive.
+        assert_eq!(empty.answered.model.as_deref(), Some("gpt-test"));
+        assert_eq!(empty.answered.finish_reason.as_deref(), Some("completed"));
 
         response["incomplete_details"] = serde_json::json!({ "reason": "max_output_tokens" });
+        response["status"] = serde_json::json!("incomplete");
+        let cut_off = empty_openai_response(&serde_json::to_vec(&response).unwrap())
+            .expect("the cut-off response carries usage too");
+        // The case this matters for: the turn ended with nothing in it because the output budget
+        // went on reasoning, and the reason is what a reader is looking for.
+        assert_eq!(
+            cut_off.answered.finish_reason.as_deref(),
+            Some("max_output_tokens")
+        );
         assert!(
             empty_openai_response(&serde_json::to_vec(&response).unwrap())
                 .expect("the raw diagnostic remains attached to the empty response")
