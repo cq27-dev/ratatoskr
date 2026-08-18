@@ -149,8 +149,12 @@ impl LiveUsage {
     /// Read them off a `usage` or `checkpoint` record. `None` for every other kind, and `None` for
     /// a record that reports no cost at all.
     ///
-    /// The keys are dotted OpenTelemetry names (`gen_ai.usage.input_tokens`), which are flat keys
-    /// in the JSON rather than nested objects — a `pointer()` lookup would find nothing.
+    /// The keys are flat dotted names in the JSON rather than nested objects — a `pointer()`
+    /// lookup would find nothing — and they come from two namespaces on purpose. `gen_ai.usage.*`
+    /// holds the two counts the OpenTelemetry GenAI conventions define; `ratatoskr.usage.*` holds
+    /// the three this endpoint reports that no convention does. Read here either way: the split is
+    /// about what an external consumer can be expected to understand, not about what this reader
+    /// wants.
     ///
     /// Absence and zero are different answers and must stay so. A checkpoint written by an
     /// operation host covers no turn, so it carries none of these keys; returning a zeroed struct
@@ -169,9 +173,9 @@ impl LiveUsage {
         let spent = [
             "gen_ai.usage.input_tokens",
             "gen_ai.usage.output_tokens",
-            "gen_ai.usage.cached_input_tokens",
-            "gen_ai.usage.cache_creation_input_tokens",
-            "gen_ai.usage.reasoning_tokens",
+            "ratatoskr.usage.cached_input_tokens",
+            "ratatoskr.usage.cache_creation_input_tokens",
+            "ratatoskr.usage.reasoning_tokens",
         ];
         // Any of them, rather than one chosen as the sentinel: a producer that reported output
         // without input would otherwise have its cost read as no cost at all.
@@ -623,9 +627,9 @@ mod tests {
                 "iteration":2,"model":"anthropic/claude-opus-4-8","tools":"Read,Bash",
                 "tools_used":"Bash","thinking":true,"reuses_session":true,"turns":31,"error":"",
                 "duration_ms":339000,"gen_ai.usage.input_tokens":7,
-                "gen_ai.usage.output_tokens":396,"gen_ai.usage.cached_input_tokens":1065945,
-                "gen_ai.usage.cache_creation_input_tokens":38998,
-                "gen_ai.usage.reasoning_tokens":0,"spans":[{"run_id":"r1"}]}"#,
+                "gen_ai.usage.output_tokens":396,"ratatoskr.usage.cached_input_tokens":1065945,
+                "ratatoskr.usage.cache_creation_input_tokens":38998,
+                "ratatoskr.usage.reasoning_tokens":0,"spans":[{"run_id":"r1"}]}"#,
         )
         .unwrap();
         let e = to_event(&record);
@@ -641,6 +645,42 @@ mod tests {
         let usage = e.usage.expect("a checkpoint reports what it cost");
         assert_eq!(usage.cached_input_tokens, 1_065_945);
         assert_eq!(usage.duration_ms, 339_000);
+    }
+
+    #[test]
+    fn the_two_counts_a_convention_defines_are_the_only_ones_wearing_its_namespace() {
+        // An attribute in the `gen_ai.` namespace makes a claim to an external consumer: that the
+        // OpenTelemetry GenAI conventions say what it means. They define input and output tokens
+        // and nothing about caches or reasoning, so this endpoint's own three are named for what
+        // they are. Both namespaces are read here — the split is about what a backend can be
+        // expected to understand, not about what this reader wants.
+        let record: Value = serde_json::from_str(
+            r#"{"timestamp":"t","kind":"usage","node":"analyst",
+                "gen_ai.usage.input_tokens":11,"gen_ai.usage.output_tokens":22,
+                "ratatoskr.usage.cached_input_tokens":33,
+                "ratatoskr.usage.cache_creation_input_tokens":44,
+                "ratatoskr.usage.reasoning_tokens":55,
+                "duration_ms":66,"spans":[{"run_id":"r1"}]}"#,
+        )
+        .unwrap();
+        let usage = to_event(&record).usage.expect("both namespaces are read");
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 22);
+        assert_eq!(usage.cached_input_tokens, 33);
+        assert_eq!(usage.cache_creation_input_tokens, 44);
+        assert_eq!(usage.reasoning_tokens, 55);
+
+        // And a producer that puts the extensions back under the convention's name is not read as
+        // conformant by accident: those keys mean nothing to this reader either.
+        let mislabelled: Value = serde_json::from_str(
+            r#"{"timestamp":"t","kind":"usage","node":"analyst",
+                "gen_ai.usage.cached_input_tokens":33,"spans":[{"run_id":"r1"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            to_event(&mislabelled).usage.is_none(),
+            "a `gen_ai.` cache count is not one of the convention's, here or anywhere"
+        );
     }
 
     #[test]
@@ -668,9 +708,9 @@ mod tests {
             r#"{"timestamp":"t","kind":"checkpoint","node":"analyst","model":"p/m","turns":1,
                 "tools":"","tools_used":"","thinking":false,"reuses_session":false,
                 "duration_ms":90,"gen_ai.usage.input_tokens":0,
-                "gen_ai.usage.output_tokens":0,"gen_ai.usage.cached_input_tokens":0,
-                "gen_ai.usage.cache_creation_input_tokens":0,
-                "gen_ai.usage.reasoning_tokens":0,"spans":[{"run_id":"r1"}]}"#,
+                "gen_ai.usage.output_tokens":0,"ratatoskr.usage.cached_input_tokens":0,
+                "ratatoskr.usage.cache_creation_input_tokens":0,
+                "ratatoskr.usage.reasoning_tokens":0,"spans":[{"run_id":"r1"}]}"#,
         )
         .unwrap();
         let e = to_event(&free);
@@ -878,9 +918,9 @@ mod tests {
         let record: Value = serde_json::from_str(
             r#"{"timestamp":"t","kind":"usage","node":"context",
                 "gen_ai.usage.input_tokens":45,"gen_ai.usage.output_tokens":82,
-                "gen_ai.usage.cached_input_tokens":853598,
-                "gen_ai.usage.cache_creation_input_tokens":53807,
-                "gen_ai.usage.reasoning_tokens":0,"duration_ms":226362,
+                "ratatoskr.usage.cached_input_tokens":853598,
+                "ratatoskr.usage.cache_creation_input_tokens":53807,
+                "ratatoskr.usage.reasoning_tokens":0,"duration_ms":226362,
                 "spans":[{"run_id":"r1"}]}"#,
         )
         .unwrap();

@@ -268,9 +268,13 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
         duration_ms = logged.duration_ms,
         "gen_ai.usage.input_tokens" = spent.map(|u| u.input_tokens),
         "gen_ai.usage.output_tokens" = spent.map(|u| u.output_tokens),
-        "gen_ai.usage.cached_input_tokens" = spent.map(|u| u.cached_input_tokens),
-        "gen_ai.usage.cache_creation_input_tokens" = spent.map(|u| u.cache_creation_input_tokens),
-        "gen_ai.usage.reasoning_tokens" = spent.map(|u| u.reasoning_tokens),
+        // The convention defines the two above and none of the three below, which are this
+        // endpoint's own counts: named `ratatoskr.usage.*` so a consumer can tell which names a
+        // backend will understand from the name alone.
+        "ratatoskr.usage.cached_input_tokens" = spent.map(|u| u.cached_input_tokens),
+        "ratatoskr.usage.cache_creation_input_tokens" =
+            spent.map(|u| u.cache_creation_input_tokens),
+        "ratatoskr.usage.reasoning_tokens" = spent.map(|u| u.reasoning_tokens),
         "checkpoint"
     );
     Ok(())
@@ -1556,9 +1560,9 @@ mod checkpoint_event_tests {
         for key in [
             "gen_ai.usage.input_tokens",
             "gen_ai.usage.output_tokens",
-            "gen_ai.usage.cached_input_tokens",
-            "gen_ai.usage.cache_creation_input_tokens",
-            "gen_ai.usage.reasoning_tokens",
+            "ratatoskr.usage.cached_input_tokens",
+            "ratatoskr.usage.cache_creation_input_tokens",
+            "ratatoskr.usage.reasoning_tokens",
             "turns",
             "duration_ms",
             "model",
@@ -1583,7 +1587,7 @@ mod checkpoint_event_tests {
         }))
         .await;
         assert_eq!(free["gen_ai.usage.input_tokens"], 0);
-        assert_eq!(free["gen_ai.usage.reasoning_tokens"], 0);
+        assert_eq!(free["ratatoskr.usage.reasoning_tokens"], 0);
         assert_eq!(free["turns"], 1);
         assert_eq!(free["model"], "p/m");
     }
