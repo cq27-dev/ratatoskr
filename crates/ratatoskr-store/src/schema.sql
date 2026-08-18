@@ -35,7 +35,10 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     output_tokens INTEGER,
     cached_input_tokens INTEGER,
     cache_creation_input_tokens INTEGER,
-    error TEXT
+    error TEXT,
+    -- Why this row exists, when the path that produced it is not the ordinary one. Null for the
+    -- ordinary path, which is nearly every row.
+    cause TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_checkpoints_run_id ON checkpoints(run_id);

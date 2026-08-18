@@ -323,6 +323,14 @@ export interface LiveEvent {
   /** Which attempt this was, on a `checkpoint`. */
   iteration?: number;
   /**
+   * Why this record exists, when the path that produced it is not the ordinary one.
+   *
+   * `ceiling_recovery` marks the plan revision and the final attempt a run makes after its
+   * iteration budget is spent — the same pair of node names a mid-loop replan writes, meaning the
+   * opposite thing. Absent for the ordinary path.
+   */
+  cause?: string;
+  /**
    * Which execution produced this, and what invoked that one.
    *
    * A name is not an execution: one stage is invoked once per converge pass and may be invoked

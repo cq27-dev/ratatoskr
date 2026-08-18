@@ -760,6 +760,7 @@ async fn note<T: serde::Serialize>(
     node: &str,
     out: &T,
     input: Option<String>,
+    cause: Option<ratatoskr_core::RecordCause>,
 ) -> Result<(), String> {
     // Implementer attempts are the only repeated model checkpoints whose ordinal is durable
     // friction evidence. Derive it from the persisted sequence rather than trusting the script's
@@ -781,6 +782,7 @@ async fn note<T: serde::Serialize>(
         output: out,
         input,
         iteration,
+        cause,
         ledger: Some(&ctx.ledger),
     })
     .await
@@ -871,7 +873,7 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
         .await
         .map_err(|e| e.to_string())?;
     // Checkpoint before the guard so a failed baseline stays inspectable.
-    note(&ctx, crate::policy::REDTEAM_NODE, &out, None).await?;
+    note(&ctx, crate::policy::REDTEAM_NODE, &out, None, None).await?;
     // The false-convergence guard is enforced here — the script cannot skip it.
     if !converge::test_command_ran(&out.failing_tests, out.passed_tests, out.exit_code) {
         return Err(format!(
@@ -950,7 +952,7 @@ async fn implement_host(ctx: Arc<WorkflowContext>, arg: String) -> Result<String
             return Err(error.to_string());
         }
     };
-    note(&ctx, crate::policy::IMPLEMENTER_NODE, &out, Some(arg)).await?;
+    note(&ctx, crate::policy::IMPLEMENTER_NODE, &out, Some(arg), None).await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -998,6 +1000,7 @@ async fn referee_judgement(
                 "referee",
                 &serde_json::json!({ "error": error.to_string() }),
                 None,
+                None,
             )
             .await
             {
@@ -1012,6 +1015,7 @@ async fn referee_judgement(
         &referee::RefereeOutput {
             violations: violations.clone(),
         },
+        None,
         None,
     )
     .await
@@ -1244,7 +1248,14 @@ async fn iterate_work(
         .map_err(|e| e.to_string())?;
     // The diagnostic, not the binding's argument: the script does not author it, so it is the one
     // thing that explains what this iteration was actually asked to fix.
-    note(ctx, crate::policy::IMPLEMENTER_NODE, &out, Some(diagnostic)).await?;
+    note(
+        ctx,
+        crate::policy::IMPLEMENTER_NODE,
+        &out,
+        Some(diagnostic),
+        None,
+    )
+    .await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -1628,7 +1639,7 @@ async fn verify_host(
             // Nothing to review is a finished review of nothing, not a review cut short.
             unchecked: Vec::new(),
         };
-        note(&ctx, "verifier", &out, Some(input_json)).await?;
+        note(&ctx, "verifier", &out, Some(input_json), None).await?;
         serde_json::to_string(&out).map_err(|e| e.to_string())?
     } else {
         let stage = executor
@@ -1653,6 +1664,7 @@ async fn verify_host(
                 invocation_guidance: None,
                 output: StageOutput::Checkpoint,
                 after_guard: true,
+                cause: None,
             },
         )
         .await
@@ -1667,6 +1679,7 @@ async fn verify_host(
                     "verifier",
                     &serde_json::json!({ "error": error }),
                     Some(input_json),
+                    None,
                 )
                 .await?;
                 return none(true, true);
@@ -1750,6 +1763,7 @@ impl CeilingRecovery for LiveCeilingRecovery {
                 clarifier: None,
                 invocation_guidance: None,
                 output: StageOutput::Checkpoint,
+                cause: Some(ratatoskr_core::RecordCause::CeilingRecovery),
                 after_guard: true,
             },
         )
@@ -1926,11 +1940,15 @@ async fn replan_at_ceiling_with<R: CeilingRecovery>(
     let implementation = recovery
         .iterate(&ctx, &worktree, &revised, &diagnostic)
         .await?;
+    // Both rows this recovery writes say so. Without it the pair is a mid-loop replan and the
+    // retry that follows it, which is the system working — where this is the system giving up
+    // gracefully, and a reader cannot tell them apart.
     note(
         &ctx,
         "implementer",
         &implementation,
         Some(serde_json::to_string(&revised).map_err(|error| error.to_string())?),
+        Some(ratatoskr_core::RecordCause::CeilingRecovery),
     )
     .await?;
     serde_json::to_string(&CeilingReplanResult {
@@ -1977,6 +1995,7 @@ async fn context_host(
             publish: None,
             clarifier: None,
             invocation_guidance: None,
+            cause: None,
             output: StageOutput::Evidence,
             after_guard: true,
         },
@@ -1985,7 +2004,7 @@ async fn context_host(
     let distilled: crate::context::Distillation =
         serde_json::from_str(&raw).map_err(|error| error.to_string())?;
     let out = crate::context::attach_evidence(distilled, memory);
-    note(&ctx, crate::policy::CONTEXT_NODE, &out, Some(arg)).await?;
+    note(&ctx, crate::policy::CONTEXT_NODE, &out, Some(arg), None).await?;
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
@@ -2144,6 +2163,10 @@ struct StageInvocation {
     clarifier: Option<Arc<dyn ratatoskr_agent::Clarifier>>,
     invocation_guidance: Option<String>,
     output: StageOutput,
+    /// Why the row this writes exists, when the path driving it is not the ordinary one — see
+    /// [`ratatoskr_core::RecordCause`]. Per invocation, not per executor: the same analyst stage
+    /// is the ordinary plan on one call and the ceiling recovery's revision on another.
+    cause: Option<ratatoskr_core::RecordCause>,
 }
 
 #[derive(Deserialize)]
@@ -2174,6 +2197,7 @@ fn stage_invocation(stage: Stage, host_input_json: String) -> Result<StageInvoca
             clarifier: None,
             invocation_guidance: None,
             output: StageOutput::Checkpoint,
+            cause: None,
         });
     };
     let envelope: RenderedStageEnvelope = serde_json::from_str(&host_input_json)
@@ -2191,6 +2215,7 @@ fn stage_invocation(stage: Stage, host_input_json: String) -> Result<StageInvoca
         clarifier: None,
         invocation_guidance: None,
         output: StageOutput::Checkpoint,
+        cause: None,
     })
 }
 
@@ -2247,6 +2272,7 @@ impl StageExecutor {
             clarifier,
             invocation_guidance,
             output: disposition,
+            cause,
         } = invocation;
         let input: serde_json::Value =
             serde_json::from_str(&input_json).map_err(|e| format!("{} arg: {e}", stage.id))?;
@@ -2384,6 +2410,7 @@ impl StageExecutor {
                 clarifier: None,
                 invocation_guidance: None,
                 output: StageOutput::Evidence,
+                cause: None,
             }))
             .await;
             // The child's turn becomes the parent's cost. It runs inside the parent's claim scope,
@@ -2496,7 +2523,7 @@ impl StageExecutor {
         // Without it the turn would be recorded under the stage and claimed under the box, which is
         // exactly the cost-in-the-bin that `RunLedger::unclaimed` exists to catch.
         if disposition == StageOutput::Checkpoint || !stage.is_own_node() {
-            note(&self.ctx, &stage.id, &output, Some(input_json)).await?;
+            note(&self.ctx, &stage.id, &output, Some(input_json), cause).await?;
         }
         serde_json::to_string(&output).map_err(|e| e.to_string())
     }
@@ -2764,6 +2791,8 @@ struct StandardStageInvocation {
     invocation_guidance: Option<String>,
     output: StageOutput,
     after_guard: bool,
+    /// See [`StageInvocation::cause`].
+    cause: Option<ratatoskr_core::RecordCause>,
 }
 
 /// A pooled adapter runtime on loan; see [`WorkflowContext::adapter`].
@@ -2817,6 +2846,7 @@ async fn execute_standard_stage(
             invocation.clarifier = settings.clarifier;
             invocation.invocation_guidance = settings.invocation_guidance;
             invocation.output = settings.output;
+            invocation.cause = settings.cause;
             if settings.after_guard {
                 executor.execute_after_guard(invocation).await
             } else {
@@ -2939,6 +2969,7 @@ async fn evaluate_standard_stage_with_turn_and_resources(
             shell,
             publish,
             clarifier,
+            cause: None,
             invocation_guidance,
             output: StageOutput::Evidence,
             after_guard: false,
@@ -3480,7 +3511,7 @@ async fn bookkeep_scripted(
         .await
         .map_err(|error| PlanError::node("bookkeeper", error))?
     };
-    note(ctx, "bookkeeper", &out, None)
+    note(ctx, "bookkeeper", &out, None, None)
         .await
         .map_err(|e| PlanError::node("bookkeeper", NodeError::Failed(e)))?;
     Ok(out)
@@ -4127,6 +4158,7 @@ mod tests {
                 "analyst",
                 &self.revised,
                 Some(serde_json::to_string(input).unwrap()),
+                Some(ratatoskr_core::RecordCause::CeilingRecovery),
             )
             .await?;
             Ok(Some(self.revised.clone()))
@@ -4670,7 +4702,7 @@ mod tests {
                 let output = context_value.clone();
                 async move {
                     calls.lock().unwrap().push("context".to_string());
-                    note(&ctx, "context", &output, Some(arg)).await?;
+                    note(&ctx, "context", &output, Some(arg), None).await?;
                     serde_json::to_string(&output).map_err(|error| error.to_string())
                 }
             }),
@@ -4685,7 +4717,7 @@ mod tests {
                 let output = baseline.clone();
                 async move {
                     calls.lock().unwrap().push("redTeam".to_string());
-                    note(&ctx, "redteam", &output, None).await?;
+                    note(&ctx, "redteam", &output, None, None).await?;
                     serde_json::to_string(&output).map_err(|error| error.to_string())
                 }
             }),
@@ -4708,7 +4740,7 @@ mod tests {
                 let output = first_output.clone();
                 async move {
                     calls.lock().unwrap().push("implement".to_string());
-                    note(&ctx, "implementer", &output, Some(arg)).await?;
+                    note(&ctx, "implementer", &output, Some(arg), None).await?;
                     serde_json::to_string(&output).map_err(|error| error.to_string())
                 }
             }),
@@ -4770,6 +4802,7 @@ mod tests {
                         "verifier",
                         &output,
                         Some(serde_json::to_string(&verifier_input).unwrap()),
+                        None,
                     )
                     .await?;
                     serde_json::to_string(&verification_result(
@@ -4791,7 +4824,7 @@ mod tests {
                 let output = iterated.clone();
                 async move {
                     calls.lock().unwrap().push("iterate".to_string());
-                    note(&ctx, "implementer", &output, Some(arg)).await?;
+                    note(&ctx, "implementer", &output, Some(arg), None).await?;
                     serde_json::to_string(&output).map_err(|error| error.to_string())
                 }
             }),
@@ -4912,6 +4945,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_ceiling_recovery_is_told_apart_from_a_mid_loop_replan_by_the_records_alone() {
+        // The two write the same pair of node names — an `analyst` revision and the `implementer`
+        // attempt that answers it — and mean opposite things: one is a plan fault caught and
+        // corrected mid-loop, the other is the run giving up gracefully after its budget is spent.
+        // Nothing on either record said which, so a run's history could not tell them apart.
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-recovery-cause-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("worktree")).unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config.implementer.max_iterations = 1;
+        let run_id = "run-recovery-cause";
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            run_id,
+            "tell the two replans apart",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+        store
+            .upsert_run(run_id, None, RunStatus::Running.as_str())
+            .await
+            .unwrap();
+        *ctx.worktree.lock().unwrap() = Some(WorktreePath(dir.join("worktree")));
+
+        let gathered = crate::ContextOutput {
+            brief: "the plan was wrong twice over".to_string(),
+            constraints: Vec::new(),
+            scout: crate::ScoutOutput {
+                related_items: Vec::new(),
+                papertrail_summary: String::new(),
+            },
+            memory: crate::MemoryOutput::default(),
+        };
+        note(&ctx, "context", &gathered, None, None).await.unwrap();
+        let plan = AnalystOutput {
+            impact_summary: "the original plan".to_string(),
+            touched: Vec::new(),
+            risks: Vec::new(),
+            requirements: vec!["hold the behavior".to_string()],
+            residual_risk: String::new(),
+            changes_code: true,
+            acceptance: Vec::new(),
+            interface: Vec::new(),
+        };
+        note(&ctx, "analyst", &plan, None, None).await.unwrap();
+        note(&ctx, "redteam", &red(&[], &["baseline"], 0), None, None)
+            .await
+            .unwrap();
+        let attempt = ImplementerOutput {
+            worktree_path: dir.join("worktree").display().to_string(),
+            ..imp(&[], &["post"], 0)
+        };
+        note(&ctx, "implementer", &attempt, None, None)
+            .await
+            .unwrap();
+
+        // The MID-LOOP replan: the verifier faulted the plan, the workflow called the analyst again
+        // and drove another attempt. Both are the script's calls, so neither states a cause — what
+        // it was given is on the record's input, and nothing more is claimed.
+        note(
+            &ctx,
+            "verifier",
+            &verifier::VerifierOutput {
+                findings: vec![verifier::Finding {
+                    severity: verifier::Severity::P1,
+                    kind: verifier::FindingKind::Execution,
+                    summary: "the plan is the common cause".to_string(),
+                    failure_scenario: "the edge case is mishandled".to_string(),
+                    file: "src/lib.rs".to_string(),
+                    line: Some(7),
+                }],
+                assessment: "re-plan".to_string(),
+                unchecked: Vec::new(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mid_loop_plan = AnalystOutput {
+            impact_summary: "corrected mid-loop".to_string(),
+            ..plan.clone()
+        };
+        note(&ctx, "analyst", &mid_loop_plan, None, None)
+            .await
+            .unwrap();
+        note(&ctx, "implementer", &attempt, None, None)
+            .await
+            .unwrap();
+        // The corrected attempt is reviewed too, and the finding stands: a recovery is only
+        // authorized while the CURRENT tree still needs a correction, so the review has to be of
+        // the attempt that just ran rather than of the one before it.
+        note(
+            &ctx,
+            "verifier",
+            &verifier::VerifierOutput {
+                findings: vec![verifier::Finding {
+                    severity: verifier::Severity::P1,
+                    kind: verifier::FindingKind::Execution,
+                    summary: "the correction exposed another fault".to_string(),
+                    failure_scenario: "the edge case is still mishandled".to_string(),
+                    file: "src/lib.rs".to_string(),
+                    line: Some(7),
+                }],
+                assessment: "the plan is still wrong".to_string(),
+                unchecked: Vec::new(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // And then the ceiling: the budget is spent, and Rust drives one revision and one final
+        // attempt of its own.
+        let recovery = RecordingCeilingRecovery {
+            revised: AnalystOutput {
+                impact_summary: "salvaged at the ceiling".to_string(),
+                ..plan.clone()
+            },
+            implementation: ImplementerOutput {
+                diff_summary: "the last attempt".to_string(),
+                ..attempt.clone()
+            },
+            revisions: Mutex::new(Vec::new()),
+            diagnostics: Mutex::new(Vec::new()),
+        };
+        let executor = StageExecutor::new(
+            Arc::clone(&ctx),
+            Arc::new(standard_stages().await.unwrap()),
+            Arc::new(RecordingStageTurn::default()),
+        );
+        let capturing = crate::test_capture::start();
+        let recovered = replan_at_ceiling_with(Arc::clone(&ctx), executor, &recovery)
+            .await
+            .unwrap();
+        let raw = capturing.text();
+        drop(capturing);
+        assert_ne!(recovered, "null", "the recovery ran");
+
+        // The records alone, with no reference to the ruleset or the script that produced them.
+        let checkpoints = store.checkpoints_for_run(run_id).await.unwrap();
+        let caused = |node: &str| {
+            checkpoints
+                .iter()
+                .filter(|c| c.node_name == node)
+                .map(|c| c.cause)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            caused("analyst"),
+            [
+                None,
+                None,
+                Some(ratatoskr_core::RecordCause::CeilingRecovery)
+            ],
+            "the initial plan and the mid-loop replan state no cause; the recovery's revision does"
+        );
+        assert_eq!(
+            caused("implementer"),
+            [
+                None,
+                None,
+                Some(ratatoskr_core::RecordCause::CeilingRecovery)
+            ],
+            "and the attempt each replan drove is marked the same way as the revision it answers"
+        );
+
+        // On the live event too: a viewer reconstructing where a run WAS reads the log, so a mark
+        // only the store carried would be missing from the view that most needs it.
+        let events = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record["kind"] == "checkpoint")
+            .collect::<Vec<_>>();
+        let marked = events
+            .iter()
+            .filter(|record| record["cause"] == "ceiling_recovery")
+            .count();
+        assert_eq!(
+            marked, 2,
+            "the recovery's two records carry the cause on the event; captured: {raw}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn ceiling_replan_is_checkpoint_derived_and_can_add_exactly_one_attempt() {
         let dir = std::env::temp_dir().join(format!(
             "ratatoskr-standard-ceiling-replan-{}",
@@ -4954,6 +5181,7 @@ mod tests {
             "context",
             &gathered,
             Some(json!(ctx.issue).to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -4974,10 +5202,11 @@ mod tests {
             "analyst",
             &initial,
             Some(serde_json::to_string(&initial_input).unwrap()),
+            None,
         )
         .await
         .unwrap();
-        note(&ctx, "redteam", &red(&[], &["baseline"], 0), None)
+        note(&ctx, "redteam", &red(&[], &["baseline"], 0), None, None)
             .await
             .unwrap();
         let first = ImplementerOutput {
@@ -4989,6 +5218,7 @@ mod tests {
             "implementer",
             &first,
             Some("first attempt".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -5008,6 +5238,7 @@ mod tests {
                 assessment: "the plan may be the common cause".to_string(),
                 unchecked: vec!["the retry path".to_string()],
             },
+            None,
             None,
         )
         .await
@@ -5048,6 +5279,7 @@ mod tests {
                 assessment: "covered the area the first pass could not reach".to_string(),
                 ..Default::default()
             },
+            None,
             None,
         )
         .await
@@ -5146,7 +5378,7 @@ mod tests {
             binding(Arc::clone(&ctx), move |ctx, arg| {
                 let output = context_out.clone();
                 async move {
-                    note(&ctx, "context", &output, Some(arg)).await?;
+                    note(&ctx, "context", &output, Some(arg), None).await?;
                     serde_json::to_string(&output).map_err(|error| error.to_string())
                 }
             }),
@@ -5319,6 +5551,7 @@ mod tests {
                 clarifier: None,
                 invocation_guidance: None,
                 output: StageOutput::Evidence,
+                cause: None,
             })
             .await
             .unwrap();
@@ -5404,6 +5637,7 @@ mod tests {
                     clarifier: None,
                     invocation_guidance: None,
                     output: StageOutput::Evidence,
+                    cause: None,
                 })
                 .await
                 .unwrap();
@@ -5637,6 +5871,7 @@ mod tests {
                     clarifier: None,
                     invocation_guidance: None,
                     output: StageOutput::Evidence,
+                    cause: None,
                 })
                 .await;
             let control = turn
@@ -5752,6 +5987,7 @@ mod tests {
                     clarifier,
                     invocation_guidance: None,
                     output: StageOutput::Evidence,
+                    cause: None,
                 })
                 .await
                 .unwrap();
@@ -7720,6 +7956,7 @@ mod tests {
             clarifier: None,
             invocation_guidance: None,
             output: StageOutput::Checkpoint,
+            cause: None,
         })
         .await
         .unwrap_err();
@@ -7928,6 +8165,7 @@ mod tests {
             clarifier: None,
             invocation_guidance: None,
             output: StageOutput::Evidence,
+            cause: None,
         })
         .await
         .unwrap();
@@ -7973,6 +8211,7 @@ mod tests {
             clarifier: None,
             invocation_guidance: None,
             output: StageOutput::Checkpoint,
+            cause: None,
         })
         .await
         .unwrap_err();
@@ -8068,6 +8307,7 @@ mod tests {
             clarifier: None,
             invocation_guidance: None,
             output: StageOutput::Evidence,
+            cause: None,
         })
         .await
         .unwrap();
@@ -8167,6 +8407,7 @@ mod tests {
             clarifier: None,
             invocation_guidance: None,
             output: StageOutput::Evidence,
+            cause: None,
         })
         .await
         .unwrap();
@@ -8256,6 +8497,7 @@ mod tests {
             clarifier: None,
             invocation_guidance: None,
             output: StageOutput::Evidence,
+            cause: None,
         })
         .await
         .unwrap();
@@ -9444,6 +9686,7 @@ mod tests {
             "redteam",
             &red(&["store::tests::prune_zero"], &["store::tests::prune"], 1),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -10447,6 +10690,7 @@ mod tests {
                 rag_rat_worktree: None,
                 shell: None,
                 publish: None,
+                cause: None,
                 clarifier: None,
                 invocation_guidance: None,
                 output: StageOutput::Checkpoint,
@@ -10716,6 +10960,7 @@ mod tests {
                 capability_ceiling: ratatoskr_core::Capability::Read,
                 rag_rat_worktree: None,
                 shell: None,
+                cause: None,
                 publish: None,
                 clarifier: None,
                 invocation_guidance: None,
@@ -11158,7 +11403,7 @@ mod tests {
 
         // Once the tree moves, the next review is a fresh one — and it is handed what the last pass
         // found, which is what this case is about.
-        note(&ctx, "implementer", &imp(&[], &["post"], 0), None)
+        note(&ctx, "implementer", &imp(&[], &["post"], 0), None, None)
             .await
             .unwrap();
         let second: VerifyResult = serde_json::from_str(&verify(arg).await.unwrap()).unwrap();
@@ -11371,7 +11616,7 @@ mod tests {
         )
         .unwrap();
 
-        note(&ctx, "implementer", &imp(&[], &["first"], 0), None)
+        note(&ctx, "implementer", &imp(&[], &["first"], 0), None, None)
             .await
             .unwrap();
         note(
@@ -11379,6 +11624,7 @@ mod tests {
             "implementer",
             &imp(&[], &["second"], 0),
             Some("Fix the checkpointed correction.".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -12224,8 +12470,8 @@ mod tests {
         *ctx.worktree.lock().unwrap() = Some(WorktreePath(dir.join("worktree")));
 
         let plan = review_plan();
-        note(&ctx, "analyst", &plan, None).await.unwrap();
-        note(&ctx, "implementer", &imp(&[], &["a"], 0), None)
+        note(&ctx, "analyst", &plan, None, None).await.unwrap();
+        note(&ctx, "implementer", &imp(&[], &["a"], 0), None, None)
             .await
             .unwrap();
         // The ceiling's worth of passes, each naming a gap it could not reach.
@@ -12237,7 +12483,9 @@ mod tests {
         // The first pass plus every continuation it is owed.
         let passes = REVIEW_CONTINUATIONS + 1;
         for _ in 0..passes {
-            note(&ctx, "verifier", &unfinished, None).await.unwrap();
+            note(&ctx, "verifier", &unfinished, None, None)
+                .await
+                .unwrap();
         }
 
         let stages = standard_stages().await.unwrap();
