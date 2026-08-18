@@ -145,7 +145,11 @@ pub struct LiveUsage {
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
-    pub reasoning_tokens: u64,
+    /// What the turn spent reasoning, where the endpoint reports it apart from the rest. Absent
+    /// means NOT MEASURED: reading a missing key as zero here would put the ambiguity back on the
+    /// one path that carries it to a viewer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
     pub duration_ms: u64,
 }
 
@@ -191,7 +195,7 @@ impl LiveUsage {
             output_tokens: n(spent[1]).unwrap_or(0),
             cached_input_tokens: n(spent[2]).unwrap_or(0),
             cache_creation_input_tokens: n(spent[3]).unwrap_or(0),
-            reasoning_tokens: n(spent[4]).unwrap_or(0),
+            reasoning_tokens: n(spent[4]),
             duration_ms: n("duration_ms").unwrap_or(0),
         })
     }
@@ -202,7 +206,7 @@ impl LiveUsage {
 pub struct LiveNodeFacts {
     pub model: String,
     pub tools: Vec<String>,
-    pub thinking: bool,
+    pub thinking_requested: bool,
     pub reuses_session: bool,
 }
 
@@ -240,7 +244,11 @@ impl LiveNodeFacts {
                 .filter(|t| !t.is_empty())
                 .map(str::to_string)
                 .collect(),
-            thinking: flag("thinking"),
+            // The same rename, over records that already exist: a log written before it spells
+            // this `thinking`, and reading only the new key would turn a node that was left free
+            // to reason into one that was not. Records rotate daily, so this reads the old spelling
+            // only until they age out.
+            thinking_requested: flag("thinking_requested") || flag("thinking"),
             reuses_session: flag("reuses_session"),
         })
     }
@@ -630,7 +638,7 @@ mod tests {
         let record: Value = serde_json::from_str(
             r#"{"timestamp":"t","kind":"checkpoint","node":"implementer","bytes":21286,
                 "iteration":2,"model":"anthropic/claude-opus-4-8","tools":"Read,Bash",
-                "tools_used":"Bash","thinking":true,"reuses_session":true,"turns":31,"error":"",
+                "tools_used":"Bash","thinking_requested":true,"reuses_session":true,"turns":31,"error":"",
                 "duration_ms":339000,"gen_ai.usage.input_tokens":7,
                 "gen_ai.usage.output_tokens":396,"ratatoskr.usage.cached_input_tokens":1065945,
                 "ratatoskr.usage.cache_creation_input_tokens":38998,
@@ -645,11 +653,67 @@ mod tests {
         let facts = e.facts.expect("a checkpoint reports what the node ran on");
         assert_eq!(facts.model, "anthropic/claude-opus-4-8");
         assert_eq!(facts.tools, ["Read", "Bash"]);
-        assert!(facts.thinking && facts.reuses_session);
+        assert!(facts.thinking_requested && facts.reuses_session);
 
         let usage = e.usage.expect("a checkpoint reports what it cost");
         assert_eq!(usage.cached_input_tokens, 1_065_945);
         assert_eq!(usage.duration_ms, 339_000);
+    }
+
+    #[test]
+    fn a_reasoning_count_the_producer_omitted_stays_absent_on_the_event() {
+        // The event path is the one a viewer reads, so a missing key read as zero here would put
+        // back exactly the ambiguity the record removed: an Anthropic turn measured nothing, and a
+        // measured zero is a different statement.
+        let anthropic: Value = serde_json::from_str(
+            r#"{"timestamp":"t","kind":"usage","node":"analyst",
+                "gen_ai.usage.input_tokens":11,"gen_ai.usage.output_tokens":22,
+                "duration_ms":66,"spans":[{"run_id":"r1"}]}"#,
+        )
+        .unwrap();
+        let usage = to_event(&anthropic)
+            .usage
+            .expect("the turn reported a cost");
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(
+            usage.reasoning_tokens, None,
+            "a figure the endpoint never reported is absent, not zero"
+        );
+
+        let reported: Value = serde_json::from_str(
+            r#"{"timestamp":"t","kind":"usage","node":"analyst",
+                "gen_ai.usage.input_tokens":11,"ratatoskr.usage.reasoning_tokens":0,
+                "spans":[{"run_id":"r1"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            to_event(&reported).usage.unwrap().reasoning_tokens,
+            Some(0),
+            "and an endpoint that reported zero said something, which is carried"
+        );
+    }
+
+    #[test]
+    fn a_log_written_before_the_rename_still_reports_what_its_route_asked_for() {
+        // Records already on disk spell this `thinking`. Reading only the new key would turn a node
+        // that was left free to reason into one that was not, on every run in the history a viewer
+        // scrubs back through.
+        let before: Value = serde_json::from_str(
+            r#"{"timestamp":"t","kind":"node_start","node":"analyst","model":"p/m",
+                "tools":"Read","thinking":true,"reuses_session":false,
+                "spans":[{"run_id":"r1"}]}"#,
+        )
+        .unwrap();
+        let facts = to_event(&before).facts.expect("a start reports its facts");
+        assert!(facts.thinking_requested, "the old spelling still reads");
+
+        let after: Value = serde_json::from_str(
+            r#"{"timestamp":"t","kind":"node_start","node":"analyst","model":"p/m",
+                "tools":"Read","thinking_requested":true,"reuses_session":false,
+                "spans":[{"run_id":"r1"}]}"#,
+        )
+        .unwrap();
+        assert!(to_event(&after).facts.unwrap().thinking_requested);
     }
 
     #[test]
@@ -673,7 +737,7 @@ mod tests {
         assert_eq!(usage.output_tokens, 22);
         assert_eq!(usage.cached_input_tokens, 33);
         assert_eq!(usage.cache_creation_input_tokens, 44);
-        assert_eq!(usage.reasoning_tokens, 55);
+        assert_eq!(usage.reasoning_tokens, Some(55));
 
         // And a producer that puts the extensions back under the convention's name is not read as
         // conformant by accident: those keys mean nothing to this reader either.
@@ -697,7 +761,7 @@ mod tests {
         // composed box's real numbers with an aggregate's zeros.
         let aggregate: Value = serde_json::from_str(
             r#"{"timestamp":"t","kind":"checkpoint","node":"redteam","bytes":120,
-                "tools":"","tools_used":"","thinking":false,"reuses_session":false,
+                "tools":"","tools_used":"","thinking_requested":false,"reuses_session":false,
                 "spans":[{"run_id":"r1"}]}"#,
         )
         .unwrap();
@@ -711,7 +775,7 @@ mod tests {
         // not read as a node that never ran.
         let free: Value = serde_json::from_str(
             r#"{"timestamp":"t","kind":"checkpoint","node":"analyst","model":"p/m","turns":1,
-                "tools":"","tools_used":"","thinking":false,"reuses_session":false,
+                "tools":"","tools_used":"","thinking_requested":false,"reuses_session":false,
                 "duration_ms":90,"gen_ai.usage.input_tokens":0,
                 "gen_ai.usage.output_tokens":0,"ratatoskr.usage.cached_input_tokens":0,
                 "ratatoskr.usage.cache_creation_input_tokens":0,

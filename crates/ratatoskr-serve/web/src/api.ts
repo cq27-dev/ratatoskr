@@ -69,10 +69,16 @@ export interface NodeTelemetry {
   /** Written to cache rather than read from it. Billed at a premium, and what separates a run that
    *  reused its context from one that rebuilt it. */
   cache_creation_input_tokens: number;
-  /** Non-zero when the model reasoned before answering. Zero from endpoints that never report it. */
-  reasoning_tokens: number;
-  /** Whether the node was left free to reason. Configured, not observed. */
-  thinking: boolean;
+  /** What the model spent reasoning before it answered, where the response reported it apart from
+   *  the rest.
+   *
+   *  Omitted entirely when it reported no such figure — an absent KEY, not a null one, so anything
+   *  reading it must treat `undefined` as absence too. Absent is not the same statement as a
+   *  reported zero: Anthropic bills thinking inside its output count and reports nothing separate,
+   *  while an endpoint that answers zero has answered. */
+  reasoning_tokens?: number | null;
+  /** Whether the ROUTE left the node free to reason — configuration, not measurement. */
+  thinking_requested: boolean;
   duration_ms: number | null;
   tools: string[];
   /** Of those, the ones it actually called. */
@@ -378,7 +384,9 @@ export interface EventUsage {
   output_tokens: number;
   cached_input_tokens: number;
   cache_creation_input_tokens: number;
-  reasoning_tokens: number;
+  /** Omitted entirely when the endpoint reported no such figure — an absent key, not a null one,
+   *  so anything reading it must treat `undefined` as absence too. */
+  reasoning_tokens?: number | null;
   duration_ms: number;
 }
 
@@ -452,7 +460,7 @@ export const getNodeCheckpoints = (
 export interface PlannedNode {
   /** Every distinct route the node's stages resolve, comma-joined — as `NodeTelemetry.model` is. */
   model: string;
-  thinking: boolean;
+  thinking_requested: boolean;
   /** Every distinct scope this node's stages will run under, in registry order — a set, because
    *  compacted continuation is a property a MEMBER has and a box with a compacted member has it
    *  whatever its siblings do. There is no `reuses_session` here: it is `sessions.includes("reuse")`,
@@ -466,6 +474,6 @@ export type SessionScope = "fresh" | "reuse" | "compacted";
 export interface NodeFacts {
   model: string;
   tools: string[];
-  thinking: boolean;
+  thinking_requested: boolean;
   reuses_session: boolean;
 }

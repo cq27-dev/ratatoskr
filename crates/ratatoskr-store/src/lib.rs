@@ -42,7 +42,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("checkpoints", "reasoning_tokens", "INTEGER"),
     ("checkpoints", "tools_json", "TEXT"),
     ("checkpoints", "reuses_session", "INTEGER"),
-    ("checkpoints", "thinking", "INTEGER"),
+    // What the ROUTE asked for, which is not a measurement — the name says so, because it sat
+    // unlabelled among the counts and read as one.
+    ("checkpoints", "thinking_requested", "INTEGER"),
     ("checkpoints", "tools_used_json", "TEXT"),
     ("checkpoints", "error", "TEXT"),
     // Which execution wrote this row, and which execution invoked that one. Null for a row written
@@ -406,7 +408,7 @@ impl Store {
                      model, duration_ms, turns, error,
                      input_tokens, output_tokens, cached_input_tokens,
                      cache_creation_input_tokens, reasoning_tokens, tools_json, reuses_session,
-                     thinking, tools_used_json, span_id, parent_span_id, cause
+                     thinking_requested, tools_used_json, span_id, parent_span_id, cause
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                            ?17, ?18, ?19, ?20, ?21)",
                 params![
@@ -426,7 +428,7 @@ impl Store {
                     usage.reasoning_tokens,
                     serde_json::to_string(&telemetry.tools).unwrap_or_default(),
                     telemetry.reuses_session,
-                    telemetry.thinking,
+                    telemetry.thinking_requested,
                     serde_json::to_string(&telemetry.tools_used).unwrap_or_default(),
                     // Written as the sixteen hex characters they are read back from, so the column
                     // holds what an exporter and a human both expect to see.
@@ -455,7 +457,7 @@ impl Store {
                         model, duration_ms, turns, error,
                         input_tokens, output_tokens, cached_input_tokens,
                         cache_creation_input_tokens, reasoning_tokens, tools_json, reuses_session,
-                        thinking, tools_used_json, span_id, parent_span_id, cause
+                        thinking_requested, tools_used_json, span_id, parent_span_id, cause
                  FROM checkpoints WHERE run_id = ?1 ORDER BY id ASC",
             )?;
             let rows = stmt
@@ -492,7 +494,7 @@ impl Store {
                                 .and_then(|j| serde_json::from_str(&j).ok())
                                 .unwrap_or_default(),
                             reuses_session: row.get::<_, Option<bool>>(15)?.unwrap_or(false),
-                            thinking: row.get::<_, Option<bool>>(16)?.unwrap_or(false),
+                            thinking_requested: row.get::<_, Option<bool>>(16)?.unwrap_or(false),
                             tools_used: row
                                 .get::<_, Option<String>>(17)?
                                 .and_then(|j| serde_json::from_str(&j).ok())
@@ -507,7 +509,11 @@ impl Store {
                                 cache_creation_input_tokens: row
                                     .get::<_, Option<u64>>(12)?
                                     .unwrap_or(0),
-                                reasoning_tokens: row.get::<_, Option<u64>>(13)?.unwrap_or(0),
+                                // NULL is "not measured" here and stays that way: the other
+                                // counts default to zero because a row that carries them carries
+                                // all of them, while this one is absent whenever the endpoint
+                                // reports no separate figure.
+                                reasoning_tokens: row.get::<_, Option<u64>>(13)?,
                             },
                         },
                     })
@@ -780,6 +786,42 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             if !existing.contains(*column) {
                 conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
             }
+        }
+        // A rename is the new column AND the values moving into it. `thinking` became
+        // `thinking_requested` because the old name read as a measurement; adding the column and
+        // stopping there would leave every row written under the old name reporting `false`, which
+        // is a different claim from the one those runs recorded. One copy, once: the destination is
+        // NULL only on rows that predate the rename, so re-running this matches nothing.
+        if table == "checkpoints" && existing.contains("thinking") {
+            conn.execute_batch(
+                "UPDATE checkpoints SET thinking_requested = thinking
+                 WHERE thinking_requested IS NULL AND thinking IS NOT NULL",
+            )?;
+            // The same repair for the count beside it. An Anthropic row's `0` was rig's default for
+            // a payload that carries no reasoning figure at all, never something the endpoint said
+            // — and left standing it goes on asserting a measurement nobody made, over exactly the
+            // history a reader scrubs back through.
+            //
+            // ONE route, which is what the `,` excludes. A row's `model` names every distinct route
+            // it folded, comma-joined — the halves of a composed node resolve their own — so a
+            // folded row beginning `anthropic/` may carry a zero its OpenAI half genuinely
+            // reported, and clearing that would destroy a measurement to remove a fabricated one.
+            // Where the row cannot say which half answered, it keeps what it has.
+            //
+            // Restricted that way the predicate is self-limiting, which matters because this runs
+            // on every open of a store that ever had the old column: a single-route Anthropic row
+            // written since records no figure at all rather than a zero, so it cannot match.
+            conn.execute_batch(
+                "UPDATE checkpoints SET reasoning_tokens = NULL
+                 WHERE reasoning_tokens = 0
+                   AND model LIKE 'anthropic/%'
+                   AND model NOT LIKE '%,%'",
+            )?;
+            // And then the old column goes, which is what makes both statements above a one-time
+            // repair rather than a scan on every open forever. It has no readers left, so keeping
+            // it would only leave a second spelling of a field this renamed, and a store opened
+            // again finds nothing to copy or clear.
+            conn.execute_batch("ALTER TABLE checkpoints DROP COLUMN thinking")?;
         }
     }
     Ok(())
@@ -1162,6 +1204,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_renamed_column_carries_its_rows_across_with_it() {
+        // `thinking` became `thinking_requested` because the old name read as a measurement. A
+        // rename is the new column AND the values moving into it: adding the column and stopping
+        // there leaves every row written under the old name reporting `false`, which is a different
+        // claim from the one those runs recorded.
+        let dir = std::env::temp_dir().join(format!("ratatoskr-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite3");
+
+        let store = Store::open(&path).unwrap();
+        store.upsert_run("run-1", None, "running").await.unwrap();
+        store
+            .insert_checkpoint(CheckpointWrite {
+                run_id: "run-1",
+                node_name: "analyst",
+                output_json: "{}",
+                telemetry: NodeTelemetry {
+                    thinking_requested: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // A folded row: a composed node whose halves ran on different routes, the first of them
+        // Anthropic. Its zero came from the half that reports the figure, and nothing in the row
+        // says which — so the repair must leave it alone.
+        store
+            .insert_checkpoint(CheckpointWrite {
+                run_id: "run-1",
+                node_name: "redteam",
+                output_json: "{}",
+                telemetry: NodeTelemetry {
+                    model: Some("anthropic/claude-opus-4-8, openai/gpt-5.6-terra".to_string()),
+                    usage: ratatoskr_core::TokenUsage {
+                        reasoning_tokens: Some(0),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // A second row from a provider that DOES report the figure, and reported zero.
+        store
+            .insert_checkpoint(CheckpointWrite {
+                run_id: "run-1",
+                node_name: "verifier",
+                output_json: "{}",
+                telemetry: NodeTelemetry {
+                    model: Some("openai/gpt-5.6-terra".to_string()),
+                    usage: ratatoskr_core::TokenUsage {
+                        reasoning_tokens: Some(0),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // The shape a store written before the rename actually has: the value under the old name,
+        // and nothing under the new one.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "ALTER TABLE checkpoints ADD COLUMN thinking INTEGER;
+                 UPDATE checkpoints SET thinking = thinking_requested, thinking_requested = NULL;",
+            )
+            .unwrap();
+        }
+
+        // And the fabricated count beside it: an Anthropic row's zero was rig's default for a
+        // payload that carries no reasoning figure, never something the endpoint said.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "UPDATE checkpoints SET model = 'anthropic/claude-sonnet-4-6', \
+                 reasoning_tokens = 0 WHERE node_name = 'analyst'",
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        let rows = reopened.checkpoints_for_run("run-1").await.unwrap();
+        assert!(
+            rows[0].telemetry.thinking_requested,
+            "a row written before the rename keeps what it recorded"
+        );
+        assert_eq!(
+            rows[0].telemetry.usage.reasoning_tokens, None,
+            "and stops asserting a measurement its endpoint never made"
+        );
+        assert_eq!(
+            rows[1].telemetry.usage.reasoning_tokens,
+            Some(0),
+            "a row whose halves ran on different routes keeps a zero the repair cannot attribute"
+        );
+        assert_eq!(
+            rows[2].telemetry.usage.reasoning_tokens,
+            Some(0),
+            "and a provider that does report the figure keeps the zero it reported"
+        );
+
+        // And the repair is ONCE. The old column is gone with its values, so a later open finds
+        // nothing to copy and nothing to clear — where leaving it in place would rescan every row
+        // of every store forever, and go on judging rows written long after the rename.
+        {
+            let conn = reopened.conn.lock().unwrap();
+            assert!(
+                conn.prepare("SELECT thinking FROM checkpoints").is_err(),
+                "the column the repair reads is dropped once it has been read"
+            );
+        }
+        drop(reopened);
+        let again = Store::open(&path).unwrap();
+        let rows = again.checkpoints_for_run("run-1").await.unwrap();
+        assert!(
+            rows[0].telemetry.thinking_requested,
+            "the migrated value stands"
+        );
+        assert_eq!(rows[0].telemetry.usage.reasoning_tokens, None);
+        assert_eq!(rows[2].telemetry.usage.reasoning_tokens, Some(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_checkpoint_carries_its_input_cost_and_model() {
         let store = Store::open_in_memory().unwrap();
         store.upsert_run("run-1", None, "running").await.unwrap();
@@ -1192,12 +1368,12 @@ mod tests {
                         output_tokens: 250,
                         cached_input_tokens: 800,
                         cache_creation_input_tokens: 200,
-                        reasoning_tokens: 4_000,
+                        reasoning_tokens: Some(4_000),
                     },
                     tools: vec!["Read".to_string(), "semantic_search".to_string()],
                     tools_used: vec!["Read".to_string()],
                     reuses_session: true,
-                    thinking: true,
+                    thinking_requested: true,
                 },
             })
             .await
@@ -1218,14 +1394,14 @@ mod tests {
         assert_eq!(cp.telemetry.usage.cache_creation_input_tokens, 200);
         // Billed as output and reported apart from it: a node that thinks before every tool call
         // reads as nearly free when this is dropped, and it is most of what the node spent.
-        assert_eq!(cp.telemetry.usage.reasoning_tokens, 4_000);
+        assert_eq!(cp.telemetry.usage.reasoning_tokens, Some(4_000));
         // What the node could reach, and whether its memory carried over — neither is
         // reconstructable later from a config that has since changed.
         assert_eq!(cp.telemetry.tools, ["Read", "semantic_search"]);
         // Given two, reached for one — the gap is the point.
         assert_eq!(cp.telemetry.tools_used, ["Read"]);
         assert!(cp.telemetry.reuses_session);
-        assert!(cp.telemetry.thinking);
+        assert!(cp.telemetry.thinking_requested);
     }
 
     #[tokio::test]

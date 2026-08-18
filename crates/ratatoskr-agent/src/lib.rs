@@ -321,12 +321,14 @@ async fn record_setup_failure(turn: SetupFailure<'_>, error: AgentError) -> Agen
                 // It never got as far as binding any: an empty list is what it ran with, and the
                 // error below is why.
                 tools: &[],
-                thinking: thinking_left_on(route),
+                thinking_requested: thinking_left_on(route),
                 reuses_session: false,
             });
             tracing::warn!(node, %error, "the turn could not reach its provider");
-            // Zeroes here are measurements, not absences: nothing was spent because nothing ran.
-            // The error is what makes this a failed attempt rather than a finished one.
+            // The counts are zero because nothing ran, and a zero that IS recorded is a
+            // measurement — no turn spent anything. The reasoning figure is absent rather than
+            // zero, for the same reason it is on any turn: no response reported one. The error is
+            // what makes this a failed attempt rather than a finished one.
             subject.spent(&NodeTelemetry {
                 model: Some(model_name.clone()),
                 duration_ms: Some(0),
@@ -336,7 +338,7 @@ async fn record_setup_failure(turn: SetupFailure<'_>, error: AgentError) -> Agen
                 tools: Vec::new(),
                 tools_used: Vec::new(),
                 reuses_session: false,
-                thinking: thinking_left_on(route),
+                thinking_requested: thinking_left_on(route),
             });
         });
     })
@@ -573,7 +575,9 @@ fn empty_openai_response(body: &[u8]) -> Option<EmptyOpenAiResponse> {
             output_tokens: usage.output_tokens,
             cached_input_tokens: usage.cached_input_tokens,
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
-            reasoning_tokens: usage.reasoning_tokens,
+            // Off this payload, like every other: a Responses body that carried no details block
+            // reports no reasoning here either.
+            reasoning_tokens: reported_reasoning(&raw).then_some(usage.reasoning_tokens),
         },
         reached_output_limit: reached_output_limit.is_some(),
     })
@@ -674,7 +678,7 @@ impl<'a> TurnSubject<'a> {
             caller = self.caller,
             model = facts.model,
             tools = %facts.tools.join(","),
-            thinking = facts.thinking,
+            thinking_requested = facts.thinking_requested,
             reuses_session = facts.reuses_session,
             "node started"
         );
@@ -716,7 +720,7 @@ impl<'a> TurnSubject<'a> {
             model = telemetry.model.as_deref(),
             tools = %telemetry.tools.join(","),
             tools_used = %telemetry.tools_used.join(","),
-            thinking = telemetry.thinking,
+            thinking_requested = telemetry.thinking_requested,
             reuses_session = telemetry.reuses_session,
             // Why it failed, for a turn that writes no checkpoint to carry it. Without this a
             // recovered failure — an answerer that could not answer, an evidence-only turn that
@@ -731,7 +735,7 @@ impl<'a> TurnSubject<'a> {
 struct TurnFacts<'a> {
     model: &'a str,
     tools: &'a [String],
-    thinking: bool,
+    thinking_requested: bool,
     reuses_session: bool,
 }
 
@@ -953,7 +957,7 @@ where
     subject.started(TurnFacts {
         model: &model_name,
         tools: &tool_names,
-        thinking: thinking_left_on(route),
+        thinking_requested: thinking_left_on(route),
         reuses_session: false,
     });
     let started = std::time::Instant::now();
@@ -979,7 +983,7 @@ where
             tools: tool_names,
             tools_used: meter.used(),
             reuses_session: false,
-            thinking: thinking_left_on(route),
+            thinking_requested: thinking_left_on(route),
         })
     });
     answer
@@ -1782,6 +1786,14 @@ where
 struct ResponseFacts {
     model: Option<String>,
     finish_reason: Option<String>,
+    /// Whether this payload carried a reasoning figure at all.
+    ///
+    /// Per RESPONSE, not per provider. A provider-level answer is an approximation of this, and it
+    /// is wrong in both directions: an endpoint that usually reports the figure omits it for a
+    /// model that does no reasoning, or behind a compatible base URL that drops the detail block —
+    /// and rig maps a missing block to a literal zero, which is the fabricated measurement this
+    /// whole field exists to avoid. The payload is the only place the question has a real answer.
+    reasoning_reported: bool,
 }
 
 /// Read [`ResponseFacts`] off a provider's own payload.
@@ -1816,7 +1828,23 @@ fn response_facts(raw: &serde_json::Value) -> ResponseFacts {
     ResponseFacts {
         model: text(raw.get("model")),
         finish_reason,
+        reasoning_reported: reported_reasoning(raw),
     }
+}
+
+/// Whether a provider payload carried a reasoning-token figure of its own.
+///
+/// The two spellings this harness sees: `completion_tokens_details` on the chat-completions
+/// surface, which is Moonshot's, and `output_tokens_details` on the Responses API. Anthropic has
+/// neither — it bills thinking inside the output count — so its payloads answer no, which is the
+/// truth rather than a table's guess about the provider.
+fn reported_reasoning(raw: &serde_json::Value) -> bool {
+    [
+        "/usage/completion_tokens_details/reasoning_tokens",
+        "/usage/output_tokens_details/reasoning_tokens",
+    ]
+    .iter()
+    .any(|path| raw.pointer(path).is_some_and(serde_json::Value::is_number))
 }
 
 /// An agent prompt can contain many provider turns separated by tool calls. Retrying the entire
@@ -1877,6 +1905,12 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
         rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
         CompletionError,
     > {
+        // Cleared like the call above, and never written: a streamed response is assembled from
+        // chunks and has no single raw payload to read, so a streaming turn reports no response
+        // facts and no reasoning measurement. Nothing takes this path today — every turn here goes
+        // through `prompt` — but leaving the slot alone would let such a turn wear the answer of
+        // whatever ran before it.
+        *self.responses.lock().expect("response facts poisoned") = None;
         retry_model_turn(&self.node, self.control.as_ref(), || {
             self.inner.stream(request.clone())
         })
@@ -1968,9 +2002,12 @@ fn metered<M: CompletionModel + 'static>(
         .lock()
         .expect("provider-call log poisoned")
         .next_id;
-    let usage = UsageHook::default();
     let observability = ObservabilityHook::default();
     let responses: Arc<Mutex<Option<ResponseFacts>>> = Arc::default();
+    let usage = UsageHook {
+        responses: Arc::clone(&responses),
+        ..Default::default()
+    };
     let meter = Meter {
         total: Arc::clone(&usage.total),
         used: Arc::clone(&observability.used),
@@ -2125,6 +2162,10 @@ impl Meter {
 #[derive(Default)]
 struct UsageHook {
     total: Arc<Mutex<TokenUsage>>,
+    /// What the response that produced this turn said about itself, filled by [`RetryingModel`]
+    /// before rig hands the turn here. Its [`ResponseFacts::reasoning_reported`] is what makes a
+    /// reasoning count a measurement rather than rig's default.
+    responses: Arc<Mutex<Option<ResponseFacts>>>,
 }
 
 impl AgentHook for UsageHook {
@@ -2178,7 +2219,13 @@ impl AgentHook for UsageHook {
                 output_tokens: event.usage.output_tokens,
                 cached_input_tokens: event.usage.cached_input_tokens,
                 cache_creation_input_tokens: event.usage.cache_creation_input_tokens,
-                reasoning_tokens: event.usage.reasoning_tokens,
+                reasoning_tokens: self
+                    .responses
+                    .lock()
+                    .expect("response facts poisoned")
+                    .as_ref()
+                    .is_some_and(|answered| answered.reasoning_reported)
+                    .then_some(event.usage.reasoning_tokens),
             });
         ModelTurnAction::Continue
     }
@@ -3706,7 +3753,7 @@ where
     subject.started(TurnFacts {
         model: &model_name,
         tools: &tool_names,
-        thinking: thinking_left_on(route),
+        thinking_requested: thinking_left_on(route),
         reuses_session: continuing_session(
             route.session,
             conversation,
@@ -3822,7 +3869,7 @@ where
                 conversation,
                 compacted_session.is_some(),
             ),
-            thinking: thinking_left_on(route),
+            thinking_requested: thinking_left_on(route),
         };
         // Inside the turn's own span: the cost record is the turn's, and emitting it beside the
         // span left the only account of a failed turn outside the span that says it failed.
@@ -4085,6 +4132,7 @@ mod tests {
         *earlier.answered.lock().unwrap() = Some(ResponseFacts {
             model: Some("answered-earlier".to_string()),
             finish_reason: Some("tool_use".to_string()),
+            reasoning_reported: true,
         });
         let last = record_provider_call(&calls);
         let meter = Meter {
@@ -4106,6 +4154,7 @@ mod tests {
         *last.answered.lock().unwrap() = Some(ResponseFacts {
             model: Some("gpt-test".to_string()),
             finish_reason: Some("max_output_tokens".to_string()),
+            reasoning_reported: true,
         });
         let answered = meter
             .answered()
@@ -4117,6 +4166,7 @@ mod tests {
         *meter.responses.lock().unwrap() = Some(ResponseFacts {
             model: Some("the-model-that-answered".to_string()),
             finish_reason: Some("stop".to_string()),
+            reasoning_reported: true,
         });
         assert_eq!(
             meter.answered().and_then(|answered| answered.finish_reason),
@@ -5473,6 +5523,67 @@ mod tests {
         assert_eq!(unknown, ResponseFacts::default());
     }
 
+    #[test]
+    fn a_reasoning_count_is_absent_unless_the_payload_carried_one() {
+        // 28 checkpoints once reported thinking beside `reasoning_tokens = 0`, all 28 of them: two
+        // fields on one row asserting opposite things. The zero was rig's default for a payload
+        // that carried no such figure, so the question is whether THIS response reported one —
+        // per response, because a provider-level answer is wrong in both directions. An endpoint
+        // that usually reports it omits the block for a model that does no reasoning, or behind a
+        // compatible base URL that drops it, and the default would be recorded as a measurement.
+        let chat = serde_json::json!({
+            "model": "kimi-k2.5",
+            "usage": { "completion_tokens_details": { "reasoning_tokens": 12 } },
+        });
+        assert!(response_facts(&chat).reasoning_reported);
+        let responses = serde_json::json!({
+            "model": "gpt-5.6-terra",
+            "usage": { "output_tokens_details": { "reasoning_tokens": 0 } },
+        });
+        assert!(
+            response_facts(&responses).reasoning_reported,
+            "a reported zero is a measurement and says so"
+        );
+
+        // The same endpoint, answering for a model that reasons about nothing: no details block, so
+        // no figure — and rig's zero for it is not one.
+        let plain = serde_json::json!({
+            "model": "kimi-k2.5",
+            "usage": { "prompt_tokens": 10, "completion_tokens": 2 },
+        });
+        assert!(!response_facts(&plain).reasoning_reported);
+        // And Anthropic, which bills thinking inside its output count and carries neither spelling.
+        let anthropic = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 10, "output_tokens": 3 },
+        });
+        assert!(!response_facts(&anthropic).reasoning_reported);
+
+        // And the fold keeps absence absent. Summing an unmeasured turn as zero would make a
+        // folded row claim a measurement none of its turns made.
+        let mut total = TokenUsage::default();
+        total.add(TokenUsage {
+            reasoning_tokens: None,
+            ..Default::default()
+        });
+        assert_eq!(total.reasoning_tokens, None);
+        total.add(TokenUsage {
+            reasoning_tokens: Some(7),
+            ..Default::default()
+        });
+        assert_eq!(total.reasoning_tokens, Some(7));
+        total.add(TokenUsage {
+            reasoning_tokens: None,
+            ..Default::default()
+        });
+        assert_eq!(
+            total.reasoning_tokens,
+            Some(7),
+            "a turn that measured nothing subtracts nothing from one that did"
+        );
+    }
+
     /// A model that refuses every request, so the turn ends in an error.
     #[derive(Clone, Default)]
     struct AlwaysRefuses;
@@ -6320,12 +6431,12 @@ mod tests {
             output_tokens: 1,
             cached_input_tokens: 8,
             cache_creation_input_tokens: 2,
-            reasoning_tokens: 700,
+            reasoning_tokens: Some(700),
         });
         total.add(TokenUsage {
             input_tokens: 5,
             output_tokens: 3,
-            reasoning_tokens: 300,
+            reasoning_tokens: Some(300),
             ..Default::default()
         });
         assert_eq!(total.input_tokens, 15);
@@ -6334,7 +6445,7 @@ mod tests {
         assert_eq!(total.cache_creation_input_tokens, 2);
         // Thinking accumulates like the rest: a turn that thought and called one tool spent most
         // of what it spent here, and a sum that drops it says the node was nearly free.
-        assert_eq!(total.reasoning_tokens, 1_000);
+        assert_eq!(total.reasoning_tokens, Some(1_000));
     }
 
     #[tokio::test]
@@ -6399,6 +6510,89 @@ mod tests {
 
         assert!(error.to_string().contains("invalid additional_params"));
         assert_eq!(meter.read().1, 0, "no transport method was invoked");
+    }
+
+    /// Answers with whatever raw payload it is given, so a test can say what the endpoint reported.
+    #[derive(Clone)]
+    struct AnswersWith(serde_json::Value);
+
+    impl CompletionModel for AnswersWith {
+        type Response = serde_json::Value;
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self(serde_json::Value::Null)
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            Ok(CompletionResponse {
+                choice: OneOrMany::one(AssistantContent::text("answered")),
+                // What rig hands the hook, independent of what the payload said: the whole point is
+                // that this number is only a measurement when the payload carried one.
+                usage: rig_core::completion::Usage {
+                    output_tokens: 3,
+                    reasoning_tokens: 700,
+                    ..Default::default()
+                },
+                raw_response: self.0.clone(),
+                message_id: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+            Err(CompletionError::ResponseError("no stream".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turns_reasoning_count_is_recorded_only_when_its_payload_reported_one() {
+        // The whole change, through the path a run takes: rig reports a reasoning number for every
+        // turn, and it is a measurement only when the response carried such a figure. The pieces
+        // are testable on their own — reading a payload, folding absence — but the wiring between
+        // them is what a run depends on, and it was the one part nothing exercised.
+        let spent = |raw: serde_json::Value| async move {
+            let (builder, meter) = metered(
+                "analyst",
+                AnswersWith(raw),
+                "answer",
+                None,
+                Request::plain(),
+                ProviderCallQueue::default(),
+                None,
+            );
+            builder
+                .build()
+                .prompt("question")
+                .await
+                .expect("the turn answers");
+            meter.read().0
+        };
+
+        // A payload that reported the figure: what rig counted is a measurement.
+        let reported = spent(serde_json::json!({
+            "model": "gpt-5.6-terra",
+            "usage": { "output_tokens_details": { "reasoning_tokens": 700 } },
+        }))
+        .await;
+        assert_eq!(reported.reasoning_tokens, Some(700));
+        assert_eq!(reported.output_tokens, 3, "the rest is counted either way");
+
+        // The same turn, from an endpoint whose payload carries no such figure: rig still hands
+        // over a number, and recording it would be the fabricated measurement this removes.
+        let silent = spent(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "usage": { "input_tokens": 10, "output_tokens": 3 },
+        }))
+        .await;
+        assert_eq!(silent.reasoning_tokens, None);
+        assert_eq!(silent.output_tokens, 3);
     }
 
     #[tokio::test]
@@ -6468,7 +6662,7 @@ mod tests {
         assert_eq!(empty.usage.input_tokens, 11);
         assert_eq!(empty.usage.output_tokens, 2);
         assert_eq!(empty.usage.cached_input_tokens, 4);
-        assert_eq!(empty.usage.reasoning_tokens, 1);
+        assert_eq!(empty.usage.reasoning_tokens, Some(1));
         assert!(!empty.reached_output_limit);
         // And what the payload said about itself. The model never sees this response — Rig converts
         // it into an error — so this capture is the only place its facts survive.

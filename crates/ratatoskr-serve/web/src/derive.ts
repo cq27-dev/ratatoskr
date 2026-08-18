@@ -622,7 +622,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
           ...blank(),
           model: ran_on.model,
           tools: ran_on.tools,
-          thinking: ran_on.thinking,
+          thinking_requested: ran_on.thinking_requested,
           reuses_session: ran_on.reuses_session,
         };
       }
@@ -652,7 +652,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
           ? {
               model: e.facts.model,
               tools: e.facts.tools,
-              thinking: e.facts.thinking,
+              thinking_requested: e.facts.thinking_requested,
               reuses_session: e.facts.reuses_session,
             }
           : {}),
@@ -662,7 +662,11 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
               output_tokens: e.usage.output_tokens,
               cached_input_tokens: e.usage.cached_input_tokens,
               cache_creation_input_tokens: e.usage.cache_creation_input_tokens,
-              reasoning_tokens: e.usage.reasoning_tokens,
+              // The producer OMITS a count it never measured, and an omitted JSON field parses as
+              // `undefined` rather than `null`. Normalised here so absence has ONE spelling inside
+              // the fold, where `blank()` spells it `null`; the fold below is tolerant of both as
+              // well, because either one alone would let an unmeasured turn be added as zero.
+              reasoning_tokens: e.usage.reasoning_tokens ?? null,
               duration_ms: e.usage.duration_ms,
             }
           : {}),
@@ -696,14 +700,14 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
         output_tokens: e.usage.output_tokens,
         cached_input_tokens: e.usage.cached_input_tokens,
         cache_creation_input_tokens: e.usage.cache_creation_input_tokens,
-        reasoning_tokens: e.usage.reasoning_tokens,
+        reasoning_tokens: e.usage.reasoning_tokens ?? null,
         duration_ms: e.usage.duration_ms,
         turns: e.turns ?? attempt.telemetry?.turns ?? null,
         ...(e.facts
           ? {
               model: e.facts.model,
               tools: e.facts.tools,
-              thinking: e.facts.thinking,
+              thinking_requested: e.facts.thinking_requested,
               reuses_session: e.facts.reuses_session,
             }
           : {}),
@@ -895,8 +899,14 @@ function fold(into: NodeTelemetry, next: NodeTelemetry): NodeTelemetry {
     output_tokens: into.output_tokens + next.output_tokens,
     cached_input_tokens: into.cached_input_tokens + next.cached_input_tokens,
     cache_creation_input_tokens: into.cache_creation_input_tokens + next.cache_creation_input_tokens,
-    reasoning_tokens: into.reasoning_tokens + next.reasoning_tokens,
-    thinking: into.thinking || next.thinking,
+    // Absence survives a fold: summing an unmeasured turn as zero would make the total claim a
+    // measurement none of its turns made. `== null` deliberately — both spellings of absence
+    // count, because a composed box folds two turns that each omitted it.
+    reasoning_tokens:
+      into.reasoning_tokens == null && next.reasoning_tokens == null
+        ? null
+        : (into.reasoning_tokens ?? 0) + (next.reasoning_tokens ?? 0),
+    thinking_requested: into.thinking_requested || next.thinking_requested,
     duration_ms: sum(into.duration_ms, next.duration_ms),
     tools: distinct(into.tools, next.tools),
     tools_used: distinct(into.tools_used, next.tools_used),
@@ -1481,8 +1491,8 @@ function blank(): NodeTelemetry {
     output_tokens: 0,
     cached_input_tokens: 0,
     cache_creation_input_tokens: 0,
-    reasoning_tokens: 0,
-    thinking: false,
+    reasoning_tokens: null,
+    thinking_requested: false,
     duration_ms: null,
     tools: [],
     tools_used: [],

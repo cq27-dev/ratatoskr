@@ -254,8 +254,8 @@ const blankTelemetry = {
   output_tokens: 0,
   cached_input_tokens: 0,
   cache_creation_input_tokens: 0,
-  reasoning_tokens: 0,
-  thinking: false,
+  reasoning_tokens: null,
+  thinking_requested: false,
   duration_ms: null,
   tools: [],
   tools_used: [],
@@ -738,7 +738,7 @@ test("the live map is keyed by the box, so the box draws with what its member an
     kind: "node_start",
     node: "context_distillation",
     detail: "",
-    facts: { model: "anthropic/claude-sonnet-5", tools: ["Read"], thinking: true, reuses_session: false },
+    facts: { model: "anthropic/claude-sonnet-5", tools: ["Read"], thinking_requested: true, reuses_session: false },
   };
   const called = {
     at: "2026-08-12T10:00:01Z",
@@ -767,7 +767,12 @@ test("the live map keeps a member's activity when a sibling starts beside it", (
   // earlier member has done. This is the window before any checkpoint, where the live map is all
   // the box has to draw with, so that work does not merely move — it disappears from the screen.
   const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
-  const facts = (model) => ({ model, tools: ["Read"], thinking: false, reuses_session: false });
+  const facts = (model) => ({
+    model,
+    tools: ["Read"],
+    thinking_requested: false,
+    reuses_session: false,
+  });
   const announced = (name, model) => ({ ...start(name), facts: facts(model) });
   const called = (name, tool) => ({
     at: "2026-08-12T10:00:02Z",
@@ -805,7 +810,7 @@ test("a member re-entering restarts its counts whether or not it announces facts
   const stages = registry(["analyst"]);
   const called = (tool) => ({ at: "t", kind: "tool_call", node: "analyst", detail: tool });
   const events = [
-    { ...start("analyst"), facts: { model: "m", tools: [], thinking: false, reuses_session: false } },
+    { ...start("analyst"), facts: { model: "m", tools: [], thinking_requested: false, reuses_session: false } },
     called("Read"),
     called("Grep"),
     start("analyst"),
@@ -880,7 +885,7 @@ test("a checkpoint is costed when a turn happened, not when it spent tokens", ()
     kind: "checkpoint",
     node: "analyst",
     detail: "",
-    facts: { model: "an endpoint that counts nothing", tools: ["Read"], thinking: false, reuses_session: false },
+    facts: { model: "an endpoint that counts nothing", tools: ["Read"], thinking_requested: false, reuses_session: false },
     turns: 1,
     usage: {
       input_tokens: 0,
@@ -932,7 +937,7 @@ test("a box's cost is the fold of its members, not whichever record landed last"
     kind: "checkpoint",
     node,
     detail: "",
-    facts: { model, tools: ["Read"], thinking: false, reuses_session: false },
+    facts: { model, tools: ["Read"], thinking_requested: false, reuses_session: false },
     usage: {
       input_tokens: input,
       output_tokens: 1,
@@ -982,7 +987,7 @@ test("a working box shows every member's model and tools, not the latest one's",
     kind: "node_start",
     node,
     detail: "",
-    facts: { model, tools: [tool], thinking: false, reuses_session: false },
+    facts: { model, tools: [tool], thinking_requested: false, reuses_session: false },
   });
   const events = [
     announced("redteam_classifier", "t1", "sonnet", "Read"),
@@ -1147,7 +1152,7 @@ function attemptStart(name, span, model) {
     node: name,
     detail: "node started",
     span_id: span,
-    facts: { model, tools: ["Read"], thinking: false, reuses_session: false },
+    facts: { model, tools: ["Read"], thinking_requested: false, reuses_session: false },
   };
 }
 
@@ -1625,7 +1630,7 @@ test("a clarification answerer is not offered as a control target", () => {
     span_id: "00000000000000b2",
     parent_span_id: "00000000000000a1",
     controlled_as: "implementer",
-    facts: { model: "opus", tools: [], thinking: false, reuses_session: false },
+    facts: { model: "opus", tools: [], thinking_requested: false, reuses_session: false },
   };
   const boxed = inNodeBoxes([answering], stages);
 
@@ -1677,7 +1682,7 @@ test("a stage answering a clarification can still be stopped for its own turn", 
     span_id: "00000000000000b2",
     parent_span_id: "00000000000000a1",
     controlled_as: "implementer",
-    facts: { model: "opus", tools: [], thinking: false, reuses_session: false },
+    facts: { model: "opus", tools: [], thinking_requested: false, reuses_session: false },
   };
   // The answerer starts SECOND, so it is the one a display would choose.
   const both = inNodeBoxes(
@@ -1707,7 +1712,7 @@ test("a turn that writes no checkpoint reports all of what it cost", () => {
     detail: "node usage",
     span_id: span,
     turns: 3,
-    facts: { model: "opus", tools: ["Read", "Grep"], thinking: true, reuses_session: false },
+    facts: { model: "opus", tools: ["Read", "Grep"], thinking_requested: true, reuses_session: false },
     usage: {
       input_tokens: 90,
       output_tokens: 12,
@@ -1722,7 +1727,7 @@ test("a turn that writes no checkpoint reports all of what it cost", () => {
   expect(box.telemetry.turns).toBe(3);
   expect(box.telemetry.model).toBe("opus");
   expect(box.telemetry.tools).toEqual(["Read", "Grep"]);
-  expect(box.telemetry.thinking).toBe(true);
+  expect(box.telemetry.thinking_requested).toBe(true);
   expect(box.telemetry.input_tokens).toBe(90);
   expect(box.telemetry.duration_ms).toBe(4200);
 });
@@ -1744,7 +1749,7 @@ test("a box with a finished member and a live answerer offers no control", () =>
     span_id: "00000000000000d2",
     parent_span_id: "00000000000000a1",
     controlled_as: "implementer",
-    facts: { model: "opus", tools: [], thinking: false, reuses_session: false },
+    facts: { model: "opus", tools: [], thinking_requested: false, reuses_session: false },
   };
   const boxed = inNodeBoxes([...done, answering], stages);
 
@@ -2597,7 +2602,7 @@ test("a turn that failed before it reached its provider reads as failed, not as 
       facts: {
         model: "not-a-provider/test-model",
         tools: [],
-        thinking: false,
+        thinking_requested: false,
         reuses_session: false,
       },
     },
@@ -2637,4 +2642,42 @@ test("a turn that failed before it reached its provider reads as failed, not as 
   // with nothing saying it failed, which is the state this test exists to keep out of the view.
   const silent = [events[0], events[2]];
   expect(nodesFromEvents(inNodeBoxes(silent, stages)).get("analyst").state).toBe("working");
+});
+
+test("two turns that measured no reasoning fold to no measurement, not to zero", () => {
+  // The producer OMITS a count it never measured, and an omitted JSON field arrives as `undefined`
+  // rather than `null`. A composed box folds its members' turns together, so a strict null check
+  // in the fold missed both and added them as zero — inventing the measurement the whole field
+  // exists to avoid, on exactly the boxes that show a total.
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const spent = (member, span) => ({
+    at: "2026-08-18T10:00:00Z",
+    kind: "usage",
+    node: member,
+    detail: "node usage",
+    span_id: span,
+    turns: 1,
+    usage: {
+      input_tokens: 10,
+      output_tokens: 2,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      // No reasoning key at all: this is what an Anthropic turn's event carries.
+      duration_ms: 5,
+    },
+  });
+  const events = [
+    spent("redteam_classifier", "00000000000000d1"),
+    spent("redteam_author", "00000000000000d2"),
+  ];
+
+  const box = nodesFromEvents(inNodeBoxes(events, stages)).get("redteam");
+  expect(box.telemetry.input_tokens).toBe(20);
+  expect(box.telemetry.reasoning_tokens).toBe(null);
+
+  // And a member that DID measure it still reports what it measured, through the same fold.
+  const measured = spent("redteam_author", "00000000000000d3");
+  measured.usage.reasoning_tokens = 700;
+  const mixed = nodesFromEvents(inNodeBoxes([events[0], measured], stages)).get("redteam");
+  expect(mixed.telemetry.reasoning_tokens).toBe(700);
 });

@@ -124,7 +124,7 @@ pub struct PlannedNode {
     /// `NodeTelemetry::fold` reports a folded row's models by, so what a box plans to run on and
     /// what it reports having run on read alike.
     pub model: String,
-    pub thinking: bool,
+    pub thinking_requested: bool,
     /// Every distinct scope the node's stages will run under, in registry order.
     ///
     /// A set rather than one value, and rather than nothing when they differ. A route is one field
@@ -198,7 +198,7 @@ impl PlannedNode {
         }
         Some(PlannedNode {
             model: models.join(", "),
-            thinking: planned.iter().any(|(route, _)| thinking(route)),
+            thinking_requested: planned.iter().any(|(route, _)| thinking(route)),
             sessions,
         })
     }
@@ -229,11 +229,14 @@ pub struct NodeTelemetryView {
     /// separates a run that reused its context from one that rebuilt it, so it is reported rather
     /// than folded into the input total.
     pub cache_creation_input_tokens: u64,
-    /// Non-zero when the model reasoned before answering. Zero from endpoints that do not report
-    /// it, which is why `thinking` exists alongside.
-    pub reasoning_tokens: u64,
-    /// Whether the node was left free to reason. Configured, not observed — see `reasoning_tokens`.
-    pub thinking: bool,
+    /// What the model spent reasoning before it answered, when the endpoint reports it apart from
+    /// the rest. Absent means not measured, which is not the same as measured zero — Anthropic
+    /// bills thinking inside the output count and reports no separate figure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    /// Whether the route left the node free to reason. Configuration, not measurement — the name
+    /// says so, because it sat unlabelled beside the counts and read as one of them.
+    pub thinking_requested: bool,
     pub duration_ms: Option<u64>,
     pub tools: Vec<String>,
     /// Of those, the ones it actually called.
@@ -280,7 +283,7 @@ impl NodeTelemetryView {
             cached_input_tokens: t.usage.cached_input_tokens,
             cache_creation_input_tokens: t.usage.cache_creation_input_tokens,
             reasoning_tokens: t.usage.reasoning_tokens,
-            thinking: t.thinking,
+            thinking_requested: t.thinking_requested,
             duration_ms: t.duration_ms,
             tools: t.tools,
             tools_used: t.tools_used,
@@ -1467,7 +1470,7 @@ mod tests {
             [ratatoskr_core::SessionScope::Reuse],
             "one route and no declaration, so the box's one scope is that route's"
         );
-        assert!(planned.thinking, "nothing disabled it");
+        assert!(planned.thinking_requested, "nothing disabled it");
 
         // A node with no route never runs, and claims nothing.
         assert!(
@@ -1652,7 +1655,7 @@ mod tests {
         // The two facts a reader needs stay answerable across the disagreement: one half reasons,
         // one half carries its context. The session scope does not, so it is absent rather than
         // asserted, and a reader falls back to `reuses_session`.
-        assert!(planned.thinking);
+        assert!(planned.thinking_requested);
         assert_eq!(
             planned.sessions,
             [
@@ -1675,13 +1678,13 @@ mod tests {
                 input_tokens: 30,
                 output_tokens: 106,
                 cached_input_tokens: 132_771,
-                reasoning_tokens: 4_000,
+                reasoning_tokens: Some(4_000),
                 ..Default::default()
             },
             tools: vec!["Read".into(), "semantic_search".into()],
             tools_used: vec!["Read".into()],
             reuses_session: true,
-            thinking: true,
+            thinking_requested: true,
             ..Default::default()
         };
         let views = derive(Some("running"), &[ran]);
@@ -1693,8 +1696,12 @@ mod tests {
         assert_eq!(t.turns, Some(12));
         assert_eq!(t.cached_input_tokens, 132_771);
         assert!(t.reuses_session, "its memory carried over");
-        assert_eq!(t.reasoning_tokens, 4_000, "and it thought before answering");
-        assert!(t.thinking, "which the route left it free to do");
+        assert_eq!(
+            t.reasoning_tokens,
+            Some(4_000),
+            "and it thought before answering"
+        );
+        assert!(t.thinking_requested, "which the route left it free to do");
         assert_eq!(t.tools, ["Read", "semantic_search"]);
         assert_eq!(t.tools_used, ["Read"], "given two, reached for one");
 

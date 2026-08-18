@@ -113,8 +113,11 @@ function NodeFacts({
     ? new Set(telemetry.tools_used)
     : (live?.used ?? new Set<string>());
   const modelFull = telemetry?.model ?? live?.telemetry?.model ?? planned?.model ?? null;
-  const thinking =
-    telemetry?.thinking ?? live?.telemetry?.thinking ?? planned?.thinking ?? false;
+  const thinkingRequested =
+    telemetry?.thinking_requested ??
+    live?.telemetry?.thinking_requested ??
+    planned?.thinking_requested ??
+    false;
   // Every scope this box's stages run under, so a box whose halves continue differently shows each
   // of their marks rather than one of them winning. Config is the only source that can say WHICH: a
   // recorded `reuses_session` is set by a compacted re-entry too, so on its own it can say no more
@@ -171,14 +174,10 @@ function NodeFacts({
             <Repeat size={13} aria-label="compacted continuation" />
           </span>
         )}
-        {thinking && (
+        {thinkingRequested && (
           <span
             className="node-icon"
-            data-tip={
-              telemetry && telemetry.reasoning_tokens > 0
-                ? `Thinking: ${short(telemetry.reasoning_tokens)} reasoning tokens before answering`
-                : "Thinking: this node is not stopped from reasoning before it answers (whether it does is the endpoint's call, and this one reports no reasoning tokens)"
-            }
+            data-tip={thinkingTip(telemetry, live)}
           >
             <Brain size={13} aria-label="thinking" />
           </span>
@@ -217,6 +216,49 @@ function NodeFacts({
       </div>
     </>
   );
+}
+
+/**
+ * What the thinking marker says, given what the turn reported about its reasoning.
+ *
+ * Four states, because absence means two different things and only one of them is about the
+ * endpoint. A count of zero is a MEASUREMENT — the endpoint was asked and answered none — while an
+ * absent count on a turn that HAS reported its cost means the endpoint reports no such figure at
+ * all, which is Anthropic's answer for every turn because it bills thinking inside its output
+ * count. A truthiness check collapses those two, and so does treating a node whose cost has not
+ * arrived yet as either of them: a live node makes no claim about its endpoint until one of its
+ * turns has answered.
+ */
+export function thinkingTip(
+  telemetry: Pick<NodeTelemetry, "reasoning_tokens"> | undefined,
+  live: Pick<DerivedNode, "telemetry" | "costed"> | undefined,
+): string {
+  // The same sources in the same order as the flag beside it, because a checkpoint is absent until
+  // a node finishes: reading only that made a live turn's reported figure — zero or otherwise —
+  // render as an endpoint that reports none.
+  const reasoning = telemetry?.reasoning_tokens ?? live?.telemetry?.reasoning_tokens ?? null;
+  // Whether any cost report has arrived at all.
+  //
+  // The stream decides wherever it has an opinion, because a started node is HANDED blank
+  // telemetry — `fromStream` shows the stream's own record from the moment it watches an
+  // invocation start, so the object exists before any turn has answered, and taking its presence
+  // as a cost report made this claim about the endpoint during every first turn. `costed` is the
+  // field that separates the two, and it says so.
+  //
+  // The server's record is the answer only where the stream has none: an ingested tail whose
+  // starts are in a rotated file, or a run recorded before checkpoints carried telemetry. There,
+  // a telemetry object is a finished row rather than a placeholder.
+  const costReported = live ? live.costed === true : telemetry != null;
+  if (reasoning == null && !costReported) {
+    return "Thinking: this node is not stopped from reasoning before it answers, and has not reported what this turn spent yet";
+  }
+  if (reasoning == null) {
+    return "Thinking: this node is not stopped from reasoning before it answers (whether it does is the endpoint's call, and this endpoint reports no reasoning figure at all)";
+  }
+  if (reasoning === 0) {
+    return "Thinking: this node was free to reason, and the endpoint reported 0 reasoning tokens for this turn";
+  }
+  return `Thinking: ${short(reasoning)} reasoning tokens before answering`;
 }
 
 /**
