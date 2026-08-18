@@ -271,12 +271,24 @@ impl AgentError {
 /// invoked the turn, exactly as the turn's own would have, and announces its start and end like any
 /// other.
 ///
+/// It emits the SAME lifecycle a turn that failed at the provider emits — `node_start` with this
+/// turn's control address, then the cost record carrying the error — because that is what a reader
+/// folding the stream reconstructs a failed attempt from. A warning alone left the node working: an
+/// attempt nothing started is controllable by default, and an execution ending `unvalidated` only
+/// settles an attempt that is not, so the box stayed live over a turn that was already over.
+///
 /// Only for setup: [`AgentError::Prompt`] can only come from a turn that ran, and that turn already
 /// recorded its outcome on its own span — opening a second one here would double-count it.
-async fn record_setup_failure(node: &str, route: &ModelRoute, error: AgentError) -> AgentError {
+async fn record_setup_failure(turn: SetupFailure<'_>, error: AgentError) -> AgentError {
     if matches!(error, AgentError::Prompt(_)) {
         return error;
     }
+    let SetupFailure {
+        node,
+        controlled_as,
+        caller,
+        route,
+    } = turn;
     let model_name = format!("{}/{}", route.provider, route.model);
     execution(node, ExecutionKind::Node, async {
         let (span_id, parent_span_id) = execution_ids();
@@ -297,12 +309,46 @@ async fn record_setup_failure(node: &str, route: &ModelRoute, error: AgentError)
         // A turn that never reached a provider produced no output to validate, so its end must not
         // read as work completed — the same distinction a turn whose output failed its schema makes.
         output_unvalidated();
-        // Inside the span, so the failure has a record and not only a field on a span nothing was
-        // emitted under.
-        span.in_scope(|| tracing::warn!(node, %error, "the turn could not reach its provider"));
+        // The subject is built inside the execution, so its identity is this turn's rather than
+        // that of whatever invoked it.
+        let subject = TurnSubject::of(node, controlled_as, caller);
+        span.in_scope(|| {
+            subject.started(TurnFacts {
+                model: &model_name,
+                // It never got as far as binding any: an empty list is what it ran with, and the
+                // error below is why.
+                tools: &[],
+                thinking: thinking_left_on(route),
+                reuses_session: false,
+            });
+            tracing::warn!(node, %error, "the turn could not reach its provider");
+            // Zeroes here are measurements, not absences: nothing was spent because nothing ran.
+            // The error is what makes this a failed attempt rather than a finished one.
+            subject.spent(&NodeTelemetry {
+                model: Some(model_name.clone()),
+                duration_ms: Some(0),
+                usage: ratatoskr_core::TokenUsage::default(),
+                turns: Some(0),
+                error: Some(error.to_string()),
+                tools: Vec::new(),
+                tools_used: Vec::new(),
+                reuses_session: false,
+                thinking: thinking_left_on(route),
+            });
+        });
     })
     .await;
     error
+}
+
+/// The turn a setup failure is about; see [`record_setup_failure`].
+struct SetupFailure<'a> {
+    node: &'a str,
+    /// Where a Stop for this turn would have been addressed, when that is not the node itself — an
+    /// attempt whose address is missing reads as one an operator can reach.
+    controlled_as: Option<&'a str>,
+    caller: Option<&'a str>,
+    route: &'a ModelRoute,
 }
 
 /// Stamp a turn's outcome onto its span: `otel.status_code` either way, `error.type` when it
@@ -686,7 +732,17 @@ pub async fn ask(
     .await
     {
         Ok(answer) => Ok(answer),
-        Err(error) => Err(record_setup_failure(&node, route, error).await),
+        Err(error) => Err(record_setup_failure(
+            SetupFailure {
+                node: &node,
+                controlled_as,
+                // An ask has no caller to state: `ask_turn` builds its subject the same way.
+                caller: None,
+                route,
+            },
+            error,
+        )
+        .await),
     }
 }
 
@@ -3225,11 +3281,15 @@ pub struct NodeRun<'a> {
 /// still validate it (see `ratatoskr_graph::parse_validated`), though a first answer that misses
 /// the schema is handed back for correction before it reaches one.
 pub async fn run_structured(run: NodeRun<'_>) -> Result<String, AgentError> {
-    let node = run.node;
-    let route = run.route;
+    let failed = SetupFailure {
+        node: run.node,
+        controlled_as: run.controlled_as,
+        caller: run.caller,
+        route: run.route,
+    };
     match run_structured_resolved(run).await {
         Ok(answer) => Ok(answer),
-        Err(error) => Err(record_setup_failure(node, route, error).await),
+        Err(error) => Err(record_setup_failure(failed, error).await),
     }
 }
 
@@ -4958,7 +5018,7 @@ mod tests {
         let failed = execution("implement", ExecutionKind::Host, async {
             run_structured(NodeRun {
                 node: "analyst",
-                controlled_as: None,
+                controlled_as: Some("implementer"),
                 caller: None,
                 route: &route,
                 preamble: "Answer.",
@@ -5012,6 +5072,31 @@ mod tests {
         assert_eq!(
             end["outcome"], "unvalidated",
             "a turn that never reached a provider produced nothing to validate: {end}"
+        );
+
+        // The lifecycle a reader folds a failed attempt from. Without it the warning alone opened an
+        // attempt nothing had started — controllable by default — and an `unvalidated` end settles
+        // only an attempt that is NOT controllable, so the box stayed working over a turn that was
+        // already over.
+        let start = records()
+            .find(|record| record["kind"] == "node_start")
+            .unwrap_or_else(|| panic!("the failed turn announced its start; captured: {raw}"));
+        assert_eq!(start["node"], "analyst");
+        assert_eq!(start["span_id"], turn["span_id"], "{start}");
+        // Its control address, so an attempt addressed elsewhere does not read as one an operator
+        // can reach.
+        assert_eq!(start["controlled_as"], "implementer", "{start}");
+        let usage = records()
+            .find(|record| record["kind"] == "usage")
+            .unwrap_or_else(|| panic!("the failed turn reported its cost; captured: {raw}"));
+        assert_eq!(usage["span_id"], turn["span_id"], "{usage}");
+        // The error is what makes this a failed attempt rather than a finished one — the execution
+        // ending says nothing about how.
+        assert!(
+            usage["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("unknown provider")),
+            "the cost record carries why it failed: {usage}"
         );
         let span = raw
             .lines()
