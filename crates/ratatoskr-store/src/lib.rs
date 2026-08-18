@@ -787,6 +787,16 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
                 conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
             }
         }
+        // A rename is the new column AND the values moving into it. `thinking` became
+        // `thinking_requested` because the old name read as a measurement; adding the column and
+        // stopping there would leave every row written under the old name reporting `false`, which
+        // is a different claim from the one those runs recorded. One copy, once: the destination is
+        // NULL only on rows that predate the rename, so re-running this matches nothing.
+        if table == "checkpoints" && existing.contains("thinking") {
+            conn.execute_batch(
+                "UPDATE checkpoints SET thinking_requested = thinking                  WHERE thinking_requested IS NULL AND thinking IS NOT NULL",
+            )?;
+        }
     }
     Ok(())
 }
@@ -1165,6 +1175,71 @@ mod tests {
             "a nested execution names the one that invoked it, not its own name"
         );
         assert_eq!(of("issue"), None, "no identity is not the invalid identity");
+    }
+
+    #[tokio::test]
+    async fn a_renamed_column_carries_its_rows_across_with_it() {
+        // `thinking` became `thinking_requested` because the old name read as a measurement. A
+        // rename is the new column AND the values moving into it: adding the column and stopping
+        // there leaves every row written under the old name reporting `false`, which is a different
+        // claim from the one those runs recorded.
+        let dir = std::env::temp_dir().join(format!("ratatoskr-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite3");
+
+        let store = Store::open(&path).unwrap();
+        store.upsert_run("run-1", None, "running").await.unwrap();
+        store
+            .insert_checkpoint(CheckpointWrite {
+                run_id: "run-1",
+                node_name: "analyst",
+                output_json: "{}",
+                telemetry: NodeTelemetry {
+                    thinking_requested: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // The shape a store written before the rename actually has: the value under the old name,
+        // and nothing under the new one.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "ALTER TABLE checkpoints ADD COLUMN thinking INTEGER;
+                 UPDATE checkpoints SET thinking = thinking_requested, thinking_requested = NULL;",
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        let rows = reopened.checkpoints_for_run("run-1").await.unwrap();
+        assert!(
+            rows[0].telemetry.thinking_requested,
+            "a row written before the rename keeps what it recorded"
+        );
+
+        // And the copy is once: it matches only rows the destination is still NULL on, so opening
+        // the same store again cannot undo a value written since.
+        {
+            let conn = reopened.conn.lock().unwrap();
+            conn.execute_batch("UPDATE checkpoints SET thinking = 0")
+                .unwrap();
+        }
+        drop(reopened);
+        let again = Store::open(&path).unwrap();
+        assert!(
+            again.checkpoints_for_run("run-1").await.unwrap()[0]
+                .telemetry
+                .thinking_requested,
+            "the migrated value stands; the old column is no longer read"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

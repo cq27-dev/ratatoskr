@@ -1970,15 +1970,17 @@ impl Request {
 
     /// The defaults: a cap and nothing else. What the compactor asks for — a summary wants neither
     /// a temperature of the node's choosing nor its extended thinking budget.
-    pub fn plain() -> Self {
+    ///
+    /// `reports_reasoning` is still the ROUTE's, passed in by the caller that has it: a summary
+    /// runs on the node's own endpoint, so what that endpoint says about reasoning is the same
+    /// answer the node's own turns get. Deciding it here recorded no reasoning for a compaction on
+    /// a provider that reported one.
+    pub fn plain(reports_reasoning: bool) -> Self {
         Request {
             max_tokens: ratatoskr_core::DEFAULT_MAX_TOKENS,
             temperature: None,
             params: None,
-            // The compactor runs on the node'''s own route, so what its endpoint reports is the
-            // node'''s answer; a summarising turn does not get to claim a different one. Callers
-            // that know the route use `of`, which reads it.
-            reports_reasoning: false,
+            reports_reasoning,
         }
     }
 }
@@ -3676,6 +3678,7 @@ where
                 ledger.clone(),
                 Arc::clone(&provider_calls),
                 runtime_control.clone(),
+                provider_reports_reasoning(&route.provider),
             ))
             .conversation(&compacted_session_key);
     } else if let Some(produces) = produces {
@@ -3687,6 +3690,7 @@ where
             ledger.clone(),
             provider_calls,
             runtime_control.clone(),
+            provider_reports_reasoning(&route.provider),
         ));
     }
     // Before the set is handed to the agent: what the model could call is part of what this turn
@@ -5536,6 +5540,11 @@ mod tests {
         };
         assert!(!Request::of(&route("anthropic")).reports_reasoning);
         assert!(Request::of(&route("openai")).reports_reasoning);
+        // Including the summarising turn a compacted node makes. It runs on that node's own
+        // endpoint, so what the endpoint reports is the node's answer — deciding it at the
+        // compactor recorded no reasoning for a compaction on a provider that reported one.
+        assert!(Request::plain(true).reports_reasoning);
+        assert!(!Request::plain(false).reports_reasoning);
 
         // And the fold keeps absence absent. Summing an unmeasured turn as zero would make a
         // folded row claim a measurement none of its turns made.
@@ -6436,7 +6445,7 @@ mod tests {
             },
             "answer directly",
             None,
-            Request::plain(),
+            Request::plain(true),
             Arc::clone(&provider_calls),
             None,
         );
@@ -6474,7 +6483,7 @@ mod tests {
             LocallyRejected,
             "answer directly",
             None,
-            Request::plain(),
+            Request::plain(true),
             provider_calls,
             None,
         );
@@ -6501,7 +6510,7 @@ mod tests {
             model(),
             "outer",
             None,
-            Request::plain(),
+            Request::plain(true),
             Arc::clone(&provider_calls),
             None,
         );
@@ -6516,7 +6525,7 @@ mod tests {
             model(),
             "nested",
             None,
-            Request::plain(),
+            Request::plain(true),
             Arc::clone(&provider_calls),
             None,
         );

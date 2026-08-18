@@ -221,7 +221,7 @@ fn check_execution_graph(
 ///
 /// One version is one shape: a bundle claiming this version carries every field of it, so adding a
 /// field is a version bump rather than a defaulted key the reader has to guess at.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// What an import did, per run.
 #[derive(Debug, Clone, PartialEq, Eq)]

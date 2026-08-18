@@ -96,6 +96,7 @@ impl CompactedSession {
     }
 
     /// Return the one memory backend shared by every attempt of this node.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn memory<M>(
         &self,
         model: M,
@@ -104,6 +105,7 @@ impl CompactedSession {
         ledger: Option<Arc<crate::RunLedger>>,
         provider_calls: crate::ProviderCallQueue,
         control: Option<crate::RuntimeControl>,
+        reports_reasoning: bool,
     ) -> Arc<dyn ConversationMemory>
     where
         M: CompletionModel + 'static,
@@ -127,6 +129,7 @@ impl CompactedSession {
             ledger,
             provider_calls,
             control,
+            reports_reasoning,
         ));
         *slot = Some(Arc::clone(&memory));
         memory
@@ -152,6 +155,11 @@ pub struct SummaryCompactor<M> {
     /// Provider pauses must work while the conversation is being compacted too: the summary is
     /// another model request in the node's same operator-controlled run.
     control: Option<crate::RuntimeControl>,
+    /// Whether a reasoning count off this node's endpoint is a measurement. The summary runs on
+    /// the node's own route, so what that endpoint reports is the node's answer — a summarising
+    /// turn does not get to record a different one, and hardcoding "no" here dropped a real figure
+    /// on every provider that does report it.
+    reports_reasoning: bool,
     /// The node being compacted, and what it has to end up producing.
     ///
     /// Included in the instruction because "keep what matters" is unanswerable in the abstract: what
@@ -170,12 +178,14 @@ impl<M> SummaryCompactor<M> {
         ledger: Option<Arc<crate::RunLedger>>,
         provider_calls: crate::ProviderCallQueue,
         control: Option<crate::RuntimeControl>,
+        reports_reasoning: bool,
     ) -> Self {
         SummaryCompactor {
             model: Arc::new(model),
             ledger,
             provider_calls,
             control,
+            reports_reasoning,
             node: node.to_string(),
             produces: produces.to_string(),
         }
@@ -225,7 +235,7 @@ where
                     self.node, self.produces
                 ),
                 None,
-                crate::Request::plain(),
+                crate::Request::plain(self.reports_reasoning),
                 Arc::clone(&self.provider_calls),
                 self.control.clone(),
             );
@@ -342,6 +352,7 @@ fn tokens_in(message: &Message) -> usize {
 /// Dropping is what a plain window does, and for a coding session it is the wrong trade: the turn
 /// that discovered a constraint is exactly the one far enough back to be evicted, and losing it
 /// means rediscovering it — or, worse, retrying the approach it ruled out.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compacting_memory<M>(
     model: M,
     node: &str,
@@ -350,6 +361,7 @@ pub(crate) fn compacting_memory<M>(
     ledger: Option<Arc<crate::RunLedger>>,
     provider_calls: crate::ProviderCallQueue,
     control: Option<crate::RuntimeControl>,
+    reports_reasoning: bool,
 ) -> rig_memory::CompactingMemory<InMemoryConversationMemory, TokenWindowMemory, SummaryCompactor<M>>
 where
     M: CompletionModel + 'static,
@@ -357,7 +369,15 @@ where
     rig_memory::CompactingMemory::new(
         InMemoryConversationMemory::new(),
         TokenWindowMemory::new(budget, tokens_in),
-        SummaryCompactor::new(model, node, produces, ledger, provider_calls, control),
+        SummaryCompactor::new(
+            model,
+            node,
+            produces,
+            ledger,
+            provider_calls,
+            control,
+            reports_reasoning,
+        ),
     )
 }
 
@@ -477,6 +497,7 @@ mod tests {
             None,
             crate::ProviderCallQueue::default(),
             Some(control),
+            true,
         );
 
         let summary = compactor
@@ -602,6 +623,7 @@ mod tests {
             None,
             crate::ProviderCallQueue::default(),
             None,
+            true,
         );
 
         let evicted = vec![
