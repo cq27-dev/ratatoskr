@@ -72,7 +72,9 @@ export interface NodeTelemetry {
   /** What the model spent reasoning before it answered, where the endpoint reports it apart from
    *  the rest. Absent means NOT MEASURED, which is not the same as measured zero: Anthropic bills
    *  thinking inside the output count and reports no separate figure. */
-  reasoning_tokens: number | null;
+  /** Omitted entirely when the endpoint reported no such figure — an absent key, not a null one,
+   *  so anything reading it must treat `undefined` as absence too. */
+  reasoning_tokens?: number | null;
   /** Whether the ROUTE left the node free to reason — configuration, not measurement. */
   thinking_requested: boolean;
   duration_ms: number | null;
@@ -380,7 +382,9 @@ export interface EventUsage {
   output_tokens: number;
   cached_input_tokens: number;
   cache_creation_input_tokens: number;
-  reasoning_tokens: number | null;
+  /** Omitted entirely when the endpoint reported no such figure — an absent key, not a null one,
+   *  so anything reading it must treat `undefined` as absence too. */
+  reasoning_tokens?: number | null;
   duration_ms: number;
 }
 

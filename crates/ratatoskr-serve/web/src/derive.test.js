@@ -2643,3 +2643,41 @@ test("a turn that failed before it reached its provider reads as failed, not as 
   const silent = [events[0], events[2]];
   expect(nodesFromEvents(inNodeBoxes(silent, stages)).get("analyst").state).toBe("working");
 });
+
+test("two turns that measured no reasoning fold to no measurement, not to zero", () => {
+  // The producer OMITS a count it never measured, and an omitted JSON field arrives as `undefined`
+  // rather than `null`. A composed box folds its members' turns together, so a strict null check
+  // in the fold missed both and added them as zero — inventing the measurement the whole field
+  // exists to avoid, on exactly the boxes that show a total.
+  const stages = registry(["redteam", "redteam_classifier", "redteam_author"]);
+  const spent = (member, span) => ({
+    at: "2026-08-18T10:00:00Z",
+    kind: "usage",
+    node: member,
+    detail: "node usage",
+    span_id: span,
+    turns: 1,
+    usage: {
+      input_tokens: 10,
+      output_tokens: 2,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      // No reasoning key at all: this is what an Anthropic turn's event carries.
+      duration_ms: 5,
+    },
+  });
+  const events = [
+    spent("redteam_classifier", "00000000000000d1"),
+    spent("redteam_author", "00000000000000d2"),
+  ];
+
+  const box = nodesFromEvents(inNodeBoxes(events, stages)).get("redteam");
+  expect(box.telemetry.input_tokens).toBe(20);
+  expect(box.telemetry.reasoning_tokens).toBe(null);
+
+  // And a member that DID measure it still reports what it measured, through the same fold.
+  const measured = spent("redteam_author", "00000000000000d3");
+  measured.usage.reasoning_tokens = 700;
+  const mixed = nodesFromEvents(inNodeBoxes([events[0], measured], stages)).get("redteam");
+  expect(mixed.telemetry.reasoning_tokens).toBe(700);
+});

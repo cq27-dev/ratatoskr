@@ -1613,7 +1613,7 @@ mod tests {
                 context_window: None,
                 temperature: None,
                 params: Some(toml::Value::Table(
-                    "thinking_requested = { type = \"disabled\" }"
+                    "thinking = { type = \"disabled\" }"
                         .parse::<toml::Table>()
                         .unwrap(),
                 )),

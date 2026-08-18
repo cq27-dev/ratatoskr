@@ -662,7 +662,11 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
               output_tokens: e.usage.output_tokens,
               cached_input_tokens: e.usage.cached_input_tokens,
               cache_creation_input_tokens: e.usage.cache_creation_input_tokens,
-              reasoning_tokens: e.usage.reasoning_tokens,
+              // The producer OMITS a count it never measured, and an omitted JSON field parses
+              // as `undefined` rather than `null`. Normalised here so absence has one spelling
+              // inside the fold: a strict null check downstream would miss `undefined` and add it
+              // as zero, inventing the measurement this whole field exists to avoid.
+              reasoning_tokens: e.usage.reasoning_tokens ?? null,
               duration_ms: e.usage.duration_ms,
             }
           : {}),
@@ -696,7 +700,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
         output_tokens: e.usage.output_tokens,
         cached_input_tokens: e.usage.cached_input_tokens,
         cache_creation_input_tokens: e.usage.cache_creation_input_tokens,
-        reasoning_tokens: e.usage.reasoning_tokens,
+        reasoning_tokens: e.usage.reasoning_tokens ?? null,
         duration_ms: e.usage.duration_ms,
         turns: e.turns ?? attempt.telemetry?.turns ?? null,
         ...(e.facts
@@ -896,9 +900,10 @@ function fold(into: NodeTelemetry, next: NodeTelemetry): NodeTelemetry {
     cached_input_tokens: into.cached_input_tokens + next.cached_input_tokens,
     cache_creation_input_tokens: into.cache_creation_input_tokens + next.cache_creation_input_tokens,
     // Absence survives a fold: summing an unmeasured turn as zero would make the total claim a
-    // measurement none of its turns made.
+    // measurement none of its turns made. `== null` deliberately — both spellings of absence
+    // count, because a composed box folds two turns that each omitted it.
     reasoning_tokens:
-      into.reasoning_tokens === null && next.reasoning_tokens === null
+      into.reasoning_tokens == null && next.reasoning_tokens == null
         ? null
         : (into.reasoning_tokens ?? 0) + (next.reasoning_tokens ?? 0),
     thinking_requested: into.thinking_requested || next.thinking_requested,
