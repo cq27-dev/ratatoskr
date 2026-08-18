@@ -1,6 +1,7 @@
 // Reference `.ratatoskr/workflow.ts` — follows Ratatoskr's bundled standard-v1 topology and adds
 // a declared requirements stage. Copy it to `.ratatoskr/workflow.ts` and edit to customize how a
-// run is sequenced. It expects the `requirements` profile from `examples/agent-profiles.toml`.
+// run is sequenced. The `requirements` agent it uses is declared right here in `agents:`; the
+// optional `examples/agent-profiles.toml` shows how deployment routes that profile to a model.
 //
 // A workflow is an ES module. Its entries are the functions it **exports** — `plan` and `run`
 // below — so a declaration without `export` is module-scoped and the run fails saying so.
@@ -59,6 +60,15 @@ defineWorkflow({
   name: "standard",
   purpose: "Plan and implement a repository change with an explicit requirements digest.",
   whenToUse: ["the task requests a code change"],
+  // The workflow owns its agents' structure: prompt, capability ceiling, turn cap. Deployment's
+  // `ratatoskr.toml` may route a declared agent to a model, and nothing else.
+  agents: {
+    requirements: {
+      basePrompt: "Extract the task's non-negotiable requirements before implementation planning.",
+      capabilities: ["read"],
+      maxTurns: 24,
+    },
+  },
   stages: [
     stage("requirements", {
       agent: "requirements",

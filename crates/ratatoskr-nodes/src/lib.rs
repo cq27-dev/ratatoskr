@@ -43,7 +43,7 @@ pub use publisher::PublisherOutput;
 pub use redteam::{RedTeamNode, RedTeamOutput};
 pub use referee::{RefereeNode, RefereeOutput, Violation};
 pub use scout::{RelatedItem, ScoutOutput};
-pub use stage::{AgentProfile, Delegation, Stage, agent_profiles, built_in_agents};
+pub use stage::{AgentProfile, Delegation, Stage, agent_profiles};
 pub use validate::validate;
 pub use verifier::{Finding, FindingKind, Severity, VerifierOutput};
 
@@ -639,15 +639,16 @@ async fn defined_in(
 pub async fn validate_configured_stages(config: &RatatoskrConfig) -> Result<(), PlanError> {
     let workflows = defined().await?;
     let standard_stages = workflow::standard_stages().await?;
-    validate_configured_stage_registry(config, &workflows, standard_stages)
+    let standard_agents = workflow::standard_agents().await?;
+    validate_configured_stage_registry(config, &workflows, standard_stages, standard_agents)
 }
 
 fn validate_configured_stage_registry(
     config: &RatatoskrConfig,
     workflows: &[WorkflowRuntime],
     standard_stages: Vec<Stage>,
+    standard_agents: Vec<AgentProfile>,
 ) -> Result<(), PlanError> {
-    let profiles = agent_profiles(config);
     // The registry the run will execute, and nothing else. `overlaid_stages` builds its base from
     // exactly this expression, so what validates here is what runs. A base carrying extra built-in
     // stages validated ghosts — `governedBy: "redteam"` passed startup against a stage the run
@@ -658,12 +659,19 @@ fn validate_configured_stage_registry(
     // it — not against one pool of everything configured. Pooling rejects the documented case of a
     // workflow overriding `analyst`, and rejects it twice over when two workflows each override the
     // same standard id: a run only ever executes one workflow, so they never meet.
+    // Each workflow is judged against its OWN agent table too: the bundled profiles with its
+    // declarations laid over them, then deployment's routes — so a stage naming an agent nobody
+    // declared fails HERE, at load, named after the workflow that owns the stage.
     let judge = |declared: Vec<Stage>,
+                 declared_agents: Vec<AgentProfile>,
                  mut permitted: Vec<String>,
                  meta: Option<&ratatoskr_script::workflow::WorkflowMeta>|
      -> Result<(), PlanError> {
         let mut stages = base.clone();
         stage::overlay(&mut stages, declared);
+        let mut agents = standard_agents.clone();
+        stage::overlay_agents(&mut agents, declared_agents);
+        let profiles = agent_profiles(&agents, config);
         // The layout is judged against the registry the workflow will actually run, so a column
         // naming a stage it overrides into existence is accepted and one naming a typo is not.
         if let Some(meta) = meta {
@@ -672,11 +680,24 @@ fn validate_configured_stage_registry(
         permitted.extend(stages.iter().map(|stage| stage.id.clone()));
         permitted.sort();
         permitted.dedup();
-        validate::validate(&stages, &profiles, &permitted)
+        validate::validate(&stages, &profiles, &permitted).map_err(|error| match (meta, error) {
+            // The workflow's name on the refusal, because the stage that named the missing agent
+            // is that workflow's to fix — the whole point of failing at load, near the
+            // declaration, instead of mid-run far from it.
+            (Some(meta), PlanError::Configuration(message)) => {
+                PlanError::Configuration(format!("workflow `{}`: {message}", meta.name))
+            }
+            (_, error) => error,
+        })
     };
 
     if workflows.is_empty() {
-        return judge(Vec::new(), governable_from(&base, std::iter::empty()), None);
+        return judge(
+            Vec::new(),
+            Vec::new(),
+            governable_from(&base, std::iter::empty()),
+            None,
+        );
     }
     for workflow in workflows {
         let declared = stage::stages_from_workflow(workflow.meta());
@@ -684,6 +705,7 @@ fn validate_configured_stage_registry(
         validate::validate_declarations(&declared, &workflow.meta().name)?;
         judge(
             declared,
+            stage::agents_from_workflow(workflow.meta()),
             governable_from(&base, [workflow]),
             Some(workflow.meta()),
         )?;
@@ -736,8 +758,9 @@ fn overseer_enabled(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     stages: &[Stage],
+    agents: &[AgentProfile],
 ) -> bool {
-    node_route(engine, config, stages, "overseer").is_some()
+    node_route(engine, config, stages, agents, "overseer").is_some()
 }
 
 fn should_consult_overseer(
@@ -804,6 +827,7 @@ pub async fn choose(request: &RunRequest<'_>) -> Result<Workflow, PlanError> {
             request.engine,
             request.config,
             &workflow::standard_stages().await?,
+            &workflow::standard_agents().await?,
         );
     if !consult {
         return select(found, request.workflow);
@@ -902,9 +926,10 @@ fn red_team_half_enabled(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     stages: &[Stage],
+    agents: &[AgentProfile],
     stage_id: &str,
 ) -> bool {
-    node_route(engine, config, stages, stage_id).is_some()
+    node_route(engine, config, stages, agents, stage_id).is_some()
 }
 
 /// The resolved agent settings for one stage: profile defaults plus stage ruleset overrides.
@@ -2017,7 +2042,15 @@ pub async fn run_bookkeeper(
     // Build the clarifier before `issue` is moved into the input (it clones the issue internally).
     // A replay runs no workflow, so this resolves to the bundled standard registry — the one the
     // terminal bookkeeper adapter is itself defined against.
-    let clarifier = NodeClarifier::new(config, store, engine, run_id, &issue, Arc::default());
+    let clarifier = NodeClarifier::new(
+        config,
+        store,
+        engine,
+        run_id,
+        &issue,
+        Arc::default(),
+        Arc::default(),
+    );
     let input = BookkeeperInput {
         issue,
         analyst,
@@ -2055,12 +2088,13 @@ pub(crate) fn build_characterizer(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     stages: &[Stage],
+    agents: &[AgentProfile],
     declared_context: Option<Arc<workflow::WorkflowContext>>,
 ) -> Result<Option<testrun::Characterizer>, PlanError> {
     // Enablement only. What the turn runs on — route, tools, ceiling, prompt — is resolved by the
     // stage executor from the registry this gate reads, so resolving it a second time here could
     // only disagree with it.
-    if node_route(engine, config, stages, "characterizer").is_none() {
+    if node_route(engine, config, stages, agents, "characterizer").is_none() {
         return Ok(None);
     }
     Ok(Some(testrun::Characterizer {
@@ -2086,6 +2120,7 @@ fn node_route(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     stages: &[Stage],
+    agents: &[AgentProfile],
     node: &str,
 ) -> Option<ratatoskr_core::ModelRoute> {
     // The profile keeps the caller's name: it is resolved from the stage this finds, and re-entering
@@ -2103,7 +2138,9 @@ fn node_route(
             params: None,
             session: Default::default(),
         })
-        .or_else(|| stage::profile_for(config, stages, node).and_then(|profile| profile.model))
+        .or_else(|| {
+            stage::profile_for(config, stages, agents, node).and_then(|profile| profile.model)
+        })
         .or_else(|| config.models.get(identity).cloned())
 }
 
@@ -2113,12 +2150,13 @@ pub fn referee_route(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     stages: &[Stage],
+    agents: &[AgentProfile],
 ) -> Option<ratatoskr_core::ModelRoute> {
     config
         .models
         .get("referee")
         .cloned()
-        .or_else(|| node_route(engine, config, stages, "verifier"))
+        .or_else(|| node_route(engine, config, stages, agents, "verifier"))
 }
 
 /// The verifier is opt-in on having somewhere to run, the same way the red-team classifier is.
@@ -2126,8 +2164,9 @@ fn verifier_enabled(
     engine: &Arc<ScriptEngine>,
     config: &RatatoskrConfig,
     stages: &[Stage],
+    agents: &[AgentProfile],
 ) -> bool {
-    node_route(engine, config, stages, "verifier").is_some()
+    node_route(engine, config, stages, agents, "verifier").is_some()
 }
 
 /// Read `[implementer] verify_threshold`. An unrecognised value is a typo, and a typo must not
@@ -2657,15 +2696,16 @@ mod agent_config_tests {
         // The whole point: no `[models.characterizer]` entry at all.
         config.models.remove("characterizer");
 
-        let cfg = plugins::declared_stage_agent_config(
-            &engine,
-            &config,
-            ToolSet::default(),
-            &standard_stage("characterizer").await,
-            &[],
-            &NodePlugins::default(),
-            ratatoskr_core::Capability::Publish,
-        )
+        let cfg = plugins::declared_stage_agent_config(plugins::StageAgentInputs {
+            engine: &engine,
+            config: &config,
+            tools: ToolSet::default(),
+            stage: &standard_stage("characterizer").await,
+            agents: &workflow::standard_agents().await.unwrap(),
+            default_tools: &[],
+            plugins: &NodePlugins::default(),
+            invocation_ceiling: ratatoskr_core::Capability::Publish,
+        })
         .unwrap()
         .0;
         assert_eq!(cfg.route.provider, "openai");
@@ -2693,15 +2733,16 @@ mod agent_config_tests {
             },
         );
 
-        let none = plugins::declared_stage_agent_config(
-            &engine,
-            &config,
-            ToolSet::default(),
-            &standard_stage("characterizer").await,
-            &[],
-            &NodePlugins::default(),
-            ratatoskr_core::Capability::Publish,
-        )
+        let none = plugins::declared_stage_agent_config(plugins::StageAgentInputs {
+            engine: &engine,
+            config: &config,
+            tools: ToolSet::default(),
+            stage: &standard_stage("characterizer").await,
+            agents: &workflow::standard_agents().await.unwrap(),
+            default_tools: &[],
+            plugins: &NodePlugins::default(),
+            invocation_ceiling: ratatoskr_core::Capability::Publish,
+        })
         .unwrap()
         .0;
         assert!(none.tools.names().is_empty(), "{:?}", none.tools.names());
@@ -2713,15 +2754,16 @@ mod agent_config_tests {
 
         // A node that does declare reach still gets them — this is the reading half of the
         // pipeline, not an exception for one node.
-        let some = plugins::declared_stage_agent_config(
-            &engine,
-            &config,
-            ToolSet::default(),
-            &standard_stage("analyst").await,
-            &["impact_surface", "symbol_lookup", "semantic_search"],
-            &NodePlugins::default(),
-            ratatoskr_core::Capability::Publish,
-        )
+        let some = plugins::declared_stage_agent_config(plugins::StageAgentInputs {
+            engine: &engine,
+            config: &config,
+            tools: ToolSet::default(),
+            stage: &standard_stage("analyst").await,
+            agents: &workflow::standard_agents().await.unwrap(),
+            default_tools: &["impact_surface", "symbol_lookup", "semantic_search"],
+            plugins: &NodePlugins::default(),
+            invocation_ceiling: ratatoskr_core::Capability::Publish,
+        })
         .unwrap()
         .0;
         assert!(some.files.is_some());
@@ -2756,15 +2798,16 @@ mod agent_config_tests {
         let engine = engine("toml-fallback").await;
         let config = RatatoskrConfig::default();
 
-        let cfg = plugins::declared_stage_agent_config(
-            &engine,
-            &config,
-            ToolSet::default(),
-            &standard_stage("bookkeeper").await,
-            &[],
-            &NodePlugins::default(),
-            ratatoskr_core::Capability::Publish,
-        )
+        let cfg = plugins::declared_stage_agent_config(plugins::StageAgentInputs {
+            engine: &engine,
+            config: &config,
+            tools: ToolSet::default(),
+            stage: &standard_stage("bookkeeper").await,
+            agents: &workflow::standard_agents().await.unwrap(),
+            default_tools: &[],
+            plugins: &NodePlugins::default(),
+            invocation_ceiling: ratatoskr_core::Capability::Publish,
+        })
         .unwrap()
         .0;
         assert_eq!(cfg.route.provider, config.models["bookkeeper"].provider);
@@ -2778,15 +2821,14 @@ mod agent_config_tests {
         // Asserted through the path the attempt takes: `implementer_attempt` resolves its turn cap
         // from the profile it selects, and its ruleset — keyed by the governance identity,
         // `implementer` — is the more specific answer when it names one.
-        let mut config = RatatoskrConfig::default();
-        config.agents.insert(
-            "build".to_string(),
-            ratatoskr_core::AgentProfileConfig {
-                capabilities: vec![ratatoskr_core::Capability::Write],
-                max_turns: Some(250),
-                ..Default::default()
-            },
-        );
+        let config = RatatoskrConfig::default();
+        // The declaration is where a turn cap lives now, so the fixture is a declared cap.
+        let mut agents = workflow::standard_agents().await.unwrap();
+        agents
+            .iter_mut()
+            .find(|profile| profile.id == "build")
+            .expect("the bundled workflow declares the build profile")
+            .max_turns = Some(250);
         let stages = workflow::standard_stages().await.unwrap();
         let attempt = stages
             .iter()
@@ -2794,15 +2836,16 @@ mod agent_config_tests {
             .expect("the standard registry declares the implementer's attempt");
 
         let engine = engine("implementer-profile-turn-cap").await;
-        let (cfg, _) = plugins::declared_stage_agent_config(
-            &engine,
-            &config,
-            ToolSet::default(),
-            attempt,
-            &[],
-            &NodePlugins::default(),
-            ratatoskr_core::Capability::Publish,
-        )
+        let (cfg, _) = plugins::declared_stage_agent_config(plugins::StageAgentInputs {
+            engine: &engine,
+            config: &config,
+            tools: ToolSet::default(),
+            stage: attempt,
+            agents: &agents,
+            default_tools: &[],
+            plugins: &NodePlugins::default(),
+            invocation_ceiling: ratatoskr_core::Capability::Publish,
+        })
         .unwrap();
         assert_eq!(cfg.max_turns, Some(250));
 
@@ -2811,15 +2854,16 @@ mod agent_config_tests {
             r#"defineAgent("implementer", { maxTurns: 7 });"#,
         )
         .await;
-        let (cfg, _) = plugins::declared_stage_agent_config(
-            &engine,
-            &config,
-            ToolSet::default(),
-            attempt,
-            &[],
-            &NodePlugins::default(),
-            ratatoskr_core::Capability::Publish,
-        )
+        let (cfg, _) = plugins::declared_stage_agent_config(plugins::StageAgentInputs {
+            engine: &engine,
+            config: &config,
+            tools: ToolSet::default(),
+            stage: attempt,
+            agents: &agents,
+            default_tools: &[],
+            plugins: &NodePlugins::default(),
+            invocation_ceiling: ratatoskr_core::Capability::Publish,
+        })
         .unwrap();
         assert_eq!(cfg.max_turns, Some(7));
     }
@@ -2831,15 +2875,16 @@ mod agent_config_tests {
         config.models.remove("analyst");
 
         assert!(matches!(
-            plugins::declared_stage_agent_config(
-                &engine,
-                &config,
-                ToolSet::default(),
-                &standard_stage("analyst").await,
-                &[],
-                &NodePlugins::default(),
-                ratatoskr_core::Capability::Publish,
-            ),
+            plugins::declared_stage_agent_config(plugins::StageAgentInputs {
+                         engine: &engine,
+                         config: &config,
+                         tools: ToolSet::default(),
+                         stage: &standard_stage("analyst").await,
+                         agents: &workflow::standard_agents().await.unwrap(),
+                         default_tools: &[],
+                         plugins: &NodePlugins::default(),
+                         invocation_ceiling: ratatoskr_core::Capability::Publish,
+                     }),
             Err(PlanError::MissingRoute(n)) if n == "analyst"
         ));
     }
@@ -2864,12 +2909,19 @@ mod agent_config_tests {
                     params: None,
                     session: Default::default(),
                 }),
-                base_prompt: "profile prompt".to_string(),
-                capabilities: vec![ratatoskr_core::Capability::Read],
                 tool_policy: None,
-                max_turns: Some(7),
             },
         );
+
+        // Structure is the workflow's: the declaration carries the prompt and the turn cap, and
+        // deployment's TOML contributes exactly the route.
+        let mut agents = workflow::standard_agents().await.unwrap();
+        let build = agents
+            .iter_mut()
+            .find(|profile| profile.id == "build")
+            .expect("the bundled workflow declares the build profile");
+        build.base_prompt = "profile prompt".to_string();
+        build.max_turns = Some(7);
 
         let stages = workflow::standard_stages().await.unwrap();
         let attempt = stages
@@ -2877,15 +2929,16 @@ mod agent_config_tests {
             .find(|stage| stage.id == "implementer_attempt")
             .expect("the standard registry declares the implementer's attempt");
         let default_tools = attempt.tools.iter().map(String::as_str).collect::<Vec<_>>();
-        let (cfg, profile) = plugins::declared_stage_agent_config(
-            &engine,
-            &config,
-            ToolSet::default(),
-            attempt,
-            &default_tools,
-            &NodePlugins::default(),
-            ratatoskr_core::Capability::Publish,
-        )
+        let (cfg, profile) = plugins::declared_stage_agent_config(plugins::StageAgentInputs {
+            engine: &engine,
+            config: &config,
+            tools: ToolSet::default(),
+            stage: attempt,
+            agents: &agents,
+            default_tools: &default_tools,
+            plugins: &NodePlugins::default(),
+            invocation_ceiling: ratatoskr_core::Capability::Publish,
+        })
         .unwrap();
         assert_eq!(cfg.route.model, "profile-model");
         assert_eq!(cfg.system_prompt, None);
@@ -2901,15 +2954,16 @@ mod agent_config_tests {
             r#"defineAgent("analyst", { tools: { allow: ["Write"] } });"#,
         )
         .await;
-        let cfg = plugins::declared_stage_agent_config(
-            &engine,
-            &RatatoskrConfig::default(),
-            ToolSet::default(),
-            &standard_stage("analyst").await,
-            &["impact_surface", "symbol_lookup", "semantic_search"],
-            &NodePlugins::default(),
-            ratatoskr_core::Capability::Publish,
-        )
+        let cfg = plugins::declared_stage_agent_config(plugins::StageAgentInputs {
+            engine: &engine,
+            config: &RatatoskrConfig::default(),
+            tools: ToolSet::default(),
+            stage: &standard_stage("analyst").await,
+            agents: &workflow::standard_agents().await.unwrap(),
+            default_tools: &["impact_surface", "symbol_lookup", "semantic_search"],
+            plugins: &NodePlugins::default(),
+            invocation_ceiling: ratatoskr_core::Capability::Publish,
+        })
         .unwrap()
         .0;
         assert!(cfg.tools.is_empty());
@@ -2917,11 +2971,14 @@ mod agent_config_tests {
 
     #[tokio::test]
     async fn redteam_classifier_opts_in_on_either_route_source() {
+        let agents = workflow::standard_agents().await.unwrap();
         let engine = engine("redteam-optin").await;
         let stages = workflow::standard_stages().await.unwrap();
         let mut config = RatatoskrConfig::default();
         for half in ["redteam_classifier", "redteam_author"] {
-            assert!(!red_team_half_enabled(&engine, &config, &stages, half));
+            assert!(!red_team_half_enabled(
+                &engine, &config, &stages, &agents, half
+            ));
         }
         config.models.insert(
             "redteam".to_string(),
@@ -2937,12 +2994,15 @@ mod agent_config_tests {
         );
         // Both halves govern as `redteam`, so `[models.redteam]` still turns both on.
         for half in ["redteam_classifier", "redteam_author"] {
-            assert!(red_team_half_enabled(&engine, &config, &stages, half));
+            assert!(red_team_half_enabled(
+                &engine, &config, &stages, &agents, half
+            ));
         }
     }
 
     #[tokio::test]
     async fn each_red_team_half_is_gated_on_its_own_stage() {
+        let agents = workflow::standard_agents().await.unwrap();
         // One answer under the shared `redteam` governance name decided for both halves, resolved
         // through whichever stage `for_node` reached first. Both directions were wrong: it skipped
         // a classifier the workflow had explicitly routed, and it enabled an author with nowhere to
@@ -2971,12 +3031,14 @@ mod agent_config_tests {
             &engine,
             &config,
             &stages,
+            &agents,
             "redteam_classifier"
         ));
         assert!(!red_team_half_enabled(
             &engine,
             &config,
             &stages,
+            &agents,
             "redteam_author"
         ));
 
@@ -2988,28 +3050,28 @@ mod agent_config_tests {
             "reason".to_string(),
             ratatoskr_core::AgentProfileConfig {
                 model: Some(route()),
-                base_prompt: String::new(),
-                capabilities: vec![ratatoskr_core::Capability::Read],
                 tool_policy: None,
-                max_turns: None,
             },
         );
         assert!(red_team_half_enabled(
             &engine,
             &config,
             &stages,
+            &agents,
             "redteam_classifier"
         ));
         assert!(!red_team_half_enabled(
             &engine,
             &config,
             &stages,
+            &agents,
             "redteam_author"
         ));
     }
 
     #[tokio::test]
     async fn a_stage_governed_by_another_identity_is_enabled_by_that_identitys_route() {
+        let agents = workflow::standard_agents().await.unwrap();
         // `stage("verifier", { ...nodes.verifier, governedBy: "review" })` — startup accepts it,
         // because `review` is a repository-owned identity with no reservation of its own.
         let engine = engine("governed-route").await;
@@ -3032,17 +3094,17 @@ mod agent_config_tests {
         // `review` is what the turn resolves its route under, so a route there is somewhere to run.
         let mut config = RatatoskrConfig::default();
         config.models.insert("review".to_string(), route());
-        assert!(verifier_enabled(&engine, &config, &stages));
+        assert!(verifier_enabled(&engine, &config, &stages, &agents));
 
         // A route left behind under the stage id is not: the turn would ask for `review`, find
         // nothing, and the review the gate promised would be reported as unavailable instead.
         let mut config = RatatoskrConfig::default();
         config.models.insert("verifier".to_string(), route());
-        assert!(!verifier_enabled(&engine, &config, &stages));
+        assert!(!verifier_enabled(&engine, &config, &stages, &agents));
 
         // A stage that governs itself — every stage in an unmodified registry — is unaffected.
         let stages = workflow::standard_stages().await.unwrap();
-        assert!(verifier_enabled(&engine, &config, &stages));
+        assert!(verifier_enabled(&engine, &config, &stages, &agents));
     }
 
     #[tokio::test]
@@ -3479,8 +3541,8 @@ mod agent_config_tests {
             .expect("the bundled standard declarations name each stage once");
     }
 
-    #[test]
-    fn configured_registry_allows_governance_by_another_declared_stage() {
+    #[tokio::test]
+    async fn configured_registry_allows_governance_by_another_declared_stage() {
         let template = stage::stage_fixture("analyst", "reason");
         let mut policy = template.clone();
         policy.id = "shared_policy".to_string();
@@ -3492,6 +3554,7 @@ mod agent_config_tests {
             &RatatoskrConfig::default(),
             &[],
             vec![policy, consumer],
+            workflow::standard_agents().await.unwrap(),
         )
         .expect("resolved declared stage IDs are permitted governance identities");
     }
@@ -3560,6 +3623,7 @@ mod agent_config_tests {
 
     #[tokio::test]
     async fn a_repository_may_govern_two_stages_under_one_name_as_the_built_ins_do() {
+        let agents = workflow::standard_agents().await.unwrap();
         // The pattern `nodes.ts` uses for the red team: two stages declare `governedBy: "redteam"`
         // and no stage is named that, so one ruleset and one `[models.*]` route shape both halves.
         // A repository was denied it — the governable set read the repository's stages by id and
@@ -3602,8 +3666,13 @@ mod agent_config_tests {
 
         // The whole point: it loads. This is the gate that refused it, and the refusal was fatal —
         // the workflow was rejected at startup rather than quietly governed by nothing.
-        validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
-            .expect("a repository may share one governance identity across its stages");
+        validate_configured_stage_registry(
+            &RatatoskrConfig::default(),
+            &found,
+            standard,
+            agents.clone(),
+        )
+        .expect("a repository may share one governance identity across its stages");
     }
 
     #[test]
@@ -3703,6 +3772,7 @@ mod agent_config_tests {
 
     #[tokio::test]
     async fn the_referee_falls_back_to_the_verifier_route() {
+        let agents = workflow::standard_agents().await.unwrap();
         let engine = engine("referee-via-verifier").await;
         let mut config = RatatoskrConfig::default();
         // Only [models.verifier] configured: a repo that already routes a model to judge the diff
@@ -3713,6 +3783,7 @@ mod agent_config_tests {
             &engine,
             &config,
             &[stage::stage_fixture("verifier", "explore")],
+            &agents,
         )
         .expect("the verifier route is the fallback");
         assert_eq!(route.provider, "anthropic");
@@ -3729,6 +3800,7 @@ mod agent_config_tests {
             &ruleset,
             &config,
             &[stage::stage_fixture("verifier", "explore")],
+            &agents,
         )
         .expect("ruleset verifier is the fallback");
         assert_eq!(route.provider, "openai");
@@ -3737,6 +3809,7 @@ mod agent_config_tests {
 
     #[tokio::test]
     async fn the_referees_own_route_wins_over_the_verifiers() {
+        let agents = workflow::standard_agents().await.unwrap();
         let engine = engine("referee-own-route").await;
         let mut config = RatatoskrConfig::default();
         let verifier = toml_route("anthropic", "claude-sonnet-4-6");
@@ -3747,6 +3820,7 @@ mod agent_config_tests {
             &engine,
             &config,
             &[stage::stage_fixture("verifier", "explore")],
+            &agents,
         )
         .expect("a referee route is configured");
         assert_eq!(
@@ -3764,6 +3838,7 @@ mod agent_config_tests {
             &ruleset,
             &config,
             &[stage::stage_fixture("verifier", "explore")],
+            &agents,
         )
         .expect("TOML referee route still wins");
         assert_eq!(route.provider, "openai");
@@ -3772,6 +3847,7 @@ mod agent_config_tests {
 
     #[tokio::test]
     async fn no_referee_and_no_verifier_route_means_no_judgement() {
+        let agents = workflow::standard_agents().await.unwrap();
         let engine = engine("referee-none").await;
         // The default config has neither [models.referee] nor [models.verifier], and the fixture
         // rulesets bind neither either.
@@ -3780,7 +3856,8 @@ mod agent_config_tests {
             referee_route(
                 &engine,
                 &config,
-                &[stage::stage_fixture("verifier", "explore")]
+                &[stage::stage_fixture("verifier", "explore")],
+                &agents,
             )
             .is_none(),
             "with no route there is no judgement: converge trusts the test result alone, and says so"
@@ -4236,6 +4313,7 @@ mod referee_governance_tests {
 
     #[tokio::test]
     async fn a_layout_naming_a_node_no_stage_provides_is_refused_at_load() {
+        let agents = workflow::standard_agents().await.unwrap();
         let (dir, found) = workflows_in(
             "layout-typo",
             &[(
@@ -4249,10 +4327,14 @@ mod referee_governance_tests {
         )
         .await;
         let standard = workflow::standard_stages().await.unwrap();
-        let error =
-            validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
-                .expect_err("a column naming nothing would be a box that never fills")
-                .to_string();
+        let error = validate_configured_stage_registry(
+            &RatatoskrConfig::default(),
+            &found,
+            standard,
+            agents.clone(),
+        )
+        .expect_err("a column naming nothing would be a box that never fills")
+        .to_string();
         assert!(error.contains("ours"), "{error}");
         assert!(error.contains("analsyt"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -4260,6 +4342,7 @@ mod referee_governance_tests {
 
     #[tokio::test]
     async fn a_layout_naming_a_stage_the_run_folds_as_evidence_is_refused() {
+        let agents = workflow::standard_agents().await.unwrap();
         // `implementer_attempt` runs as evidence for the `implementer` checkpoint and never appears
         // under its own name, so a column naming it draws a box no record can ever reach.
         let (dir, found) = workflows_in(
@@ -4275,10 +4358,14 @@ mod referee_governance_tests {
         )
         .await;
         let standard = workflow::standard_stages().await.unwrap();
-        let error =
-            validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
-                .expect_err("a stage folded as evidence records nothing under its own name")
-                .to_string();
+        let error = validate_configured_stage_registry(
+            &RatatoskrConfig::default(),
+            &found,
+            standard,
+            agents.clone(),
+        )
+        .expect_err("a stage folded as evidence records nothing under its own name")
+        .to_string();
         assert!(error.contains("ours"), "{error}");
         assert!(error.contains("implementer_attempt"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -4286,6 +4373,7 @@ mod referee_governance_tests {
 
     #[tokio::test]
     async fn a_layout_column_with_no_nodes_is_refused() {
+        let agents = workflow::standard_agents().await.unwrap();
         // An empty column still takes its position, so the ones after it are drawn a column further
         // along with a gap to their left; a layout that is empty throughout records what declaring
         // none records, and the workflow is read as having said nothing about where its nodes go.
@@ -4302,10 +4390,14 @@ mod referee_governance_tests {
         )
         .await;
         let standard = workflow::standard_stages().await.unwrap();
-        let error =
-            validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
-                .expect_err("a column with no nodes places nothing")
-                .to_string();
+        let error = validate_configured_stage_registry(
+            &RatatoskrConfig::default(),
+            &found,
+            standard,
+            agents.clone(),
+        )
+        .expect_err("a column with no nodes places nothing")
+        .to_string();
         assert!(error.contains("ours"), "{error}");
         assert!(error.contains("empty column"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -4313,6 +4405,7 @@ mod referee_governance_tests {
 
     #[tokio::test]
     async fn a_layout_naming_one_node_twice_is_refused() {
+        let agents = workflow::standard_agents().await.unwrap();
         // The viewer keys a box by its name, so a second column of the same name would replace the
         // first's edges and state rather than drawing beside it.
         let (dir, found) = workflows_in(
@@ -4328,10 +4421,14 @@ mod referee_governance_tests {
         )
         .await;
         let standard = workflow::standard_stages().await.unwrap();
-        let error =
-            validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
-                .expect_err("one name is one box")
-                .to_string();
+        let error = validate_configured_stage_registry(
+            &RatatoskrConfig::default(),
+            &found,
+            standard,
+            agents.clone(),
+        )
+        .expect_err("one name is one box")
+        .to_string();
         assert!(error.contains("ours"), "{error}");
         assert!(error.contains("analyst"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -4339,6 +4436,7 @@ mod referee_governance_tests {
 
     #[tokio::test]
     async fn a_workflow_may_lay_out_a_stage_it_declares_itself() {
+        let agents = workflow::standard_agents().await.unwrap();
         let (dir, found) = workflows_in(
             "layout-own-stage",
             &[(
@@ -4354,13 +4452,19 @@ mod referee_governance_tests {
         )
         .await;
         let standard = workflow::standard_stages().await.unwrap();
-        validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
-            .expect("a workflow may place the stages it declares");
+        validate_configured_stage_registry(
+            &RatatoskrConfig::default(),
+            &found,
+            standard,
+            agents.clone(),
+        )
+        .expect("a workflow may place the stages it declares");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn an_overridden_standard_stage_passes_startup_validation() {
+        let agents = workflow::standard_agents().await.unwrap();
         // The headline case, through the registry validation `validate_configured_stages` runs
         // before any node starts: the override keeps the id `analyst`, so pooling it alongside the
         // standard definition would reject the repo at startup as a duplicate identifier.
@@ -4378,13 +4482,19 @@ mod referee_governance_tests {
         )
         .await;
         let standard = workflow::standard_stages().await.unwrap();
-        validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
-            .expect("a workflow overriding `analyst` is a valid configuration");
+        validate_configured_stage_registry(
+            &RatatoskrConfig::default(),
+            &found,
+            standard,
+            agents.clone(),
+        )
+        .expect("a workflow overriding `analyst` is a valid configuration");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn two_workflows_may_each_override_the_same_standard_stage() {
+        let agents = workflow::standard_agents().await.unwrap();
         // A run executes one workflow, so two overrides of `analyst` never meet. Validating them
         // against one pooled registry would make each repo's second workflow illegal.
         let ours = |name: &str, instructions: &str| {
@@ -4407,13 +4517,139 @@ mod referee_governance_tests {
         .await;
         assert_eq!(found.len(), 2, "both workflows were discovered");
         let standard = workflow::standard_stages().await.unwrap();
-        validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
-            .expect("two workflows may each override `analyst`");
+        validate_configured_stage_registry(
+            &RatatoskrConfig::default(),
+            &found,
+            standard,
+            agents.clone(),
+        )
+        .expect("two workflows may each override `analyst`");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_workflow_defines_an_agent_and_uses_it_with_no_toml_change() {
+        let agents = workflow::standard_agents().await.unwrap();
+        // The pipeline is self-contained: the declaration is the profile's whole definition, and
+        // the default config — which routes nothing and defines nothing — accepts the workflow.
+        let (dir, found) = workflows_in(
+            "self-contained-agent",
+            &[(
+                "ours",
+                r#"defineWorkflow({
+                     name: "ours",
+                     agents: {
+                       librarian: {
+                         basePrompt: "Catalogue before you conclude.",
+                         capabilities: ["read"],
+                         maxTurns: 12,
+                       },
+                     },
+                     stages: [stage("catalogue", { agent: "librarian", instructions: "x" })],
+                   });
+                   export async function plan(input) { return input; }"#,
+            )],
+        )
+        .await;
+        let standard = workflow::standard_stages().await.unwrap();
+        validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard, agents)
+            .expect("a declared profile satisfies the stage that names it, with no TOML");
+
+        // And the run's table carries the declaration, not just the validator's copy.
+        let runtime = found
+            .iter()
+            .find(|workflow| workflow.meta().name == "ours")
+            .expect("the workflow loaded");
+        let mut declared = workflow::standard_agents().await.unwrap();
+        stage::overlay_agents(&mut declared, stage::agents_from_workflow(runtime.meta()));
+        let librarian = declared
+            .iter()
+            .find(|profile| profile.id == "librarian")
+            .expect("the declared profile joins the run's table");
+        assert_eq!(librarian.base_prompt, "Catalogue before you conclude.");
+        assert_eq!(
+            librarian.capabilities,
+            vec![ratatoskr_core::Capability::Read]
+        );
+        assert_eq!(librarian.max_turns, Some(12));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_stage_naming_an_undefined_agent_is_refused_naming_stage_and_workflow() {
+        let agents = workflow::standard_agents().await.unwrap();
+        let (dir, found) = workflows_in(
+            "undefined-agent",
+            &[(
+                "ours",
+                r#"defineWorkflow({
+                     name: "ours",
+                     stages: [stage("catalogue", { agent: "librarian", instructions: "x" })],
+                   });
+                   export async function plan(input) { return input; }"#,
+            )],
+        )
+        .await;
+        let standard = workflow::standard_stages().await.unwrap();
+        let error = validate_configured_stage_registry(
+            &RatatoskrConfig::default(),
+            &found,
+            standard,
+            agents,
+        )
+        .expect_err("an agent nobody declared fails at load, not mid-run");
+        let error = error.to_string();
+        // The acceptance wording: the error names the stage AND the workflow, because the fix is a
+        // declaration in that workflow, near where the reader is sent.
+        assert!(error.contains("`catalogue`"), "names the stage: {error}");
+        assert!(error.contains("`librarian`"), "names the agent: {error}");
+        assert!(
+            error.contains("workflow `ours`"),
+            "names the workflow: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_declared_agent_overrides_a_standard_profile_by_id() {
+        let agents = workflow::standard_agents().await.unwrap();
+        // Same overlay rule as stages: a declaration bearing a standard id replaces the bundled
+        // profile for this workflow's runs, so importing and overriding is one mechanism, not two.
+        let (dir, found) = workflows_in(
+            "override-standard-agent",
+            &[(
+                "ours",
+                r#"defineWorkflow({
+                     name: "ours",
+                     agents: { reason: { capabilities: [], basePrompt: "No tools; just think." } },
+                   });
+                   export async function plan(input) { return input; }"#,
+            )],
+        )
+        .await;
+        let runtime = found
+            .iter()
+            .find(|workflow| workflow.meta().name == "ours")
+            .expect("the workflow loaded");
+        let mut declared = agents.clone();
+        stage::overlay_agents(&mut declared, stage::agents_from_workflow(runtime.meta()));
+        assert_eq!(
+            declared.len(),
+            agents.len(),
+            "an override replaces; it does not append a twin"
+        );
+        let reason = declared
+            .iter()
+            .find(|profile| profile.id == "reason")
+            .unwrap();
+        assert_eq!(reason.base_prompt, "No tools; just think.");
+        assert!(reason.capabilities.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn a_new_stage_id_validates_and_a_repeated_one_within_a_workflow_does_not() {
+        let agents = workflow::standard_agents().await.unwrap();
         // Overlay semantics must not swallow the case it looks like: an id declared twice by the
         // same workflow overrides nothing, it is a workflow that cannot say which one it meant.
         let (dir, found) = workflows_in(
@@ -4429,8 +4665,13 @@ mod referee_governance_tests {
         )
         .await;
         let standard = workflow::standard_stages().await.unwrap();
-        validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
-            .expect("a genuinely new stage id is still added");
+        validate_configured_stage_registry(
+            &RatatoskrConfig::default(),
+            &found,
+            standard,
+            agents.clone(),
+        )
+        .expect("a genuinely new stage id is still added");
         let _ = std::fs::remove_dir_all(&dir);
 
         let (dir, found) = workflows_in(
@@ -4449,9 +4690,13 @@ mod referee_governance_tests {
         )
         .await;
         let standard = workflow::standard_stages().await.unwrap();
-        let error =
-            validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
-                .expect_err("a workflow may not declare one id twice");
+        let error = validate_configured_stage_registry(
+            &RatatoskrConfig::default(),
+            &found,
+            standard,
+            agents.clone(),
+        )
+        .expect_err("a workflow may not declare one id twice");
         assert!(
             error
                 .to_string()
@@ -4463,6 +4708,7 @@ mod referee_governance_tests {
 
     #[tokio::test]
     async fn a_reserved_name_is_refused_by_the_startup_gate() {
+        let agents = workflow::standard_agents().await.unwrap();
         // `validate_configured_stages` is the first statement of `run_plan` and `run_full`, before
         // the run row and the `issue` checkpoint. A name conflict that only surfaced when the host
         // table was built killed the run mid-flight, with checkpoints already written.
@@ -4490,9 +4736,13 @@ mod referee_governance_tests {
             )
             .await;
             let standard = workflow::standard_stages().await.unwrap();
-            let error =
-                validate_configured_stage_registry(&RatatoskrConfig::default(), &found, standard)
-                    .expect_err("a reserved name must be refused at load");
+            let error = validate_configured_stage_registry(
+                &RatatoskrConfig::default(),
+                &found,
+                standard,
+                agents.clone(),
+            )
+            .expect_err("a reserved name must be refused at load");
             let error = error.to_string();
             assert!(error.contains(expected), "unexpected error: {error}");
             assert!(
@@ -4529,6 +4779,7 @@ mod referee_governance_tests {
 
     #[tokio::test]
     async fn a_referee_ruleset_contributes_no_route() {
+        let agents = workflow::standard_agents().await.unwrap();
         // The route override is TOML-only now: a defineAgent("referee", { model }) with no
         // [models.referee], no [models.verifier] and no verifier ruleset anywhere is no route
         // at all — the judgement is skipped, exactly as if the ruleset were absent.
@@ -4542,7 +4793,8 @@ mod referee_governance_tests {
             referee_route(
                 &engine,
                 &config,
-                &[stage::stage_fixture("verifier", "explore")]
+                &[stage::stage_fixture("verifier", "explore")],
+                &agents,
             )
             .is_none(),
             "a referee ruleset is never consulted for a route"
@@ -4551,6 +4803,7 @@ mod referee_governance_tests {
 
     #[tokio::test]
     async fn models_referee_is_toml_only_and_still_wins() {
+        let agents = workflow::standard_agents().await.unwrap();
         // [models.referee] set alongside every other spelling that could claim the route: it
         // wins, and the referee ruleset's model is not it.
         let engine = rules_engine(
@@ -4575,6 +4828,7 @@ mod referee_governance_tests {
             &engine,
             &config,
             &[stage::stage_fixture("verifier", "explore")],
+            &agents,
         )
         .expect("[models.referee] is configured");
         assert_eq!(resolved.provider, "anthropic");
@@ -4591,6 +4845,7 @@ mod referee_governance_tests {
 
     #[tokio::test]
     async fn the_verifier_route_is_still_the_fallback() {
+        let agents = workflow::standard_agents().await.unwrap();
         // Only the verifier routed — here by TOML, with a referee ruleset present that must be
         // ignored — and the judgement still happens, on the verifier's model.
         let engine = rules_engine(
@@ -4607,6 +4862,7 @@ mod referee_governance_tests {
             &engine,
             &config,
             &[stage::stage_fixture("verifier", "explore")],
+            &agents,
         )
         .expect("the verifier route is the fallback");
         assert_eq!(resolved.provider, "anthropic");

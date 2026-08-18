@@ -399,6 +399,23 @@ fn machine_name(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The standard profiles as the bundled workflow declares them, restated as a fixture: these
+    /// cases are about VALIDATION shapes, not about reading the bundled declaration, and reading
+    /// it would make every one of them async for an input that never varies.
+    fn standard_profiles() -> Vec<crate::AgentProfile> {
+        ["explore", "reason", "transcribe", "build", "publish"]
+            .into_iter()
+            .map(|id| crate::AgentProfile {
+                id: id.to_string(),
+                model: None,
+                base_prompt: String::new(),
+                capabilities: Vec::new(),
+                tool_policy: None,
+                max_turns: None,
+            })
+            .collect()
+    }
+
     use super::*;
 
     /// The governance identities a registry offers: every stage's id and the identity it runs
@@ -445,7 +462,7 @@ mod tests {
         // The workflow script calls hosts explicitly, so metadata order cannot create a dataflow
         // edge or make two independently useful stages incompatible.
         assert!(validate_declared_contracts(&stages).is_ok());
-        assert!(validate(&stages, &crate::built_in_agents(), &permitted_for(&stages)).is_ok());
+        assert!(validate(&stages, &standard_profiles(), &permitted_for(&stages)).is_ok());
     }
 
     #[test]
@@ -458,7 +475,7 @@ mod tests {
             stage.id = reserved.to_string();
             stage.governed_by = None;
 
-            let err = validate(&[stage], &crate::built_in_agents(), &[])
+            let err = validate(&[stage], &standard_profiles(), &[])
                 .expect_err("a reserved record name must not be accepted as a stage");
             assert!(
                 format!("{err}").contains("a checkpoint the run writes itself"),
@@ -473,7 +490,7 @@ mod tests {
         stage.id = "custom_plan".to_string();
         stage.governed_by = None;
 
-        assert!(validate(&[stage], &crate::built_in_agents(), &[]).is_ok());
+        assert!(validate(&[stage], &standard_profiles(), &[]).is_ok());
     }
 
     #[test]
@@ -541,7 +558,7 @@ mod tests {
             stage
         };
 
-        let error = validate(&[member("redtaem")], &crate::built_in_agents(), &[])
+        let error = validate(&[member("redtaem")], &standard_profiles(), &[])
             .expect_err("a box nothing records under cannot be joined")
             .to_string();
         assert!(error.contains("nothing this run records under"), "{error}");
@@ -550,7 +567,7 @@ mod tests {
         // red team, implementer and context stages join.
         for identity in policy::AGGREGATE_IDENTITIES {
             assert!(
-                validate(&[member(identity)], &crate::built_in_agents(), &[]).is_ok(),
+                validate(&[member(identity)], &standard_profiles(), &[]).is_ok(),
                 "`{identity}` is a box the run records under"
             );
         }
@@ -560,7 +577,7 @@ mod tests {
         // operation host that checkpoints nothing of its own, so a box under it stays empty for the
         // whole run. Both are names a workflow may not declare a stage under, and neither is a box.
         for reserved in ["issue", "verify", "overseer"] {
-            let error = match validate(&[member(reserved)], &crate::built_in_agents(), &[]) {
+            let error = match validate(&[member(reserved)], &standard_profiles(), &[]) {
                 Ok(()) => panic!("`{reserved}` is not a box anything records under"),
                 Err(error) => error.to_string(),
             };
@@ -569,19 +586,12 @@ mod tests {
 
         // So does a peer stage that is a node of its own: two stages composing one repository box.
         let peer = crate::stage::stage_fixture("review", "reason");
-        assert!(
-            validate(
-                &[member("review"), peer.clone()],
-                &crate::built_in_agents(),
-                &[]
-            )
-            .is_ok()
-        );
+        assert!(validate(&[member("review"), peer.clone()], &standard_profiles(), &[]).is_ok());
 
         // But not a peer that is itself a member. A box holds turns, not boxes.
         let mut nested = peer;
         nested.node = Some("redteam".to_string());
-        let error = validate(&[member("review"), nested], &crate::built_in_agents(), &[])
+        let error = validate(&[member("review"), nested], &standard_profiles(), &[])
             .expect_err("membership does not chain")
             .to_string();
         assert!(error.contains("nothing this run records under"), "{error}");
@@ -598,7 +608,7 @@ mod tests {
         author.governed_by = Some("triage".to_string());
         let stages = [classifier, author];
 
-        assert!(validate(&stages, &crate::built_in_agents(), &permitted_for(&stages)).is_ok());
+        assert!(validate(&stages, &standard_profiles(), &permitted_for(&stages)).is_ok());
         assert!(stages.iter().all(Stage::is_own_node));
     }
 
@@ -610,14 +620,7 @@ mod tests {
 
         // `redteam` is what the standard red-team stages are governed by, so it is in the set
         // `governable_from` derives from them.
-        assert!(
-            validate(
-                &[stage],
-                &crate::built_in_agents(),
-                &["redteam".to_string()],
-            )
-            .is_ok()
-        );
+        assert!(validate(&[stage], &standard_profiles(), &["redteam".to_string()],).is_ok());
     }
 
     #[test]
@@ -629,7 +632,7 @@ mod tests {
         assert!(
             validate(
                 &[stage],
-                &crate::built_in_agents(),
+                &standard_profiles(),
                 &["shared_policy".to_string()],
             )
             .is_ok()
@@ -646,7 +649,7 @@ mod tests {
         plan.governed_by = Some(policy.id.clone());
         let stages = [policy, plan];
 
-        assert!(validate(&stages, &crate::built_in_agents(), &permitted_for(&stages),).is_ok());
+        assert!(validate(&stages, &standard_profiles(), &permitted_for(&stages),).is_ok());
     }
 
     #[test]
@@ -656,7 +659,7 @@ mod tests {
         stage.governed_by = Some("verifer".to_string());
         let permitted = ["verifier".to_string(), "redteam".to_string()];
 
-        let error = validate(&[stage], &crate::built_in_agents(), &permitted)
+        let error = validate(&[stage], &standard_profiles(), &permitted)
             .unwrap_err()
             .to_string();
 
@@ -845,7 +848,7 @@ mod tests {
         child.question_renderer = Some("input => JSON.stringify(input)".to_string());
 
         let stages = [parent, child];
-        let error = validate(&stages, &crate::built_in_agents(), &permitted_for(&stages))
+        let error = validate(&stages, &standard_profiles(), &permitted_for(&stages))
             .unwrap_err()
             .to_string();
 
@@ -887,7 +890,7 @@ mod tests {
             delegating("second", "leaf"),
             leaf,
         ];
-        let error = validate(&chain, &crate::built_in_agents(), &permitted_for(&chain))
+        let error = validate(&chain, &standard_profiles(), &permitted_for(&chain))
             .expect_err("a delegation target that delegates must be refused")
             .to_string();
         assert!(error.contains("first"), "{error}");
@@ -895,7 +898,7 @@ mod tests {
         assert!(error.contains("delegates onwards"), "{error}");
 
         let itself = [delegating("loop", "loop")];
-        let error = validate(&itself, &crate::built_in_agents(), &permitted_for(&itself))
+        let error = validate(&itself, &standard_profiles(), &permitted_for(&itself))
             .expect_err("a stage that delegates to itself must be refused")
             .to_string();
         assert!(error.contains("loop"), "{error}");
@@ -934,7 +937,7 @@ mod tests {
         );
         for id in folded {
             let stages = [delegating(id), child.clone()];
-            let error = validate(&stages, &crate::built_in_agents(), &permitted_for(&stages))
+            let error = validate(&stages, &standard_profiles(), &permitted_for(&stages))
                 .expect_err("a stage the run folds as evidence must not take a delegation")
                 .to_string();
             assert!(error.contains(id), "{error}");
@@ -943,7 +946,7 @@ mod tests {
 
         // The verifier's adapter checkpoints what it runs, so delegation from it reaches execution.
         let stages = [delegating("verifier"), child];
-        assert!(validate(&stages, &crate::built_in_agents(), &permitted_for(&stages)).is_ok());
+        assert!(validate(&stages, &standard_profiles(), &permitted_for(&stages)).is_ok());
     }
 
     fn column(node: &str) -> [ratatoskr_script::workflow::WorkflowLayoutColumn; 1] {

@@ -24,6 +24,24 @@
 // import: a stage's host binding is installed as a global under the stage's own id, so a bare
 // `import { analyst }` shadows the `analyst(..)` host an entry function calls.
 
+// What a stage's `agent:` names: the profile it runs as — what it may at most do, the guidance
+// it starts from, how long it may run. Structure, not deployment: which MODEL a profile runs on
+// is `ratatoskr.toml`'s (`[agents.<name>]`), and nothing else about the pipeline is. A workflow
+// declares the profiles its stages depend on — `agents: nodes.agents` for these, spread-extended
+// for its own — so a shared pipeline carries its definitions with it.
+export const agents = {
+  // Read-only reconnaissance: file tools and the code index, no mutation.
+  explore: { capabilities: ["read"] },
+  // Read-only judgement over evidence already gathered.
+  reason: { capabilities: ["read"] },
+  // Pure transcription — no tools at all; the input is the whole world.
+  transcribe: { capabilities: [] },
+  // Edits a worktree: the implementer's and the test author's writing hand.
+  build: { capabilities: ["write"] },
+  // May publish beyond the repository, granted only by Rust to the delivery stages.
+  publish: { capabilities: ["publish"] },
+};
+
 export const overseer = {
   agent: "reason",
   inputContract: "OverseerInput",

@@ -37,35 +37,31 @@ pub struct RatatoskrConfig {
     pub endpoint: EndpointConfig,
 }
 
-/// Configurable defaults for a reusable agent profile. A missing model leaves the stage on its
-/// `[models.<stage>]` route, so adopting a profile never silently re-routes a node.
+/// Deployment's half of an agent profile: the route it runs on, and nothing else.
+///
+/// What a profile IS — its capability ceiling, its base prompt, its turn ceiling — is structure,
+/// and structure is declared where the pipeline is: in the workflow (`agents:` beside the stages
+/// that depend on it). Unknown keys are refused so a profile definition pasted here fails loudly
+/// at load instead of silently configuring nothing.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentProfileConfig {
     #[serde(default)]
     pub model: Option<ModelRoute>,
-    #[serde(default)]
-    pub base_prompt: String,
-    #[serde(default)]
-    pub capabilities: Vec<Capability>,
-    /// Rust-supplied policy shared by every stage using this profile; TOML cannot express code.
+    /// Rust-supplied policy shared by every stage using this profile; TOML cannot express code,
+    /// so this is deployment's like the route is, not structure the workflow could declare.
     #[serde(skip)]
     pub tool_policy: Option<Arc<dyn crate::ToolPolicy>>,
-    #[serde(default)]
-    pub max_turns: Option<usize>,
 }
 
 impl std::fmt::Debug for AgentProfileConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentProfileConfig")
             .field("model", &self.model)
-            .field("base_prompt", &self.base_prompt)
-            .field("capabilities", &self.capabilities)
             .field(
                 "tool_policy",
                 &self.tool_policy.as_ref().map(|_| "configured"),
             )
-            .field("max_turns", &self.max_turns)
             .finish()
     }
 }
@@ -1845,10 +1841,6 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(config.agents["explore"].capabilities, [Capability::Read]);
-        assert_eq!(config.agents["build"].capabilities, [Capability::Write]);
-        assert_eq!(config.agents["publish"].capabilities, [Capability::Publish]);
-        assert!(config.agents["reason"].model.is_none());
         assert_eq!(
             config.agents["requirements"]
                 .model
@@ -1856,5 +1848,21 @@ mod tests {
                 .map(|route| route.model.as_str()),
             Some("claude-sonnet-4-6")
         );
+
+        // Structure belongs to the workflow declaration; a structural key in TOML is a hard error,
+        // not a silent override the workflow never sees.
+        for structural in [
+            "capabilities = [\"read\"]",
+            "base_prompt = \"x\"",
+            "max_turns = 3",
+        ] {
+            assert!(
+                RatatoskrConfig::from_toml_str(&format!(
+                    "[store]\npath = \"s\"\n[worktree]\nroot = \"w\"\n[agents.build]\n{structural}\n"
+                ))
+                .is_err(),
+                "TOML `{structural}` under [agents.build] must fail config load"
+            );
+        }
     }
 }

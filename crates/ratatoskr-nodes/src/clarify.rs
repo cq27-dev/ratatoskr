@@ -98,6 +98,8 @@ pub struct NodeClarifier {
     /// The registry this run executes, shared with its `WorkflowContext`. An answerer is the stage
     /// the run would run, not the compiled-in stage that happens to share its name.
     stages: crate::workflow::ExecutionStages,
+    /// The run's agent profiles, shared exactly as the registry is.
+    agents: crate::workflow::ExecutionAgents,
     budget: AtomicUsize,
     recorded: Mutex<Vec<Value>>,
 }
@@ -110,6 +112,7 @@ impl NodeClarifier {
         run_id: &str,
         issue: &str,
         stages: crate::workflow::ExecutionStages,
+        agents: crate::workflow::ExecutionAgents,
     ) -> Arc<Self> {
         Arc::new(Self {
             config: config.clone(),
@@ -118,6 +121,7 @@ impl NodeClarifier {
             run_id: run_id.to_string(),
             issue: issue.to_string(),
             stages,
+            agents,
             budget: AtomicUsize::new(0),
             recorded: Mutex::new(Vec::new()),
         })
@@ -257,6 +261,7 @@ impl NodeClarifier {
         // first candidate that *resolves* rather than the first that matches — otherwise a run with
         // a red team is told its red team does not exist because the other half is declared first.
         let stages = crate::workflow::execution_stages(&self.stages).await.ok()?;
+        let agents = &crate::workflow::execution_agents(&self.agents).await.ok()?;
         let by_id = stages.iter().filter(|stage| stage.id == answerer);
         let by_governance = stages
             .iter()
@@ -275,17 +280,19 @@ impl NodeClarifier {
             .chain(by_governance)
             .chain(by_membership)
             .find_map(|stage| {
-                let (cfg, profile) = crate::plugins::declared_stage_agent_config(
-                    &self.engine,
-                    &self.config,
-                    ToolSet::default(),
-                    stage,
-                    // Answer mode runs with no tools at all, so no skills either.
-                    &[],
-                    &crate::NodePlugins::default(),
-                    ratatoskr_core::Capability::Read,
-                )
-                .ok()?;
+                let (cfg, profile) =
+                    crate::plugins::declared_stage_agent_config(crate::plugins::StageAgentInputs {
+                        engine: &self.engine,
+                        config: &self.config,
+                        tools: ToolSet::default(),
+                        stage,
+                        agents,
+                        // Answer mode runs with no tools at all, so no skills either.
+                        default_tools: &[],
+                        plugins: &crate::NodePlugins::default(),
+                        invocation_ceiling: ratatoskr_core::Capability::Read,
+                    })
+                    .ok()?;
                 Some((cfg, profile.base_prompt))
             })
     }
@@ -518,6 +525,7 @@ mod tests {
             "run-clarify",
             "an issue",
             registry,
+            Arc::default(),
         );
         clarifier.budget.store(ASK_BUDGET, Ordering::SeqCst);
 
@@ -596,6 +604,7 @@ mod tests {
             "run-clarify",
             "an issue",
             registry,
+            Arc::default(),
         );
         let (cfg, _) = clarifier
             .answerer_agent("analyst")
@@ -635,10 +644,7 @@ mod tests {
                     params: None,
                     session: Default::default(),
                 }),
-                base_prompt: String::new(),
-                capabilities: vec![ratatoskr_core::Capability::Write],
                 tool_policy: None,
-                max_turns: None,
             },
         );
 
@@ -653,6 +659,7 @@ mod tests {
             "run-clarify-redteam",
             "an issue",
             registry,
+            Arc::default(),
         );
         let (cfg, _) = clarifier
             .answerer_agent("redteam")
@@ -714,6 +721,7 @@ mod tests {
             "run-clarify-membership",
             "an issue",
             registry,
+            Arc::default(),
         );
         let (cfg, _) = clarifier
             .answerer_agent("context")

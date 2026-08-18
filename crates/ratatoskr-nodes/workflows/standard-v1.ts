@@ -4,6 +4,9 @@ import * as nodes from "ratatoskr/nodes";
 
 defineWorkflow({
   name: "ratatoskr-standard-v1",
+  // The profiles the stages below run as. Declared, not assumed: every workflow names the
+  // profiles it depends on, and these standard ones are importable exactly as the stages are.
+  agents: nodes.agents,
   stages: [
     stage("overseer", nodes.overseer),
     stage("characterizer", nodes.characterizer),
