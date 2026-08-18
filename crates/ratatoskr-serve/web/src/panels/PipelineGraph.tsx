@@ -177,11 +177,7 @@ function NodeFacts({
         {thinkingRequested && (
           <span
             className="node-icon"
-            data-tip={
-              telemetry?.reasoning_tokens
-                ? `Thinking: ${short(telemetry.reasoning_tokens)} reasoning tokens before answering`
-                : "Thinking: this node is not stopped from reasoning before it answers (whether it does is the endpoint's call, and this one reports no reasoning tokens)"
-            }
+            data-tip={thinkingTip(telemetry?.reasoning_tokens)}
           >
             <Brain size={13} aria-label="thinking" />
           </span>
@@ -235,6 +231,25 @@ function NodeFacts({
  * it, and a node without those reads as uninitialised — the condition the fit waits on, so the graph
  * would never refit around the box that grew.
  */
+/**
+ * What the thinking marker says, given what the turn reported about its reasoning.
+ *
+ * Three states, not two. A count of zero is a MEASUREMENT — the endpoint was asked and answered
+ * none — while an absent count means it reports no such figure at all, which is Anthropic's answer
+ * for every turn because it bills thinking inside its output count. A truthiness check collapses
+ * the two, which is the ambiguity the telemetry stopped asserting; the marker must not put it back
+ * where a person actually reads it.
+ */
+export function thinkingTip(reasoning: number | null | undefined): string {
+  if (reasoning == null) {
+    return "Thinking: this node is not stopped from reasoning before it answers (whether it does is the endpoint's call, and this endpoint reports no reasoning figure at all)";
+  }
+  if (reasoning === 0) {
+    return "Thinking: this node was free to reason, and the endpoint reported 0 reasoning tokens for this turn";
+  }
+  return `Thinking: ${short(reasoning)} reasoning tokens before answering`;
+}
+
 export function carryMeasurement(
   previous: PipelineNodeType | undefined,
   next: PipelineNodeType,

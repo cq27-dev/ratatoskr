@@ -26,7 +26,13 @@ import {
   tapSide,
   wiredToSpine,
 } from "./panels/layout";
-import { carryMeasurement, pipStrip, pipsOf, pulsedBox } from "./panels/PipelineGraph";
+import {
+  carryMeasurement,
+  pipStrip,
+  pipsOf,
+  pulsedBox,
+  thinkingTip,
+} from "./panels/PipelineGraph";
 
 /**
  * The span geometry, over every shape a workflow may declare rather than the ones that happened to
@@ -626,4 +632,22 @@ test("the pip strip never exceeds its cap, and the overflow tile takes the last 
   expect(pipsOf(["review", "security"], "review", new Map())).toEqual([
     { id: "security", state: "idle" },
   ]);
+});
+
+test("the thinking marker tells a measured zero from a figure nobody reported", () => {
+  // The two states the telemetry stopped conflating, at the surface a person actually reads. A
+  // truthiness check put them back together: a measured zero took the same text as an absent count,
+  // so the one endpoint that answers "none" looked like the one that never answers at all.
+  expect(thinkingTip(700)).toContain("700 reasoning tokens");
+
+  const measuredZero = thinkingTip(0);
+  expect(measuredZero).toContain("reported 0 reasoning tokens");
+
+  // Absent, in both spellings the wire produces: the field is omitted, which parses as undefined,
+  // and normalised to null inside the fold.
+  for (const absent of [null, undefined]) {
+    const tip = thinkingTip(absent);
+    expect(tip).toContain("no reasoning figure at all");
+    expect(tip).not.toBe(measuredZero);
+  }
 });
