@@ -622,7 +622,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
           ...blank(),
           model: ran_on.model,
           tools: ran_on.tools,
-          thinking: ran_on.thinking,
+          thinking_requested: ran_on.thinking_requested,
           reuses_session: ran_on.reuses_session,
         };
       }
@@ -652,7 +652,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
           ? {
               model: e.facts.model,
               tools: e.facts.tools,
-              thinking: e.facts.thinking,
+              thinking_requested: e.facts.thinking_requested,
               reuses_session: e.facts.reuses_session,
             }
           : {}),
@@ -703,7 +703,7 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
           ? {
               model: e.facts.model,
               tools: e.facts.tools,
-              thinking: e.facts.thinking,
+              thinking_requested: e.facts.thinking_requested,
               reuses_session: e.facts.reuses_session,
             }
           : {}),
@@ -895,8 +895,13 @@ function fold(into: NodeTelemetry, next: NodeTelemetry): NodeTelemetry {
     output_tokens: into.output_tokens + next.output_tokens,
     cached_input_tokens: into.cached_input_tokens + next.cached_input_tokens,
     cache_creation_input_tokens: into.cache_creation_input_tokens + next.cache_creation_input_tokens,
-    reasoning_tokens: into.reasoning_tokens + next.reasoning_tokens,
-    thinking: into.thinking || next.thinking,
+    // Absence survives a fold: summing an unmeasured turn as zero would make the total claim a
+    // measurement none of its turns made.
+    reasoning_tokens:
+      into.reasoning_tokens === null && next.reasoning_tokens === null
+        ? null
+        : (into.reasoning_tokens ?? 0) + (next.reasoning_tokens ?? 0),
+    thinking_requested: into.thinking_requested || next.thinking_requested,
     duration_ms: sum(into.duration_ms, next.duration_ms),
     tools: distinct(into.tools, next.tools),
     tools_used: distinct(into.tools_used, next.tools_used),
@@ -1481,8 +1486,8 @@ function blank(): NodeTelemetry {
     output_tokens: 0,
     cached_input_tokens: 0,
     cache_creation_input_tokens: 0,
-    reasoning_tokens: 0,
-    thinking: false,
+    reasoning_tokens: null,
+    thinking_requested: false,
     duration_ms: null,
     tools: [],
     tools_used: [],

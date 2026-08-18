@@ -202,7 +202,7 @@ impl LiveUsage {
 pub struct LiveNodeFacts {
     pub model: String,
     pub tools: Vec<String>,
-    pub thinking: bool,
+    pub thinking_requested: bool,
     pub reuses_session: bool,
 }
 
@@ -240,7 +240,7 @@ impl LiveNodeFacts {
                 .filter(|t| !t.is_empty())
                 .map(str::to_string)
                 .collect(),
-            thinking: flag("thinking"),
+            thinking_requested: flag("thinking_requested"),
             reuses_session: flag("reuses_session"),
         })
     }
@@ -630,7 +630,7 @@ mod tests {
         let record: Value = serde_json::from_str(
             r#"{"timestamp":"t","kind":"checkpoint","node":"implementer","bytes":21286,
                 "iteration":2,"model":"anthropic/claude-opus-4-8","tools":"Read,Bash",
-                "tools_used":"Bash","thinking":true,"reuses_session":true,"turns":31,"error":"",
+                "tools_used":"Bash","thinking_requested":true,"reuses_session":true,"turns":31,"error":"",
                 "duration_ms":339000,"gen_ai.usage.input_tokens":7,
                 "gen_ai.usage.output_tokens":396,"ratatoskr.usage.cached_input_tokens":1065945,
                 "ratatoskr.usage.cache_creation_input_tokens":38998,
@@ -645,7 +645,7 @@ mod tests {
         let facts = e.facts.expect("a checkpoint reports what the node ran on");
         assert_eq!(facts.model, "anthropic/claude-opus-4-8");
         assert_eq!(facts.tools, ["Read", "Bash"]);
-        assert!(facts.thinking && facts.reuses_session);
+        assert!(facts.thinking_requested && facts.reuses_session);
 
         let usage = e.usage.expect("a checkpoint reports what it cost");
         assert_eq!(usage.cached_input_tokens, 1_065_945);
@@ -697,7 +697,7 @@ mod tests {
         // composed box's real numbers with an aggregate's zeros.
         let aggregate: Value = serde_json::from_str(
             r#"{"timestamp":"t","kind":"checkpoint","node":"redteam","bytes":120,
-                "tools":"","tools_used":"","thinking":false,"reuses_session":false,
+                "tools":"","tools_used":"","thinking_requested":false,"reuses_session":false,
                 "spans":[{"run_id":"r1"}]}"#,
         )
         .unwrap();
@@ -711,7 +711,7 @@ mod tests {
         // not read as a node that never ran.
         let free: Value = serde_json::from_str(
             r#"{"timestamp":"t","kind":"checkpoint","node":"analyst","model":"p/m","turns":1,
-                "tools":"","tools_used":"","thinking":false,"reuses_session":false,
+                "tools":"","tools_used":"","thinking_requested":false,"reuses_session":false,
                 "duration_ms":90,"gen_ai.usage.input_tokens":0,
                 "gen_ai.usage.output_tokens":0,"ratatoskr.usage.cached_input_tokens":0,
                 "ratatoskr.usage.cache_creation_input_tokens":0,

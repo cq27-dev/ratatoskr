@@ -321,7 +321,7 @@ async fn record_setup_failure(turn: SetupFailure<'_>, error: AgentError) -> Agen
                 // It never got as far as binding any: an empty list is what it ran with, and the
                 // error below is why.
                 tools: &[],
-                thinking: thinking_left_on(route),
+                thinking_requested: thinking_left_on(route),
                 reuses_session: false,
             });
             tracing::warn!(node, %error, "the turn could not reach its provider");
@@ -336,7 +336,7 @@ async fn record_setup_failure(turn: SetupFailure<'_>, error: AgentError) -> Agen
                 tools: Vec::new(),
                 tools_used: Vec::new(),
                 reuses_session: false,
-                thinking: thinking_left_on(route),
+                thinking_requested: thinking_left_on(route),
             });
         });
     })
@@ -405,6 +405,26 @@ enum Provider {
     Anthropic,
     OpenAi,
     Moonshot,
+}
+
+/// Whether this provider reports reasoning tokens apart from the rest of its output.
+///
+/// A zero from an endpoint that reports no such figure is this layer's default, not the model's
+/// answer — and recording it as a measurement is what put `reasoning_tokens = 0` beside
+/// `thinking_requested = true` on every record that set both. Read off the provider because that is
+/// where the answer is knowable: it is a property of the endpoint's response shape, not of the turn.
+///
+/// Anthropic bills thinking inside `output_tokens` and reports nothing separate — rig's Anthropic
+/// adapter fills the field with a literal `0`. Both OpenAI surfaces this harness uses map it from a
+/// token-details block when the response carries one, and Moonshot runs on the chat-completions
+/// surface, so both report it where the model produced any.
+fn provider_reports_reasoning(provider: &str) -> bool {
+    match provider {
+        "anthropic" => false,
+        // The default for anything else: reporting a count the endpoint may well have sent is a
+        // smaller error than dropping one it did.
+        _ => true,
+    }
 }
 
 /// Resolve a config provider string. Kept separate so it's testable without a live connection.
@@ -573,7 +593,8 @@ fn empty_openai_response(body: &[u8]) -> Option<EmptyOpenAiResponse> {
             output_tokens: usage.output_tokens,
             cached_input_tokens: usage.cached_input_tokens,
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
-            reasoning_tokens: usage.reasoning_tokens,
+            // This capture only ever reads an OpenAI Responses payload, which reports the figure.
+            reasoning_tokens: Some(usage.reasoning_tokens),
         },
         reached_output_limit: reached_output_limit.is_some(),
     })
@@ -674,7 +695,7 @@ impl<'a> TurnSubject<'a> {
             caller = self.caller,
             model = facts.model,
             tools = %facts.tools.join(","),
-            thinking = facts.thinking,
+            thinking_requested = facts.thinking_requested,
             reuses_session = facts.reuses_session,
             "node started"
         );
@@ -716,7 +737,7 @@ impl<'a> TurnSubject<'a> {
             model = telemetry.model.as_deref(),
             tools = %telemetry.tools.join(","),
             tools_used = %telemetry.tools_used.join(","),
-            thinking = telemetry.thinking,
+            thinking_requested = telemetry.thinking_requested,
             reuses_session = telemetry.reuses_session,
             // Why it failed, for a turn that writes no checkpoint to carry it. Without this a
             // recovered failure — an answerer that could not answer, an evidence-only turn that
@@ -731,7 +752,7 @@ impl<'a> TurnSubject<'a> {
 struct TurnFacts<'a> {
     model: &'a str,
     tools: &'a [String],
-    thinking: bool,
+    thinking_requested: bool,
     reuses_session: bool,
 }
 
@@ -953,7 +974,7 @@ where
     subject.started(TurnFacts {
         model: &model_name,
         tools: &tool_names,
-        thinking: thinking_left_on(route),
+        thinking_requested: thinking_left_on(route),
         reuses_session: false,
     });
     let started = std::time::Instant::now();
@@ -979,7 +1000,7 @@ where
             tools: tool_names,
             tools_used: meter.used(),
             reuses_session: false,
-            thinking: thinking_left_on(route),
+            thinking_requested: thinking_left_on(route),
         })
     });
     answer
@@ -1919,6 +1940,9 @@ pub struct Request {
     max_tokens: u64,
     temperature: Option<f64>,
     params: Option<serde_json::Value>,
+    /// Whether a reasoning count off this route's endpoint is a measurement; see
+    /// [`provider_reports_reasoning`].
+    reports_reasoning: bool,
 }
 
 impl Request {
@@ -1926,6 +1950,7 @@ impl Request {
     pub fn of(route: &ModelRoute) -> Self {
         Request {
             max_tokens: route.max_tokens(),
+            reports_reasoning: provider_reports_reasoning(&route.provider),
             temperature: route.temperature,
             params: route.params.as_ref().and_then(|p| {
                 serde_json::to_value(p)
@@ -1950,6 +1975,10 @@ impl Request {
             max_tokens: ratatoskr_core::DEFAULT_MAX_TOKENS,
             temperature: None,
             params: None,
+            // The compactor runs on the node'''s own route, so what its endpoint reports is the
+            // node'''s answer; a summarising turn does not get to claim a different one. Callers
+            // that know the route use `of`, which reads it.
+            reports_reasoning: false,
         }
     }
 }
@@ -1968,7 +1997,10 @@ fn metered<M: CompletionModel + 'static>(
         .lock()
         .expect("provider-call log poisoned")
         .next_id;
-    let usage = UsageHook::default();
+    let usage = UsageHook {
+        reports_reasoning: request.reports_reasoning,
+        ..Default::default()
+    };
     let observability = ObservabilityHook::default();
     let responses: Arc<Mutex<Option<ResponseFacts>>> = Arc::default();
     let meter = Meter {
@@ -2125,6 +2157,9 @@ impl Meter {
 #[derive(Default)]
 struct UsageHook {
     total: Arc<Mutex<TokenUsage>>,
+    /// Whether a reasoning count off this endpoint is a measurement; see
+    /// [`provider_reports_reasoning`].
+    reports_reasoning: bool,
 }
 
 impl AgentHook for UsageHook {
@@ -2178,7 +2213,9 @@ impl AgentHook for UsageHook {
                 output_tokens: event.usage.output_tokens,
                 cached_input_tokens: event.usage.cached_input_tokens,
                 cache_creation_input_tokens: event.usage.cache_creation_input_tokens,
-                reasoning_tokens: event.usage.reasoning_tokens,
+                reasoning_tokens: self
+                    .reports_reasoning
+                    .then_some(event.usage.reasoning_tokens),
             });
         ModelTurnAction::Continue
     }
@@ -3706,7 +3743,7 @@ where
     subject.started(TurnFacts {
         model: &model_name,
         tools: &tool_names,
-        thinking: thinking_left_on(route),
+        thinking_requested: thinking_left_on(route),
         reuses_session: continuing_session(
             route.session,
             conversation,
@@ -3822,7 +3859,7 @@ where
                 conversation,
                 compacted_session.is_some(),
             ),
-            thinking: thinking_left_on(route),
+            thinking_requested: thinking_left_on(route),
         };
         // Inside the turn's own span: the cost record is the turn's, and emitting it beside the
         // span left the only account of a failed turn outside the span that says it failed.
@@ -5473,6 +5510,57 @@ mod tests {
         assert_eq!(unknown, ResponseFacts::default());
     }
 
+    #[test]
+    fn a_reasoning_count_is_absent_where_the_endpoint_reports_none() {
+        // 28 checkpoints once reported `thinking = true` beside `reasoning_tokens = 0`, all 28 of
+        // them: two fields on one row asserting opposite things, with nothing to say which was
+        // right. The zero was this side's default — Anthropic bills thinking inside its output
+        // count and reports no separate figure, and rig's adapter fills the field with a literal
+        // zero — so the fix is to stop calling it a measurement.
+        assert!(!provider_reports_reasoning("anthropic"));
+        // Both OpenAI surfaces this harness uses map the figure from a token-details block, and
+        // Moonshot runs on the chat-completions one.
+        assert!(provider_reports_reasoning("openai"));
+        assert!(provider_reports_reasoning("moonshot"));
+
+        // What the route carries into the turn, so the answer travels with the request rather than
+        // being asked again somewhere it cannot be known.
+        let route = |provider: &str| ModelRoute {
+            provider: provider.to_string(),
+            model: "m".to_string(),
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        };
+        assert!(!Request::of(&route("anthropic")).reports_reasoning);
+        assert!(Request::of(&route("openai")).reports_reasoning);
+
+        // And the fold keeps absence absent. Summing an unmeasured turn as zero would make a
+        // folded row claim a measurement none of its turns made.
+        let mut total = TokenUsage::default();
+        total.add(TokenUsage {
+            reasoning_tokens: None,
+            ..Default::default()
+        });
+        assert_eq!(total.reasoning_tokens, None);
+        total.add(TokenUsage {
+            reasoning_tokens: Some(7),
+            ..Default::default()
+        });
+        assert_eq!(total.reasoning_tokens, Some(7));
+        total.add(TokenUsage {
+            reasoning_tokens: None,
+            ..Default::default()
+        });
+        assert_eq!(
+            total.reasoning_tokens,
+            Some(7),
+            "a turn that measured nothing subtracts nothing from one that did"
+        );
+    }
+
     /// A model that refuses every request, so the turn ends in an error.
     #[derive(Clone, Default)]
     struct AlwaysRefuses;
@@ -6320,12 +6408,12 @@ mod tests {
             output_tokens: 1,
             cached_input_tokens: 8,
             cache_creation_input_tokens: 2,
-            reasoning_tokens: 700,
+            reasoning_tokens: Some(700),
         });
         total.add(TokenUsage {
             input_tokens: 5,
             output_tokens: 3,
-            reasoning_tokens: 300,
+            reasoning_tokens: Some(300),
             ..Default::default()
         });
         assert_eq!(total.input_tokens, 15);
@@ -6334,7 +6422,7 @@ mod tests {
         assert_eq!(total.cache_creation_input_tokens, 2);
         // Thinking accumulates like the rest: a turn that thought and called one tool spent most
         // of what it spent here, and a sum that drops it says the node was nearly free.
-        assert_eq!(total.reasoning_tokens, 1_000);
+        assert_eq!(total.reasoning_tokens, Some(1_000));
     }
 
     #[tokio::test]
@@ -6468,7 +6556,7 @@ mod tests {
         assert_eq!(empty.usage.input_tokens, 11);
         assert_eq!(empty.usage.output_tokens, 2);
         assert_eq!(empty.usage.cached_input_tokens, 4);
-        assert_eq!(empty.usage.reasoning_tokens, 1);
+        assert_eq!(empty.usage.reasoning_tokens, Some(1));
         assert!(!empty.reached_output_limit);
         // And what the payload said about itself. The model never sees this response — Rig converts
         // it into an error — so this capture is the only place its facts survive.

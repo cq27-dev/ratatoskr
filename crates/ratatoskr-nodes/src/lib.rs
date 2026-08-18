@@ -270,7 +270,7 @@ async fn record<T: Serialize>(r: Record<'_, T>) -> Result<(), PlanError> {
         model = logged.model.as_deref(),
         tools = logged.tools.join(","),
         tools_used = logged.tools_used.join(","),
-        thinking = logged.thinking,
+        thinking_requested = logged.thinking_requested,
         reuses_session = logged.reuses_session,
         turns = logged.turns,
         error = logged.error.as_deref(),
@@ -1590,8 +1590,25 @@ mod checkpoint_event_tests {
         // It still says a node produced output, which is the whole point of the event.
         assert_eq!(record["node"], "redteam");
 
-        // And a turn that genuinely spent nothing reports every figure, because each is then a
-        // measurement. An endpoint that makes a real call and counts nothing must not be
+        // A turn that FAILED and whose failure the run carried on from writes its reason here —
+        // the referee and the verifier both record one — and that reason is what makes the row read
+        // as a failed attempt rather than a finished one. A node that fails outright writes no row
+        // at all, and which node a failed run died in is answered from the event stream, where its
+        // start and its cost record survive without a checkpoint.
+        let failed = checkpoint_record(Some(ratatoskr_core::NodeTelemetry {
+            model: Some("p/m".to_string()),
+            turns: Some(1),
+            error: Some("the verifier could not reach the diff".to_string()),
+            ..Default::default()
+        }))
+        .await;
+        assert_eq!(
+            failed["error"], "the verifier could not reach the diff",
+            "a failure the run recovered from is on the row it wrote: {failed}"
+        );
+
+        // And a turn that genuinely spent nothing reports every figure it measured, because each is
+        // then a measurement. An endpoint that makes a real call and counts nothing must not be
         // indistinguishable from a node that never ran.
         let free = checkpoint_record(Some(ratatoskr_core::NodeTelemetry {
             model: Some("p/m".to_string()),
@@ -1601,9 +1618,28 @@ mod checkpoint_event_tests {
         }))
         .await;
         assert_eq!(free["gen_ai.usage.input_tokens"], 0);
-        assert_eq!(free["ratatoskr.usage.reasoning_tokens"], 0);
         assert_eq!(free["turns"], 1);
         assert_eq!(free["model"], "p/m");
+        // Except the one figure the endpoint may not report at all. A turn on a route that bills
+        // thinking inside its output count measured nothing here, and a zero would be this side's
+        // default standing in for the model's answer.
+        assert!(
+            free.get("ratatoskr.usage.reasoning_tokens").is_none(),
+            "an unmeasured reasoning count is absent, not zero: {free}"
+        );
+        let thought = checkpoint_record(Some(ratatoskr_core::NodeTelemetry {
+            model: Some("p/m".to_string()),
+            usage: ratatoskr_core::TokenUsage {
+                reasoning_tokens: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .await;
+        assert_eq!(
+            thought["ratatoskr.usage.reasoning_tokens"], 0,
+            "and an endpoint that reported zero said something, which is recorded: {thought}"
+        );
     }
 }
 

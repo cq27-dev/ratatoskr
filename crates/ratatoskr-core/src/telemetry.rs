@@ -23,13 +23,20 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
-    /// Tokens spent on the model's own reasoning before it answered.
+    /// Tokens spent on the model's own reasoning before it answered, when the endpoint reports
+    /// them apart from the rest.
     ///
-    /// Billed as output and reported apart from it, so a node that thinks before every tool call
-    /// looks nearly free when only `output_tokens` is read — and thinking is the reason such a
-    /// node's turns are slow, which makes this the number that explains the wall-clock.
+    /// `None` where the number was not measured, which is not the same statement as `Some(0)`.
+    /// Anthropic bills thinking inside `output_tokens` and reports no separate figure at all, so a
+    /// zero there was this endpoint's default rather than the model's answer — and a node that
+    /// plainly thought reported `thinking_requested = true` beside `reasoning_tokens = 0` on every
+    /// record that set both, two fields on one row asserting opposite things.
+    ///
+    /// Where it IS reported, it explains the wall-clock: billed as output and reported apart from
+    /// it, so a node that thinks before every tool call looks nearly free when only `output_tokens`
+    /// is read.
     #[serde(default)]
-    pub reasoning_tokens: u64,
+    pub reasoning_tokens: Option<u64>,
 }
 
 impl TokenUsage {
@@ -40,7 +47,12 @@ impl TokenUsage {
         self.output_tokens += other.output_tokens;
         self.cached_input_tokens += other.cached_input_tokens;
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
-        self.reasoning_tokens += other.reasoning_tokens;
+        // Absence stays absent unless something real is folded in: summing an unmeasured turn as
+        // zero would make a folded row claim a measurement none of its turns made.
+        self.reasoning_tokens = match (self.reasoning_tokens, other.reasoning_tokens) {
+            (Some(mine), Some(theirs)) => Some(mine + theirs),
+            (mine, theirs) => mine.or(theirs),
+        };
     }
 }
 
@@ -64,8 +76,13 @@ pub struct NodeTelemetry {
     /// How many model calls the turn took. A node that hit its turn cap looks identical to one that
     /// finished early in every other column.
     pub turns: Option<u64>,
-    /// Why the node failed, when it did. A checkpoint is written for a failed node too — the reason
-    /// it failed is the most useful thing about that row.
+    /// Why the node failed, when it did and the run carried on from it: the referee and the
+    /// verifier both record a failure this way, and the reason is the most useful thing about that
+    /// row.
+    ///
+    /// A node that fails OUTRIGHT writes no row at all — the run ends at it — so this is not where
+    /// a failed run's cause is looked up. That lives in the event stream, which carries the turn's
+    /// start and its cost record with the error on it whether or not a checkpoint follows.
     pub error: Option<String>,
     /// The tools this node could call, by the names the model saw.
     ///
@@ -83,15 +100,17 @@ pub struct NodeTelemetry {
     /// Whether this node's endpoint session carried over from an earlier attempt in the run.
     #[serde(default)]
     pub reuses_session: bool,
-    /// Whether the node was left free to reason before answering.
+    /// Whether the route left the node free to reason before answering — CONFIGURATION, which is
+    /// why the name says so.
     ///
-    /// Recorded as configured rather than observed, because `usage.reasoning_tokens` comes back
-    /// zero from endpoints that do not report it — and a node that plainly thought would then look
-    /// like one that did not. `false` means the route disabled it explicitly; `true` means it was
-    /// not disabled, which is not quite the same as "it happened": with thinking left alone, the
-    /// endpoint decides, and several turn it on as soon as a request carries tools.
+    /// It sat beside the measurements as `thinking`, and a reader had no way to tell that this one
+    /// field describes what was asked for rather than what happened. `false` means the route
+    /// disabled reasoning explicitly; `true` means it did not, which is not the same as "it
+    /// happened": with thinking left alone the endpoint decides, and several turn it on as soon as
+    /// a request carries tools. What the turn actually spent, where the endpoint says, is
+    /// [`TokenUsage::reasoning_tokens`].
     #[serde(default)]
-    pub thinking: bool,
+    pub thinking_requested: bool,
 }
 
 impl NodeTelemetry {
@@ -138,7 +157,7 @@ impl NodeTelemetry {
         extend_distinct(&mut self.tools, other.tools);
         extend_distinct(&mut self.tools_used, other.tools_used);
         self.reuses_session |= other.reuses_session;
-        self.thinking |= other.thinking;
+        self.thinking_requested |= other.thinking_requested;
     }
 }
 
@@ -196,7 +215,7 @@ mod tests {
         let mut folded = NodeTelemetry {
             tools: vec!["Read".to_string(), "Write".to_string()],
             error: Some("the author gave up".to_string()),
-            thinking: true,
+            thinking_requested: true,
             ..turn("anthropic/opus", 10)
         };
         folded.fold(NodeTelemetry {
@@ -213,7 +232,7 @@ mod tests {
         assert_eq!(folded.tools, ["Read", "Write", "semantic_search"]);
         // A best-effort half's failure survives its checkpoint; nothing else records it.
         assert_eq!(folded.error.as_deref(), Some("the author gave up"));
-        assert!(folded.thinking);
+        assert!(folded.thinking_requested);
     }
 
     #[test]

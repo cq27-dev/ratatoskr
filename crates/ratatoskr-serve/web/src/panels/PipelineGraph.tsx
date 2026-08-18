@@ -113,8 +113,11 @@ function NodeFacts({
     ? new Set(telemetry.tools_used)
     : (live?.used ?? new Set<string>());
   const modelFull = telemetry?.model ?? live?.telemetry?.model ?? planned?.model ?? null;
-  const thinking =
-    telemetry?.thinking ?? live?.telemetry?.thinking ?? planned?.thinking ?? false;
+  const thinkingRequested =
+    telemetry?.thinking_requested ??
+    live?.telemetry?.thinking_requested ??
+    planned?.thinking_requested ??
+    false;
   // Every scope this box's stages run under, so a box whose halves continue differently shows each
   // of their marks rather than one of them winning. Config is the only source that can say WHICH: a
   // recorded `reuses_session` is set by a compacted re-entry too, so on its own it can say no more
@@ -171,11 +174,11 @@ function NodeFacts({
             <Repeat size={13} aria-label="compacted continuation" />
           </span>
         )}
-        {thinking && (
+        {thinkingRequested && (
           <span
             className="node-icon"
             data-tip={
-              telemetry && telemetry.reasoning_tokens > 0
+              telemetry?.reasoning_tokens
                 ? `Thinking: ${short(telemetry.reasoning_tokens)} reasoning tokens before answering`
                 : "Thinking: this node is not stopped from reasoning before it answers (whether it does is the endpoint's call, and this one reports no reasoning tokens)"
             }
