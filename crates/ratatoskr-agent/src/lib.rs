@@ -255,6 +255,40 @@ impl AgentError {
     }
 }
 
+/// A turn that failed before it could open its own span still has to appear as a failed turn.
+///
+/// Provider resolution and client construction happen ahead of the turn — an unknown provider or a
+/// missing API key returns there — so the span the turn would have opened never exists, and a trace
+/// showed nothing at all for a node that demonstrably tried and failed. This opens that span for
+/// exactly those failures, carrying the same identity and the same outcome fields a turn's own span
+/// carries, so `unknown_provider` and `provider_client` are reachable in a trace rather than only in
+/// the returned error.
+///
+/// Only for setup: [`AgentError::Prompt`] can only come from a turn that ran, and that turn already
+/// recorded its outcome on its own span — opening a second one here would double-count it.
+fn record_setup_failure(node: &str, route: &ModelRoute, error: AgentError) -> AgentError {
+    if matches!(error, AgentError::Prompt(_)) {
+        return error;
+    }
+    let model_name = format!("{}/{}", route.provider, route.model);
+    let span = tracing::info_span!(
+        "invoke_agent",
+        node,
+        otel.name = %otel_name("invoke_agent", node),
+        otel.kind = "client",
+        otel.status_code = tracing::field::Empty,
+        "error.type" = tracing::field::Empty,
+        "gen_ai.operation.name" = "invoke_agent",
+        "gen_ai.agent.name" = node,
+        "gen_ai.request.model" = %model_name,
+    );
+    record_turn_outcome(&span, Some(&error));
+    // Inside the span, so the failure has a record and not only a field on a span nothing was
+    // emitted under.
+    span.in_scope(|| tracing::warn!(node, %error, "the turn could not reach its provider"));
+    error
+}
+
 /// Stamp a turn's outcome onto its span: `otel.status_code` either way, `error.type` when it
 /// failed.
 ///
@@ -623,13 +657,40 @@ pub async fn ask(
     let node = answerer.map_or_else(|| addressed.clone(), str::to_string);
     // Only where they differ: a plain ask answers under its own name and is controlled by it.
     let controlled_as = (node != addressed).then_some(addressed.as_str());
+    ask_resolved(
+        route,
+        preamble,
+        question,
+        tools,
+        max_turns,
+        control,
+        &node,
+        controlled_as,
+    )
+    .await
+    .map_err(|error| record_setup_failure(&node, route, error))
+}
+
+/// [`ask`], from provider resolution onward. Separate so a failure to resolve one is still a turn
+/// with a span — see [`record_setup_failure`].
+#[allow(clippy::too_many_arguments)]
+async fn ask_resolved(
+    route: &ModelRoute,
+    preamble: &str,
+    question: &str,
+    tools: ToolSet,
+    max_turns: Option<usize>,
+    control: Option<RuntimeControl>,
+    node: &str,
+    controlled_as: Option<&str>,
+) -> Result<String, AgentError> {
     match parse_provider(&route.provider)? {
         Provider::Anthropic => {
             let session = uuid::Uuid::new_v4().to_string();
             let (client, calls) = anthropic_client(Some(&session))?;
             run(AskRun {
                 model: caching(client.completion_model(&route.model)),
-                node: &node,
+                node,
                 controlled_as,
                 preamble,
                 question,
@@ -645,7 +706,7 @@ pub async fn ask(
             let (client, calls) = openai_client()?;
             run(AskRun {
                 model: client.completion_model(&route.model),
-                node: &node,
+                node,
                 controlled_as,
                 preamble,
                 question,
@@ -664,7 +725,7 @@ pub async fn ask(
                 // endpoint honours an Anthropic `cache_control` is its business, and sending one
                 // it rejects would cost the call rather than the cache.
                 model: client.completion_model(&route.model),
-                node: &node,
+                node,
                 controlled_as,
                 preamble,
                 question,
@@ -3145,6 +3206,16 @@ pub struct NodeRun<'a> {
 /// still validate it (see `ratatoskr_graph::parse_validated`), though a first answer that misses
 /// the schema is handed back for correction before it reaches one.
 pub async fn run_structured(run: NodeRun<'_>) -> Result<String, AgentError> {
+    let node = run.node;
+    let route = run.route;
+    run_structured_resolved(run)
+        .await
+        .map_err(|error| record_setup_failure(node, route, error))
+}
+
+/// [`run_structured`], from provider resolution onward. Separate so a failure to resolve one is
+/// still a turn with a span — see [`record_setup_failure`].
+async fn run_structured_resolved(run: NodeRun<'_>) -> Result<String, AgentError> {
     match parse_provider(&run.route.provider)? {
         Provider::Anthropic => {
             let session = session_id(&run);
@@ -4839,6 +4910,73 @@ mod tests {
         // Exactly what a strict caller does with it, succeeding exactly when the turn completed.
         let parsed: Done = serde_json::from_str(&answer).expect("the returned text IS the value");
         assert_eq!(parsed.summary, "done");
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_never_reached_its_provider_is_still_a_failed_turn_on_a_span() {
+        // Provider resolution and client construction happen before the turn opens its span, so an
+        // unknown provider or a missing key returned with nothing in the trace at all: a node that
+        // tried and failed looked like a node that never ran.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Done {
+            summary: String,
+        }
+
+        let route = ModelRoute {
+            provider: "not-a-provider".to_string(),
+            model: "test-model".to_string(),
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            params: None,
+            session: Default::default(),
+        };
+        let capturing = capture::start();
+        let failed = run_structured(NodeRun {
+            node: "analyst",
+            controlled_as: None,
+            caller: None,
+            route: &route,
+            preamble: "Answer.",
+            question: "Answer.",
+            tools: ToolSet::default(),
+            output_schema: schemars::schema_for!(Done),
+            policy: None,
+            max_turns: Some(2),
+            clarifier: None,
+            observer: None,
+            skills: Vec::new(),
+            files: None,
+            rag_rat_worktree: None,
+            shell: None,
+            push: None,
+            conversation: None,
+            ledger: None,
+            produces: None,
+        })
+        .await;
+        let raw = capturing.text();
+        drop(capturing);
+
+        assert!(matches!(failed, Err(AgentError::UnknownProvider(_))));
+        let span = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|record| {
+                record["spans"]
+                    .as_array()?
+                    .iter()
+                    .find(|span| span["name"] == "invoke_agent")
+                    .cloned()
+            })
+            .next_back()
+            .unwrap_or_else(|| panic!("the failed setup opened the turn's span; captured: {raw}"));
+        assert_eq!(span["otel.name"], "invoke_agent analyst");
+        assert_eq!(span["otel.status_code"], "ERROR", "{span}");
+        // The same mapping serves a client that could not initialize (`provider_client`), which is
+        // the missing-API-key case; both classes were previously unreachable in a trace.
+        assert_eq!(span["error.type"], "unknown_provider", "{span}");
     }
 
     /// A model that refuses every request, so the turn ends in an error.
