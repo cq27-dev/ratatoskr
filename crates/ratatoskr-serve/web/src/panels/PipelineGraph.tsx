@@ -177,7 +177,7 @@ function NodeFacts({
         {thinkingRequested && (
           <span
             className="node-icon"
-            data-tip={thinkingTip(telemetry?.reasoning_tokens)}
+            data-tip={thinkingTip(telemetry, live)}
           >
             <Brain size={13} aria-label="thinking" />
           </span>
@@ -234,13 +234,27 @@ function NodeFacts({
 /**
  * What the thinking marker says, given what the turn reported about its reasoning.
  *
- * Three states, not two. A count of zero is a MEASUREMENT — the endpoint was asked and answered
- * none — while an absent count means it reports no such figure at all, which is Anthropic's answer
- * for every turn because it bills thinking inside its output count. A truthiness check collapses
- * the two, which is the ambiguity the telemetry stopped asserting; the marker must not put it back
- * where a person actually reads it.
+ * Four states, because absence means two different things and only one of them is about the
+ * endpoint. A count of zero is a MEASUREMENT — the endpoint was asked and answered none — while an
+ * absent count on a turn that HAS reported its cost means the endpoint reports no such figure at
+ * all, which is Anthropic's answer for every turn because it bills thinking inside its output
+ * count. A truthiness check collapses those two, and so does treating a node whose cost has not
+ * arrived yet as either of them: a live node makes no claim about its endpoint until one of its
+ * turns has answered.
  */
-export function thinkingTip(reasoning: number | null | undefined): string {
+export function thinkingTip(
+  telemetry: Pick<NodeTelemetry, "reasoning_tokens"> | undefined,
+  live: Pick<DerivedNode, "telemetry" | "costed"> | undefined,
+): string {
+  // The same sources in the same order as the flag beside it, because a checkpoint is absent until
+  // a node finishes: reading only that made a live turn's reported figure — zero or otherwise —
+  // render as an endpoint that reports none.
+  const reasoning = telemetry?.reasoning_tokens ?? live?.telemetry?.reasoning_tokens ?? null;
+  // Whether any cost report has arrived at all, from either.
+  const costReported = telemetry != null || live?.costed === true;
+  if (reasoning == null && !costReported) {
+    return "Thinking: this node is not stopped from reasoning before it answers, and has not reported what this turn spent yet";
+  }
   if (reasoning == null) {
     return "Thinking: this node is not stopped from reasoning before it answers (whether it does is the endpoint's call, and this endpoint reports no reasoning figure at all)";
   }

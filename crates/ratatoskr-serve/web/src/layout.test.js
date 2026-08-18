@@ -638,16 +638,41 @@ test("the thinking marker tells a measured zero from a figure nobody reported", 
   // The two states the telemetry stopped conflating, at the surface a person actually reads. A
   // truthiness check put them back together: a measured zero took the same text as an absent count,
   // so the one endpoint that answers "none" looked like the one that never answers at all.
-  expect(thinkingTip(700)).toContain("700 reasoning tokens");
+  const recorded = (reasoning_tokens) => ({ reasoning_tokens });
+  expect(thinkingTip(recorded(700), undefined)).toContain("700 reasoning tokens");
 
-  const measuredZero = thinkingTip(0);
+  const measuredZero = thinkingTip(recorded(0), undefined);
   expect(measuredZero).toContain("reported 0 reasoning tokens");
 
   // Absent, in both spellings the wire produces: the field is omitted, which parses as undefined,
   // and normalised to null inside the fold.
   for (const absent of [null, undefined]) {
-    const tip = thinkingTip(absent);
+    const tip = thinkingTip(recorded(absent), undefined);
     expect(tip).toContain("no reasoning figure at all");
     expect(tip).not.toBe(measuredZero);
   }
+});
+
+test("a node that has not reported its cost yet makes no claim about its endpoint", () => {
+  // A checkpoint is absent until a node finishes, so a live node's marker read as "this endpoint
+  // reports no reasoning figure at all" while its first turn was still running — a claim about the
+  // endpoint made before anything had asked it.
+  const pending = thinkingTip(undefined, { telemetry: null, costed: false });
+  expect(pending).toContain("not reported what this turn spent yet");
+  expect(pending).not.toContain("no reasoning figure at all");
+  // A node nothing is known about at all reads the same way, rather than as an endpoint claim.
+  expect(thinkingTip(undefined, undefined)).toBe(pending);
+
+  // And once a turn answers, the marker says what it answered — including a zero, and including
+  // while the node is still live and only the stream has the figure.
+  const streamed = (reasoning_tokens) => ({
+    telemetry: { reasoning_tokens },
+    costed: true,
+  });
+  expect(thinkingTip(undefined, streamed(0))).toContain("reported 0 reasoning tokens");
+  expect(thinkingTip(undefined, streamed(700))).toContain("700 reasoning tokens");
+  // A live turn that reported a cost and no reasoning figure is the endpoint's answer, not a gap.
+  expect(thinkingTip(undefined, streamed(null))).toContain("no reasoning figure at all");
+  // The checkpoint wins where it has an answer of its own.
+  expect(thinkingTip({ reasoning_tokens: 12 }, streamed(700))).toContain("12 reasoning tokens");
 });
