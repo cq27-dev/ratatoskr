@@ -146,6 +146,11 @@ pub struct WorkflowContext {
     /// `characterizer`. Rebuilding it per path is what let an override validate at startup and then
     /// be ignored by the model turn that actually ran.
     stages: ExecutionStages,
+    /// The agent profiles this run's stages resolve against: the bundled workflow's declared
+    /// profiles with the running workflow's laid over them. Beside [`Self::stages`] and shaped
+    /// like it, for the same reason: one resolution, shared by the executor, the clarifier,
+    /// enablement and validation — a second resolution is a second answer.
+    agents: ExecutionAgents,
 }
 
 /// The one stage registry a run executes, resolved once and shared by everything that has to answer
@@ -155,6 +160,27 @@ pub struct WorkflowContext {
 /// answering out of the compiled-in table while the executor ran the overlaid registry is exactly
 /// how one run came to route the same node two different ways.
 pub(crate) type ExecutionStages = Arc<tokio::sync::OnceCell<Arc<Vec<Stage>>>>;
+
+/// The agent profiles a run resolves against, resolved once beside [`ExecutionStages`].
+pub(crate) type ExecutionAgents = Arc<tokio::sync::OnceCell<Arc<Vec<crate::stage::AgentProfile>>>>;
+
+/// This run's agent profiles, falling back to the bundled workflow's declarations — the same
+/// fallback, for the same turns, as [`execution_stages`].
+pub(crate) async fn execution_agents(
+    agents: &ExecutionAgents,
+) -> Result<Arc<Vec<crate::stage::AgentProfile>>, PlanError> {
+    agents
+        .get_or_try_init(|| async { Ok(Arc::new(standard_agents().await?)) })
+        .await
+        .cloned()
+}
+
+/// The bundled workflow's declared agent profiles — the base every run's table is laid over,
+/// exactly as `standard_stages` is the registry's base.
+pub(crate) async fn standard_agents() -> Result<Vec<crate::stage::AgentProfile>, PlanError> {
+    let runtime = standard_runtime().await?;
+    Ok(crate::stage::agents_from_workflow(runtime.meta()))
+}
 
 /// This run's registry, falling back to the bundled standard one. See [`WorkflowContext::stages`]
 /// for when that fallback is the right answer.
@@ -221,6 +247,7 @@ impl WorkflowContext {
         // One registry cell, shared with the clarifier: it must answer for the stage this run
         // executes, not for the compiled-in stage of the same name.
         let stages: ExecutionStages = Arc::default();
+        let agents: ExecutionAgents = Arc::default();
         let clarifier = crate::clarify::NodeClarifier::new(
             config,
             store,
@@ -228,6 +255,7 @@ impl WorkflowContext {
             run_id,
             issue,
             Arc::clone(&stages),
+            Arc::clone(&agents),
         );
         let configured_servers = configured.to_vec();
         Ok(Arc::new(Self {
@@ -260,6 +288,7 @@ impl WorkflowContext {
             iterations: AtomicU32::new(0),
             standard_runtimes: Mutex::new(Vec::new()),
             standard_runtimes_built: AtomicUsize::new(0),
+            agents,
         }))
     }
 
@@ -357,6 +386,11 @@ impl WorkflowContext {
     pub(crate) async fn stages(&self) -> Result<Arc<Vec<Stage>>, PlanError> {
         execution_stages(&self.stages).await
     }
+
+    /// This run's agent profiles — the same one-resolution rule as [`Self::stages`].
+    pub(crate) async fn agents(&self) -> Result<Arc<Vec<crate::stage::AgentProfile>>, PlanError> {
+        execution_agents(&self.agents).await
+    }
 }
 
 /// Resolve the registry this run executes and install it on the context, once.
@@ -368,10 +402,26 @@ async fn install_execution_stages(
     ctx: &WorkflowContext,
     runtime: &WorkflowRuntime,
 ) -> Result<Arc<Vec<Stage>>, PlanError> {
+    ctx.agents
+        .get_or_try_init(|| async { Ok::<_, PlanError>(Arc::new(overlaid_agents(runtime).await?)) })
+        .await?;
     ctx.stages
         .get_or_try_init(|| async { Ok(Arc::new(overlaid_stages(runtime).await?)) })
         .await
         .cloned()
+}
+
+async fn overlaid_agents(
+    runtime: &WorkflowRuntime,
+) -> Result<Vec<crate::stage::AgentProfile>, PlanError> {
+    let mut agents = standard_agents().await?;
+    if !runtime.is_bundled() {
+        crate::stage::overlay_agents(
+            &mut agents,
+            crate::stage::agents_from_workflow(runtime.meta()),
+        );
+    }
+    Ok(agents)
 }
 
 async fn overlaid_stages(runtime: &WorkflowRuntime) -> Result<Vec<Stage>, PlanError> {
@@ -665,14 +715,16 @@ async fn build_red_team(
 ) -> Result<RedTeamNode, PlanError> {
     let short: String = ctx.run_id.chars().take(8).collect();
     let stages = ctx.stages().await?;
+    let agents = ctx.agents().await?;
     // Enablement only, and each half on its own stage. Each drives its turn through the stage
     // executor, which resolves route, tools, ceiling and prompt from the run's registry — the
     // classifier from `redteam_classifier`, the author from `redteam_author`, whose own `write`
     // ceiling is what keeps the classifier's read ceiling from disarming it. So the gate has to
     // ask about the same stage the turn will run: a single answer under the shared `redteam`
     // governance name decides for whichever stage it reached first, and is wrong for the other.
-    let enabled =
-        |stage_id| crate::red_team_half_enabled(&ctx.engine, &ctx.config, &stages, stage_id);
+    let enabled = |stage_id| {
+        crate::red_team_half_enabled(&ctx.engine, &ctx.config, &stages, &agents, stage_id)
+    };
     let classifier = enabled("redteam_classifier").then(|| redteam::RedTeamClassifier {
         declared_context: Arc::clone(ctx),
     });
@@ -686,6 +738,7 @@ async fn build_red_team(
             &ctx.engine,
             &ctx.config,
             &stages,
+            &ctx.agents().await?,
             Some(Arc::clone(ctx)),
         )?,
         repo_path: ctx.repo_path.clone(),
@@ -841,6 +894,7 @@ async fn build_implementer(
             &ctx.engine,
             &ctx.config,
             &stages,
+            &ctx.agents().await?,
             Some(Arc::clone(ctx)),
         )
         .ok()
@@ -912,10 +966,18 @@ async fn referee_judgement(
             return Vec::new();
         }
     };
+    let agents = match ctx.agents().await {
+        Ok(agents) => agents,
+        Err(error) => {
+            tracing::warn!("the referee could not resolve this run's agents: {error}");
+            return Vec::new();
+        }
+    };
     let violations = match referee::judge(referee::Judgement {
         engine: &ctx.engine,
         config: &ctx.config,
         stages: &stages,
+        agents: &agents,
         ledger: &ctx.ledger,
         issue: &ctx.issue,
         requirements: &analyst.requirements,
@@ -1470,7 +1532,12 @@ async fn verify_host(
         })
         .map_err(|e| e.to_string())
     };
-    if !crate::verifier_enabled(&ctx.engine, &ctx.config, executor.stages.as_slice()) {
+    if !crate::verifier_enabled(
+        &ctx.engine,
+        &ctx.config,
+        executor.stages.as_slice(),
+        &ctx.agents().await.map_err(|e| e.to_string())?,
+    ) {
         return none(false, false);
     }
     let worktree = ctx
@@ -2227,16 +2294,18 @@ impl StageExecutor {
         {
             offered.add_local(ratatoskr_agent::publish::push_declaration());
         }
-        let (mut cfg, profile) = crate::plugins::declared_stage_agent_config(
-            &self.ctx.engine,
-            &self.ctx.config,
-            offered,
-            &stage,
-            &default_tools,
-            &plugins,
-            capability_ceiling,
-        )
-        .map_err(|e| e.to_string())?;
+        let (mut cfg, profile) =
+            crate::plugins::declared_stage_agent_config(crate::plugins::StageAgentInputs {
+                engine: &self.ctx.engine,
+                config: &self.ctx.config,
+                tools: offered,
+                stage: &stage,
+                agents: &self.ctx.agents().await.map_err(|e| e.to_string())?,
+                default_tools: &default_tools,
+                plugins: &plugins,
+                invocation_ceiling: capability_ceiling,
+            })
+            .map_err(|e| e.to_string())?;
         cfg.route.session = stage.session_scope(cfg.route.session);
 
         // Delegation folds the child's evidence into the parent's runtime input on the way to the
@@ -2270,7 +2339,10 @@ impl StageExecutor {
                     )
                 })?
                 .clone();
-            let target_profile = crate::agent_profiles(&self.ctx.config)
+            let declared = execution_agents(&self.ctx.agents)
+                .await
+                .map_err(|e| e.to_string())?;
+            let target_profile = crate::agent_profiles(&declared, &self.ctx.config)
                 .into_iter()
                 .find(|candidate| candidate.id == target.agent)
                 .ok_or_else(|| format!("stage `{}` has no agent `{}`", target.id, target.agent))?;
@@ -3743,10 +3815,14 @@ mod tests {
         let mut stage = crate::stage::stage_fixture("analyst", "reason");
         stage.instructions = "stage instructions".to_string();
         stage.context = "stage context".to_string();
-        let mut profile = crate::built_in_agents()
-            .into_iter()
-            .find(|profile| profile.id == "reason")
-            .unwrap();
+        let mut profile = crate::AgentProfile {
+            id: "reason".to_string(),
+            model: None,
+            base_prompt: String::new(),
+            capabilities: vec![ratatoskr_core::Capability::Read],
+            tool_policy: None,
+            max_turns: None,
+        };
         profile.base_prompt = "agent prompt".to_string();
         let skills = [ratatoskr_plugin::Skill {
             name: "review-skill".to_string(),
@@ -6729,8 +6805,9 @@ mod tests {
         );
 
         let standard = standard_stages().await.unwrap();
+        let agents = standard_agents().await.unwrap();
         assert!(
-            !crate::verifier_enabled(&engine, &config, &standard),
+            !crate::verifier_enabled(&engine, &config, &standard, &agents),
             "without the override there is nowhere for the verifier to run"
         );
         let stages = overlaid_stages(&runtime).await.unwrap();
@@ -6742,7 +6819,7 @@ mod tests {
             Some("reason")
         );
         assert!(
-            crate::verifier_enabled(&engine, &config, &stages),
+            crate::verifier_enabled(&engine, &config, &stages, &agents),
             "the registry the run executes decides, so the override's profile enables review"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -7067,6 +7144,7 @@ mod tests {
             &workflow_path,
             r#"defineWorkflow({
                  name: "ours",
+                 agents: { shipwright: { capabilities: ["write"] } },
                  stages: [
                    stage("implementer_attempt", {
                      agent: "shipwright",
@@ -7106,7 +7184,6 @@ mod tests {
                     model: "shipwright-model".to_string(),
                     ..model_route()
                 }),
-                capabilities: vec![ratatoskr_core::Capability::Write],
                 ..Default::default()
             },
         );

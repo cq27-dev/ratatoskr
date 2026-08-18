@@ -684,16 +684,31 @@ fn node_agent_config(
 /// round. Without it the narrowing below would answer to the stage's own ceiling alone, and a
 /// declaration naming a mutating MCP tool (`memory_update`, say, whose declared capability is
 /// `Write`) would be offered it on a turn whose stated grant is read-only.
+pub(crate) struct StageAgentInputs<'a> {
+    pub engine: &'a Arc<ScriptEngine>,
+    pub config: &'a RatatoskrConfig,
+    pub tools: ToolSet,
+    pub stage: &'a Stage,
+    pub agents: &'a [AgentProfile],
+    pub default_tools: &'a [&'a str],
+    pub plugins: &'a NodePlugins,
+    pub invocation_ceiling: Capability,
+}
+
 pub(crate) fn declared_stage_agent_config(
-    engine: &Arc<ScriptEngine>,
-    config: &RatatoskrConfig,
-    tools: ToolSet,
-    stage: &Stage,
-    default_tools: &[&str],
-    plugins: &NodePlugins,
-    invocation_ceiling: Capability,
+    inputs: StageAgentInputs<'_>,
 ) -> Result<(NodeAgentConfig, AgentProfile), PlanError> {
-    let profile = agent_profiles(config)
+    let StageAgentInputs {
+        engine,
+        config,
+        tools,
+        stage,
+        agents,
+        default_tools,
+        plugins,
+        invocation_ceiling,
+    } = inputs;
+    let profile = agent_profiles(agents, config)
         .into_iter()
         .find(|profile| profile.id == stage.agent)
         .ok_or_else(|| {
@@ -803,15 +818,16 @@ mod tests {
         let config = RatatoskrConfig::default();
 
         let default_engine = binding_engine("exa-default-denied", "").await;
-        let default = declared_stage_agent_config(
-            &default_engine,
-            &config,
-            tools.clone(),
-            &analyst_stage().await,
-            &["semantic_search"],
-            &NodePlugins::default(),
-            ratatoskr_core::Capability::Publish,
-        )
+        let default = declared_stage_agent_config(StageAgentInputs {
+            engine: &default_engine,
+            config: &config,
+            tools: tools.clone(),
+            stage: &analyst_stage().await,
+            agents: &crate::workflow::standard_agents().await.unwrap(),
+            default_tools: &["semantic_search"],
+            plugins: &NodePlugins::default(),
+            invocation_ceiling: ratatoskr_core::Capability::Publish,
+        })
         .unwrap()
         .0;
         assert!(
@@ -834,15 +850,16 @@ mod tests {
             r#"defineAgent("analyst", { tools: { allow: ["semantic_search"] } });"#,
         )
         .await;
-        let explicit = declared_stage_agent_config(
-            &explicit_engine,
-            &config,
+        let explicit = declared_stage_agent_config(StageAgentInputs {
+            engine: &explicit_engine,
+            config: &config,
             tools,
-            &analyst_stage().await,
-            &["semantic_search"],
-            &NodePlugins::default(),
-            ratatoskr_core::Capability::Publish,
-        )
+            stage: &analyst_stage().await,
+            agents: &crate::workflow::standard_agents().await.unwrap(),
+            default_tools: &["semantic_search"],
+            plugins: &NodePlugins::default(),
+            invocation_ceiling: ratatoskr_core::Capability::Publish,
+        })
         .unwrap()
         .0;
         assert_eq!(explicit.tools.names(), vec!["semantic_search"]);
@@ -869,15 +886,16 @@ mod tests {
         let config = RatatoskrConfig::default();
         let engine = binding_engine("configured-read-collision", "").await;
 
-        let configured = declared_stage_agent_config(
-            &engine,
-            &config,
+        let configured = declared_stage_agent_config(StageAgentInputs {
+            engine: &engine,
+            config: &config,
             tools,
-            &analyst_stage().await,
-            &[ratatoskr_agent::files::READ],
-            &NodePlugins::default(),
-            ratatoskr_core::Capability::Publish,
-        )
+            stage: &analyst_stage().await,
+            agents: &crate::workflow::standard_agents().await.unwrap(),
+            default_tools: &[ratatoskr_agent::files::READ],
+            plugins: &NodePlugins::default(),
+            invocation_ceiling: ratatoskr_core::Capability::Publish,
+        })
         .unwrap()
         .0;
 
@@ -972,6 +990,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_profile_policy_applies_to_every_stage_using_the_profile() {
+        let agents = crate::workflow::standard_agents().await.unwrap();
         let engine = binding_engine("profile-policy", "").await;
         let mut config = RatatoskrConfig::default();
         config.agents.insert(
@@ -991,15 +1010,16 @@ mod tests {
                 .find(|stage| stage.id == id)
                 .expect("a standard stage");
             assert_eq!(stage.agent, "reason", "`{id}` selects the patched profile");
-            let (cfg, _) = declared_stage_agent_config(
-                &engine,
-                &config,
-                ToolSet::default(),
+            let (cfg, _) = declared_stage_agent_config(StageAgentInputs {
+                engine: &engine,
+                config: &config,
+                tools: ToolSet::default(),
                 stage,
-                &[],
-                &NodePlugins::default(),
-                ratatoskr_core::Capability::Publish,
-            )
+                agents: &agents,
+                default_tools: &[],
+                plugins: &NodePlugins::default(),
+                invocation_ceiling: ratatoskr_core::Capability::Publish,
+            })
             .unwrap();
             assert!(matches!(
                 cfg.policy.unwrap().decide("Write", "{}").await,
@@ -1010,6 +1030,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_invocations_ceiling_narrows_mcp_tools_a_declaration_widened_to() {
+        let agents = crate::workflow::standard_agents().await.unwrap();
         // `verify()` hands the review turn a `Read` grant. A declaration that raises the stage's
         // own ceiling to `write` and names a mutating rag-rat tool must still not be offered it:
         // the bound belongs to the invocation, and it has to reach the MCP narrowing seam and not
@@ -1043,15 +1064,16 @@ mod tests {
         widened.tools = vec!["memory_update".to_string()];
 
         let offered = |ceiling| {
-            let (cfg, _) = declared_stage_agent_config(
-                &engine,
-                &config,
-                tools.clone(),
-                &widened,
-                &["memory_update"],
-                &NodePlugins::default(),
-                ceiling,
-            )
+            let (cfg, _) = declared_stage_agent_config(StageAgentInputs {
+                engine: &engine,
+                config: &config,
+                tools: tools.clone(),
+                stage: &widened,
+                agents: &agents,
+                default_tools: &["memory_update"],
+                plugins: &NodePlugins::default(),
+                invocation_ceiling: ceiling,
+            })
             .unwrap();
             cfg.tools.names()
         };
@@ -1076,6 +1098,7 @@ mod tests {
 
     #[tokio::test]
     async fn redteam_test_author_retains_its_write_tools() {
+        let agents = crate::workflow::standard_agents().await.unwrap();
         // The author and the classifier share the `redteam` governance identity, and the
         // classifier's stage is read-only. The author keeps its editing tools because the ceiling
         // that narrows them is its own stage's, resolved per turn from the run's registry — not
@@ -1093,15 +1116,16 @@ mod tests {
         tools.add_local_tools(ratatoskr_agent::files::edit_declarations());
 
         let default_tools = author.tools.iter().map(String::as_str).collect::<Vec<_>>();
-        let (cfg, _) = declared_stage_agent_config(
-            &engine,
-            &config,
+        let (cfg, _) = declared_stage_agent_config(StageAgentInputs {
+            engine: &engine,
+            config: &config,
             tools,
-            author,
-            &default_tools,
-            &NodePlugins::default(),
-            ratatoskr_core::Capability::Publish,
-        )
+            stage: author,
+            agents: &agents,
+            default_tools: &default_tools,
+            plugins: &NodePlugins::default(),
+            invocation_ceiling: ratatoskr_core::Capability::Publish,
+        })
         .unwrap();
 
         for required in [ratatoskr_agent::files::WRITE, ratatoskr_agent::files::EDIT] {

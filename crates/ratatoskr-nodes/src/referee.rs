@@ -191,6 +191,8 @@ pub(crate) struct Judgement<'a> {
     /// The registry this run executes, so the verifier fallback resolves against the stage that
     /// will actually review rather than a fixed table.
     pub stages: &'a [crate::Stage],
+    /// The run's agent profiles, beside the registry for the same reason.
+    pub agents: &'a [crate::AgentProfile],
     pub ledger: &'a Arc<RunLedger>,
     pub issue: &'a str,
     pub requirements: &'a [String],
@@ -205,13 +207,14 @@ pub(crate) async fn judge(
         engine,
         config,
         stages,
+        agents,
         ledger,
         issue,
         requirements,
         implementer,
         worktree,
     } = judgement;
-    let Some(route) = crate::referee_route(engine, config, stages) else {
+    let Some(route) = crate::referee_route(engine, config, stages, agents) else {
         tracing::info!("no referee or verifier route configured; trusting test results alone");
         return Ok(None);
     };
@@ -631,6 +634,7 @@ rename to src/new.rs
             engine: &engine,
             config: &config,
             stages: &[crate::stage::stage_fixture("verifier", "explore")],
+            agents: &crate::workflow::standard_agents().await.unwrap(),
             ledger: &ledger,
             issue: "the issue",
             requirements: &["keep the tests intact".to_string()],
@@ -669,6 +673,7 @@ rename to src/new.rs
             engine: &engine,
             config: &config,
             stages: &[crate::stage::stage_fixture("verifier", "explore")],
+            agents: &crate::workflow::standard_agents().await.unwrap(),
             ledger: &ledger,
             issue: "the issue",
             requirements: &[],
@@ -684,6 +689,7 @@ rename to src/new.rs
             engine: &engine,
             config: &config,
             stages: &[crate::stage::stage_fixture("verifier", "explore")],
+            agents: &crate::workflow::standard_agents().await.unwrap(),
             ledger: &ledger,
             issue: "the issue",
             requirements: &[],
@@ -711,6 +717,7 @@ rename to src/new.rs
             engine: &engine,
             config: &config,
             stages: &[crate::stage::stage_fixture("verifier", "explore")],
+            agents: &crate::workflow::standard_agents().await.unwrap(),
             ledger: &ledger,
             issue: "the issue",
             requirements: &[],

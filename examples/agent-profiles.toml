@@ -1,34 +1,16 @@
-# Reusable agent profiles for a workflow that declares its own stages.
+# Deployment routes for agent profiles a workflow declares.
 #
-# Copy these tables into `ratatoskr.toml` after choosing the provider and model routes that suit
-# the repository. A profile's `model` takes precedence over `[models.<stage>]`; omit it for a
-# built-in profile when its stages should keep their existing stage-keyed routes. `capabilities`
-# is an authority ceiling, so a stage can request less reach but never more.
+# An agent profile's *structure* — its base prompt, capability ceiling, and turn cap — lives in the
+# workflow that uses it (`agents:` in `defineWorkflow`, see `examples/workflow.ts`). The TOML side
+# carries only what is deployment's to decide: which model serves the profile. A structural key
+# here (`capabilities`, `base_prompt`, `max_turns`) fails config load rather than silently
+# overriding the workflow.
+#
+# A profile's `model` takes precedence over `[models.<stage>]`; omit the table entirely for a
+# profile whose stages should keep their existing stage-keyed routes.
 
-[agents.explore]
-capabilities = ["read"]
-base_prompt = "Inspect the repository before drawing conclusions."
-
-[agents.reason]
-capabilities = ["read"]
-base_prompt = "State concrete requirements and uncertainties from the evidence."
-
-[agents.build]
-capabilities = ["write"]
-base_prompt = "Make the smallest complete change and verify it."
-max_turns = 100
-
-[agents.publish]
-capabilities = ["publish"]
-base_prompt = "Describe the completed change accurately and concisely."
-
-# `examples/workflow.ts` uses this profile for its `requirements` stage. It has its own route so
-# adding that stage does not change how the built-in stages resolve their existing model routes.
-[agents.requirements]
-capabilities = ["read"]
-base_prompt = "Extract the task's non-negotiable requirements before implementation planning."
-max_turns = 24
-
+# `examples/workflow.ts` declares the `requirements` profile. Routing it here gives its stage its
+# own model without changing how the built-in stages resolve theirs.
 [agents.requirements.model]
 provider = "anthropic"
 model = "claude-sonnet-4-6"

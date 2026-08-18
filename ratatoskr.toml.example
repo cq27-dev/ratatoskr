@@ -160,23 +160,15 @@ model = "claude-opus-4-8"
 provider = "moonshot"
 model = "kimi-k2.5"
 
-# Optional reusable agent profiles. They separate reusable model/prompt/authority defaults from
-# stable stage identities and checkpoint names. A profile model overrides `[models.<stage>]`; omit
-# it to retain the existing stage-keyed route. See `examples/agent-profiles.toml` for a complete
-# configuration, including a dedicated profile for a declared workflow stage.
+# Optional model routes for agent profiles. A profile's *structure* — base prompt, capability
+# ceiling, turn cap — is declared by the workflow that uses it (`agents:` in `defineWorkflow`);
+# this file only decides which model serves it. A profile model overrides `[models.<stage>]`; omit
+# it to retain the existing stage-keyed route. A structural key here fails config load. See
+# `examples/agent-profiles.toml` for routing a declared workflow's own profile.
 #
-# [agents.explore]
-# capabilities = ["read"]
-# base_prompt = "Inspect the repository before drawing conclusions."
-#
-# [agents.reason]
-# capabilities = ["read"]
-#
-# [agents.build]
-# capabilities = ["write"]
-#
-# [agents.publish]
-# capabilities = ["publish"]
+# [agents.build.model]
+# provider = "anthropic"
+# model = "claude-opus-4-8"
 
 # Optional: with a [models.redteam] route set, red-team adds one LLM pass classifying each baseline
 # failure as flaky vs real (an additive field; the deterministic pass/fail is untouched). Omit to
@@ -232,12 +224,6 @@ verify_threshold = "P2"
 # `no_code_change` instead of paying for a baseline test run and an implementer session to produce
 # an empty diff. Set this to override that judgement; it only ever adds the fork back.
 always_fork = false
-
-# The standard implementer stage uses the reusable build profile. Its capability is an authority
-# ceiling, and max_turns bounds each initial or convergence attempt independently.
-[agents.build]
-capabilities = ["write"]
-max_turns = 100
 
 # Phase 3: red-team and implementer run the repo's tests in a sandbox.
 [sandbox]

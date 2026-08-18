@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use ratatoskr_core::{
-    AgentProfileConfig, Capability, ModelRoute, SessionScope, ToolPolicy,
+    Capability, ModelRoute, SessionScope, ToolPolicy,
     shape::{Recorded, RunStage, ShapeNode},
 };
 
@@ -19,17 +19,6 @@ pub struct AgentProfile {
 }
 
 impl AgentProfile {
-    pub fn from_config(id: impl Into<String>, config: AgentProfileConfig) -> Self {
-        Self {
-            id: id.into(),
-            model: config.model,
-            base_prompt: config.base_prompt,
-            capabilities: config.capabilities,
-            tool_policy: config.tool_policy,
-            max_turns: config.max_turns,
-        }
-    }
-
     pub fn ceiling(&self) -> Option<Capability> {
         Capability::ceiling(&self.capabilities)
     }
@@ -147,62 +136,61 @@ pub struct Delegation {
 /// The built-in reusable profiles. Routes stay stage-keyed unless a repository opts into profiles:
 /// `[models.<stage>]` and `.ratatoskr/rules/<stage>.ts` are the documented way to route one node,
 /// and a profile is the way to route several at once — not a replacement for either.
-pub fn built_in_agents() -> Vec<AgentProfile> {
-    vec![
-        AgentProfile {
-            id: "explore".into(),
+/// The agent profiles a workflow declared, in the shape the run resolves them.
+///
+/// Structure only: the model stays `None` here, because which model a profile runs on is
+/// deployment's — [`agent_profiles`] lays `ratatoskr.toml`'s route over these.
+pub fn agents_from_workflow(meta: &ratatoskr_script::workflow::WorkflowMeta) -> Vec<AgentProfile> {
+    let mut declared: Vec<AgentProfile> = meta
+        .agents
+        .iter()
+        .map(|(id, agent)| AgentProfile {
+            id: id.clone(),
             model: None,
-            base_prompt: String::new(),
-            capabilities: vec![Capability::Read],
+            base_prompt: agent.base_prompt.clone(),
+            capabilities: agent.capabilities.clone(),
             tool_policy: None,
-            max_turns: None,
-        },
-        AgentProfile {
-            id: "reason".into(),
-            model: None,
-            base_prompt: String::new(),
-            capabilities: vec![Capability::Read],
-            tool_policy: None,
-            max_turns: None,
-        },
-        AgentProfile {
-            id: "transcribe".into(),
-            model: None,
-            base_prompt: String::new(),
-            capabilities: Vec::new(),
-            tool_policy: None,
-            max_turns: None,
-        },
-        AgentProfile {
-            id: "build".into(),
-            model: None,
-            base_prompt: String::new(),
-            capabilities: vec![Capability::Write],
-            tool_policy: None,
-            max_turns: None,
-        },
-        AgentProfile {
-            id: "publish".into(),
-            model: None,
-            base_prompt: String::new(),
-            capabilities: vec![Capability::Publish],
-            tool_policy: None,
-            max_turns: None,
-        },
-    ]
+            max_turns: agent.max_turns,
+        })
+        .collect();
+    // Deterministic order for error listings; a map's iteration order is nobody's contract.
+    declared.sort_by(|a, b| a.id.cmp(&b.id));
+    declared
 }
 
-/// Built-in stage identities are intentionally the historic checkpoint names.
-pub fn agent_profiles(config: &ratatoskr_core::RatatoskrConfig) -> Vec<AgentProfile> {
-    let mut profiles = built_in_agents();
-    for (id, profile) in &config.agents {
-        if let Some(existing) = profiles.iter_mut().find(|existing| existing.id == *id) {
-            *existing = AgentProfile::from_config(id, profile.clone());
+/// Lay a workflow's declared profiles over the bundled base, by id — the same relation
+/// [`overlay`] gives stages: the base is always present, and a declaration wins over it.
+pub fn overlay_agents(base: &mut Vec<AgentProfile>, declared: Vec<AgentProfile>) {
+    for profile in declared {
+        if let Some(existing) = base.iter_mut().find(|existing| existing.id == profile.id) {
+            *existing = profile;
         } else {
-            profiles.push(AgentProfile::from_config(id, profile.clone()));
+            base.push(profile);
         }
     }
-    profiles
+}
+
+/// The run's profiles with deployment's half laid on: `[agents.<id>]` in `ratatoskr.toml`
+/// decides which model a profile runs on, and nothing else about it.
+pub fn agent_profiles(
+    declared: &[AgentProfile],
+    config: &ratatoskr_core::RatatoskrConfig,
+) -> Vec<AgentProfile> {
+    declared
+        .iter()
+        .cloned()
+        .map(|mut profile| {
+            if let Some(deployed) = config.agents.get(&profile.id) {
+                if deployed.model.is_some() {
+                    profile.model.clone_from(&deployed.model);
+                }
+                if deployed.tool_policy.is_some() {
+                    profile.tool_policy.clone_from(&deployed.tool_policy);
+                }
+            }
+            profile
+        })
+        .collect()
 }
 
 /// Resolve the profile of the stage that runs under `node` in `stages`.
@@ -219,10 +207,11 @@ pub fn agent_profiles(config: &ratatoskr_core::RatatoskrConfig) -> Vec<AgentProf
 pub fn profile_for(
     config: &ratatoskr_core::RatatoskrConfig,
     stages: &[Stage],
+    agents: &[AgentProfile],
     node: &str,
 ) -> Option<AgentProfile> {
     let stage = for_node(stages, node)?;
-    agent_profiles(config)
+    agent_profiles(agents, config)
         .into_iter()
         .find(|profile| profile.id == stage.agent)
 }
@@ -379,6 +368,7 @@ mod tests {
             purpose: String::new(),
             when_to_use: Vec::new(),
             nodes: Vec::new(),
+            agents: Default::default(),
             stages: vec![ratatoskr_script::workflow::WorkflowStage {
                 id: "review".to_string(),
                 agent: "reason".to_string(),

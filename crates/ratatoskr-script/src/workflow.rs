@@ -124,7 +124,7 @@ globalThis.defineWorkflow = function (meta) {
         throw new Error("defineWorkflow: `name` is required");
     }
     for (var k in meta) {
-        if (k !== "name" && k !== "purpose" && k !== "whenToUse" && k !== "nodes" && k !== "stages" && k !== "layout") {
+        if (k !== "name" && k !== "purpose" && k !== "whenToUse" && k !== "nodes" && k !== "stages" && k !== "layout" && k !== "agents") {
             throw new Error("defineWorkflow: unknown key '" + k + "'");
         }
     }
@@ -156,7 +156,8 @@ globalThis.defineWorkflow = function (meta) {
         whenToUse: meta.whenToUse || [],
         nodes: meta.nodes || [],
         stages: stages,
-        layout: meta.layout || []
+        layout: meta.layout || [],
+        agents: meta.agents || {}
     };
 };
 globalThis.__workflowMeta = function () {
@@ -249,6 +250,17 @@ pub struct WorkflowMeta {
     /// Ordered user-defined stages. Their contracts are checked at startup before a run starts.
     #[serde(default)]
     pub stages: Vec<WorkflowStage>,
+    /// The agent profiles this workflow's stages run as, keyed by the name a stage's `agent:`
+    /// names.
+    ///
+    /// Structure, not deployment: what an agent may do, the guidance it starts from, how long it
+    /// may run. Which MODEL a profile runs on stays in `ratatoskr.toml` — the route is the
+    /// deployment's — and a `model` key here is refused for exactly that reason. Declared beside
+    /// the stages that depend on them, so a shared pipeline carries its own definitions; the
+    /// standard profiles are `agents` in `ratatoskr/nodes`, imported and overridden like the
+    /// stage definitions are.
+    #[serde(default)]
+    pub agents: std::collections::HashMap<String, WorkflowAgent>,
     /// Where this workflow's nodes sit when a run of it is drawn, in column order.
     ///
     /// Column order is meaningful, and is the only edge relation the drawn graph has: adjacent
@@ -278,6 +290,21 @@ pub struct WorkflowLayoutColumn {
     /// it was never asked.
     #[serde(default)]
     pub optional: bool,
+}
+
+/// One agent profile a workflow declares; see [`WorkflowMeta::agents`].
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAgent {
+    /// Guidance every stage running as this agent starts from, ahead of the stage's own text.
+    #[serde(default, rename = "basePrompt")]
+    pub base_prompt: String,
+    /// The profile's capability ceiling — what a stage running as it may at most do.
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+    /// The most model turns one invocation may take.
+    #[serde(default, rename = "maxTurns")]
+    pub max_turns: Option<usize>,
 }
 
 /// A serializable stage declaration kept in the script crate so workflow metadata remains independent
@@ -611,6 +638,7 @@ impl WorkflowRuntime {
             when_to_use: Vec::new(),
             nodes: Vec::new(),
             stages: Vec::new(),
+            agents: std::collections::HashMap::new(),
             layout: Vec::new(),
         });
 
@@ -2931,6 +2959,47 @@ export async function plan(i) { return { entryRan: true }; }
             Ok(_) => panic!("`layouts` is not a key `defineWorkflow` knows"),
         };
         assert!(error.contains("unknown key 'layouts'"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_declared_agent_carries_structure_and_refuses_a_route() {
+        let dir = scratch("workflow-agents");
+        std::fs::write(
+            dir.join("staffed.ts"),
+            r#"defineWorkflow({
+                 name: "staffed",
+                 agents: {
+                   librarian: { basePrompt: "Catalogue first.", capabilities: ["read"], maxTurns: 9 },
+                   mute: {},
+                 },
+               });"#,
+        )
+        .unwrap();
+        let found = WorkflowRuntime::discover(&dir, &[]).await.unwrap();
+        let agents = &found[0].meta().agents;
+        let librarian = &agents["librarian"];
+        assert_eq!(librarian.base_prompt, "Catalogue first.");
+        assert_eq!(librarian.capabilities, vec![Capability::Read]);
+        assert_eq!(librarian.max_turns, Some(9));
+        // Every field is structure with a safe default: an empty declaration is a name.
+        assert_eq!(agents["mute"], WorkflowAgent::default());
+
+        // The route is deployment's, so a workflow claiming one is refused where it claims it —
+        // not silently dropped for `ratatoskr.toml` to contradict later.
+        std::fs::write(
+            dir.join("staffed.ts"),
+            r#"defineWorkflow({
+                 name: "staffed",
+                 agents: { librarian: { model: { provider: "openai", model: "gpt-5" } } },
+               });"#,
+        )
+        .unwrap();
+        let error = match WorkflowRuntime::discover(&dir, &[]).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a declared agent may not name a model"),
+        };
+        assert!(error.contains("model"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
