@@ -74,7 +74,9 @@ impl TraceId {
 
     /// Read one back from the thirty-two hex characters it is written as, hyphens not allowed.
     pub fn parse(hex: &str) -> Option<Self> {
-        if hex.len() != 32 {
+        // `from_str_radix` accepts a leading `+`, so without this `+f+f…` and `0f0f…` parse to the
+        // same bytes — two run ids on one trace, and the first taken for a uuid it is not.
+        if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         let mut bytes = [0u8; 16];
@@ -99,20 +101,16 @@ impl TraceId {
         if let Some(id) = Self::parse(&run_id.replace('-', "")) {
             return id;
         }
-        // FNV-1a, run twice over distinct offset bases to fill sixteen bytes. Not a cryptographic
-        // hash and does not need to be: this maps a name to a trace id, and the only property that
-        // matters is that the same name always reaches the same one.
-        // The two bases must differ in their LOW bits, not just somewhere. Multiplying mod 2^64 by
-        // an odd constant and xor-ing a byte both leave the low k bits a function of the low k bits
-        // alone, so two bases agreeing in their low nibble produce halves whose low nibbles are
-        // equal for every input — visibly, the last hex digit of each half would always match.
-        let halves = [0xcbf2_9ce4_8422_2325u64, 0x9e37_79b9_7f4a_7c1bu64].map(|mut hash| {
-            for byte in run_id.as_bytes() {
-                hash ^= u64::from(*byte);
-                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            hash.to_be_bytes()
-        });
+        // Two halves, and they must be different FUNCTIONS of the input rather than one function
+        // at two offsets. FNV-1a's low bit is the basis's low bit xor the parity of the input
+        // bytes' low bits, independent of everything else in the basis — so ANY two bases give
+        // halves whose bit 0 is either always equal or always opposite, and hunting for luckier
+        // constants cannot fix that. Feeding the second half the bytes in reverse breaks the
+        // algebra instead: the two then depend on the input in genuinely different ways.
+        let halves = [
+            fnv1a(run_id.as_bytes().iter().copied()),
+            fnv1a(run_id.as_bytes().iter().rev().copied()),
+        ];
         let mut bytes = [0u8; 16];
         bytes[..8].copy_from_slice(&halves[0]);
         bytes[8..].copy_from_slice(&halves[1]);
@@ -124,6 +122,28 @@ impl TraceId {
     pub fn to_bytes(self) -> [u8; 16] {
         self.0
     }
+}
+
+/// FNV-1a with an avalanche finalizer. Not cryptographic and does not need to be: this maps a name
+/// to a trace id, and the only property that matters is that one name always reaches one id.
+///
+/// The finalizer is not decoration. Plain FNV-1a's lowest bit is the basis's lowest bit xor the
+/// *parity* of the input bytes' lowest bits — nothing else in the basis, the prime, or the byte
+/// ORDER can touch it. So two plain FNV halves always agree on bit 0 or always disagree on it, and
+/// neither a different basis nor reversing the input can fix that; only mixing high bits down can.
+/// These are the SplitMix64 constants, whose job is exactly that.
+fn fnv1a(bytes: impl Iterator<Item = u8>) -> [u8; 8] {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^= hash >> 31;
+    hash.to_be_bytes()
 }
 
 impl std::fmt::Display for TraceId {
@@ -525,31 +545,29 @@ mod tests {
         );
     }
 
-    /// The halves must not be correlated, which two bases sharing a low nibble would make them.
+    /// The halves must not track each other — in EITHER direction.
+    ///
+    /// Counting hex-digit *equality* cannot see this: two halves that are always OPPOSITE agree 0%
+    /// of the time, which a naive count reads as maximal independence when it is in fact maximal
+    /// dependence. Agreement is measured per bit, and has to sit near half.
     #[test]
     fn the_two_hash_halves_do_not_track_each_other() {
-        let mut agreed = [0usize; 4];
-        let total = 500;
+        let total = 2000;
+        let mut agreed = [0usize; 64];
         for n in 0..total {
-            let hex = TraceId::of_run(&format!("run-{n}")).to_string();
-            let (left, right) = hex.split_at(16);
-            for (bit, (a, b)) in left
-                .chars()
-                .rev()
-                .zip(right.chars().rev())
-                .take(4)
-                .enumerate()
-            {
-                if a == b {
-                    agreed[bit] += 1;
-                }
+            let bytes = TraceId::of_run(&format!("run-{n}")).to_bytes();
+            let left = u64::from_be_bytes(bytes[..8].try_into().expect("eight bytes"));
+            let right = u64::from_be_bytes(bytes[8..].try_into().expect("eight bytes"));
+            let same = !(left ^ right);
+            for (bit, count) in agreed.iter_mut().enumerate() {
+                *count += usize::from((same >> bit) & 1 == 1);
             }
         }
-        // Independent nibbles agree about 1 time in 16; a shared low nibble agrees every time.
         for (bit, count) in agreed.iter().enumerate() {
+            let share = *count as f64 / total as f64;
             assert!(
-                *count < total * 3 / 4,
-                "hex digit {bit} from the end agreed {count}/{total} times — the halves track"
+                (0.35..=0.65).contains(&share),
+                "bit {bit} agreed {count}/{total} ({share:.2}) — the halves are not independent"
             );
         }
     }
@@ -565,6 +583,17 @@ mod tests {
         for id in ["", "x", "nightly", "6402ccea-650f-4472-bff5-24e34466fe6d"] {
             assert_ne!(TraceId::of_run(id).to_bytes(), [0; 16], "for `{id}`");
         }
+    }
+
+    /// Only hex digits. `from_str_radix` would otherwise take `+f` as `0f`.
+    #[test]
+    fn a_sign_is_not_a_hex_digit() {
+        assert!(TraceId::parse(&"+f".repeat(16)).is_none());
+        assert!(TraceId::parse(&"-f".repeat(16)).is_none());
+        assert_ne!(
+            TraceId::of_run(&"+f".repeat(16)),
+            TraceId::of_run(&"0f".repeat(16))
+        );
     }
 
     #[test]

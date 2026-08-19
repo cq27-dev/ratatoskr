@@ -254,9 +254,10 @@ With neither variable set nothing is built and no socket is opened. One run is o
 the run id — a UUID run id becomes the trace id with its hyphens dropped, so you can paste a run id
 into a backend and find it.
 
-A collector that is unreachable does not stop a run. Export failures — a refused connection, a
-404, a dropped batch — are logged and retried on the next interval; the run is unaffected either
-way.
+A collector that is unreachable does not stop a run. An export failure — a refused connection, a
+404 — is logged, and that batch is dropped rather than retried; later spans are unaffected. An
+endpoint that is not an `http(s)` URL disables export with a warning, rather than falling back to
+a default collector nobody asked for.
 
 ### Starting a run from GitHub
 

@@ -39,32 +39,41 @@ use ratatoskr_core::span::TraceId;
 /// says that — a second run in one process would be a different design, and would find this taken.
 static TRACE: OnceLock<TraceId> = OnceLock::new();
 
-/// Bind this process's trace to a run, once its id is known.
+/// The process's trace cell, handed to the generator so it can read it when it mints.
 ///
-/// Called where the run span is opened rather than at subscriber assembly, because the subscriber
-/// is built before the command has parsed — `ratatoskr runs list` has no run id at all, and a run
-/// resuming or being given `--run-id` learns it later still. Spans opened before this reach the
-/// random fallback, which is correct: they belong to no run.
+/// The subscriber is assembled before the command has parsed — `ratatoskr runs list` has no run id
+/// at all, and a run given `--run-id` learns it later still — so the value cannot be read at build
+/// time. Spans opened before a run is bound reach the random fallback, which is correct: they
+/// belong to no run.
+pub fn run_trace() -> &'static OnceLock<TraceId> {
+    &TRACE
+}
+
+/// Bind this process's trace to a run, once its id is known.
 pub fn bind_run(run_id: &str) {
     let _ = TRACE.set(TraceId::of_run(run_id));
 }
 
 /// Trace ids from the run; span ids from the SDK.
 ///
-/// Carries the trace it was built with rather than reading [`TRACE`] per call, so the decision is
-/// testable without a process-global. The global is read once, at the one place a provider is
-/// built. Reading it here instead made the generator's test depend on which test in the binary
-/// reached `bind_run` first — `run_span` calls it, and a test in `main.rs` calls `run_span`.
+/// Holds the *cell*, not the value, and reads it when it mints. The provider is built inside
+/// `init_logging`, which runs before `Cli::parse` — so at build time no command has been parsed,
+/// no run id exists, and a trace read then is always absent. A root span opens later, after
+/// `run_span` has bound the run, which is the only moment the answer exists.
+///
+/// The cell is a parameter rather than the process global so a test can hand over its own and get
+/// a deterministic answer. Reading the global directly here is what made this generator's test
+/// depend on whichever test in the binary reached `bind_run` first.
 #[derive(Debug)]
 struct RunTrace {
-    bound: Option<TraceId>,
+    trace: &'static OnceLock<TraceId>,
     ids: opentelemetry_sdk::trace::RandomIdGenerator,
 }
 
 impl RunTrace {
-    fn new(bound: Option<TraceId>) -> Self {
+    fn new(trace: &'static OnceLock<TraceId>) -> Self {
         Self {
-            bound,
+            trace,
             ids: opentelemetry_sdk::trace::RandomIdGenerator::default(),
         }
     }
@@ -72,10 +81,11 @@ impl RunTrace {
 
 impl IdGenerator for RunTrace {
     fn new_trace_id(&self) -> opentelemetry::TraceId {
-        match self.bound {
+        match self.trace.get() {
             Some(trace) => opentelemetry::TraceId::from_bytes(trace.to_bytes()),
-            // A process that drives no run. A random trace is honest: these spans belong to no run,
-            // and folding them into a fixed id would invent a trace that nothing else joins.
+            // A process driving no run, or a span opened before one was bound. A random trace is
+            // honest: those spans belong to no run, and folding them into a fixed id would invent
+            // a trace that nothing else joins.
             None => self.ids.new_trace_id(),
         }
     }
@@ -179,8 +189,21 @@ fn chosen(traces: Option<&str>, general: Option<&str>) -> Option<String> {
     [traces, general]
         .into_iter()
         .flatten()
-        .find(|value| !value.trim().is_empty())
+        .map(str::trim)
+        .find(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+/// Whether a configured endpoint is one the SDK will actually use.
+///
+/// The SDK parses the variable itself and, on anything that is not a `Uri`, falls through to the
+/// built-in `http://localhost:4318` — so a typo like `htp://collector:4318` does not disable
+/// export, it silently redirects a run's traces to localhost. Checked here so that is a refusal
+/// with a message instead.
+pub fn usable(endpoint: &str) -> bool {
+    endpoint
+        .parse::<http::Uri>()
+        .is_ok_and(|uri| matches!(uri.scheme_str(), Some("http" | "https")))
 }
 
 /// Build the tracer.
@@ -193,18 +216,29 @@ fn chosen(traces: Option<&str>, general: Option<&str>) -> Option<String> {
 ///
 /// Returns the provider alongside the tracer because a batch exporter has to be shut down for the
 /// last spans to leave the process — dropping it is not enough.
-pub fn tracer() -> anyhow::Result<(
+pub fn tracer(
+    trace: &'static OnceLock<TraceId>,
+    endpoint: Option<&str>,
+) -> anyhow::Result<(
     opentelemetry_sdk::trace::SdkTracerProvider,
     opentelemetry_sdk::trace::SdkTracer,
 )> {
     use opentelemetry::trace::TracerProvider as _;
 
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .build()?;
+    // `endpoint` is `None` in production, and must stay so: the SDK reads the two variables
+    // itself and appends `/v1/traces` only to the general one. It exists for the round-trip test,
+    // which must point at its own listener without mutating the environment (see #314).
+    let http = opentelemetry_otlp::SpanExporter::builder().with_http();
+    let exporter = match endpoint {
+        Some(url) => {
+            use opentelemetry_otlp::WithExportConfig as _;
+            http.with_endpoint(url).build()?
+        }
+        None => http.build()?,
+    };
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_batch_exporter(Vocabulary(exporter))
-        .with_id_generator(RunTrace::new(TRACE.get().copied()))
+        .with_id_generator(RunTrace::new(trace))
         .with_resource(
             opentelemetry_sdk::Resource::builder()
                 .with_service_name("ratatoskr")
@@ -291,7 +325,12 @@ mod tests {
     #[test]
     fn every_span_of_a_bound_run_shares_the_runs_trace() {
         let run = "6402ccea-650f-4472-bff5-24e34466fe6d";
-        let ids = RunTrace::new(Some(TraceId::of_run(run)));
+        // Its OWN cell, bound as `run_span` binds the process one — so this drives the production
+        // wiring rather than a copy of it. Leaked because the generator holds it for 'static; one
+        // cell per test run is nothing.
+        let cell: &'static OnceLock<TraceId> = Box::leak(Box::new(OnceLock::new()));
+        cell.set(TraceId::of_run(run)).expect("a fresh cell");
+        let ids = RunTrace::new(cell);
         let first = ids.new_trace_id();
         assert_eq!(first, ids.new_trace_id(), "a run's spans share one trace");
         assert_eq!(
@@ -352,47 +391,44 @@ mod tests {
         });
 
         let run = "6402ccea-650f-4472-bff5-24e34466fe6d";
-        // Built exactly as production builds it, except for the endpoint the SDK would otherwise
-        // read from the environment — which a test must not mutate (see #314).
-        let exporter = {
-            use opentelemetry_otlp::WithExportConfig as _;
-            opentelemetry_otlp::SpanExporter::builder()
-                .with_http()
-                .with_endpoint(format!("http://127.0.0.1:{port}/v1/traces"))
-                .build()
-                .expect("the exporter builds")
-        };
-        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-            .with_batch_exporter(Vocabulary(exporter))
-            .with_id_generator(RunTrace::new(Some(TraceId::of_run(run))))
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name("ratatoskr")
-                    .build(),
-            )
-            .build();
+        // Its OWN cell, bound as `run_span` binds the process one — so this drives the production
+        // wiring rather than a copy of it. Leaked because the generator holds it for 'static; one
+        // cell per test run is nothing.
+        let cell: &'static OnceLock<TraceId> = Box::leak(Box::new(OnceLock::new()));
+        cell.set(TraceId::of_run(run)).expect("a fresh cell");
+        let (provider, tracer) = tracer(cell, Some(&format!("http://127.0.0.1:{port}/v1/traces")))
+            .expect("the tracer builds");
 
         {
-            use opentelemetry::trace::TracerProvider as _;
             use tracing_subscriber::layer::SubscriberExt as _;
-            let layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("ratatoskr"));
+            let layer = tracing_opentelemetry::layer().with_tracer(tracer);
             let subscriber = tracing_subscriber::registry().with(layer);
             tracing::subscriber::with_default(subscriber, || {
-                let parent = tracing::info_span!("invoke_agent analyst");
+                let parent = tracing::info_span!(
+                    "invoke_agent analyst",
+                    "gen_ai.provider.name" = "anthropic"
+                );
                 let _entered = parent.enter();
                 tracing::info!(kind = "model_text", "model text");
                 let child = tracing::info_span!("invoke_agent implementer");
                 let _nested = child.enter();
             });
         }
-        provider
-            .shutdown()
+        // Shutdown runs on its own thread and is never joined on the failure path. It is what
+        // flushes the batch, but with nothing to flush it BLOCKS — measured, not assumed — so
+        // calling it inline turns "exported nothing", the exact regression this test exists for,
+        // into a hung CI job with no failing assertion. The receive below is the deadline for the
+        // whole exchange; when it expires the test fails red and the parked threads die with the
+        // process. `collector` is joined only on the path where a request actually arrived.
+        let flushed = std::thread::spawn(move || provider.shutdown());
+        let (head, body) = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("a request reached the collector within 15s");
+        flushed
+            .join()
+            .expect("the shutdown thread")
             .expect("the batch exporter flushes on shutdown");
         collector.join().expect("the listener thread");
-
-        let (head, body) = rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("a request reached the collector");
         assert!(head.starts_with("post /v1/traces "), "got: {head}");
         assert!(
             head.contains("content-type: application/x-protobuf"),
@@ -433,6 +469,19 @@ mod tests {
             child.parent_span_id, parent.span_id,
             "the child must name its parent, not a fresh root"
         );
+        // A `gen_ai.*` attribute survives the trip — the conventions are the point of exporting.
+        assert!(
+            parent
+                .attributes
+                .iter()
+                .any(|kv| kv.key == "gen_ai.provider.name"),
+            "gen_ai attributes must reach the wire, got {:?}",
+            parent
+                .attributes
+                .iter()
+                .map(|kv| &kv.key)
+                .collect::<Vec<_>>()
+        );
         // And the vocabulary was translated on the way out, not at the emit site.
         assert!(
             parent.events.iter().any(|e| e.name == "gen_ai.choice"),
@@ -444,7 +493,8 @@ mod tests {
     /// A process driving no run invents no trace to put its spans in.
     #[test]
     fn an_unbound_process_gets_a_random_trace_per_root() {
-        let ids = RunTrace::new(None);
+        let unbound: &'static OnceLock<TraceId> = Box::leak(Box::new(OnceLock::new()));
+        let ids = RunTrace::new(unbound);
         assert_ne!(ids.new_trace_id(), ids.new_trace_id());
     }
 }

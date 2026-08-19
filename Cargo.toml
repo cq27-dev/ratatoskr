@@ -66,7 +66,9 @@ regex = "1"
 walkdir = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
-# OTLP export (#250). Traces only — no metrics or logs pipeline is used.
+# OTLP export (#250). Only the trace pipeline is used. Note `http-proto` turns `metrics` on
+# transitively whatever we ask for, so `default-features = false` buys the logs pipeline and a
+# blocking-vs-async client choice, not the absence of metrics.
 #
 # `reqwest-blocking-client` is not a preference, it is the only client the default
 # `BatchSpanProcessor` can drive: that processor exports from its own OS thread with no tokio

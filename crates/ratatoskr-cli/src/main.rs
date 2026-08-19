@@ -490,7 +490,13 @@ fn init_logging() -> Guards {
     // must not stop a run, which is the whole reason export is a layer and not a dependency.
     let (otlp_layer, otlp_provider) = match otlp::endpoint() {
         None => (None, None),
-        Some(_) => match otlp::tracer() {
+        Some(endpoint) if !otlp::usable(&endpoint) => {
+            // Not a silent fallback: the SDK would parse this, fail, and export to its built-in
+            // localhost default instead of the collector that was meant.
+            eprintln!("warning: OTLP export disabled — `{endpoint}` is not an http(s) URL");
+            (None, None)
+        }
+        Some(_) => match otlp::tracer(otlp::run_trace(), None) {
             Ok((provider, tracer)) => {
                 // Filtered like every other layer, and for the same reason: unfiltered, this one
                 // reports no `max_level_hint`, which drops the global level to TRACE and sends

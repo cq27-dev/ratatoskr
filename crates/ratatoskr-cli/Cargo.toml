@@ -27,6 +27,8 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
+# Only to reject an endpoint the SDK would silently replace with its localhost default.
+http.workspace = true
 anyhow.workspace = true
 dotenvy.workspace = true
 uuid.workspace = true
