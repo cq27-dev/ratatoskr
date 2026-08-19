@@ -649,12 +649,15 @@ async fn run_cmd(
 
     let engine = load_rules(&config).await?;
     let run_id = match run_id {
-        // Reusing an id would interleave this run's checkpoints with the existing run's, since
-        // the run row is an upsert and checkpoints are an unconstrained append.
-        Some(id) if store.run_status(&id).await?.is_some() => {
-            bail!("run {id} already exists; omit --run-id to start a new run")
+        Some(id) => {
+            let id = named_run_id(id)?;
+            // Reusing an id would interleave this run's checkpoints with the existing run's, since
+            // the run row is an upsert and checkpoints are an unconstrained append.
+            if store.run_status(&id).await?.is_some() {
+                bail!("run {id} already exists; omit --run-id to start a new run");
+            }
+            id
         }
-        Some(id) => id,
         None => uuid::Uuid::new_v4().to_string(),
     };
     let result = ratatoskr_nodes::run_full(ratatoskr_nodes::RunRequest {
@@ -1289,8 +1292,15 @@ async fn runs(command: RunsCommand, config_path: &Path) -> anyhow::Result<()> {
         }
 
         RunsCommand::Abandon { run_ids } => {
+            // Resolved in full before anything is written, as `rm`, `ingest` and `export` do.
+            // Abandoning is terminal and the command refuses a run that already reached a terminal
+            // status, so a bad argument halfway down the list would otherwise leave the runs
+            // before it relabelled with no way back.
+            let mut resolved = Vec::new();
             for id in &run_ids {
-                let run_id = resolve(&store, id).await?;
+                resolved.push(resolve(&store, id).await?);
+            }
+            for run_id in resolved {
                 let status = store.run_status(&run_id).await?;
                 // An unparseable status is left alone rather than overwritten: it was written by a
                 // build that knows something this one does not, and abandoning it would discard
@@ -1415,15 +1425,50 @@ async fn runs(command: RunsCommand, config_path: &Path) -> anyhow::Result<()> {
 
 /// Accept a run id prefix, the way every other tool that shows short ids does.
 async fn resolve(store: &ratatoskr_store::Store, prefix: &str) -> anyhow::Result<String> {
-    let matching: Vec<String> = store
+    let ids = store
         .list_runs()
         .await?
         .into_iter()
         .map(|r| r.run_id)
+        .collect();
+    unique_prefix_match(ids, prefix)
+}
+
+/// A `--run-id` that actually names a run.
+///
+/// Refused at the writing end for the same reason [`unique_prefix_match`] refuses it at the
+/// reading end: a run row keyed by the empty string is one no `runs` subcommand can name
+/// afterwards, so it and its checkpoints and its events could only be removed by hand.
+/// `--run-id "$ID"` with `ID` unset is all it takes.
+fn named_run_id(id: String) -> anyhow::Result<String> {
+    if id.trim().is_empty() {
+        bail!("--run-id must name a run");
+    }
+    Ok(id)
+}
+
+/// The one run a prefix names, or an error saying which way it failed.
+///
+/// Empty is refused rather than matched. `starts_with("")` holds for every id, so an empty
+/// argument would resolve to whichever run happened to be the only one in the store — and the
+/// commands reaching here delete a run with its checkpoints and its event history, or relabel it.
+/// `required = true` on the argument does not help: it demands a value, and `""` is one.
+///
+/// `ratatoskr-store` already refuses an empty prefix in [`ratatoskr_store::Store::resolve_run`],
+/// which is what `serve` resolves through; this is the CLI's own second matcher, which is why
+/// only the CLI had the gap. Collapsing the two is worth doing separately — `resolve_run`
+/// short-circuits a full-length id to `Some` without checking it exists, so a naive swap would
+/// make `runs rm --force <unknown-full-id>` report success.
+fn unique_prefix_match(ids: Vec<String>, prefix: &str) -> anyhow::Result<String> {
+    if prefix.is_empty() {
+        bail!("give a run id; an empty prefix names no run");
+    }
+    let mut matching: Vec<String> = ids
+        .into_iter()
         .filter(|id| id.starts_with(prefix))
         .collect();
     match matching.len() {
-        1 => Ok(matching.into_iter().next().expect("checked")),
+        1 => Ok(matching.remove(0)),
         0 => bail!("no run starts with `{prefix}`"),
         n => bail!("`{prefix}` matches {n} runs; give more of the id"),
     }
@@ -1780,6 +1825,88 @@ mod tests {
             spans.iter().any(|s| s["otel.name"] == "run run-abc"),
             "the exported span name must name the run, got {spans:?}"
         );
+    }
+
+    /// The guard that stands between `runs rm --force ""` and a deleted run.
+    ///
+    /// Every `runs` subcommand that takes a run id — `tag`, `untag`, `abandon`, `rm`, `ingest`,
+    /// `export` — reaches the store through `resolve`, so the refusal belongs in the matcher they
+    /// share rather than in the one subcommand where the consequence is worst. `status` and
+    /// `bookkeep` take a full id and do not prefix-match at all; `run --run-id` is guarded
+    /// separately, at the point the id is written.
+    #[test]
+    fn an_empty_prefix_names_no_run_however_few_there_are() {
+        let one = vec!["run-abc".to_string()];
+        let err = crate::unique_prefix_match(one, "")
+            .expect_err("an empty prefix must not resolve, even against a single run");
+        assert!(
+            err.to_string().contains("empty prefix"),
+            "the error must say what was wrong with the argument, got: {err}"
+        );
+    }
+
+    /// The other end of the same rule: a run keyed by nothing is one no subcommand can name, so
+    /// refusing it on lookup is only half the fix if it can still be created.
+    #[test]
+    fn a_run_cannot_be_created_under_an_empty_id() {
+        for id in ["", " ", "\t"] {
+            let result = crate::named_run_id(id.to_string());
+            assert!(
+                result.is_err(),
+                "`--run-id {id:?}` must be refused, got {result:?}"
+            );
+        }
+        assert_eq!(
+            crate::named_run_id("run-abc".to_string()).unwrap(),
+            "run-abc"
+        );
+    }
+
+    /// The wiring: `resolve` has to feed the store's own ids into the matcher. The matcher tests
+    /// take a hand-built list, which proves the decision and not the lookup behind it.
+    #[tokio::test]
+    async fn resolve_matches_against_the_ids_the_store_holds() {
+        let store = ratatoskr_store::Store::open_in_memory().expect("an in-memory store");
+        store
+            .upsert_run("6402ccea-650f-4472-bff5-24e34466fe6d", None, "running")
+            .await
+            .expect("recording a run");
+        assert_eq!(
+            crate::resolve(&store, "6402")
+                .await
+                .expect("one run matches"),
+            "6402ccea-650f-4472-bff5-24e34466fe6d"
+        );
+        let err = crate::resolve(&store, "")
+            .await
+            .expect_err("an empty prefix must not resolve against the real store either");
+        assert!(err.to_string().contains("empty prefix"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prefix_that_narrows_to_one_run_resolves_to_it() {
+        let ids = vec!["run-abc".to_string(), "run-bcd".to_string()];
+        assert_eq!(
+            crate::unique_prefix_match(ids, "run-a").expect("one run starts with `run-a`"),
+            "run-abc"
+        );
+    }
+
+    #[test]
+    fn a_prefix_matching_several_runs_asks_for_more_of_the_id() {
+        let ids = vec!["run-abc".to_string(), "run-abd".to_string()];
+        let err = crate::unique_prefix_match(ids, "run-ab").expect_err("two runs share `run-ab`");
+        assert!(
+            err.to_string().contains("matches 2 runs"),
+            "an ambiguous prefix must say how many it matched, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_prefix_matching_nothing_says_so() {
+        let ids = vec!["run-abc".to_string()];
+        let err = crate::unique_prefix_match(ids, "run-z").expect_err("no run starts with `run-z`");
+        assert!(err.to_string().contains("no run starts with"), "got: {err}");
     }
 
     #[test]
