@@ -1415,15 +1415,31 @@ async fn runs(command: RunsCommand, config_path: &Path) -> anyhow::Result<()> {
 
 /// Accept a run id prefix, the way every other tool that shows short ids does.
 async fn resolve(store: &ratatoskr_store::Store, prefix: &str) -> anyhow::Result<String> {
-    let matching: Vec<String> = store
+    let ids = store
         .list_runs()
         .await?
         .into_iter()
         .map(|r| r.run_id)
+        .collect();
+    unique_prefix_match(ids, prefix)
+}
+
+/// The one run a prefix names, or an error saying which way it failed.
+///
+/// Empty is refused rather than matched. `starts_with("")` holds for every id, so an empty
+/// argument would resolve to whichever run happened to be the only one in the store — and the
+/// commands reaching here delete a run with its checkpoints and its event history, or relabel it.
+/// `required = true` on the argument does not help: it demands a value, and `""` is one.
+fn unique_prefix_match(ids: Vec<String>, prefix: &str) -> anyhow::Result<String> {
+    if prefix.is_empty() {
+        bail!("give a run id; an empty prefix names no run");
+    }
+    let mut matching: Vec<String> = ids
+        .into_iter()
         .filter(|id| id.starts_with(prefix))
         .collect();
     match matching.len() {
-        1 => Ok(matching.into_iter().next().expect("checked")),
+        1 => Ok(matching.remove(0)),
         0 => bail!("no run starts with `{prefix}`"),
         n => bail!("`{prefix}` matches {n} runs; give more of the id"),
     }
@@ -1780,6 +1796,48 @@ mod tests {
             spans.iter().any(|s| s["otel.name"] == "run run-abc"),
             "the exported span name must name the run, got {spans:?}"
         );
+    }
+
+    /// The guard that stands between `runs rm --force ""` and a deleted run.
+    ///
+    /// Every command that takes a run id — `tag`, `untag`, `abandon`, `rm`, `ingest`, `export` —
+    /// reaches the store through `resolve`, so the refusal belongs in the matcher they share
+    /// rather than in the one subcommand where the consequence is worst.
+    #[test]
+    fn an_empty_prefix_names_no_run_however_few_there_are() {
+        let one = vec!["run-abc".to_string()];
+        let err = crate::unique_prefix_match(one, "")
+            .expect_err("an empty prefix must not resolve, even against a single run");
+        assert!(
+            err.to_string().contains("empty prefix"),
+            "the error must say what was wrong with the argument, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_prefix_that_narrows_to_one_run_resolves_to_it() {
+        let ids = vec!["run-abc".to_string(), "run-bcd".to_string()];
+        assert_eq!(
+            crate::unique_prefix_match(ids, "run-a").expect("one run starts with `run-a`"),
+            "run-abc"
+        );
+    }
+
+    #[test]
+    fn a_prefix_matching_several_runs_asks_for_more_of_the_id() {
+        let ids = vec!["run-abc".to_string(), "run-abd".to_string()];
+        let err = crate::unique_prefix_match(ids, "run-ab").expect_err("two runs share `run-ab`");
+        assert!(
+            err.to_string().contains("matches 2 runs"),
+            "an ambiguous prefix must say how many it matched, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_prefix_matching_nothing_says_so() {
+        let ids = vec!["run-abc".to_string()];
+        let err = crate::unique_prefix_match(ids, "run-z").expect_err("no run starts with `run-z`");
+        assert!(err.to_string().contains("no run starts with"), "got: {err}");
     }
 
     #[test]
