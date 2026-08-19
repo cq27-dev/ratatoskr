@@ -66,6 +66,14 @@ regex = "1"
 walkdir = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
+# OTLP export (#250). `default-features = false` because the default set pulls a BLOCKING reqwest
+# client and the metrics/logs pipelines, none of which this uses: only traces are exported, over
+# the same async reqwest already in the tree. `grpc-tonic` is deliberately not taken — it would add
+# tonic and prost for a transport no deployment here has asked for.
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-client"] }
+tracing-opentelemetry = { version = "0.33", default-features = false, features = ["tracing-log"] }
 thiserror = "2"
 anyhow = "1"
 toml = "1"

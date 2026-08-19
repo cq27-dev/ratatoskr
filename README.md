@@ -233,6 +233,29 @@ than by a rule that has to keep being enforced.
 `ratatoskr users list`, `role`, `passwd`, `disable` and `enable` manage accounts. A role change or a
 disable reaches an open browser on its next request — neither waits for the session to lapse.
 
+### Exporting traces
+
+A run's spans already carry the OpenTelemetry GenAI conventions — `gen_ai.*` attributes, span
+names, kinds and nesting — so sending them to a collector is a matter of naming one:
+
+```sh
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT='http://localhost:4318/v1/traces' ratatoskr run ...
+```
+
+`OTEL_EXPORTER_OTLP_ENDPOINT` works too; the traces-specific variable wins. OTLP over HTTP with
+protobuf bodies — the endpoint is the full path, not a base URL.
+
+From the environment rather than `ratatoskr.toml`, for the same reason the webhook secret is:
+where a deployment sends its traces is not a property of the repository being worked on, and a
+checked-in endpoint would make every clone export to whoever wrote it down.
+
+With neither variable set nothing is built and no socket is opened. One run is one trace, keyed on
+the run id — a UUID run id becomes the trace id with its hyphens dropped, so you can paste a run id
+into a backend and find it.
+
+A collector that is unreachable does not stop a run: the failure is reported once and export stays
+off for that process.
+
 ### Starting a run from GitHub
 
 Mention the bot in an issue and it starts a run on that repository:
