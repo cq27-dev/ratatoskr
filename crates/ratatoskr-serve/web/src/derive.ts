@@ -216,6 +216,35 @@ function attempts<A extends Tracked>() {
 type Attempts<A extends Tracked> = ReturnType<typeof attempts<A>>;
 
 /**
+ * One invocation of one member: what it ran on, what it spent, and whether it is still going.
+ *
+ * Per invocation rather than per member, because a name never identified one. A stage is invoked
+ * once per converge pass and may be invoked concurrently, so a second attempt used to open on the
+ * first one's model, tokens and duration — and scrubbing back showed a later attempt's figures
+ * against an earlier moment. Each invocation now carries its own, and the member is whichever of
+ * them is current.
+ */
+interface Attempt extends Tracked {
+  state: NodeState;
+  /** How this execution's own end said it went, once it has. */
+  outcome?: string | undefined;
+  /** The execution that invoked this one, where a record has said. */
+  parent?: string;
+  /**
+   * The box this invocation's work is FOR, stated by its caller on the `node_start`.
+   *
+   * Producer provenance, above the parentage walk: a run-driven judgement's chain honestly
+   * reaches no box, yet its caller is known exactly at the call site and stated there.
+   */
+  stated?: string;
+  telemetry?: NodeTelemetry;
+  cycles: number;
+  used: Set<string>;
+  costed: boolean;
+}
+type Member = Attempts<Attempt>;
+
+/**
  * Fold `events` into per-node state as of the last event given.
  *
  * Pass a prefix of the stream to see where the run was at that point — that is the whole mechanism
@@ -294,6 +323,7 @@ function spanIndex() {
     },
   };
 }
+type SpanIndex = ReturnType<typeof spanIndex>;
 
 /** One traversal of the graph: the box that just became active, and what handed off to it. */
 export interface Transition {
@@ -428,34 +458,6 @@ export function transitions(events: readonly BoxedEvent[]): Transition[] {
 }
 
 export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, DerivedNode> {
-  /**
-   * One invocation of one member: what it ran on, what it spent, and whether it is still going.
-   *
-   * Per invocation rather than per member, because a name never identified one. A stage is invoked
-   * once per converge pass and may be invoked concurrently, so a second attempt used to open on the
-   * first one's model, tokens and duration — and scrubbing back showed a later attempt's figures
-   * against an earlier moment. Each invocation now carries its own, and the member is whichever of
-   * them is current.
-   */
-  interface Attempt extends Tracked {
-    state: NodeState;
-    /** How this execution's own end said it went, once it has. */
-    outcome?: string | undefined;
-    /** The execution that invoked this one, where a record has said. */
-    parent?: string;
-    /**
-     * The box this invocation's work is FOR, stated by its caller on the `node_start`.
-     *
-     * Producer provenance, above the parentage walk: a run-driven judgement's chain honestly
-     * reaches no box, yet its caller is known exactly at the call site and stated there.
-     */
-    stated?: string;
-    telemetry?: NodeTelemetry;
-    cycles: number;
-    used: Set<string>;
-    costed: boolean;
-  }
-  type Member = Attempts<Attempt>;
   const boxes = new Map<string, { checkpoints: number; members: Map<string, Member> }>();
   const at = (name: string) => {
     const found = boxes.get(name);
@@ -737,54 +739,71 @@ export function nodesFromEvents(events: readonly BoxedEvent[]): Map<string, Deri
     const seen = attemptFor(member, e, span);
     if (WORKING.has(e.kind) && !seen.ended) seen.state = "working";
   }
+  return emit(boxes, index);
+}
 
-  /**
-   * The box this one's invocations ran inside, when every chain that resolves agrees.
-   *
-   * From the invocation's PARENT outward — its own span proves only itself — through spans no box
-   * owns, which is where host calls sit. A chain that reaches this box's own span stops without an
-   * answer: a member nested inside its box's aggregate turn is the box's own structure, not a
-   * caller. Hops are capped because parentage is producer-supplied data, and a cycle in it must
-   * cost a bounded walk rather than hang the render.
-   */
-  // `undefined` when the stream names no box, `null` when it REFUSES one — a refusal is evidence
-  // and must not read as silence, or a durable caller re-anchors what the stream contradicted.
-  const callerOf = (name: string, box: { members: Map<string, Member> }): string | null | undefined => {
-    let found: string | undefined;
-    // An invocation whose chain reaches no box at all: driven by the workflow itself, or
-    // unresolvable. That is a VOTE, not an abstention — a box invoked once at the root and once
-    // inside another fits two placements, which is the same conflict as two different callers.
-    // Alone it is not a refusal: every chain reaching the run is the stream having no box to
-    // name, which is where a durable record's answer legitimately stands in.
-    let rooted = false;
-    for (const m of box.members.values()) {
-      for (const a of m.list) {
-        // Stated provenance supersedes this invocation's walk: a run-driven judgement's chain
-        // honestly reaches no box, and reading that as a root VOTE against the statement would
-        // refuse the one anchor the producer went out of its way to assert. Conflicts between
-        // statements — or between a statement and another invocation's walk — still refuse.
-        const owner = a.stated ?? index.owner(a.parent);
-        // Nested under this box's own turn: internal structure, saying nothing about who called
-        // the box — the only outcome that abstains.
-        if (owner === name) continue;
-        if (owner === undefined) {
-          rooted = true;
-          continue;
-        }
-        // Two invocations resolving different callers is an anchor that fits two histories,
-        // which is an assertion about neither.
-        if (found !== undefined && found !== owner) return null;
-        found = owner;
+/**
+ * The box this one's invocations ran inside, when every chain that resolves agrees.
+ *
+ * From the invocation's PARENT outward — its own span proves only itself — through spans no box
+ * owns, which is where host calls sit. A chain that reaches this box's own span stops without an
+ * answer: a member nested inside its box's aggregate turn is the box's own structure, not a
+ * caller. Hops are capped because parentage is producer-supplied data, and a cycle in it must
+ * cost a bounded walk rather than hang the render.
+ */
+// `undefined` when the stream names no box, `null` when it REFUSES one — a refusal is evidence
+// and must not read as silence, or a durable caller re-anchors what the stream contradicted.
+function callerOf(
+  name: string,
+  box: { members: Map<string, Member> },
+  index: SpanIndex,
+): string | null | undefined {
+  let found: string | undefined;
+  // An invocation whose chain reaches no box at all: driven by the workflow itself, or
+  // unresolvable. That is a VOTE, not an abstention — a box invoked once at the root and once
+  // inside another fits two placements, which is the same conflict as two different callers.
+  // Alone it is not a refusal: every chain reaching the run is the stream having no box to
+  // name, which is where a durable record's answer legitimately stands in.
+  let rooted = false;
+  for (const m of box.members.values()) {
+    for (const a of m.list) {
+      // Stated provenance supersedes this invocation's walk: a run-driven judgement's chain
+      // honestly reaches no box, and reading that as a root VOTE against the statement would
+      // refuse the one anchor the producer went out of its way to assert. Conflicts between
+      // statements — or between a statement and another invocation's walk — still refuse.
+      const owner = a.stated ?? index.owner(a.parent);
+      // Nested under this box's own turn: internal structure, saying nothing about who called
+      // the box — the only outcome that abstains.
+      if (owner === name) continue;
+      if (owner === undefined) {
+        rooted = true;
+        continue;
       }
+      // Two invocations resolving different callers is an anchor that fits two histories,
+      // which is an assertion about neither.
+      if (found !== undefined && found !== owner) return null;
+      found = owner;
     }
-    if (rooted && found !== undefined) return null;
-    return found;
-  };
+  }
+  if (rooted && found !== undefined) return null;
+  return found;
+}
 
+/**
+ * Read the folded bookkeeping out as the boxes a viewer sees.
+ *
+ * One pass over the boxes, after the whole stream has been folded: each box's state, cost,
+ * caller and controls are decided from every invocation of every member at once, which is why
+ * none of it can be settled event by event.
+ */
+function emit(
+  boxes: Map<string, { checkpoints: number; members: Map<string, Member> }>,
+  index: SpanIndex,
+): Map<string, DerivedNode> {
   const out = new Map<string, DerivedNode>();
   for (const [name, box] of boxes) {
     const members = [...box.members.values()];
-    const caller = callerOf(name, box);
+    const caller = callerOf(name, box, index);
     // The box, from all of its members and its own rows. A member still working outranks
     // everything, including a failure: that is the live half a Stop has to keep reaching, and it is
     // what the box did on the way to the record it already has. Below that, the box's own record
