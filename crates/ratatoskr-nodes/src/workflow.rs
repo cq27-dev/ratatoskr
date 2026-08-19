@@ -3233,7 +3233,7 @@ impl FullTerminalActions for LiveTerminalActions {
         worktree: &WorktreePath,
         implementer: &ImplementerOutput,
     ) {
-        crate::commit_worktree(
+        crate::commit::commit_worktree(
             &ctx.config,
             &ctx.issue,
             worktree,
