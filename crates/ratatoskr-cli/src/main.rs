@@ -107,7 +107,12 @@ enum Command {
         /// human a question. Loopback only: reaching it is what stands in for a credential.
         #[arg(long, default_value = "127.0.0.1:7879")]
         internal_addr: SocketAddr,
-        /// Serve this project's runs to anyone, with no sign-in. Repeatable, by directory name.
+        /// Serve this project's runs to anyone, with no sign-in. Repeatable.
+        ///
+        /// Named by the slug the dashboard shows in its URL, which is the directory name
+        /// lowercased with every non-alphanumeric character replaced by `-` — a checkout in
+        /// `My_Repo` is `my-repo`. A name matching nothing refuses to start and lists what is
+        /// being served.
         ///
         /// Everything a run recorded becomes public: the issue text, the model's output, and the
         /// contents of every file its tools read. Starting runs still needs an operator.
@@ -829,36 +834,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             .collect::<anyhow::Result<Vec<_>>>()?
     };
 
-    // Visibility is decided here, from this instance's flags — never from the project's own
-    // config, which lives in the repository and would let a checkout publish itself.
-    let public: std::collections::BTreeSet<&str> = public.iter().map(String::as_str).collect();
-    for spec in &mut specs {
-        let slug = spec
-            .dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        if public.contains(slug) {
-            spec.visibility = Visibility::Public;
-        }
-    }
-    // A name that matches nothing is a typo, and the failure it produces — a project that stays
-    // private — is invisible. Better to say so than to serve the opposite of what was asked.
-    let known: std::collections::BTreeSet<&str> = specs
-        .iter()
-        .filter_map(|s| s.dir.file_name().and_then(|n| n.to_str()))
-        .collect();
-    let unknown: Vec<&&str> = public.difference(&known).collect();
-    if !unknown.is_empty() {
-        bail!(
-            "--public names no project being served: {}",
-            unknown
-                .iter()
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
+    apply_visibility(&mut specs, &public)?;
 
     // From the environment, never a flag: a webhook secret in an argument is readable by every
     // process on the machine and lands in shell history, and it is the only thing standing between
@@ -871,14 +847,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                      the webhook was created with"
                 )
             })?;
-            if secret.chars().count() < 16 {
-                bail!("that webhook secret is shorter than 16 characters");
-            }
-            Some(ratatoskr_serve::github::GitHubConfig {
-                trigger: bot.trim_start_matches(['@', '/']).to_string(),
-                account: github_account.map(|a| a.trim_start_matches('@').to_string()),
-                secret,
-            })
+            Some(github_config(&bot, github_account.as_deref(), secret)?)
         }
         None => None,
     };
@@ -1020,6 +989,100 @@ async fn principal_id_for(
         .await?
         .map(|p| p.principal_id)
         .ok_or_else(|| anyhow::anyhow!("no account called `{username}`"))
+}
+
+/// Mark the projects `--public` names, and refuse a name that matches none of them.
+///
+/// Visibility is decided here, from this instance's flags — never from the project's own config,
+/// which lives in the repository and would let a checkout publish itself.
+///
+/// A project is named by its slug, which is what the dashboard puts in its URLs and what the
+/// operator therefore reads before typing it. That is not the raw directory name:
+/// `ratatoskr_serve::project::slug_for` lowercases and replaces every non-alphanumeric, so a
+/// checkout in `My_Repo` is served as `my-repo`. Matching the directory name here meant the
+/// spelling the dashboard shows was rejected and the one that worked was invisible.
+fn apply_visibility(
+    specs: &mut [ratatoskr_serve::ProjectSpec],
+    public: &[String],
+) -> anyhow::Result<()> {
+    let named: std::collections::BTreeSet<&str> = public.iter().map(String::as_str).collect();
+    let slugs: Vec<String> = specs
+        .iter()
+        .map(|s| ratatoskr_serve::project::slug_for(&s.dir))
+        .collect();
+    // Checked before anything is marked, so a call that fails leaves every spec as it found it.
+    // A name that matches nothing is a typo, and the failure it produces — a project that stays
+    // private — is invisible. Better to say so than to serve the opposite of what was asked, and
+    // to say it alongside the names that would have worked: the whole defect this replaced was an
+    // operator with no way to learn the spelling.
+    let known: std::collections::BTreeSet<&str> = slugs.iter().map(String::as_str).collect();
+    let unknown: Vec<&&str> = named.difference(&known).collect();
+    if !unknown.is_empty() {
+        bail!(
+            "--public names no project being served: {}; serving: {}",
+            unknown
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            slugs.join(", ")
+        );
+    }
+    for (spec, slug) in specs.iter_mut().zip(&slugs) {
+        if named.contains(slug.as_str()) {
+            spec.visibility = Visibility::Public;
+        }
+    }
+    Ok(())
+}
+
+/// The bare name behind a mention, from what the operator passed to `--github-bot` or
+/// `--github-account`.
+///
+/// The leading `@` or `/` is optional at both flags, because that is how a person writes a
+/// mention. Stripping it can leave nothing, or nothing but a space, and both flags read that
+/// wrongly in a direction that costs something:
+///
+/// * `--github-bot @` leaves no name. `instruction_for` searches for `format!("{sigil}{bot}")`,
+///   so the needle becomes a bare `@` or `/` rather than a word — and `find_trigger` accepts one
+///   preceded by whitespace and followed by a non-name character with anything after it. A
+///   comment reading `will rebase / (later)` starts a run.
+/// * `--github-account @` leaves an empty account, which is worse than passing none at all:
+///   [`GitHubConfig::is_self`] falls back to the trigger only for `None`, so `Some("")` matches no
+///   login and the bot stops recognising its own comments — the loop this guards is the expensive
+///   direction.
+///
+/// One helper for both, because the bug is the argument, not the flag.
+fn mention_name(flag: &str, value: &str) -> anyhow::Result<String> {
+    let name = value.trim().trim_start_matches(['@', '/']).trim();
+    if name.is_empty() || name.chars().any(char::is_whitespace) {
+        bail!("{flag} needs a single-word name to match; `{value}` is not one");
+    }
+    Ok(name.to_string())
+}
+
+/// The GitHub integration's settings, with every argument checked before any of them is used.
+///
+/// Assembled here rather than inline so both names go through [`mention_name`]: the account is
+/// read by a different rule from the trigger and fails in the opposite direction, so a guard on
+/// only the flag a report named would leave the other half open. The secret's floor travels with
+/// them because it is the same question — whether these three values can be trusted at all —
+/// while reading it from the environment stays at the call site, which is where the reason lives.
+fn github_config(
+    bot: &str,
+    account: Option<&str>,
+    secret: String,
+) -> anyhow::Result<ratatoskr_serve::github::GitHubConfig> {
+    if secret.chars().count() < 16 {
+        bail!("that webhook secret is shorter than 16 characters");
+    }
+    Ok(ratatoskr_serve::github::GitHubConfig {
+        trigger: mention_name("--github-bot", bot)?,
+        account: account
+            .map(|a| mention_name("--github-account", a))
+            .transpose()?,
+        secret,
+    })
 }
 
 /// Resolve one project for `serve`: its config, and where that config's store actually is.
@@ -1907,6 +1970,154 @@ mod tests {
         let ids = vec!["run-abc".to_string()];
         let err = crate::unique_prefix_match(ids, "run-z").expect_err("no run starts with `run-z`");
         assert!(err.to_string().contains("no run starts with"), "got: {err}");
+    }
+
+    /// Built and asserted with `Visibility::Private` named outright, never `default()`. Comparing
+    /// against the default would let a later `#[default]` move to `Public` turn every unnamed
+    /// project world-readable with all of these still green.
+    fn spec(dir: &str) -> ratatoskr_serve::ProjectSpec {
+        ratatoskr_serve::ProjectSpec {
+            dir: std::path::PathBuf::from(dir),
+            config_path: std::path::PathBuf::from("ratatoskr.toml"),
+            store_path: std::path::PathBuf::from("store.db"),
+            visibility: ratatoskr_core::auth::Visibility::Private,
+        }
+    }
+
+    /// `--public` is spelled the way the dashboard spells the project.
+    ///
+    /// A directory name is not a slug: `slug_for` lowercases and replaces every non-alphanumeric,
+    /// so this checkout is served at `/my-repo` and that is the only name an operator ever sees.
+    #[test]
+    fn a_project_is_made_public_by_the_slug_the_dashboard_shows() {
+        let mut specs = vec![spec("/srv/My_Repo")];
+        crate::apply_visibility(&mut specs, &["my-repo".to_string()])
+            .expect("the slug the dashboard shows names the project");
+        assert_eq!(
+            specs[0].visibility,
+            ratatoskr_core::auth::Visibility::Public
+        );
+    }
+
+    /// The other half of the same rule: one identity, not two spellings for it.
+    #[test]
+    fn the_raw_directory_name_is_not_how_a_project_is_named() {
+        let mut specs = vec![spec("/srv/My_Repo")];
+        let err = crate::apply_visibility(&mut specs, &["My_Repo".to_string()])
+            .expect_err("the directory name is not the project's name");
+        assert!(
+            err.to_string().contains("my-repo"),
+            "the refusal must name the spelling that would have worked, got: {err}"
+        );
+        assert_eq!(
+            specs[0].visibility,
+            ratatoskr_core::auth::Visibility::Private,
+            "a refused name must not have published anything on its way out"
+        );
+    }
+
+    #[test]
+    fn a_project_nobody_named_stays_private() {
+        let mut specs = vec![spec("/srv/alpha"), spec("/srv/beta")];
+        crate::apply_visibility(&mut specs, &["alpha".to_string()]).expect("alpha is served");
+        assert_eq!(
+            specs[0].visibility,
+            ratatoskr_core::auth::Visibility::Public
+        );
+        assert_eq!(
+            specs[1].visibility,
+            ratatoskr_core::auth::Visibility::Private
+        );
+    }
+
+    /// The wiring, not just the helper: both names have to reach [`mention_name`] on the way into
+    /// a `GitHubConfig`, and a test on the helper alone would pass with either flag unrouted.
+    #[test]
+    fn neither_github_name_reaches_the_config_unchecked() {
+        let secret = "0123456789abcdef".to_string();
+        assert!(
+            crate::github_config("@", None, secret.clone()).is_err(),
+            "an empty trigger must not reach the config"
+        );
+        assert!(
+            crate::github_config("@ratatoskr", Some("@"), secret.clone()).is_err(),
+            "an empty account must not reach the config"
+        );
+        let ok = crate::github_config("@ratatoskr", Some("@ratatoskr[bot]"), secret.clone())
+            .expect("two real names are accepted");
+        assert_eq!(ok.trigger, "ratatoskr");
+        assert_eq!(ok.account.as_deref(), Some("ratatoskr[bot]"));
+        // The secret floor travels with them, and is checked before either name is read.
+        assert!(crate::github_config("@ratatoskr", None, "short".to_string()).is_err());
+    }
+
+    /// A refusal must leave every spec as it found it, which only a multi-name call can show.
+    #[test]
+    fn one_bad_public_name_publishes_nothing() {
+        let mut specs = vec![spec("/srv/alpha"), spec("/srv/beta")];
+        crate::apply_visibility(&mut specs, &["alpha".to_string(), "typo".to_string()])
+            .expect_err("`typo` names no project");
+        assert_eq!(
+            specs[0].visibility,
+            ratatoskr_core::auth::Visibility::Private,
+            "`alpha` was valid, but the call failed, so nothing may have been published"
+        );
+    }
+
+    /// A name that trims away leaves the sigil itself as the needle: `instruction_for` searches
+    /// for `format!("{sigil}{bot}")`, so an empty name makes it a bare `@` or `/`, which
+    /// `find_trigger` accepts wherever whitespace precedes it and a non-name character follows.
+    /// A comment reading `will rebase / (later)` is enough to start a run.
+    #[test]
+    fn a_bot_name_that_trims_to_nothing_is_refused() {
+        for bot in ["@", "/", "@/", "//", " ", "@ ", "@ rata toskr", "  "] {
+            let result = crate::mention_name("--github-bot", bot);
+            assert!(
+                result.is_err(),
+                "`{bot}` must be refused; it leaves nothing to match, got {result:?}"
+            );
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("is not one"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn a_bot_name_keeps_what_is_left_after_the_mention_marks() {
+        assert_eq!(
+            crate::mention_name("--github-bot", "@ratatoskr").unwrap(),
+            "ratatoskr"
+        );
+        assert_eq!(
+            crate::mention_name("--github-bot", "/ratatoskr").unwrap(),
+            "ratatoskr"
+        );
+        assert_eq!(
+            crate::mention_name("--github-bot", "ratatoskr").unwrap(),
+            "ratatoskr"
+        );
+        // Padding is the operator's, not part of the name: a shell that expands to a trailing
+        // space would otherwise make the trigger unmatchable and say nothing about why.
+        assert_eq!(
+            crate::mention_name("--github-bot", " @ratatoskr ").unwrap(),
+            "ratatoskr"
+        );
+    }
+
+    /// `--github-account` trims the same way and is read by a different rule, which fails open.
+    ///
+    /// `GitHubConfig::is_self` falls back to the trigger only when the account is `None`. An empty
+    /// `Some` matches no login at all, so the bot stops recognising its own comments and answers
+    /// itself — which is why the same guard has to cover both flags rather than the one the
+    /// report named.
+    #[test]
+    fn an_account_that_trims_to_nothing_is_refused_like_a_bot_name() {
+        let err = crate::mention_name("--github-account", "@")
+            .expect_err("an empty account is worse than no account");
+        assert!(err.to_string().contains("--github-account"), "got: {err}");
+        assert_eq!(
+            crate::mention_name("--github-account", "@ratatoskr-app").unwrap(),
+            "ratatoskr-app"
+        );
     }
 
     #[test]
