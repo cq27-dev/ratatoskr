@@ -98,7 +98,11 @@ pub enum ProjectError {
 
 /// How a project is named in URLs and in the UI: its directory name, which is what a person
 /// actually calls the repository.
-fn slug_for(dir: &Path) -> String {
+///
+/// Public because it is the project's identity, and every caller that names a project has to agree
+/// with it. An operator spelling a project the way the dashboard shows it — `my-repo`, not
+/// `My_Repo` — is naming the slug, so the flag that reads that name resolves it through here.
+pub fn slug_for(dir: &Path) -> String {
     let raw = dir
         .file_name()
         .and_then(|n| n.to_str())
