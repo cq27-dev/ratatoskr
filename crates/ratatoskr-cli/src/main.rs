@@ -490,11 +490,25 @@ fn init_logging() -> Guards {
     // must not stop a run, which is the whole reason export is a layer and not a dependency.
     let (otlp_layer, otlp_provider) = match otlp::endpoint() {
         None => (None, None),
-        Some(endpoint) => match otlp::tracer(&endpoint) {
-            Ok((provider, tracer)) => (
-                Some(tracing_opentelemetry::layer().with_tracer(tracer)),
-                Some(provider),
-            ),
+        Some(_) => match otlp::tracer() {
+            Ok((provider, tracer)) => {
+                // Filtered like every other layer, and for the same reason: unfiltered, this one
+                // reports no `max_level_hint`, which drops the global level to TRACE and sends
+                // every dependency's spans through the registry AND on to the collector — burying
+                // the run's own spans in hyper, reqwest and rustls chatter, in the run's hot path.
+                let filter = EnvFilter::new(
+                    std::env::var("RATATOSKR_OTEL_LOG")
+                        .unwrap_or_else(|_| "ratatoskr=info".to_string()),
+                );
+                (
+                    Some(
+                        tracing_opentelemetry::layer()
+                            .with_tracer(tracer)
+                            .with_filter(filter),
+                    ),
+                    Some(provider),
+                )
+            }
             Err(e) => {
                 eprintln!("warning: OTLP export disabled ({e})");
                 (None, None)

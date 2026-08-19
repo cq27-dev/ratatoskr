@@ -4797,6 +4797,7 @@ dependencies = [
  "js-sys",
  "pin-project-lite",
  "thiserror 2.0.19",
+ "tracing",
 ]
 
 [[package]]
@@ -4853,8 +4854,6 @@ dependencies = [
  "portable-atomic",
  "rand 0.9.5",
  "thiserror 2.0.19",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]
@@ -5461,7 +5460,9 @@ dependencies = [
  "gix",
  "opentelemetry",
  "opentelemetry-otlp",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
+ "prost",
  "ratatoskr-agent",
  "ratatoskr-core",
  "ratatoskr-exec",
@@ -5758,6 +5759,7 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

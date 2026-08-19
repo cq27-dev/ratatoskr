@@ -34,5 +34,11 @@ serde_json.workspace = true
 # Pinned now so the full dependency tree resolves in CI; used from Phase 3 (gix worktrees).
 gix.workspace = true
 
+[dev-dependencies]
+# Only so the round-trip test can decode what actually went over the wire, rather than asserting
+# that *something* was POSTed. Already in the tree via opentelemetry-otlp.
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
+prost = "0.14"
+
 [lints]
 workspace = true

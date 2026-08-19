@@ -102,7 +102,11 @@ impl TraceId {
         // FNV-1a, run twice over distinct offset bases to fill sixteen bytes. Not a cryptographic
         // hash and does not need to be: this maps a name to a trace id, and the only property that
         // matters is that the same name always reaches the same one.
-        let halves = [0xcbf2_9ce4_8422_2325u64, 0x9e37_79b9_7f4a_7c15u64].map(|mut hash| {
+        // The two bases must differ in their LOW bits, not just somewhere. Multiplying mod 2^64 by
+        // an odd constant and xor-ing a byte both leave the low k bits a function of the low k bits
+        // alone, so two bases agreeing in their low nibble produce halves whose low nibbles are
+        // equal for every input — visibly, the last hex digit of each half would always match.
+        let halves = [0xcbf2_9ce4_8422_2325u64, 0x9e37_79b9_7f4a_7c1bu64].map(|mut hash| {
             for byte in run_id.as_bytes() {
                 hash ^= u64::from(*byte);
                 hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
@@ -519,6 +523,35 @@ mod tests {
             TraceId::of_run("6402ccea-650f-4472-bff5-24e34466fe6d"),
             TraceId::of_run("6402ccea650f4472bff524e34466fe6d0"),
         );
+    }
+
+    /// The halves must not be correlated, which two bases sharing a low nibble would make them.
+    #[test]
+    fn the_two_hash_halves_do_not_track_each_other() {
+        let mut agreed = [0usize; 4];
+        let total = 500;
+        for n in 0..total {
+            let hex = TraceId::of_run(&format!("run-{n}")).to_string();
+            let (left, right) = hex.split_at(16);
+            for (bit, (a, b)) in left
+                .chars()
+                .rev()
+                .zip(right.chars().rev())
+                .take(4)
+                .enumerate()
+            {
+                if a == b {
+                    agreed[bit] += 1;
+                }
+            }
+        }
+        // Independent nibbles agree about 1 time in 16; a shared low nibble agrees every time.
+        for (bit, count) in agreed.iter().enumerate() {
+            assert!(
+                *count < total * 3 / 4,
+                "hex digit {bit} from the end agreed {count}/{total} times — the halves track"
+            );
+        }
     }
 
     /// All-zero is OpenTelemetry's invalid trace id, and no derivation may produce it.

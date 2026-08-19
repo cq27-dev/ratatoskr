@@ -50,22 +50,38 @@ pub fn bind_run(run_id: &str) {
 }
 
 /// Trace ids from the run; span ids from the SDK.
-#[derive(Debug, Default)]
-struct RunTrace(opentelemetry_sdk::trace::RandomIdGenerator);
+///
+/// Carries the trace it was built with rather than reading [`TRACE`] per call, so the decision is
+/// testable without a process-global. The global is read once, at the one place a provider is
+/// built. Reading it here instead made the generator's test depend on which test in the binary
+/// reached `bind_run` first — `run_span` calls it, and a test in `main.rs` calls `run_span`.
+#[derive(Debug)]
+struct RunTrace {
+    bound: Option<TraceId>,
+    ids: opentelemetry_sdk::trace::RandomIdGenerator,
+}
+
+impl RunTrace {
+    fn new(bound: Option<TraceId>) -> Self {
+        Self {
+            bound,
+            ids: opentelemetry_sdk::trace::RandomIdGenerator::default(),
+        }
+    }
+}
 
 impl IdGenerator for RunTrace {
     fn new_trace_id(&self) -> opentelemetry::TraceId {
-        match TRACE.get() {
+        match self.bound {
             Some(trace) => opentelemetry::TraceId::from_bytes(trace.to_bytes()),
-            // Before a run is bound, or in a process that drives none. A random trace is honest
-            // here: these spans genuinely belong to no run, and folding them into a fixed id would
-            // invent a trace that nothing else joins.
-            None => self.0.new_trace_id(),
+            // A process that drives no run. A random trace is honest: these spans belong to no run,
+            // and folding them into a fixed id would invent a trace that nothing else joins.
+            None => self.ids.new_trace_id(),
         }
     }
 
     fn new_span_id(&self) -> opentelemetry::SpanId {
-        self.0.new_span_id()
+        self.ids.new_span_id()
     }
 }
 
@@ -83,6 +99,10 @@ impl IdGenerator for RunTrace {
 fn convention_event_name(kind: &str) -> Option<&'static str> {
     match kind {
         "model_text" => Some("gen_ai.choice"),
+        // Both, because the conventions have one name for a tool exchange. `tool_call` is not
+        // strictly a `gen_ai.tool.message` — that name is the result fed back to the model — but
+        // the `kind` attribute is preserved on the event, so the two stay distinguishable to
+        // anything that cares, and inventing a name outside the conventions would help nobody.
         "tool_call" | "tool_result" => Some("gen_ai.tool.message"),
         _ => None,
     }
@@ -105,12 +125,12 @@ impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanEx
     ) -> opentelemetry_sdk::error::OTelSdkResult {
         for span in &mut batch {
             for event in &mut span.events.events {
-                let kind = event
+                let renamed = event
                     .attributes
                     .iter()
                     .find(|kv| kv.key.as_str() == "kind")
-                    .map(|kv| kv.value.as_str().into_owned());
-                if let Some(name) = kind.as_deref().and_then(convention_event_name) {
+                    .and_then(|kv| convention_event_name(kv.value.as_str().as_ref()));
+                if let Some(name) = renamed {
                     event.name = name.into();
                 }
             }
@@ -118,8 +138,14 @@ impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanEx
         self.0.export(batch).await
     }
 
-    fn shutdown(&self) -> opentelemetry_sdk::error::OTelSdkResult {
-        self.0.shutdown()
+    fn shutdown_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        // This half, not `shutdown` — the trait's `shutdown` delegates here, so overriding only
+        // `shutdown` leaves a timed shutdown returning `Ok(())` without touching the inner
+        // exporter, and the last batch would be dropped rather than sent.
+        self.0.shutdown_with_timeout(timeout)
     }
 
     fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
@@ -157,26 +183,28 @@ fn chosen(traces: Option<&str>, general: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Build the tracer for `endpoint`.
+/// Build the tracer.
+///
+/// The endpoint is NOT passed in. The SDK reads the same two variables itself, and treats them
+/// differently on purpose: `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is the full path, while
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` is a base URL it appends `/v1/traces` to. Handing it a
+/// pre-resolved string defeats that — the standard base URL every collector documents would then
+/// POST to `/` and 404. [`endpoint`] therefore decides only *whether* to export, never *where*.
 ///
 /// Returns the provider alongside the tracer because a batch exporter has to be shut down for the
 /// last spans to leave the process — dropping it is not enough.
-pub fn tracer(
-    endpoint: &str,
-) -> anyhow::Result<(
+pub fn tracer() -> anyhow::Result<(
     opentelemetry_sdk::trace::SdkTracerProvider,
     opentelemetry_sdk::trace::SdkTracer,
 )> {
     use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_otlp::WithExportConfig as _;
 
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
-        .with_endpoint(endpoint)
         .build()?;
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_batch_exporter(Vocabulary(exporter))
-        .with_id_generator(RunTrace::default())
+        .with_id_generator(RunTrace::new(TRACE.get().copied()))
         .with_resource(
             opentelemetry_sdk::Resource::builder()
                 .with_service_name("ratatoskr")
@@ -257,21 +285,166 @@ mod tests {
     }
 
     /// The generator is what makes a run one trace rather than one trace per root span.
+    ///
+    /// Built with its trace rather than reading the process-global, so this asserts the decision
+    /// and not whichever test in this binary happened to call `bind_run` first.
     #[test]
     fn every_span_of_a_bound_run_shares_the_runs_trace() {
-        bind_run("6402ccea-650f-4472-bff5-24e34466fe6d");
-        let ids = RunTrace::default();
+        let run = "6402ccea-650f-4472-bff5-24e34466fe6d";
+        let ids = RunTrace::new(Some(TraceId::of_run(run)));
         let first = ids.new_trace_id();
-        let second = ids.new_trace_id();
-        assert_eq!(first, second, "a run's spans must share one trace");
+        assert_eq!(first, ids.new_trace_id(), "a run's spans share one trace");
         assert_eq!(
             first,
-            opentelemetry::TraceId::from_bytes(
-                TraceId::of_run("6402ccea-650f-4472-bff5-24e34466fe6d").to_bytes()
-            ),
-            "and it must be the trace the run id derives, so a reader can find it by run"
+            opentelemetry::TraceId::from_bytes(TraceId::of_run(run).to_bytes()),
+            "and it is the trace the run id derives, so a reader can find it by run"
         );
         // Span ids stay the SDK's, and stay distinct.
         assert_ne!(ids.new_span_id(), ids.new_span_id());
+    }
+
+    /// The whole path, end to end: a span opened through the layer arrives at a listener as OTLP.
+    ///
+    /// This is the test that was missing, and both defects it now pins were shipped without it.
+    /// The batch processor exports from its own thread with no tokio context, so pairing it with
+    /// an async HTTP client panics there and nothing ever leaves — invisible to every unit test.
+    /// And a pre-resolved endpoint handed to `with_endpoint` bypasses the SDK's `/v1/traces`
+    /// resolution, so the standard base URL POSTs to `/`.
+    ///
+    /// A bare `TcpListener` rather than a real collector: the assertion is what went over the
+    /// wire, which needs no backend to observe.
+    #[test]
+    fn a_span_reaches_a_collector_as_otlp_over_http() {
+        use prost::Message as _;
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local port");
+        let port = listener.local_addr().expect("its address").port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let collector = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("one connection");
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 8192];
+            // Read until the body is complete, which the head's Content-Length tells us.
+            loop {
+                let read = socket.read(&mut buf).expect("reading the request");
+                if read == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..read]);
+                let Some(head) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&raw[..head]).to_ascii_lowercase();
+                let len: usize = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if raw.len() >= head + 4 + len {
+                    let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                    let _ = socket.flush();
+                    tx.send((text, raw[head + 4..].to_vec()))
+                        .expect("handing it back");
+                    break;
+                }
+            }
+        });
+
+        let run = "6402ccea-650f-4472-bff5-24e34466fe6d";
+        // Built exactly as production builds it, except for the endpoint the SDK would otherwise
+        // read from the environment — which a test must not mutate (see #314).
+        let exporter = {
+            use opentelemetry_otlp::WithExportConfig as _;
+            opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_endpoint(format!("http://127.0.0.1:{port}/v1/traces"))
+                .build()
+                .expect("the exporter builds")
+        };
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(Vocabulary(exporter))
+            .with_id_generator(RunTrace::new(Some(TraceId::of_run(run))))
+            .with_resource(
+                opentelemetry_sdk::Resource::builder()
+                    .with_service_name("ratatoskr")
+                    .build(),
+            )
+            .build();
+
+        {
+            use opentelemetry::trace::TracerProvider as _;
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("ratatoskr"));
+            let subscriber = tracing_subscriber::registry().with(layer);
+            tracing::subscriber::with_default(subscriber, || {
+                let parent = tracing::info_span!("invoke_agent analyst");
+                let _entered = parent.enter();
+                tracing::info!(kind = "model_text", "model text");
+                let child = tracing::info_span!("invoke_agent implementer");
+                let _nested = child.enter();
+            });
+        }
+        provider
+            .shutdown()
+            .expect("the batch exporter flushes on shutdown");
+        collector.join().expect("the listener thread");
+
+        let (head, body) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a request reached the collector");
+        assert!(head.starts_with("post /v1/traces "), "got: {head}");
+        assert!(
+            head.contains("content-type: application/x-protobuf"),
+            "got: {head}"
+        );
+
+        let request =
+            opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest::decode(
+                &body[..],
+            )
+            .expect("the body is an OTLP trace export");
+        let spans: Vec<_> = request
+            .resource_spans
+            .iter()
+            .flat_map(|r| &r.scope_spans)
+            .flat_map(|s| &s.spans)
+            .collect();
+        assert!(!spans.is_empty(), "at least one span was exported");
+
+        // One run is one trace.
+        let expected = TraceId::of_run(run).to_bytes();
+        for span in &spans {
+            assert_eq!(
+                span.trace_id, expected,
+                "every span carries the run's trace"
+            );
+        }
+        // Nesting survives: the child names the parent's span id.
+        let parent = spans
+            .iter()
+            .find(|s| s.name == "invoke_agent analyst")
+            .expect("the parent span");
+        let child = spans
+            .iter()
+            .find(|s| s.name == "invoke_agent implementer")
+            .expect("the child span");
+        assert_eq!(
+            child.parent_span_id, parent.span_id,
+            "the child must name its parent, not a fresh root"
+        );
+        // And the vocabulary was translated on the way out, not at the emit site.
+        assert!(
+            parent.events.iter().any(|e| e.name == "gen_ai.choice"),
+            "the `model_text` event exports under its convention name, got {:?}",
+            parent.events.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// A process driving no run invents no trace to put its spans in.
+    #[test]
+    fn an_unbound_process_gets_a_random_trace_per_root() {
+        let ids = RunTrace::new(None);
+        assert_ne!(ids.new_trace_id(), ids.new_trace_id());
     }
 }

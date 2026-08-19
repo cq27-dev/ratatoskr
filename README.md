@@ -242,8 +242,9 @@ names, kinds and nesting — so sending them to a collector is a matter of namin
 OTEL_EXPORTER_OTLP_TRACES_ENDPOINT='http://localhost:4318/v1/traces' ratatoskr run ...
 ```
 
-`OTEL_EXPORTER_OTLP_ENDPOINT` works too; the traces-specific variable wins. OTLP over HTTP with
-protobuf bodies — the endpoint is the full path, not a base URL.
+`OTEL_EXPORTER_OTLP_ENDPOINT` works too, and the two are read differently, as the specification
+says: the traces-specific variable is the **full path**, while the general one is a **base URL**
+that `/v1/traces` is appended to. OTLP over HTTP with protobuf bodies.
 
 From the environment rather than `ratatoskr.toml`, for the same reason the webhook secret is:
 where a deployment sends its traces is not a property of the repository being worked on, and a
@@ -253,8 +254,9 @@ With neither variable set nothing is built and no socket is opened. One run is o
 the run id — a UUID run id becomes the trace id with its hyphens dropped, so you can paste a run id
 into a backend and find it.
 
-A collector that is unreachable does not stop a run: the failure is reported once and export stays
-off for that process.
+A collector that is unreachable does not stop a run. Export failures — a refused connection, a
+404, a dropped batch — are logged and retried on the next interval; the run is unaffected either
+way.
 
 ### Starting a run from GitHub
 
