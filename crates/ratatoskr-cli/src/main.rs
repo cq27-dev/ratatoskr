@@ -496,7 +496,7 @@ fn init_logging() -> Guards {
             eprintln!("warning: OTLP export disabled — `{endpoint}` is not an http(s) URL");
             (None, None)
         }
-        Some(_) => match otlp::tracer(otlp::run_trace(), None) {
+        Some(_) => match otlp::tracer() {
             Ok((provider, tracer)) => {
                 // Filtered like every other layer, and for the same reason: unfiltered, this one
                 // reports no `max_level_hint`, which drops the global level to TRACE and sends
@@ -2184,6 +2184,21 @@ mod tests {
         assert_eq!(
             crate::mention_name("--github-account", "@ratatoskr-app").unwrap(),
             "ratatoskr-app"
+        );
+    }
+
+    /// `run_span` is where the process trace is bound, and nothing else covers that line.
+    ///
+    /// Two review rounds were lost to defects in this chain — `bind_run` -> `TRACE` -> the
+    /// generator — because every test built its own cell. Asserting `is_some()` is monotone, so it
+    /// stays deterministic beside `the_json_sink_emits_the_documented_shape`, which calls
+    /// `run_span` in this same binary and may win the `OnceLock`.
+    #[test]
+    fn the_run_span_binds_the_process_trace() {
+        let _span = crate::run_span("6402ccea-650f-4472-bff5-24e34466fe6d");
+        assert!(
+            crate::otlp::run_trace().get().is_some(),
+            "run_span must bind the process trace, or every run exports under a random one"
         );
     }
 

@@ -186,11 +186,14 @@ pub fn endpoint() -> Option<String> {
 /// concurrently-running tests reading the environment — the defect this repo already carries as
 /// #314. Nothing here needs a real process variable to be worth checking.
 fn chosen(traces: Option<&str>, general: Option<&str>) -> Option<String> {
+    // Emptiness is judged on the trimmed value; the value itself is returned UNTRIMMED. The SDK
+    // reads the raw variable, so trimming here would let `usable` bless a padded endpoint the SDK
+    // then fails to parse — and its fallback is its built-in localhost collector, which is the
+    // exact silent redirect `usable` exists to prevent.
     [traces, general]
         .into_iter()
         .flatten()
-        .map(str::trim)
-        .find(|value| !value.is_empty())
+        .find(|value| !value.trim().is_empty())
         .map(str::to_string)
 }
 
@@ -216,7 +219,21 @@ pub fn usable(endpoint: &str) -> bool {
 ///
 /// Returns the provider alongside the tracer because a batch exporter has to be shut down for the
 /// last spans to leave the process — dropping it is not enough.
-pub fn tracer(
+pub fn tracer() -> anyhow::Result<(
+    opentelemetry_sdk::trace::SdkTracerProvider,
+    opentelemetry_sdk::trace::SdkTracer,
+)> {
+    // Through the accessor, not `&TRACE` directly: that keeps `run_trace` a production path
+    // rather than an item reachable only from a test, which `warnings = "deny"` would reject.
+    build(run_trace(), None)
+}
+
+/// The tracer, with the two things only a test may vary.
+///
+/// Private, and `tracer` is the only production caller, so neither the wrong trace cell nor a
+/// hand-resolved endpoint can be passed by accident. Round two shipped a defect that was exactly
+/// one wrong argument at this call site.
+fn build(
     trace: &'static OnceLock<TraceId>,
     endpoint: Option<&str>,
 ) -> anyhow::Result<(
@@ -396,7 +413,7 @@ mod tests {
         // cell per test run is nothing.
         let cell: &'static OnceLock<TraceId> = Box::leak(Box::new(OnceLock::new()));
         cell.set(TraceId::of_run(run)).expect("a fresh cell");
-        let (provider, tracer) = tracer(cell, Some(&format!("http://127.0.0.1:{port}/v1/traces")))
+        let (provider, tracer) = build(cell, Some(&format!("http://127.0.0.1:{port}/v1/traces")))
             .expect("the tracer builds");
 
         {
@@ -414,20 +431,16 @@ mod tests {
                 let _nested = child.enter();
             });
         }
-        // Shutdown runs on its own thread and is never joined on the failure path. It is what
-        // flushes the batch, but with nothing to flush it BLOCKS — measured, not assumed — so
-        // calling it inline turns "exported nothing", the exact regression this test exists for,
-        // into a hung CI job with no failing assertion. The receive below is the deadline for the
-        // whole exchange; when it expires the test fails red and the parked threads die with the
-        // process. `collector` is joined only on the path where a request actually arrived.
-        let flushed = std::thread::spawn(move || provider.shutdown());
+        // Shutdown is bounded by the SDK itself — `shutdown()` is `shutdown_with_timeout(5s)` — so
+        // it cannot park here, and an empty queue returns immediately. The deadline that matters is
+        // the receive: it is what turns "exported nothing" red instead of leaving the test blocked
+        // in `accept()` forever, which is why `collector.join()` must come after it and not before.
+        provider
+            .shutdown()
+            .expect("the batch exporter flushes on shutdown");
         let (head, body) = rx
             .recv_timeout(std::time::Duration::from_secs(15))
             .expect("a request reached the collector within 15s");
-        flushed
-            .join()
-            .expect("the shutdown thread")
-            .expect("the batch exporter flushes on shutdown");
         collector.join().expect("the listener thread");
         assert!(head.starts_with("post /v1/traces "), "got: {head}");
         assert!(

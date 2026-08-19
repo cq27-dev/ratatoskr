@@ -101,12 +101,14 @@ impl TraceId {
         if let Some(id) = Self::parse(&run_id.replace('-', "")) {
             return id;
         }
-        // Two halves, and they must be different FUNCTIONS of the input rather than one function
-        // at two offsets. FNV-1a's low bit is the basis's low bit xor the parity of the input
-        // bytes' low bits, independent of everything else in the basis — so ANY two bases give
-        // halves whose bit 0 is either always equal or always opposite, and hunting for luckier
-        // constants cannot fix that. Feeding the second half the bytes in reverse breaks the
-        // algebra instead: the two then depend on the input in genuinely different ways.
+        // Two halves. The reversal is what stops them being the SAME value — nothing more; it is
+        // the finalizer inside `fnv1a` that makes them independent, and the reason is documented
+        // there. Do not read this as "reversing fixes the correlation": it does not, and a reader
+        // who believes it will delete the finalizer.
+        //
+        // A palindrome hashes identically in both directions, so `--run-id aba` yields a trace
+        // whose halves are equal — a legal, non-zero, deterministic id carrying 64 bits rather
+        // than 128. Not worth special-casing; worth not being surprised by.
         let halves = [
             fnv1a(run_id.as_bytes().iter().copied()),
             fnv1a(run_id.as_bytes().iter().rev().copied()),
