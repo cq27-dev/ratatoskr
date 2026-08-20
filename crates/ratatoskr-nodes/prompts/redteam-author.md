@@ -21,6 +21,11 @@ cannot compile or cannot find the symbol is expected at this stage — what matt
 symbol arrives with the contracted shape, the test exercises it rather than needing a rewrite. Do
 not write a test that passes today by asserting nothing.
 
+This is checked, not trusted. Your tests are run against the tree as it is now, before the change,
+and any of them that passes there is dropped: it cannot have been proving the change happened, so
+it is not allowed to be what says the change happened. A test dropped this way is worse than one
+you never wrote, because the run then has one fewer thing holding the implementer to the contract.
+
 Match the interface exactly: the names, the parameter order, the types. If the contract is
 ambiguous about something you need, pick the reading that makes the requirement checkable and note
 the choice in a comment on the test — do not invent a second, more convenient interface.
