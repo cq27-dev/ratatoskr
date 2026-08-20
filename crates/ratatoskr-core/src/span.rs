@@ -59,6 +59,104 @@ impl std::fmt::Display for SpanId {
     }
 }
 
+/// A run's identity as a trace: sixteen bytes, thirty-two lowercase hex characters, never all-zero.
+///
+/// One run is one trace, so this is derived from `run_id` rather than minted — every execution of
+/// a run has to reach the same answer without coordinating, including in a different process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TraceId([u8; 16]);
+
+impl TraceId {
+    /// The trace of these bytes, or `None` for the invalid all-zero id.
+    pub fn new(bytes: [u8; 16]) -> Option<Self> {
+        (bytes != [0; 16]).then_some(Self(bytes))
+    }
+
+    /// Read one back from the thirty-two hex characters it is written as, hyphens not allowed.
+    pub fn parse(hex: &str) -> Option<Self> {
+        // `from_str_radix` accepts a leading `+`, so without this `+f+f…` and `0f0f…` parse to the
+        // same bytes — two run ids on one trace, and the first taken for a uuid it is not.
+        if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut bytes = [0u8; 16];
+        for (byte, pair) in bytes.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+            *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+        }
+        Self::new(bytes)
+    }
+
+    /// The trace a run id names. Total: every run id yields one, and none of them is malformed.
+    ///
+    /// A run id is ordinarily a hyphenated v4 UUID, which is already sixteen bytes — the transform
+    /// is dropping the hyphens, so a trace id read in a backend is recognisably the run. But
+    /// `--run-id` takes any non-empty string, so the general case is not a UUID at all and cannot
+    /// be re-encoded into one.
+    ///
+    /// Such a run is hashed rather than refused. Refusing would mean a run that named itself
+    /// cannot be observed, which trades away the thing being built to protect a formatting rule;
+    /// hashing keeps one run one trace, deterministically and across processes, and the only thing
+    /// lost is that the id no longer reads back as the run's own name.
+    pub fn of_run(run_id: &str) -> Self {
+        if let Some(id) = Self::parse(&run_id.replace('-', "")) {
+            return id;
+        }
+        // Two halves. The reversal is what stops them being the SAME value — nothing more; it is
+        // the finalizer inside `fnv1a` that makes them independent, and the reason is documented
+        // there. Do not read this as "reversing fixes the correlation": it does not, and a reader
+        // who believes it will delete the finalizer.
+        //
+        // A palindrome hashes identically in both directions, so `--run-id aba` yields a trace
+        // whose halves are equal — a legal, non-zero, deterministic id carrying 64 bits rather
+        // than 128. Not worth special-casing; worth not being surprised by.
+        let halves = [
+            fnv1a(run_id.as_bytes().iter().copied()),
+            fnv1a(run_id.as_bytes().iter().rev().copied()),
+        ];
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&halves[0]);
+        bytes[8..].copy_from_slice(&halves[1]);
+        // A hash of all-zero would be the invalid id. Vanishingly unlikely and cheap to exclude,
+        // and the alternative is returning an id a backend must reject.
+        Self::new(bytes).unwrap_or(Self([0xff; 16]))
+    }
+
+    pub fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+/// FNV-1a with an avalanche finalizer. Not cryptographic and does not need to be: this maps a name
+/// to a trace id, and the only property that matters is that one name always reaches one id.
+///
+/// The finalizer is not decoration. Plain FNV-1a's lowest bit is the basis's lowest bit xor the
+/// *parity* of the input bytes' lowest bits — nothing else in the basis, the prime, or the byte
+/// ORDER can touch it. So two plain FNV halves always agree on bit 0 or always disagree on it, and
+/// neither a different basis nor reversing the input can fix that; only mixing high bits down can.
+/// These are the SplitMix64 constants, whose job is exactly that.
+fn fnv1a(bytes: impl Iterator<Item = u8>) -> [u8; 8] {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^= hash >> 31;
+    hash.to_be_bytes()
+}
+
+impl std::fmt::Display for TraceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 impl Serialize for SpanId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.to_string())
@@ -417,5 +515,95 @@ mod tests {
 
         // And a malformed one does not deserialize into something that reads as an execution.
         assert!(serde_json::from_str::<SpanId>("\"nope\"").is_err());
+    }
+
+    /// The ordinary case: a run id IS a uuid, so the trace reads back as the run's own name.
+    #[test]
+    fn a_uuid_run_id_becomes_itself_with_the_hyphens_dropped() {
+        let trace = TraceId::of_run("6402ccea-650f-4472-bff5-24e34466fe6d");
+        assert_eq!(trace.to_string(), "6402ccea650f4472bff524e34466fe6d");
+        assert_eq!(trace.to_bytes().len(), 16);
+        // Uppercase is the same run; a backend must not see two traces for one id.
+        assert_eq!(
+            TraceId::of_run("6402CCEA-650F-4472-BFF5-24E34466FE6D"),
+            trace
+        );
+    }
+
+    /// `--run-id` takes any non-empty string, so the general case cannot be re-encoded.
+    #[test]
+    fn a_run_id_that_is_not_a_uuid_is_hashed_rather_than_refused() {
+        let trace = TraceId::of_run("nightly-2026-08-19");
+        assert_eq!(trace.to_string().len(), 32);
+        assert!(trace.to_string().chars().all(|c| c.is_ascii_hexdigit()));
+        // Deterministic: the same name reaches the same trace, in this process and any other.
+        assert_eq!(TraceId::of_run("nightly-2026-08-19"), trace);
+        // And distinct names do not collapse into one trace.
+        assert_ne!(TraceId::of_run("nightly-2026-08-20"), trace);
+        // A uuid-shaped id is never reached by the hash path, so the two cannot collide.
+        assert_ne!(
+            TraceId::of_run("6402ccea-650f-4472-bff5-24e34466fe6d"),
+            TraceId::of_run("6402ccea650f4472bff524e34466fe6d0"),
+        );
+    }
+
+    /// The halves must not track each other — in EITHER direction.
+    ///
+    /// Counting hex-digit *equality* cannot see this: two halves that are always OPPOSITE agree 0%
+    /// of the time, which a naive count reads as maximal independence when it is in fact maximal
+    /// dependence. Agreement is measured per bit, and has to sit near half.
+    #[test]
+    fn the_two_hash_halves_do_not_track_each_other() {
+        let total = 2000;
+        let mut agreed = [0usize; 64];
+        for n in 0..total {
+            let bytes = TraceId::of_run(&format!("run-{n}")).to_bytes();
+            let left = u64::from_be_bytes(bytes[..8].try_into().expect("eight bytes"));
+            let right = u64::from_be_bytes(bytes[8..].try_into().expect("eight bytes"));
+            let same = !(left ^ right);
+            for (bit, count) in agreed.iter_mut().enumerate() {
+                *count += usize::from((same >> bit) & 1 == 1);
+            }
+        }
+        for (bit, count) in agreed.iter().enumerate() {
+            let share = *count as f64 / total as f64;
+            assert!(
+                (0.35..=0.65).contains(&share),
+                "bit {bit} agreed {count}/{total} ({share:.2}) — the halves are not independent"
+            );
+        }
+    }
+
+    /// All-zero is OpenTelemetry's invalid trace id, and no derivation may produce it.
+    #[test]
+    fn no_run_id_derives_the_invalid_trace() {
+        assert_eq!(TraceId::new([0; 16]), None);
+        assert!(TraceId::parse("00000000000000000000000000000000").is_none());
+        // The all-zero uuid is a legal run id and must still yield a usable trace.
+        let zeroes = TraceId::of_run("00000000-0000-0000-0000-000000000000");
+        assert_ne!(zeroes.to_bytes(), [0; 16]);
+        for id in ["", "x", "nightly", "6402ccea-650f-4472-bff5-24e34466fe6d"] {
+            assert_ne!(TraceId::of_run(id).to_bytes(), [0; 16], "for `{id}`");
+        }
+    }
+
+    /// Only hex digits. `from_str_radix` would otherwise take `+f` as `0f`.
+    #[test]
+    fn a_sign_is_not_a_hex_digit() {
+        assert!(TraceId::parse(&"+f".repeat(16)).is_none());
+        assert!(TraceId::parse(&"-f".repeat(16)).is_none());
+        assert_ne!(
+            TraceId::of_run(&"+f".repeat(16)),
+            TraceId::of_run(&"0f".repeat(16))
+        );
+    }
+
+    #[test]
+    fn a_trace_id_round_trips_through_its_hex() {
+        let trace = TraceId::of_run("nightly-2026-08-19");
+        assert_eq!(TraceId::parse(&trace.to_string()), Some(trace));
+        // Strict about width, and hyphens are not part of the written form.
+        assert!(TraceId::parse("6402ccea-650f-4472-bff5-24e34466fe6d").is_none());
+        assert!(TraceId::parse("6402ccea650f4472bff524e34466fe").is_none());
     }
 }

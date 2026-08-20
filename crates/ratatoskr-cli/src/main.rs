@@ -14,6 +14,8 @@ use tracing::Instrument as _;
 use tracing_subscriber::EnvFilter;
 
 /// System prompt for `ask`: ground answers in rag-rat's tools, don't guess.
+mod otlp;
+
 const ASK_PREAMBLE: &str = include_str!("../prompts/ask.md");
 
 #[derive(Parser)]
@@ -421,7 +423,7 @@ async fn main() -> anyhow::Result<()> {
 ///
 /// Returns the file-writer guards, which must be held for the process's lifetime or buffered
 /// output is dropped.
-fn init_logging() -> Vec<tracing_appender::non_blocking::WorkerGuard> {
+fn init_logging() -> Guards {
     use tracing_subscriber::Layer as _;
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
@@ -482,12 +484,74 @@ fn init_logging() -> Vec<tracing_appender::non_blocking::WorkerGuard> {
         Err(_) => (None, None),
     };
 
+    // Absent unless a collector is configured, and then it is one more layer beside the others —
+    // the span vocabulary is already the convention's, so nothing here translates anything. A
+    // failure to build it is reported and dropped rather than propagated: an unreachable collector
+    // must not stop a run, which is the whole reason export is a layer and not a dependency.
+    let (otlp_layer, otlp_provider) = match otlp::endpoint() {
+        None => (None, None),
+        Some(endpoint) if !otlp::usable(&endpoint) => {
+            // Not a silent fallback: the SDK would parse this, fail, and export to its built-in
+            // localhost default instead of the collector that was meant.
+            eprintln!("warning: OTLP export disabled — `{endpoint}` is not an http(s) URL");
+            (None, None)
+        }
+        Some(_) => match otlp::tracer() {
+            Ok((provider, tracer)) => {
+                // Filtered like every other layer, and for the same reason: unfiltered, this one
+                // reports no `max_level_hint`, which drops the global level to TRACE and sends
+                // every dependency's spans through the registry AND on to the collector — burying
+                // the run's own spans in hyper, reqwest and rustls chatter, in the run's hot path.
+                let filter = EnvFilter::new(
+                    std::env::var("RATATOSKR_OTEL_LOG")
+                        .unwrap_or_else(|_| "ratatoskr=info".to_string()),
+                );
+                (
+                    Some(
+                        tracing_opentelemetry::layer()
+                            .with_tracer(tracer)
+                            .with_filter(filter),
+                    ),
+                    Some(provider),
+                )
+            }
+            Err(e) => {
+                eprintln!("warning: OTLP export disabled ({e})");
+                (None, None)
+            }
+        },
+    };
+
     tracing_subscriber::registry()
         .with(console)
         .with(file_layer)
         .with(json_layer)
+        .with(otlp_layer)
         .init();
-    [guard, json_guard].into_iter().flatten().collect()
+    Guards {
+        _appenders: [guard, json_guard].into_iter().flatten().collect(),
+        otlp: otlp_provider,
+    }
+}
+
+/// What has to outlive the process's work for its records to actually be written.
+///
+/// The appender guards flush buffered log lines. The tracer provider is separate and is NOT
+/// flushed by being dropped — a batch exporter holds spans until its interval elapses, so the last
+/// spans of a short run leave only because [`Guards::drop`] asks it to.
+struct Guards {
+    _appenders: Vec<tracing_appender::non_blocking::WorkerGuard>,
+    otlp: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+}
+
+impl Drop for Guards {
+    fn drop(&mut self) {
+        if let Some(provider) = self.otlp.take()
+            && let Err(e) = provider.shutdown()
+        {
+            eprintln!("warning: OTLP export did not flush ({e})");
+        }
+    }
 }
 
 /// Write a default config, leaving any existing `ratatoskr.toml` untouched.
@@ -539,6 +603,9 @@ async fn ask(question: &str, config_path: &Path) -> anyhow::Result<()> {
 /// static name because readers resolve it by key — see [`init_logging`] — while `otel.name` gives
 /// the exported span the convention's `<operation> <target>` name, which is per run.
 fn run_span(run_id: &str) -> tracing::Span {
+    // One run is one trace, and this is where the id first exists. Every span opened under this
+    // one therefore shares the trace the run id derives; see `otlp::bind_run`.
+    otlp::bind_run(run_id);
     tracing::info_span!(
         "run",
         run_id = %run_id,
@@ -2117,6 +2184,21 @@ mod tests {
         assert_eq!(
             crate::mention_name("--github-account", "@ratatoskr-app").unwrap(),
             "ratatoskr-app"
+        );
+    }
+
+    /// `run_span` is where the process trace is bound, and nothing else covers that line.
+    ///
+    /// Two review rounds were lost to defects in this chain — `bind_run` -> `TRACE` -> the
+    /// generator — because every test built its own cell. Asserting `is_some()` is monotone, so it
+    /// stays deterministic beside `the_json_sink_emits_the_documented_shape`, which calls
+    /// `run_span` in this same binary and may win the `OnceLock`.
+    #[test]
+    fn the_run_span_binds_the_process_trace() {
+        let _span = crate::run_span("6402ccea-650f-4472-bff5-24e34466fe6d");
+        assert!(
+            crate::otlp::run_trace().get().is_some(),
+            "run_span must bind the process trace, or every run exports under a random one"
         );
     }
 
