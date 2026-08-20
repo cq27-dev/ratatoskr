@@ -110,6 +110,75 @@ pub struct AuthoredTests {
     /// One line per file on what it covers, or why nothing was written.
     #[serde(default)]
     pub covers: String,
+    /// Authored tests that did **not** fail on the baseline, and so gate nothing.
+    ///
+    /// A test written before the code is supposed to fail without it. One that passes anyway is
+    /// either asserting behaviour that already existed or not running at all, and in both cases it
+    /// proves the change did nothing — so it is moved out of [`tests`](Self::tests) rather than
+    /// left there to be satisfied for free.
+    ///
+    /// Kept rather than discarded because the fallback has to be *said*. A run whose task had no
+    /// testable outcome should fall back to the ordinary gate openly; one that quietly dropped an
+    /// unprovable test would look identical to one that never wrote a test at all.
+    ///
+    /// Absent from the generated schema — `schemars(skip)` — because this struct is two things:
+    /// the contract the authoring model is validated against, and the record the run carries. The
+    /// model does not write this field; the baseline decides it afterwards. Putting it in the
+    /// contract would ask the model for an answer only the run can give, and
+    /// `standard_redteam_contracts_match_the_typed_output_gates` is what noticed.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub unproven: Vec<String>,
+}
+
+impl AuthoredTests {
+    /// Keep only the tests the baseline proved fail without the change.
+    ///
+    /// `baseline_failing` is the run that had these files copied in, so a test missing from it
+    /// passed there — see [`RedTeamNode::run_and_author`]. Matching is by the name the runner
+    /// reports, which is what [`tests`](Self::tests) is documented to hold.
+    fn proven_by(self, baseline_failing: &[String]) -> Self {
+        let (tests, unproven): (Vec<String>, Vec<String>) = self
+            .tests
+            .into_iter()
+            .partition(|t| baseline_failing.contains(t));
+        if !unproven.is_empty() {
+            tracing::warn!(
+                kind = "unproven_tests",
+                tests = %unproven.join(", "),
+                "these authored tests passed without the change, so they gate nothing"
+            );
+        }
+        Self {
+            tests,
+            unproven: [self.unproven, unproven].concat(),
+            ..self
+        }
+    }
+}
+
+/// Authored test files, and the worktree to copy them out of.
+struct Seed<'a> {
+    from: &'a std::path::Path,
+    files: &'a [String],
+}
+
+impl Seed<'_> {
+    /// Copy the authored files into `into`, creating the directories they need.
+    ///
+    /// Paths are repository-relative, so the same relative path names the file in both trees.
+    fn plant(&self, into: &std::path::Path) -> Result<(), String> {
+        for file in self.files {
+            let (src, dst) = (self.from.join(file), into.join(file));
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+            }
+            std::fs::copy(&src, &dst)
+                .map_err(|e| format!("copying {} to {}: {e}", src.display(), dst.display()))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -196,21 +265,39 @@ pub struct RedTeamNode {
 }
 
 impl RedTeamNode {
-    /// Characterise the baseline and write the change's tests, in one step.
+    /// Write the change's tests, then characterise the baseline *with those tests in it*.
     ///
-    /// The two are independent — one reads the repository as it is, the other writes into a
-    /// worktree — so they run together. Both finish before the implementer starts, which is the
-    /// point: it meets the tests it has to satisfy rather than writing them itself.
+    /// Sequential, and that ordering is the point. A test written before the code is only worth
+    /// gating on if it fails without the code — one that already passes proves nothing and would
+    /// satisfy [`converge::unsatisfied`](crate::converge::unsatisfied) no matter what the
+    /// implementer did. The baseline is the only place that question can be answered, because the
+    /// baseline is the tree without the change.
+    ///
+    /// So the authored files are copied into the baseline worktree before it runs, and an authored
+    /// test earns its place in [`AuthoredTests::tests`] only by appearing in that run's failures.
+    /// This costs the authoring turn on the critical path — the two used to run concurrently — and
+    /// buys the difference between a gate and a formality. It costs no extra suite run: the
+    /// baseline had to run anyway, and it now answers two questions instead of one.
+    ///
+    /// Authored tests landing in `failing_tests` is correct and not a leak: `is_converged` asks
+    /// only what *newly* fails, so a test that failed in the baseline cannot be read as damage the
+    /// implementer did, while `unsatisfied` requires that same test to pass once the change is in.
     pub async fn run_and_author(
         &self,
         worktree: &std::path::Path,
         issue: &str,
         interface: &[crate::analyst::InterfaceItem],
     ) -> Result<RedTeamOutput, NodeError> {
-        let (baseline, authored) =
-            tokio::join!(self.run(), self.author_tests(worktree, issue, interface));
-        let mut out = baseline?;
-        out.authored = authored;
+        let authored = self.author_tests(worktree, issue, interface).await;
+        let seed = authored
+            .as_ref()
+            .map(|a| Seed {
+                from: worktree,
+                files: &a.files,
+            })
+            .filter(|s| !s.files.is_empty());
+        let mut out = self.run_seeded(seed).await?;
+        out.authored = authored.map(|a| a.proven_by(&out.failing_tests));
         Ok(out)
     }
 
@@ -258,9 +345,12 @@ impl RedTeamNode {
     /// checkout carries installed dependencies and build output a fresh fork does not, so the two
     /// runs disagree about things that have nothing to do with the change.
     ///
-    /// Not the implementer's worktree either: the red team writes the change's tests into that one
-    /// at the same time, and a baseline that saw them would file the new tests as pre-existing
-    /// failures — which is precisely the set converge is told to ignore.
+    /// Not the implementer's worktree either — that one is where the change happens, and a
+    /// baseline measured in it would be measuring the change. The authored tests are *copied* into
+    /// this tree instead (see [`RedTeamNode::run_and_author`]), which is deliberate: they have to
+    /// fail here to be worth gating on, and filing them as pre-existing failures is exactly right.
+    /// `is_converged` ignores that set, so they cannot read as damage; `unsatisfied` requires them
+    /// to pass once the change is in.
     async fn baseline_worktree(&self) -> Result<WorktreePath, NodeError> {
         create_worktree(&self.repo_path, &self.worktree_root, &self.baseline_branch)
             .await
@@ -282,7 +372,25 @@ impl RedTeamNode {
     }
 
     pub async fn run(&self) -> Result<RedTeamOutput, NodeError> {
+        self.run_seeded(None).await
+    }
+
+    /// The baseline run, optionally with the authored tests copied in first.
+    ///
+    /// Seeding is best-effort in the same sense the rest of this node is: a file that cannot be
+    /// copied leaves its tests unproven rather than failing the run, because a weaker judgement
+    /// beats no judgement. It is never silent — [`AuthoredTests::proven_by`] records every test
+    /// that did not earn its place.
+    async fn run_seeded(&self, seed: Option<Seed<'_>>) -> Result<RedTeamOutput, NodeError> {
         let worktree = self.baseline_worktree().await?;
+        if let Some(seed) = seed
+            && let Err(e) = seed.plant(worktree.as_path())
+        {
+            tracing::warn!(
+                "could not put the authored tests in the baseline ({e}); they cannot be proven to \
+                 fail without the change, so none of them will gate it"
+            );
+        }
         let outcomes = run_acceptance(Acceptance {
             cfg: &self.sandbox,
             node: "redteam",
@@ -324,6 +432,82 @@ impl RedTeamNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn authored(tests: &[&str], files: &[&str]) -> AuthoredTests {
+        AuthoredTests {
+            files: files.iter().map(|s| s.to_string()).collect(),
+            tests: tests.iter().map(|s| s.to_string()).collect(),
+            covers: String::new(),
+            unproven: Vec::new(),
+        }
+    }
+
+    /// A test that already passes without the change proves nothing, and must not gate.
+    ///
+    /// This is the hole the reproduction gate had: `unsatisfied` asks which authored tests are
+    /// still failing afterwards, so a test that never failed is satisfied for free and waves
+    /// through a change that did nothing.
+    #[test]
+    fn an_authored_test_that_passes_without_the_change_gates_nothing() {
+        let baseline_failing = vec!["repro::the_bug_is_fixed".to_string()];
+        let kept = authored(
+            &["repro::the_bug_is_fixed", "repro::two_plus_two_is_four"],
+            &[],
+        )
+        .proven_by(&baseline_failing);
+
+        assert_eq!(kept.tests, ["repro::the_bug_is_fixed"]);
+        assert_eq!(kept.unproven, ["repro::two_plus_two_is_four"]);
+        // And the surviving test still gates, which is the other half of the rule.
+        assert_eq!(
+            crate::converge::unsatisfied(&kept.tests, &["repro::the_bug_is_fixed".to_string()]),
+            ["repro::the_bug_is_fixed"]
+        );
+        // The rejected one cannot be satisfied for free, because it is no longer asked about.
+        assert!(crate::converge::unsatisfied(&kept.tests, &[]).is_empty());
+    }
+
+    /// Nothing proven means the ordinary gate, said out loud rather than silently.
+    #[test]
+    fn tests_that_all_pass_on_the_baseline_leave_nothing_to_gate_on() {
+        let kept = authored(&["a", "b"], &[]).proven_by(&[]);
+        assert!(kept.tests.is_empty(), "none of them earned a place");
+        assert_eq!(kept.unproven, ["a", "b"], "and the run can say why");
+    }
+
+    /// Seeding is what puts the authored tests where the baseline can judge them.
+    #[test]
+    fn planting_copies_the_authored_files_into_the_baseline_tree() {
+        let tmp = std::env::temp_dir().join(format!("ratatoskr-seed-{}", std::process::id()));
+        let (from, into) = (tmp.join("impl"), tmp.join("base"));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(from.join("tests/deep")).unwrap();
+        std::fs::create_dir_all(&into).unwrap();
+        std::fs::write(from.join("tests/deep/repro.rs"), "fn t() {}").unwrap();
+
+        Seed {
+            from: &from,
+            files: &["tests/deep/repro.rs".to_string()],
+        }
+        .plant(&into)
+        .expect("the file is copied, directories and all");
+
+        assert_eq!(
+            std::fs::read_to_string(into.join("tests/deep/repro.rs")).unwrap(),
+            "fn t() {}"
+        );
+        // A file that is not there is reported rather than silently skipped: unreported, its tests
+        // would look proven-absent and quietly stop gating.
+        assert!(
+            Seed {
+                from: &from,
+                files: &["tests/missing.rs".to_string()],
+            }
+            .plant(&into)
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     /// A repository with one commit, plus an untracked `node_modules/installed` — what a live
     /// checkout carries and a fresh fork does not.
