@@ -132,16 +132,29 @@ pub struct AuthoredTests {
 }
 
 impl AuthoredTests {
-    /// Keep only the tests the baseline proved fail without the change.
+    /// Keep only the tests the proving run showed fail without the change.
     ///
-    /// `baseline_failing` is the run that had these files copied in, so a test missing from it
-    /// passed there — see [`RedTeamNode::run_and_author`]. Matching is by the name the runner
-    /// reports, which is what [`tests`](Self::tests) is documented to hold.
-    fn proven_by(self, baseline_failing: &[String]) -> Self {
+    /// `seeded` is the pass that had these files copied in; `clean` is the pass that never saw
+    /// them and is the only one converge compares against. Matching is by the name the runner
+    /// reports, which is what [`tests`](Self::tests) is documented to hold — see
+    /// [`RedTeamNode::proven`] for why the two runs are separate.
+    fn proven_by(self, seeded: &RedTeamOutput, clean: &RedTeamOutput) -> Self {
+        // The suite ran clean and then ran nothing at all with these files in it: they broke the
+        // build. That is proof, not absence — a test that cannot compile certainly does not pass
+        // without the change, which is the only question being asked. Reading it as "unproven"
+        // would throw the gate away in the case the authoring prompt calls expected.
+        if clean.passed_tests > 0 && seeded.passed_tests == 0 {
+            tracing::info!(
+                kind = "authored_tests_proven",
+                tests = %self.tests.join(", "),
+                "the authored tests stop the suite building without the change"
+            );
+            return self;
+        }
         let (tests, unproven): (Vec<String>, Vec<String>) = self
             .tests
             .into_iter()
-            .partition(|t| baseline_failing.contains(t));
+            .partition(|t| seeded.failing_tests.contains(t));
         if !unproven.is_empty() {
             tracing::warn!(
                 kind = "unproven_tests",
@@ -155,6 +168,47 @@ impl AuthoredTests {
             ..self
         }
     }
+
+    /// Nothing could be proven, so nothing gates — and the run says which way it failed.
+    fn none_proven(self, why: &str) -> Self {
+        if !self.tests.is_empty() {
+            tracing::warn!(
+                kind = "unproven_tests",
+                tests = %self.tests.join(", "),
+                "{why}; the change is judged by the tests that already exist"
+            );
+        }
+        Self {
+            unproven: [self.unproven, self.tests].concat(),
+            tests: Vec::new(),
+            ..self
+        }
+    }
+}
+
+/// `root` joined with `rel`, but only when the result is genuinely under `root`.
+///
+/// Resolved component by component rather than by canonicalising: the destination does not exist
+/// yet, so there is nothing to canonicalise, and a `..` has to be cancelled against what precedes
+/// it rather than against the filesystem. An absolute path, a `..` that escapes, or a root prefix
+/// yields `None` — the same rule the file tools apply, for the same reason.
+fn contained(root: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for part in std::path::Path::new(rel).components() {
+        match part {
+            Component::Normal(p) => out.push(p),
+            // A `..` may only cancel a component this path itself contributed.
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!out.as_os_str().is_empty()).then(|| root.join(out))
 }
 
 /// Authored test files, and the worktree to copy them out of.
@@ -166,18 +220,45 @@ struct Seed<'a> {
 impl Seed<'_> {
     /// Copy the authored files into `into`, creating the directories they need.
     ///
-    /// Paths are repository-relative, so the same relative path names the file in both trees.
+    /// Every path here comes from a model, and this runs on the HOST, in the daemon process,
+    /// outside every sandbox, on a value ultimately derived from issue text that `serve` accepts
+    /// from GitHub. So each one is contained before it is touched, the way every other path-taking
+    /// operation in this workspace is.
+    ///
+    /// `Path::join` is the trap: joining an absolute path discards the base entirely, so
+    /// `from.join("/etc/passwd")` and `into.join("/etc/passwd")` are the same file — and
+    /// `fs::copy(p, p)` does not fail, it opens the destination with `truncate(true)`, returns
+    /// `Ok(0)`, and leaves the file EMPTY. An unguarded copy therefore destroys whatever the model
+    /// names, reports success, and takes the authored tests with it. `..` reaches the same state:
+    /// the two worktrees sit at equal depth, so any `../` prefix cancels identically.
+    ///
+    /// Errors are collected per file rather than returned at the first: one mistyped path must not
+    /// discard the seeding of every other.
     fn plant(&self, into: &std::path::Path) -> Result<(), String> {
+        let mut refused = Vec::new();
         for file in self.files {
-            let (src, dst) = (self.from.join(file), into.join(file));
-            if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+            let (Some(src), Some(dst)) = (contained(self.from, file), contained(into, file)) else {
+                refused.push(format!("{file} is not inside the worktree"));
+                continue;
+            };
+            if src == dst {
+                refused.push(format!("{file} resolves to one file in both trees"));
+                continue;
             }
-            std::fs::copy(&src, &dst)
-                .map_err(|e| format!("copying {} to {}: {e}", src.display(), dst.display()))?;
+            if let Some(parent) = dst.parent()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                refused.push(format!("creating {}: {e}", parent.display()));
+                continue;
+            }
+            if let Err(e) = std::fs::copy(&src, &dst) {
+                refused.push(format!("copying {file}: {e}"));
+            }
         }
-        Ok(())
+        match refused.is_empty() {
+            true => Ok(()),
+            false => Err(refused.join("; ")),
+        }
     }
 }
 
@@ -289,16 +370,44 @@ impl RedTeamNode {
         interface: &[crate::analyst::InterfaceItem],
     ) -> Result<RedTeamOutput, NodeError> {
         let authored = self.author_tests(worktree, issue, interface).await;
-        let seed = authored
-            .as_ref()
-            .map(|a| Seed {
-                from: worktree,
-                files: &a.files,
-            })
-            .filter(|s| !s.files.is_empty());
-        let mut out = self.run_seeded(seed).await?;
-        out.authored = authored.map(|a| a.proven_by(&out.failing_tests));
+        // The clean pass first, and it is the ONLY one converge ever compares against.
+        let mut out = self.run_seeded(None).await?;
+        if let Some(authored) = authored {
+            out.authored = Some(self.proven(authored, worktree, &out).await);
+        }
         Ok(out)
+    }
+
+    /// Decide which authored tests fail without the change, in a pass of their own.
+    ///
+    /// A separate run, not the baseline with the files dropped in. Seeding the baseline looks
+    /// cheaper and is wrong: a test written before its code routinely does not compile — the
+    /// authoring prompt says so, because the symbol does not exist yet — and in most ecosystems one
+    /// file that fails to build means the suite runs nothing. The characterizer then reports the
+    /// acceptance STEP as the single failing check, which is the same name the implementer's run
+    /// reports when it fails to build for the same reason. `newly_introduced_failures` compares the
+    /// two, finds no difference, and a change that did nothing converges. That is the very failure
+    /// this gate exists to catch, so the numbers converge reads must come from a tree that has
+    /// never seen these files.
+    ///
+    /// The cost is one extra suite run, and only when tests were actually written.
+    async fn proven(
+        &self,
+        authored: AuthoredTests,
+        from: &std::path::Path,
+        clean: &RedTeamOutput,
+    ) -> AuthoredTests {
+        if authored.files.is_empty() || authored.tests.is_empty() {
+            return authored.none_proven("the red team named no files to prove them with");
+        }
+        let seed = Seed {
+            from,
+            files: &authored.files,
+        };
+        match self.run_seeded(Some(seed)).await {
+            Ok(seeded) => authored.proven_by(&seeded, clean),
+            Err(e) => authored.none_proven(&format!("the proving run failed: {e}")),
+        }
     }
 
     /// Write the tests, when there is an author and something to write against.
@@ -442,6 +551,16 @@ mod tests {
         }
     }
 
+    fn ran(failing: &[&str], passed: usize) -> RedTeamOutput {
+        RedTeamOutput {
+            authored: None,
+            failing_tests: failing.iter().map(|s| s.to_string()).collect(),
+            passed_tests: passed,
+            exit_code: if failing.is_empty() { 0 } else { 1 },
+            classifications: Vec::new(),
+        }
+    }
+
     /// A test that already passes without the change proves nothing, and must not gate.
     ///
     /// This is the hole the reproduction gate had: `unsatisfied` asks which authored tests are
@@ -449,16 +568,16 @@ mod tests {
     /// through a change that did nothing.
     #[test]
     fn an_authored_test_that_passes_without_the_change_gates_nothing() {
-        let baseline_failing = vec!["repro::the_bug_is_fixed".to_string()];
+        let clean = ran(&[], 10);
+        let seeded = ran(&["repro::the_bug_is_fixed"], 9);
         let kept = authored(
             &["repro::the_bug_is_fixed", "repro::two_plus_two_is_four"],
-            &[],
+            &["tests/repro.rs"],
         )
-        .proven_by(&baseline_failing);
+        .proven_by(&seeded, &clean);
 
         assert_eq!(kept.tests, ["repro::the_bug_is_fixed"]);
         assert_eq!(kept.unproven, ["repro::two_plus_two_is_four"]);
-        // And the surviving test still gates, which is the other half of the rule.
         assert_eq!(
             crate::converge::unsatisfied(&kept.tests, &["repro::the_bug_is_fixed".to_string()]),
             ["repro::the_bug_is_fixed"]
@@ -467,15 +586,113 @@ mod tests {
         assert!(crate::converge::unsatisfied(&kept.tests, &[]).is_empty());
     }
 
+    /// A test that stops the suite building has demonstrably not passed without the change.
+    ///
+    /// The modal case: the symbol does not exist yet, so the file does not compile, so the runner
+    /// reports the acceptance STEP rather than any test name. Reading that as "unproven" would
+    /// throw the gate away exactly when the authored test is doing its job.
+    #[test]
+    fn a_test_that_breaks_the_build_without_the_change_is_proven_by_that() {
+        let clean = ran(&[], 10);
+        let seeded = ran(&["cargo test"], 0);
+        let kept =
+            authored(&["repro::the_bug_is_fixed"], &["tests/repro.rs"]).proven_by(&seeded, &clean);
+        assert_eq!(kept.tests, ["repro::the_bug_is_fixed"], "still gates");
+        assert!(kept.unproven.is_empty());
+    }
+
+    /// The clean run is what converge compares against, and it never sees the authored files.
+    ///
+    /// Seeding the baseline instead would make a no-op change converge: both runs fail to build,
+    /// both report the same acceptance step, and `newly_introduced_failures` finds no difference.
+    #[test]
+    fn a_change_that_does_nothing_does_not_converge_when_the_tests_break_the_build() {
+        let clean = ran(&[], 10);
+        // What the implementer's run reports when it changed nothing and the authored file is there.
+        let after_no_op = vec!["cargo test".to_string()];
+        assert!(
+            !crate::converge::is_converged(&clean.failing_tests, &after_no_op),
+            "a build the change did not fix is a NEW failure against a clean baseline"
+        );
+        // Had the baseline been seeded, it would report the same step and the difference vanishes.
+        let seeded_baseline = ran(&["cargo test"], 0);
+        assert!(
+            crate::converge::is_converged(&seeded_baseline.failing_tests, &after_no_op),
+            "which is precisely why the baseline must not be seeded"
+        );
+    }
+
     /// Nothing proven means the ordinary gate, said out loud rather than silently.
     #[test]
     fn tests_that_all_pass_on_the_baseline_leave_nothing_to_gate_on() {
-        let kept = authored(&["a", "b"], &[]).proven_by(&[]);
+        let kept = authored(&["a", "b"], &["tests/repro.rs"]).proven_by(&ran(&[], 5), &ran(&[], 5));
         assert!(kept.tests.is_empty(), "none of them earned a place");
         assert_eq!(kept.unproven, ["a", "b"], "and the run can say why");
     }
 
-    /// Seeding is what puts the authored tests where the baseline can judge them.
+    /// Named tests with no file to prove them by gate nothing, and say so.
+    #[test]
+    fn tests_with_no_files_cannot_be_proven() {
+        let kept = authored(&["a"], &[]).none_proven("no files");
+        assert!(kept.tests.is_empty());
+        assert_eq!(kept.unproven, ["a"]);
+    }
+
+    /// A model-supplied path must not reach `fs::copy` uncontained.
+    ///
+    /// `Path::join` discards the base for an absolute path, so `from.join(p)` and `into.join(p)`
+    /// become the SAME file — and `fs::copy(p, p)` does not fail, it truncates to zero and returns
+    /// `Ok`. Unguarded, one absolute path in the model's output deletes the file it names.
+    #[test]
+    fn a_path_that_escapes_the_worktree_is_refused_rather_than_copied() {
+        let root = std::path::Path::new("/srv/wt/impl");
+        assert_eq!(
+            contained(root, "tests/repro.rs").unwrap(),
+            root.join("tests/repro.rs")
+        );
+        assert_eq!(contained(root, "./a/../b.rs").unwrap(), root.join("b.rs"));
+        for escape in [
+            "/etc/passwd",
+            "../../../.env",
+            "../sibling/x.rs",
+            "..",
+            "",
+            "./",
+        ] {
+            assert!(
+                contained(root, escape).is_none(),
+                "`{escape}` must be refused"
+            );
+        }
+    }
+
+    /// And the refusal is reported per file, so one bad path does not discard the rest.
+    #[test]
+    fn one_refused_path_does_not_discard_the_other_files() {
+        let tmp = std::env::temp_dir().join(format!("ratatoskr-refuse-{}", std::process::id()));
+        let (from, into) = (tmp.join("impl"), tmp.join("base"));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(from.join("tests")).unwrap();
+        std::fs::create_dir_all(&into).unwrap();
+        std::fs::write(from.join("tests/good.rs"), "ok").unwrap();
+
+        let err = Seed {
+            from: &from,
+            files: &["/etc/passwd".to_string(), "tests/good.rs".to_string()],
+        }
+        .plant(&into)
+        .expect_err("the absolute path is refused");
+
+        assert!(err.contains("/etc/passwd"), "the refusal names it: {err}");
+        assert_eq!(
+            std::fs::read_to_string(into.join("tests/good.rs")).unwrap(),
+            "ok",
+            "the good file is still planted"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Seeding is what puts the authored tests where the proving run can judge them.
     #[test]
     fn planting_copies_the_authored_files_into_the_baseline_tree() {
         let tmp = std::env::temp_dir().join(format!("ratatoskr-seed-{}", std::process::id()));
