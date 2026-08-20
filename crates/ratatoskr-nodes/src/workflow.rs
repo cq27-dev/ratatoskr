@@ -567,6 +567,21 @@ fn infer_status(
         .as_ref()
         .map(|a| a.tests.as_slice())
         .unwrap_or_default();
+    // Said where the run's own record is written, not only in the summary a person may not read.
+    // A run whose authored tests all failed to prove themselves has fallen back to "did anything
+    // break" — the weaker gate — and from the outside that is indistinguishable from a run that
+    // wrote no tests at all.
+    if let Some(a) = &red_team.authored
+        && a.tests.is_empty()
+        && !a.unproven.is_empty()
+    {
+        tracing::warn!(
+            kind = "reproduction_gate_off",
+            unproven = ?a.unproven,
+            "no authored test could be shown to fail without the change; this run is gated only \
+             on whether anything broke"
+        );
+    }
     let unsatisfied = converge::unsatisfied(authored, &implementer.failing_tests);
     if !unsatisfied.is_empty() {
         tracing::warn!(
