@@ -41,7 +41,7 @@ pub use implementer::{ImplementerNode, ImplementerOutput};
 pub use memory::{MemoryOutput, MemoryRecord};
 pub use overseer::OverseerOutput;
 pub use publisher::PublisherOutput;
-pub use redteam::{RedTeamNode, RedTeamOutput};
+pub use redteam::{AuthoredTests, RedTeamNode, RedTeamOutput};
 pub use referee::{RefereeNode, RefereeOutput, Violation};
 pub use scout::{RelatedItem, ScoutOutput};
 pub use stage::{AgentProfile, Delegation, Stage, agent_profiles};
