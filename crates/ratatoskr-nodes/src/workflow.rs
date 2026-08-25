@@ -10361,7 +10361,7 @@ mod tests {
         let turn = Arc::new(RecordingStageTurn {
             output: json!({
                 "failing": ["suite::fails"],
-                "passed": 8
+                "passed": [8]
             })
             .to_string(),
             ..Default::default()
@@ -10558,7 +10558,7 @@ mod tests {
             }],
         };
         let turn = Arc::new(RecordingStageTurn {
-            output: json!({ "failing": ["suite::one"], "passed": 3 }).to_string(),
+            output: json!({ "failing": ["suite::one"], "passed": [3] }).to_string(),
             ..Default::default()
         });
         let output = evaluate_standard_stage_with_turn(
@@ -10571,7 +10571,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&output).unwrap(),
-            json!({ "failing": ["suite::one"], "passed": 3 })
+            json!({ "failing": ["suite::one"], "passed": [3] })
         );
         assert_eq!(
             *turn.nodes.lock().expect("recording runner mutex poisoned"),

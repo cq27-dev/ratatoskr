@@ -201,13 +201,18 @@ const PREAMBLE: &str = include_str!("../prompts/characterizer.md");
 pub(crate) struct CharacterizerOutput {
     #[serde(default)]
     failing: Vec<String>,
-    /// How many checks passed — a count, never the names.
+    /// The passing counts the model read, one per summary line — never a total it worked out.
     ///
-    /// Nothing downstream reads a passing check's name: converge compares failures, and the only
+    /// A list rather than a number because the arithmetic belongs here. An acceptance step like
+    /// `cargo test --workspace` prints one summary line per test binary, so a single figure asks
+    /// the cheapest model on the routing table to add up twenty-odd numbers, and it gets it wrong
+    /// (#160). Reading each number is transcription, which is the job; summing them is not.
+    ///
+    /// Nothing downstream reads a passing check's NAME: converge compares failures, and the only
     /// other readers ask "did anything run" and "how many". Transcribing a few hundred identifiers
     /// to answer that is the single largest output in the pipeline, and it grows with the suite.
     #[serde(default)]
-    passed: usize,
+    passed: Vec<usize>,
 }
 
 /// The deterministic acceptance evidence presented to one characterizer turn.
@@ -280,9 +285,10 @@ fn reconcile(read: CharacterizerOutput, floor: TestResults) -> TestResults {
     }
     TestResults {
         failing: read.failing,
-        // Never below what the exit codes already prove ran. A miscounted zero would read as "the
-        // command never ran" downstream and strand a green suite.
-        passed: read.passed.max(floor.passed),
+        // Summed here, never by the model. Never below what the exit codes already prove ran: a
+        // miscounted zero would read as "the command never ran" downstream and strand a green
+        // suite, and an empty list — the `serde(default)` — is exactly that zero.
+        passed: read.passed.iter().sum::<usize>().max(floor.passed),
         exit_code: floor.exit_code,
         raw_output: floor.raw_output,
     }
@@ -389,7 +395,7 @@ mod tests {
         // baseline and call a broken change converged.
         let blind = CharacterizerOutput {
             failing: Vec::new(),
-            passed: 12,
+            passed: vec![12],
         };
         let out = reconcile(blind, floor.clone());
         assert_eq!(
@@ -402,7 +408,7 @@ mod tests {
         // whether the run passed.
         let named = CharacterizerOutput {
             failing: vec!["spec/login.spec.ts:12".into()],
-            passed: 3,
+            passed: vec![3],
         };
         let out = reconcile(named, floor);
         assert_eq!(out.failing, ["spec/login.spec.ts:12"]);
@@ -417,7 +423,7 @@ mod tests {
         ]);
         let read = CharacterizerOutput {
             failing: vec!["suite::one_case".into()],
-            passed: 0,
+            passed: Vec::new(),
         };
         let out = reconcile(read, floor);
         assert_eq!(out.failing, ["suite::one_case"]);
@@ -425,12 +431,28 @@ mod tests {
         assert_eq!(out.exit_code, 101, "the model cannot rewrite the exit code");
     }
 
+    /// #160: the arithmetic is Rust's. A workspace whose acceptance step prints one summary line
+    /// per test binary hands back twenty-odd numbers; the run reported 430 passing where 340 ran,
+    /// because the model was asked to add them up. Reading each number is transcription, which is
+    /// what this stage is for. Summing is not, and this is what stops it moving back into the
+    /// prompt.
+    #[test]
+    fn the_passing_total_is_summed_here_not_by_the_model() {
+        let floor = by_exit_code(&[outcome("cargo test --workspace", 0, "ok")]);
+        let read = CharacterizerOutput {
+            failing: Vec::new(),
+            // One per test binary, as the runner printed them.
+            passed: vec![285, 42, 12, 7, 118],
+        };
+        assert_eq!(reconcile(read, floor).passed, 464);
+    }
+
     #[test]
     fn a_clean_run_may_legitimately_name_no_failures() {
         let floor = by_exit_code(&[outcome("tests", 0, "ok")]);
         let read = CharacterizerOutput {
             failing: Vec::new(),
-            passed: 41,
+            passed: vec![41],
         };
         let out = reconcile(read, floor);
         assert!(out.failing.is_empty());

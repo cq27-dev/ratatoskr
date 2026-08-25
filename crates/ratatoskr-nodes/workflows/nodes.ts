@@ -77,7 +77,9 @@ export const characterizer = {
   outputContract: "CharacterizerOutput",
   outputSchema: obj({
     failing: arr(str()),
-    passed: num(),
+    // A list, never a total: the run sums it. Asking the cheapest model on the routing table to
+    // add up one summary line per test binary is what got the count wrong (#160).
+    passed: arr(num()),
   }),
   instructions: LOAD("prompts/characterizer.md").trim(),
   renderQuestion(input: any) {
