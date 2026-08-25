@@ -159,7 +159,7 @@ impl AuthoredTests {
             tracing::warn!(
                 kind = "unproven_tests",
                 tests = %unproven.join(", "),
-                "these authored tests passed without the change, so they gate nothing"
+                "these authored tests did not fail without the change, so they gate nothing"
             );
         }
         Self {

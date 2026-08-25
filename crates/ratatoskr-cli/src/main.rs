@@ -1256,7 +1256,6 @@ fn read_issue(description: Option<String>, file: Option<PathBuf>) -> anyhow::Res
     }
 }
 
-/// Render a full-run outcome: the plan summary plus the fork+converge result.
 /// What the summary says about the reproduction gate — the second half of convergence.
 ///
 /// Its whole purpose is the last case. A test the red team wrote earns its place only by failing
@@ -1291,7 +1290,7 @@ fn reproduction_lines(authored: Option<&ratatoskr_nodes::AuthoredTests>) -> Vec<
         }
         if !a.unproven.is_empty() {
             out.push(format!(
-                "  ({} more gated nothing: they passed without the change)",
+                "  ({} more gated nothing: they could not be shown to fail without the change)",
                 a.unproven.len()
             ));
         }
@@ -1302,6 +1301,7 @@ fn reproduction_lines(authored: Option<&ratatoskr_nodes::AuthoredTests>) -> Vec<
     out
 }
 
+/// Render a full-run outcome: the plan summary plus the fork+converge result.
 fn print_run_summary(run_id: &str, outcome: &ratatoskr_nodes::RunOutcome) {
     println!("── run {run_id} ──\n");
     println!(

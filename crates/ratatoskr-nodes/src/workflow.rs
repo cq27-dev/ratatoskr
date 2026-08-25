@@ -543,6 +543,23 @@ fn infer_status(
     review: Option<&verifier::VerifierOutput>,
     threshold: verifier::Severity,
 ) -> RunStatus {
+    // Said where the run's own record is written, not only in the summary a person may not read.
+    // A run whose authored tests all failed to prove themselves has fallen back to "did anything
+    // break" — the weaker gate — and from the outside that is indistinguishable from a run that
+    // wrote no tests at all. Above every early return: the gate was off whatever ended the run,
+    // and a referee violation or a blocking review must not swallow that.
+    if let Some(a) = &red_team.authored
+        && a.tests.is_empty()
+        && !a.unproven.is_empty()
+    {
+        tracing::warn!(
+            kind = "reproduction_gate_off",
+            unproven = ?a.unproven,
+            "no authored test could be shown to fail without the change; this run is gated only \
+             on whether anything broke"
+        );
+    }
+
     if !referee.is_empty() {
         tracing::warn!(violations = ?referee, "run weakened the referee; not converged");
         return RunStatus::MaxIterationsReached;
@@ -567,21 +584,6 @@ fn infer_status(
         .as_ref()
         .map(|a| a.tests.as_slice())
         .unwrap_or_default();
-    // Said where the run's own record is written, not only in the summary a person may not read.
-    // A run whose authored tests all failed to prove themselves has fallen back to "did anything
-    // break" — the weaker gate — and from the outside that is indistinguishable from a run that
-    // wrote no tests at all.
-    if let Some(a) = &red_team.authored
-        && a.tests.is_empty()
-        && !a.unproven.is_empty()
-    {
-        tracing::warn!(
-            kind = "reproduction_gate_off",
-            unproven = ?a.unproven,
-            "no authored test could be shown to fail without the change; this run is gated only \
-             on whether anything broke"
-        );
-    }
     let unsatisfied = converge::unsatisfied(authored, &implementer.failing_tests);
     if !unsatisfied.is_empty() {
         tracing::warn!(
@@ -13210,6 +13212,42 @@ mod tests {
                 verifier::Severity::P2
             ),
             RunStatus::MaxIterationsReached
+        );
+    }
+
+    /// The gate being off is a property of the run, not of how the run ended. A referee violation
+    /// or a blocking review returns before the status is decided, and a diagnostic placed below
+    /// those returns is written only for runs that got that far — so the terminal summary would
+    /// report a dead reproduction gate that the run's own record never mentions.
+    #[test]
+    fn a_dead_reproduction_gate_is_recorded_even_when_the_referee_blocks_the_run() {
+        let mut baseline = red(&["a"], &["b"], 1);
+        baseline.authored = Some(crate::redteam::AuthoredTests {
+            files: vec!["tests/repro.rs".into()],
+            tests: vec![],
+            covers: "the reported bug".into(),
+            unproven: vec!["repro::the_bug".into()],
+        });
+        let blocked = vec![violation(
+            "src/lib.rs",
+            "deleted the characterisation module",
+        )];
+
+        let capturing = crate::test_capture::start();
+        let status = infer_status(
+            &baseline,
+            &imp(&[], &["a", "b"], 0),
+            &blocked,
+            None,
+            verifier::Severity::P2,
+        );
+        let raw = capturing.text();
+        drop(capturing);
+
+        assert_eq!(status, RunStatus::MaxIterationsReached);
+        assert!(
+            raw.contains("reproduction_gate_off"),
+            "the referee return must not swallow it; captured: {raw}"
         );
     }
 
