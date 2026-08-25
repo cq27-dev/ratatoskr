@@ -1256,6 +1256,51 @@ fn read_issue(description: Option<String>, file: Option<PathBuf>) -> anyhow::Res
     }
 }
 
+/// What the summary says about the reproduction gate — the second half of convergence.
+///
+/// Its whole purpose is the last case. A test the red team wrote earns its place only by failing
+/// without the change; one that cannot be proven to is dropped, and a run where *all* of them were
+/// dropped has silently fallen back to "did anything break", which is the gate this was added to
+/// strengthen. That is indistinguishable, from the outside, from a run where no tests were written
+/// at all — unless it is said.
+///
+/// Returns lines rather than printing them so the decision can be tested. The wiring above prints
+/// whatever comes back.
+fn reproduction_lines(authored: Option<&ratatoskr_nodes::AuthoredTests>) -> Vec<String> {
+    let Some(a) = authored else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if a.tests.is_empty() && a.unproven.is_empty() {
+        return out;
+    }
+    if a.tests.is_empty() {
+        out.push(format!(
+            "\nREPRODUCTION: NONE of the {} authored test(s) could be shown to fail without the \
+             change, so none of them gated it. This run was judged only by whether anything broke.",
+            a.unproven.len()
+        ));
+    } else {
+        out.push(format!(
+            "\nREPRODUCTION: {} test(s) had to pass for this to converge",
+            a.tests.len()
+        ));
+        for t in &a.tests {
+            out.push(format!("  • {t}"));
+        }
+        if !a.unproven.is_empty() {
+            out.push(format!(
+                "  ({} more gated nothing: they could not be shown to fail without the change)",
+                a.unproven.len()
+            ));
+        }
+    }
+    for t in &a.unproven {
+        out.push(format!("  ✗ {t}"));
+    }
+    out
+}
+
 /// Render a full-run outcome: the plan summary plus the fork+converge result.
 fn print_run_summary(run_id: &str, outcome: &ratatoskr_nodes::RunOutcome) {
     println!("── run {run_id} ──\n");
@@ -1303,6 +1348,10 @@ fn print_run_summary(run_id: &str, outcome: &ratatoskr_nodes::RunOutcome) {
         for f in &new_failures {
             println!("  • {f}");
         }
+    }
+
+    for line in reproduction_lines(rt.authored.as_ref()) {
+        println!("{line}");
     }
 
     println!("\nWORKTREE: {}", im.worktree_path);
@@ -2200,6 +2249,55 @@ mod tests {
             crate::otlp::run_trace().get().is_some(),
             "run_span must bind the process trace, or every run exports under a random one"
         );
+    }
+
+    fn authored(tests: &[&str], unproven: &[&str]) -> ratatoskr_nodes::AuthoredTests {
+        ratatoskr_nodes::AuthoredTests {
+            files: Vec::new(),
+            tests: tests.iter().map(|s| s.to_string()).collect(),
+            covers: String::new(),
+            unproven: unproven.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// The case this exists for: the gate is off, and a reader must be able to tell.
+    ///
+    /// A run where every authored test failed to prove itself has fallen back to "did anything
+    /// break". From the outside that looks exactly like a run that wrote no tests at all, which is
+    /// why silence is the wrong answer.
+    #[test]
+    fn a_run_whose_reproduction_gate_did_nothing_says_so() {
+        let lines = crate::reproduction_lines(Some(&authored(&[], &["a::x", "a::y"])));
+        let said = lines.join("\n");
+        assert!(
+            said.contains("NONE"),
+            "it has to be legible at a glance: {said}"
+        );
+        assert!(said.contains('2'), "and say how many: {said}");
+        assert!(
+            said.contains("only by whether anything broke"),
+            "and what the run was actually judged on: {said}"
+        );
+        assert!(said.contains("a::x") && said.contains("a::y"));
+    }
+
+    /// A gate that held names what it held to.
+    #[test]
+    fn a_reproduction_that_gated_names_the_tests_it_required() {
+        let lines = crate::reproduction_lines(Some(&authored(&["a::x"], &["a::y"])));
+        let said = lines.join("\n");
+        assert!(said.contains("1 test(s) had to pass"), "{said}");
+        assert!(said.contains("a::x"));
+        // And the one that did not earn its place is still shown, not quietly dropped.
+        assert!(said.contains("1 more gated nothing"), "{said}");
+        assert!(said.contains("a::y"));
+    }
+
+    /// Nothing written, nothing to say — the summary does not grow a section for every run.
+    #[test]
+    fn a_run_that_authored_no_tests_says_nothing_about_reproduction() {
+        assert!(crate::reproduction_lines(None).is_empty());
+        assert!(crate::reproduction_lines(Some(&authored(&[], &[]))).is_empty());
     }
 
     #[test]
