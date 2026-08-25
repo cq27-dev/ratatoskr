@@ -283,12 +283,28 @@ fn reconcile(read: CharacterizerOutput, floor: TestResults) -> TestResults {
         );
         return floor;
     }
+    // Summed here, never by the model — and checked, because these are numbers a model wrote.
+    // `Vec<usize>` and the schema both admit values whose total does not fit, which would panic in
+    // debug and wrap in release; a wrapped total is a bogus count presented as a real one. This
+    // function must never fail the run over what a model returned, so a total that cannot be added
+    // is no total at all and the floor answers instead.
+    let counted = read
+        .passed
+        .iter()
+        .try_fold(0usize, |total, n| total.checked_add(*n));
+    if counted.is_none() {
+        tracing::warn!(
+            counts = read.passed.len(),
+            "the characterization's passing counts do not add up to a representable total; \
+             using the exit-code floor"
+        );
+    }
     TestResults {
         failing: read.failing,
-        // Summed here, never by the model. Never below what the exit codes already prove ran: a
-        // miscounted zero would read as "the command never ran" downstream and strand a green
-        // suite, and an empty list — the `serde(default)` — is exactly that zero.
-        passed: read.passed.iter().sum::<usize>().max(floor.passed),
+        // Never below what the exit codes already prove ran: a miscounted zero would read as "the
+        // command never ran" downstream and strand a green suite, and an empty list — the
+        // `serde(default)` — is exactly that zero.
+        passed: counted.unwrap_or(0).max(floor.passed),
         exit_code: floor.exit_code,
         raw_output: floor.raw_output,
     }
@@ -445,6 +461,17 @@ mod tests {
             passed: vec![285, 42, 12, 7, 118],
         };
         assert_eq!(reconcile(read, floor).passed, 464);
+    }
+
+    #[test]
+    fn counts_that_cannot_be_added_fall_back_to_what_the_exit_codes_prove() {
+        let floor = by_exit_code(&[outcome("build", 0, "built"), outcome("tests", 0, "ok")]);
+        let read = CharacterizerOutput {
+            failing: Vec::new(),
+            passed: vec![usize::MAX, 1],
+        };
+        let out = reconcile(read, floor);
+        assert_eq!(out.passed, 2, "the two steps the exit codes prove ran");
     }
 
     #[test]
