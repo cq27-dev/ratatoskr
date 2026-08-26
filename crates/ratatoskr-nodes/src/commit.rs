@@ -132,6 +132,7 @@ mod tests {
         // of a commit has is "why". The implementer's own account is the only description written
         // by the thing that made the change.
         let out = ImplementerOutput {
+            produced_change: true,
             worktree_path: "/w".into(),
             branch: "ratatoskr/abc12345".into(),
             diff_summary: " crates/a.rs | 72 ++++++\n 1 file changed, 72 insertions(+)".into(),

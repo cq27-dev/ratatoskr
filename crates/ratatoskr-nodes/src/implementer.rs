@@ -42,6 +42,15 @@ pub struct ImplementerOutput {
     pub diff_summary: String,
     #[serde(default)]
     pub touched_files: Vec<String>,
+    /// Whether this implementer changed anything at all, measured against the tree it was handed.
+    ///
+    /// Not derivable from [`touched_files`](Self::touched_files): the red team authors its tests
+    /// into the implementer's worktree before the first attempt, so that list is already non-empty
+    /// when the implementer has written nothing. A run where this is false ran no acceptance suite
+    /// — there was nothing new to check — so the three test fields below are zeros standing for
+    /// "not measured", and every reader of them must consult this first.
+    #[serde(default = "produced_change_default")]
+    pub produced_change: bool,
     /// Of those, the ones where a line that was already there was removed or replaced.
     ///
     /// What the referee gate reads. Adding a test is work worth having from an implementer;
@@ -124,6 +133,13 @@ pub(crate) struct ImplementerAttemptInput {
     pub diagnostic: Option<String>,
 }
 
+/// A record written before this field existed describes a run that did produce a change — the
+/// no-change outcome did not exist to be recorded — so absence reads as `true`. That is also the
+/// safe direction: it withholds the outcome rather than claiming it.
+fn produced_change_default() -> bool {
+    true
+}
+
 /// The implementer node. Holds everything needed to create the worktree and run the acceptance
 /// checks against it.
 ///
@@ -153,6 +169,13 @@ pub struct ImplementerNode {
     pub characterizer: Option<Characterizer>,
     /// The generic stage executor context used for every implementation attempt.
     pub(crate) declared_context: Arc<crate::workflow::WorkflowContext>,
+    /// The tree as the implementer was handed it, captured before its first attempt.
+    ///
+    /// Not an empty tree. The red team authors its tests into this same worktree, before any
+    /// attempt runs, so `git status --porcelain` is already non-empty when the implementer starts
+    /// and "did the implementer change anything" cannot be asked of the tree's contents alone.
+    /// Everything that differs from this snapshot is the implementer's own doing.
+    pub(crate) handed: tokio::sync::OnceCell<Option<String>>,
 }
 
 impl ImplementerNode {
@@ -220,6 +243,15 @@ impl ImplementerNode {
     ) -> Result<ImplementerOutput, NodeError> {
         let input_json = serde_json::to_string(&input)
             .map_err(|error| NodeError::Failed(format!("implementer input: {error}")))?;
+        // Captured before the turn, and only once: on the first attempt this is the tree with the
+        // red team's authored tests already in it, which is what the implementer was handed. Later
+        // attempts keep comparing against that same tree, so "did the implementer change anything"
+        // stays a question about the run rather than about the last iteration.
+        let handed = self
+            .handed
+            .get_or_init(|| async { worktree::full_diff_text(worktree).await.ok() })
+            .await
+            .clone();
         let raw = crate::workflow::evaluate_standard_stage_with_resources(
             Arc::clone(&self.declared_context),
             "implementer_attempt",
@@ -242,20 +274,26 @@ impl ImplementerNode {
         // running it again to compare a set against itself is the most expensive way to learn
         // nothing — a full sandboxed run, twice, to find that 53 passing tests still pass.
         //
-        // `is_ok_and` and not `unwrap_or_default`: a git that cannot answer must read as CHANGED.
-        // The other direction skips the run and reports a change that was never checked.
-        let unchanged = worktree::touched_files(worktree)
-            .await
-            .is_ok_and(|touched| touched.is_empty());
-        let tests = if unchanged {
+        // Compared against what the implementer was handed, never against an empty tree: the red
+        // team's authored tests are already in this worktree, so a tree that merely has files in
+        // it says nothing about whether the implementer wrote any of them.
+        //
+        // Either diff failing to read leaves this CHANGED. A git that cannot answer must not be
+        // able to skip the suite and report a change nobody checked.
+        let now = worktree::full_diff_text(worktree).await.ok();
+        let produced_change = match (&handed, &now) {
+            (Some(handed), Some(now)) => handed != now,
+            _ => true,
+        };
+        let tests = if !produced_change {
             tracing::info!(
                 kind = "acceptance_skipped_unchanged_tree",
-                "the implementer's tree is unchanged, so the baseline's result still stands; \
-                 not running the acceptance suite again"
+                "the implementer wrote nothing, so the baseline's result still stands; not \
+                 running the acceptance suite again"
             );
             // Not measured, and not measurable: nothing ran. Every reader of these three fields
-            // must check `touched_files.is_empty()` first — `infer_status` and the two correction
-            // paths do, which is what stops an empty failing set reading as convergence.
+            // must check `produced_change` first — `infer_status` and the two correction paths do,
+            // which is what stops an empty failing set reading as convergence.
             TestResults {
                 failing: Vec::new(),
                 passed: 0,
@@ -287,6 +325,7 @@ impl ImplementerNode {
             .unwrap_or_default();
 
         Ok(ImplementerOutput {
+            produced_change,
             worktree_path: worktree.as_path().display().to_string(),
             branch: self.branch(),
             diff_summary,
@@ -479,6 +518,7 @@ mod tests {
         )
         .unwrap();
         let node = ImplementerNode {
+            handed: tokio::sync::OnceCell::new(),
             repo_path: repo.clone(),
             worktree_root: dir.join("worktrees"),
             sandbox: config.sandbox.clone(),

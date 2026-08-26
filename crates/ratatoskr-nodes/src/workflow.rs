@@ -560,12 +560,16 @@ fn infer_status(
         );
     }
 
-    // Before anything that reads a test result, because when the tree is unchanged there is no
-    // test result: the suite was not run, and the three fields carrying it are zeros standing for
-    // "not measured". Converge compares failing sets, so an empty one against the baseline reads
-    // as "introduced no new failures" — which is true, and describes a change that held up when
-    // no change was made.
-    if implementer.touched_files.is_empty() {
+    // Before anything that reads a test result, because when the implementer wrote nothing there
+    // is no test result: the suite was not run, and the three fields carrying it are zeros
+    // standing for "not measured". Converge compares failing sets, so an empty one against the
+    // baseline reads as "introduced no new failures" — which is true, and describes a change that
+    // held up when no change was made.
+    //
+    // `produced_change` and never `touched_files.is_empty()`: the red team authors its tests into
+    // the implementer's worktree before the first attempt, so that list is non-empty for a run
+    // whose implementer wrote nothing at all.
+    if !implementer.produced_change {
         tracing::warn!(
             kind = "no_change_produced",
             "the implementer's tree came back unchanged; there is no change to have converged"
@@ -920,6 +924,7 @@ async fn build_implementer(
 ) -> Result<ImplementerNode, PlanError> {
     let stages = ctx.stages().await?;
     Ok(ImplementerNode {
+        handed: tokio::sync::OnceCell::new(),
         clarifier: Some(ctx.clarifier.as_dyn()),
         acceptance: ctx.acceptance(&analyst.acceptance),
         characterizer: crate::build_characterizer(
@@ -1224,7 +1229,7 @@ async fn iterate_work(
         .map(|authored| authored.tests.as_slice())
         .unwrap_or_default();
     let unsatisfied = converge::unsatisfied(authored, &prev.failing_tests);
-    let diagnostic = if prev.touched_files.is_empty() {
+    let diagnostic = if !prev.produced_change {
         "Your last attempt left the tree unchanged: nothing was written, so there is nothing to \
          test and nothing to review. If the task needs a change, make it. If you believe it needs \
          none, say so in your summary and explain why rather than returning again with no edit."
@@ -1924,10 +1929,10 @@ async fn replan_at_ceiling_with<R: CeilingRecovery>(
         .as_ref()
         .map(|authored| authored.tests.as_slice())
         .unwrap_or_default();
-    // An unchanged tree is not a clean one. Its suite was never run, so the empty failing set it
-    // carries clears every test condition below by default — and a run that produced nothing is
-    // exactly the case a replan is for.
-    let tests_clean = !implementation.touched_files.is_empty()
+    // A tree the implementer never wrote to is not a clean one. Its suite was never run, so the
+    // empty failing set it carries clears every test condition below by default — and a run that
+    // produced nothing is exactly the case a replan is for.
+    let tests_clean = implementation.produced_change
         && converge::test_command_ran(
             &implementation.failing_tests,
             implementation.passed_tests,
@@ -3613,6 +3618,7 @@ mod tests {
 
     fn imp(failing: &[&str], passing: &[&str], exit: i32) -> ImplementerOutput {
         ImplementerOutput {
+            produced_change: true,
             branch: "ratatoskr/test".into(),
             worktree_path: "/wt".to_string(),
             diff_summary: String::new(),
@@ -7878,6 +7884,7 @@ mod tests {
                 interface: Vec::new(),
             },
             implementer: ImplementerOutput {
+                produced_change: true,
                 worktree_path: "/tmp/ratatoskr/worktree".to_string(),
                 branch: "ratatoskr/bookkeeper".to_string(),
                 diff_summary: " bookkeeper.rs | 4 ++++".to_string(),
@@ -8088,6 +8095,7 @@ mod tests {
                 interface: Vec::new(),
             },
             implementer: Some(ImplementerOutput {
+                produced_change: true,
                 worktree_path: "/tmp/ratatoskr/worktree".to_string(),
                 branch: "ratatoskr/publisher".to_string(),
                 diff_summary: " publisher.rs | 2 ++".to_string(),
@@ -13289,18 +13297,21 @@ mod tests {
     fn a_tree_nobody_changed_has_not_converged() {
         let baseline = red(&["a"], &["b"], 1);
         let mut nothing = imp(&[], &[], 0);
-        nothing.touched_files = Vec::new();
-        nothing.rewritten_files = Vec::new();
+        nothing.produced_change = false;
+        // The tree is NOT empty, and this is the case the gate has to survive: the red team
+        // authored its tests into the implementer's worktree before the first attempt, so a run
+        // whose implementer wrote nothing still reports files here. Reading emptiness off this
+        // list would leave the whole gate inert for every run with a test author.
+        nothing.touched_files = vec!["tests/repro.rs".to_string()];
         assert_eq!(
             infer_status(&baseline, &nothing, &[], None, verifier::Severity::P2),
             RunStatus::NoChangeProduced,
-            "an unchanged tree would otherwise clear every test condition by default"
+            "an implementer that wrote nothing would otherwise clear every test condition"
         );
 
-        // The same output with a change in it is judged on its tests, as before — so this is a
-        // gate on the tree being untouched, not on the failing set being empty.
+        // The same output from an implementer that did write is judged on its tests, as before.
         let mut changed = imp(&[], &[], 0);
-        changed.touched_files = vec!["src/lib.rs".to_string()];
+        changed.produced_change = true;
         assert_eq!(
             infer_status(&baseline, &changed, &[], None, verifier::Severity::P2),
             RunStatus::Converged

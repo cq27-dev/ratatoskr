@@ -246,7 +246,7 @@ pub(crate) fn skipped_before_compose(
     // came back unchanged, so there is no change to draw a memory from — only friction, which the
     // conditions below already require to be absent before declining the turn.
     if matches!(input.status.as_str(), "converged" | "no_change_produced")
-        && input.implementer.touched_files.is_empty()
+        && !input.implementer.produced_change
         && input.implementer.diff_summary.trim().is_empty()
         && input.friction.is_empty()
     {
@@ -564,6 +564,7 @@ mod tests {
                 interface: Vec::new(),
             },
             implementer: ImplementerOutput {
+                produced_change: true,
                 branch: "ratatoskr/test".into(),
                 worktree_path: "/tmp/wt".into(),
                 diff_summary: diff.into(),

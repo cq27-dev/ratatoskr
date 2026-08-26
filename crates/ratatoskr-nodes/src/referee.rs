@@ -514,6 +514,7 @@ rename to src/new.rs
 
     fn implementer(rewritten: &[&str]) -> ImplementerOutput {
         ImplementerOutput {
+            produced_change: true,
             worktree_path: "/wt".into(),
             branch: "ratatoskr/test".into(),
             diff_summary: String::new(),

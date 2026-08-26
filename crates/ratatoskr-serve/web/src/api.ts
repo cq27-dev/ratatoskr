@@ -18,6 +18,7 @@ export type RunStatus =
   | "max_iterations_reached"
   | "unreviewed"
   | "no_code_change"
+  | "no_change_produced"
   | "failed"
   | "abandoned";
 
