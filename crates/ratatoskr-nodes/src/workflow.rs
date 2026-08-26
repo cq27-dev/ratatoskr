@@ -560,6 +560,18 @@ fn infer_status(
         );
     }
 
+    // Before anything that reads a test result, because when the tree is unchanged there is no
+    // test result: the suite was not run, and the three fields carrying it are zeros standing for
+    // "not measured". Converge compares failing sets, so an empty one against the baseline reads
+    // as "introduced no new failures" — which is true, and describes a change that held up when
+    // no change was made.
+    if implementer.touched_files.is_empty() {
+        tracing::warn!(
+            kind = "no_change_produced",
+            "the implementer's tree came back unchanged; there is no change to have converged"
+        );
+        return RunStatus::NoChangeProduced;
+    }
     if !referee.is_empty() {
         tracing::warn!(violations = ?referee, "run weakened the referee; not converged");
         return RunStatus::MaxIterationsReached;
@@ -1212,7 +1224,12 @@ async fn iterate_work(
         .map(|authored| authored.tests.as_slice())
         .unwrap_or_default();
     let unsatisfied = converge::unsatisfied(authored, &prev.failing_tests);
-    let diagnostic = if !referee.is_empty() {
+    let diagnostic = if prev.touched_files.is_empty() {
+        "Your last attempt left the tree unchanged: nothing was written, so there is nothing to \
+         test and nothing to review. If the task needs a change, make it. If you believe it needs \
+         none, say so in your summary and explain why rather than returning again with no edit."
+            .to_string()
+    } else if !referee.is_empty() {
         referee::correction(&referee)
     } else if !post_ran {
         format!(
@@ -1907,12 +1924,16 @@ async fn replan_at_ceiling_with<R: CeilingRecovery>(
         .as_ref()
         .map(|authored| authored.tests.as_slice())
         .unwrap_or_default();
-    let tests_clean = converge::test_command_ran(
-        &implementation.failing_tests,
-        implementation.passed_tests,
-        implementation.exit_code,
-    ) && converge::unsatisfied(authored, &implementation.failing_tests)
-        .is_empty()
+    // An unchanged tree is not a clean one. Its suite was never run, so the empty failing set it
+    // carries clears every test condition below by default — and a run that produced nothing is
+    // exactly the case a replan is for.
+    let tests_clean = !implementation.touched_files.is_empty()
+        && converge::test_command_ran(
+            &implementation.failing_tests,
+            implementation.passed_tests,
+            implementation.exit_code,
+        )
+        && converge::unsatisfied(authored, &implementation.failing_tests).is_empty()
         && converge::is_converged(&red_team.failing_tests, &implementation.failing_tests);
     // This tree's review, folded across the passes that produced it — the same value `verify()`
     // handed the workflow. Read off the latest checkpoint alone, a continuation that turned up
@@ -3402,13 +3423,19 @@ async fn finish_full_inner<A: FullTerminalActions>(
     // Read once: both halves come from the same review, and asking twice could straddle a write.
     let (unresolved, unchecked) = crate::unresolved_of(&ctx.store, &ctx.run_id).await;
 
-    let terminal = matches!(
+    // Two decisions, not one. A run whose implementer produced nothing has nothing to deliver —
+    // publishing it would open a pull request over an empty diff — but it is exactly the run whose
+    // friction is worth keeping: something stopped the change being made, and the next run should
+    // not rediscover it. The bookkeeper's own gate already declines to spend a turn when nothing
+    // changed and nothing went wrong.
+    let publishable = matches!(
         status,
         RunStatus::Converged | RunStatus::MaxIterationsReached | RunStatus::Unreviewed
     );
+    let recordable = publishable || status == RunStatus::NoChangeProduced;
     let (bookkeeper, published) = tokio::join!(
         async {
-            if !terminal {
+            if !recordable {
                 return None;
             }
             actions
@@ -3437,7 +3464,7 @@ async fn finish_full_inner<A: FullTerminalActions>(
                 unresolved,
                 unchecked: unchecked.clone(),
             },
-            terminal,
+            publishable,
             Some(&worktree),
         )
     );
@@ -3589,7 +3616,10 @@ mod tests {
             branch: "ratatoskr/test".into(),
             worktree_path: "/wt".to_string(),
             diff_summary: String::new(),
-            touched_files: vec![],
+            // A change exists. These are convergence cases, and `infer_status` refuses to judge a
+            // tree nobody changed before it reads a test result — see
+            // `a_tree_nobody_changed_has_not_converged`.
+            touched_files: vec!["src/lib.rs".to_string()],
             rewritten_files: Vec::new(),
             commit_kind: String::new(),
             commit_scope: String::new(),
@@ -13249,6 +13279,40 @@ mod tests {
             raw.contains("reproduction_gate_off"),
             "the referee return must not swallow it; captured: {raw}"
         );
+    }
+
+    /// #91: the trap this gate exists for. When the tree is unchanged the acceptance suite is not
+    /// run, so the failing set is empty — and an empty failing set introduces no new failures,
+    /// which is the definition of converged. Every test condition clears by default, and the run
+    /// reports that a change held up when no change was made.
+    #[test]
+    fn a_tree_nobody_changed_has_not_converged() {
+        let baseline = red(&["a"], &["b"], 1);
+        let mut nothing = imp(&[], &[], 0);
+        nothing.touched_files = Vec::new();
+        nothing.rewritten_files = Vec::new();
+        assert_eq!(
+            infer_status(&baseline, &nothing, &[], None, verifier::Severity::P2),
+            RunStatus::NoChangeProduced,
+            "an unchanged tree would otherwise clear every test condition by default"
+        );
+
+        // The same output with a change in it is judged on its tests, as before — so this is a
+        // gate on the tree being untouched, not on the failing set being empty.
+        let mut changed = imp(&[], &[], 0);
+        changed.touched_files = vec!["src/lib.rs".to_string()];
+        assert_eq!(
+            infer_status(&baseline, &changed, &[], None, verifier::Severity::P2),
+            RunStatus::Converged
+        );
+    }
+
+    /// It is not a failure and it is not still running: a reader that classified it either way
+    /// would show a finished run as executing forever, or count it against the run's success.
+    #[test]
+    fn a_run_that_produced_nothing_is_finished_and_not_a_failure() {
+        assert!(RunStatus::NoChangeProduced.is_terminal());
+        assert!(RunStatus::NoChangeProduced.ran_to_completion());
     }
 
     #[test]

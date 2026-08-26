@@ -242,7 +242,10 @@ pub(crate) fn skipped_before_compose(
         tracing::info!("no memory index in this repository; recording no memory");
         return Some(input.nothing_recorded("this repository keeps no memory index"));
     }
-    if input.status == "converged"
+    // `no_change_produced` is the same shape reached by a different route: the implementer's tree
+    // came back unchanged, so there is no change to draw a memory from — only friction, which the
+    // conditions below already require to be absent before declining the turn.
+    if matches!(input.status.as_str(), "converged" | "no_change_produced")
         && input.implementer.touched_files.is_empty()
         && input.implementer.diff_summary.trim().is_empty()
         && input.friction.is_empty()

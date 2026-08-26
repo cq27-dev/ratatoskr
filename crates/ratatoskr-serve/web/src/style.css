@@ -278,6 +278,7 @@ body {
 .st--idle,
 .st--max_iterations_reached,
 .st--no_code_change,
+.st--no_change_produced,
 .st--unreviewed,
 .st--abandoned,
 .st--pending {

@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyst::AnalystOutput;
 use crate::testrun::{
-    Acceptance, Characterizer, GUEST_WORKSPACE, by_exit_code, mounts_for, run_acceptance,
+    Acceptance, Characterizer, GUEST_WORKSPACE, TestResults, by_exit_code, mounts_for,
+    run_acceptance,
 };
 
 /// Implementer output. Test fields are deterministic; `diff_summary`/`touched_files`/`narrative`
@@ -237,19 +238,45 @@ impl ImplementerNode {
         .map_err(|error| NodeError::Failed(format!("implementer agent failed: {error}")))?;
         let report = parse_validated::<Report>(&raw)?;
 
-        let outcomes = run_acceptance(Acceptance {
-            cfg: &self.sandbox,
-            node: "implementer",
-            name: &format!("ratatoskr-impl-{}", self.short_id()),
-            repo_root: &self.repo_path,
-            worktree: worktree.as_path(),
-            steps: &self.acceptance,
-        })
-        .await
-        .map_err(NodeError::Failed)?;
-        let tests = match &self.characterizer {
-            Some(c) => c.read(&outcomes).await,
-            None => by_exit_code(&outcomes),
+        // An unchanged tree has an unchanged test result. The baseline already ran this suite, so
+        // running it again to compare a set against itself is the most expensive way to learn
+        // nothing — a full sandboxed run, twice, to find that 53 passing tests still pass.
+        //
+        // `is_ok_and` and not `unwrap_or_default`: a git that cannot answer must read as CHANGED.
+        // The other direction skips the run and reports a change that was never checked.
+        let unchanged = worktree::touched_files(worktree)
+            .await
+            .is_ok_and(|touched| touched.is_empty());
+        let tests = if unchanged {
+            tracing::info!(
+                kind = "acceptance_skipped_unchanged_tree",
+                "the implementer's tree is unchanged, so the baseline's result still stands; \
+                 not running the acceptance suite again"
+            );
+            // Not measured, and not measurable: nothing ran. Every reader of these three fields
+            // must check `touched_files.is_empty()` first — `infer_status` and the two correction
+            // paths do, which is what stops an empty failing set reading as convergence.
+            TestResults {
+                failing: Vec::new(),
+                passed: 0,
+                exit_code: 0,
+                raw_output: String::new(),
+            }
+        } else {
+            let outcomes = run_acceptance(Acceptance {
+                cfg: &self.sandbox,
+                node: "implementer",
+                name: &format!("ratatoskr-impl-{}", self.short_id()),
+                repo_root: &self.repo_path,
+                worktree: worktree.as_path(),
+                steps: &self.acceptance,
+            })
+            .await
+            .map_err(NodeError::Failed)?;
+            match &self.characterizer {
+                Some(c) => c.read(&outcomes).await,
+                None => by_exit_code(&outcomes),
+            }
         };
 
         // Diff/touched reads are best-effort — don't fail the attempt if they hiccup.
