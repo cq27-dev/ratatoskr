@@ -18,17 +18,22 @@ a test path, a spec name, a case label. Do not reformat, shorten or prettify the
 compared against another run's, and a name written two different ways reads as one check
 disappearing and another appearing, which is a regression that did not happen.
 
-`passed` — how many checks passed, as a NUMBER. Count them; do not list them. Nothing downstream
-reads the names of passing checks, and a suite of several hundred is several hundred names nobody
+`passed` — the passing counts, as a LIST OF NUMBERS. Do not list the names of passing checks:
+nothing downstream reads them, and a suite of several hundred is several hundred names nobody
 uses — the run pays for every one of them in the time it takes you to write it out.
 
-If a step's output prints a summary line with the count (`285 passed`, `ok. 42 passed`), take the
-number from there rather than counting by hand, and add the counts across steps.
+Where the output prints a summary line with a count (`285 passed`, `ok. 42 passed`), take the
+number from there rather than counting by hand, and add ONE ENTRY TO THE LIST PER SUMMARY LINE.
+A command that runs several test binaries prints one such line each; report each number as you
+read it.
+
+Do NOT add them up. The total is worked out from your list, and a sum you do yourself is a place
+to go wrong for no gain — `[285, 42]` is the right answer, `[327]` is not.
 
 ## Edge cases
 
 If a step's output has no per-check structure — a compiler, a bundler, a linter that prints only
-a summary — treat the STEP ITSELF as one check: count it in `passed` if it exited zero, and name
+a summary — treat the STEP ITSELF as one check: add `1` to `passed` if it exited zero, and name
 it in `failing` otherwise. Never invent per-check detail the output does not contain.
 
 A step that exited non-zero has at least one failing check. If you cannot see which, name that
