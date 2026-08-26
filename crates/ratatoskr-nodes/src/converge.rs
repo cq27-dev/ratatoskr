@@ -43,6 +43,21 @@ pub fn test_command_ran(failing: &[String], passed: usize, exit_code: i32) -> bo
     !failing.is_empty() || passed > 0 || exit_code == 0
 }
 
+/// Whether the change stopped the checks running at all.
+///
+/// The baseline executed something and the change's run executed nothing: the acceptance command
+/// did not get far enough to run a single check. A build error, an import error, a call site that
+/// no longer matches the code it calls.
+///
+/// Read off the counts alone, so nothing here has to know what any runner's output looks like —
+/// the same signal [`crate::redteam`] already trusts to prove an authored test stops the suite
+/// building. It is one-directional by construction: a characterization can only ever raise the
+/// passing count above the exit-code floor, never lower it, so a model cannot manufacture this
+/// state to unlock anything.
+pub fn checks_stopped_running(baseline_passed: usize, post_passed: usize) -> bool {
+    baseline_passed > 0 && post_passed == 0
+}
+
 /// Files whose diff removed or replaced existing lines and are not exempted by the task's
 /// up-front `defineDefaults({ mayModifyTests: [...] })` declaration. The model referee judges
 /// these candidates; this deterministic half intentionally has no language-specific path rules.
@@ -67,6 +82,24 @@ mod tests {
 
     fn v(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// #157: the mechanical half of "a test that does not compile is not a test that failed".
+    #[test]
+    fn checks_stop_running_only_when_the_baseline_ran_and_the_change_did_not() {
+        assert!(checks_stopped_running(430, 0), "the change broke the build");
+        assert!(
+            !checks_stopped_running(430, 1),
+            "something executed, so the checks ran"
+        );
+        assert!(
+            !checks_stopped_running(0, 0),
+            "a baseline that ran nothing proves nothing about the change"
+        );
+        assert!(
+            !checks_stopped_running(0, 12),
+            "a baseline that ran nothing and a change that ran is not this state"
+        );
     }
 
     #[test]

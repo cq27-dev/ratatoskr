@@ -978,6 +978,7 @@ async fn referee_judgement(
     worktree: &WorktreePath,
     analyst: &AnalystOutput,
     implementer: &ImplementerOutput,
+    baseline_passed: usize,
 ) -> Vec<referee::Violation> {
     let stages = match ctx.stages().await {
         Ok(stages) => stages,
@@ -1002,6 +1003,7 @@ async fn referee_judgement(
         issue: &ctx.issue,
         requirements: &analyst.requirements,
         implementer,
+        baseline_passed,
         worktree,
     })
     .await
@@ -1203,7 +1205,7 @@ async fn iterate_work(
     let analyst: AnalystOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "analyst")
         .await
         .map_err(|e| e.to_string())?;
-    let referee = referee_judgement(ctx, &worktree, &analyst, &prev).await;
+    let referee = referee_judgement(ctx, &worktree, &analyst, &prev, red_team.passed_tests).await;
     // Referee first, same as the built-in loop: a moved referee makes the test sets meaningless,
     // so reverting it is what this iteration has to be told to do.
     let authored = red_team
@@ -1901,7 +1903,14 @@ async fn replan_at_ceiling_with<R: CeilingRecovery>(
     // A stale finding from an earlier iteration is not authority to extend a now-clean run. The
     // current attempt must still need a correction under the same Rust-owned referee/test/review
     // gates as the convergence loop.
-    let referee = referee_judgement(&ctx, &worktree, &current_plan, &implementation).await;
+    let referee = referee_judgement(
+        &ctx,
+        &worktree,
+        &current_plan,
+        &implementation,
+        red_team.passed_tests,
+    )
+    .await;
     let authored = red_team
         .authored
         .as_ref()
@@ -3383,7 +3392,14 @@ async fn finish_full_inner<A: FullTerminalActions>(
     // the change would be accepted on its tests alone.
     let checkpoints = ctx.store.checkpoints_for_run(&ctx.run_id).await?;
     let review = scripted_review(&checkpoints);
-    let referee = referee_judgement(ctx, &worktree, &plan.analyst, &implementer).await;
+    let referee = referee_judgement(
+        ctx,
+        &worktree,
+        &plan.analyst,
+        &implementer,
+        red_team.passed_tests,
+    )
+    .await;
     let status = infer_status(
         &red_team,
         &implementer,

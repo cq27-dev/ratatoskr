@@ -197,6 +197,9 @@ pub(crate) struct Judgement<'a> {
     pub issue: &'a str,
     pub requirements: &'a [String],
     pub implementer: &'a crate::ImplementerOutput,
+    /// How many checks the baseline ran, so a change that stopped them running is recognisable.
+    /// Only the count: the referee has no use for the baseline's failures.
+    pub baseline_passed: usize,
     pub worktree: &'a WorktreePath,
 }
 
@@ -212,6 +215,7 @@ pub(crate) async fn judge(
         issue,
         requirements,
         implementer,
+        baseline_passed,
         worktree,
     } = judgement;
     let Some(route) = crate::referee_route(engine, config, stages, agents) else {
@@ -223,6 +227,27 @@ pub(crate) async fn judge(
         engine.may_modify_tests(),
     );
     if candidates.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    // A rewritten file is judged because editing a check that FAILED is how a change gets marked
+    // done without being done. When the change stopped the checks running, no check reached an
+    // outcome — there is nothing that was believed and could now be un-believed, and the premise
+    // the gate rests on is simply absent. The commonest way to land here is a test the red team
+    // wrote against an interface that did not exist yet, whose call site no longer matches the
+    // code it calls; refusing the repair leaves the run building the API the test guessed at, or
+    // failing.
+    //
+    // The licence is narrow and closes itself. The diff is cumulative — HEAD does not move until
+    // the run commits at the end — so every file let through here is judged again, under the
+    // ordinary rule, on the first iteration whose checks run. And a run in this state cannot be
+    // reported converged: the acceptance step names itself as failing, which is a new failure.
+    if crate::converge::checks_stopped_running(baseline_passed, implementer.passed_tests) {
+        tracing::warn!(
+            kind = "referee_skipped_no_checks_ran",
+            candidates = ?candidates,
+            "the change stopped the checks running, so no check outcome exists to have been \
+             weakened; these rewrites are judged on the first iteration that runs"
+        );
         return Ok(Some(Vec::new()));
     }
 
@@ -639,6 +664,7 @@ rename to src/new.rs
             issue: "the issue",
             requirements: &["keep the tests intact".to_string()],
             implementer: &implementer(&["crates/foo/src/lib.rs"]),
+            baseline_passed: 0,
             worktree: &worktree("judge-no-route"),
         })
         .await
@@ -678,6 +704,7 @@ rename to src/new.rs
             issue: "the issue",
             requirements: &[],
             implementer: &implementer(&["crates/foo/tests/api.rs"]),
+            baseline_passed: 0,
             worktree: &worktree("judge-exempt"),
         })
         .await
@@ -694,6 +721,7 @@ rename to src/new.rs
             issue: "the issue",
             requirements: &[],
             implementer: &implementer(&[]),
+            baseline_passed: 0,
             worktree: &worktree("judge-exempt"),
         })
         .await
@@ -722,12 +750,70 @@ rename to src/new.rs
             issue: "the issue",
             requirements: &[],
             implementer: &implementer(&["crates/foo/src/lib.rs"]),
+            baseline_passed: 0,
             worktree: &worktree("judge-fails-open"),
         })
         .await;
         assert!(
             result.is_err(),
             "a failed judgement must reach the caller for failure checkpointing"
+        );
+    }
+
+    /// #157: the gate refuses a rewritten check because editing a check that FAILED is how a
+    /// change gets marked done without being done. A change that stopped the checks running has
+    /// no check outcome to have weakened, so the premise is absent and the judgement is skipped.
+    ///
+    /// Same construction as `a_failed_judgement_is_surfaced`: the route points nowhere, so
+    /// reaching the model is an error. An `Ok` here can only mean the skip happened first — and
+    /// the identical setup with a baseline that ran nothing is exactly that error, which is what
+    /// makes this a skip rather than a route that quietly does nothing.
+    #[tokio::test]
+    async fn a_change_that_stopped_the_checks_running_is_not_judged() {
+        let engine = rules_engine("judge-nothing-ran", "").await;
+        let mut config = RatatoskrConfig::default();
+        config.models.insert(
+            "referee".to_string(),
+            route("no-such-provider", "no-such-model"),
+        );
+        let ledger = Arc::new(RunLedger::default());
+        // The red team's tests were written against an interface that did not exist yet; the call
+        // site does not match the code it calls, and the acceptance command runs nothing.
+        let mut broken = implementer(&["crates/foo/tests/api.rs"]);
+        broken.failing_tests = vec!["cargo test --workspace".to_string()];
+        broken.passed_tests = 0;
+        broken.exit_code = 101;
+
+        let stages = [crate::stage::stage_fixture("verifier", "explore")];
+        let wt = worktree("judge-nothing-ran");
+        let requirements = ["keep the tests intact".to_string()];
+        let judgement = |baseline_passed| Judgement {
+            engine: &engine,
+            config: &config,
+            stages: &stages,
+            agents: &[],
+            ledger: &ledger,
+            issue: "the issue",
+            requirements: &requirements,
+            implementer: &broken,
+            baseline_passed,
+            worktree: &wt,
+        };
+
+        let violations = judge(judgement(430))
+            .await
+            .expect("a repair to a check that never ran is not a refusal");
+        assert!(
+            violations.is_some_and(|v| v.is_empty()),
+            "skipped, not unrouted: an unrouted judgement is None"
+        );
+
+        // The control, and the reason this is a carve-out rather than a hole: with a baseline that
+        // ran nothing there is no evidence the change stopped anything, so the ordinary rule
+        // applies and the judgement is attempted — against a route that cannot answer.
+        assert!(
+            judge(judgement(0)).await.is_err(),
+            "without a baseline that ran, the rewrite is judged as usual"
         );
     }
 }
