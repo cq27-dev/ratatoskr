@@ -136,7 +136,7 @@ pub(crate) struct ImplementerAttemptInput {
 /// A record written before this field existed describes a run that did produce a change — the
 /// no-change outcome did not exist to be recorded — so absence reads as `true`. That is also the
 /// safe direction: it withholds the outcome rather than claiming it.
-fn produced_change_default() -> bool {
+pub(crate) fn produced_change_default() -> bool {
     true
 }
 

@@ -39,8 +39,18 @@ pub fn is_converged(baseline_failing: &[String], post_failing: &[String]) -> boo
 /// command didn't run to completion (a broken build, a missing runner, a sandbox mis-mount) — NOT
 /// "no failures". Without this guard, both branches report zero tests and converge falsely reports
 /// success on empty data (the failure mode the first live run hit).
-pub fn test_command_ran(failing: &[String], passed: usize, exit_code: i32) -> bool {
-    !failing.is_empty() || passed > 0 || exit_code == 0
+///
+/// `produced_change` is asked for rather than assumed because an implementer that wrote nothing
+/// has no acceptance run at all: the suite is skipped, and the zeros standing in for its result
+/// read here as a command that exited cleanly. Every caller must supply it — the parameter is the
+/// reminder, since the answer is otherwise indistinguishable from a green suite.
+pub fn test_command_ran(
+    produced_change: bool,
+    failing: &[String],
+    passed: usize,
+    exit_code: i32,
+) -> bool {
+    produced_change && (!failing.is_empty() || passed > 0 || exit_code == 0)
 }
 
 /// Files whose diff removed or replaced existing lines and are not exempted by the task's
@@ -139,13 +149,27 @@ mod tests {
     #[test]
     fn zero_tests_with_nonzero_exit_did_not_run() {
         // The false-convergence case: no tests parsed and the command failed.
-        assert!(!test_command_ran(&v(&[]), 0, 101));
+        assert!(!test_command_ran(true, &v(&[]), 0, 101));
         // A genuinely empty suite that exited 0 counts as "ran" (nothing to break).
-        assert!(test_command_ran(&v(&[]), 0, 0));
+        assert!(test_command_ran(true, &v(&[]), 0, 0));
         // Any parsed test means it ran, regardless of exit code.
-        assert!(test_command_ran(&v(&["a"]), 0, 101));
+        assert!(test_command_ran(true, &v(&["a"]), 0, 101));
         // A passing count alone proves it ran, which is the whole reason the count is carried.
-        assert!(test_command_ran(&v(&[]), 285, 101));
+        assert!(test_command_ran(true, &v(&[]), 285, 101));
+    }
+
+    /// An implementer that wrote nothing has no acceptance run to report. Its result is zeros
+    /// standing for "not measured", and `exit_code: 0` among them is the shape of a suite that
+    /// passed — which is what the workflow reads before deciding to review rather than iterate.
+    #[test]
+    fn a_skipped_suite_did_not_run_however_clean_its_zeros_look() {
+        assert!(
+            !test_command_ran(false, &v(&[]), 0, 0),
+            "the exact shape a skipped acceptance leaves behind"
+        );
+        // And the fact is decisive on its own: nothing in the numbers can say the suite ran when
+        // it was never started.
+        assert!(!test_command_ran(false, &v(&["a"]), 285, 0));
     }
 
     #[test]

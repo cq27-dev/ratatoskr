@@ -620,6 +620,7 @@ fn infer_status(
         return RunStatus::MaxIterationsReached;
     }
     let post_ran = converge::test_command_ran(
+        implementer.produced_change,
         &implementer.failing_tests,
         implementer.passed_tests,
         implementer.exit_code,
@@ -723,6 +724,14 @@ async fn reconstruct_plan(store: &Store, run_id: &str) -> Result<PlanOutcome, Pl
 /// JSON shape shared by `RedTeamOutput` and `ImplementerOutput` for the pure converge helpers.
 #[derive(Deserialize)]
 struct RunShape {
+    /// Whether the implementer wrote anything. A run that produced no change ran no acceptance
+    /// suite, so the three fields below are zeros standing for "not measured" — and `exit_code: 0`
+    /// would otherwise read to the workflow as a suite that passed.
+    ///
+    /// Defaults to `true` so a shape from anywhere that does not carry it is judged on its test
+    /// fields, as before, rather than silently reading as a skipped run.
+    #[serde(default = "crate::implementer::produced_change_default")]
+    produced_change: bool,
     #[serde(default)]
     failing_tests: Vec<String>,
     #[serde(default)]
@@ -919,7 +928,9 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
     // Checkpoint before the guard so a failed baseline stays inspectable.
     note(&ctx, crate::policy::REDTEAM_NODE, &out, None, None).await?;
     // The false-convergence guard is enforced here — the script cannot skip it.
-    if !converge::test_command_ran(&out.failing_tests, out.passed_tests, out.exit_code) {
+    // `true`: the baseline is a run of the suite by definition — there is no change to have been
+    // skipped for. What this guard is asking is whether that run produced any checks.
+    if !converge::test_command_ran(true, &out.failing_tests, out.passed_tests, out.exit_code) {
         return Err(format!(
             "the baseline acceptance run produced no checks (exit {}); check the analyst's acceptance, [sandbox] test_command and the sandbox backend",
             out.exit_code
@@ -1225,8 +1236,12 @@ async fn iterate_work(
     let prev: ImplementerOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "implementer")
         .await
         .map_err(|e| e.to_string())?;
-    let post_ran =
-        converge::test_command_ran(&prev.failing_tests, prev.passed_tests, prev.exit_code);
+    let post_ran = converge::test_command_ran(
+        prev.produced_change,
+        &prev.failing_tests,
+        prev.passed_tests,
+        prev.exit_code,
+    );
     let analyst: AnalystOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "analyst")
         .await
         .map_err(|e| e.to_string())?;
@@ -1318,7 +1333,12 @@ async fn is_converged_host(_ctx: Arc<WorkflowContext>, arg: String) -> Result<St
 
 async fn test_command_ran_host(_ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
     let s: RunShape = serde_json::from_str(&arg).map_err(|e| format!("testCommandRan arg: {e}"))?;
-    let v = converge::test_command_ran(&s.failing_tests, s.passed_tests, s.exit_code);
+    let v = converge::test_command_ran(
+        s.produced_change,
+        &s.failing_tests,
+        s.passed_tests,
+        s.exit_code,
+    );
     serde_json::to_string(&v).map_err(|e| e.to_string())
 }
 
@@ -1942,13 +1962,13 @@ async fn replan_at_ceiling_with<R: CeilingRecovery>(
     // A tree the implementer never wrote to is not a clean one. Its suite was never run, so the
     // empty failing set it carries clears every test condition below by default — and a run that
     // produced nothing is exactly the case a replan is for.
-    let tests_clean = implementation.produced_change
-        && converge::test_command_ran(
-            &implementation.failing_tests,
-            implementation.passed_tests,
-            implementation.exit_code,
-        )
-        && converge::unsatisfied(authored, &implementation.failing_tests).is_empty()
+    let tests_clean = converge::test_command_ran(
+        implementation.produced_change,
+        &implementation.failing_tests,
+        implementation.passed_tests,
+        implementation.exit_code,
+    ) && converge::unsatisfied(authored, &implementation.failing_tests)
+        .is_empty()
         && converge::is_converged(&red_team.failing_tests, &implementation.failing_tests);
     // This tree's review, folded across the passes that produced it — the same value `verify()`
     // handed the workflow. Read off the latest checkpoint alone, a continuation that turned up
@@ -5485,6 +5505,32 @@ mod tests {
         assert_eq!(actions.calls().len(), 1);
         assert!(matches!(actions.calls()[0], TerminalCall::Publish { .. }));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The workflow reads the implementer's result through `RunShape`, and `produced_change`
+    /// defaults to `true` there. If the field ever stopped being serialized, that default would
+    /// silently restore the bug it exists to close: `testCommandRan` would answer `true` for a
+    /// skipped suite, the standard loop would review instead of iterating, and the no-change
+    /// correction would never reach the implementer.
+    #[test]
+    fn the_workflow_sees_that_a_skipped_suite_did_not_run() {
+        let mut nothing = imp(&[], &[], 0);
+        nothing.produced_change = false;
+        let shape: RunShape =
+            serde_json::from_str(&serde_json::to_string(&nothing).unwrap()).unwrap();
+        assert!(
+            !shape.produced_change,
+            "the field has to survive the round trip the host reads through"
+        );
+        assert!(
+            !converge::test_command_ran(
+                shape.produced_change,
+                &shape.failing_tests,
+                shape.passed_tests,
+                shape.exit_code,
+            ),
+            "so the standard workflow iterates rather than reviewing"
+        );
     }
 
     /// The snapshot the no-change outcome rests on belongs to the RUN, not to a node.
