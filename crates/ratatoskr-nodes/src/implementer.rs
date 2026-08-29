@@ -24,9 +24,18 @@ use crate::testrun::{
     Acceptance, Characterizer, GUEST_WORKSPACE, by_exit_code, mounts_for, run_acceptance,
 };
 
-/// Implementer output. Test fields are deterministic; `diff_summary`/`touched_files`/`narrative`
-/// are best-effort context (relaxed) for the bookkeeper in Phase 4.
+/// Implementer output. The acceptance result is deterministic; `diff_summary`/`touched_files`/
+/// `narrative` are best-effort context (relaxed) for the bookkeeper in Phase 4.
+///
+/// `deny_unknown_fields` so a record this build cannot read is refused rather than half-read. A
+/// checkpoint written before `acceptance` replaced the three flat test fields still carries those,
+/// and `Option` decodes a missing field as `None` whatever else is present — which every reader
+/// takes as "the implementer wrote nothing", turning a completed run into a skipped one. Run
+/// history is disposable here and no compatible decoding is owed to it; being told the record is
+/// from another build is, because the alternative is a durable memory written about a run that
+/// never happened.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ImplementerOutput {
     pub worktree_path: String,
     /// The branch this run authored, by name.
@@ -55,7 +64,6 @@ pub struct ImplementerOutput {
     /// unchanged tree has an unchanged test result, so the suite is not run again. A zeroed result
     /// would be indistinguishable from a clean one, which is how a change that does not exist came
     /// to report convergence; the absence is the fact, and every reader has to unwrap it.
-    #[serde(default)]
     pub acceptance: Option<crate::testrun::AcceptanceResult>,
     /// The CLI's own narrative of what it did (optional).
     #[serde(default)]
@@ -378,6 +386,27 @@ fn where_you_are() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A checkpoint from before `acceptance` replaced the three flat test fields is refused, not
+    /// half-read.
+    ///
+    /// `Option` decodes a missing field as `None` whether or not `serde(default)` is present, and
+    /// `None` is how this build says "the implementer wrote nothing" — so without
+    /// `deny_unknown_fields` an old completed run would replay as a skipped one, and `bookkeep`
+    /// would write a durable memory about a run that never happened. Run history is disposable
+    /// here; being told the record belongs to another build is not the same as preserving it.
+    #[test]
+    fn a_checkpoint_from_before_this_shape_is_refused_rather_than_misread() {
+        let legacy = r#"{"worktree_path":"/wt","branch":"b","diff_summary":"","touched_files":[],
+            "rewritten_files":[],"failing_tests":["a::case"],"passed_tests":5,"exit_code":0,
+            "commit_kind":"","commit_scope":"","commit_subject":""}"#;
+        let error = serde_json::from_str::<ImplementerOutput>(legacy)
+            .expect_err("a record carrying the old test fields is not one this build can read");
+        assert!(
+            error.to_string().contains("failing_tests"),
+            "the refusal has to name what it could not read: {error}"
+        );
+    }
     use super::*;
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {
