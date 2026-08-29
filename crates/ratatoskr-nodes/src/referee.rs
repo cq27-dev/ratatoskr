@@ -514,14 +514,16 @@ rename to src/new.rs
 
     fn implementer(rewritten: &[&str]) -> ImplementerOutput {
         ImplementerOutput {
+            acceptance: Some(crate::testrun::AcceptanceResult {
+                failing_tests: Vec::new(),
+                passed_tests: 0,
+                exit_code: 0,
+            }),
             worktree_path: "/wt".into(),
             branch: "ratatoskr/test".into(),
             diff_summary: String::new(),
             touched_files: Vec::new(),
             rewritten_files: rewritten.iter().map(|s| s.to_string()).collect(),
-            failing_tests: Vec::new(),
-            passed_tests: 0,
-            exit_code: 0,
             narrative: None,
             commit_kind: String::new(),
             commit_scope: String::new(),

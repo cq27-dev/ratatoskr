@@ -55,6 +55,37 @@ pub struct TestResults {
     pub raw_output: String,
 }
 
+/// What an acceptance run reported, as a run carries it afterwards.
+///
+/// [`TestResults`] minus the raw output, which is evidence for the characterizer and far too large
+/// to keep in a checkpoint.
+///
+/// This exists to be wrapped in an `Option`. A run whose implementer wrote nothing never starts a
+/// suite, and the honest record of that is the absence of this whole struct rather than a zeroed
+/// copy of it — `passed: 0, exit_code: 0` is also exactly what a clean run of an empty suite
+/// looks like, so a reader holding one cannot tell "nothing failed" from "nothing ran". Absence
+/// can only be read one way, and the compiler makes every reader read it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AcceptanceResult {
+    pub failing_tests: Vec<String>,
+    /// How many checks passed. Only the count is carried: nothing reads a passing check's name,
+    /// and a suite of several hundred costs the characterizer more output than the rest of the
+    /// pipeline combined to write out.
+    #[serde(default)]
+    pub passed_tests: usize,
+    pub exit_code: i32,
+}
+
+impl From<TestResults> for AcceptanceResult {
+    fn from(results: TestResults) -> Self {
+        Self {
+            failing_tests: results.failing,
+            passed_tests: results.passed,
+            exit_code: results.exit_code,
+        }
+    }
+}
+
 /// What an acceptance run needs: the policy, who is running it, and the two paths it spans.
 pub struct Acceptance<'a> {
     pub cfg: &'a SandboxConfig,

@@ -24,9 +24,18 @@ use crate::testrun::{
     Acceptance, Characterizer, GUEST_WORKSPACE, by_exit_code, mounts_for, run_acceptance,
 };
 
-/// Implementer output. Test fields are deterministic; `diff_summary`/`touched_files`/`narrative`
-/// are best-effort context (relaxed) for the bookkeeper in Phase 4.
+/// Implementer output. The acceptance result is deterministic; `diff_summary`/`touched_files`/
+/// `narrative` are best-effort context (relaxed) for the bookkeeper in Phase 4.
+///
+/// `deny_unknown_fields` so a record this build cannot read is refused rather than half-read. A
+/// checkpoint written before `acceptance` replaced the three flat test fields still carries those,
+/// and `Option` decodes a missing field as `None` whatever else is present — which every reader
+/// takes as "the implementer wrote nothing", turning a completed run into a skipped one. Run
+/// history is disposable here and no compatible decoding is owed to it; being told the record is
+/// from another build is, because the alternative is a durable memory written about a run that
+/// never happened.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ImplementerOutput {
     pub worktree_path: String,
     /// The branch this run authored, by name.
@@ -48,13 +57,14 @@ pub struct ImplementerOutput {
     /// apart.
     #[serde(default)]
     pub rewritten_files: Vec<String>,
-    pub failing_tests: Vec<String>,
-    /// How many checks passed. Only the count is carried: nothing reads a passing check's name,
-    /// and a suite of several hundred costs the characterizer more output than the rest of the
-    /// pipeline combined to write out.
-    #[serde(default)]
-    pub passed_tests: usize,
-    pub exit_code: i32,
+    /// What the acceptance run reported, or `None` when there was no run to report.
+    ///
+    /// `None` is not "nothing failed". The implementer wrote nothing — measured against the tree
+    /// it was handed, so the red team's authored tests do not count as its doing — and an
+    /// unchanged tree has an unchanged test result, so the suite is not run again. A zeroed result
+    /// would be indistinguishable from a clean one, which is how a change that does not exist came
+    /// to report convergence; the absence is the fact, and every reader has to unwrap it.
+    pub acceptance: Option<crate::testrun::AcceptanceResult>,
     /// The CLI's own narrative of what it did (optional).
     #[serde(default)]
     pub narrative: Option<String>,
@@ -219,6 +229,21 @@ impl ImplementerNode {
     ) -> Result<ImplementerOutput, NodeError> {
         let input_json = serde_json::to_string(&input)
             .map_err(|error| NodeError::Failed(format!("implementer input: {error}")))?;
+        // Captured before the turn, and only once: on the first attempt this is the tree with the
+        // red team's authored tests already in it, which is what the implementer was handed. Later
+        // attempts keep comparing against that same tree, so "did the implementer change anything"
+        // stays a question about the run rather than about the last iteration.
+        // Held on the run's context, not on this node: `iterate` and `replanAtCeiling` each build
+        // a fresh `ImplementerNode`, and a snapshot retaken per node would be of a tree already
+        // carrying an earlier attempt's work — so a last iteration that added nothing would report
+        // the whole run as having produced none, and the change in the worktree would go
+        // unpublished.
+        let handed = self
+            .declared_context
+            .handed
+            .get_or_init(|| async { worktree::full_diff_text(worktree).await.ok() })
+            .await
+            .clone();
         let raw = crate::workflow::evaluate_standard_stage_with_resources(
             Arc::clone(&self.declared_context),
             "implementer_attempt",
@@ -237,19 +262,48 @@ impl ImplementerNode {
         .map_err(|error| NodeError::Failed(format!("implementer agent failed: {error}")))?;
         let report = parse_validated::<Report>(&raw)?;
 
-        let outcomes = run_acceptance(Acceptance {
-            cfg: &self.sandbox,
-            node: "implementer",
-            name: &format!("ratatoskr-impl-{}", self.short_id()),
-            repo_root: &self.repo_path,
-            worktree: worktree.as_path(),
-            steps: &self.acceptance,
-        })
-        .await
-        .map_err(NodeError::Failed)?;
-        let tests = match &self.characterizer {
-            Some(c) => c.read(&outcomes).await,
-            None => by_exit_code(&outcomes),
+        // An unchanged tree has an unchanged test result. The baseline already ran this suite, so
+        // running it again to compare a set against itself is the most expensive way to learn
+        // nothing — a full sandboxed run, twice, to find that 53 passing tests still pass.
+        //
+        // Compared against what the implementer was handed, never against an empty tree: the red
+        // team's authored tests are already in this worktree, so a tree that merely has files in
+        // it says nothing about whether the implementer wrote any of them.
+        //
+        // Either diff failing to read leaves this CHANGED. A git that cannot answer must not be
+        // able to skip the suite and report a change nobody checked.
+        let now = worktree::full_diff_text(worktree).await.ok();
+        let produced_change = match (&handed, &now) {
+            (Some(handed), Some(now)) => handed != now,
+            _ => true,
+        };
+        let acceptance = if !produced_change {
+            tracing::info!(
+                kind = "acceptance_skipped_unchanged_tree",
+                "the implementer wrote nothing, so the baseline's result still stands; not \
+                 running the acceptance suite again"
+            );
+            // Absent, never zeroed: there is no result, and a reader must not be able to mistake
+            // one for a clean run.
+            None
+        } else {
+            let outcomes = run_acceptance(Acceptance {
+                cfg: &self.sandbox,
+                node: "implementer",
+                name: &format!("ratatoskr-impl-{}", self.short_id()),
+                repo_root: &self.repo_path,
+                worktree: worktree.as_path(),
+                steps: &self.acceptance,
+            })
+            .await
+            .map_err(NodeError::Failed)?;
+            Some(
+                match &self.characterizer {
+                    Some(c) => c.read(&outcomes).await,
+                    None => by_exit_code(&outcomes),
+                }
+                .into(),
+            )
         };
 
         // Diff/touched reads are best-effort — don't fail the attempt if they hiccup.
@@ -260,14 +314,12 @@ impl ImplementerNode {
             .unwrap_or_default();
 
         Ok(ImplementerOutput {
+            acceptance,
             worktree_path: worktree.as_path().display().to_string(),
             branch: self.branch(),
             diff_summary,
             touched_files,
             rewritten_files,
-            failing_tests: tests.failing,
-            passed_tests: tests.passed,
-            exit_code: tests.exit_code,
             commit_kind: report.kind,
             commit_scope: report.scope,
             commit_subject: report.subject,
@@ -334,6 +386,27 @@ fn where_you_are() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A checkpoint from before `acceptance` replaced the three flat test fields is refused, not
+    /// half-read.
+    ///
+    /// `Option` decodes a missing field as `None` whether or not `serde(default)` is present, and
+    /// `None` is how this build says "the implementer wrote nothing" — so without
+    /// `deny_unknown_fields` an old completed run would replay as a skipped one, and `bookkeep`
+    /// would write a durable memory about a run that never happened. Run history is disposable
+    /// here; being told the record belongs to another build is not the same as preserving it.
+    #[test]
+    fn a_checkpoint_from_before_this_shape_is_refused_rather_than_misread() {
+        let legacy = r#"{"worktree_path":"/wt","branch":"b","diff_summary":"","touched_files":[],
+            "rewritten_files":[],"failing_tests":["a::case"],"passed_tests":5,"exit_code":0,
+            "commit_kind":"","commit_scope":"","commit_subject":""}"#;
+        let error = serde_json::from_str::<ImplementerOutput>(legacy)
+            .expect_err("a record carrying the old test fields is not one this build can read");
+        assert!(
+            error.to_string().contains("failing_tests"),
+            "the refusal has to name what it could not read: {error}"
+        );
+    }
     use super::*;
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {

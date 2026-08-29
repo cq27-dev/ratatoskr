@@ -1796,6 +1796,31 @@ mod tests {
         assert_eq!(state_of(&views, "overseer"), NodeState::Idle);
     }
 
+    /// The dashboard mirrors `RunStatus` as a hand-written union, and nothing regenerates it. A
+    /// variant missing there is a status the server returns and the client's types say cannot
+    /// exist — which is how `no_change_produced` was first shipped without it.
+    #[test]
+    fn the_dashboard_can_name_every_status_the_server_returns() {
+        use strum::IntoEnumIterator as _;
+
+        let api = include_str!("../web/src/api.ts");
+        let union = api
+            .split_once("export type RunStatus =")
+            .expect("web/src/api.ts declares a RunStatus union")
+            .1
+            .split_once(';')
+            .expect("the union is terminated")
+            .0;
+        for status in ratatoskr_core::RunStatus::iter() {
+            let token = format!("\"{}\"", status.as_str());
+            assert!(
+                union.contains(&token),
+                "`{}` is missing from the RunStatus union in web/src/api.ts",
+                status.as_str()
+            );
+        }
+    }
+
     #[test]
     fn every_run_status_is_classified() {
         use strum::IntoEnumIterator as _;

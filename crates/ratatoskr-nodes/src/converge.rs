@@ -4,6 +4,8 @@
 //! in the baseline (red-team). A pre-existing failure is not the implementer's problem; a new one
 //! is. Empty new-failure set → converged.
 
+use crate::testrun::AcceptanceResult;
+
 /// Tests failing after the change that were not failing in the baseline.
 pub fn newly_introduced_failures(
     baseline_failing: &[String],
@@ -31,16 +33,29 @@ pub fn unsatisfied(authored: &[String], post_failing: &[String]) -> Vec<String> 
 }
 
 /// Whether the change converged: it introduced no new failures.
-pub fn is_converged(baseline_failing: &[String], post_failing: &[String]) -> bool {
-    newly_introduced_failures(baseline_failing, post_failing).is_empty()
+///
+/// Takes the post-change result as an `Option` for the same reason [`test_command_ran`] does: an
+/// implementer that wrote nothing ran no suite, and an empty failing set introduces no new
+/// failures by construction. A change that does not exist has not converged; it has not happened,
+/// and no comparison of failing sets can say otherwise. The baseline stays flat — the red team
+/// always runs its suite, so there is no absence to represent on that side.
+pub fn is_converged(baseline_failing: &[String], post: Option<&AcceptanceResult>) -> bool {
+    post.is_some_and(|post| {
+        newly_introduced_failures(baseline_failing, &post.failing_tests).is_empty()
+    })
 }
 
 /// Whether a test run actually produced results. Zero tests parsed *and* a non-zero exit means the
 /// command didn't run to completion (a broken build, a missing runner, a sandbox mis-mount) — NOT
 /// "no failures". Without this guard, both branches report zero tests and converge falsely reports
 /// success on empty data (the failure mode the first live run hit).
-pub fn test_command_ran(failing: &[String], passed: usize, exit_code: i32) -> bool {
-    !failing.is_empty() || passed > 0 || exit_code == 0
+///
+/// Takes the whole result rather than its parts, so absence has to be dealt with: an implementer
+/// that wrote nothing has no acceptance run at all, and `None` is the only honest way to say so.
+/// Zeros could not — `passed: 0, exit_code: 0` is also a clean run of an empty suite.
+pub fn test_command_ran(acceptance: Option<&AcceptanceResult>) -> bool {
+    acceptance
+        .is_some_and(|a| !a.failing_tests.is_empty() || a.passed_tests > 0 || a.exit_code == 0)
 }
 
 /// Files whose diff removed or replaced existing lines and are not exempted by the task's
@@ -69,15 +84,53 @@ mod tests {
         xs.iter().map(|s| s.to_string()).collect()
     }
 
+    /// An acceptance run that reported `failing`. The counts are only ever read through
+    /// [`test_command_ran`], so they are the shape of a run that got as far as reporting.
+    fn shape(failing: &[&str], passed: usize, exit_code: i32) -> AcceptanceResult {
+        AcceptanceResult {
+            failing_tests: v(failing),
+            passed_tests: passed,
+            exit_code,
+        }
+    }
+
+    fn result(failing: &[String]) -> AcceptanceResult {
+        AcceptanceResult {
+            failing_tests: failing.to_vec(),
+            passed_tests: 1,
+            exit_code: 1,
+        }
+    }
+
+    fn ran(failing: &[&str]) -> AcceptanceResult {
+        AcceptanceResult {
+            failing_tests: v(failing),
+            passed_tests: 1,
+            exit_code: if failing.is_empty() { 0 } else { 1 },
+        }
+    }
+
+    /// The other half of the skipped-suite pair. A repository-authored workflow may call
+    /// `isConverged` without calling `testCommandRan` beside it, so this cannot rely on the other
+    /// guard having been asked first.
+    #[test]
+    fn a_change_that_was_never_made_has_not_converged() {
+        assert!(
+            !is_converged(&v(&["a"]), None),
+            "an empty failing set from a suite that never ran is not a clean one"
+        );
+        assert!(is_converged(&v(&["a"]), Some(&ran(&[]))));
+    }
+
     #[test]
     fn converged_when_no_new_failures() {
         // Pre-existing failure stays; nothing new introduced.
         assert!(is_converged(
             &v(&["a::pre_existing"]),
-            &v(&["a::pre_existing"])
+            Some(&ran(&["a::pre_existing"]))
         ));
-        assert!(is_converged(&v(&["a::pre_existing"]), &v(&[])));
-        assert!(is_converged(&v(&[]), &v(&[])));
+        assert!(is_converged(&v(&["a::pre_existing"]), Some(&ran(&[]))));
+        assert!(is_converged(&v(&[]), Some(&ran(&[]))));
     }
 
     #[test]
@@ -89,7 +142,7 @@ mod tests {
         assert_eq!(new, ["b::broke"]);
         assert!(!is_converged(
             &v(&["a::pre_existing"]),
-            &v(&["a::pre_existing", "b::broke"])
+            Some(&ran(&["a::pre_existing", "b::broke"]))
         ));
     }
 
@@ -106,7 +159,7 @@ mod tests {
         let still_failing = v(&["store::zero_duration_removes_nothing"]);
 
         assert!(
-            is_converged(&baseline_failing, &still_failing),
+            is_converged(&baseline_failing, Some(&result(&still_failing))),
             "nothing is newly failing, which is exactly why this is not enough on its own"
         );
         assert_eq!(
@@ -139,13 +192,31 @@ mod tests {
     #[test]
     fn zero_tests_with_nonzero_exit_did_not_run() {
         // The false-convergence case: no tests parsed and the command failed.
-        assert!(!test_command_ran(&v(&[]), 0, 101));
+        assert!(!test_command_ran(Some(&shape(&[], 0, 101))));
         // A genuinely empty suite that exited 0 counts as "ran" (nothing to break).
-        assert!(test_command_ran(&v(&[]), 0, 0));
+        assert!(test_command_ran(Some(&shape(&[], 0, 0))));
         // Any parsed test means it ran, regardless of exit code.
-        assert!(test_command_ran(&v(&["a"]), 0, 101));
+        assert!(test_command_ran(Some(&shape(&["a"], 0, 101))));
         // A passing count alone proves it ran, which is the whole reason the count is carried.
-        assert!(test_command_ran(&v(&[]), 285, 101));
+        assert!(test_command_ran(Some(&shape(&[], 285, 101))));
+    }
+
+    /// An implementer that wrote nothing has no acceptance run to report — and the absence is the
+    /// only honest way to say so, since a zeroed result is also what a clean run of an empty suite
+    /// reports. That shape is what the workflow reads before deciding to review rather than
+    /// iterate, so it must not be constructible for a run that never started one.
+    #[test]
+    fn a_suite_that_never_ran_is_absent_not_zeroed() {
+        assert!(
+            !test_command_ran(None),
+            "there is no result, which is not the same as a clean one"
+        );
+        assert!(
+            test_command_ran(Some(&shape(&[], 0, 0))),
+            "the zeros a real clean run of an empty suite reports still read as a run"
+        );
+        // And there is no way to say it with numbers: `None` is the whole vocabulary, which is
+        // the point — a skipped run has no shape a reader could mistake for a real one.
     }
 
     #[test]

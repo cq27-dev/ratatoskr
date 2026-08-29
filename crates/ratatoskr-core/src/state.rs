@@ -97,6 +97,18 @@ pub enum RunStatus {
     /// against the baseline", and reporting it for a run that produced no change describes a
     /// success nobody had. Terminal and not a failure; the run's artifact is its plan.
     NoCodeChange,
+    /// The fork ran and the implementer's tree came back unchanged.
+    ///
+    /// Distinct from [`RunStatus::NoCodeChange`], which is the analyst deciding up front that the
+    /// task changes no code: here the run expected a change, built a worktree and spent the
+    /// implementer's turns, and got none. Distinct from `Converged` for the reason that matters —
+    /// converge compares failing sets, and an unchanged tree trivially introduces no new failures,
+    /// so reporting this as convergence describes a change that held up when no change was made.
+    /// Distinct from `MaxIterationsReached`, which means the loop worked and ran out of budget.
+    ///
+    /// Terminal and not a failure: the implementer may be right that nothing needs changing, and
+    /// the run's friction is worth recording either way.
+    NoChangeProduced,
     Failed,
     Abandoned,
 }
@@ -124,6 +136,7 @@ impl RunStatus {
             | RunStatus::MaxIterationsReached
             | RunStatus::Unreviewed
             | RunStatus::NoCodeChange
+            | RunStatus::NoChangeProduced
             | RunStatus::Failed
             | RunStatus::Abandoned => true,
         }
@@ -145,7 +158,8 @@ impl RunStatus {
             | RunStatus::Converged
             | RunStatus::MaxIterationsReached
             | RunStatus::Unreviewed
-            | RunStatus::NoCodeChange => true,
+            | RunStatus::NoCodeChange
+            | RunStatus::NoChangeProduced => true,
             RunStatus::Pending
             | RunStatus::Running
             | RunStatus::AwaitingClarification

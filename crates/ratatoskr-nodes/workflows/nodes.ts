@@ -547,10 +547,21 @@ export const bookkeeper = {
             "answer never landed. Nothing here says the change is wrong. ") +
         "This is not a wall the change hit; it is something nobody has looked at. Record what a " +
         "future run should know about reviewing this area, not about fixing it.\n\n";
+    } else if (input.status === "no_change_produced") {
+      // No wall, and no failing tests to name: the implementer wrote nothing, so the acceptance
+      // suite was never run and `acceptance` is absent rather than zeroed. Falling through to the
+      // wall wording asks for a durable memory built on a diagnosis the run never made.
+      question +=
+        `OUTCOME: the run PRODUCED NO CHANGE — after ${input.iterations} implementer ` +
+        "iterations the worktree came back exactly as the implementer was handed it. No code was " +
+        "written, so the tests were not run and nothing here says the change would have failed. " +
+        "Either the task needed no change, or something stopped it being made. Record what a " +
+        "future run should know about why this task produced nothing — not about fixing tests.\n\n";
     } else {
       question +=
         `OUTCOME: the run HIT A WALL — after ${input.iterations} implementer iterations ` +
-        `it could not resolve these failing tests: ${input.implementer.failing_tests.join(", ")}. ` +
+        "it could not resolve these failing tests: " +
+        `${(input.implementer.acceptance?.failing_tests ?? []).join(", ")}. ` +
         "Record what a future run should know about this wall / this class of change.\n\n";
     }
     question += `TASK:\n${input.issue}\n\n`;
@@ -697,11 +708,18 @@ export const publisher = {
     if (implementer.diff_summary) {
       question += `\nDIFF:\n${implementer.diff_summary}\n`;
     }
-    question +=
-      `\nACCEPTANCE: ${implementer.failing_tests.length} failing, ` +
-      `${implementer.passed_tests} passing (exit ${implementer.exit_code}).\n`;
-    if (implementer.failing_tests.length > 0) {
-      question += `Still failing: ${implementer.failing_tests.join(", ")}\n`;
+    // Absent when the implementer wrote nothing: no suite was run, so there is no result to
+    // report. Printing zeros would describe a clean acceptance run that never happened.
+    const ran = implementer.acceptance;
+    if (ran) {
+      question +=
+        `\nACCEPTANCE: ${ran.failing_tests.length} failing, ` +
+        `${ran.passed_tests} passing (exit ${ran.exit_code}).\n`;
+      if (ran.failing_tests.length > 0) {
+        question += `Still failing: ${ran.failing_tests.join(", ")}\n`;
+      }
+    } else {
+      question += "\nACCEPTANCE: not run — the implementer wrote nothing to check.\n";
     }
     return question;
   },

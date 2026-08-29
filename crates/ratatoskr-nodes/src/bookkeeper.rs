@@ -242,11 +242,17 @@ pub(crate) fn skipped_before_compose(
         tracing::info!("no memory index in this repository; recording no memory");
         return Some(input.nothing_recorded("this repository keeps no memory index"));
     }
-    if input.status == "converged"
-        && input.implementer.touched_files.is_empty()
-        && input.implementer.diff_summary.trim().is_empty()
-        && input.friction.is_empty()
-    {
+    // Nothing was written and nothing went wrong, so there is nothing to draw a memory from.
+    //
+    // Asked of `produced_change` alone, never of the worktree. `diff_summary` and `touched_files`
+    // describe the whole tree, and the red team authors its tests into the implementer's worktree
+    // before the first attempt — so both are non-empty for a run whose implementer wrote nothing,
+    // and requiring them empty spends a turn on exactly the runs this declines to spend one on.
+    //
+    // The status is not consulted either: `infer_status` returns `no_change_produced` as soon as
+    // `produced_change` is false, so the two say the same thing and only one of them says it about
+    // the implementer.
+    if input.implementer.acceptance.is_none() && input.friction.is_empty() {
         tracing::info!("nothing was changed and nothing went wrong; recording no memory");
         return Some(input.nothing_recorded("the run changed nothing and hit nothing"));
     }
@@ -561,14 +567,16 @@ mod tests {
                 interface: Vec::new(),
             },
             implementer: ImplementerOutput {
+                acceptance: Some(crate::testrun::AcceptanceResult {
+                    failing_tests: Vec::new(),
+                    passed_tests: 1,
+                    exit_code: 0,
+                }),
                 branch: "ratatoskr/test".into(),
                 worktree_path: "/tmp/wt".into(),
                 diff_summary: diff.into(),
                 touched_files: touched.iter().map(|s| (*s).to_string()).collect(),
                 rewritten_files: Vec::new(),
-                failing_tests: Vec::new(),
-                passed_tests: 0,
-                exit_code: 0,
                 narrative: None,
                 commit_kind: String::new(),
                 commit_scope: String::new(),
@@ -598,13 +606,35 @@ mod tests {
 
     #[test]
     fn a_run_that_hit_a_wall_without_touching_files_still_has_something_to_say() {
-        // Converged-and-untouched is a no-op; walled-and-untouched is a wall worth recording.
+        // Walled-and-untouched is a wall worth recording, and the skip must not swallow it.
         let walled = input(false, &[], "");
         assert!(
-            !(walled.status == "converged"
-                && walled.implementer.touched_files.is_empty()
-                && walled.implementer.diff_summary.trim().is_empty()),
+            skipped_before_compose(&walled, true).is_none(),
             "the skip must not swallow a run that failed to get started"
+        );
+    }
+
+    /// The red team authors its tests into the implementer's worktree, so a run whose implementer
+    /// wrote nothing still reports a whole-tree diff and a touched-file list. A skip conditioned on
+    /// either spends a bookkeeper turn on precisely the run it means to decline.
+    #[test]
+    fn a_run_that_wrote_nothing_declines_the_turn_even_with_authored_tests_in_the_tree() {
+        let mut nothing = input(true, &["tests/repro.rs"], " tests/repro.rs | 12 ++++++");
+        nothing.status = "no_change_produced".to_string();
+        nothing.implementer.acceptance = None;
+        assert!(
+            skipped_before_compose(&nothing, true).is_some(),
+            "nothing was written and nothing went wrong, whatever else is in the tree"
+        );
+
+        // Friction is the whole reason such a run is offered to the bookkeeper at all: something
+        // stopped the change being made, and that is worth keeping.
+        let mut rough = nothing.clone();
+        rough.friction.diagnostics =
+            vec!["the sandbox could not resolve the test command".to_string()];
+        assert!(
+            skipped_before_compose(&rough, true).is_none(),
+            "a run that hit something has something to say"
         );
     }
 

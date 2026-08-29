@@ -1333,20 +1333,32 @@ fn print_run_summary(run_id: &str, outcome: &ratatoskr_nodes::RunOutcome) {
         println!("  [{}] {}{}", c.category, c.test, reason);
     }
 
-    println!(
-        "AFTER CHANGE: {} failing, {} passing",
-        im.failing_tests.len(),
-        im.passed_tests
-    );
-
-    let new_failures =
-        ratatoskr_nodes::converge::newly_introduced_failures(&rt.failing_tests, &im.failing_tests);
-    if new_failures.is_empty() {
-        println!("NEW FAILURES: none");
-    } else {
-        println!("NEW FAILURES ({}):", new_failures.len());
-        for f in &new_failures {
-            println!("  • {f}");
+    // A run whose implementer wrote nothing has no result to print. "0 failing, 0 passing" is
+    // what a clean run of an empty suite would say, so printing it here would report a green run
+    // to the one reader in a position to notice nothing happened.
+    match im.acceptance.as_ref() {
+        None => println!(
+            "AFTER CHANGE: nothing was written, so the suite was not run again — the baseline \
+             above still stands"
+        ),
+        Some(ran) => {
+            println!(
+                "AFTER CHANGE: {} failing, {} passing",
+                ran.failing_tests.len(),
+                ran.passed_tests
+            );
+            let new_failures = ratatoskr_nodes::converge::newly_introduced_failures(
+                &rt.failing_tests,
+                &ran.failing_tests,
+            );
+            if new_failures.is_empty() {
+                println!("NEW FAILURES: none");
+            } else {
+                println!("NEW FAILURES ({}):", new_failures.len());
+                for f in &new_failures {
+                    println!("  • {f}");
+                }
+            }
         }
     }
 
