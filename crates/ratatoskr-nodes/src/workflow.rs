@@ -107,6 +107,16 @@ pub struct WorkflowContext {
     /// Prepared by `redTeam` (or `implement` when no red team runs), then reused by implementation,
     /// iteration, and cleanup. The script never sees a raw path.
     worktree: Mutex<Option<WorktreePath>>,
+    /// The worktree as the implementer was first handed it, captured before its first attempt.
+    ///
+    /// Run-scoped and not per-node: `iterate` and `replanAtCeiling` each build a fresh
+    /// `ImplementerNode`, so a snapshot held on the node would be retaken against a tree that
+    /// already contains an earlier attempt's work. A final iteration that added nothing would then
+    /// report the whole run as having produced no change, and the change already in the worktree
+    /// would go unpublished.
+    ///
+    /// Not an empty tree either: the red team authors its tests here before any attempt runs.
+    pub(crate) handed: tokio::sync::OnceCell<Option<String>>,
     /// Red-team authoring must finish before the implementer can edit the same worktree.
     red_team_started: AtomicBool,
     red_team_completed: AtomicBool,
@@ -280,6 +290,7 @@ impl WorkflowContext {
             configured_servers,
             repo_path,
             worktree: Mutex::new(None),
+            handed: tokio::sync::OnceCell::new(),
             red_team_started: AtomicBool::new(false),
             red_team_completed: AtomicBool::new(false),
             implement_started: AtomicBool::new(false),
@@ -924,7 +935,6 @@ async fn build_implementer(
 ) -> Result<ImplementerNode, PlanError> {
     let stages = ctx.stages().await?;
     Ok(ImplementerNode {
-        handed: tokio::sync::OnceCell::new(),
         clarifier: Some(ctx.clarifier.as_dyn()),
         acceptance: ctx.acceptance(&analyst.acceptance),
         characterizer: crate::build_characterizer(
@@ -5477,6 +5487,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The snapshot the no-change outcome rests on belongs to the RUN, not to a node.
+    ///
+    /// `iterate` and `replanAtCeiling` each build a fresh `ImplementerNode`. Held per node, the
+    /// snapshot would be retaken against a tree that already contains the first attempt's work, so
+    /// a last iteration that added nothing would report the whole run as having produced no change
+    /// — and `finish_full` would decline to publish code that was actually written.
+    #[tokio::test]
+    async fn the_handed_tree_is_snapshotted_once_for_the_run_not_once_per_node() {
+        let dir =
+            std::env::temp_dir().join(format!("ratatoskr-handed-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptEngine::load(&dir.join("rules")).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = RatatoskrConfig::default();
+        config
+            .models
+            .insert("implementer".to_string(), model_route());
+        let run_id = "run-handed-scope";
+        let analyst = terminal_plan(&store, run_id, false).await;
+        let ctx = WorkflowContext::new(
+            None,
+            &config,
+            &store,
+            run_id,
+            "the handed tree is the run's",
+            &engine,
+            crate::PluginContext::default(),
+        )
+        .unwrap();
+
+        // What the first attempt saw.
+        let first = ctx
+            .handed
+            .get_or_init(|| async { Some("the tree as handed over".to_string()) })
+            .await
+            .clone();
+
+        // The rebuild an iteration performs. Its node must still answer with the first snapshot,
+        // never re-take one against the tree as it now stands.
+        let rebuilt = build_implementer(&ctx, analyst).await.unwrap();
+        let seen = rebuilt
+            .declared_context
+            .handed
+            .get_or_init(|| async { Some("a tree that already carries the change".to_string()) })
+            .await
+            .clone();
+
+        assert_eq!(
+            seen, first,
+            "a rebuilt implementer must not re-snapshot the tree it is handed"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn implementer_host_shares_and_reconstructs_run_clarifications() {
         let dir = std::env::temp_dir().join(format!(
@@ -7943,6 +8008,54 @@ mod tests {
             .unwrap();
         assert!(question.contains("OUTCOME: the run HIT A WALL"));
         assert!(question.contains("The decision omitted its action."));
+
+        // A run that produced no change is not a wall. Its acceptance suite never ran, so the
+        // empty `failing_tests` it carries means "not measured" — and the wall wording would name
+        // that emptiness as the tests the run could not resolve, asking for a durable memory built
+        // on a diagnosis nobody made.
+        let mut produced_nothing = input.clone();
+        produced_nothing.status = "no_change_produced".to_string();
+        produced_nothing.implementer.produced_change = false;
+        produced_nothing.implementer.failing_tests = Vec::new();
+        let capture = Arc::clone(&captured);
+        let host: HostFn = Arc::new(move |arg| {
+            let capture = Arc::clone(&capture);
+            Box::pin(async move {
+                *capture.lock().expect("bookkeeper capture mutex poisoned") =
+                    Some(serde_json::from_str::<serde_json::Value>(&arg).unwrap());
+                Ok(json!({ "decisions": [] }).to_string())
+            })
+        });
+        runtime
+            .run_with_question_renderers(
+                "run",
+                serde_json::to_string(&produced_nothing).unwrap(),
+                HashMap::from([("bookkeeper".to_string(), host)]),
+                stage_question_renderers(&stages),
+            )
+            .await
+            .unwrap();
+        let envelope = captured
+            .lock()
+            .expect("bookkeeper capture mutex poisoned")
+            .take()
+            .unwrap();
+        let question = envelope["__ratatoskrRenderedQuestion"]["question"]
+            .as_str()
+            .unwrap();
+        assert!(
+            question.contains("OUTCOME: the run PRODUCED NO CHANGE"),
+            "{question}"
+        );
+        assert!(
+            !question.contains("HIT A WALL"),
+            "a run that wrote nothing hit no wall: {question}"
+        );
+        assert!(
+            !question.contains("could not resolve these failing tests"),
+            "the tests were never run, so none of them failed: {question}"
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -547,6 +547,17 @@ export const bookkeeper = {
             "answer never landed. Nothing here says the change is wrong. ") +
         "This is not a wall the change hit; it is something nobody has looked at. Record what a " +
         "future run should know about reviewing this area, not about fixing it.\n\n";
+    } else if (input.status === "no_change_produced") {
+      // No wall, and no failing tests to name: the implementer wrote nothing, so the acceptance
+      // suite was never run and the empty `failing_tests` here means "not measured" rather than
+      // "none failed". Falling through to the wall wording asks for a durable memory built on a
+      // diagnosis the run never made.
+      question +=
+        `OUTCOME: the run PRODUCED NO CHANGE — after ${input.iterations} implementer ` +
+        "iterations the worktree came back exactly as the implementer was handed it. No code was " +
+        "written, so the tests were not run and nothing here says the change would have failed. " +
+        "Either the task needed no change, or something stopped it being made. Record what a " +
+        "future run should know about why this task produced nothing — not about fixing tests.\n\n";
     } else {
       question +=
         `OUTCOME: the run HIT A WALL — after ${input.iterations} implementer iterations ` +

@@ -169,13 +169,6 @@ pub struct ImplementerNode {
     pub characterizer: Option<Characterizer>,
     /// The generic stage executor context used for every implementation attempt.
     pub(crate) declared_context: Arc<crate::workflow::WorkflowContext>,
-    /// The tree as the implementer was handed it, captured before its first attempt.
-    ///
-    /// Not an empty tree. The red team authors its tests into this same worktree, before any
-    /// attempt runs, so `git status --porcelain` is already non-empty when the implementer starts
-    /// and "did the implementer change anything" cannot be asked of the tree's contents alone.
-    /// Everything that differs from this snapshot is the implementer's own doing.
-    pub(crate) handed: tokio::sync::OnceCell<Option<String>>,
 }
 
 impl ImplementerNode {
@@ -247,7 +240,13 @@ impl ImplementerNode {
         // red team's authored tests already in it, which is what the implementer was handed. Later
         // attempts keep comparing against that same tree, so "did the implementer change anything"
         // stays a question about the run rather than about the last iteration.
+        // Held on the run's context, not on this node: `iterate` and `replanAtCeiling` each build
+        // a fresh `ImplementerNode`, and a snapshot retaken per node would be of a tree already
+        // carrying an earlier attempt's work — so a last iteration that added nothing would report
+        // the whole run as having produced none, and the change in the worktree would go
+        // unpublished.
         let handed = self
+            .declared_context
             .handed
             .get_or_init(|| async { worktree::full_diff_text(worktree).await.ok() })
             .await
@@ -518,7 +517,6 @@ mod tests {
         )
         .unwrap();
         let node = ImplementerNode {
-            handed: tokio::sync::OnceCell::new(),
             repo_path: repo.clone(),
             worktree_root: dir.join("worktrees"),
             sandbox: config.sandbox.clone(),
