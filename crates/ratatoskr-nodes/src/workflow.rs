@@ -580,13 +580,13 @@ fn infer_status(
     // `produced_change` and never `touched_files.is_empty()`: the red team authors its tests into
     // the implementer's worktree before the first attempt, so that list is non-empty for a run
     // whose implementer wrote nothing at all.
-    if !implementer.produced_change {
+    let Some(ran) = implementer.acceptance.as_ref() else {
         tracing::warn!(
             kind = "no_change_produced",
             "the implementer's tree came back unchanged; there is no change to have converged"
         );
         return RunStatus::NoChangeProduced;
-    }
+    };
     if !referee.is_empty() {
         tracing::warn!(violations = ?referee, "run weakened the referee; not converged");
         return RunStatus::MaxIterationsReached;
@@ -611,7 +611,7 @@ fn infer_status(
         .as_ref()
         .map(|a| a.tests.as_slice())
         .unwrap_or_default();
-    let unsatisfied = converge::unsatisfied(authored, &implementer.failing_tests);
+    let unsatisfied = converge::unsatisfied(authored, &ran.failing_tests);
     if !unsatisfied.is_empty() {
         tracing::warn!(
             tests = ?unsatisfied,
@@ -619,19 +619,8 @@ fn infer_status(
         );
         return RunStatus::MaxIterationsReached;
     }
-    let post_ran = converge::test_command_ran(
-        implementer.produced_change,
-        &implementer.failing_tests,
-        implementer.passed_tests,
-        implementer.exit_code,
-    );
-    if post_ran
-        && converge::is_converged(
-            implementer.produced_change,
-            &red_team.failing_tests,
-            &implementer.failing_tests,
-        )
-    {
+    let post_ran = converge::test_command_ran(Some(ran));
+    if post_ran && converge::is_converged(&red_team.failing_tests, Some(ran)) {
         RunStatus::Converged
     } else {
         RunStatus::MaxIterationsReached
@@ -729,27 +718,33 @@ async fn reconstruct_plan(store: &Store, run_id: &str) -> Result<PlanOutcome, Pl
 
 /// JSON shape shared by `RedTeamOutput` and `ImplementerOutput` for the pure converge helpers.
 #[derive(Deserialize)]
+/// The baseline's result, as the workflow hands it back.
+///
+/// Only the failing set, and flat rather than optional: the red team always runs its suite — a
+/// baseline that produced no checks is refused where it is measured, not carried this far — so
+/// there is no absence to represent on this side.
 struct RunShape {
-    /// Whether the implementer wrote anything. A run that produced no change ran no acceptance
-    /// suite, so the three fields below are zeros standing for "not measured" — and `exit_code: 0`
-    /// would otherwise read to the workflow as a suite that passed.
-    ///
-    /// Defaults to `true` so a shape from anywhere that does not carry it is judged on its test
-    /// fields, as before, rather than silently reading as a skipped run.
-    #[serde(default = "crate::implementer::produced_change_default")]
-    produced_change: bool,
     #[serde(default)]
     failing_tests: Vec<String>,
+}
+
+/// The implementer's result, as the workflow hands it back.
+///
+/// `acceptance` is absent when the implementer wrote nothing and no suite was run. Absent and not
+/// zeroed, so a workflow — the bundled one or a repository's own — cannot read a run that never
+/// happened as a clean one.
+///
+/// A projection of the whole implementer output, so unknown fields are ignored rather than denied.
+#[derive(Deserialize)]
+struct PostShape {
     #[serde(default)]
-    passed_tests: usize,
-    #[serde(default)]
-    exit_code: i32,
+    acceptance: Option<crate::testrun::AcceptanceResult>,
 }
 
 #[derive(Deserialize)]
 struct BaselinePost {
     baseline: RunShape,
-    post: RunShape,
+    post: PostShape,
 }
 
 fn binding<F, Fut>(ctx: Arc<WorkflowContext>, f: F) -> HostFn
@@ -934,9 +929,13 @@ async fn red_team_host(ctx: Arc<WorkflowContext>, _arg: String) -> Result<String
     // Checkpoint before the guard so a failed baseline stays inspectable.
     note(&ctx, crate::policy::REDTEAM_NODE, &out, None, None).await?;
     // The false-convergence guard is enforced here — the script cannot skip it.
-    // `true`: the baseline is a run of the suite by definition — there is no change to have been
-    // skipped for. What this guard is asking is whether that run produced any checks.
-    if !converge::test_command_ran(true, &out.failing_tests, out.passed_tests, out.exit_code) {
+    // The baseline is a run of the suite by definition — there is no change to have been skipped
+    // for — so it is always `Some`. What this guard asks is whether that run produced any checks.
+    if !converge::test_command_ran(Some(&crate::testrun::AcceptanceResult {
+        failing_tests: out.failing_tests.clone(),
+        passed_tests: out.passed_tests,
+        exit_code: out.exit_code,
+    })) {
         return Err(format!(
             "the baseline acceptance run produced no checks (exit {}); check the analyst's acceptance, [sandbox] test_command and the sandbox backend",
             out.exit_code
@@ -1242,12 +1241,7 @@ async fn iterate_work(
     let prev: ImplementerOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "implementer")
         .await
         .map_err(|e| e.to_string())?;
-    let post_ran = converge::test_command_ran(
-        prev.produced_change,
-        &prev.failing_tests,
-        prev.passed_tests,
-        prev.exit_code,
-    );
+    let post_ran = converge::test_command_ran(prev.acceptance.as_ref());
     let analyst: AnalystOutput = latest_checkpoint(&ctx.store, &ctx.run_id, "analyst")
         .await
         .map_err(|e| e.to_string())?;
@@ -1259,57 +1253,61 @@ async fn iterate_work(
         .as_ref()
         .map(|authored| authored.tests.as_slice())
         .unwrap_or_default();
-    let unsatisfied = converge::unsatisfied(authored, &prev.failing_tests);
-    let diagnostic = if !prev.produced_change {
-        "Your last attempt left the tree unchanged: nothing was written, so there is nothing to \
-         test and nothing to review. If the task needs a change, make it. If you believe it needs \
-         none, say so in your summary and explain why rather than returning again with no edit."
-            .to_string()
-    } else if !referee.is_empty() {
-        referee::correction(&referee)
-    } else if !post_ran {
-        format!(
-            "The test command did not run to completion (exit {}) — your change likely does not \
-             compile. Fix it so the tests run and pass.",
-            prev.exit_code
-        )
-    } else if !unsatisfied.is_empty() {
-        format!(
-            "These tests were written for this change, from the interface, before any code existed \
-             to satisfy them — making them pass is what the change is for, and they are still \
-             failing: {}. They are not yours to edit; implement what they describe. If one of \
-             them is wrong about the contract rather than about your code, say so in your summary \
-             and implement the rest.",
-            unsatisfied.join(", ")
-        )
-    } else if !converge::is_converged(
-        prev.produced_change,
-        &red_team.failing_tests,
-        &prev.failing_tests,
-    ) {
-        let new_failures =
-            converge::newly_introduced_failures(&red_team.failing_tests, &prev.failing_tests);
-        format!(
-            "Your change introduced NEW failing tests not present in the baseline: {}. Fix them \
-             without breaking other tests.",
-            new_failures.join(", ")
-        )
-    } else if let Some(review) = input.review.as_ref() {
-        let checkpoints = ctx
-            .store
-            .checkpoints_for_run(&ctx.run_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        review_correction(
-            &checkpoints,
-            review,
-            crate::parse_threshold(&ctx.config.implementer.verify_threshold),
-        )?
-    } else {
-        return Err(
-            "iterate() has no referee, test, or checkpointed review correction to apply"
-                .to_string(),
-        );
+    // Every branch but the first reads an acceptance result, and a run that wrote nothing has
+    // none — so the absence is answered first and the rest are handed the result they need.
+    let diagnostic = match prev.acceptance.as_ref() {
+        None => "Your last attempt left the tree unchanged: nothing was written, so there is \
+                 nothing to test and nothing to review. If the task needs a change, make it. If \
+                 you believe it needs none, say so in your summary and explain why rather than \
+                 returning again with no edit."
+            .to_string(),
+        Some(ran) => {
+            let unsatisfied = converge::unsatisfied(authored, &ran.failing_tests);
+            if !referee.is_empty() {
+                referee::correction(&referee)
+            } else if !post_ran {
+                format!(
+                    "The test command did not run to completion (exit {}) — your change likely \
+                     does not compile. Fix it so the tests run and pass.",
+                    ran.exit_code
+                )
+            } else if !unsatisfied.is_empty() {
+                format!(
+                    "These tests were written for this change, from the interface, before any \
+                     code existed to satisfy them — making them pass is what the change is for, \
+                     and they are still failing: {}. They are not yours to edit; implement what \
+                     they describe. If one of them is wrong about the contract rather than about \
+                     your code, say so in your summary and implement the rest.",
+                    unsatisfied.join(", ")
+                )
+            } else if !converge::is_converged(&red_team.failing_tests, Some(ran)) {
+                let new_failures = converge::newly_introduced_failures(
+                    &red_team.failing_tests,
+                    &ran.failing_tests,
+                );
+                format!(
+                    "Your change introduced NEW failing tests not present in the baseline: {}. \
+                     Fix them without breaking other tests.",
+                    new_failures.join(", ")
+                )
+            } else if let Some(review) = input.review.as_ref() {
+                let checkpoints = ctx
+                    .store
+                    .checkpoints_for_run(&ctx.run_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                review_correction(
+                    &checkpoints,
+                    review,
+                    crate::parse_threshold(&ctx.config.implementer.verify_threshold),
+                )?
+            } else {
+                return Err(
+                    "iterate() has no referee, test, or checkpointed review correction to apply"
+                        .to_string(),
+                );
+            }
+        }
     };
 
     ctx.resolved_container_image().await?;
@@ -1337,22 +1335,14 @@ async fn iterate_work(
 async fn is_converged_host(_ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
     let bp: BaselinePost =
         serde_json::from_str(&arg).map_err(|e| format!("isConverged arg: {e}"))?;
-    let v = converge::is_converged(
-        bp.post.produced_change,
-        &bp.baseline.failing_tests,
-        &bp.post.failing_tests,
-    );
+    let v = converge::is_converged(&bp.baseline.failing_tests, bp.post.acceptance.as_ref());
     serde_json::to_string(&v).map_err(|e| e.to_string())
 }
 
 async fn test_command_ran_host(_ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
-    let s: RunShape = serde_json::from_str(&arg).map_err(|e| format!("testCommandRan arg: {e}"))?;
-    let v = converge::test_command_ran(
-        s.produced_change,
-        &s.failing_tests,
-        s.passed_tests,
-        s.exit_code,
-    );
+    let s: PostShape =
+        serde_json::from_str(&arg).map_err(|e| format!("testCommandRan arg: {e}"))?;
+    let v = converge::test_command_ran(s.acceptance.as_ref());
     serde_json::to_string(&v).map_err(|e| e.to_string())
 }
 
@@ -1973,21 +1963,13 @@ async fn replan_at_ceiling_with<R: CeilingRecovery>(
         .as_ref()
         .map(|authored| authored.tests.as_slice())
         .unwrap_or_default();
-    // A tree the implementer never wrote to is not a clean one. Its suite was never run, so the
-    // empty failing set it carries clears every test condition below by default — and a run that
-    // produced nothing is exactly the case a replan is for.
-    let tests_clean = converge::test_command_ran(
-        implementation.produced_change,
-        &implementation.failing_tests,
-        implementation.passed_tests,
-        implementation.exit_code,
-    ) && converge::unsatisfied(authored, &implementation.failing_tests)
-        .is_empty()
-        && converge::is_converged(
-            implementation.produced_change,
-            &red_team.failing_tests,
-            &implementation.failing_tests,
-        );
+    // A tree the implementer never wrote to is not a clean one: there is no acceptance result to
+    // be clean, and a run that produced nothing is exactly the case a replan is for.
+    let tests_clean = implementation.acceptance.as_ref().is_some_and(|ran| {
+        converge::test_command_ran(Some(ran))
+            && converge::unsatisfied(authored, &ran.failing_tests).is_empty()
+            && converge::is_converged(&red_team.failing_tests, Some(ran))
+    });
     // This tree's review, folded across the passes that produced it — the same value `verify()`
     // handed the workflow. Read off the latest checkpoint alone, a continuation that turned up
     // nothing new looked like a clean review, and the one recovery this run is allowed was skipped
@@ -3666,7 +3648,6 @@ mod tests {
 
     fn imp(failing: &[&str], passing: &[&str], exit: i32) -> ImplementerOutput {
         ImplementerOutput {
-            produced_change: true,
             branch: "ratatoskr/test".into(),
             worktree_path: "/wt".to_string(),
             diff_summary: String::new(),
@@ -3678,9 +3659,11 @@ mod tests {
             commit_kind: String::new(),
             commit_scope: String::new(),
             commit_subject: String::new(),
-            failing_tests: failing.iter().map(|s| s.to_string()).collect(),
-            passed_tests: passing.len(),
-            exit_code: exit,
+            acceptance: Some(crate::testrun::AcceptanceResult {
+                failing_tests: failing.iter().map(|s| s.to_string()).collect(),
+                passed_tests: passing.len(),
+                exit_code: exit,
+            }),
             narrative: None,
         }
     }
@@ -4827,9 +4810,11 @@ mod tests {
         let first = ImplementerOutput {
             worktree_path: dir.join("worktree").display().to_string(),
             branch: "ratatoskr/standard-full".to_string(),
-            failing_tests: Vec::new(),
-            passed_tests: 1,
-            exit_code: 0,
+            acceptance: Some(crate::testrun::AcceptanceResult {
+                failing_tests: Vec::new(),
+                passed_tests: 1,
+                exit_code: 0,
+            }),
             ..imp(&[], &[], 0)
         };
         let implement_calls = Arc::clone(&calls);
@@ -5525,30 +5510,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The workflow reads the implementer's result through `RunShape`, and `produced_change`
-    /// defaults to `true` there. If the field ever stopped being serialized, that default would
-    /// silently restore the bug it exists to close: `testCommandRan` would answer `true` for a
-    /// skipped suite, the standard loop would review instead of iterating, and the no-change
-    /// correction would never reach the implementer.
+    /// The workflow reads the implementer's result through `PostShape`, and an absent
+    /// `acceptance` is what tells it a suite never ran. If the field stopped being serialized
+    /// under that name, the shape would deserialize to `None` for every run instead — so the
+    /// round trip is pinned in both directions.
     #[test]
-    fn the_workflow_sees_that_a_skipped_suite_did_not_run() {
+    fn the_workflow_sees_whether_a_suite_ran() {
         let mut nothing = imp(&[], &[], 0);
-        nothing.produced_change = false;
-        let shape: RunShape =
+        nothing.acceptance = None;
+        let shape: PostShape =
             serde_json::from_str(&serde_json::to_string(&nothing).unwrap()).unwrap();
+        assert!(shape.acceptance.is_none());
         assert!(
-            !shape.produced_change,
-            "the field has to survive the round trip the host reads through"
-        );
-        assert!(
-            !converge::test_command_ran(
-                shape.produced_change,
-                &shape.failing_tests,
-                shape.passed_tests,
-                shape.exit_code,
-            ),
+            !converge::test_command_ran(shape.acceptance.as_ref()),
             "so the standard workflow iterates rather than reviewing"
         );
+
+        // And a run that did test still reads as one, so the absence means what it says.
+        let ran: PostShape =
+            serde_json::from_str(&serde_json::to_string(&imp(&[], &["a"], 0)).unwrap()).unwrap();
+        assert!(converge::test_command_ran(ran.acceptance.as_ref()));
     }
 
     /// The snapshot the no-change outcome rests on belongs to the RUN, not to a node.
@@ -8013,7 +7994,6 @@ mod tests {
                 interface: Vec::new(),
             },
             implementer: ImplementerOutput {
-                produced_change: true,
                 worktree_path: "/tmp/ratatoskr/worktree".to_string(),
                 branch: "ratatoskr/bookkeeper".to_string(),
                 diff_summary: " bookkeeper.rs | 4 ++++".to_string(),
@@ -8022,9 +8002,11 @@ mod tests {
                 commit_kind: "refactor".to_string(),
                 commit_scope: "nodes".to_string(),
                 commit_subject: "declare the bookkeeper".to_string(),
-                failing_tests: vec!["bookkeeper::schema".to_string()],
-                passed_tests: 3,
-                exit_code: 101,
+                acceptance: Some(crate::testrun::AcceptanceResult {
+                    failing_tests: vec!["bookkeeper::schema".to_string()],
+                    passed_tests: 3,
+                    exit_code: 101,
+                }),
                 narrative: Some("The writer must remain deterministic.".to_string()),
             },
             iterations: 2,
@@ -8079,8 +8061,7 @@ mod tests {
         // on a diagnosis nobody made.
         let mut produced_nothing = input.clone();
         produced_nothing.status = "no_change_produced".to_string();
-        produced_nothing.implementer.produced_change = false;
-        produced_nothing.implementer.failing_tests = Vec::new();
+        produced_nothing.implementer.acceptance = None;
         let capture = Arc::clone(&captured);
         let host: HostFn = Arc::new(move |arg| {
             let capture = Arc::clone(&capture);
@@ -8272,7 +8253,6 @@ mod tests {
                 interface: Vec::new(),
             },
             implementer: Some(ImplementerOutput {
-                produced_change: true,
                 worktree_path: "/tmp/ratatoskr/worktree".to_string(),
                 branch: "ratatoskr/publisher".to_string(),
                 diff_summary: " publisher.rs | 2 ++".to_string(),
@@ -8281,9 +8261,11 @@ mod tests {
                 commit_kind: "fix".to_string(),
                 commit_scope: "publisher".to_string(),
                 commit_subject: "keep links distinct".to_string(),
-                failing_tests: vec!["publisher::links".to_string()],
-                passed_tests: 4,
-                exit_code: 101,
+                acceptance: Some(crate::testrun::AcceptanceResult {
+                    failing_tests: vec!["publisher::links".to_string()],
+                    passed_tests: 4,
+                    exit_code: 101,
+                }),
                 narrative: None,
             }),
             status: "max_iterations_reached".to_string(),
@@ -13474,7 +13456,7 @@ mod tests {
     fn a_tree_nobody_changed_has_not_converged() {
         let baseline = red(&["a"], &["b"], 1);
         let mut nothing = imp(&[], &[], 0);
-        nothing.produced_change = false;
+        nothing.acceptance = None;
         // The tree is NOT empty, and this is the case the gate has to survive: the red team
         // authored its tests into the implementer's worktree before the first attempt, so a run
         // whose implementer wrote nothing still reports files here. Reading emptiness off this
@@ -13487,10 +13469,14 @@ mod tests {
         );
 
         // The same output from an implementer that did write is judged on its tests, as before.
-        let mut changed = imp(&[], &[], 0);
-        changed.produced_change = true;
         assert_eq!(
-            infer_status(&baseline, &changed, &[], None, verifier::Severity::P2),
+            infer_status(
+                &baseline,
+                &imp(&[], &[], 0),
+                &[],
+                None,
+                verifier::Severity::P2
+            ),
             RunStatus::Converged
         );
     }

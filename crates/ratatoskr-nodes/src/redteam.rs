@@ -611,13 +611,27 @@ mod tests {
         // What the implementer's run reports when it changed nothing and the authored file is there.
         let after_no_op = vec!["cargo test".to_string()];
         assert!(
-            !crate::converge::is_converged(true, &clean.failing_tests, &after_no_op),
+            !crate::converge::is_converged(
+                &clean.failing_tests,
+                Some(&crate::testrun::AcceptanceResult {
+                    failing_tests: after_no_op.clone(),
+                    passed_tests: 0,
+                    exit_code: 101,
+                })
+            ),
             "a build the change did not fix is a NEW failure against a clean baseline"
         );
         // Had the baseline been seeded, it would report the same step and the difference vanishes.
         let seeded_baseline = ran(&["cargo test"], 0);
         assert!(
-            crate::converge::is_converged(true, &seeded_baseline.failing_tests, &after_no_op),
+            crate::converge::is_converged(
+                &seeded_baseline.failing_tests,
+                Some(&crate::testrun::AcceptanceResult {
+                    failing_tests: after_no_op.clone(),
+                    passed_tests: 0,
+                    exit_code: 101,
+                })
+            ),
             "which is precisely why the baseline must not be seeded"
         );
     }

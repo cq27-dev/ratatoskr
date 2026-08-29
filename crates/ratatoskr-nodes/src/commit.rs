@@ -132,15 +132,12 @@ mod tests {
         // of a commit has is "why". The implementer's own account is the only description written
         // by the thing that made the change.
         let out = ImplementerOutput {
-            produced_change: true,
+            acceptance: None,
             worktree_path: "/w".into(),
             branch: "ratatoskr/abc12345".into(),
             diff_summary: " crates/a.rs | 72 ++++++\n 1 file changed, 72 insertions(+)".into(),
             touched_files: vec!["crates/a.rs".into()],
             rewritten_files: Vec::new(),
-            failing_tests: Vec::new(),
-            passed_tests: 3,
-            exit_code: 0,
             narrative: Some(
                 "Fenced the acceptance output and bounded it across steps rather than per step, \
                  so one pathological step cannot fill the prompt on its own."

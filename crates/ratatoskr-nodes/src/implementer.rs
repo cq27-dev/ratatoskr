@@ -21,8 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyst::AnalystOutput;
 use crate::testrun::{
-    Acceptance, Characterizer, GUEST_WORKSPACE, TestResults, by_exit_code, mounts_for,
-    run_acceptance,
+    Acceptance, Characterizer, GUEST_WORKSPACE, by_exit_code, mounts_for, run_acceptance,
 };
 
 /// Implementer output. Test fields are deterministic; `diff_summary`/`touched_files`/`narrative`
@@ -42,15 +41,6 @@ pub struct ImplementerOutput {
     pub diff_summary: String,
     #[serde(default)]
     pub touched_files: Vec<String>,
-    /// Whether this implementer changed anything at all, measured against the tree it was handed.
-    ///
-    /// Not derivable from [`touched_files`](Self::touched_files): the red team authors its tests
-    /// into the implementer's worktree before the first attempt, so that list is already non-empty
-    /// when the implementer has written nothing. A run where this is false ran no acceptance suite
-    /// — there was nothing new to check — so the three test fields below are zeros standing for
-    /// "not measured", and every reader of them must consult this first.
-    #[serde(default = "produced_change_default")]
-    pub produced_change: bool,
     /// Of those, the ones where a line that was already there was removed or replaced.
     ///
     /// What the referee gate reads. Adding a test is work worth having from an implementer;
@@ -58,13 +48,15 @@ pub struct ImplementerOutput {
     /// apart.
     #[serde(default)]
     pub rewritten_files: Vec<String>,
-    pub failing_tests: Vec<String>,
-    /// How many checks passed. Only the count is carried: nothing reads a passing check's name,
-    /// and a suite of several hundred costs the characterizer more output than the rest of the
-    /// pipeline combined to write out.
+    /// What the acceptance run reported, or `None` when there was no run to report.
+    ///
+    /// `None` is not "nothing failed". The implementer wrote nothing — measured against the tree
+    /// it was handed, so the red team's authored tests do not count as its doing — and an
+    /// unchanged tree has an unchanged test result, so the suite is not run again. A zeroed result
+    /// would be indistinguishable from a clean one, which is how a change that does not exist came
+    /// to report convergence; the absence is the fact, and every reader has to unwrap it.
     #[serde(default)]
-    pub passed_tests: usize,
-    pub exit_code: i32,
+    pub acceptance: Option<crate::testrun::AcceptanceResult>,
     /// The CLI's own narrative of what it did (optional).
     #[serde(default)]
     pub narrative: Option<String>,
@@ -131,13 +123,6 @@ pub(crate) struct ImplementerAttemptInput {
     pub acceptance: Vec<ratatoskr_core::AcceptanceStep>,
     #[serde(default)]
     pub diagnostic: Option<String>,
-}
-
-/// A record written before this field existed describes a run that did produce a change — the
-/// no-change outcome did not exist to be recorded — so absence reads as `true`. That is also the
-/// safe direction: it withholds the outcome rather than claiming it.
-pub(crate) fn produced_change_default() -> bool {
-    true
 }
 
 /// The implementer node. Holds everything needed to create the worktree and run the acceptance
@@ -284,21 +269,15 @@ impl ImplementerNode {
             (Some(handed), Some(now)) => handed != now,
             _ => true,
         };
-        let tests = if !produced_change {
+        let acceptance = if !produced_change {
             tracing::info!(
                 kind = "acceptance_skipped_unchanged_tree",
                 "the implementer wrote nothing, so the baseline's result still stands; not \
                  running the acceptance suite again"
             );
-            // Not measured, and not measurable: nothing ran. Every reader of these three fields
-            // must check `produced_change` first — `infer_status` and the two correction paths do,
-            // which is what stops an empty failing set reading as convergence.
-            TestResults {
-                failing: Vec::new(),
-                passed: 0,
-                exit_code: 0,
-                raw_output: String::new(),
-            }
+            // Absent, never zeroed: there is no result, and a reader must not be able to mistake
+            // one for a clean run.
+            None
         } else {
             let outcomes = run_acceptance(Acceptance {
                 cfg: &self.sandbox,
@@ -310,10 +289,13 @@ impl ImplementerNode {
             })
             .await
             .map_err(NodeError::Failed)?;
-            match &self.characterizer {
-                Some(c) => c.read(&outcomes).await,
-                None => by_exit_code(&outcomes),
-            }
+            Some(
+                match &self.characterizer {
+                    Some(c) => c.read(&outcomes).await,
+                    None => by_exit_code(&outcomes),
+                }
+                .into(),
+            )
         };
 
         // Diff/touched reads are best-effort — don't fail the attempt if they hiccup.
@@ -324,15 +306,12 @@ impl ImplementerNode {
             .unwrap_or_default();
 
         Ok(ImplementerOutput {
-            produced_change,
+            acceptance,
             worktree_path: worktree.as_path().display().to_string(),
             branch: self.branch(),
             diff_summary,
             touched_files,
             rewritten_files,
-            failing_tests: tests.failing,
-            passed_tests: tests.passed,
-            exit_code: tests.exit_code,
             commit_kind: report.kind,
             commit_scope: report.scope,
             commit_subject: report.subject,

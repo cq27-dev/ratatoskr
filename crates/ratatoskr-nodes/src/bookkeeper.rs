@@ -252,7 +252,7 @@ pub(crate) fn skipped_before_compose(
     // The status is not consulted either: `infer_status` returns `no_change_produced` as soon as
     // `produced_change` is false, so the two say the same thing and only one of them says it about
     // the implementer.
-    if !input.implementer.produced_change && input.friction.is_empty() {
+    if input.implementer.acceptance.is_none() && input.friction.is_empty() {
         tracing::info!("nothing was changed and nothing went wrong; recording no memory");
         return Some(input.nothing_recorded("the run changed nothing and hit nothing"));
     }
@@ -567,15 +567,16 @@ mod tests {
                 interface: Vec::new(),
             },
             implementer: ImplementerOutput {
-                produced_change: true,
+                acceptance: Some(crate::testrun::AcceptanceResult {
+                    failing_tests: Vec::new(),
+                    passed_tests: 1,
+                    exit_code: 0,
+                }),
                 branch: "ratatoskr/test".into(),
                 worktree_path: "/tmp/wt".into(),
                 diff_summary: diff.into(),
                 touched_files: touched.iter().map(|s| (*s).to_string()).collect(),
                 rewritten_files: Vec::new(),
-                failing_tests: Vec::new(),
-                passed_tests: 0,
-                exit_code: 0,
                 narrative: None,
                 commit_kind: String::new(),
                 commit_scope: String::new(),
@@ -620,7 +621,7 @@ mod tests {
     fn a_run_that_wrote_nothing_declines_the_turn_even_with_authored_tests_in_the_tree() {
         let mut nothing = input(true, &["tests/repro.rs"], " tests/repro.rs | 12 ++++++");
         nothing.status = "no_change_produced".to_string();
-        nothing.implementer.produced_change = false;
+        nothing.implementer.acceptance = None;
         assert!(
             skipped_before_compose(&nothing, true).is_some(),
             "nothing was written and nothing went wrong, whatever else is in the tree"
