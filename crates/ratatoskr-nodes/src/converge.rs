@@ -31,8 +31,17 @@ pub fn unsatisfied(authored: &[String], post_failing: &[String]) -> Vec<String> 
 }
 
 /// Whether the change converged: it introduced no new failures.
-pub fn is_converged(baseline_failing: &[String], post_failing: &[String]) -> bool {
-    newly_introduced_failures(baseline_failing, post_failing).is_empty()
+///
+/// `produced_change` for the same reason [`test_command_ran`] asks for it: an implementer that
+/// wrote nothing ran no suite, and the empty failing set standing in for its result introduces no
+/// new failures by construction. A change that does not exist has not converged; it has not
+/// happened, and no comparison of failing sets can say otherwise.
+pub fn is_converged(
+    produced_change: bool,
+    baseline_failing: &[String],
+    post_failing: &[String],
+) -> bool {
+    produced_change && newly_introduced_failures(baseline_failing, post_failing).is_empty()
 }
 
 /// Whether a test run actually produced results. Zero tests parsed *and* a non-zero exit means the
@@ -79,15 +88,28 @@ mod tests {
         xs.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The other half of the skipped-suite pair. A repository-authored workflow may call
+    /// `isConverged` without calling `testCommandRan` beside it, so this cannot rely on the other
+    /// guard having been asked first.
+    #[test]
+    fn a_change_that_was_never_made_has_not_converged() {
+        assert!(
+            !is_converged(false, &v(&["a"]), &v(&[])),
+            "an empty failing set from a suite that never ran is not a clean one"
+        );
+        assert!(is_converged(true, &v(&["a"]), &v(&[])));
+    }
+
     #[test]
     fn converged_when_no_new_failures() {
         // Pre-existing failure stays; nothing new introduced.
         assert!(is_converged(
+            true,
             &v(&["a::pre_existing"]),
             &v(&["a::pre_existing"])
         ));
-        assert!(is_converged(&v(&["a::pre_existing"]), &v(&[])));
-        assert!(is_converged(&v(&[]), &v(&[])));
+        assert!(is_converged(true, &v(&["a::pre_existing"]), &v(&[])));
+        assert!(is_converged(true, &v(&[]), &v(&[])));
     }
 
     #[test]
@@ -98,6 +120,7 @@ mod tests {
         );
         assert_eq!(new, ["b::broke"]);
         assert!(!is_converged(
+            true,
             &v(&["a::pre_existing"]),
             &v(&["a::pre_existing", "b::broke"])
         ));
@@ -116,7 +139,7 @@ mod tests {
         let still_failing = v(&["store::zero_duration_removes_nothing"]);
 
         assert!(
-            is_converged(&baseline_failing, &still_failing),
+            is_converged(true, &baseline_failing, &still_failing),
             "nothing is newly failing, which is exactly why this is not enough on its own"
         );
         assert_eq!(

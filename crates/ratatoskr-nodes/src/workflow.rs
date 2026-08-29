@@ -625,7 +625,13 @@ fn infer_status(
         implementer.passed_tests,
         implementer.exit_code,
     );
-    if post_ran && converge::is_converged(&red_team.failing_tests, &implementer.failing_tests) {
+    if post_ran
+        && converge::is_converged(
+            implementer.produced_change,
+            &red_team.failing_tests,
+            &implementer.failing_tests,
+        )
+    {
         RunStatus::Converged
     } else {
         RunStatus::MaxIterationsReached
@@ -1276,7 +1282,11 @@ async fn iterate_work(
              and implement the rest.",
             unsatisfied.join(", ")
         )
-    } else if !converge::is_converged(&red_team.failing_tests, &prev.failing_tests) {
+    } else if !converge::is_converged(
+        prev.produced_change,
+        &red_team.failing_tests,
+        &prev.failing_tests,
+    ) {
         let new_failures =
             converge::newly_introduced_failures(&red_team.failing_tests, &prev.failing_tests);
         format!(
@@ -1327,7 +1337,11 @@ async fn iterate_work(
 async fn is_converged_host(_ctx: Arc<WorkflowContext>, arg: String) -> Result<String, String> {
     let bp: BaselinePost =
         serde_json::from_str(&arg).map_err(|e| format!("isConverged arg: {e}"))?;
-    let v = converge::is_converged(&bp.baseline.failing_tests, &bp.post.failing_tests);
+    let v = converge::is_converged(
+        bp.post.produced_change,
+        &bp.baseline.failing_tests,
+        &bp.post.failing_tests,
+    );
     serde_json::to_string(&v).map_err(|e| e.to_string())
 }
 
@@ -1969,7 +1983,11 @@ async fn replan_at_ceiling_with<R: CeilingRecovery>(
         implementation.exit_code,
     ) && converge::unsatisfied(authored, &implementation.failing_tests)
         .is_empty()
-        && converge::is_converged(&red_team.failing_tests, &implementation.failing_tests);
+        && converge::is_converged(
+            implementation.produced_change,
+            &red_team.failing_tests,
+            &implementation.failing_tests,
+        );
     // This tree's review, folded across the passes that produced it — the same value `verify()`
     // handed the workflow. Read off the latest checkpoint alone, a continuation that turned up
     // nothing new looked like a clean review, and the one recovery this run is allowed was skipped
