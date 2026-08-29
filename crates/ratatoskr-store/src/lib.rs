@@ -182,9 +182,6 @@ pub(crate) fn open_sqlite(path: &Path) -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
-/// The length of a run id in full: a hyphenated uuid. Anything shorter is treated as a prefix.
-const UUID_LEN: usize = 36;
-
 /// A handle to the checkpoint database. Cheap to clone (shares the guarded connection).
 #[derive(Clone)]
 pub struct Store {
@@ -277,12 +274,12 @@ impl Store {
     ///
     /// A prefix scan on the primary key, so this is a range scan of an index rather than a table
     /// scan. `LIMIT 2` because one more than one is all the answer needs.
+    ///
+    /// A full-length id is resolved like any other prefix rather than handed straight back. It is
+    /// the common case and the query is an index seek, so the saving was small; what it cost was
+    /// that an id nobody had ever stored resolved to itself, and a caller that deletes what it
+    /// resolves has no way to tell that from a run it found. Everything this answers now exists.
     pub async fn resolve_run(&self, prefix: &str) -> Result<Option<String>, StoreError> {
-        // An exact id needs no resolving, and a full uuid is the common case — the dashboard
-        // shortens for display but every internal caller has the whole thing.
-        if prefix.len() >= UUID_LEN {
-            return Ok(Some(prefix.to_string()));
-        }
         // `LIKE` treats these as wildcards, so a prefix carrying one would match far too much.
         // Refused rather than escaped: no real run id contains either.
         if prefix.is_empty() || prefix.contains('%') || prefix.contains('_') {
